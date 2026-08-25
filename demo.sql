@@ -44,4 +44,22 @@ SELECT
     h3_to_string(string_to_h3('8828308281fffff')) AS roundtrip_hex,
     h3_get_resolution(string_to_h3('8828308281fffff')) AS res;
 
+-- 6. Query Plan & Cardinality Estimation
+EXPLAIN SELECT count(*) FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8);
+
+-- 7. Export H3 Aggregations Directly to Parquet
+COPY (
+    SELECT
+        h3_index,
+        h3_hex,
+        mean,
+        count,
+        min,
+        max,
+        h3_to_lat(h3_index) AS centroid_lat,
+        h3_to_lng(h3_index) AS centroid_lng
+    FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8)
+) TO '/data/sf_elevation_h3.parquet' (FORMAT PARQUET);
+
+
 

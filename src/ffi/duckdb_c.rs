@@ -113,6 +113,7 @@ extern "C" {
         destroy: Option<duckdb_delete_callback_t>,
     );
     pub fn duckdb_bind_get_bind_data(info: duckdb_bind_info) -> *mut c_void;
+    pub fn duckdb_bind_set_cardinality(info: duckdb_bind_info, cardinality: idx_t, is_exact: bool);
     pub fn duckdb_bind_set_error(info: duckdb_bind_info, error: *const c_char);
 
     // Init info

@@ -183,6 +183,38 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let mut type_double_mut = type_double;
     duckdb_destroy_logical_type(&mut type_double_mut);
 
+    // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
+    const H3_AREA_M2: [f64; 16] = [
+        4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
+        3.613e7, 5.161e6, 7.373e5, 1.053e5, 1.505e4, 2.150e3,
+        3.071e2, 4.387e1, 6.268e0, 8.954e-1,
+    ];
+
+    let estimated_cardinality = if let Ok(reader) = GeoTiffStreamReader::open(&file_path) {
+        let w = reader.metadata.width as f64;
+        let h = reader.metadata.height as f64;
+        let total_pixels = (w * h) as u64;
+
+        let (x0, y0) = reader.metadata.geotransform.pixel_to_coord(0.0, 0.0);
+        let (x1, y1) = reader.metadata.geotransform.pixel_to_coord(w, h);
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+
+        let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
+            dx * 111_320.0 * dy * 110_540.0
+        } else {
+            dx * dy
+        };
+
+        let hex_area = H3_AREA_M2.get(resolution as usize).copied().unwrap_or(7.373e5);
+        let hex_count = (area_m2 / hex_area).ceil() as u64;
+        hex_count.min(total_pixels).max(1)
+    } else {
+        10_000
+    };
+
+    duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
+
     let bind_data = Box::new(RasterH3BindData {
         file_path,
         resolution,

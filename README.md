@@ -115,6 +115,29 @@ SELECT
 FROM h3_raster_aggregate('temperature.tif', 7);
 ```
 
+### 5. Spatial Joins & Parquet Export
+```sql
+-- Direct 64-bit integer join with vector data
+SELECT
+    r.h3_hex,
+    r.mean AS avg_elevation,
+    p.population
+FROM h3_raster_aggregate('elevation.tif', 8) r
+JOIN population_table p ON r.h3_index = p.h3_index;
+
+-- Export raster aggregation directly to Parquet
+COPY (
+    SELECT
+        h3_index,
+        h3_hex,
+        mean,
+        count,
+        h3_to_lat(h3_index) AS centroid_lat,
+        h3_to_lng(h3_index) AS centroid_lng
+    FROM h3_raster_aggregate('elevation.tif', resolution := 8)
+) TO 'elevation_h3.parquet' (FORMAT PARQUET);
+```
+
 ---
 
 ## Architecture
