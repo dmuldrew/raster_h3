@@ -58,7 +58,7 @@ fn test_accumulator_operations() {
     let mut acc1 = H3Accumulator::new(10.0);
     acc1.update(20.0);
     acc1.update(30.0);
-    assert_eq!(acc1.count, 3);
+    assert_eq!(acc1.count, 3.0);
     assert_eq!(acc1.sum, 60.0);
     assert_eq!(acc1.mean(), 20.0);
     assert_eq!(acc1.min, 10.0);
@@ -68,11 +68,34 @@ fn test_accumulator_operations() {
     acc2.update(50.0);
 
     acc1.merge(&acc2);
-    assert_eq!(acc1.count, 5);
+    assert_eq!(acc1.count, 5.0);
     assert_eq!(acc1.sum, 150.0);
     assert_eq!(acc1.mean(), 30.0);
     assert_eq!(acc1.min, 10.0);
     assert_eq!(acc1.max, 50.0);
+
+    // Test weighted updates
+    let mut acc_w = H3Accumulator::new_weighted(100.0, 0.4);
+    acc_w.update_weighted(200.0, 0.6);
+    assert_eq!(acc_w.count, 1.0);
+    assert_eq!(acc_w.sum, 160.0);
+    assert_eq!(acc_w.mean(), 160.0);
+}
+
+#[test]
+fn test_subpixel_sampling_patterns() {
+    use raster_h3::aggregator::SamplingPattern;
+
+    let center = SamplingPattern::parse("center");
+    assert!(center.is_single_point());
+
+    let presets = ["rgss", "5point", "gaussian", "hex", "8rooks", "9point", "16point"];
+    for name in presets {
+        let pattern = SamplingPattern::parse(name);
+        assert!(!pattern.is_single_point());
+        let sum_w: f64 = pattern.points.iter().map(|p| p.weight).sum();
+        assert!((sum_w - 1.0).abs() < 1e-9, "Weights did not sum to 1.0 for {}", name);
+    }
 }
 
 #[test]

@@ -109,7 +109,7 @@ fn aggregate_native_slice_hoisted<T, F, N>(
             // Fast spatial coherence H3 lookup
             if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, resolution) {
                 if cell_u64 != run_cell {
-                    if run_cell != 0 && run_acc.count > 0 {
+                    if run_cell != 0 && run_acc.count > 0.0 {
                         map.entry(run_cell)
                             .and_modify(|acc| acc.merge(&run_acc))
                             .or_insert(run_acc);
@@ -164,7 +164,7 @@ fn aggregate_native_slice_hoisted<T, F, N>(
         }
 
         // Flush remaining run at end of row
-        if run_cell != 0 && run_acc.count > 0 {
+        if run_cell != 0 && run_acc.count > 0.0 {
             map.entry(run_cell)
                 .and_modify(|acc| acc.merge(&run_acc))
                 .or_insert(run_acc);

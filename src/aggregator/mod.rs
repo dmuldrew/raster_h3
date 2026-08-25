@@ -2,6 +2,7 @@ pub mod accumulator;
 pub mod coherence;
 pub mod h3_map;
 pub mod horizon_streamer;
+pub mod sampling;
 
 pub use accumulator::H3Accumulator;
 pub use coherence::SpatialCoherenceCache;
@@ -10,3 +11,4 @@ pub use horizon_streamer::{
     compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig, HexEvictionEntry,
     ScanHorizonStreamer,
 };
+pub use sampling::{SamplePoint, SamplingPattern};

@@ -92,6 +92,7 @@ pub struct AggregationConfig {
     pub custom_crs: Option<String>,
     pub custom_nodata: Option<f64>,
     pub bbox: Option<[f64; 4]>, // [min_lon, min_lat, max_lon, max_lat]
+    pub sampling: SamplingPattern,
 }
 
 impl Default for AggregationConfig {
@@ -101,6 +102,7 @@ impl Default for AggregationConfig {
             custom_crs: None,
             custom_nodata: None,
             bbox: None,
+            sampling: SamplingPattern::default(),
         }
     }
 }
@@ -151,6 +153,7 @@ pub struct ScanHorizonStreamer {
     resolution: Resolution,
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
+    sampling: SamplingPattern,
     gt: GeoTransform,
     chunk_stride: u32,
     active_map: IntMap<u64, H3Accumulator>,
@@ -200,6 +203,7 @@ impl ScanHorizonStreamer {
             resolution,
             nodata,
             bbox,
+            sampling: config.sampling.clone(),
             gt,
             chunk_stride,
             active_map: IntMap::default(),
@@ -260,40 +264,52 @@ impl ScanHorizonStreamer {
             0.0
         };
 
-        // 3. Row-by-row processing with hoisted latitude and scanline run-skipping
+        // 3. Row-by-row processing
         for r in 0..chunk.height {
             let row_idx = (chunk.row_offset + r) as usize;
             let slice_row_start = (r * self.chunk_stride) as usize;
             let mut row_cache = SpatialCoherenceCache::default();
 
-            let mut run_cell: u64 = 0;
-            let mut run_acc = H3Accumulator::default();
+            if self.sampling.is_single_point() {
+                // Fast-path: Single-point center sampling with scanline run-skipping
+                let mut run_cell: u64 = 0;
+                let mut run_acc = H3Accumulator::default();
 
-            // Hoist latitude and starting longitude for the entire row
-            let (x_start, y_row) = self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
+                let (x_start, y_row) = self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
 
-            let (mut lon_curr, lat_row) = if is_wgs84 {
-                (x_start, y_row)
-            } else if is_web_mercator {
-                let lat = (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
-                let lon = (x_start / WGS84_A) * RAD_TO_DEG;
-                (lon, lat)
-            } else {
-                match self.crs_transformer.transform_point(x_start, y_row) {
-                    Ok(coords) => coords,
-                    Err(_) => (x_start, y_row),
-                }
-            };
-
-            let mut c = 0;
-            while c < chunk.width as usize {
-                let (lon, lat) = if is_wgs84 || is_web_mercator {
-                    (lon_curr, lat_row)
+                let (mut lon_curr, lat_row) = if is_wgs84 {
+                    (x_start, y_row)
+                } else if is_web_mercator {
+                    let lat = (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
+                    let lon = (x_start / WGS84_A) * RAD_TO_DEG;
+                    (lon, lat)
                 } else {
-                    let (x, y) = self.gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
-                    match self.crs_transformer.transform_point(x, y) {
+                    match self.crs_transformer.transform_point(x_start, y_row) {
                         Ok(coords) => coords,
-                        Err(_) => {
+                        Err(_) => (x_start, y_row),
+                    }
+                };
+
+                let mut c = 0;
+                while c < chunk.width as usize {
+                    let (lon, lat) = if is_wgs84 || is_web_mercator {
+                        (lon_curr, lat_row)
+                    } else {
+                        let (x, y) = self.gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
+                        match self.crs_transformer.transform_point(x, y) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                c += 1;
+                                if is_wgs84 || is_web_mercator {
+                                    lon_curr += d_lon_step;
+                                }
+                                continue;
+                            }
+                        }
+                    };
+
+                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
+                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
                             c += 1;
                             if is_wgs84 || is_web_mercator {
                                 lon_curr += d_lon_step;
@@ -301,98 +317,157 @@ impl ScanHorizonStreamer {
                             continue;
                         }
                     }
-                };
 
-                // Filter point against bounding box if specified
-                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
-                    if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                    if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, self.resolution) {
+                        if cell_u64 != run_cell {
+                            if run_cell != 0 && run_acc.count > 0.0 {
+                                self.active_map
+                                    .entry(run_cell)
+                                    .and_modify(|acc| acc.merge(&run_acc))
+                                    .or_insert_with(|| {
+                                        let south_lat = compute_cell_south_lat(run_cell);
+                                        self.eviction_queue.push(HexEvictionEntry {
+                                            south_lat,
+                                            cell_u64: run_cell,
+                                        });
+                                        run_acc
+                                    });
+                            }
+                            run_cell = cell_u64;
+                            run_acc = H3Accumulator::default();
+                        }
+
+                        let safe_span = if is_wgs84 || is_web_mercator {
+                            row_cache.safe_span_length(lon_curr, d_lon_step)
+                        } else {
+                            1
+                        };
+
+                        let span_end = (c + safe_span).min(chunk.width as usize);
+
+                        for i in c..span_end {
+                            let val_raw = slice[slice_row_start + i];
+
+                            if let Some(nd_nat) = native_nodata {
+                                if nd_nat == val_raw {
+                                    continue;
+                                }
+                            }
+
+                            let val = to_f64(val_raw);
+                            if !val.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = self.nodata {
+                                if (val - nd).abs() < 1e-6 {
+                                    continue;
+                                }
+                            }
+
+                            run_acc.update(val);
+                        }
+
+                        let num_stepped = span_end - c;
+                        if is_wgs84 || is_web_mercator {
+                            lon_curr += (num_stepped as f64) * d_lon_step;
+                        }
+                        c = span_end;
+                    } else {
                         c += 1;
                         if is_wgs84 || is_web_mercator {
                             lon_curr += d_lon_step;
                         }
-                        continue;
                     }
                 }
 
-                // Resolve H3 cell
-                if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, self.resolution) {
-                    if cell_u64 != run_cell {
-                        // Flush previous run to active_map (only on cell boundary)
-                        if run_cell != 0 && run_acc.count > 0 {
-                            self.active_map
-                                .entry(run_cell)
-                                .and_modify(|acc| acc.merge(&run_acc))
-                                .or_insert_with(|| {
-                                    let south_lat = compute_cell_south_lat(run_cell);
-                                    self.eviction_queue.push(HexEvictionEntry {
-                                        south_lat,
-                                        cell_u64: run_cell,
-                                    });
-                                    run_acc
-                                });
-                        }
-                        run_cell = cell_u64;
-                        run_acc = H3Accumulator::default();
-                    }
+                if run_cell != 0 && run_acc.count > 0.0 {
+                    self.active_map
+                        .entry(run_cell)
+                        .and_modify(|acc| acc.merge(&run_acc))
+                        .or_insert_with(|| {
+                            let south_lat = compute_cell_south_lat(run_cell);
+                            self.eviction_queue.push(HexEvictionEntry {
+                                south_lat,
+                                cell_u64: run_cell,
+                            });
+                            run_acc
+                        });
+                }
+            } else {
+                // Multi-point sub-pixel super-sampling
+                for c in 0..chunk.width as usize {
+                    let val_raw = slice[slice_row_start + c];
 
-                    // Compute safe span length guaranteed to remain in this cell
-                    let safe_span = if is_wgs84 || is_web_mercator {
-                        row_cache.safe_span_length(lon_curr, d_lon_step)
-                    } else {
-                        1
-                    };
-
-                    let span_end = (c + safe_span).min(chunk.width as usize);
-
-                    // Tight slice vector loop (auto-vectorizes with AVX2 / ARM NEON)
-                    for i in c..span_end {
-                        let val_raw = slice[slice_row_start + i];
-
-                        if let Some(nd_nat) = native_nodata {
-                            if nd_nat == val_raw {
-                                continue;
-                            }
-                        }
-
-                        let val = to_f64(val_raw);
-                        if !val.is_finite() {
+                    if let Some(nd_nat) = native_nodata {
+                        if nd_nat == val_raw {
                             continue;
                         }
-                        if let Some(nd) = self.nodata {
-                            if (val - nd).abs() < 1e-6 {
-                                continue;
+                    }
+
+                    let val = to_f64(val_raw);
+                    if !val.is_finite() {
+                        continue;
+                    }
+                    if let Some(nd) = self.nodata {
+                        if (val - nd).abs() < 1e-6 {
+                            continue;
+                        }
+                    }
+
+                    let col_px = (chunk.col_offset as usize) + c;
+                    let (center_x, center_y) = self.gt.pixel_center_to_coord(col_px, row_idx);
+                    let (center_lon, center_lat) = match self.crs_transformer.transform_point(center_x, center_y) {
+                        Ok(coords) => coords,
+                        Err(_) => continue,
+                    };
+
+                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
+                        if center_lon < b_min_lon || center_lon > b_max_lon || center_lat < b_min_lat || center_lat > b_max_lat {
+                            continue;
+                        }
+                    }
+
+                    if row_cache.contains(center_lat, center_lon) {
+                        // Fast-path: 100% of sub-points fall strictly inside cached hexagon
+                        let cell_u64 = row_cache.cell_u64;
+                        self.active_map
+                            .entry(cell_u64)
+                            .and_modify(|acc| acc.update_weighted(val, 1.0))
+                            .or_insert_with(|| {
+                                let south_lat = compute_cell_south_lat(cell_u64);
+                                self.eviction_queue.push(HexEvictionEntry {
+                                    south_lat,
+                                    cell_u64,
+                                });
+                                H3Accumulator::new_weighted(val, 1.0)
+                            });
+                    } else {
+                        // Boundary zone: evaluate each sub-pixel offset
+                        for pt in &self.sampling.points {
+                            let (px, py) = self.gt.pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
+                            if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py) {
+                                if let Ok(lat_lng) = LatLng::new(lat_i, lon_i) {
+                                    let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
+                                    self.active_map
+                                        .entry(cell_u64)
+                                        .and_modify(|acc| acc.update_weighted(val, pt.weight))
+                                        .or_insert_with(|| {
+                                            let south_lat = compute_cell_south_lat(cell_u64);
+                                            self.eviction_queue.push(HexEvictionEntry {
+                                                south_lat,
+                                                cell_u64,
+                                            });
+                                            H3Accumulator::new_weighted(val, pt.weight)
+                                        });
+                                }
                             }
                         }
 
-                        run_acc.update(val);
-                    }
-
-                    let num_stepped = span_end - c;
-                    if is_wgs84 || is_web_mercator {
-                        lon_curr += (num_stepped as f64) * d_lon_step;
-                    }
-                    c = span_end;
-                } else {
-                    c += 1;
-                    if is_wgs84 || is_web_mercator {
-                        lon_curr += d_lon_step;
+                        if let Ok(center_ll) = LatLng::new(center_lat, center_lon) {
+                            row_cache.update(center_ll.to_cell(self.resolution));
+                        }
                     }
                 }
-            }
-
-            // Flush remaining run at end of row
-            if run_cell != 0 && run_acc.count > 0 {
-                self.active_map
-                    .entry(run_cell)
-                    .and_modify(|acc| acc.merge(&run_acc))
-                    .or_insert_with(|| {
-                        let south_lat = compute_cell_south_lat(run_cell);
-                        self.eviction_queue.push(HexEvictionEntry {
-                            south_lat,
-                            cell_u64: run_cell,
-                        });
-                        run_acc
-                    });
             }
         }
     }

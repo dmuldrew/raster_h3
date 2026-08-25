@@ -47,7 +47,21 @@ SELECT
 -- 6. Query Plan & Cardinality Estimation
 EXPLAIN SELECT count(*) FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8);
 
--- 7. Export H3 Aggregations Directly to Parquet
+-- 7. Anti-Aliased Sub-Pixel Super-Sampling (Rotated Grid Super-Sampling RGSS)
+SELECT
+    h3_hex,
+    round(mean, 2) AS mean_elev,
+    round(count, 2) AS weighted_pixel_count,
+    min,
+    max
+FROM h3_raster_aggregate(
+    '/data/sample_sf.tif',
+    resolution := 9,
+    sampling := 'rgss'  -- Presets: 'center', 'rgss', 'hex', 'gaussian', '5point', '8rooks', '9point', '16point'
+)
+LIMIT 10;
+
+-- 8. Export H3 Aggregations Directly to Parquet
 COPY (
     SELECT
         h3_index,
@@ -58,8 +72,10 @@ COPY (
         max,
         h3_to_lat(h3_index) AS centroid_lat,
         h3_to_lng(h3_index) AS centroid_lng
-    FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8)
+    FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8, sampling := 'rgss')
 ) TO '/data/sf_elevation_h3.parquet' (FORMAT PARQUET);
+
+
 
 
 

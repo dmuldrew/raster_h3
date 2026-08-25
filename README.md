@@ -7,12 +7,13 @@ A fast, native DuckDB loadable extension written in Rust to aggregate geospatial
 ## Key Features
 
 - **Pure Rust Engine**: Built with [`h3o`](https://crates.io/crates/h3o) and [`proj4rs`](https://crates.io/crates/proj4rs) for high performance with zero external C/C++ dependencies.
+- **Anti-Aliased Sub-Pixel Multi-Sampling**: Evaluates 5-point quincunx or 9-point $3 \times 3$ sub-pixel offsets (`sampling := '5point'`) with fractional weights for exact area-proportional boundary aggregation.
 - **Parallel Multi-Threaded DuckDB Scans**: Uses `init_local` so DuckDB's execution engine streams raster chunks across all CPU worker threads concurrently.
 - **Scanline Run-Skipping (SIMD Vectorization)**: Calculates safe in-cell pixel spans and accumulates them in flat slice vector loops (processing 8–16 pixels per CPU cycle).
 - **Branchless Hardware Floating-Point Reductions**: Uses `minsd`/`maxsd` (x86_64) and `fminnm`/`fmaxnm` (ARM64) to eliminate branch mispredictions.
 - **Zero-Allocation Fast Hex Formatting**: Stack-allocated 16-byte LUT conversion that eliminates all heap allocations in the DuckDB output vector loop.
 - **Spatial Bounding Box (ROI) Chunk Pruning**: Skips non-intersecting chunks from disk upfront when `min_lon, min_lat, max_lon, max_lat` are specified.
-- **Zero-Copy Memory-Mapped I/O (`memmap2`)**: Direct kernel-to-user memory mapping eliminating `read()` syscalls and user buffer copies.
+- **DuckDB Query Planner Cardinality Estimation**: Registers exact theoretical hexagon counts with DuckDB's optimizer for optimal join order planning.
 - **Row-Constant Latitude Hoisting**: Hoists transcendental projection math (`atan`, `exp`) once per row, eliminating 99.8% of coordinate projection math on Web Mercator and projected rasters.
 - **1-Cycle Identity Hasher (`nohash-hasher`)**: Direct bitwise bucket indexing for 64-bit H3 integer cell keys.
 - **Native Typed NoData Filtering**: Evaluates integer NoData using 1-cycle integer `CMP` instructions, bypassing floating-point conversions on masked pixels.
@@ -83,23 +84,24 @@ SELECT
 FROM h3_raster_aggregate('elevation.tif', resolution := 8);
 ```
 
-### 3. Advanced Parameters (CRS, NoData, ROI Bounding Box)
+### 3. Advanced Parameters (CRS, NoData, ROI Bounding Box, Sub-Pixel Sampling)
 ```sql
 SELECT
     h3_hex,
     mean,
-    count
+    round(count, 2) AS weighted_count
 FROM h3_raster_aggregate(
     'global_elevation.tif',
     resolution := 9,
     source_crs := 'EPSG:4326',  -- Override raster CRS
     nodata := -9999.0,          -- Override NoData pixel value
+    sampling := '5point',       -- Anti-aliased sub-pixel sampling ('5point', '9point', 'center')
     min_lon := -122.50,         -- Region of Interest (ROI) bounding box
     min_lat := 37.70,           -- Prunes non-intersecting chunks upfront
     max_lon := -122.35,
     max_lat := 37.85
 )
-ORDER BY count DESC;
+ORDER BY weighted_count DESC;
 ```
 
 ### 4. Helper Scalar Functions
@@ -115,14 +117,47 @@ SELECT
 FROM h3_raster_aggregate('temperature.tif', 7);
 ```
 
-### 5. Spatial Joins & Parquet Export
+### 5. Sub-Pixel Super-Sampling Guide
+
+When a raster pixel lies across the boundary between two or more H3 hexagons, single-point center sampling assigns 100% of the pixel's value to whichever cell contains the center point. 
+
+With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta y_i)$ are evaluated within each pixel's unit box $[0, 1] \times [0, 1]$ with fractional weights:
+
+```
++-------------------------------------------------------------------------------+
+| RGSS (4-Point Rotated)         Hexagonal Lattice (7-Point)    Gaussian (5-Pt) |
+| +-------------------+          +-------------------+          +-------------+ |
+| |     • (0.375,0.125)|         |       •     •     |          |      •      | |
+| |           • (0.875,0.375)    |    •     •     •  |          |   •  •(50%)•| |
+| | • (0.125,0.625)   |          |       •     •     |          |      •      | |
+| |         • (0.625,0.875)      +-------------------+          +-------------+ |
+| +-------------------+                                                         |
++-------------------------------------------------------------------------------+
+```
+
+#### Sampling Preset Reference Table
+
+| Preset Name | Points | Weighting | Geometric Rationale | Why & When to Use |
+| :--- | :---: | :--- | :--- | :--- |
+| **`'center'`** *(default)* | 1 | $1.0$ (Center) | Centroid evaluation | **Maximum speed**: Best when raster pixels are much smaller than H3 cells (e.g. 10m Sentinel vs Res 7 cells). |
+| **`'rgss'`** / `'rotated4'` ⭐ | 4 | $0.25$ each | $26.6^\circ$ rotated grid ($\arctan 0.5$) | **Best overall balance**: No two points share the same X or Y axis, eliminating collinear boundary blind spots with only 4 samples. |
+| **`'hex'`** / `'7point'` | 7 | $\frac{1}{7}$ each | Inscribed regular hexagon | **H3 Geometry Alignment**: Matches the natural hexagonal symmetry of H3 cell edges with zero directional bias. |
+| **`'gaussian'`** / `'psf'` | 5 | Center $0.50$, Edges $0.125$ | Gaussian Point Spread Function | **Optical Sensor Emulation**: Emulates real-world satellite sensor response where the pixel center is more sensitive than the corners. |
+| **`'5point'`** / `'quincunx'` | 5 | $0.20$ each | Center + 4 diagonal corners | **Classic Area Weighting**: Standard 5-point super-sampling. |
+| **`'8rooks'`** / `'stratified8'`| 8 | $\frac{1}{8}$ each | Latin Hypercube non-attacking rooks | **Diagonal Anti-Aliasing**: Eliminates sample clumping along diagonal hexagon edges. |
+| **`'9point'`** / `'3x3'` | 9 | $\frac{1}{9}$ each | Regular $3 \times 3$ grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
+| **`'16point'`** / `'4x4'` | 16 | $\frac{1}{16}$ each | Regular $4 \times 4$ grid | **Coarse $\rightarrow$ Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
+
+---
+
+### 6. Spatial Joins & Parquet Export
 ```sql
 -- Direct 64-bit integer join with vector data
 SELECT
     r.h3_hex,
     r.mean AS avg_elevation,
     p.population
-FROM h3_raster_aggregate('elevation.tif', 8) r
+FROM h3_raster_aggregate('elevation.tif', 8, sampling := 'rgss') r
 JOIN population_table p ON r.h3_index = p.h3_index;
 
 -- Export raster aggregation directly to Parquet
@@ -134,7 +169,7 @@ COPY (
         count,
         h3_to_lat(h3_index) AS centroid_lat,
         h3_to_lng(h3_index) AS centroid_lng
-    FROM h3_raster_aggregate('elevation.tif', resolution := 8)
+    FROM h3_raster_aggregate('elevation.tif', resolution := 8, sampling := 'rgss')
 ) TO 'elevation_h3.parquet' (FORMAT PARQUET);
 ```
 

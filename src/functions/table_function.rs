@@ -2,6 +2,7 @@ use std::ffi::{c_char, c_void, CString};
 use std::sync::Mutex;
 
 use crate::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
+use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
 use crate::functions::fast_hex::fast_hex_u64;
@@ -15,6 +16,7 @@ pub struct RasterH3BindData {
     pub nodata: Option<f64>,
     pub chunk_size: u32,
     pub bbox: Option<[f64; 4]>,
+    pub sampling: SamplingPattern,
 }
 
 /// Global scan state wrapping ScanHorizonStreamer in a thread-safe mutex
@@ -114,6 +116,17 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Named parameter: sampling ('center', '5point', 'quincunx', '9point', '3x3')
+    let mut sampling = SamplingPattern::default();
+    let name_sampling = to_c_string("sampling");
+    let named_sampling_val = duckdb_bind_get_named_parameter(info, name_sampling.as_ptr());
+    if !named_sampling_val.is_null() {
+        let sampling_ptr = duckdb_get_varchar(named_sampling_val);
+        if let Some(s) = from_duckdb_string(sampling_ptr) {
+            sampling = SamplingPattern::parse(&s);
+        }
+    }
+
     // Named parameters for bounding box filtering
     let name_min_lon = to_c_string("min_lon");
     let named_min_lon_val = duckdb_bind_get_named_parameter(info, name_min_lon.as_ptr());
@@ -162,12 +175,9 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let type_double = duckdb_create_logical_type(DuckDBType::Double);
     duckdb_bind_add_result_column(info, col_mean.as_ptr(), type_double);
 
-    // 3: count UBIGINT
+    // 3: count DOUBLE (Weighted pixel count)
     let col_cnt = to_c_string("count");
-    let type_ubigint2 = duckdb_create_logical_type(DuckDBType::UBigInt);
-    duckdb_bind_add_result_column(info, col_cnt.as_ptr(), type_ubigint2);
-    let mut type_ubigint2_mut = type_ubigint2;
-    duckdb_destroy_logical_type(&mut type_ubigint2_mut);
+    duckdb_bind_add_result_column(info, col_cnt.as_ptr(), type_double);
 
     // 4: min DOUBLE
     let col_min = to_c_string("min");
@@ -222,6 +232,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         nodata,
         chunk_size,
         bbox,
+        sampling,
     });
 
     duckdb_bind_set_bind_data(
@@ -256,6 +267,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         custom_crs: bind_data.source_crs.clone(),
         custom_nodata: bind_data.nodata,
         bbox: bind_data.bbox,
+        sampling: bind_data.sampling.clone(),
     };
 
     let streamer = match ScanHorizonStreamer::new(reader, &config) {
@@ -325,7 +337,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 
     let p_h3 = duckdb_vector_get_data(v_h3) as *mut u64;
     let p_mean = duckdb_vector_get_data(v_mean) as *mut f64;
-    let p_cnt = duckdb_vector_get_data(v_cnt) as *mut u64;
+    let p_cnt = duckdb_vector_get_data(v_cnt) as *mut f64;
     let p_min = duckdb_vector_get_data(v_min) as *mut f64;
     let p_max = duckdb_vector_get_data(v_max) as *mut f64;
     let p_sum = duckdb_vector_get_data(v_sum) as *mut f64;
@@ -385,6 +397,10 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
     // chunk_size (BIGINT)
     let name_chunk = to_c_string("chunk_size");
     duckdb_table_function_add_named_parameter(tf, name_chunk.as_ptr(), type_bigint);
+
+    // sampling (VARCHAR)
+    let name_sampling = to_c_string("sampling");
+    duckdb_table_function_add_named_parameter(tf, name_sampling.as_ptr(), type_varchar);
 
     // Bounding box named parameters: min_lon, min_lat, max_lon, max_lat
     let name_min_lon = to_c_string("min_lon");
