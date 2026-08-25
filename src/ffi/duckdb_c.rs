@@ -93,6 +93,10 @@ extern "C" {
         table_function: duckdb_table_function,
         function: duckdb_table_function_t,
     );
+    pub fn duckdb_table_function_set_projection_pushdown(
+        table_function: duckdb_table_function,
+        pushdown: bool,
+    );
     pub fn duckdb_register_table_function(
         con: duckdb_connection,
         table_function: duckdb_table_function,

@@ -17,6 +17,7 @@ pub struct RasterH3BindData {
     pub chunk_size: u32,
     pub bbox: Option<[f64; 4]>,
     pub sampling: SamplingPattern,
+    pub band: u32,
 }
 
 /// Global scan state wrapping ScanHorizonStreamer in a thread-safe mutex
@@ -116,7 +117,18 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
-    // Named parameter: sampling ('center', '5point', 'quincunx', '9point', '3x3')
+    // Named parameter: band (1-indexed, default 1)
+    let mut band: u32 = 1;
+    let name_band = to_c_string("band");
+    let named_band_val = duckdb_bind_get_named_parameter(info, name_band.as_ptr());
+    if !named_band_val.is_null() {
+        let b = duckdb_get_int64(named_band_val);
+        if b > 0 {
+            band = b as u32;
+        }
+    }
+
+    // Named parameter: sampling
     let mut sampling = SamplingPattern::default();
     let name_sampling = to_c_string("sampling");
     let named_sampling_val = duckdb_bind_get_named_parameter(info, name_sampling.as_ptr());
@@ -175,19 +187,23 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let type_double = duckdb_create_logical_type(DuckDBType::Double);
     duckdb_bind_add_result_column(info, col_mean.as_ptr(), type_double);
 
-    // 3: count DOUBLE (Weighted pixel count)
+    // 3: stddev DOUBLE (Welford's online sample standard deviation)
+    let col_stddev = to_c_string("stddev");
+    duckdb_bind_add_result_column(info, col_stddev.as_ptr(), type_double);
+
+    // 4: count DOUBLE (Weighted pixel count)
     let col_cnt = to_c_string("count");
     duckdb_bind_add_result_column(info, col_cnt.as_ptr(), type_double);
 
-    // 4: min DOUBLE
+    // 5: min DOUBLE
     let col_min = to_c_string("min");
     duckdb_bind_add_result_column(info, col_min.as_ptr(), type_double);
 
-    // 5: max DOUBLE
+    // 6: max DOUBLE
     let col_max = to_c_string("max");
     duckdb_bind_add_result_column(info, col_max.as_ptr(), type_double);
 
-    // 6: sum DOUBLE
+    // 7: sum DOUBLE
     let col_sum = to_c_string("sum");
     duckdb_bind_add_result_column(info, col_sum.as_ptr(), type_double);
     let mut type_double_mut = type_double;
@@ -233,6 +249,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         chunk_size,
         bbox,
         sampling,
+        band,
     });
 
     duckdb_bind_set_bind_data(
@@ -330,13 +347,15 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let v_h3 = duckdb_data_chunk_get_vector(output, 0);
     let v_hex = duckdb_data_chunk_get_vector(output, 1);
     let v_mean = duckdb_data_chunk_get_vector(output, 2);
-    let v_cnt = duckdb_data_chunk_get_vector(output, 3);
-    let v_min = duckdb_data_chunk_get_vector(output, 4);
-    let v_max = duckdb_data_chunk_get_vector(output, 5);
-    let v_sum = duckdb_data_chunk_get_vector(output, 6);
+    let v_stddev = duckdb_data_chunk_get_vector(output, 3);
+    let v_cnt = duckdb_data_chunk_get_vector(output, 4);
+    let v_min = duckdb_data_chunk_get_vector(output, 5);
+    let v_max = duckdb_data_chunk_get_vector(output, 6);
+    let v_sum = duckdb_data_chunk_get_vector(output, 7);
 
     let p_h3 = duckdb_vector_get_data(v_h3) as *mut u64;
     let p_mean = duckdb_vector_get_data(v_mean) as *mut f64;
+    let p_stddev = duckdb_vector_get_data(v_stddev) as *mut f64;
     let p_cnt = duckdb_vector_get_data(v_cnt) as *mut f64;
     let p_min = duckdb_vector_get_data(v_min) as *mut f64;
     let p_max = duckdb_vector_get_data(v_max) as *mut f64;
@@ -359,6 +378,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         );
 
         *p_mean.add(i) = acc.mean();
+        *p_stddev.add(i) = acc.stddev();
         *p_cnt.add(i) = acc.count;
         *p_min.add(i) = acc.min;
         *p_max.add(i) = acc.max;
@@ -398,6 +418,10 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
     let name_chunk = to_c_string("chunk_size");
     duckdb_table_function_add_named_parameter(tf, name_chunk.as_ptr(), type_bigint);
 
+    // band (BIGINT)
+    let name_band = to_c_string("band");
+    duckdb_table_function_add_named_parameter(tf, name_band.as_ptr(), type_bigint);
+
     // sampling (VARCHAR)
     let name_sampling = to_c_string("sampling");
     duckdb_table_function_add_named_parameter(tf, name_sampling.as_ptr(), type_varchar);
@@ -413,11 +437,12 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
     duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double);
     duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double);
 
-    // Set callbacks including parallel init_local
+    // Set callbacks including parallel init_local and projection pushdown
     duckdb_table_function_set_bind(tf, raster_h3_bind);
     duckdb_table_function_set_init(tf, raster_h3_init);
     duckdb_table_function_set_init_local(tf, raster_h3_init_local);
     duckdb_table_function_set_function(tf, raster_h3_scan);
+    duckdb_table_function_set_projection_pushdown(tf, true);
 
     let state = duckdb_register_table_function(con, tf);
 

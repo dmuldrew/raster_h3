@@ -297,6 +297,7 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `resolution` | `BIGINT` | `8` | Named alternative for H3 grid resolution level ($0 \le R \le 15$). |
+| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate from multi-spectral imagery. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
@@ -312,6 +313,7 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 | `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index (fast for joins). |
 | `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation (e.g. `'8828308281fffff'`). |
 | `mean` | `DOUBLE` | Arithmetic mean of pixel values in the cell. |
+| `stddev` | `DOUBLE` | Single-pass Welford sample standard deviation of pixel values. |
 | `count` | `DOUBLE` | Weighted count of pixels contributing to the cell. |
 | `min` | `DOUBLE` | Minimum pixel value observed within the cell. |
 | `max` | `DOUBLE` | Maximum pixel value observed within the cell. |

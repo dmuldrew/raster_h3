@@ -67,6 +67,8 @@ impl GeoTiffStreamReader {
         let path_buf = path.as_ref().to_path_buf();
         let file = File::open(&path_buf)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         let mmap_arc = Arc::new(mmap);
 
         let cursor = Cursor::new(&mmap_arc[..]);

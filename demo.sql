@@ -2,14 +2,15 @@
 -- 1. Load the compiled extension
 LOAD '/extensions/libraster_h3.so';
 
--- 2. Preview aggregated H3 cells from GeoTIFF at H3 Resolution 8
+-- 2. Preview aggregated H3 cells from GeoTIFF at H3 Resolution 8 with StdDev
 SELECT
     h3_hex,
     round(mean, 2) AS avg_elevation_m,
+    round(stddev, 2) AS elevation_stddev_m,
     count AS pixel_count,
     round(min, 2) AS min_elevation,
     round(max, 2) AS max_elevation
-FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8)
+FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8, band := 1)
 ORDER BY pixel_count DESC
 LIMIT 10;
 

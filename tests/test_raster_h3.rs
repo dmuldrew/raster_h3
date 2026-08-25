@@ -73,6 +73,8 @@ fn test_accumulator_operations() {
     assert_eq!(acc1.mean(), 30.0);
     assert_eq!(acc1.min, 10.0);
     assert_eq!(acc1.max, 50.0);
+    assert_eq!(acc1.variance(), 250.0);
+    assert!((acc1.stddev() - 250.0f64.sqrt()).abs() < 1e-9);
 
     // Test weighted updates
     let mut acc_w = H3Accumulator::new_weighted(100.0, 0.4);

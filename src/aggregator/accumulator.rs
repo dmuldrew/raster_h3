@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// High-performance cache-aligned pixel accumulator for H3 cell statistics (32 bytes = 1/2 L1 cache line)
+/// High-performance pixel accumulator for H3 cell statistics with single-pass Welford online variance
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct H3Accumulator {
@@ -8,6 +8,7 @@ pub struct H3Accumulator {
     pub count: f64,
     pub min: f64,
     pub max: f64,
+    pub m2: f64, // Sum of squared deviations from mean (Welford's algorithm)
 }
 
 impl Default for H3Accumulator {
@@ -18,6 +19,7 @@ impl Default for H3Accumulator {
             count: 0.0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
+            m2: 0.0,
         }
     }
 }
@@ -31,6 +33,7 @@ impl H3Accumulator {
             count: 1.0,
             min: val,
             max: val,
+            m2: 0.0,
         }
     }
 
@@ -42,6 +45,7 @@ impl H3Accumulator {
             count: weight,
             min: val,
             max: val,
+            m2: 0.0,
         }
     }
 
@@ -51,16 +55,31 @@ impl H3Accumulator {
         self.update_weighted(val, 1.0);
     }
 
-    /// Branchless update of running statistics with a sub-pixel weighted value
+    /// Branchless update of running statistics with single-pass Welford online variance
     #[inline(always)]
     pub fn update_weighted(&mut self, val: f64, weight: f64) {
+        if weight <= 0.0 {
+            return;
+        }
+        if self.count == 0.0 {
+            self.sum = val * weight;
+            self.count = weight;
+            self.min = val;
+            self.max = val;
+            self.m2 = 0.0;
+            return;
+        }
+
+        let old_mean = self.sum / self.count;
         self.sum += val * weight;
         self.count += weight;
+        let new_mean = self.sum / self.count;
+        self.m2 += weight * (val - old_mean) * (val - new_mean);
         self.min = self.min.min(val);
         self.max = self.max.max(val);
     }
 
-    /// Branchless merge of another accumulator into this one
+    /// Branchless merge of another accumulator using parallel Chan-Golub-LeVeque combine formula
     #[inline(always)]
     pub fn merge(&mut self, other: &Self) {
         if other.count == 0.0 {
@@ -70,8 +89,16 @@ impl H3Accumulator {
             *self = *other;
             return;
         }
+
+        let n1 = self.count;
+        let n2 = other.count;
+        let mean1 = self.sum / n1;
+        let mean2 = other.sum / n2;
+        let delta = mean2 - mean1;
+
         self.sum += other.sum;
         self.count += other.count;
+        self.m2 += other.m2 + delta * delta * (n1 * n2 / (n1 + n2));
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
     }
@@ -83,6 +110,29 @@ impl H3Accumulator {
             self.sum / self.count
         } else {
             f64::NAN
+        }
+    }
+
+    /// Calculate sample variance
+    #[inline(always)]
+    pub fn variance(&self) -> f64 {
+        if self.count > 1.0 {
+            self.m2 / (self.count - 1.0)
+        } else if self.count > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Calculate sample standard deviation
+    #[inline(always)]
+    pub fn stddev(&self) -> f64 {
+        let var = self.variance();
+        if var.is_nan() {
+            f64::NAN
+        } else {
+            var.max(0.0).sqrt()
         }
     }
 }
