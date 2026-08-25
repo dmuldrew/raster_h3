@@ -82,6 +82,21 @@ fn test_fast_hex_formatting() {
     let hex_slice = fast_hex_u64(cell_u64, &mut buf);
     let hex_str = std::str::from_utf8(hex_slice).unwrap();
     assert_eq!(hex_str, format!("{:x}", cell_u64));
+
+    // Test bidirectional parsing
+    let parsed = raster_h3::functions::parse_hex_u64(hex_str).unwrap();
+    assert_eq!(parsed, cell_u64);
+}
+
+#[test]
+fn test_bitshift_resolution() {
+    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
+    let cell_u64: u64 = cell.into();
+
+    let res_bitshift = (cell_u64 >> 52) & 0x0F;
+    assert_eq!(res_bitshift, 8);
+    assert_eq!(u8::from(cell.resolution()), res_bitshift as u8);
 }
 
 #[test]

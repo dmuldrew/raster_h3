@@ -19,6 +19,27 @@ pub fn fast_hex_u64(mut val: u64, buf: &mut [u8; 16]) -> &[u8] {
     &buf[idx..16]
 }
 
+/// Parse a hexadecimal ASCII string into a u64 with zero heap allocations.
+#[inline(always)]
+pub fn parse_hex_u64(s: &str) -> Option<u64> {
+    let bytes = s.trim().as_bytes();
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+
+    let mut val: u64 = 0;
+    for &b in bytes {
+        let nibble = match b {
+            b'0'..=b'9' => (b - b'0') as u64,
+            b'a'..=b'f' => (b - b'a' + 10) as u64,
+            b'A'..=b'F' => (b - b'A' + 10) as u64,
+            _ => return None,
+        };
+        val = (val << 4) | nibble;
+    }
+    Some(val)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +60,19 @@ mod tests {
         let max_slice = fast_hex_u64(u64::MAX, &mut buf);
         let s_max = std::str::from_utf8(max_slice).unwrap();
         assert_eq!(s_max, "ffffffffffffffff");
+    }
+
+    #[test]
+    fn test_parse_hex_u64() {
+        let val = 0x8828308281fffffu64;
+        let s = "8828308281fffff";
+        assert_eq!(parse_hex_u64(s), Some(val));
+
+        let s_upper = "8828308281FFFFF";
+        assert_eq!(parse_hex_u64(s_upper), Some(val));
+
+        assert_eq!(parse_hex_u64("0"), Some(0));
+        assert_eq!(parse_hex_u64("ffffffffffffffff"), Some(u64::MAX));
+        assert_eq!(parse_hex_u64("invalid_hex"), None);
     }
 }

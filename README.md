@@ -107,6 +107,7 @@ ORDER BY count DESC;
 -- Convert integer H3 cell to string, lat, lng, or resolution
 SELECT
     h3_to_string(h3_index) AS h3_str,
+    string_to_h3('8828308281fffff') AS h3_int,
     h3_to_lat(h3_index) AS center_lat,
     h3_to_lng(h3_index) AS center_lng,
     h3_get_resolution(h3_index) AS res,

@@ -38,3 +38,10 @@ FROM h3_raster_aggregate(
     max_lat := 37.79
 );
 
+-- 5. Bidirectional Hex String to H3 Integer Conversion
+SELECT
+    string_to_h3('8828308281fffff') AS h3_int,
+    h3_to_string(string_to_h3('8828308281fffff')) AS roundtrip_hex,
+    h3_get_resolution(string_to_h3('8828308281fffff')) AS res;
+
+
