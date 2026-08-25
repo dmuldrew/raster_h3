@@ -10,6 +10,7 @@ use raster_h3::aggregator::{
     H3Accumulator, ScanHorizonStreamer, SpatialCoherenceCache,
 };
 use raster_h3::crs::CrsTransformer;
+use raster_h3::functions::fast_hex_u64;
 use raster_h3::raster::{GeoTiffStreamReader, GeoTransform, PrefetchedChunkReader};
 
 #[test]
@@ -72,6 +73,15 @@ fn test_accumulator_operations() {
     assert_eq!(acc1.mean(), 30.0);
     assert_eq!(acc1.min, 10.0);
     assert_eq!(acc1.max, 50.0);
+}
+
+#[test]
+fn test_fast_hex_formatting() {
+    let mut buf = [0u8; 16];
+    let cell_u64 = 0x8828308281fffffu64;
+    let hex_slice = fast_hex_u64(cell_u64, &mut buf);
+    let hex_str = std::str::from_utf8(hex_slice).unwrap();
+    assert_eq!(hex_str, format!("{:x}", cell_u64));
 }
 
 #[test]
@@ -154,6 +164,7 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
         resolution: 9,
         custom_crs: None,
         custom_nodata: None,
+        bbox: None,
     };
 
     let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
@@ -176,6 +187,59 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
         assert_eq!(acc.min, 75.0);
         assert_eq!(acc.max, 75.0);
     }
+}
+
+#[test]
+fn test_bounding_box_pruning() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    // 100x100 raster from lon [-122.5, -122.4], lat [37.7, 37.8]
+    let width = 100;
+    let height = 100;
+    let data = vec![50.0f32; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [
+            1, 1, 0, 2,
+            1024, 0, 1, 2,
+            2048, 0, 1, 4326,
+        ];
+        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+
+    // Query only a small sub-rectangle: lon [-122.48, -122.46], lat [37.72, 37.74]
+    let config = AggregationConfig {
+        resolution: 9,
+        custom_crs: None,
+        custom_nodata: None,
+        bbox: Some([-122.48, 37.72, -122.46, 37.74]),
+    };
+
+    let result = aggregate_raster_stream(&reader, &config).unwrap();
+    let filtered_pixels: u64 = result.values().map(|acc| acc.count).sum();
+
+    // Should only cover the sub-rectangle (approx 20x20 = 400 pixels out of 10,000)
+    assert!(filtered_pixels > 0);
+    assert!(filtered_pixels < 10000);
 }
 
 #[test]
@@ -218,6 +282,7 @@ fn test_web_mercator_hoisted_streaming() {
         resolution: 8,
         custom_crs: Some("EPSG:3857".to_string()),
         custom_nodata: None,
+        bbox: None,
     };
 
     let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();

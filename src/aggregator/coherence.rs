@@ -33,6 +33,25 @@ impl SpatialCoherenceCache {
             && lon <= self.max_lon
     }
 
+    /// Calculate the number of consecutive pixels along the scanline guaranteed to remain in this cell
+    #[inline(always)]
+    pub fn safe_span_length(&self, lon: f64, d_lon_step: f64) -> usize {
+        if self.cell_u64 == 0 || d_lon_step == 0.0 {
+            return 1;
+        }
+        if d_lon_step > 0.0 {
+            if self.max_lon > lon {
+                (((self.max_lon - lon) / d_lon_step).floor() as usize).max(1)
+            } else {
+                1
+            }
+        } else if self.min_lon < lon {
+            (((self.min_lon - lon) / d_lon_step).floor() as usize).max(1)
+        } else {
+            1
+        }
+    }
+
     /// Update the cache with a newly resolved H3 cell and calculate its safe inner bounds
     pub fn update(&mut self, cell_index: CellIndex) {
         self.cell_u64 = cell_index.into();
@@ -105,5 +124,18 @@ mod tests {
         // A large step (5 km ~ 0.05 deg) should recompute a new cell
         let cell2 = cache.get_or_compute(lat0 + 0.05, lon0 + 0.05, res).unwrap();
         assert_ne!(cell0, cell2);
+    }
+
+    #[test]
+    fn test_safe_span_length() {
+        let mut cache = SpatialCoherenceCache::default();
+        let res = Resolution::Eight;
+
+        let lat0 = 37.7749;
+        let lon0 = -122.4194;
+
+        cache.get_or_compute(lat0, lon0, res).unwrap();
+        let span = cache.safe_span_length(lon0, 0.00001);
+        assert!(span > 1);
     }
 }

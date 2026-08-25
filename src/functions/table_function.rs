@@ -1,23 +1,30 @@
-use std::ffi::c_void;
-use std::os::raw::c_char;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ffi::{c_char, c_void, CString};
+use std::sync::Mutex;
 
-use crate::aggregator::{aggregate_raster_stream, AggregationConfig, H3Accumulator};
-use crate::ffi::*;
-use crate::raster::GeoTiffStreamReader;
+use crate::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
+use crate::ffi::duckdb_c::*;
+use crate::ffi::{from_duckdb_string, to_c_string};
+use crate::functions::fast_hex::fast_hex_u64;
+use crate::raster::geotiff::GeoTiffStreamReader;
 
-/// Bind state passed between bind -> init
+/// User-data bound during table function query compilation
 pub struct RasterH3BindData {
     pub file_path: String,
     pub resolution: u8,
-    pub chunk_size: u32,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
+    pub chunk_size: u32,
+    pub bbox: Option<[f64; 4]>,
 }
 
-/// Execution state across scan batches using Southernmost Scan-Line Horizon Eviction
-pub struct RasterH3InitData {
-    pub streamer: std::sync::Mutex<crate::aggregator::ScanHorizonStreamer>,
+/// Global scan state wrapping ScanHorizonStreamer in a thread-safe mutex
+pub struct RasterH3GlobalData {
+    pub streamer: Mutex<ScanHorizonStreamer>,
+}
+
+/// Thread-local state for parallel DuckDB execution threads
+pub struct RasterH3LocalData {
+    pub thread_id: usize,
 }
 
 unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
@@ -26,36 +33,42 @@ unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn delete_init_data(data: *mut c_void) {
+unsafe extern "C" fn delete_global_data(data: *mut c_void) {
     if !data.is_null() {
-        drop(Box::from_raw(data as *mut RasterH3InitData));
+        drop(Box::from_raw(data as *mut RasterH3GlobalData));
     }
 }
 
-/// Bind callback: parses arguments and registers result columns
+unsafe extern "C" fn delete_local_data(data: *mut c_void) {
+    if !data.is_null() {
+        drop(Box::from_raw(data as *mut RasterH3LocalData));
+    }
+}
+
+/// Bind callback: parses input arguments, defines output columns, and returns bind data
 pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let param_count = duckdb_bind_get_parameter_count(info);
-    if param_count == 0 {
-        let err = to_c_string("h3_raster_aggregate requires at least 1 parameter: file_path");
-        duckdb_bind_set_error(info, err.as_ptr());
+    if param_count < 1 {
+        let err_msg = to_c_string("h3_raster_aggregate requires at least 1 argument: file_path");
+        duckdb_bind_set_error(info, err_msg.as_ptr());
         return;
     }
 
     // Param 0: file_path (VARCHAR)
-    let file_val = duckdb_bind_get_parameter(info, 0);
-    let file_ptr = duckdb_get_varchar(file_val);
-    let file_path = match from_duckdb_string(file_ptr) {
+    let path_val = duckdb_bind_get_parameter(info, 0);
+    let path_str_ptr = duckdb_get_varchar(path_val);
+    let file_path = match from_duckdb_string(path_str_ptr) {
         Some(s) => s,
         None => {
-            let err = to_c_string("Invalid file_path parameter");
-            duckdb_bind_set_error(info, err.as_ptr());
+            let err_msg = to_c_string("Invalid file_path parameter");
+            duckdb_bind_set_error(info, err_msg.as_ptr());
             return;
         }
     };
 
-    // Param 1: resolution (optional positional)
+    // Param 1 (optional positional): resolution (BIGINT)
     let mut resolution: u8 = 8;
-    if param_count > 1 {
+    if param_count >= 2 {
         let res_val = duckdb_bind_get_parameter(info, 1);
         let res_int = duckdb_get_int64(res_val);
         if (0..=15).contains(&res_int) {
@@ -101,6 +114,34 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Named parameters for bounding box filtering
+    let name_min_lon = to_c_string("min_lon");
+    let named_min_lon_val = duckdb_bind_get_named_parameter(info, name_min_lon.as_ptr());
+
+    let name_min_lat = to_c_string("min_lat");
+    let named_min_lat_val = duckdb_bind_get_named_parameter(info, name_min_lat.as_ptr());
+
+    let name_max_lon = to_c_string("max_lon");
+    let named_max_lon_val = duckdb_bind_get_named_parameter(info, name_max_lon.as_ptr());
+
+    let name_max_lat = to_c_string("max_lat");
+    let named_max_lat_val = duckdb_bind_get_named_parameter(info, name_max_lat.as_ptr());
+
+    let bbox = if !named_min_lon_val.is_null()
+        && !named_min_lat_val.is_null()
+        && !named_max_lon_val.is_null()
+        && !named_max_lat_val.is_null()
+    {
+        Some([
+            duckdb_get_double(named_min_lon_val),
+            duckdb_get_double(named_min_lat_val),
+            duckdb_get_double(named_max_lon_val),
+            duckdb_get_double(named_max_lat_val),
+        ])
+    } else {
+        None
+    };
+
     // Add Output Columns:
     // 0: h3_index UBIGINT
     let col_h3 = to_c_string("h3_index");
@@ -139,16 +180,16 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     // 6: sum DOUBLE
     let col_sum = to_c_string("sum");
     duckdb_bind_add_result_column(info, col_sum.as_ptr(), type_double);
-
     let mut type_double_mut = type_double;
     duckdb_destroy_logical_type(&mut type_double_mut);
 
     let bind_data = Box::new(RasterH3BindData {
         file_path,
         resolution,
-        chunk_size,
         source_crs,
         nodata,
+        chunk_size,
+        bbox,
     });
 
     duckdb_bind_set_bind_data(
@@ -158,22 +199,22 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     );
 }
 
-/// Init callback: instantiates ScanHorizonStreamer for on-demand streaming scan
+/// Global init callback: opens GeoTIFF stream reader and initializes shared ScanHorizonStreamer
 pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     let bind_data_ptr = duckdb_init_get_bind_data(info) as *const RasterH3BindData;
     if bind_data_ptr.is_null() {
-        let err = to_c_string("Missing bind data in raster_h3_init");
-        duckdb_init_set_error(info, err.as_ptr());
+        let err_msg = to_c_string("Missing bind data in init");
+        duckdb_init_set_error(info, err_msg.as_ptr());
         return;
     }
     let bind_data = &*bind_data_ptr;
 
-    // Open GeoTIFF Header and metadata stream
     let reader = match GeoTiffStreamReader::open(&bind_data.file_path) {
         Ok(r) => r,
         Err(e) => {
-            let err = to_c_string(&format!("Failed to open raster '{}': {}", bind_data.file_path, e));
-            duckdb_init_set_error(info, err.as_ptr());
+            let err_msg = CString::new(format!("Failed to open GeoTIFF: {}", e))
+                .unwrap_or_else(|_| CString::new("Failed to open GeoTIFF").unwrap());
+            duckdb_init_set_error(info, err_msg.as_ptr());
             return;
         }
     };
@@ -182,43 +223,57 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         resolution: bind_data.resolution,
         custom_crs: bind_data.source_crs.clone(),
         custom_nodata: bind_data.nodata,
+        bbox: bind_data.bbox,
     };
 
-    let streamer = match crate::aggregator::ScanHorizonStreamer::new(reader, &config) {
+    let streamer = match ScanHorizonStreamer::new(reader, &config) {
         Ok(s) => s,
         Err(e) => {
-            let err = to_c_string(&format!("Failed to initialize stream: {}", e));
-            duckdb_init_set_error(info, err.as_ptr());
+            let err_msg = CString::new(format!("Failed to initialize streaming aggregator: {}", e))
+                .unwrap_or_else(|_| CString::new("Failed to init streamer").unwrap());
+            duckdb_init_set_error(info, err_msg.as_ptr());
             return;
         }
     };
 
-    let init_data = Box::new(RasterH3InitData {
-        streamer: std::sync::Mutex::new(streamer),
+    let global_data = Box::new(RasterH3GlobalData {
+        streamer: Mutex::new(streamer),
     });
 
     duckdb_init_set_init_data(
         info,
-        Box::into_raw(init_data) as *mut c_void,
-        Some(delete_init_data),
+        Box::into_raw(global_data) as *mut c_void,
+        Some(delete_global_data),
+    );
+}
+
+/// Thread-local init callback for multi-threaded parallel DuckDB execution
+pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
+    let local_data = Box::new(RasterH3LocalData { thread_id: 0 });
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(local_data) as *mut c_void,
+        Some(delete_local_data),
     );
 }
 
 /// Scan callback: streams up to 2048 records per invocation directly from ScanHorizonStreamer
 pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
-    let init_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3InitData;
-    if init_data_ptr.is_null() {
+    let global_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3GlobalData;
+    if global_data_ptr.is_null() {
         duckdb_data_chunk_set_size(output, 0);
         return;
     }
-    let init_data = &*init_data_ptr;
+    let global_data = &*global_data_ptr;
 
-    let mut streamer = match init_data.streamer.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let batch = {
+        let mut streamer = match global_data.streamer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        streamer.fetch_next_batch(2048)
     };
 
-    let batch = streamer.fetch_next_batch(2048);
     let batch_size = batch.len();
 
     if batch_size == 0 {
@@ -243,18 +298,20 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let p_max = duckdb_vector_get_data(v_max) as *mut f64;
     let p_sum = duckdb_vector_get_data(v_sum) as *mut f64;
 
+    let mut hex_buf = [0u8; 16];
+
     for (i, (cell_u64, acc)) in batch.iter().enumerate() {
         let row_idx = i as u64;
 
         *p_h3.add(i) = *cell_u64;
 
-        // Write hexadecimal string
-        let hex_str = format!("{:x}", cell_u64);
+        // Zero-allocation hexadecimal string formatting
+        let hex_slice = fast_hex_u64(*cell_u64, &mut hex_buf);
         duckdb_vector_assign_string_element_len(
             v_hex,
             row_idx,
-            hex_str.as_ptr() as *const c_char,
-            hex_str.len() as idx_t,
+            hex_slice.as_ptr() as *const c_char,
+            hex_slice.len() as idx_t,
         );
 
         *p_mean.add(i) = acc.mean();
@@ -264,16 +321,17 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         *p_sum.add(i) = acc.sum;
     }
 
-    duckdb_data_chunk_set_size(output, batch_size as u64);
+    duckdb_data_chunk_set_size(output, batch_size as idx_t);
 }
 
-/// Register `h3_raster_aggregate` table function with DuckDB
-pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), String> {
+/// Register `h3_raster_aggregate` table function in DuckDB connection
+pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Result<(), String> {
+    let fn_name = to_c_string("h3_raster_aggregate");
     let tf = duckdb_create_table_function();
-    let name = to_c_string("h3_raster_aggregate");
-    duckdb_table_function_set_name(tf, name.as_ptr());
+    duckdb_table_function_set_name(tf, fn_name.as_ptr());
 
-    // Parameter 0: file_path (VARCHAR)
+    // Positional Parameters:
+    // 0: file_path (VARCHAR)
     let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
     duckdb_table_function_add_parameter(tf, type_varchar);
 
@@ -296,9 +354,21 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), Stri
     let name_chunk = to_c_string("chunk_size");
     duckdb_table_function_add_named_parameter(tf, name_chunk.as_ptr(), type_bigint);
 
-    // Set callbacks
+    // Bounding box named parameters: min_lon, min_lat, max_lon, max_lat
+    let name_min_lon = to_c_string("min_lon");
+    duckdb_table_function_add_named_parameter(tf, name_min_lon.as_ptr(), type_double);
+
+    let name_min_lat = to_c_string("min_lat");
+    let name_max_lon = to_c_string("max_lon");
+    let name_max_lat = to_c_string("max_lat");
+    duckdb_table_function_add_named_parameter(tf, name_min_lat.as_ptr(), type_double);
+    duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double);
+    duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double);
+
+    // Set callbacks including parallel init_local
     duckdb_table_function_set_bind(tf, raster_h3_bind);
     duckdb_table_function_set_init(tf, raster_h3_init);
+    duckdb_table_function_set_init_local(tf, raster_h3_init_local);
     duckdb_table_function_set_function(tf, raster_h3_scan);
 
     let state = duckdb_register_table_function(con, tf);

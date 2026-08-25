@@ -23,3 +23,18 @@ SELECT
     count
 FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 9)
 LIMIT 5;
+
+-- 4. Fast Region of Interest (ROI) bounding box pruning
+SELECT
+    h3_hex,
+    round(mean, 2) AS mean_val,
+    count AS pixels
+FROM h3_raster_aggregate(
+    '/data/sample_sf.tif',
+    resolution := 9,
+    min_lon := -122.45,
+    min_lat := 37.75,
+    max_lon := -122.40,
+    max_lat := 37.79
+);
+

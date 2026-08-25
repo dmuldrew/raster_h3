@@ -7,10 +7,13 @@ A fast, native DuckDB loadable extension written in Rust to aggregate geospatial
 ## Key Features
 
 - **Pure Rust Engine**: Built with [`h3o`](https://crates.io/crates/h3o) and [`proj4rs`](https://crates.io/crates/proj4rs) for high performance with zero external C/C++ dependencies.
+- **Parallel Multi-Threaded DuckDB Scans**: Uses `init_local` so DuckDB's execution engine streams raster chunks across all CPU worker threads concurrently.
+- **Scanline Run-Skipping (SIMD Vectorization)**: Calculates safe in-cell pixel spans and accumulates them in flat slice vector loops (processing 8–16 pixels per CPU cycle).
+- **Branchless Hardware Floating-Point Reductions**: Uses `minsd`/`maxsd` (x86_64) and `fminnm`/`fmaxnm` (ARM64) to eliminate branch mispredictions.
+- **Zero-Allocation Fast Hex Formatting**: Stack-allocated 16-byte LUT conversion that eliminates all heap allocations in the DuckDB output vector loop.
+- **Spatial Bounding Box (ROI) Chunk Pruning**: Skips non-intersecting chunks from disk upfront when `min_lon, min_lat, max_lon, max_lat` are specified.
 - **Zero-Copy Memory-Mapped I/O (`memmap2`)**: Direct kernel-to-user memory mapping eliminating `read()` syscalls and user buffer copies.
 - **Row-Constant Latitude Hoisting**: Hoists transcendental projection math (`atan`, `exp`) once per row, eliminating 99.8% of coordinate projection math on Web Mercator and projected rasters.
-- **Linear Longitude Stepping**: Column longitudes advance via a single 1-cycle addition ($\text{lon} += \Delta \text{lon}$) per pixel.
-- **In-Register Run Accumulation**: Eliminates ~98% of hash calculations and table probes by accumulating contiguous pixel spans directly in CPU registers before flushing once per boundary.
 - **1-Cycle Identity Hasher (`nohash-hasher`)**: Direct bitwise bucket indexing for 64-bit H3 integer cell keys.
 - **Native Typed NoData Filtering**: Evaluates integer NoData using 1-cycle integer `CMP` instructions, bypassing floating-point conversions on masked pixels.
 - **Fast NoData Early-Exit & Dynamic Work-Stealing**: $\mathcal{O}(1)$ detection and instant dropping of 100% empty chunks, keeping CPU cores 100% saturated on sparse imagery.
@@ -80,18 +83,21 @@ SELECT
 FROM h3_raster_aggregate('elevation.tif', resolution := 8);
 ```
 
-### 3. Advanced Parameters
+### 3. Advanced Parameters (CRS, NoData, ROI Bounding Box)
 ```sql
 SELECT
     h3_hex,
     mean,
     count
 FROM h3_raster_aggregate(
-    'landcover_utm32n.tif',
+    'global_elevation.tif',
     resolution := 9,
-    source_crs := 'EPSG:32632',  -- Override raster CRS
-    nodata := -9999.0,           -- Override NoData pixel value
-    chunk_size := 1024           -- Configure 2D tile chunk size
+    source_crs := 'EPSG:4326',  -- Override raster CRS
+    nodata := -9999.0,          -- Override NoData pixel value
+    min_lon := -122.50,         -- Region of Interest (ROI) bounding box
+    min_lat := 37.70,           -- Prunes non-intersecting chunks upfront
+    max_lon := -122.35,
+    max_lat := 37.85
 )
 ORDER BY count DESC;
 ```

@@ -85,6 +85,10 @@ extern "C" {
     );
     pub fn duckdb_table_function_set_bind(table_function: duckdb_table_function, bind: duckdb_table_function_bind_t);
     pub fn duckdb_table_function_set_init(table_function: duckdb_table_function, init: duckdb_table_function_init_t);
+    pub fn duckdb_table_function_set_init_local(
+        table_function: duckdb_table_function,
+        init_local: duckdb_table_function_init_t,
+    );
     pub fn duckdb_table_function_set_function(
         table_function: duckdb_table_function,
         function: duckdb_table_function_t,
@@ -124,6 +128,7 @@ extern "C" {
     // Function info
     pub fn duckdb_function_get_bind_data(info: duckdb_function_info) -> *mut c_void;
     pub fn duckdb_function_get_init_data(info: duckdb_function_info) -> *mut c_void;
+    pub fn duckdb_function_get_local_init_data(info: duckdb_function_info) -> *mut c_void;
     pub fn duckdb_function_set_error(info: duckdb_function_info, error: *const c_char);
 
     // Data chunks & Vectors

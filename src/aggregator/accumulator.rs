@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// High-performance cache-aligned pixel accumulator for H3 cell statistics
+/// High-performance cache-aligned pixel accumulator for H3 cell statistics (32 bytes = 1/2 L1 cache line)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct H3Accumulator {
@@ -34,20 +34,16 @@ impl H3Accumulator {
         }
     }
 
-    /// Update running statistics with a new pixel value
+    /// Branchless update of running statistics with a new pixel value (compiles to x86 minsd/maxsd)
     #[inline(always)]
     pub fn update(&mut self, val: f64) {
         self.sum += val;
         self.count += 1;
-        if val < self.min {
-            self.min = val;
-        }
-        if val > self.max {
-            self.max = val;
-        }
+        self.min = self.min.min(val);
+        self.max = self.max.max(val);
     }
 
-    /// Merge another accumulator into this one (for parallel tree reduction)
+    /// Branchless merge of another accumulator into this one
     #[inline(always)]
     pub fn merge(&mut self, other: &Self) {
         if other.count == 0 {
@@ -59,12 +55,8 @@ impl H3Accumulator {
         }
         self.sum += other.sum;
         self.count += other.count;
-        if other.min < self.min {
-            self.min = other.min;
-        }
-        if other.max > self.max {
-            self.max = other.max;
-        }
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
     }
 
     /// Calculate arithmetic mean

@@ -91,6 +91,7 @@ pub struct AggregationConfig {
     pub resolution: u8,
     pub custom_crs: Option<String>,
     pub custom_nodata: Option<f64>,
+    pub bbox: Option<[f64; 4]>, // [min_lon, min_lat, max_lon, max_lat]
 }
 
 impl Default for AggregationConfig {
@@ -99,8 +100,47 @@ impl Default for AggregationConfig {
             resolution: 8,
             custom_crs: None,
             custom_nodata: None,
+            bbox: None,
         }
     }
+}
+
+/// Check if a 2D chunk intersects the given [min_lon, min_lat, max_lon, max_lat] bounding box
+pub fn chunk_intersects_bbox(
+    chunk: &RasterChunk,
+    gt: &GeoTransform,
+    transformer: &CrsTransformer,
+    bbox: &[f64; 4],
+) -> bool {
+    let [b_min_lon, b_min_lat, b_max_lon, b_max_lat] = *bbox;
+
+    let corners = [
+        (chunk.col_offset as usize, chunk.row_offset as usize),
+        ((chunk.col_offset + chunk.width) as usize, chunk.row_offset as usize),
+        (chunk.col_offset as usize, (chunk.row_offset + chunk.height) as usize),
+        ((chunk.col_offset + chunk.width) as usize, (chunk.row_offset + chunk.height) as usize),
+    ];
+
+    let mut c_min_lon = f64::INFINITY;
+    let mut c_max_lon = f64::NEG_INFINITY;
+    let mut c_min_lat = f64::INFINITY;
+    let mut c_max_lat = f64::NEG_INFINITY;
+
+    for (c, r) in corners {
+        let (x, y) = gt.pixel_to_coord(c as f64, r as f64);
+        if let Ok((lon, lat)) = transformer.transform_point(x, y) {
+            if lon < c_min_lon { c_min_lon = lon; }
+            if lon > c_max_lon { c_max_lon = lon; }
+            if lat < c_min_lat { c_min_lat = lat; }
+            if lat > c_max_lat { c_max_lat = lat; }
+        }
+    }
+
+    if !c_min_lon.is_finite() {
+        return true;
+    }
+
+    c_min_lon <= b_max_lon && c_max_lon >= b_min_lon && c_min_lat <= b_max_lat && c_max_lat >= b_min_lat
 }
 
 /// Streaming aggregator using Southernmost Scan-Line Horizon Eviction,
@@ -110,6 +150,7 @@ pub struct ScanHorizonStreamer {
     crs_transformer: CrsTransformer,
     resolution: Resolution,
     nodata: Option<f64>,
+    bbox: Option<[f64; 4]>,
     gt: GeoTransform,
     chunk_stride: u32,
     active_map: IntMap<u64, H3Accumulator>,
@@ -119,7 +160,7 @@ pub struct ScanHorizonStreamer {
 }
 
 impl ScanHorizonStreamer {
-    /// Initialize a new ScanHorizonStreamer with background async prefetching
+    /// Initialize a new ScanHorizonStreamer with background async prefetching and bbox pruning
     pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {
         let resolution = Resolution::try_from(config.resolution)
             .map_err(|_| RasterH3Error::InvalidParameter(format!("Invalid H3 resolution: {}", config.resolution)))?;
@@ -130,11 +171,27 @@ impl ScanHorizonStreamer {
         )?;
 
         let nodata = config.custom_nodata.or(reader.metadata.nodata);
+        let bbox = config.bbox;
         let gt = reader.metadata.geotransform;
         let chunk_stride = reader.chunk_layout.chunk_width;
         let total_chunks = reader.chunk_layout.total_chunks;
 
-        let chunk_indices: Vec<u32> = (0..total_chunks).collect();
+        // Prune chunks upfront against bounding box if specified
+        let chunk_indices: Vec<u32> = (0..total_chunks)
+            .filter(|&idx| {
+                if let Some(ref b) = bbox {
+                    let chunk_bounds = reader.chunk_layout.get_chunk_bounds(
+                        idx,
+                        reader.metadata.width,
+                        reader.metadata.height,
+                    );
+                    chunk_intersects_bbox(&chunk_bounds, &gt, &crs_transformer, b)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 2);
 
         Ok(Self {
@@ -142,6 +199,7 @@ impl ScanHorizonStreamer {
             crs_transformer,
             resolution,
             nodata,
+            bbox,
             gt,
             chunk_stride,
             active_map: IntMap::default(),
@@ -202,7 +260,7 @@ impl ScanHorizonStreamer {
             0.0
         };
 
-        // 3. Row-by-row processing with hoisted latitude and linear longitude stepping
+        // 3. Row-by-row processing with hoisted latitude and scanline run-skipping
         for r in 0..chunk.height {
             let row_idx = (chunk.row_offset + r) as usize;
             let slice_row_start = (r * self.chunk_stride) as usize;
@@ -227,61 +285,40 @@ impl ScanHorizonStreamer {
                 }
             };
 
-            for c in 0..chunk.width {
-                let val_raw = slice[slice_row_start + c as usize];
-
-                // Native integer / typed NoData check
-                if let Some(nd_nat) = native_nodata {
-                    if nd_nat == val_raw {
-                        if is_wgs84 || is_web_mercator {
-                            lon_curr += d_lon_step;
-                        }
-                        continue;
-                    }
-                }
-
-                let val = to_f64(val_raw);
-                if !val.is_finite() {
-                    if is_wgs84 || is_web_mercator {
-                        lon_curr += d_lon_step;
-                    }
-                    continue;
-                }
-                if let Some(nd) = self.nodata {
-                    if (val - nd).abs() < 1e-6 {
-                        if is_wgs84 || is_web_mercator {
-                            lon_curr += d_lon_step;
-                        }
-                        continue;
-                    }
-                }
-
-                // If general Proj4, reproject point; otherwise use hoisted lat & linear lon
+            let mut c = 0;
+            while c < chunk.width as usize {
                 let (lon, lat) = if is_wgs84 || is_web_mercator {
                     (lon_curr, lat_row)
                 } else {
-                    let (x, y) = self.gt.pixel_center_to_coord((chunk.col_offset + c) as usize, row_idx);
+                    let (x, y) = self.gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
                     match self.crs_transformer.transform_point(x, y) {
                         Ok(coords) => coords,
                         Err(_) => {
+                            c += 1;
+                            if is_wgs84 || is_web_mercator {
+                                lon_curr += d_lon_step;
+                            }
                             continue;
                         }
                     }
                 };
 
-                // Advance linear longitude
-                if is_wgs84 || is_web_mercator {
-                    lon_curr += d_lon_step;
+                // Filter point against bounding box if specified
+                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
+                    if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                        c += 1;
+                        if is_wgs84 || is_web_mercator {
+                            lon_curr += d_lon_step;
+                        }
+                        continue;
+                    }
                 }
 
-                // Use spatial coherence cache to resolve H3 cell
+                // Resolve H3 cell
                 if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, self.resolution) {
-                    if cell_u64 == run_cell {
-                        // ZERO HASH & ZERO LOOKUP: In-register accumulator update
-                        run_acc.update(val);
-                    } else {
+                    if cell_u64 != run_cell {
                         // Flush previous run to active_map (only on cell boundary)
-                        if run_cell != 0 {
+                        if run_cell != 0 && run_acc.count > 0 {
                             self.active_map
                                 .entry(run_cell)
                                 .and_modify(|acc| acc.merge(&run_acc))
@@ -295,13 +332,56 @@ impl ScanHorizonStreamer {
                                 });
                         }
                         run_cell = cell_u64;
-                        run_acc = H3Accumulator::new(val);
+                        run_acc = H3Accumulator::default();
+                    }
+
+                    // Compute safe span length guaranteed to remain in this cell
+                    let safe_span = if is_wgs84 || is_web_mercator {
+                        row_cache.safe_span_length(lon_curr, d_lon_step)
+                    } else {
+                        1
+                    };
+
+                    let span_end = (c + safe_span).min(chunk.width as usize);
+
+                    // Tight slice vector loop (auto-vectorizes with AVX2 / ARM NEON)
+                    for i in c..span_end {
+                        let val_raw = slice[slice_row_start + i];
+
+                        if let Some(nd_nat) = native_nodata {
+                            if nd_nat == val_raw {
+                                continue;
+                            }
+                        }
+
+                        let val = to_f64(val_raw);
+                        if !val.is_finite() {
+                            continue;
+                        }
+                        if let Some(nd) = self.nodata {
+                            if (val - nd).abs() < 1e-6 {
+                                continue;
+                            }
+                        }
+
+                        run_acc.update(val);
+                    }
+
+                    let num_stepped = span_end - c;
+                    if is_wgs84 || is_web_mercator {
+                        lon_curr += (num_stepped as f64) * d_lon_step;
+                    }
+                    c = span_end;
+                } else {
+                    c += 1;
+                    if is_wgs84 || is_web_mercator {
+                        lon_curr += d_lon_step;
                     }
                 }
             }
 
             // Flush remaining run at end of row
-            if run_cell != 0 {
+            if run_cell != 0 && run_acc.count > 0 {
                 self.active_map
                     .entry(run_cell)
                     .and_modify(|acc| acc.merge(&run_acc))
