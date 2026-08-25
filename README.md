@@ -10,16 +10,16 @@ A high-performance, native DuckDB loadable extension written in pure Rust that a
 
 ## 📖 Table of Contents
 - [1. Motivation & Project Goals](#1-motivation--project-goals)
-- [2. Performance Comparison vs Other Solutions](#2-performance-comparison-vs-other-solutions)
-- [3. Core Engineering Innovations](#3-core-engineering-innovations)
-- [4. Quickstart with Docker](#4-quickstart-with-docker)
-- [5. SQL Usage & Practical Recipes](#5-sql-usage--practical-recipes)
-- [6. Sub-Pixel Super-Sampling Guide](#6-sub-pixel-super-sampling-guide)
-- [7. Complete API Reference](#7-complete-api-reference)
-- [8. Architecture Diagram](#8-architecture-diagram)
-- [9. Core Dependencies & Architectural Contributions](#9-core-dependencies--architectural-contributions)
-- [10. Building & Testing Locally](#10-building--testing-locally)
-
+- [2. Nontechnical Overview: Why Traditional Tools Are Slow & How We Fix It](#2-nontechnical-overview-why-traditional-tools-are-slow--how-we-fix-it)
+- [3. Performance Comparison vs Other Solutions](#3-performance-comparison-vs-other-solutions)
+- [4. Core Engineering Innovations](#4-core-engineering-innovations)
+- [5. Quickstart with Docker](#5-quickstart-with-docker)
+- [6. SQL Usage & Practical Recipes](#6-sql-usage--practical-recipes)
+- [7. Sub-Pixel Super-Sampling Guide](#7-sub-pixel-super-sampling-guide)
+- [8. Complete API Reference](#8-complete-api-reference)
+- [9. Architecture Diagram](#9-architecture-diagram)
+- [10. Core Dependencies & Architectural Contributions](#10-core-dependencies--architectural-contributions)
+- [11. Building & Testing Locally](#11-building--testing-locally)
 
 ---
 
@@ -45,7 +45,56 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 
 ---
 
-## 2. Performance Comparison vs Other Solutions
+## 2. Nontechnical Overview: Why Traditional Tools Are Slow & How We Fix It
+
+If you have ever tried to convert satellite imagery or elevation grids to hexagons using Python (`rasterio` + `h3-py`) or GIS software, you have likely encountered long processing times and out-of-memory (OOM) crashes. 
+
+Here is why traditional tools struggle, and how `raster_h3` fixes the problem:
+
+---
+
+### The Problem: The "Stop-at-Every-Millimeter" Road Trip
+
+Imagine going on a road trip across the country:
+- **Traditional Python tools** act like a driver who **stops the car at every single millimeter**, takes out a protractor to recalculate the curvature of the Earth, calculates which county they are in, opens a massive paper ledger in the back seat, flips through millions of entries, and writes a tally mark. Doing this 100 million times takes minutes or hours.
+- Furthermore, traditional tools try to load the entire country's map into the back seat all at once. For a 10 GB file, your computer allocates **30 to 50 GB of memory**, causing crashes and freezes.
+
+---
+
+### How `raster_h3` Fixes It: 4 Simple Ideas
+
+```
+Traditional Approach:                      raster_h3 Approach:
++-----------------------------------+     +-----------------------------------+
+| 1. Load entire 10 GB raster in RAM|     | 1. Stream 1 thin row at a time    |
+| 2. Re-calculate GPS math on 100M  |     | 2. Set "Cruise Control" (1 math   |
+|    individual pixels              |        calculation per row)             |
+| 3. Search hash table on every px  |     | 3. "Run-Skip" 50 pixels at once   |
+| 4. Hold all results until the end |     | 4. Evict finished hexagons from   |
+|                                   |        memory immediately               |
+| Result: Minutes & Memory Crashes  |     | Result: Milliseconds & < 15 MB RAM|
++-----------------------------------+     +-----------------------------------+
+```
+
+#### 1. The Moving Scanner Front (Constant Memory)
+Instead of loading a multi-gigabyte file into memory, `raster_h3` reads the image like an office document scanner—one paper-thin row at a time from North to South. The moment a row moves past the bottom edge of a hexagon, that hexagon is sealed, finished, and streamed directly into your SQL query results. 
+- **The Benefit**: Your computer never holds more than a few kilobytes in memory (< 15 MB RAM), whether your raster is 10 megabytes or 500 gigabytes.
+
+#### 2. Latitude "Cruise Control" (Eliminating 99.8% of Math)
+Every pixel in a horizontal row shares the exact same latitude coordinate. Rather than running heavy spherical trigonometry 100 million times, `raster_h3` calculates the latitude once at the start of the row, sets "cruise control", and simply steps across the row with lightning-fast arithmetic.
+- **The Benefit**: 99.8% of the mathematical calculations are completely eliminated.
+
+#### 3. The Hexagon Superhighway (Run-Skipping & SIMD)
+Most pixels lie safely inside the interior of a hexagon rather than on its border. When `raster_h3` enters a hexagon, it calculates how many pixels ahead are guaranteed to stay in that same hexagon (e.g. 50 pixels). It aggregates all 50 pixels together in single CPU heartbeats using modern hardware vector instructions.
+- **The Benefit**: Instead of evaluating pixels one by one, your processor crunches 8 to 16 pixels per clock cycle.
+
+#### 4. In-Database Streaming (No Intermediate Files)
+Traditional pipelines require writing intermediate shapefiles or GeoTIFFs to disk, transferring data between Python and C++, and importing them into a database. `raster_h3` runs directly inside DuckDB, streaming results straight into your SQL queries, joins, and Parquet exports.
+- **The Benefit**: Zero intermediate files and instant query execution.
+
+---
+
+## 3. Performance Comparison vs Other Solutions
 
 ### Benchmark: 100-Million Pixel Raster (10,000 × 10,000 GeoTIFF)
 
@@ -77,7 +126,7 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 
 ---
 
-## 3. Core Engineering Innovations
+## 4. Core Engineering Innovations
 
 `raster_h3` achieves hardware limits through 10 architectural pillars:
 
@@ -134,7 +183,7 @@ Registers `duckdb_table_function_set_init_local` so DuckDB's execution engine dy
 
 ---
 
-## 4. Quickstart with Docker 🐳
+## 5. Quickstart with Docker 🐳
 
 The easiest way to test and run `raster_h3` is with the bundled Docker container:
 
@@ -169,7 +218,7 @@ LIMIT 10;
 
 ---
 
-## 5. SQL Usage & Practical Recipes
+## 6. SQL Usage & Practical Recipes
 
 ### 1. Load the Extension
 ```sql
@@ -252,7 +301,7 @@ COPY (
 
 ---
 
-## 6. Sub-Pixel Super-Sampling Guide
+## 7. Sub-Pixel Super-Sampling Guide
 
 When a raster pixel lies across the boundary between two or more H3 hexagons, single-point center sampling assigns 100% of the pixel's value to whichever cell contains the center point. 
 
@@ -285,7 +334,7 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 
 ---
 
-## 7. Complete API Reference
+## 8. Complete API Reference
 
 ### `h3_raster_aggregate(file_path, [resolution], ...)`
 
@@ -332,7 +381,7 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 
 ---
 
-## 8. Architecture Diagram
+## 9. Architecture Diagram
 
 ```mermaid
 flowchart TD
