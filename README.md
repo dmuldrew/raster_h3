@@ -370,6 +370,22 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 | `max` | `DOUBLE` | Maximum pixel value observed within the cell. |
 | `sum` | `DOUBLE` | Sum of all weighted pixel values in the cell. |
 
+---
+
+### Aggregation Statistics: Mathematical Definitions & Geospatial Use Cases
+
+`raster_h3` computes all 6 descriptive summary statistics simultaneously in a **single linear pass** using hardware-accelerated accumulators and Welford's online algorithm:
+
+| Statistic | Mathematical Formula | Geospatial Analytics Use Case | Why & When to Use |
+| :--- | :--- | :--- | :--- |
+| **`mean`** | $\bar{x} = \frac{\sum w_i \cdot x_i}{\sum w_i}$ | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health, mean slope. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
+| **`stddev`** | $s = \sqrt{\frac{\sum w_i (x_i - \bar{x}_{\text{old}})(x_i - \bar{x}_{\text{new}})}{\sum w_i - 1}}$ | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep canyons/cliffs; low `stddev` indicates flat plains. |
+| **`count`** | $N = \sum w_i$ | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns the integer count of pixels in the cell. In super-sampling (`rgss`, `hex`), returns fractional area coverage (e.g. `142.75` px). |
+| **`min`** | $\min_i (x_i)$ | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch misprediction penalties. |
+| **`max`** | $\max_i (x_i)$ | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building/canopy height in DSM rasters. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
+| **`sum`** | $\sum w_i \cdot x_i$ | **Cumulative Physical Quantities**: Total precipitation volume ($mm \times \text{area}$), solar radiation flux ($kWh$), biomass carbon stock. | Used whenever the raster pixel represents a density or rate per unit area that must be integrated across the entire hexagon. |
+
+
 #### Scalar Functions
 | Function | Signature | Return Type | Description |
 | :--- | :--- | :--- | :--- |
