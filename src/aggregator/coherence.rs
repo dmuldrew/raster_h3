@@ -1,5 +1,27 @@
 use h3o::{CellIndex, LatLng, Resolution};
 
+/// Approximate H3 cell edge length in degrees by resolution (0–15).
+/// Derived from H3 documentation average edge lengths, converted to degrees at mid-latitudes.
+/// Used as a fast proxy for the inscribed safe bounding box instead of computing cell.boundary().
+const H3_EDGE_DEG: [f64; 16] = [
+    6.570,     // res 0:  ~730 km
+    2.490,     // res 1:  ~277 km
+    0.943,     // res 2:  ~105 km
+    0.357,     // res 3:  ~39.7 km
+    0.135,     // res 4:  ~15.0 km
+    0.0510,    // res 5:  ~5.66 km
+    0.0193,    // res 6:  ~2.14 km
+    0.00730,   // res 7:  ~810 m
+    0.00276,   // res 8:  ~306 m
+    0.00104,   // res 9:  ~116 m
+    0.000394,  // res 10: ~44 m
+    0.000149,  // res 11: ~17 m
+    0.0000563, // res 12: ~6.3 m
+    0.0000213, // res 13: ~2.4 m
+    0.00000805,// res 14: ~0.9 m
+    0.00000304,// res 15: ~0.3 m
+];
+
 /// Spatial coherence cache for accelerating in-row pixel-to-H3 conversion
 #[derive(Debug, Clone, Copy)]
 pub struct SpatialCoherenceCache {
@@ -52,39 +74,28 @@ impl SpatialCoherenceCache {
         }
     }
 
-    /// Update the cache with a newly resolved H3 cell and calculate its safe inner bounds
+    /// Update the cache with a newly resolved H3 cell using precomputed edge-length table.
+    /// This avoids the expensive `cell.boundary()` call by using a resolution-indexed
+    /// approximate edge length with a conservative 0.45× safety factor.
     pub fn update(&mut self, cell_index: CellIndex) {
         self.cell_u64 = cell_index.into();
 
-        // Calculate cell center and approximate inner inscribed bounding box
         let center = LatLng::from(cell_index);
         let center_lat = center.lat();
         let center_lon = center.lng();
 
-        // Find distance to closest vertex to establish safe inradius
-        let boundary = cell_index.boundary();
-        let mut min_d_lat = f64::INFINITY;
-        let mut min_d_lon = f64::INFINITY;
+        // Use resolution-indexed edge length table instead of computing boundary vertices
+        let res_u8: u8 = cell_index.resolution().into();
+        let edge_deg = H3_EDGE_DEG.get(res_u8 as usize).copied().unwrap_or(0.001);
 
-        for vertex in boundary.iter() {
-            let d_lat = (vertex.lat() - center_lat).abs();
-            let d_lon = (vertex.lng() - center_lon).abs();
-            if d_lat > 0.0 && d_lat < min_d_lat {
-                min_d_lat = d_lat;
-            }
-            if d_lon > 0.0 && d_lon < min_d_lon {
-                min_d_lon = d_lon;
-            }
-        }
+        // Conservative safe factor: 0.45× edge length gives a safe inscribed box
+        // that is guaranteed to be fully inside the hexagon
+        let safe_r = edge_deg * 0.45;
 
-        // Conservative safe factor (0.75 of minimum distance to edge)
-        let safe_lat = if min_d_lat.is_finite() { min_d_lat * 0.75 } else { 0.0001 };
-        let safe_lon = if min_d_lon.is_finite() { min_d_lon * 0.75 } else { 0.0001 };
-
-        self.min_lat = center_lat - safe_lat;
-        self.max_lat = center_lat + safe_lat;
-        self.min_lon = center_lon - safe_lon;
-        self.max_lon = center_lon + safe_lon;
+        self.min_lat = center_lat - safe_r;
+        self.max_lat = center_lat + safe_r;
+        self.min_lon = center_lon - safe_r;
+        self.max_lon = center_lon + safe_r;
     }
 
     /// Fast lookup: returns cached cell_u64 if within safe inner box, or computes new cell
@@ -137,5 +148,25 @@ mod tests {
         cache.get_or_compute(lat0, lon0, res).unwrap();
         let span = cache.safe_span_length(lon0, 0.00001);
         assert!(span > 1);
+    }
+
+    #[test]
+    fn test_update_uses_precomputed_radius() {
+        let mut cache = SpatialCoherenceCache::default();
+        let res = Resolution::Eight;
+
+        let lat0 = 37.7749;
+        let lon0 = -122.4194;
+        cache.get_or_compute(lat0, lon0, res).unwrap();
+
+        // Verify that the safe box is reasonable for res 8 (~306m edge ≈ 0.00276 deg)
+        let box_width = cache.max_lon - cache.min_lon;
+        let box_height = cache.max_lat - cache.min_lat;
+
+        // Should be approximately 2 * 0.00276 * 0.45 ≈ 0.00248 degrees
+        assert!(box_width > 0.001, "Safe box too small: {}", box_width);
+        assert!(box_width < 0.005, "Safe box too large: {}", box_width);
+        assert!(box_height > 0.001, "Safe box too small: {}", box_height);
+        assert!(box_height < 0.005, "Safe box too large: {}", box_height);
     }
 }

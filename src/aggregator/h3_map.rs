@@ -208,56 +208,70 @@ pub fn aggregate_raster_stream(
 
     let aggregated_map: H3HashMap = chunk_indices
         .into_par_iter()
-        .map(|chunk_idx| {
-            let mut local_map = H3HashMap::default();
+        .fold(
+            || {
+                // Each Rayon worker thread creates its own persistent decoder + local map
+                let decoder = reader.open_decoder().ok();
+                (H3HashMap::default(), decoder)
+            },
+            |(mut local_map, mut decoder_opt), chunk_idx| {
+                let read_result = if let Some(ref mut decoder) = decoder_opt {
+                    // Fast path: reuse persistent decoder (no header re-parse)
+                    decoder.read_chunk(chunk_idx).ok()
+                } else {
+                    // Fallback: create a fresh decoder per chunk
+                    reader.read_chunk(chunk_idx).ok()
+                };
 
-            if let Ok((chunk_bounds, decoding_result)) = reader.read_chunk(chunk_idx) {
-                match decoding_result {
-                    DecodingResult::U8(slice) => {
-                        let nd = nodata_val.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::U16(slice) => {
-                        let nd = nodata_val.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::U32(slice) => {
-                        let nd = nodata_val.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::U64(slice) => {
-                        let nd = nodata_val.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::I8(slice) => {
-                        let nd = nodata_val.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::I16(slice) => {
-                        let nd = nodata_val.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::I32(slice) => {
-                        let nd = nodata_val.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::I64(slice) => {
-                        let nd = nodata_val.map(|v| v as i64);
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::F32(slice) => {
-                        let nd = nodata_val.map(|v| v as f32);
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
-                    }
-                    DecodingResult::F64(slice) => {
-                        let nd = nodata_val;
-                        aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x, nd);
+                if let Some((chunk_bounds, decoding_result)) = read_result {
+                    match decoding_result {
+                        DecodingResult::U8(slice) => {
+                            let nd = nodata_val.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::U16(slice) => {
+                            let nd = nodata_val.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::U32(slice) => {
+                            let nd = nodata_val.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::U64(slice) => {
+                            let nd = nodata_val.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::I8(slice) => {
+                            let nd = nodata_val.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::I16(slice) => {
+                            let nd = nodata_val.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::I32(slice) => {
+                            let nd = nodata_val.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::I64(slice) => {
+                            let nd = nodata_val.map(|v| v as i64);
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::F32(slice) => {
+                            let nd = nodata_val.map(|v| v as f32);
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x as f64, nd);
+                        }
+                        DecodingResult::F64(slice) => {
+                            let nd = nodata_val;
+                            aggregate_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| x, nd);
+                        }
                     }
                 }
-            }
 
-            local_map
-        })
+                (local_map, decoder_opt)
+            },
+        )
+        .map(|(map, _decoder)| map)
         .reduce(H3HashMap::default, |mut map_a, map_b| {
             if map_a.len() < map_b.len() {
                 let mut merged = map_b;
@@ -281,3 +295,4 @@ pub fn aggregate_raster_stream(
 
     Ok(aggregated_map)
 }
+

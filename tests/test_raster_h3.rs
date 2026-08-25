@@ -159,9 +159,10 @@ fn test_compute_cell_south_lat() {
     let cell = lat_lng.to_cell(h3o::Resolution::Eight);
     let cell_u64: u64 = cell.into();
 
+    // Now returns center lat as a fast proxy (always >= true south vertex lat)
     let south_lat = compute_cell_south_lat(cell_u64);
-    assert!(south_lat < 37.7749);
-    assert!(south_lat > 37.76);
+    assert!(south_lat > 37.76, "Center lat should be near input: {}", south_lat);
+    assert!(south_lat < 37.79, "Center lat should be near input: {}", south_lat);
 }
 
 #[test]
@@ -205,6 +206,7 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
         custom_crs: None,
         custom_nodata: None,
         bbox: None,
+        ..Default::default()
     };
 
     let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
@@ -219,8 +221,8 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
     }
 
     assert!(!all_yielded.is_empty());
-    let total_pixels: u64 = all_yielded.iter().map(|(_, acc)| acc.count).sum();
-    assert_eq!(total_pixels, 10000);
+    let total_pixels: f64 = all_yielded.iter().map(|(_, acc)| acc.count).sum();
+    assert_eq!(total_pixels, 10000.0);
 
     for (_, acc) in &all_yielded {
         assert_eq!(acc.mean(), 75.0);
@@ -272,14 +274,15 @@ fn test_bounding_box_pruning() {
         custom_crs: None,
         custom_nodata: None,
         bbox: Some([-122.48, 37.72, -122.46, 37.74]),
+        ..Default::default()
     };
 
     let result = aggregate_raster_stream(&reader, &config).unwrap();
-    let filtered_pixels: u64 = result.values().map(|acc| acc.count).sum();
+    let filtered_pixels: f64 = result.values().map(|acc| acc.count).sum();
 
     // Should only cover the sub-rectangle (approx 20x20 = 400 pixels out of 10,000)
-    assert!(filtered_pixels > 0);
-    assert!(filtered_pixels < 10000);
+    assert!(filtered_pixels > 0.0);
+    assert!(filtered_pixels < 10000.0);
 }
 
 #[test]
@@ -323,21 +326,22 @@ fn test_web_mercator_hoisted_streaming() {
         custom_crs: Some("EPSG:3857".to_string()),
         custom_nodata: None,
         bbox: None,
+        ..Default::default()
     };
 
     let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
-    let mut total_count: u64 = 0;
+    let mut total_count: f64 = 0.0;
     loop {
         let batch = streamer.fetch_next_batch(64);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for (_, acc) in &batch {
             total_count += acc.count;
             assert_eq!(acc.mean(), 120.0);
         }
     }
-    assert_eq!(total_count, 2500);
+    assert_eq!(total_count, 2500.0);
 }
 
 #[test]

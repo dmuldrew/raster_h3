@@ -2,7 +2,7 @@ pub mod geotiff;
 pub mod geotransform;
 pub mod prefetch;
 
-pub use geotiff::{ChunkLayout, GeoTiffMetadata, GeoTiffStreamReader};
+pub use geotiff::{ChunkDecoder, ChunkLayout, GeoTiffMetadata, GeoTiffStreamReader};
 pub use geotransform::GeoTransform;
 pub use prefetch::PrefetchedChunkReader;
 

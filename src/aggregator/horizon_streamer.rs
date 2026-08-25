@@ -1,10 +1,11 @@
 use std::collections::{BinaryHeap, VecDeque};
-use h3o::{CellIndex, Resolution};
+use h3o::{CellIndex, LatLng, Resolution};
 use nohash_hasher::IntMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::coherence::SpatialCoherenceCache;
+use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
@@ -39,19 +40,12 @@ impl PartialOrd for HexEvictionEntry {
     }
 }
 
-/// Compute the southernmost latitude vertex for an H3 cell
+/// Compute the approximate southernmost latitude for an H3 cell using center lat as a fast proxy.
+/// Center lat is always >= true south vertex lat, making eviction conservatively lazy (safe).
 #[inline(always)]
 pub fn compute_cell_south_lat(cell_u64: u64) -> f64 {
     if let Ok(cell) = CellIndex::try_from(cell_u64) {
-        let boundary = cell.boundary();
-        let mut min_lat = f64::INFINITY;
-        for vertex in boundary.iter() {
-            let lat = vertex.lat();
-            if lat < min_lat {
-                min_lat = lat;
-            }
-        }
-        min_lat
+        h3o::LatLng::from(cell).lat()
     } else {
         f64::NEG_INFINITY
     }
@@ -195,7 +189,7 @@ impl ScanHorizonStreamer {
             })
             .collect();
 
-        let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 2);
+        let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 8);
 
         Ok(Self {
             prefetcher: Some(prefetcher),

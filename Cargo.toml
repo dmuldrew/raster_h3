@@ -13,10 +13,6 @@ crate-type = ["cdylib", "rlib"]
 # Fast pure-Rust H3 indexing library
 h3o = "0.6"
 
-# High-performance hash maps for 64-bit integer keys
-ahash = "0.8"
-fxhash = "0.2"
-
 # Data parallelism across raster chunks
 rayon = "1.10"
 

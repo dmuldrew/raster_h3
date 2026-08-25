@@ -61,6 +61,30 @@ pub struct GeoTiffStreamReader {
     pub chunk_layout: ChunkLayout,
 }
 
+/// Persistent chunk decoder that reuses the TIFF decoder across reads.
+/// This avoids re-parsing IFD headers, tag tables, and strip/tile offset
+/// arrays on every chunk read — the single largest I/O optimization.
+pub struct ChunkDecoder<'a> {
+    decoder: Decoder<Cursor<&'a [u8]>>,
+    chunk_layout: ChunkLayout,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> ChunkDecoder<'a> {
+    /// Read and decode a single chunk using the persistent decoder (no header re-parse)
+    pub fn read_chunk(&mut self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
+        let chunk_bounds = self.chunk_layout.get_chunk_bounds(
+            chunk_index,
+            self.width,
+            self.height,
+        );
+
+        let data = self.decoder.read_chunk(chunk_index)?;
+        Ok((chunk_bounds, data))
+    }
+}
+
 impl GeoTiffStreamReader {
     /// Open and memory-map a GeoTIFF file, decoding only header tags and layout metadata
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -109,7 +133,22 @@ impl GeoTiffStreamReader {
         })
     }
 
-    /// Read and decode a single chunk on-demand directly from memory-mapped pages
+    /// Create a persistent ChunkDecoder that reuses the TIFF decoder for multiple chunk reads.
+    /// The decoder parses the IFD once and then seeks directly to tile data on each read_chunk call.
+    pub fn open_decoder(&self) -> Result<ChunkDecoder<'_>> {
+        let cursor = Cursor::new(&self.mmap[..]);
+        let decoder = Decoder::new(cursor)?;
+
+        Ok(ChunkDecoder {
+            decoder,
+            chunk_layout: self.chunk_layout,
+            width: self.metadata.width,
+            height: self.metadata.height,
+        })
+    }
+
+    /// Read and decode a single chunk on-demand directly from memory-mapped pages.
+    /// NOTE: This creates a fresh decoder per call. For sequential reads, prefer open_decoder().
     pub fn read_chunk(&self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
         let cursor = Cursor::new(&self.mmap[..]);
         let mut decoder = Decoder::new(cursor)?;
