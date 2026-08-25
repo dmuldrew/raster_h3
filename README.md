@@ -17,7 +17,9 @@ A high-performance, native DuckDB loadable extension written in pure Rust that a
 - [6. Sub-Pixel Super-Sampling Guide](#6-sub-pixel-super-sampling-guide)
 - [7. Complete API Reference](#7-complete-api-reference)
 - [8. Architecture Diagram](#8-architecture-diagram)
-- [9. Building & Testing Locally](#9-building--testing-locally)
+- [9. Core Dependencies & Architectural Contributions](#9-core-dependencies--architectural-contributions)
+- [10. Building & Testing Locally](#10-building--testing-locally)
+
 
 ---
 
@@ -384,7 +386,23 @@ flowchart TD
 
 ---
 
-## 9. Building & Testing Locally
+## 9. Core Dependencies & Architectural Contributions
+
+`raster_h3` is built using a carefully curated set of pure-Rust libraries to achieve zero external runtime dependencies and hardware-saturating performance:
+
+| Dependency | Purpose | Architectural Contribution to `raster_h3` |
+| :--- | :--- | :--- |
+| [`h3o`](https://crates.io/crates/h3o) `v0.6` | Pure-Rust H3 Engine | Provides 100% pure-Rust implementation of Uber's H3 Discrete Global Grid System. Replaces the C H3 library, enabling zero-copy boundary extraction, cell indexing, and fast lat/lng conversions without C/C++ toolchain dependencies or FFI boundary overhead. |
+| [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Directly maps GeoTIFF files from disk into userspace virtual memory, completely bypassing `read()` syscalls and intermediate buffer copies. Enables issuing kernel-level `madvise(MADV_SEQUENTIAL)` readahead hints to prefetch disk blocks in 2MB–4MB bursts. |
+| [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression. Decodes individual tiles and strips on-demand directly from memory-mapped slices and frees them immediately, maintaining flat $\mathcal{O}(1)$ memory consumption. |
+| [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Standalone Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 geodetic transformations (UTM, Transverse Mercator, Lambert Conformal Conic $\rightarrow$ WGS84). Replaces the massive multi-gigabyte C++ `libproj` library with a thread-safe, self-contained coordinate transformer. |
+| [`nohash-hasher`](https://crates.io/crates/nohash-hasher) `v0.2` | 1-Cycle Bitwise Identity Hasher | Eliminates CPU hashing overhead for 64-bit integer H3 cell keys. Because H3 indices are already uniformly distributed 64-bit integers, `nohash-hasher` provides direct 1-cycle bitwise bucket indexing, bypassing SipHash/MurmurHash latency entirely. |
+| [`rayon`](https://crates.io/crates/rayon) `v1.10` | Work-Stealing Parallelism | Provides lightweight, lock-free work-stealing data parallelism for concurrent chunk decompression and aggregation across all available CPU cores. |
+| [`thiserror`](https://crates.io/crates/thiserror) & [`serde`](https://crates.io/crates/serde) | Robust Error & Data Handling | Provides ergonomic, zero-overhead typed error propagation across DuckDB C-FFI boundaries without panics. |
+
+---
+
+## 10. Building & Testing Locally
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (Edition 2021+, stable toolchain)
@@ -407,5 +425,6 @@ cargo test
 
 ---
 
-## 10. License
+## 11. License
 This project is licensed under the [MIT License](LICENSE).
+
