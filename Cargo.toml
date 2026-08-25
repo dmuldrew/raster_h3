@@ -1,0 +1,47 @@
+[package]
+name = "raster_h3"
+version = "0.1.0"
+edition = "2021"
+authors = ["raster_h3 contributors"]
+description = "High-performance DuckDB extension in Rust to aggregate raster pixels to H3 hexagonal indices"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Fast pure-Rust H3 indexing library
+h3o = "0.6"
+
+# High-performance hash maps for 64-bit integer keys
+ahash = "0.8"
+fxhash = "0.2"
+
+# Data parallelism across raster chunks
+rayon = "1.10"
+
+# Pure Rust TIFF / GeoTIFF decoder
+tiff = "0.9"
+
+# Pure Rust coordinate reference system transformation
+proj4rs = "0.1"
+
+# Zero-copy memory-mapped file I/O
+memmap2 = "0.9"
+
+# Zero-overhead identity hasher for 64-bit integer keys
+nohash-hasher = "0.2"
+
+# Error handling and utility
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

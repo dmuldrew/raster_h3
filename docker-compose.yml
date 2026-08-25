@@ -1,0 +1,10 @@
+services:
+  raster_h3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raster_h3:latest
+    volumes:
+      - ./data:/data
+    stdin_open: true
+    tty: true
