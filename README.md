@@ -18,11 +18,12 @@ Supports both **continuous** raster surfaces (elevation, temperature, NDVI) and 
 - [5. Quickstart with Docker](#5-quickstart-with-docker)
 - [6. SQL Usage & Practical Recipes](#6-sql-usage--practical-recipes)
 - [7. Sub-Pixel Super-Sampling Guide](#7-sub-pixel-super-sampling-guide)
-- [8. Complete API Reference](#8-complete-api-reference)
-- [9. Architecture Diagram](#9-architecture-diagram)
-- [10. Core Dependencies & Architectural Contributions](#10-core-dependencies--architectural-contributions)
-- [11. Building & Testing Locally](#11-building--testing-locally)
-- [12. License](#12-license)
+- [8. Supported Coordinate Reference Systems](#8-supported-coordinate-reference-systems)
+- [9. Complete API Reference](#9-complete-api-reference)
+- [10. Architecture Diagram](#10-architecture-diagram)
+- [11. Core Dependencies & Architectural Contributions](#11-core-dependencies--architectural-contributions)
+- [12. Building & Testing Locally](#12-building--testing-locally)
+- [13. License](#13-license)
 
 ---
 
@@ -379,7 +380,59 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 
 ---
 
-## 8. Complete API Reference
+## 8. Supported Coordinate Reference Systems
+
+`raster_h3` automatically detects the Coordinate Reference System (CRS) embedded in your GeoTIFF file and reprojects all pixel coordinates to WGS84 (EPSG:4326) for H3 indexing. You can also override the CRS manually via the `source_crs` parameter.
+
+The transformer uses a **three-tier performance hierarchy** — selecting the fastest available path for each projection type:
+
+| Tier | CRS Family | EPSG Codes | Transform Strategy | Per-Pixel Cost |
+| :---: | :--- | :--- | :--- | :--- |
+| 🟢 **Identity** | WGS84 Geographic | `EPSG:4326`, `EPSG:4269` (NAD83) | Zero math — coordinates pass through unchanged | **0 cycles** |
+| 🟡 **Analytical** | Web Mercator | `EPSG:3857`, `EPSG:900913`, `EPSG:3785` | Closed-form inverse Mercator: `lon = x / a`, `lat = 2·atan(exp(y/a)) - π/2` | **~5 cycles** (2 transcendentals) |
+| 🔵 **PROJ4** | All other projections | `EPSG:32601`–`32660` (UTM N), `EPSG:32701`–`32760` (UTM S), and any valid PROJ string | Full `proj4rs` pure-Rust reprojection pipeline | **~50–200 cycles** |
+
+### How CRS Detection Works
+
+1. **GeoTIFF metadata**: The extension reads the `ModelTiepointTag`, `ModelPixelScaleTag`, and `GeoKeyDirectoryTag` from the TIFF header to extract the embedded projection definition.
+2. **EPSG matching**: If an EPSG code is found, the transformer selects the optimal tier (Identity → Analytical → PROJ4).
+3. **PROJ string fallback**: If only a PROJ.4 definition string is present (e.g. Lambert Conformal Conic, Albers Equal-Area), it is passed directly to `proj4rs`.
+4. **Manual override**: The `source_crs` parameter accepts `'EPSG:XXXX'` codes or full PROJ.4 definition strings, overriding any embedded metadata.
+
+### Supported Projection Families
+
+| Projection Family | Common Use Cases | Example EPSG Codes |
+| :--- | :--- | :--- |
+| **Geographic (lat/lon)** | Global datasets, climate grids (ERA5, PRISM) | `EPSG:4326` (WGS84), `EPSG:4269` (NAD83) |
+| **Web Mercator** | Web tile services, Google/Bing/OSM basemaps | `EPSG:3857`, `EPSG:900913` |
+| **UTM (Universal Transverse Mercator)** | High-resolution regional data, Sentinel-2, Landsat | `EPSG:32601`–`32660` (North), `EPSG:32701`–`32760` (South) |
+| **Transverse Mercator** | National grid systems (British National Grid, GDA2020) | `EPSG:27700`, `EPSG:7856` |
+| **Lambert Conformal Conic** | Continental-scale datasets, CONUS projections | `EPSG:5070` (NAD83 Conus Albers), custom PROJ strings |
+| **Albers Equal-Area** | Area-preserving thematic maps, NLCD, MODIS composites | `EPSG:5070`, `EPSG:6933` |
+| **Polar Stereographic** | Arctic/Antarctic datasets, sea ice, NSIDC | `EPSG:3413` (North), `EPSG:3031` (South) |
+
+### Usage Examples
+
+```sql
+-- Auto-detect from GeoTIFF metadata (most common)
+SELECT * FROM h3_raster_continuous_aggregate('sentinel2_utm32n.tif', resolution := 8);
+
+-- Override CRS with EPSG code
+SELECT * FROM h3_raster_continuous_aggregate('legacy_raster.tif', resolution := 8, source_crs := 'EPSG:32632');
+
+-- Override with full PROJ string (Lambert Conformal Conic)
+SELECT * FROM h3_raster_continuous_aggregate(
+    'conus_climate.tif',
+    resolution := 7,
+    source_crs := '+proj=lcc +lat_1=25 +lat_2=60 +lat_0=42.5 +lon_0=-100 +datum=NAD83 +units=m'
+);
+```
+
+> **Performance Tip**: When working with large UTM or projected rasters, the row-constant latitude hoisting optimization still applies — the projection math is evaluated **once per row**, not once per pixel. This means even the PROJ4 tier achieves near-analytical throughput on wide rasters.
+
+---
+
+## 9. Complete API Reference
 
 ### Continuous Rasters: `h3_raster_continuous_aggregate(file_path, [resolution], ...)`
 *(Alias: `h3_raster_continuous`)*
@@ -509,7 +562,7 @@ WHERE fraction >= 0.10;
 
 ---
 
-## 9. Architecture Diagram
+## 10. Architecture Diagram
 
 ```mermaid
 flowchart TD
@@ -565,7 +618,7 @@ flowchart TD
 
 ---
 
-## 10. Core Dependencies & Architectural Contributions
+## 11. Core Dependencies & Architectural Contributions
 
 `raster_h3` is built using a carefully curated set of pure-Rust libraries to achieve zero external runtime dependencies and hardware-saturating performance:
 
@@ -581,7 +634,7 @@ flowchart TD
 
 ---
 
-## 11. Building & Testing Locally
+## 12. Building & Testing Locally
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (Edition 2021+, stable toolchain)
@@ -604,5 +657,5 @@ cargo test
 
 ---
 
-## 12. License
+## 13. License
 This project is licensed under the [MIT License](LICENSE).
