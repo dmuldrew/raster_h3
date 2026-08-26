@@ -7,7 +7,8 @@ use tiff::tags::Tag;
 
 use raster_h3::aggregator::{
     aggregate_raster_stream, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
-    H3Accumulator, ScanHorizonStreamer, SpatialCoherenceCache,
+    CategoricalAccumulator, CategoricalHorizonStreamer, H3Accumulator, ScanHorizonStreamer,
+    SpatialCoherenceCache,
 };
 use raster_h3::crs::CrsTransformer;
 use raster_h3::functions::fast_hex_u64;
@@ -373,3 +374,105 @@ fn test_prefetched_chunk_reader() {
     }
     assert_eq!(count, total_chunks);
 }
+
+#[test]
+fn test_categorical_accumulator_operations() {
+    let mut acc1 = CategoricalAccumulator::new();
+    // Hex with 70 pixels of class 10 (Forest) and 30 pixels of class 20 (Grassland)
+    for _ in 0..70 {
+        acc1.update(10);
+    }
+    for _ in 0..30 {
+        acc1.update(20);
+    }
+
+    assert_eq!(acc1.total_count, 100.0);
+    assert_eq!(acc1.unique_classes(), 2);
+
+    let (maj_cat, maj_cnt, maj_frac) = acc1.majority();
+    assert_eq!(maj_cat, 10);
+    assert_eq!(maj_cnt, 70.0);
+    assert!((maj_frac - 0.70).abs() < 1e-6);
+
+    let json = acc1.histogram_json();
+    assert!(json.contains("\"10\": 0.7000"));
+    assert!(json.contains("\"20\": 0.3000"));
+
+    // Test weighted updates (e.g. sub-pixel sampling)
+    let mut acc2 = CategoricalAccumulator::new();
+    acc2.update_weighted(50, 0.5); // 0.5 of class 50 (Urban)
+    acc2.update_weighted(10, 0.5);
+
+    acc1.merge(&acc2);
+    assert_eq!(acc1.total_count, 101.0);
+    assert_eq!(acc1.unique_classes(), 3);
+}
+
+#[test]
+fn test_categorical_horizon_streaming() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 50;
+    let height = 50;
+    // Upper half is class 10 (Forest), lower half is class 50 (Urban)
+    let mut data = vec![10u8; width * height];
+    for i in (width * height / 2)..(width * height) {
+        data[i] = 50;
+    }
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [
+            1, 1, 0, 2,
+            1024, 0, 1, 2,
+            2048, 0, 1, 4326,
+        ];
+        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        custom_crs: None,
+        custom_nodata: None,
+        bbox: None,
+        ..Default::default()
+    };
+
+    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut all_yielded = Vec::new();
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        all_yielded.extend(batch);
+    }
+
+    assert!(!all_yielded.is_empty());
+    let total_pixels: f64 = all_yielded.iter().map(|(_, acc)| acc.total_count).sum();
+    assert_eq!(total_pixels, 2500.0);
+
+    for (_, acc) in &all_yielded {
+        let (maj_cat, _, maj_frac) = acc.majority();
+        assert!(maj_cat == 10 || maj_cat == 50);
+        assert!(maj_frac > 0.0 && maj_frac <= 1.0);
+    }
+}
+

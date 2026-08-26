@@ -2,7 +2,7 @@
 -- 1. Load the compiled extension
 LOAD '/extensions/libraster_h3.so';
 
--- 2. Preview aggregated H3 cells from GeoTIFF at H3 Resolution 8 with StdDev
+-- 2. Preview aggregated H3 cells from GeoTIFF at H3 Resolution 8 with StdDev (Continuous)
 SELECT
     h3_hex,
     round(mean, 2) AS avg_elevation_m,
@@ -10,7 +10,7 @@ SELECT
     count AS pixel_count,
     round(min, 2) AS min_elevation,
     round(max, 2) AS max_elevation
-FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8, band := 1)
+FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8, band := 1)
 ORDER BY pixel_count DESC
 LIMIT 10;
 
@@ -22,7 +22,7 @@ SELECT
     h3_get_resolution(h3_index) AS h3_res,
     round(mean, 2) AS mean_value,
     count
-FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 9)
+FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 9)
 LIMIT 5;
 
 -- 4. Fast Region of Interest (ROI) bounding box pruning
@@ -30,7 +30,7 @@ SELECT
     h3_hex,
     round(mean, 2) AS mean_val,
     count AS pixels
-FROM h3_raster_aggregate(
+FROM h3_raster_continuous_aggregate(
     '/data/sample_sf.tif',
     resolution := 9,
     min_lon := -122.45,
@@ -46,7 +46,7 @@ SELECT
     h3_get_resolution(string_to_h3('8828308281fffff')) AS res;
 
 -- 6. Query Plan & Cardinality Estimation
-EXPLAIN SELECT count(*) FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8);
+EXPLAIN SELECT count(*) FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8);
 
 -- 7. Anti-Aliased Sub-Pixel Super-Sampling (Rotated Grid Super-Sampling RGSS)
 SELECT
@@ -55,7 +55,7 @@ SELECT
     round(count, 2) AS weighted_pixel_count,
     min,
     max
-FROM h3_raster_aggregate(
+FROM h3_raster_continuous_aggregate(
     '/data/sample_sf.tif',
     resolution := 9,
     sampling := 'rgss'  -- Presets: 'center', 'rgss', 'hex', 'gaussian', '5point', '8rooks', '9point', '16point'
@@ -73,10 +73,44 @@ COPY (
         max,
         h3_to_lat(h3_index) AS centroid_lat,
         h3_to_lng(h3_index) AS centroid_lng
-    FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8, sampling := 'rgss')
+    FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8, sampling := 'rgss')
 ) TO '/data/sf_elevation_h3.parquet' (FORMAT PARQUET);
 
+-- 9. Categorical Raster Aggregation: Dominant / Majority Class & Histogram (Wide Format)
+SELECT
+    h3_hex,
+    majority_class,
+    round(majority_fraction * 100, 1) AS dominance_pct,
+    majority_count,
+    unique_classes,
+    total_count,
+    histogram
+FROM h3_raster_categorical_aggregate('/data/sample_sf.tif', resolution := 8)
+LIMIT 10;
 
+-- 10. Categorical Raster Aggregation: Normalized Long Form
+SELECT
+    h3_hex,
+    category,
+    count AS category_pixels,
+    round(fraction * 100, 2) AS pct_coverage,
+    total_count AS hex_total_pixels
+FROM h3_raster_categorical_aggregate('/data/sample_sf.tif', resolution := 8, format := 'long')
+WHERE fraction >= 0.10
+ORDER BY h3_hex, fraction DESC
+LIMIT 15;
 
-
+-- 11. Anti-Aliased Sub-Pixel Categorical Aggregation (Hexagonal 7-Point Lattice)
+SELECT
+    h3_hex,
+    majority_class,
+    round(majority_fraction * 100, 1) AS majority_pct,
+    round(total_count, 2) AS weighted_total_pixels,
+    histogram
+FROM h3_raster_categorical_aggregate(
+    '/data/sample_sf.tif',
+    resolution := 9,
+    sampling := 'hex'
+)
+LIMIT 10;
 

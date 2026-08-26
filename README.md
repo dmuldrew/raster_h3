@@ -211,7 +211,7 @@ SELECT
     h3_hex,
     round(mean, 2) AS avg_value,
     count AS pixel_count
-FROM h3_raster_aggregate('/data/sample_sf.tif', resolution := 8)
+FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8)
 ORDER BY pixel_count DESC
 LIMIT 10;
 ```
@@ -225,7 +225,7 @@ LIMIT 10;
 LOAD 'target/release/libraster_h3.dylib'; -- macOS (.so on Linux, .dll on Windows)
 ```
 
-### 2. Basic Raster Aggregation
+### 2. Basic Raster Aggregation (Continuous Surfaces)
 ```sql
 SELECT
     h3_index,
@@ -235,7 +235,7 @@ SELECT
     min,
     max,
     sum
-FROM h3_raster_aggregate('elevation.tif', resolution := 8);
+FROM h3_raster_continuous_aggregate('elevation.tif', resolution := 8);
 ```
 
 ### 3. Advanced Parameters (CRS, NoData, Bounding Box, Super-Sampling)
@@ -244,7 +244,7 @@ SELECT
     h3_hex,
     round(mean, 2) AS avg_temp_c,
     round(count, 2) AS weighted_pixel_count
-FROM h3_raster_aggregate(
+FROM h3_raster_continuous_aggregate(
     'temperature_global.tif',
     resolution := 9,
     source_crs := 'EPSG:4326',  -- Override raster CRS
@@ -267,7 +267,7 @@ SELECT
     h3_to_lng(h3_index) AS center_lng,
     h3_get_resolution(h3_index) AS res,
     mean
-FROM h3_raster_aggregate('elevation.tif', 8);
+FROM h3_raster_continuous_aggregate('elevation.tif', 8);
 ```
 
 ### 5. Spatial Joins with Vector & Demographic Tables
@@ -278,7 +278,7 @@ SELECT
     r.mean AS avg_elevation,
     p.total_population,
     p.median_income
-FROM h3_raster_aggregate('california_elevation.tif', resolution := 8) r
+FROM h3_raster_continuous_aggregate('california_elevation.tif', resolution := 8) r
 JOIN population_h3_table p ON r.h3_index = p.h3_index
 WHERE r.mean > 500.0;
 ```
@@ -295,7 +295,7 @@ COPY (
         max,
         h3_to_lat(h3_index) AS centroid_lat,
         h3_to_lng(h3_index) AS centroid_lng
-    FROM h3_raster_aggregate('elevation.tif', resolution := 8, sampling := 'rgss')
+    FROM h3_raster_continuous_aggregate('elevation.tif', resolution := 8, sampling := 'rgss')
 ) TO 'elevation_h3.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
 ```
 
@@ -336,7 +336,10 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 
 ## 8. Complete API Reference
 
-### `h3_raster_aggregate(file_path, [resolution], ...)`
+### Continuous Rasters: `h3_raster_continuous_aggregate(file_path, [resolution], ...)`
+*(Alias: `h3_raster_continuous`)*
+
+Use for continuous spatial surfaces (elevation, temperature, rainfall, satellite NDVI/spectral bands, wind speed).
 
 #### Positional Parameters
 | Parameter | Type | Required | Default | Description |
@@ -385,6 +388,55 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 | **`max`** | $\max_i (x_i)$ | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building/canopy height in DSM rasters. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
 | **`sum`** | $\sum w_i \cdot x_i$ | **Cumulative Physical Quantities**: Total precipitation volume ($mm \times \text{area}$), solar radiation flux ($kWh$), biomass carbon stock. | Used whenever the raster pixel represents a density or rate per unit area that must be integrated across the entire hexagon. |
 
+---
+
+### Categorical Raster Aggregation: `h3_raster_categorical_aggregate`
+
+For **categorical rasters** (land cover, biomes, soil classifications, zoning), `raster_h3` provides dedicated categorical aggregation supporting **Majority/Mode Class (Option A)**, **JSON Class Distribution / Histogram (Option B)**, and **Normalized Long-Form Output (Option C)**:
+
+```sql
+-- 1. Wide Format (Default): Majority Class + Distribution Histogram
+SELECT
+    h3_hex,
+    majority_class,
+    round(majority_fraction * 100, 1) AS dominance_pct,
+    unique_classes,
+    total_count,
+    histogram
+FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8);
+
+-- 2. Long Format: Normalized breakdown row per (hex, category)
+SELECT
+    h3_hex,
+    category,
+    count AS category_pixels,
+    round(fraction * 100, 2) AS pct_coverage
+FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8, format := 'long')
+WHERE fraction >= 0.10;
+```
+
+#### Wide Format Output Schema (`format := 'wide'`, Default)
+| Column Name | Logical Type | Description |
+| :--- | :--- | :--- |
+| `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index. |
+| `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation. |
+| `majority_class` | `BIGINT` | Most frequent category ID in the hexagon (Option A). |
+| `majority_fraction` | `DOUBLE` | Fraction ($0.0 \dots 1.0$) of the hexagon occupied by majority class. |
+| `majority_count` | `DOUBLE` | Weighted pixel count of the majority category. |
+| `unique_classes` | `BIGINT` | Number of distinct categories present in the hexagon (richness). |
+| `total_count` | `DOUBLE` | Total non-nodata pixels in the hexagon. |
+| `histogram` | `VARCHAR` | JSON map of `{category_id: fraction, ...}` (Option B). |
+
+#### Long Format Output Schema (`format := 'long'`, Option C)
+| Column Name | Logical Type | Description |
+| :--- | :--- | :--- |
+| `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index. |
+| `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation. |
+| `category` | `BIGINT` | Category ID present in this hexagon. |
+| `count` | `DOUBLE` | Weighted pixel count for this category. |
+| `fraction` | `DOUBLE` | Proportion ($0.0 \dots 1.0$) of this category in the hexagon. |
+| `total_count` | `DOUBLE` | Total pixels in the hexagon across all categories. |
+
 
 #### Scalar Functions
 | Function | Signature | Return Type | Description |
@@ -402,7 +454,7 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 ```mermaid
 flowchart TD
     subgraph DuckDB ["DuckDB SQL Query Engine"]
-        SQL["SQL Query: SELECT * FROM h3_raster_aggregate('file.tif', 8)"]
+        SQL["SQL Query: SELECT * FROM h3_raster_continuous_aggregate('file.tif', 8)"]
         TF["Table Function C API: bind -> init -> scan"]
         SQL --> TF
     end

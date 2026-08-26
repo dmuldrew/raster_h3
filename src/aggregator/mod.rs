@@ -1,10 +1,12 @@
 pub mod accumulator;
+pub mod categorical;
 pub mod coherence;
 pub mod h3_map;
 pub mod horizon_streamer;
 pub mod sampling;
 
 pub use accumulator::H3Accumulator;
+pub use categorical::{CategoricalAccumulator, CategoricalHorizonStreamer};
 pub use coherence::SpatialCoherenceCache;
 pub use h3_map::{aggregate_raster_stream, H3HashMap};
 pub use horizon_streamer::{

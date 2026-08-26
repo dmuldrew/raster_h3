@@ -52,7 +52,7 @@ unsafe extern "C" fn delete_local_data(data: *mut c_void) {
 pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let param_count = duckdb_bind_get_parameter_count(info);
     if param_count < 1 {
-        let err_msg = to_c_string("h3_raster_aggregate requires at least 1 argument: file_path");
+        let err_msg = to_c_string("h3_raster_continuous_aggregate requires at least 1 argument: file_path");
         duckdb_bind_set_error(info, err_msg.as_ptr());
         return;
     }
@@ -388,77 +388,87 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     duckdb_data_chunk_set_size(output, batch_size as idx_t);
 }
 
-/// Register `h3_raster_aggregate` table function in DuckDB connection
+/// Register `h3_raster_continuous_aggregate` and `h3_raster_continuous` table functions
 pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Result<(), String> {
-    let fn_name = to_c_string("h3_raster_aggregate");
-    let tf = duckdb_create_table_function();
-    duckdb_table_function_set_name(tf, fn_name.as_ptr());
+    let names = [
+        "h3_raster_continuous_aggregate",
+        "h3_raster_continuous",
+    ];
 
-    // Positional Parameters:
-    // 0: file_path (VARCHAR)
-    let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
-    duckdb_table_function_add_parameter(tf, type_varchar);
+    for name in &names {
+        let fn_name = to_c_string(name);
+        let tf = duckdb_create_table_function();
+        duckdb_table_function_set_name(tf, fn_name.as_ptr());
 
-    // Named Parameters:
-    // resolution (BIGINT)
-    let name_res = to_c_string("resolution");
-    let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
-    duckdb_table_function_add_named_parameter(tf, name_res.as_ptr(), type_bigint);
+        // Positional Parameters:
+        // 0: file_path (VARCHAR)
+        let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
+        duckdb_table_function_add_parameter(tf, type_varchar);
 
-    // source_crs (VARCHAR)
-    let name_crs = to_c_string("source_crs");
-    duckdb_table_function_add_named_parameter(tf, name_crs.as_ptr(), type_varchar);
+        // Named Parameters:
+        // resolution (BIGINT)
+        let name_res = to_c_string("resolution");
+        let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
+        duckdb_table_function_add_named_parameter(tf, name_res.as_ptr(), type_bigint);
 
-    // nodata (DOUBLE)
-    let name_nodata = to_c_string("nodata");
-    let type_double = duckdb_create_logical_type(DuckDBType::Double);
-    duckdb_table_function_add_named_parameter(tf, name_nodata.as_ptr(), type_double);
+        // source_crs (VARCHAR)
+        let name_crs = to_c_string("source_crs");
+        duckdb_table_function_add_named_parameter(tf, name_crs.as_ptr(), type_varchar);
 
-    // chunk_size (BIGINT)
-    let name_chunk = to_c_string("chunk_size");
-    duckdb_table_function_add_named_parameter(tf, name_chunk.as_ptr(), type_bigint);
+        // nodata (DOUBLE)
+        let name_nodata = to_c_string("nodata");
+        let type_double = duckdb_create_logical_type(DuckDBType::Double);
+        duckdb_table_function_add_named_parameter(tf, name_nodata.as_ptr(), type_double);
 
-    // band (BIGINT)
-    let name_band = to_c_string("band");
-    duckdb_table_function_add_named_parameter(tf, name_band.as_ptr(), type_bigint);
+        // chunk_size (BIGINT)
+        let name_chunk = to_c_string("chunk_size");
+        duckdb_table_function_add_named_parameter(tf, name_chunk.as_ptr(), type_bigint);
 
-    // sampling (VARCHAR)
-    let name_sampling = to_c_string("sampling");
-    duckdb_table_function_add_named_parameter(tf, name_sampling.as_ptr(), type_varchar);
+        // band (BIGINT)
+        let name_band = to_c_string("band");
+        duckdb_table_function_add_named_parameter(tf, name_band.as_ptr(), type_bigint);
 
-    // Bounding box named parameters: min_lon, min_lat, max_lon, max_lat
-    let name_min_lon = to_c_string("min_lon");
-    duckdb_table_function_add_named_parameter(tf, name_min_lon.as_ptr(), type_double);
+        // sampling (VARCHAR)
+        let name_sampling = to_c_string("sampling");
+        duckdb_table_function_add_named_parameter(tf, name_sampling.as_ptr(), type_varchar);
 
-    let name_min_lat = to_c_string("min_lat");
-    let name_max_lon = to_c_string("max_lon");
-    let name_max_lat = to_c_string("max_lat");
-    duckdb_table_function_add_named_parameter(tf, name_min_lat.as_ptr(), type_double);
-    duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double);
-    duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double);
+        // Bounding box named parameters: min_lon, min_lat, max_lon, max_lat
+        let name_min_lon = to_c_string("min_lon");
+        let type_double_bbox = duckdb_create_logical_type(DuckDBType::Double);
+        duckdb_table_function_add_named_parameter(tf, name_min_lon.as_ptr(), type_double_bbox);
 
-    // Set callbacks including parallel init_local and projection pushdown
-    duckdb_table_function_set_bind(tf, raster_h3_bind);
-    duckdb_table_function_set_init(tf, raster_h3_init);
-    duckdb_table_function_set_init_local(tf, raster_h3_init_local);
-    duckdb_table_function_set_function(tf, raster_h3_scan);
-    duckdb_table_function_set_projection_pushdown(tf, true);
+        let name_min_lat = to_c_string("min_lat");
+        let name_max_lon = to_c_string("max_lon");
+        let name_max_lat = to_c_string("max_lat");
+        duckdb_table_function_add_named_parameter(tf, name_min_lat.as_ptr(), type_double_bbox);
+        duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double_bbox);
+        duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double_bbox);
 
-    let state = duckdb_register_table_function(con, tf);
+        // Set callbacks including parallel init_local and projection pushdown
+        duckdb_table_function_set_bind(tf, raster_h3_bind);
+        duckdb_table_function_set_init(tf, raster_h3_init);
+        duckdb_table_function_set_init_local(tf, raster_h3_init_local);
+        duckdb_table_function_set_function(tf, raster_h3_scan);
+        duckdb_table_function_set_projection_pushdown(tf, true);
 
-    // Cleanup logical types
-    let mut type_varchar_mut = type_varchar;
-    duckdb_destroy_logical_type(&mut type_varchar_mut);
-    let mut type_bigint_mut = type_bigint;
-    duckdb_destroy_logical_type(&mut type_bigint_mut);
-    let mut type_double_mut = type_double;
-    duckdb_destroy_logical_type(&mut type_double_mut);
+        let state = duckdb_register_table_function(con, tf);
 
-    let mut tf_mut = tf;
-    duckdb_destroy_table_function(&mut tf_mut);
+        // Cleanup logical types
+        let mut type_varchar_mut = type_varchar;
+        duckdb_destroy_logical_type(&mut type_varchar_mut);
+        let mut type_bigint_mut = type_bigint;
+        duckdb_destroy_logical_type(&mut type_bigint_mut);
+        let mut type_double_mut = type_double;
+        duckdb_destroy_logical_type(&mut type_double_mut);
+        let mut type_double_bbox_mut = type_double_bbox;
+        duckdb_destroy_logical_type(&mut type_double_bbox_mut);
 
-    if state != DuckDBState::Success {
-        return Err("Failed to register h3_raster_aggregate table function".to_string());
+        let mut tf_mut = tf;
+        duckdb_destroy_table_function(&mut tf_mut);
+
+        if state != DuckDBState::Success {
+            return Err(format!("Failed to register {} table function", name));
+        }
     }
 
     Ok(())
