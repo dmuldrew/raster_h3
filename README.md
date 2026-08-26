@@ -353,17 +353,7 @@ When a raster pixel lies across the boundary between two or more H3 hexagons, si
 
 With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta y_i)$ are evaluated within each pixel's unit box $[0, 1] \times [0, 1]$ with fractional weights:
 
-```
-+-------------------------------------------------------------------------------+
-| RGSS (4-Point Rotated)         Hexagonal Lattice (7-Point)    Gaussian (5-Pt) |
-| +-------------------+          +-------------------+          +-------------+ |
-| |     • (0.375,0.125)|         |       •     •     |          |      •      | |
-| |           • (0.875,0.375)    |    •     •     •  |          |   •  •(50%)•| |
-| | • (0.125,0.625)   |          |       •     •     |          |      •      | |
-| |         • (0.625,0.875)      +-------------------+          +-------------+ |
-| +-------------------+                                                         |
-+-------------------------------------------------------------------------------+
-```
+![Sub-Pixel Super-Sampling Patterns](assets/sampling_patterns.svg)
 
 ### Sampling Preset Reference Table
 
