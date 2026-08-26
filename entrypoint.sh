@@ -19,6 +19,7 @@ if [ "$#" -eq 0 ]; then
     echo "-----------------------------------------------------------------"
     echo "Starting interactive DuckDB session..."
     echo "Run: SELECT * FROM h3_raster_continuous_aggregate('/data/your_file.tif', 8);"
+    echo "     SELECT * FROM h3_raster_categorical_aggregate('/data/landcover.tif', 8);"
     echo "================================================================="
     exec duckdb -unsigned
 else

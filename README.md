@@ -6,6 +6,8 @@
 
 A high-performance, native DuckDB loadable extension written in pure Rust that aggregates multi-gigabyte geospatial raster files (GeoTIFF, Cloud-Optimized GeoTIFFs) directly into Uber H3 hexagonal grid cells at hardware limits.
 
+Supports both **continuous** raster surfaces (elevation, temperature, NDVI) and **categorical** classification rasters (land cover, zoning, soil types) with dedicated aggregation engines.
+
 ---
 
 ## 📖 Table of Contents
@@ -20,6 +22,7 @@ A high-performance, native DuckDB loadable extension written in pure Rust that a
 - [9. Architecture Diagram](#9-architecture-diagram)
 - [10. Core Dependencies & Architectural Contributions](#10-core-dependencies--architectural-contributions)
 - [11. Building & Testing Locally](#11-building--testing-locally)
+- [12. License](#12-license)
 
 ---
 
@@ -28,9 +31,11 @@ A high-performance, native DuckDB loadable extension written in pure Rust that a
 ### The Problem: The Raster-Tabular Divide in Geospatial Analytics
 Geospatial data generally exists in two incompatible formats:
 1. **Tabular / Vector Data**: Points, polygons, GPS traces, telemetry, and demographic census records stored in relational databases and data warehouses (e.g. DuckDB, Snowflake, BigQuery, PostgreSQL).
-2. **Continuous Raster Grids**: Multi-spectral satellite imagery (Sentinel-2, Landsat), Digital Elevation Models (SRTM, 3DEP), climate grids (ERA5, PRISM), and weather forecasts stored as 2D pixel matrices in GeoTIFF files.
+2. **Raster Grids**: Stored as 2D pixel matrices in GeoTIFF files, encompassing both:
+   - **Continuous surfaces**: Multi-spectral satellite imagery (Sentinel-2, Landsat), Digital Elevation Models (SRTM, 3DEP), climate grids (ERA5, PRISM), and weather forecasts.
+   - **Categorical classifications**: Land cover maps (ESA WorldCover, NLCD, CORINE), soil type grids, biome zones, and urban zoning layers.
 
-Joining continuous raster values (e.g. elevation, slope, canopy cover, temperature) with business entities (e.g. customers, delivery routes, real estate parcels, cell towers) has traditionally required complex, slow, and memory-intensive ETL pipelines in Python or specialized GIS software.
+Joining raster values (e.g. elevation, temperature, land cover class) with business entities (e.g. customers, delivery routes, real estate parcels, cell towers) has traditionally required complex, slow, and memory-intensive ETL pipelines in Python or specialized GIS software.
 
 ### The Solution: Uber H3 Discrete Global Grid System (DGGS)
 The **Uber H3 Index** divides the Earth's surface into a hierarchical hexagonal grid. Hexagons have uniform neighbor adjacency (each hexagon has exactly 6 equidistant neighbors) and minimal area distortion.
@@ -130,22 +135,18 @@ Traditional pipelines require writing intermediate shapefiles or GeoTIFFs to dis
 
 `raster_h3` achieves hardware limits through 10 architectural pillars:
 
-```
-+---------------------------------------------------------------------------------------+
-|                                10 Engineering Pillars                                 |
-+---------------------------------------------------------------------------------------+
-|  1. Southernmost Scan-Line Horizon Eviction  --> RAM stays < 15 MB regardless of size|
-|  2. Row-Constant Latitude Hoisting           --> Eliminates 99.8% of coordinate math  |
-|  3. Linear Longitude Stepping                --> Single 1-cycle addition per pixel    |
-|  4. In-Register Run Accumulation             --> Eliminates ~98% of hash table probes |
-|  5. Scanline Run-Skipping (SIMD)             --> 8–16 pixels processed per CPU cycle  |
-|  6. Branchless Hardware Min/Max              --> Zero branch mispredictions (minsd)   |
-|  7. Zero-Copy memmap2 & Async Prefetching    --> Direct kernel mapping + double buffer|
-|  8. Zero-Allocation Fast Hex Formatting      --> 16-byte stack LUT formatting         |
-|  9. ROI Bounding Box Chunk Pruning           --> Skips unneeded chunks upfront        |
-| 10. Native Parallelism & Cardinality         --> 100% saturation across all CPU cores |
-+---------------------------------------------------------------------------------------+
-```
+| # | Engineering Pillar | Performance Impact |
+| :---: | :--- | :--- |
+| 1 | Southernmost Scan-Line Horizon Eviction | RAM stays < 15 MB regardless of raster size |
+| 2 | Row-Constant Latitude Hoisting | Eliminates 99.8% of coordinate projection math |
+| 3 | Linear Longitude Stepping | Single 1-cycle addition per pixel |
+| 4 | In-Register Run Accumulation | Eliminates ~98% of hash table probes |
+| 5 | Scanline Run-Skipping (SIMD) | 8–16 pixels processed per CPU cycle |
+| 6 | Branchless Hardware Min/Max | Zero branch mispredictions (`minsd`/`maxsd`) |
+| 7 | Zero-Copy `memmap2` & Async Prefetching | Direct kernel mapping + double buffering |
+| 8 | Zero-Allocation Fast Hex Formatting | 16-byte stack LUT formatting |
+| 9 | ROI Bounding Box Chunk Pruning | Skips unneeded chunks upfront |
+| 10 | Native Parallelism & Cardinality | 100% saturation across all CPU cores |
 
 ### 1. Southernmost Scan-Line Horizon Eviction ($\text{Lat}_{\text{south}}$)
 Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
@@ -207,12 +208,22 @@ Inside the DuckDB prompt:
 ```sql
 LOAD '/extensions/libraster_h3.so';
 
+-- Continuous aggregation (elevation, temperature, NDVI)
 SELECT
     h3_hex,
     round(mean, 2) AS avg_value,
     count AS pixel_count
 FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8)
 ORDER BY pixel_count DESC
+LIMIT 10;
+
+-- Categorical aggregation (land cover, zoning, soil)
+SELECT
+    h3_hex,
+    majority_class,
+    round(majority_fraction * 100, 1) AS dominance_pct,
+    histogram
+FROM h3_raster_categorical_aggregate('/data/landcover.tif', resolution := 8)
 LIMIT 10;
 ```
 
@@ -297,6 +308,45 @@ COPY (
         h3_to_lng(h3_index) AS centroid_lng
     FROM h3_raster_continuous_aggregate('elevation.tif', resolution := 8, sampling := 'rgss')
 ) TO 'elevation_h3.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
+```
+
+### 7. Categorical Raster Aggregation (Land Cover, Zoning, Soil Types)
+
+#### 7a. Majority Class & Dominance Percentage (Wide Format)
+```sql
+SELECT
+    h3_hex,
+    majority_class,
+    round(majority_fraction * 100, 1) AS dominance_pct,
+    unique_classes,
+    total_count,
+    histogram
+FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8);
+```
+
+#### 7b. Querying the JSON Class Histogram
+```sql
+-- Use DuckDB's built-in JSON functions to extract specific class fractions
+SELECT
+    h3_hex,
+    majority_class,
+    json_extract(histogram, '$."10"') AS forest_fraction,
+    json_extract(histogram, '$."50"') AS urban_fraction
+FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8)
+WHERE json_extract(histogram, '$."50"') IS NOT NULL;
+```
+
+#### 7c. Normalized Long-Form Filtering
+```sql
+-- Find all hexagons with >= 25% Urban (class 50) coverage
+SELECT
+    h3_hex,
+    category AS urban_class,
+    count AS urban_pixel_count,
+    round(fraction * 100, 2) AS urban_coverage_pct
+FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8, format := 'long')
+WHERE category = 50 AND fraction >= 0.25
+ORDER BY fraction DESC;
 ```
 
 ---
@@ -390,9 +440,10 @@ Use for continuous spatial surfaces (elevation, temperature, rainfall, satellite
 
 ---
 
-### Categorical Raster Aggregation: `h3_raster_categorical_aggregate`
+### Categorical Rasters: `h3_raster_categorical_aggregate(file_path, [resolution], ...)`
+*(Alias: `h3_raster_categorical`)*
 
-For **categorical rasters** (land cover, biomes, soil classifications, zoning), `raster_h3` provides dedicated categorical aggregation supporting **Majority/Mode Class (Option A)**, **JSON Class Distribution / Histogram (Option B)**, and **Normalized Long-Form Output (Option C)**:
+Use for discrete classification rasters (land cover, biomes, soil types, zoning). Provides three output modes: **Majority/Mode Class (Option A)**, **JSON Class Distribution / Histogram (Option B)**, and **Normalized Long-Form Output (Option C)**:
 
 ```sql
 -- 1. Wide Format (Default): Majority Class + Distribution Histogram
@@ -414,6 +465,18 @@ SELECT
 FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8, format := 'long')
 WHERE fraction >= 0.10;
 ```
+
+#### Named Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `resolution` | `BIGINT` | `8` | H3 grid resolution level ($0 \le R \le 15$). |
+| `format` | `VARCHAR` | `'wide'` | Output layout: `'wide'` (Options A & B) or `'long'` (Option C). |
+| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate from multi-spectral imagery. |
+| `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). |
+| `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
+| `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
+| `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, etc.). |
+| `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Bounding box coordinates for spatial Region of Interest (ROI) chunk pruning. |
 
 #### Wide Format Output Schema (`format := 'wide'`, Default)
 | Column Name | Logical Type | Description |
@@ -437,8 +500,10 @@ WHERE fraction >= 0.10;
 | `fraction` | `DOUBLE` | Proportion ($0.0 \dots 1.0$) of this category in the hexagon. |
 | `total_count` | `DOUBLE` | Total pixels in the hexagon across all categories. |
 
+---
 
-#### Scalar Functions
+### Scalar Helper Functions
+
 | Function | Signature | Return Type | Description |
 | :--- | :--- | :--- | :--- |
 | `h3_to_string` | `(UBIGINT)` | `VARCHAR` | Zero-allocation hexadecimal string formatter. |
@@ -454,9 +519,11 @@ WHERE fraction >= 0.10;
 ```mermaid
 flowchart TD
     subgraph DuckDB ["DuckDB SQL Query Engine"]
-        SQL["SQL Query: SELECT * FROM h3_raster_continuous_aggregate('file.tif', 8)"]
+        SQL1["h3_raster_continuous_aggregate (mean, stddev, min, max, sum)"]
+        SQL2["h3_raster_categorical_aggregate (majority, histogram, long)"]
         TF["Table Function C API: bind -> init -> scan"]
-        SQL --> TF
+        SQL1 --> TF
+        SQL2 --> TF
     end
 
     subgraph IO ["Zero-Copy Disk & Memory Layer"]
@@ -481,7 +548,7 @@ flowchart TD
         end
 
         subgraph HORIZON ["Southernmost Scan-Line Horizon Eviction"]
-            ACTIVE_MAP["IntMap&lt;u64, H3Accumulator&gt; (Active Front &lt; 15 MB)"]
+            ACTIVE_MAP["FxHashMap&lt;u64, Accumulator&gt; (Active Front &lt; 15 MB)"]
             QUEUE["Priority Queue: HexEvictionEntry (Lat_south)"]
             RUN -->|"Flush Run Boundary"| ACTIVE_MAP
             RUN -->|"Register New Cell"| QUEUE
@@ -503,7 +570,7 @@ flowchart TD
 
 ---
 
-## 9. Core Dependencies & Architectural Contributions
+## 10. Core Dependencies & Architectural Contributions
 
 `raster_h3` is built using a carefully curated set of pure-Rust libraries to achieve zero external runtime dependencies and hardware-saturating performance:
 
@@ -513,13 +580,13 @@ flowchart TD
 | [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Directly maps GeoTIFF files from disk into userspace virtual memory, completely bypassing `read()` syscalls and intermediate buffer copies. Enables issuing kernel-level `madvise(MADV_SEQUENTIAL)` readahead hints to prefetch disk blocks in 2MB–4MB bursts. |
 | [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression. Decodes individual tiles and strips on-demand directly from memory-mapped slices and frees them immediately, maintaining flat $\mathcal{O}(1)$ memory consumption. |
 | [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Standalone Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 geodetic transformations (UTM, Transverse Mercator, Lambert Conformal Conic $\rightarrow$ WGS84). Replaces the massive multi-gigabyte C++ `libproj` library with a thread-safe, self-contained coordinate transformer. |
-| [`nohash-hasher`](https://crates.io/crates/nohash-hasher) `v0.2` | 1-Cycle Bitwise Identity Hasher | Eliminates CPU hashing overhead for 64-bit integer H3 cell keys. Because H3 indices are already uniformly distributed 64-bit integers, `nohash-hasher` provides direct 1-cycle bitwise bucket indexing, bypassing SipHash/MurmurHash latency entirely. |
+| [`fxhash`](https://crates.io/crates/fxhash) `v0.2` | Fast Non-Cryptographic Hasher | Provides the Firefox-derived FxHash algorithm for `HashMap` keys. Delivers near-identity-hash throughput for 64-bit integer H3 cell keys while maintaining robust collision resistance across mixed key distributions used by both continuous accumulators and categorical frequency maps. |
 | [`rayon`](https://crates.io/crates/rayon) `v1.10` | Work-Stealing Parallelism | Provides lightweight, lock-free work-stealing data parallelism for concurrent chunk decompression and aggregation across all available CPU cores. |
 | [`thiserror`](https://crates.io/crates/thiserror) & [`serde`](https://crates.io/crates/serde) | Robust Error & Data Handling | Provides ergonomic, zero-overhead typed error propagation across DuckDB C-FFI boundaries without panics. |
 
 ---
 
-## 10. Building & Testing Locally
+## 11. Building & Testing Locally
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (Edition 2021+, stable toolchain)
@@ -542,6 +609,5 @@ cargo test
 
 ---
 
-## 11. License
+## 12. License
 This project is licensed under the [MIT License](LICENSE).
-

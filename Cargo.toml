@@ -25,7 +25,7 @@ proj4rs = "0.1"
 # Zero-copy memory-mapped file I/O
 memmap2 = "0.9"
 
-# Zero-overhead identity hasher for 64-bit integer keys
+# Fast non-cryptographic hasher for 64-bit integer H3 cell keys
 fxhash = "0.2"
 
 # Error handling and utility
