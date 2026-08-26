@@ -68,18 +68,13 @@ Imagine going on a road trip across the country:
 
 ### How `raster_h3` Fixes It: 4 Simple Ideas
 
-```
-Traditional Approach:                      raster_h3 Approach:
-+-----------------------------------+     +-----------------------------------+
-| 1. Load entire 10 GB raster in RAM|     | 1. Stream 1 thin row at a time    |
-| 2. Re-calculate GPS math on 100M  |     | 2. Set "Cruise Control" (1 math   |
-|    individual pixels              |        calculation per row)             |
-| 3. Search hash table on every px  |     | 3. "Run-Skip" 50 pixels at once   |
-| 4. Hold all results until the end |     | 4. Evict finished hexagons from   |
-|                                   |        memory immediately               |
-| Result: Minutes & Memory Crashes  |     | Result: Milliseconds & < 15 MB RAM|
-+-----------------------------------+     +-----------------------------------+
-```
+| Step | Traditional Approach | `raster_h3` Approach |
+| :---: | :--- | :--- |
+| 1 | Load entire 10 GB raster into RAM | Stream 1 thin row at a time |
+| 2 | Re-calculate GPS math on 100M individual pixels | Set "Cruise Control" (1 math calculation per row) |
+| 3 | Search hash table on every pixel | "Run-Skip" 50 pixels at once |
+| 4 | Hold all results until the end | Evict finished hexagons from memory immediately |
+| **Result** | **Minutes & Memory Crashes** | **Milliseconds & < 15 MB RAM** |
 
 #### 1. The Moving Scanner Front (Constant Memory)
 Instead of loading a multi-gigabyte file into memory, `raster_h3` reads the image like an office document scanner—one paper-thin row at a time from North to South. The moment a row moves past the bottom edge of a hexagon, that hexagon is sealed, finished, and streamed directly into your SQL query results. 
