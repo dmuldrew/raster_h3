@@ -26,7 +26,7 @@ proj4rs = "0.1"
 memmap2 = "0.9"
 
 # Zero-overhead identity hasher for 64-bit integer keys
-nohash-hasher = "0.2"
+fxhash = "0.2"
 
 # Error handling and utility
 thiserror = "1.0"

@@ -1,5 +1,6 @@
 use h3o::Resolution;
-use nohash_hasher::IntMap;
+use std::collections::HashMap;
+use fxhash::FxBuildHasher;
 use rayon::prelude::*;
 use tiff::decoder::DecodingResult;
 
@@ -15,7 +16,7 @@ use crate::raster::RasterChunk;
 const WGS84_A: f64 = 6378137.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
-pub type H3HashMap = IntMap<u64, H3Accumulator>;
+pub type H3HashMap = HashMap<u64, H3Accumulator, FxBuildHasher>;
 
 /// Helper to iterate through a typed native slice and aggregate into an H3 map using
 /// Row-Constant Latitude Hoisting, Linear Longitude Stepping, and In-Register Run Accumulation

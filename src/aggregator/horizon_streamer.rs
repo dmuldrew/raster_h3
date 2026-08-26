@@ -1,6 +1,7 @@
 use std::collections::{BinaryHeap, VecDeque};
 use h3o::{CellIndex, LatLng, Resolution};
-use nohash_hasher::IntMap;
+use std::collections::HashMap;
+use fxhash::FxBuildHasher;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
@@ -150,7 +151,7 @@ pub struct ScanHorizonStreamer {
     sampling: SamplingPattern,
     gt: GeoTransform,
     chunk_stride: u32,
-    active_map: IntMap<u64, H3Accumulator>,
+    active_map: HashMap<u64, H3Accumulator, FxBuildHasher>,
     eviction_queue: BinaryHeap<HexEvictionEntry>,
     completed_buffer: VecDeque<(u64, H3Accumulator)>,
     is_finished: bool,
@@ -200,7 +201,7 @@ impl ScanHorizonStreamer {
             sampling: config.sampling.clone(),
             gt,
             chunk_stride,
-            active_map: IntMap::default(),
+            active_map: HashMap::default(),
             eviction_queue: BinaryHeap::new(),
             completed_buffer: VecDeque::new(),
             is_finished: false,
