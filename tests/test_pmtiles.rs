@@ -185,3 +185,20 @@ fn test_export_generic_h3_features_with_validation() {
     assert_eq!(&header[0..7], b"PMTiles");
     assert_eq!(header[7], 3);
 }
+
+#[test]
+fn test_h3_res_to_zoom_monotonicity_all_levels() {
+    use raster_h3::pmtiles::tiler::h3_res_to_zoom;
+
+    let mut prev_zoom = 0u8;
+    for res in 0..=15 {
+        let zoom = h3_res_to_zoom(res);
+        assert!(zoom >= prev_zoom, "Zoom must be monotonically non-decreasing with H3 resolution (res: {}, zoom: {})", res, zoom);
+        prev_zoom = zoom;
+    }
+
+    assert_eq!(h3_res_to_zoom(0), 0);
+    assert_eq!(h3_res_to_zoom(8), 13);
+    assert_eq!(h3_res_to_zoom(10), 16);
+    assert_eq!(h3_res_to_zoom(15), 23);
+}

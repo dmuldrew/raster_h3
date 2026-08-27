@@ -45,18 +45,26 @@ pub fn tile_xy_to_bbox(z: u8, x: u32, y: u32) -> [f64; 4] {
     [min_lon, min_lat, max_lon, max_lat]
 }
 
-/// Default mapping from H3 resolution to Web Mercator zoom level
+/// Default mapping from H3 resolution to Web Mercator zoom level (scaling ratio ~1.4037)
 pub fn h3_res_to_zoom(res: u8) -> u8 {
     match res {
-        0..=3 => res * 2,
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        3 => 5,
         4 => 7,
         5 => 8,
         6 => 10,
         7 => 11,
         8 => 13,
         9 => 14,
-        10 => 15,
-        _ => 16,
+        10 => 16,
+        11 => 17,
+        12 => 19,
+        13 => 20,
+        14 => 21,
+        15 => 23,
+        _ => 24,
     }
 }
 
