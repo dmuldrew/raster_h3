@@ -247,6 +247,26 @@ SELECT
     histogram
 FROM h3_raster_categorical_aggregate('/data/landcover.tif', resolution := 8)
 LIMIT 10;
+
+-- Direct PMTiles v3 Vector Pyramid Export
+SELECT * FROM h3_raster_to_pmtiles(
+    '/data/sample_sf.tif',
+    '/data/sample_sf.pmtiles',
+    min_resolution := 7,
+    max_resolution := 9,
+    sampling := 'rgss'
+);
+```
+
+### 4. Direct 1-Line Docker PMTiles Converter
+Run standalone CLI tiling on any local raster without entering the interactive prompt:
+```bash
+docker run --rm -v $(pwd):/data raster_h3:latest \
+  raster_to_pmtiles \
+    --input /data/my_raster.tif \
+    --output /data/my_map.pmtiles \
+    --resolutions 6,7,8 \
+    --sampling rgss
 ```
 
 ---

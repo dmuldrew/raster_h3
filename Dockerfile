@@ -11,9 +11,10 @@ COPY src/ ./src/
 COPY tests/ ./tests/
 COPY examples/ ./examples/
 
-# Run tests and compile release dynamic library
+# Run tests and compile release dynamic library and CLI utilities
 RUN cargo test --release && \
     cargo build --release && \
+    cargo build --release --examples && \
     cargo run --release --example generate_sample sample_sf.tif
 
 # ==============================================================================
@@ -58,14 +59,15 @@ RUN set -eux; \
 # Create directories
 RUN mkdir -p /extensions /data /app /root
 
-# Copy extension library and sample data from builder
+# Copy extension library, CLI tools, and sample data from builder
 COPY --from=builder /build/target/release/libraster_h3.so /extensions/raster_h3.duckdb_extension
 COPY --from=builder /build/target/release/libraster_h3.so /extensions/libraster_h3.so
+COPY --from=builder /build/target/release/examples/raster_to_pmtiles /usr/local/bin/raster_to_pmtiles
 COPY --from=builder /build/sample_sf.tif /data/sample_sf.tif
 COPY demo.sql /app/demo.sql
 COPY e2e_performance.sql /app/e2e_performance.sql
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh /usr/local/bin/raster_to_pmtiles
 
 ENV LD_PRELOAD=/usr/local/lib/libduckdb.so
 
