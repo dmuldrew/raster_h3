@@ -1,12 +1,12 @@
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use fxhash::FxBuildHasher;
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use serde::{Deserialize, Serialize};
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::coherence::SpatialCoherenceCache;
 use crate::aggregator::horizon_streamer::{
-    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
+    chunk_intersects_bbox, compute_cell_south_lat, AggregationConfig,
     HexEvictionEntry,
 };
 use crate::aggregator::sampling::SamplingPattern;
@@ -114,7 +114,7 @@ impl CategoricalAccumulator {
                 s.push_str(", ");
             }
             first = false;
-            let cnt = self.counts.get(k).copied().unwrap_or(0.0);
+            let cnt = self.counts.get(&k).copied().unwrap_or(0.0);
             let frac = if self.total_count > 0.0 {
                 cnt / self.total_count
             } else {

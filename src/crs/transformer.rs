@@ -20,7 +20,20 @@ pub enum CrsTransformer {
 impl CrsTransformer {
     /// Create a transformer from an optional EPSG code or PROJ string
     pub fn from_crs_or_epsg(epsg: Option<u32>, proj_str: Option<&str>) -> Result<Self> {
-        if let Some(code) = epsg {
+        let parsed_epsg = proj_str.and_then(|s| {
+            let s = s.trim();
+            if let Some(rest) = s.strip_prefix("EPSG:").or_else(|| s.strip_prefix("epsg:")) {
+                rest.trim().parse::<u32>().ok()
+            } else if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
+                s.parse::<u32>().ok()
+            } else {
+                None
+            }
+        });
+
+        let effective_epsg = epsg.or(parsed_epsg);
+
+        if let Some(code) = effective_epsg {
             match code {
                 4326 | 4269 => return Ok(Self::Wgs84Identity),
                 3857 | 900913 | 3785 => return Ok(Self::WebMercatorFast),
@@ -45,10 +58,11 @@ impl CrsTransformer {
 
         if let Some(s) = proj_str {
             let trimmed = s.trim();
-            if trimmed.contains("longlat") && (trimmed.contains("WGS84") || trimmed.contains("epsg:4326")) {
+            let lower = trimmed.to_lowercase();
+            if lower.contains("longlat") || lower.contains("4326") || lower.contains("wgs84") {
                 return Ok(Self::Wgs84Identity);
             }
-            if trimmed.contains("merc") && trimmed.contains("a=6378137") {
+            if lower.contains("3857") || lower.contains("900913") || (lower.contains("merc") && lower.contains("a=6378137")) {
                 return Ok(Self::WebMercatorFast);
             }
             return Self::from_proj_string(trimmed);

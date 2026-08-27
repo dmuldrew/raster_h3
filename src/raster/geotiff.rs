@@ -6,7 +6,7 @@ use memmap2::Mmap;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
-use crate::error::{RasterH3Error, Result};
+use crate::error::Result;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
 
@@ -165,14 +165,21 @@ impl GeoTiffStreamReader {
 
     /// Extract affine geotransform from tags
     fn extract_geotransform<R: std::io::Read + Seek>(decoder: &mut Decoder<R>) -> Result<GeoTransform> {
-        if let Ok(matrix) = decoder.get_tag_f64_vec(Tag::Unknown(34264)) {
+        let matrix_res = decoder
+            .get_tag_f64_vec(Tag::ModelTransformationTag)
+            .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(34264)));
+        if let Ok(matrix) = matrix_res {
             if let Some(gt) = GeoTransform::from_model_transformation(&matrix) {
                 return Ok(gt);
             }
         }
 
-        let tiepoint_res = decoder.get_tag_f64_vec(Tag::Unknown(33922));
-        let scale_res = decoder.get_tag_f64_vec(Tag::Unknown(33550));
+        let tiepoint_res = decoder
+            .get_tag_f64_vec(Tag::ModelTiepointTag)
+            .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(33922)));
+        let scale_res = decoder
+            .get_tag_f64_vec(Tag::ModelPixelScaleTag)
+            .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(33550)));
 
         if let (Ok(tiepoint), Ok(scale)) = (tiepoint_res, scale_res) {
             if let Some(gt) = GeoTransform::from_tiepoint_and_scale(&tiepoint, &scale) {
@@ -183,9 +190,12 @@ impl GeoTiffStreamReader {
         Ok(GeoTransform::default())
     }
 
-    /// Extract NoData value from tag 42113
+    /// Extract NoData value from tag 42113 / GdalNodata
     fn extract_nodata<R: std::io::Read + Seek>(decoder: &mut Decoder<R>) -> Option<f64> {
-        if let Ok(s) = decoder.get_tag_ascii_string(Tag::Unknown(42113)) {
+        let s_res = decoder
+            .get_tag_ascii_string(Tag::GdalNodata)
+            .or_else(|_| decoder.get_tag_ascii_string(Tag::Unknown(42113)));
+        if let Ok(s) = s_res {
             if let Ok(val) = s.trim().parse::<f64>() {
                 return Some(val);
             }
@@ -195,7 +205,10 @@ impl GeoTiffStreamReader {
 
     /// Extract EPSG code from GeoKeyDirectoryTag (34735)
     fn extract_epsg<R: std::io::Read + Seek>(decoder: &mut Decoder<R>) -> Option<u32> {
-        if let Ok(keys) = decoder.get_tag_u16_vec(Tag::Unknown(34735)) {
+        let keys_res = decoder
+            .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
+            .or_else(|_| decoder.get_tag_u16_vec(Tag::Unknown(34735)));
+        if let Ok(keys) = keys_res {
             if keys.len() >= 4 {
                 let num_keys = keys[3] as usize;
                 for i in 0..num_keys {

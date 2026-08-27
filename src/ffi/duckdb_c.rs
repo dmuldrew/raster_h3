@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types, non_snake_case, dead_code)]
+
 use std::ffi::c_void;
 use std::os::raw::c_char;
 

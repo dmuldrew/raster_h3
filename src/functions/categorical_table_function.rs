@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Mutex;
 
-use crate::aggregator::categorical::{CategoricalAccumulator, CategoricalHorizonStreamer};
+use crate::aggregator::categorical::CategoricalHorizonStreamer;
 use crate::aggregator::horizon_streamer::AggregationConfig;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;

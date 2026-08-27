@@ -1,14 +1,14 @@
 use std::fs::File;
 use std::io::BufWriter;
 use tempfile::NamedTempFile;
-use tiff::encoder::colortype::{Gray32Float, Gray8};
+use tiff::encoder::colortype::{Gray16, Gray32Float, Gray64Float, Gray8};
 use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use raster_h3::aggregator::{
-    aggregate_raster_stream, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
-    CategoricalAccumulator, CategoricalHorizonStreamer, H3Accumulator, ScanHorizonStreamer,
-    SpatialCoherenceCache,
+    compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
+    CategoricalAccumulator, CategoricalHorizonStreamer, H3Accumulator,
+    SamplingPattern, ScanHorizonStreamer, SpatialCoherenceCache,
 };
 use raster_h3::crs::CrsTransformer;
 use raster_h3::functions::fast_hex_u64;
@@ -87,8 +87,6 @@ fn test_accumulator_operations() {
 
 #[test]
 fn test_subpixel_sampling_patterns() {
-    use raster_h3::aggregator::SamplingPattern;
-
     let center = SamplingPattern::parse("center");
     assert!(center.is_single_point());
 
@@ -278,8 +276,17 @@ fn test_bounding_box_pruning() {
         ..Default::default()
     };
 
-    let result = aggregate_raster_stream(&reader, &config).unwrap();
-    let filtered_pixels: f64 = result.values().map(|acc| acc.count).sum();
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut filtered_pixels: f64 = 0.0;
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            filtered_pixels += acc.count;
+        }
+    }
 
     // Should only cover the sub-rectangle (approx 20x20 = 400 pixels out of 10,000)
     assert!(filtered_pixels > 0.0);
@@ -358,7 +365,7 @@ fn test_prefetched_chunk_reader() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -474,5 +481,408 @@ fn test_categorical_horizon_streaming() {
         assert!(maj_cat == 10 || maj_cat == 50);
         assert!(maj_frac > 0.0 && maj_frac <= 1.0);
     }
+}
+
+#[test]
+fn test_u16_raster_streaming() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 40;
+    let height = 40;
+    let data = vec![1250u16; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray16>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert_eq!(acc.mean(), 1250.0);
+            assert_eq!(acc.min, 1250.0);
+            assert_eq!(acc.max, 1250.0);
+        }
+    }
+    assert_eq!(total_pixels, 1600.0);
+}
+
+#[test]
+fn test_f64_raster_streaming() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 30;
+    let height = 30;
+    let data = vec![273.15f64; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray64Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert!((acc.mean() - 273.15).abs() < 1e-6);
+        }
+    }
+    assert_eq!(total_pixels, 900.0);
+}
+
+#[test]
+fn test_subpixel_rgss_streaming() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 40;
+    let height = 40;
+    let data = vec![25.0f32; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        sampling: SamplingPattern::rgss(),
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+    let mut has_fractional_cell = false;
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert!((acc.mean() - 25.0).abs() < 1e-6);
+            if (acc.count.fract() - 0.0).abs() > 1e-4 {
+                has_fractional_cell = true;
+            }
+        }
+    }
+
+    // RGSS 4-point weights (0.25 each) must sum to the exact total pixels (1600.0)
+    assert!((total_pixels - 1600.0).abs() < 1e-3, "Total RGSS area weight mismatch: {}", total_pixels);
+    // Boundary hexagons should have fractional pixel area contributions
+    assert!(has_fractional_cell, "Expected boundary hexagons to have fractional counts under RGSS super-sampling");
+}
+
+#[test]
+fn test_subpixel_hex_streaming() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 30;
+    let height = 30;
+    let data = vec![42.0f32; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        sampling: SamplingPattern::hex_seven_point(),
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert!((acc.mean() - 42.0).abs() < 1e-6);
+        }
+    }
+
+    assert!((total_pixels - 900.0).abs() < 1e-3, "Total Hex 7-point area weight mismatch: {}", total_pixels);
+}
+
+#[test]
+fn test_nodata_filtering_preserves_statistics() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 40;
+    let height = 40;
+    // Upper half is valid 100.0, lower half is -9999.0 (NoData)
+    let mut data = vec![100.0f32; width * height];
+    for i in (width * height / 2)..(width * height) {
+        data[i] = -9999.0;
+    }
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.encoder().write_tag(Tag::GdalNodata, "-9999").unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    assert_eq!(reader.metadata.nodata, Some(-9999.0));
+
+    let config = AggregationConfig {
+        resolution: 9,
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            // All statistics must strictly reflect the valid 100.0 values, never polluted by -9999.0
+            assert_eq!(acc.mean(), 100.0);
+            assert_eq!(acc.min, 100.0);
+            assert_eq!(acc.max, 100.0);
+            assert_eq!(acc.variance(), 0.0);
+            assert_eq!(acc.stddev(), 0.0);
+        }
+    }
+
+    // Exactly 800 valid pixels out of 1600 total
+    assert_eq!(total_pixels, 800.0);
+}
+
+#[test]
+fn test_nan_filtering_in_streaming() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 20;
+    let height = 20;
+    let mut data = vec![50.0f32; width * height];
+    // Set half the pixels to NaN
+    for i in (width * height / 2)..(width * height) {
+        data[i] = f32::NAN;
+    }
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert_eq!(acc.mean(), 50.0);
+            assert_eq!(acc.min, 50.0);
+            assert_eq!(acc.max, 50.0);
+        }
+    }
+
+    assert_eq!(total_pixels, 200.0);
+}
+
+#[test]
+fn test_custom_nodata_override() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 30;
+    let height = 30;
+    // 0.0 is background/nodata, 100.0 is signal
+    let mut data = vec![0.0f32; width * height];
+    for i in 0..100 {
+        data[i] = 100.0;
+    }
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        custom_nodata: Some(0.0),
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert_eq!(acc.mean(), 100.0);
+        }
+    }
+
+    // Exactly 100 signal pixels counted
+    assert_eq!(total_pixels, 100.0);
 }
 
