@@ -36,16 +36,23 @@ pub struct MultiResolutionConfig {
     pub custom_crs: Option<String>,
 }
 
-impl Default for MultiResolutionConfig {
-    fn default() -> Self {
+impl MultiResolutionConfig {
+    /// Create a new multi-resolution configuration
+    pub fn new(resolutions: Vec<u8>) -> Self {
         Self {
-            resolutions: vec![8],
+            resolutions,
             band: 1,
             custom_nodata: None,
             bbox: None,
             sampling: SamplingPattern::center(),
             custom_crs: None,
         }
+    }
+}
+
+impl Default for MultiResolutionConfig {
+    fn default() -> Self {
+        Self::new(vec![8])
     }
 }
 
