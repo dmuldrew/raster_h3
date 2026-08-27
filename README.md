@@ -488,19 +488,7 @@ SELECT * FROM h3_raster_continuous_aggregate(
 
 `raster_h3` provides single-pass multi-resolution streaming via `MultiScanHorizonStreamer` and `MultiCategoricalHorizonStreamer`, enabling simultaneous extraction across multiple H3 zoom levels (e.g. resolutions 7, 8, and 9) in a **single file read**.
 
-```
-       Direct Pixel Containment                  Hierarchical Parent Rollup
-    (100% True to Raster Pixels)               (Hex-to-Hex Approximation)
- 
-         ┌───────────────┐                          ┌───────────────┐
-         │               │                          │               │
-      ●  │   Parent      │                       ┌──┴──┐  Parent    │
-  (Pixel)│   Hexagon     │                       │Child│  Hexagon   │
-         │               │                       └──┬──┘            │
-         └───────────────┘                          └───────────────┘
-  Pixel coordinate (x,y) is tested         Pixel assigned to Child Hex, then
-  directly inside Parent's true boundary   Child mapped to Parent (boundary bleed)
-```
+![Direct Pixel Containment vs Hierarchical Parent Rollup](assets/direct_vs_hierarchical.svg)
 
 ### The "Aperture 7" Challenge & True Ground-Truth Guarantee
 In the H3 Discrete Global Grid System, parent hexagons are **not** the strict geometric union of their 7 child hexagons due to an Aperture-7 angular rotation. As a result:
