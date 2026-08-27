@@ -580,6 +580,30 @@ While DuckDB and `raster_h3` can aggregate hundreds of millions of raster pixels
 
 ---
 
+### H3 Resolution to PMTiles Zoom Level Mapping
+
+Because H3 uses an **Aperture-7** hexagonal hierarchy ($7\times$ area reduction per step) while Web Mercator uses an **Aperture-4** quadtree ($4\times$ area reduction per zoom level), the mathematical scaling ratio is:
+
+$$\frac{\Delta \text{Zoom}}{\Delta R} = \log_4(7) \approx \mathbf{1.4037}$$
+
+To ensure optimal visual density on screen (**150 to 2,500 hexagons per 512px tile**) without WebGL frame drops, `raster_h3` maps H3 resolutions to Web Mercator zoom levels as follows:
+
+| H3 Res ($R$) | Avg Hexagon Area | Avg Edge Length | Geographic Scale | Recommended PMTiles Zoom | Hexagons / 512px Tile |
+| :---: | :---: | :---: | :--- | :---: | :---: |
+| **Res 0** | $4,357,449 \text{ km}^2$ | $1,107 \text{ km}$ | Global / Hemispheric | **Z0 – Z1** | ~10 – 30 |
+| **Res 1** | $609,788 \text{ km}^2$ | $418 \text{ km}$ | Continental | **Z2 – Z3** | ~30 – 100 |
+| **Res 2** | $86,801 \text{ km}^2$ | $158 \text{ km}$ | Sub-Continental / Large Nations | **Z3 – Z4** | ~50 – 200 |
+| **Res 3** | $12,393 \text{ km}^2$ | $59.8 \text{ km}$ | State / Province / Large Region | **Z5 – Z6** | ~100 – 400 |
+| **Res 4** | $1,770 \text{ km}^2$ | $22.6 \text{ km}$ | Metropolitan Area / Valley | **Z7 – Z8** | ~200 – 600 |
+| **Res 5** | $252.9 \text{ km}^2$ | $8.54 \text{ km}$ | County / Large City | **Z8 – Z9** | ~300 – 900 |
+| **Res 6** | $36.13 \text{ km}^2$ | $3.23 \text{ km}$ | Municipal / Urban District | **Z10 – Z11** | ~400 – 1,200 |
+| **Res 7** | $5.16 \text{ km}^2$ | $1.22 \text{ km}$ | Neighborhood / Watershed | **Z11 – Z12** | ~500 – 1,500 |
+| **Res 8** | $0.737 \text{ km}^2$ ($73.7 \text{ ha}$) | $461 \text{ m}$ | City Block / Industrial Park | **Z13 – Z14** | ~600 – 1,800 |
+| **Res 9** | $0.105 \text{ km}^2$ ($10.5 \text{ ha}$) | $174 \text{ m}$ | Parcel / Street Intersection | **Z14 – Z15** | ~700 – 2,200 |
+| **Res 10** | $0.015 \text{ km}^2$ ($1.5 \text{ ha}$) | $65.9 \text{ m}$ | Building Footprint / Property Lot | **Z16 – Z17** | ~800 – 2,500 |
+
+---
+
 ### How to Generate PMTiles: Two Simple Interfaces
 
 #### Option A: Directly from DuckDB SQL
