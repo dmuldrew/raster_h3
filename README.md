@@ -112,10 +112,10 @@ The table below reports live, end-to-end measured performance across increasing 
 
 | Raster Dimensions | Total Pixels | Raw File Size | 1-Core Streaming Time (Throughput) | 4-Core Rayon (Speedup) | 8-Core Rayon (Speedup) | Peak In-Flight RAM |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **$1,000 \times 1,000$** | **$1.00\text{ Mpx}$** | $3.8\text{ MB}$ | **$187.3\text{ ms}$** ($5.3\text{ Mpx/s}$) | $12.8\text{ Mpx/s}$ ($2.40\times$) | $13.0\text{ Mpx/s}$ ($2.44\times$) | **$< 0.52\text{ MB}$** |
-| **$2,000 \times 2,000$** | **$4.00\text{ Mpx}$** | $15.3\text{ MB}$ | **$734.2\text{ ms}$** ($5.4\text{ Mpx/s}$) | $13.4\text{ Mpx/s}$ ($2.46\times$) | $23.6\text{ Mpx/s}$ ($4.33\times$) | **$< 0.54\text{ MB}$** |
-| **$5,000 \times 5,000$** | **$25.00\text{ Mpx}$** | $95.4\text{ MB}$ | **$4,486.3\text{ ms}$** ($5.6\text{ Mpx/s}$) | $13.4\text{ Mpx/s}$ ($2.40\times$) | $25.3\text{ Mpx/s}$ ($4.54\times$) | **$< 0.60\text{ MB}$** |
-| **$10,000 \times 10,000$** | **$100.00\text{ Mpx}$** | $381.5\text{ MB}$ | **$17,366.1\text{ ms}$** ($5.8\text{ Mpx/s}$) | **$7,513.9\text{ ms}$** ($2.31\times$) | **$3,850.3\text{ ms}$** ($4.51\times$) | **$< 0.70\text{ MB}$** |
+| **$1,000 \times 1,000$** | **$1.00\text{ Mpx}$** | $3.8\text{ MB}$ | **$163.3\text{ ms}$** ($6.1\text{ Mpx/s}$) | $12.9\text{ Mpx/s}$ ($2.10\times$) | $13.0\text{ Mpx/s}$ ($2.12\times$) | **$< 0.52\text{ MB}$** |
+| **$2,000 \times 2,000$** | **$4.00\text{ Mpx}$** | $15.3\text{ MB}$ | **$633.8\text{ ms}$** ($6.3\text{ Mpx/s}$) | $13.5\text{ Mpx/s}$ ($2.13\times$) | $25.5\text{ Mpx/s}$ ($4.04\times$) | **$< 0.54\text{ MB}$** |
+| **$5,000 \times 5,000$** | **$25.00\text{ Mpx}$** | $95.4\text{ MB}$ | **$4,028.4\text{ ms}$** ($6.2\text{ Mpx/s}$) | $13.4\text{ Mpx/s}$ ($2.16\times$) | $25.3\text{ Mpx/s}$ ($4.08\times$) | **$< 0.60\text{ MB}$** |
+| **$10,000 \times 10,000$** | **$100.00\text{ Mpx}$** | $381.5\text{ MB}$ | **$15,956.4\text{ ms}$** ($6.3\text{ Mpx/s}$) | **$7,534.7\text{ ms}$** ($2.12\times$) | **$4,041.6\text{ ms}$** ($3.95\times$) | **$< 0.70\text{ MB}$** |
 
 #### Benchmark Environment & Hardware Testbed
 * **CPU**: 8-Core Modern Processor (e.g. Apple Silicon M-Series / AMD Ryzen 7 5800X / Intel Core i7 12th+ Gen) @ $3.2\text{ GHz} - 4.5\text{ GHz}$

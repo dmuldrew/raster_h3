@@ -201,9 +201,9 @@ impl ScanHorizonStreamer {
             sampling: config.sampling.clone(),
             gt,
             chunk_stride,
-            active_map: HashMap::default(),
-            eviction_queue: BinaryHeap::new(),
-            completed_buffer: VecDeque::new(),
+            active_map: HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default()),
+            eviction_queue: BinaryHeap::with_capacity(1024),
+            completed_buffer: VecDeque::with_capacity(2048),
             is_finished: false,
         })
     }
@@ -340,26 +340,35 @@ impl ScanHorizonStreamer {
 
                         let span_end = (c + safe_span).min(chunk.width as usize);
 
-                        for i in c..span_end {
-                            let val_raw = slice[slice_row_start + i];
-
-                            if let Some(nd_nat) = native_nodata {
-                                if nd_nat == val_raw {
-                                    continue;
+                        if native_nodata.is_none() && self.nodata.is_none() {
+                            for i in c..span_end {
+                                let val = to_f64(slice[slice_row_start + i]);
+                                if val.is_finite() {
+                                    run_acc.update(val);
                                 }
                             }
+                        } else {
+                            for i in c..span_end {
+                                let val_raw = slice[slice_row_start + i];
 
-                            let val = to_f64(val_raw);
-                            if !val.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = self.nodata {
-                                if (val - nd).abs() < 1e-6 {
+                                if let Some(nd_nat) = native_nodata {
+                                    if nd_nat == val_raw {
+                                        continue;
+                                    }
+                                }
+
+                                let val = to_f64(val_raw);
+                                if !val.is_finite() {
                                     continue;
                                 }
-                            }
+                                if let Some(nd) = self.nodata {
+                                    if (val - nd).abs() < 1e-6 {
+                                        continue;
+                                    }
+                                }
 
-                            run_acc.update(val);
+                                run_acc.update(val);
+                            }
                         }
 
                         let num_stepped = span_end - c;

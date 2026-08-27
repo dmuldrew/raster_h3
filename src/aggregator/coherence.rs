@@ -89,13 +89,15 @@ impl SpatialCoherenceCache {
         let edge_deg = H3_EDGE_DEG.get(res_u8 as usize).copied().unwrap_or(0.001);
 
         // Conservative safe factor: 0.45× edge length gives a safe inscribed box
-        // that is guaranteed to be fully inside the hexagon
-        let safe_r = edge_deg * 0.45;
+        // in latitude. In longitude, degrees expand by 1 / cos(lat) at higher latitudes.
+        let safe_r_lat = edge_deg * 0.45;
+        let cos_lat = center_lat.to_radians().cos().abs().max(0.05);
+        let safe_r_lon = (safe_r_lat / cos_lat).min(180.0);
 
-        self.min_lat = center_lat - safe_r;
-        self.max_lat = center_lat + safe_r;
-        self.min_lon = center_lon - safe_r;
-        self.max_lon = center_lon + safe_r;
+        self.min_lat = center_lat - safe_r_lat;
+        self.max_lat = center_lat + safe_r_lat;
+        self.min_lon = center_lon - safe_r_lon;
+        self.max_lon = center_lon + safe_r_lon;
     }
 
     /// Fast lookup: returns cached cell_u64 if within safe inner box, or computes new cell
@@ -168,5 +170,25 @@ mod tests {
         assert!(box_width < 0.005, "Safe box too large: {}", box_width);
         assert!(box_height > 0.001, "Safe box too small: {}", box_height);
         assert!(box_height < 0.005, "Safe box too large: {}", box_height);
+    }
+
+    #[test]
+    fn test_latitude_cosine_scaling_at_poles_and_equator() {
+        let mut cache = SpatialCoherenceCache::default();
+        let res = Resolution::Eight;
+
+        // Equator (0.0 lat): cos(0) = 1.0 -> longitude and latitude radii are equal
+        cache.get_or_compute(0.0, 10.0, res).unwrap();
+        let eq_width = cache.max_lon - cache.min_lon;
+        let eq_height = cache.max_lat - cache.min_lat;
+        assert!((eq_width - eq_height).abs() < 1e-6);
+
+        // High Arctic latitude (80.0 lat): cos(80 deg) ≈ 0.1736 -> longitude width should expand ~5.7x
+        cache.get_or_compute(80.0, 10.0, res).unwrap();
+        let arctic_width = cache.max_lon - cache.min_lon;
+        let arctic_height = cache.max_lat - cache.min_lat;
+        assert!(arctic_width > arctic_height * 5.0);
+        assert!(arctic_width < 180.0);
+        assert!(!arctic_width.is_nan());
     }
 }

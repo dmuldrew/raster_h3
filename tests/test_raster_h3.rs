@@ -1411,3 +1411,97 @@ fn test_sampling_pattern_fallback_to_center() {
     assert_eq!(default_pattern.points[0].dx, 0.5);
     assert_eq!(default_pattern.points[0].dy, 0.5);
 }
+
+#[test]
+fn test_categorical_rle_alternating_and_interspersed_nodata() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 64;
+    let height = 64;
+    let mut data = Vec::with_capacity(width * height);
+
+    // Row pattern:
+    // Half alternating [1, 2, 1, 2...]
+    // Half contiguous [10, 10, 10, NoData(255), 10, 10...]
+    let mut expected_valid_pixels = 0.0;
+    for row in 0..height {
+        for col in 0..width {
+            if row < 32 {
+                let cat = if col % 2 == 0 { 1u8 } else { 2u8 };
+                data.push(cat);
+                expected_valid_pixels += 1.0;
+            } else {
+                if col % 10 == 5 {
+                    data.push(255u8); // NoData
+                } else {
+                    data.push(10u8);
+                    expected_valid_pixels += 1.0;
+                }
+            }
+        }
+    }
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [
+            1, 1, 0, 2,
+            1024, 0, 1, 2,
+            2048, 0, 1, 4326,
+        ];
+        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 8,
+        custom_nodata: Some(255.0),
+        ..Default::default()
+    };
+
+    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_accumulated = 0.0;
+    let mut class_1_total = 0.0;
+    let mut class_2_total = 0.0;
+    let mut class_10_total = 0.0;
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_accumulated += acc.total_count;
+            if let Some(&cnt) = acc.counts.get(&1) {
+                class_1_total += cnt;
+            }
+            if let Some(&cnt) = acc.counts.get(&2) {
+                class_2_total += cnt;
+            }
+            if let Some(&cnt) = acc.counts.get(&10) {
+                class_10_total += cnt;
+            }
+            assert!(acc.counts.get(&255).is_none()); // NoData sentinel never recorded
+        }
+    }
+
+    assert_eq!(total_accumulated, expected_valid_pixels);
+    assert!(class_1_total > 0.0);
+    assert!(class_2_total > 0.0);
+    assert!(class_10_total > 0.0);
+    assert_eq!(class_1_total + class_2_total + class_10_total, expected_valid_pixels);
+}

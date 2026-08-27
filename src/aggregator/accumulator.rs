@@ -52,7 +52,22 @@ impl H3Accumulator {
     /// Update running statistics with a full pixel (weight = 1.0)
     #[inline(always)]
     pub fn update(&mut self, val: f64) {
-        self.update_weighted(val, 1.0);
+        if self.count == 0.0 {
+            self.sum = val;
+            self.count = 1.0;
+            self.min = val;
+            self.max = val;
+            self.m2 = 0.0;
+            return;
+        }
+
+        let delta = val - (self.sum / self.count);
+        self.sum += val;
+        self.count += 1.0;
+        let delta2 = val - (self.sum / self.count);
+        self.m2 += delta * delta2;
+        self.min = self.min.min(val);
+        self.max = self.max.max(val);
     }
 
     /// Branchless update of running statistics with single-pass Welford online variance

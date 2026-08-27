@@ -193,9 +193,9 @@ impl CategoricalHorizonStreamer {
             sampling: config.sampling.clone(),
             gt,
             chunk_stride,
-            active_map: HashMap::default(),
-            eviction_queue: BinaryHeap::new(),
-            completed_buffer: VecDeque::new(),
+            active_map: HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default()),
+            eviction_queue: BinaryHeap::with_capacity(1024),
+            completed_buffer: VecDeque::with_capacity(2048),
             is_finished: false,
         })
     }
@@ -334,6 +334,9 @@ impl CategoricalHorizonStreamer {
 
                         let span_end = (c + safe_span).min(chunk.width as usize);
 
+                        let mut curr_cat: Option<i64> = None;
+                        let mut curr_cat_count = 0.0;
+
                         for i in c..span_end {
                             let val_raw = slice[slice_row_start + i];
 
@@ -349,8 +352,20 @@ impl CategoricalHorizonStreamer {
                                         continue;
                                     }
                                 }
-                                run_acc.update(cat);
+                                if Some(cat) == curr_cat {
+                                    curr_cat_count += 1.0;
+                                } else {
+                                    if let Some(prev) = curr_cat {
+                                        run_acc.update_weighted(prev, curr_cat_count);
+                                    }
+                                    curr_cat = Some(cat);
+                                    curr_cat_count = 1.0;
+                                }
                             }
+                        }
+
+                        if let Some(prev) = curr_cat {
+                            run_acc.update_weighted(prev, curr_cat_count);
                         }
 
                         let num_stepped = span_end - c;
