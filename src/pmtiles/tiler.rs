@@ -388,4 +388,92 @@ impl H3PmtilesTiler {
         let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
         Self::generate_from_continuous_streamer(streamer, pmtiles_path)
     }
+
+    /// Convert any H3-indexed Parquet file directly into a PMTiles v3 archive
+    pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
+        parquet_path: P1,
+        pmtiles_path: P2,
+        h3_column_name: Option<&str>,
+    ) -> Result<PmtilesExportSummary, Box<dyn std::error::Error + Send + Sync>> {
+        use std::fs::File;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use crate::functions::fast_hex::parse_hex_u64;
+
+        let file = File::open(parquet_path)?;
+        let reader = SerializedFileReader::new(file)?;
+        let schema = reader.metadata().file_metadata().schema_descr();
+
+        // Identify H3 index column
+        let mut h3_col_idx = None;
+        if let Some(target) = h3_column_name {
+            for (idx, field) in schema.columns().iter().enumerate() {
+                if field.name().eq_ignore_ascii_case(target) {
+                    h3_col_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        if h3_col_idx.is_none() {
+            // Auto-detect common H3 column names: h3_index, h3_hex, h3, cell, hex, or column 0
+            for (idx, field) in schema.columns().iter().enumerate() {
+                let name = field.name().to_ascii_lowercase();
+                if name == "h3_index" || name == "h3_hex" || name == "h3" || name == "cell" || name == "hex" {
+                    h3_col_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let h3_idx = h3_col_idx.unwrap_or(0);
+
+        let mut features = Vec::new();
+        for row_result in reader.into_iter() {
+            let row = row_result?;
+            let mut h3_val_u64 = None;
+
+            if let Some((_, field_val)) = row.get_column_iter().nth(h3_idx) {
+                match field_val {
+                    parquet::record::Field::ULong(u) => h3_val_u64 = Some(*u),
+                    parquet::record::Field::Long(i) => h3_val_u64 = Some(*i as u64),
+                    parquet::record::Field::Str(s) => {
+                        h3_val_u64 = parse_hex_u64(s);
+                    }
+                    parquet::record::Field::Bytes(b) => {
+                        if let Ok(s) = std::str::from_utf8(b.data()) {
+                            h3_val_u64 = parse_hex_u64(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(h3_u64) = h3_val_u64 {
+                let mut properties = Vec::new();
+                for (col_i, (name, field_val)) in row.get_column_iter().enumerate() {
+                    if col_i == h3_idx {
+                        continue;
+                    }
+                    match field_val {
+                        parquet::record::Field::Double(d) => properties.push((name.to_string(), MvtValue::Double(*d))),
+                        parquet::record::Field::Float(f) => properties.push((name.to_string(), MvtValue::Float(*f))),
+                        parquet::record::Field::Long(i) => properties.push((name.to_string(), MvtValue::Int(*i))),
+                        parquet::record::Field::ULong(u) => properties.push((name.to_string(), MvtValue::UInt(*u))),
+                        parquet::record::Field::Int(i) => properties.push((name.to_string(), MvtValue::Int(*i as i64))),
+                        parquet::record::Field::UInt(u) => properties.push((name.to_string(), MvtValue::UInt(*u as u64))),
+                        parquet::record::Field::Short(s) => properties.push((name.to_string(), MvtValue::Int(*s as i64))),
+                        parquet::record::Field::UShort(u) => properties.push((name.to_string(), MvtValue::UInt(*u as u64))),
+                        parquet::record::Field::Byte(b) => properties.push((name.to_string(), MvtValue::Int(*b as i64))),
+                        parquet::record::Field::UByte(u) => properties.push((name.to_string(), MvtValue::UInt(*u as u64))),
+                        parquet::record::Field::Str(s) => properties.push((name.to_string(), MvtValue::String(s.clone()))),
+                        parquet::record::Field::Bool(b) => properties.push((name.to_string(), MvtValue::Bool(*b))),
+                        _ => {}
+                    }
+                }
+                features.push(H3Feature::new(h3_u64, properties));
+            }
+        }
+
+        Self::export_h3_features(features, pmtiles_path)
+    }
 }

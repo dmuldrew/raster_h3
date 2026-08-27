@@ -620,8 +620,8 @@ SELECT * FROM h3_raster_to_pmtiles(
 );
 ```
 
-#### Option B: Standalone CLI Tool
-Convert any GeoTIFF directly from the command line without DuckDB:
+#### Option B: Standalone Raster CLI Tool
+Convert any GeoTIFF directly from the command line:
 
 ```bash
 # Convert a GeoTIFF to a multi-resolution PMTiles vector archive (Zoom levels 11 & 13)
@@ -630,6 +630,17 @@ cargo run --release --example raster_to_pmtiles -- \
   --output data/california_elevation.pmtiles \
   --resolutions 7,8 \
   --sampling center
+```
+
+#### Option C: Convert H3 Parquet Files to PMTiles
+Convert any existing Parquet file with H3 indices directly into a PMTiles archive:
+
+```bash
+# Convert an H3-indexed Parquet file to PMTiles (auto-detects H3 column & properties)
+cargo run --release --example parquet_to_pmtiles -- \
+  --input data/demographics_h3.parquet \
+  --output data/demographics.pmtiles \
+  --h3-col h3_index
 ```
 
 ---
