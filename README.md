@@ -45,7 +45,7 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 
 ### Project Goals
 - **Zero Python / Zero GDAL C++ Dependencies**: A pure Rust engine compiled into a single self-contained native dynamic library (`.dylib`, `.so`, `.dll`).
-- **Bounded Constant Memory ($\mathcal{O}(\text{Scan Front}) < 15\text{ MB}$ RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
+- **Bounded Constant Memory ($O(\text{Scan Front}) < 15\text{ MB}$ RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
 - **Hardware-Saturating Throughput**: Processes **80M–150M pixels/sec per core** and scales to **600M–1.2B pixels/sec** across multi-threaded DuckDB query scans.
 - **Sub-Pixel Area-Weighted Anti-Aliasing**: Supports multi-point super-sampling (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact area-proportional boundary aggregation.
 
@@ -105,7 +105,7 @@ Traditional pipelines require writing intermediate shapefiles or GeoTIFFs to dis
 | **Throughput** | ~1.5M – 2.5M px/sec | ~0.3M – 0.6M px/sec | ~0.4M – 0.8M px/sec | **80M – 150M px/sec** | **600M – 1.2B px/sec** |
 | **Peak RAM Usage** | **4 GB – 8 GB (OOM risk)** | **2 GB – 6 GB** (DB shared buffers) | **3 GB – 6 GB** (Intermediate disk/RAM) | **< 15 MB** | **< 15 MB** |
 | **Intermediate Storage**| None / NumPy arrays | Heavy database bloat | Massive intermediate shapefiles | **Zero (0 bytes)** | **Zero (0 bytes)** |
-| **Speedup vs Python** | $1\times$ (Baseline) | $0.25\times$ (Slower) | $0.4\times$ (Slower) | **~40× – 60× Faster** | **~250× – 450× Faster** |
+| **Speedup vs Python** | 1× (Baseline) | 0.25× (Slower) | 0.4× (Slower) | **~40× – 60× Faster** | **~250× – 450× Faster** |
 
 ---
 
@@ -144,10 +144,10 @@ Traditional pipelines require writing intermediate shapefiles or GeoTIFFs to dis
 | 9 | ROI Bounding Box Chunk Pruning | Skips unneeded chunks upfront |
 | 10 | Native Parallelism & Cardinality | 100% saturation across all CPU cores |
 
-### 1. Southernmost Scan-Line Horizon Eviction ($\text{Lat}_{\text{south}}$)
+### 1. Southernmost Scan-Line Horizon Eviction
 Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
 - Finished hexagons are immediately evicted from the hash map and streamed into DuckDB vector chunks.
-- Active memory remains strictly bounded to $\mathcal{O}(\text{Scan Front Width})$ (**$< 15\text{ MB}$ RAM**), allowing a 16 GB laptop to seamlessly process a 500 GB global raster.
+- Active memory remains strictly bounded to $O(\text{Scan Front Width})$ (**< 15 MB RAM**), allowing a 16 GB laptop to seamlessly process a 500 GB global raster.
 
 ### 2. Row-Constant Latitude Hoisting
 On North-Up rasters (Web Mercator EPSG:3857, WGS84 EPSG:4326, UTM), latitude is identical across all pixels in a row.
@@ -155,13 +155,13 @@ On North-Up rasters (Web Mercator EPSG:3857, WGS84 EPSG:4326, UTM), latitude is 
 - Eliminates **99.8% of coordinate projection math**.
 
 ### 3. Linear Longitude Stepping
-Column coordinates advance via a single 1-cycle addition ($\text{lon} += \Delta\text{lon}$) per pixel without trigonometric evaluation.
+Column coordinates advance via a single 1-cycle addition ($\text{lon} \mathrel{+}= \Delta\text{lon}$) per pixel without trigonometric evaluation.
 
 ### 4. In-Register Run Accumulation
 Contiguous pixels within the same H3 cell update running statistics directly in CPU registers (`run_acc`). The hash table is only probed when crossing a cell boundary, eliminating **~98% of hash table lookups**.
 
 ### 5. Scanline Run-Skipping (AVX2 / ARM NEON SIMD)
-Upon entering an H3 cell, the engine calculates the safe pixel span $K = \lfloor (lon_{\max} - lon)/\Delta lon \rfloor$ and aggregates contiguous slices in flat vector loops (processing **8 to 16 pixels per CPU cycle**).
+Upon entering an H3 cell, the engine calculates the safe pixel span $K = \lfloor (\text{lon}_{\max} - \text{lon}) / \Delta\text{lon} \rfloor$ and aggregates contiguous slices in flat vector loops (processing **8 to 16 pixels per CPU cycle**).
 
 ### 6. Branchless Hardware Floating-Point Reductions
 Replaces branchy `if val < min` conditional logic with `self.min.min(val)` and `self.max.max(val)`, compiling directly to hardware instructions (`minsd`/`maxsd` on x86_64, `fminnm`/`fmaxnm` on ARM64) with **zero branch mispredictions**.
@@ -360,13 +360,13 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 | Preset Name | Points | Weighting | Geometric Rationale | Why & When to Use |
 | :--- | :---: | :--- | :--- | :--- |
 | **`'center'`** *(default)* | 1 | $1.0$ (Center) | Centroid evaluation | **Maximum speed**: Best when raster pixels are much smaller than H3 cells (e.g. 10m Sentinel vs Res 7 cells). |
-| **`'rgss'`** / `'rotated4'` ⭐ | 4 | $0.25$ each | $26.6^\circ$ rotated grid ($\arctan 0.5$) | **Best overall balance**: No two points share the same X or Y axis, eliminating collinear boundary blind spots with only 4 samples. |
+| **`'rgss'`** / `'rotated4'` ⭐ | 4 | $0.25$ each | 26.6° rotated grid ($\arctan 0.5$) | **Best overall balance**: No two points share the same X or Y axis, eliminating collinear boundary blind spots with only 4 samples. |
 | **`'hex'`** / `'7point'` | 7 | $\frac{1}{7}$ each | Inscribed regular hexagon | **H3 Geometry Alignment**: Matches the natural hexagonal symmetry of H3 cell edges with zero directional bias. |
 | **`'gaussian'`** / `'psf'` | 5 | Center $0.50$, Edges $0.125$ | Gaussian Point Spread Function | **Optical Sensor Emulation**: Emulates real-world satellite sensor response where the pixel center is more sensitive than the corners. |
 | **`'5point'`** / `'quincunx'` | 5 | $0.20$ each | Center + 4 diagonal corners | **Classic Area Weighting**: Standard 5-point super-sampling. |
 | **`'8rooks'`** / `'stratified8'`| 8 | $\frac{1}{8}$ each | Latin Hypercube non-attacking rooks | **Diagonal Anti-Aliasing**: Eliminates sample clumping along diagonal hexagon edges. |
-| **`'9point'`** / `'3x3'` | 9 | $\frac{1}{9}$ each | Regular $3 \times 3$ grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
-| **`'16point'`** / `'4x4'` | 16 | $\frac{1}{16}$ each | Regular $4 \times 4$ grid | **Coarse $\rightarrow$ Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
+| **`'9point'`** / `'3x3'` | 9 | $\frac{1}{9}$ each | Regular 3 × 3 grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
+| **`'16point'`** / `'4x4'` | 16 | $\frac{1}{16}$ each | Regular 4 × 4 grid | **Coarse → Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
 
 ---
 
@@ -470,7 +470,7 @@ Use for continuous spatial surfaces (elevation, temperature, rainfall, satellite
 | Statistic | Mathematical Formula | Geospatial Analytics Use Case | Why & When to Use |
 | :--- | :--- | :--- | :--- |
 | **`mean`** | $\bar{x} = \frac{\sum w_i \cdot x_i}{\sum w_i}$ | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health, mean slope. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
-| **`stddev`** | $s = \sqrt{\frac{M_2}{\sum w_i - 1}}$ where $M_2 = \sum w_i (x_i - \bar{x}\_{k-1})(x_i - \bar{x}\_k)$ | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep canyons/cliffs; low `stddev` indicates flat plains. |
+| **`stddev`** | $s = \sqrt{\frac{M_2}{\sum w_i - 1}}$ where $M_2 = \sum w_i (x_i - \bar{x}_{k-1})(x_i - \bar{x}_k)$ | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep canyons/cliffs; low `stddev` indicates flat plains. |
 | **`count`** | $N = \sum w_i$ | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns the integer count of pixels in the cell. In super-sampling (`rgss`, `hex`), returns fractional area coverage (e.g. `142.75` px). |
 | **`min`** | $\min_i(x_i)$ | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch misprediction penalties. |
 | **`max`** | $\max_i(x_i)$ | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building/canopy height in DSM rasters. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
@@ -616,8 +616,8 @@ flowchart TD
 | :--- | :--- | :--- |
 | [`h3o`](https://crates.io/crates/h3o) `v0.6` | Pure-Rust H3 Engine | Provides 100% pure-Rust implementation of Uber's H3 Discrete Global Grid System. Replaces the C H3 library, enabling zero-copy boundary extraction, cell indexing, and fast lat/lng conversions without C/C++ toolchain dependencies or FFI boundary overhead. |
 | [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Directly maps GeoTIFF files from disk into userspace virtual memory, completely bypassing `read()` syscalls and intermediate buffer copies. Enables issuing kernel-level `madvise(MADV_SEQUENTIAL)` readahead hints to prefetch disk blocks in 2MB–4MB bursts. |
-| [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression. Decodes individual tiles and strips on-demand directly from memory-mapped slices and frees them immediately, maintaining flat $\mathcal{O}(1)$ memory consumption. |
-| [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Standalone Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 geodetic transformations (UTM, Transverse Mercator, Lambert Conformal Conic $\rightarrow$ WGS84). Replaces the massive multi-gigabyte C++ `libproj` library with a thread-safe, self-contained coordinate transformer. |
+| [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression. Decodes individual tiles and strips on-demand directly from memory-mapped slices and frees them immediately, maintaining flat $O(1)$ memory consumption. |
+| [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Standalone Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 geodetic transformations (UTM, Transverse Mercator, Lambert Conformal Conic → WGS84). Replaces the massive multi-gigabyte C++ `libproj` library with a thread-safe, self-contained coordinate transformer. |
 | [`fxhash`](https://crates.io/crates/fxhash) `v0.2` | Fast Non-Cryptographic Hasher | Provides the Firefox-derived FxHash algorithm for `HashMap` keys. Delivers near-identity-hash throughput for 64-bit integer H3 cell keys while maintaining robust collision resistance across mixed key distributions used by both continuous accumulators and categorical frequency maps. |
 | [`rayon`](https://crates.io/crates/rayon) `v1.10` | Work-Stealing Parallelism | Provides lightweight, lock-free work-stealing data parallelism for concurrent chunk decompression and aggregation across all available CPU cores. |
 | [`thiserror`](https://crates.io/crates/thiserror) & [`serde`](https://crates.io/crates/serde) | Robust Error & Data Handling | Provides ergonomic, zero-overhead typed error propagation across DuckDB C-FFI boundaries without panics. |
