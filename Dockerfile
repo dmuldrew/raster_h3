@@ -63,6 +63,7 @@ COPY --from=builder /build/target/release/libraster_h3.so /extensions/raster_h3.
 COPY --from=builder /build/target/release/libraster_h3.so /extensions/libraster_h3.so
 COPY --from=builder /build/sample_sf.tif /data/sample_sf.tif
 COPY demo.sql /app/demo.sql
+COPY e2e_performance.sql /app/e2e_performance.sql
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
