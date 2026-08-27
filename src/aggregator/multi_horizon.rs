@@ -222,9 +222,17 @@ impl MultiScanHorizonStreamer {
             let active_map = &mut self.active_maps[res_idx];
             let eviction_queue = &mut self.eviction_queues[res_idx];
 
-            for r in 0..chunk.height {
-                let row_idx = (chunk.row_offset + r) as usize;
-                let slice_row_start = (r * self.chunk_stride) as usize;
+            let stride = if self.chunk_stride > 0 && slice.len() >= self.chunk_stride as usize {
+                self.chunk_stride as usize
+            } else {
+                (chunk.width as usize).max(1)
+            };
+            let actual_rows = (slice.len() / stride).min(chunk.height as usize);
+
+            for r in 0..actual_rows {
+                let row_idx = (chunk.row_offset + r as u32) as usize;
+                let slice_row_start = r * stride;
+                let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
                 let mut row_cache = SpatialCoherenceCache::default();
 
                 if self.sampling.is_single_point() {
@@ -249,7 +257,7 @@ impl MultiScanHorizonStreamer {
                     };
 
                     let mut c = 0;
-                    while c < chunk.width as usize {
+                    while c < row_width {
                         let (lon, lat) = if is_wgs84 || is_web_mercator {
                             (lon_curr, lat_row)
                         } else {
@@ -303,7 +311,7 @@ impl MultiScanHorizonStreamer {
                                 1
                             };
 
-                            let span_end = (c + safe_span).min(chunk.width as usize);
+                            let span_end = (c + safe_span).min(row_width);
 
                             if native_nodata.is_none() && self.nodata.is_none() {
                                 for i in c..span_end {
@@ -363,7 +371,7 @@ impl MultiScanHorizonStreamer {
                             });
                     }
                 } else {
-                    for c in 0..chunk.width as usize {
+                    for c in 0..row_width {
                         let val_raw = slice[slice_row_start + c];
                         if let Some(nd_nat) = native_nodata {
                             if nd_nat == val_raw {
@@ -710,9 +718,17 @@ impl MultiCategoricalHorizonStreamer {
             let active_map = &mut self.active_maps[res_idx];
             let eviction_queue = &mut self.eviction_queues[res_idx];
 
-            for r in 0..chunk.height {
-                let row_idx = (chunk.row_offset + r) as usize;
-                let slice_row_start = (r * self.chunk_stride) as usize;
+            let stride = if self.chunk_stride > 0 && slice.len() >= self.chunk_stride as usize {
+                self.chunk_stride as usize
+            } else {
+                (chunk.width as usize).max(1)
+            };
+            let actual_rows = (slice.len() / stride).min(chunk.height as usize);
+
+            for r in 0..actual_rows {
+                let row_idx = (chunk.row_offset + r as u32) as usize;
+                let slice_row_start = r * stride;
+                let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
                 let mut row_cache = SpatialCoherenceCache::default();
 
                 if self.sampling.is_single_point() {
@@ -737,7 +753,7 @@ impl MultiCategoricalHorizonStreamer {
                     };
 
                     let mut c = 0;
-                    while c < chunk.width as usize {
+                    while c < row_width {
                         let (lon, lat) = if is_wgs84 || is_web_mercator {
                             (lon_curr, lat_row)
                         } else {
@@ -791,7 +807,7 @@ impl MultiCategoricalHorizonStreamer {
                                 1
                             };
 
-                            let span_end = (c + safe_span).min(chunk.width as usize);
+                            let span_end = (c + safe_span).min(row_width);
 
                             let mut curr_cat: Option<i64> = None;
                             let mut curr_cat_count = 0.0;
@@ -854,7 +870,7 @@ impl MultiCategoricalHorizonStreamer {
                             });
                     }
                 } else {
-                    for c in 0..chunk.width as usize {
+                    for c in 0..row_width {
                         let val_raw = slice[slice_row_start + c];
                         if let Some(nd_nat) = native_nodata {
                             if nd_nat == val_raw {
