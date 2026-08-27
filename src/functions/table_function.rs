@@ -447,9 +447,9 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         // Set callbacks including parallel init_local and projection pushdown
         duckdb_table_function_set_bind(tf, raster_h3_bind);
         duckdb_table_function_set_init(tf, raster_h3_init);
-        duckdb_table_function_set_init_local(tf, raster_h3_init_local);
+        duckdb_table_function_set_local_init(tf, raster_h3_init_local);
         duckdb_table_function_set_function(tf, raster_h3_scan);
-        duckdb_table_function_set_projection_pushdown(tf, true);
+        duckdb_table_function_supports_projection_pushdown(tf, true);
 
         let state = duckdb_register_table_function(con, tf);
 

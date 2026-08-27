@@ -39,28 +39,36 @@ RUN set -eux; \
         *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac; \
     if [ "$DUCKDB_VERSION" = "latest" ]; then \
-        DOWNLOAD_URL="https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-${DUCK_ARCH}.zip"; \
+        CLI_URL="https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-${DUCK_ARCH}.zip"; \
+        LIB_URL="https://github.com/duckdb/duckdb/releases/latest/download/libduckdb-${DUCK_ARCH}.zip"; \
     else \
-        DOWNLOAD_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${DUCK_ARCH}.zip"; \
+        CLI_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${DUCK_ARCH}.zip"; \
+        LIB_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-${DUCK_ARCH}.zip"; \
     fi; \
-    curl -fsSL "$DOWNLOAD_URL" -o duckdb.zip; \
+    curl -fsSL "$CLI_URL" -o duckdb.zip; \
     unzip duckdb.zip -d /usr/local/bin; \
     chmod +x /usr/local/bin/duckdb; \
-    rm duckdb.zip
+    rm duckdb.zip; \
+    curl -fsSL "$LIB_URL" -o libduckdb.zip; \
+    unzip libduckdb.zip -d /tmp/libduckdb; \
+    mv /tmp/libduckdb/libduckdb.so /usr/local/lib/; \
+    rm -rf /tmp/libduckdb libduckdb.zip; \
+    ldconfig
 
 # Create directories
 RUN mkdir -p /extensions /data /app /root
 
 # Copy extension library and sample data from builder
+COPY --from=builder /build/target/release/libraster_h3.so /extensions/raster_h3.duckdb_extension
 COPY --from=builder /build/target/release/libraster_h3.so /extensions/libraster_h3.so
 COPY --from=builder /build/sample_sf.tif /data/sample_sf.tif
 COPY demo.sql /app/demo.sql
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Configure default .duckdbrc to allow unsigned extensions
-RUN echo "SET allow_unsigned_extensions=true;" > /root/.duckdbrc
+ENV LD_PRELOAD=/usr/local/lib/libduckdb.so
 
+# Set working directory
 WORKDIR /data
 
 # Expose volume mount point for external GeoTIFF data

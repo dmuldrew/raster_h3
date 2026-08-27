@@ -32,6 +32,31 @@ pub struct ChunkLayout {
 }
 
 impl ChunkLayout {
+    /// Create layout for tiled TIFFs
+    pub fn new_tiled(image_width: u32, image_height: u32, tile_width: u32, tile_height: u32) -> Self {
+        let chunks_across = (image_width + tile_width - 1) / tile_width;
+        let chunks_down = (image_height + tile_height - 1) / tile_height;
+        Self {
+            chunk_width: tile_width,
+            chunk_height: tile_height,
+            chunks_across,
+            chunks_down,
+            total_chunks: chunks_across * chunks_down,
+        }
+    }
+
+    /// Create layout for striped TIFFs
+    pub fn new_striped(image_width: u32, image_height: u32, rows_per_strip: u32) -> Self {
+        let chunks_down = (image_height + rows_per_strip - 1) / rows_per_strip;
+        Self {
+            chunk_width: image_width,
+            chunk_height: rows_per_strip,
+            chunks_across: 1,
+            chunks_down,
+            total_chunks: chunks_down,
+        }
+    }
+
     /// Calculate grid bounds for a given chunk index
     pub fn get_chunk_bounds(&self, chunk_index: u32, image_width: u32, image_height: u32) -> RasterChunk {
         let chunk_col = chunk_index % self.chunks_across;

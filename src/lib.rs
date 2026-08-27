@@ -43,8 +43,8 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
     true
 }
 
-/// Version entry point invoked by DuckDB
+/// Version entry point invoked by DuckDB (specifies C-API version v0.0.1)
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_version() -> *const c_char {
-    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+    c"v0.0.1".as_ptr()
 }

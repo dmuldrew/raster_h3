@@ -1,18 +1,21 @@
 use std::fs::File;
 use std::io::BufWriter;
+use std::path::Path;
 use tempfile::NamedTempFile;
 use tiff::encoder::colortype::{Gray16, Gray32Float, Gray64Float, Gray8};
 use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
+use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::{
-    compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
+    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
     CategoricalAccumulator, CategoricalHorizonStreamer, H3Accumulator,
     SamplingPattern, ScanHorizonStreamer, SpatialCoherenceCache,
 };
 use raster_h3::crs::CrsTransformer;
+use raster_h3::error::RasterH3Error;
 use raster_h3::functions::fast_hex_u64;
-use raster_h3::raster::{GeoTiffStreamReader, GeoTransform, PrefetchedChunkReader};
+use raster_h3::raster::{ChunkLayout, GeoTiffStreamReader, GeoTransform, PrefetchedChunkReader};
 
 #[test]
 fn test_geotransform_accuracy() {
@@ -886,3 +889,525 @@ fn test_custom_nodata_override() {
     assert_eq!(total_pixels, 100.0);
 }
 
+#[test]
+fn test_crs_southern_hemisphere_utm() {
+    // UTM Zone 33S (EPSG:32733) - Southern Africa / Namibia area
+    let transformer = CrsTransformer::from_crs_or_epsg(Some(32733), None).unwrap();
+    let (lon, lat) = transformer.transform_point(500000.0, 6200000.0).unwrap();
+    // Central meridian for Zone 33 is 15°E
+    assert!((lon - 15.0).abs() < 0.1, "Expected lon near 15°E, got: {}", lon);
+    // Northing 6,200,000 in Southern hemisphere maps to ~ -34.3° S
+    assert!(lat < -30.0 && lat > -40.0, "Expected negative latitude in S hemisphere, got: {}", lat);
+}
+
+#[test]
+fn test_crs_custom_albers_proj_string() {
+    // Standard CONUS Albers Equal-Area projection
+    let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs";
+    let transformer = CrsTransformer::from_proj_string(proj_str).unwrap();
+
+    // Origin (0.0, 0.0) in projection meters maps to (-96.0, 37.5) in WGS84
+    let (lon, lat) = transformer.transform_point(0.0, 0.0).unwrap();
+    assert!((lon - -96.0).abs() < 0.01, "Expected lon near -96.0, got: {}", lon);
+    assert!((lat - 37.5).abs() < 0.01, "Expected lat near 37.5, got: {}", lat);
+}
+
+#[test]
+fn test_crs_invalid_proj_string_error_handling() {
+    let result = CrsTransformer::from_proj_string("+proj=totally_invalid_nonexistent_proj");
+    assert!(result.is_err(), "Expected error on invalid PROJ string");
+    match result {
+        Err(RasterH3Error::CrsError(msg)) => {
+            assert!(msg.contains("Failed to parse source PROJ string"), "Unexpected message: {}", msg);
+        }
+        _ => panic!("Expected RasterH3Error::CrsError"),
+    }
+}
+
+#[test]
+fn test_categorical_tied_majority() {
+    let mut acc = CategoricalAccumulator::new();
+    // Exactly 50 pixels of class 10 and 50 pixels of class 20
+    for _ in 0..50 {
+        acc.update(10);
+    }
+    for _ in 0..50 {
+        acc.update(20);
+    }
+
+    assert_eq!(acc.total_count, 100.0);
+    assert_eq!(acc.unique_classes(), 2);
+
+    let (maj_cat, maj_cnt, maj_frac) = acc.majority();
+    // Deterministically returns one of the two top classes
+    assert!(maj_cat == 10 || maj_cat == 20);
+    assert_eq!(maj_cnt, 50.0);
+    assert!((maj_frac - 0.50).abs() < 1e-6);
+}
+
+#[test]
+fn test_categorical_homogeneous_raster() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    let width = 30;
+    let height = 30;
+    // 100% class 40 (Cropland)
+    let data = vec![40u8; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 9,
+        ..Default::default()
+    };
+
+    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut all_yielded = Vec::new();
+
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        all_yielded.extend(batch);
+    }
+
+    assert!(!all_yielded.is_empty());
+    let total_pixels: f64 = all_yielded.iter().map(|(_, acc)| acc.total_count).sum();
+    assert_eq!(total_pixels, 900.0);
+
+    for (_, acc) in &all_yielded {
+        let (maj_cat, _, maj_frac) = acc.majority();
+        assert_eq!(maj_cat, 40);
+        assert!((maj_frac - 1.0).abs() < 1e-6);
+        let json = acc.histogram_json();
+        assert_eq!(json, "{\"40\": 1.0000}");
+    }
+}
+
+#[test]
+fn test_scalar_resolution_and_parent_calculations() {
+    let lat_lng = LatLng::new(37.7749, -122.4194).unwrap();
+
+    let resolutions = [
+        (0, Resolution::Zero),
+        (4, Resolution::Four),
+        (8, Resolution::Eight),
+        (10, Resolution::Ten),
+        (12, Resolution::Twelve),
+        (15, Resolution::Fifteen),
+    ];
+
+    for (res_num, res_enum) in resolutions {
+        let cell = lat_lng.to_cell(res_enum);
+        let cell_u64: u64 = cell.into();
+
+        // 1. Bitshift resolution extraction
+        let extracted_res = (cell_u64 >> 52) & 0x0F;
+        assert_eq!(extracted_res, res_num as u64);
+
+        // 2. Parent calculation at lower resolution (if resolution > 0)
+        if res_num > 4 {
+            let parent_opt = cell.parent(Resolution::Four);
+            assert!(parent_opt.is_some());
+            let parent_u64: u64 = parent_opt.unwrap().into();
+            let parent_res = (parent_u64 >> 52) & 0x0F;
+            assert_eq!(parent_res, 4);
+        }
+    }
+}
+
+#[test]
+fn test_invalid_resolution_parameter_error() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let data = vec![1.0f32; 100];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let image = encoder.new_image::<Gray32Float>(10, 10).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    // Resolution 16 is invalid in H3 (valid range: 0..=15)
+    let invalid_config = AggregationConfig {
+        resolution: 16,
+        ..Default::default()
+    };
+
+    let res_cont = ScanHorizonStreamer::new(reader.clone(), &invalid_config);
+    assert!(res_cont.is_err());
+    match res_cont {
+        Err(RasterH3Error::InvalidParameter(msg)) => {
+            assert!(msg.contains("Invalid H3 resolution: 16"), "Unexpected message: {}", msg);
+        }
+        _ => panic!("Expected RasterH3Error::InvalidParameter"),
+    }
+
+    let res_cat = CategoricalHorizonStreamer::new(reader, &invalid_config);
+    assert!(res_cat.is_err());
+    match res_cat {
+        Err(RasterH3Error::InvalidParameter(msg)) => {
+            assert!(msg.contains("Invalid H3 resolution: 16"), "Unexpected message: {}", msg);
+        }
+        _ => panic!("Expected RasterH3Error::InvalidParameter"),
+    }
+}
+
+#[test]
+fn test_nonexistent_file_path_error() {
+    let result = GeoTiffStreamReader::open(Path::new("/nonexistent_directory/nonexistent_file.tif"));
+    assert!(result.is_err());
+    match result {
+        Err(RasterH3Error::Io(_)) => {}
+        _ => panic!("Expected RasterH3Error::Io"),
+    }
+}
+
+#[test]
+fn test_plain_tiff_without_geokeys() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    let data = vec![42.0f32; 100];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let image = encoder.new_image::<Gray32Float>(10, 10).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    // Non-georeferenced images should gracefully fallback to default GeoTransform & identity CRS
+    assert_eq!(reader.metadata.epsg, None);
+    assert_eq!(reader.metadata.geotransform, GeoTransform::default());
+
+    let config = AggregationConfig {
+        resolution: 4,
+        ..Default::default()
+    };
+
+    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_pixels = 0.0;
+    loop {
+        let batch = streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_pixels += acc.count;
+            assert_eq!(acc.mean(), 42.0);
+        }
+    }
+    assert_eq!(total_pixels, 100.0);
+}
+
+#[test]
+fn test_tiled_chunk_layout_calculation() {
+    // 512x512 image tiled into 256x256 tiles -> 2 cols x 2 rows = 4 tiles total
+    let layout = ChunkLayout::new_tiled(512, 512, 256, 256);
+    assert_eq!(layout.total_chunks, 4);
+    assert_eq!(layout.chunks_across, 2);
+    assert_eq!(layout.chunks_down, 2);
+
+    // Tile (0, 0)
+    let chunk0 = layout.get_chunk_bounds(0, 512, 512);
+    assert_eq!(chunk0.col_offset, 0);
+    assert_eq!(chunk0.row_offset, 0);
+    assert_eq!(chunk0.width, 256);
+    assert_eq!(chunk0.height, 256);
+
+    // Tile (1, 0)
+    let chunk1 = layout.get_chunk_bounds(1, 512, 512);
+    assert_eq!(chunk1.col_offset, 256);
+    assert_eq!(chunk1.row_offset, 0);
+    assert_eq!(chunk1.width, 256);
+    assert_eq!(chunk1.height, 256);
+
+    // Tile (0, 1)
+    let chunk2 = layout.get_chunk_bounds(2, 512, 512);
+    assert_eq!(chunk2.col_offset, 0);
+    assert_eq!(chunk2.row_offset, 256);
+    assert_eq!(chunk2.width, 256);
+    assert_eq!(chunk2.height, 256);
+
+    // Tile (1, 1)
+    let chunk3 = layout.get_chunk_bounds(3, 512, 512);
+    assert_eq!(chunk3.col_offset, 256);
+    assert_eq!(chunk3.row_offset, 256);
+    assert_eq!(chunk3.width, 256);
+    assert_eq!(chunk3.height, 256);
+}
+
+#[test]
+fn test_chunk_intersects_bbox_tile_filtering() {
+    let layout = ChunkLayout::new_tiled(200, 200, 100, 100);
+    let gt = GeoTransform {
+        c0: 0.0,
+        a: 1.0,
+        b: 0.0,
+        f0: 200.0,
+        d: 0.0,
+        e: -1.0,
+    };
+    let transformer = CrsTransformer::Wgs84Identity;
+
+    // Tile 0 covers cols [0..100], rows [0..100] -> x: [0..100], y: [100..200]
+    let chunk0 = layout.get_chunk_bounds(0, 200, 200);
+    // Tile 3 covers cols [100..200], rows [100..200] -> x: [100..200], y: [0..100]
+    let chunk3 = layout.get_chunk_bounds(3, 200, 200);
+
+    // Query bbox in upper-left: [10, 150, 50, 180]
+    let bbox_upper_left = [10.0, 150.0, 50.0, 180.0];
+    assert!(chunk_intersects_bbox(&chunk0, &gt, &transformer, &bbox_upper_left));
+    assert!(!chunk_intersects_bbox(&chunk3, &gt, &transformer, &bbox_upper_left));
+
+    // Query bbox in lower-right: [120, 10, 180, 50]
+    let bbox_lower_right = [120.0, 10.0, 180.0, 50.0];
+    assert!(!chunk_intersects_bbox(&chunk0, &gt, &transformer, &bbox_lower_right));
+    assert!(chunk_intersects_bbox(&chunk3, &gt, &transformer, &bbox_lower_right));
+}
+
+#[test]
+fn test_accumulator_single_sample_variance_and_empty_default() {
+    // Empty accumulator
+    let acc_empty = H3Accumulator::default();
+    assert_eq!(acc_empty.count, 0.0);
+    assert!(acc_empty.mean().is_nan());
+    assert!(acc_empty.variance().is_nan());
+    assert!(acc_empty.stddev().is_nan());
+    assert_eq!(acc_empty.min, f64::INFINITY);
+    assert_eq!(acc_empty.max, f64::NEG_INFINITY);
+
+    // Single sample accumulator (variance must be exactly 0.0)
+    let acc_single = H3Accumulator::new(99.0);
+    assert_eq!(acc_single.count, 1.0);
+    assert_eq!(acc_single.mean(), 99.0);
+    assert_eq!(acc_single.variance(), 0.0);
+    assert_eq!(acc_single.stddev(), 0.0);
+    assert_eq!(acc_single.min, 99.0);
+    assert_eq!(acc_single.max, 99.0);
+}
+
+#[test]
+fn test_categorical_accumulator_merge_operations() {
+    let mut acc1 = CategoricalAccumulator::new();
+    acc1.update(10);
+    acc1.update(10);
+    acc1.update(20);
+
+    let mut acc2 = CategoricalAccumulator::new();
+    acc2.update(20);
+    acc2.update(30);
+
+    acc1.merge(&acc2);
+
+    assert_eq!(acc1.total_count, 5.0);
+    assert_eq!(acc1.unique_classes(), 3);
+    assert_eq!(acc1.counts[&10], 2.0);
+    assert_eq!(acc1.counts[&20], 2.0);
+    assert_eq!(acc1.counts[&30], 1.0);
+
+    let (maj_cat, maj_cnt, maj_frac) = acc1.majority();
+    assert!(maj_cat == 10 || maj_cat == 20);
+    assert_eq!(maj_cnt, 2.0);
+    assert_eq!(maj_frac, 0.40);
+}
+
+#[test]
+fn test_geotransform_inverse_precision() {
+    let gt = GeoTransform {
+        c0: -122.4194,
+        a: 0.0008333333333333334,
+        b: 0.0,
+        f0: 37.7749,
+        d: 0.0,
+        e: -0.0008333333333333334,
+    };
+
+    // Forward transform pixel (150.0, 250.0)
+    let (x, y) = gt.pixel_to_coord(150.0, 250.0);
+    // Reverse transform coordinate back to pixel
+    let (col, row) = gt.coord_to_pixel(x, y).unwrap();
+
+    assert!((col - 150.0).abs() < 1e-7);
+    assert!((row - 250.0).abs() < 1e-7);
+}
+
+#[test]
+fn test_tiled_uneven_chunk_layout_and_bounds() {
+    // 500x300 image tiled into 256x256 tiles -> 2 cols x 2 rows = 4 tiles total
+    // Uneven edges: right column width = 244, bottom row height = 44
+    let layout = ChunkLayout::new_tiled(500, 300, 256, 256);
+    assert_eq!(layout.total_chunks, 4);
+    assert_eq!(layout.chunks_across, 2);
+    assert_eq!(layout.chunks_down, 2);
+
+    // Tile (0, 0): top-left full tile
+    let chunk0 = layout.get_chunk_bounds(0, 500, 300);
+    assert_eq!(chunk0.col_offset, 0);
+    assert_eq!(chunk0.row_offset, 0);
+    assert_eq!(chunk0.width, 256);
+    assert_eq!(chunk0.height, 256);
+
+    // Tile (1, 0): top-right partial tile (width = 500 - 256 = 244)
+    let chunk1 = layout.get_chunk_bounds(1, 500, 300);
+    assert_eq!(chunk1.col_offset, 256);
+    assert_eq!(chunk1.row_offset, 0);
+    assert_eq!(chunk1.width, 244);
+    assert_eq!(chunk1.height, 256);
+
+    // Tile (0, 1): bottom-left partial tile (height = 300 - 256 = 44)
+    let chunk2 = layout.get_chunk_bounds(2, 500, 300);
+    assert_eq!(chunk2.col_offset, 0);
+    assert_eq!(chunk2.row_offset, 256);
+    assert_eq!(chunk2.width, 256);
+    assert_eq!(chunk2.height, 44);
+
+    // Tile (1, 1): bottom-right corner partial tile (width = 244, height = 44)
+    let chunk3 = layout.get_chunk_bounds(3, 500, 300);
+    assert_eq!(chunk3.col_offset, 256);
+    assert_eq!(chunk3.row_offset, 256);
+    assert_eq!(chunk3.width, 244);
+    assert_eq!(chunk3.height, 44);
+}
+
+#[test]
+fn test_all_nodata_full_stream_scan_and_categorical() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    // Create a 16x16 GeoTIFF where all values are -9999.0 (NoData)
+    let width = 16u32;
+    let height = 16u32;
+    let nodata_val = -9999.0f32;
+    let data = vec![nodata_val; (width * height) as usize];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.4194, 37.7749, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let config = AggregationConfig {
+        resolution: 7,
+        custom_nodata: Some(-9999.0),
+        ..Default::default()
+    };
+
+    // Test ScanHorizonStreamer on 100% nodata raster
+    let mut scan_streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut total_accumulated_pixels = 0.0;
+    loop {
+        let batch = scan_streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_accumulated_pixels += acc.count;
+        }
+    }
+    assert_eq!(total_accumulated_pixels, 0.0);
+
+    // Test CategoricalHorizonStreamer on 100% nodata raster
+    let reader_cat = GeoTiffStreamReader::open(&path).unwrap();
+    let mut cat_streamer = CategoricalHorizonStreamer::new(reader_cat, &config).unwrap();
+    let mut total_categorical_pixels = 0.0;
+    loop {
+        let batch = cat_streamer.fetch_next_batch(16);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            total_categorical_pixels += acc.total_count;
+        }
+    }
+    assert_eq!(total_categorical_pixels, 0.0);
+}
+
+#[test]
+fn test_corrupted_and_empty_tiff_error_handling() {
+    use std::io::Write;
+
+    // 1. Zero-byte empty file
+    let empty_file = NamedTempFile::new().unwrap();
+    let empty_path = empty_file.path().to_path_buf();
+    assert!(GeoTiffStreamReader::open(&empty_path).is_err());
+
+    // 2. Corrupted invalid header magic bytes
+    let mut invalid_magic_file = NamedTempFile::new().unwrap();
+    invalid_magic_file.write_all(b"NOT_A_VALID_TIFF_STREAM").unwrap();
+    invalid_magic_file.flush().unwrap();
+    assert!(GeoTiffStreamReader::open(invalid_magic_file.path()).is_err());
+
+    // 3. Truncated TIFF header (valid magic bytes II 42 but truncated pointer)
+    let mut truncated_file = NamedTempFile::new().unwrap();
+    truncated_file.write_all(&[0x49, 0x49, 0x2A, 0x00]).unwrap();
+    truncated_file.flush().unwrap();
+    assert!(GeoTiffStreamReader::open(truncated_file.path()).is_err());
+}
+
+#[test]
+fn test_crs_unspecified_fallback_and_invalid_proj_error() {
+    // 1. Unspecified CRS (None, None) gracefully defaults to identity WGS84
+    let default_transformer = CrsTransformer::from_crs_or_epsg(None, None).unwrap();
+    let (lon, lat) = default_transformer.transform_point(-122.4, 37.8).unwrap();
+    assert!((lon - (-122.4)).abs() < 1e-9);
+    assert!((lat - 37.8).abs() < 1e-9);
+
+    // 2. Explicit invalid PROJ definition returns a typed CrsError
+    let invalid_result = CrsTransformer::from_crs_or_epsg(None, Some("+proj=nonexistent_invalid_crs +units=m"));
+    assert!(invalid_result.is_err());
+    match invalid_result {
+        Err(RasterH3Error::CrsError(msg)) => {
+            assert!(msg.contains("Failed to parse") || msg.contains("nonexistent_invalid_crs"));
+        }
+        _ => panic!("Expected RasterH3Error::CrsError for invalid PROJ string"),
+    }
+}
+
+#[test]
+fn test_sampling_pattern_fallback_to_center() {
+    let default_pattern = SamplingPattern::parse("unknown_nonexistent_mode");
+    assert!(default_pattern.is_single_point());
+    assert_eq!(default_pattern.points.len(), 1);
+    assert_eq!(default_pattern.points[0].weight, 1.0);
+    assert_eq!(default_pattern.points[0].dx, 0.5);
+    assert_eq!(default_pattern.points[0].dy, 0.5);
+}

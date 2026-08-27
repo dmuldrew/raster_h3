@@ -1,6 +1,6 @@
 -- DuckDB Raster-to-H3 Extension Demo Script
 -- 1. Load the compiled extension
-LOAD '/extensions/libraster_h3.so';
+LOAD '/extensions/raster_h3.duckdb_extension';
 
 -- 2. Preview aggregated H3 cells from GeoTIFF at H3 Resolution 8 with StdDev (Continuous)
 SELECT

@@ -87,7 +87,7 @@ extern "C" {
     );
     pub fn duckdb_table_function_set_bind(table_function: duckdb_table_function, bind: duckdb_table_function_bind_t);
     pub fn duckdb_table_function_set_init(table_function: duckdb_table_function, init: duckdb_table_function_init_t);
-    pub fn duckdb_table_function_set_init_local(
+    pub fn duckdb_table_function_set_local_init(
         table_function: duckdb_table_function,
         init_local: duckdb_table_function_init_t,
     );
@@ -95,7 +95,7 @@ extern "C" {
         table_function: duckdb_table_function,
         function: duckdb_table_function_t,
     );
-    pub fn duckdb_table_function_set_projection_pushdown(
+    pub fn duckdb_table_function_supports_projection_pushdown(
         table_function: duckdb_table_function,
         pushdown: bool,
     );
@@ -180,4 +180,6 @@ extern "C" {
         con: duckdb_connection,
         scalar_function: duckdb_scalar_function,
     ) -> DuckDBState;
+
+    pub fn duckdb_library_version() -> *const c_char;
 }

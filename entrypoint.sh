@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
-# Default .duckdbrc configuration to allow loading custom extensions
-cat <<EOF > /root/.duckdbrc
-SET allow_unsigned_extensions=true;
-EOF
 
 if [ "$#" -eq 0 ]; then
     echo "================================================================="
     echo "  Raster H3 Hexification - DuckDB Extension Container"
     echo "================================================================="
-    echo "Extension loaded at: /extensions/libraster_h3.so"
+    echo "Extension loaded at: /extensions/raster_h3.duckdb_extension"
     echo "Sample GeoTIFF at:   /data/sample_sf.tif"
     echo ""
     echo "Running demonstration query on sample GeoTIFF..."

@@ -560,9 +560,9 @@ pub unsafe fn register_categorical_table_function(
 
         duckdb_table_function_set_bind(tf, raster_h3_categorical_bind);
         duckdb_table_function_set_init(tf, raster_h3_categorical_init);
-        duckdb_table_function_set_init_local(tf, raster_h3_categorical_init_local);
+        duckdb_table_function_set_local_init(tf, raster_h3_categorical_init_local);
         duckdb_table_function_set_function(tf, raster_h3_categorical_scan);
-        duckdb_table_function_set_projection_pushdown(tf, true);
+        duckdb_table_function_supports_projection_pushdown(tf, true);
 
         let state = duckdb_register_table_function(con, tf);
 

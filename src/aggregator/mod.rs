@@ -10,7 +10,7 @@ pub use categorical::{CategoricalAccumulator, CategoricalHorizonStreamer};
 pub use coherence::SpatialCoherenceCache;
 pub use h3_map::{aggregate_raster_stream, H3HashMap};
 pub use horizon_streamer::{
-    compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig, HexEvictionEntry,
-    ScanHorizonStreamer,
+    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
+    HexEvictionEntry, ScanHorizonStreamer,
 };
 pub use sampling::{SamplePoint, SamplingPattern};

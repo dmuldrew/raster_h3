@@ -641,8 +641,25 @@ The compiled extension will be in:
 - Windows: `target/release/libraster_h3.dll`
 
 ### 2. Run Comprehensive Test Suite
+
+#### Locally with Cargo:
 ```bash
-cargo test
+# Run all unit and integration tests
+cargo test --release
+
+# Run with verbose test stdout output
+cargo test -- --nocapture
+```
+
+#### In an Isolated Docker Container:
+Running tests in Docker ensures an identical environment with all required system dependencies:
+
+```bash
+# Build the Docker image (automatically runs cargo test --release and compiles the extension)
+docker build -t raster_h3 .
+
+# Or run tests explicitly inside a transient container
+docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release
 ```
 
 ---

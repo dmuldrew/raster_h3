@@ -15,16 +15,21 @@ Thank you for your interest in contributing! This guide will help you get starte
 cargo build --release
 
 # Run the full test suite
-cargo test
+cargo test --release
 
 # Run tests with output visible
 cargo test -- --nocapture
 ```
 
 ### Docker
+The Docker build automatically runs the entire test suite in an isolated container environment:
+
 ```bash
+# Build and run test suite in Docker
 docker build -t raster_h3:latest .
-docker run -it raster_h3:latest
+
+# Run the interactive DuckDB CLI container with the preloaded extension and demo dataset
+docker run -it --rm raster_h3:latest
 ```
 
 ## Project Structure
