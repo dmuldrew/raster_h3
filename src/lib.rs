@@ -50,6 +50,27 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
     true
 }
 
+/// C API extension entry point invoked by DuckDB v1.2+
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_init_c_api(
+    info: crate::ffi::duckdb_c::duckdb_extension_info,
+    access: *const crate::ffi::duckdb_c::duckdb_extension_access,
+) -> bool {
+    if access.is_null() {
+        return false;
+    }
+    let get_db = match (*access).get_database {
+        Some(f) => f,
+        None => return false,
+    };
+    let db_ptr = get_db(info);
+    if db_ptr.is_null() {
+        return false;
+    }
+    let db = *db_ptr;
+    raster_h3_init(db)
+}
+
 /// Version entry point invoked by DuckDB (specifies C-API version v0.0.1)
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_version() -> *const c_char {

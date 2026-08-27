@@ -11,11 +11,19 @@ COPY src/ ./src/
 COPY tests/ ./tests/
 COPY examples/ ./examples/
 
-# Run tests and compile release dynamic library and CLI utilities
+# Run tests and compile release dynamic library, CLI utilities, and metadata-tagged extension
 RUN cargo test --release && \
     cargo build --release && \
     cargo build --release --examples && \
-    cargo run --release --example generate_sample sample_sf.tif
+    cargo run --release --example generate_sample sample_sf.tif && \
+    cargo install cargo-duckdb-ext-tools && \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+        x86_64)  DUCK_PLAT="linux_amd64" ;; \
+        aarch64|arm64) DUCK_PLAT="linux_arm64" ;; \
+        *) DUCK_PLAT="linux_amd64" ;; \
+    esac; \
+    cargo-duckdb-ext package -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension -v v0.1.0 -p "$DUCK_PLAT" -d v1.5.5
 
 # ==============================================================================
 # Stage 2: Runtime Environment with DuckDB CLI
@@ -60,7 +68,7 @@ RUN set -eux; \
 RUN mkdir -p /extensions /data /app /root
 
 # Copy extension library, CLI tools, and sample data from builder
-COPY --from=builder /build/target/release/libraster_h3.so /extensions/raster_h3.duckdb_extension
+COPY --from=builder /build/target/release/raster_h3.duckdb_extension /extensions/raster_h3.duckdb_extension
 COPY --from=builder /build/target/release/libraster_h3.so /extensions/libraster_h3.so
 COPY --from=builder /build/target/release/examples/raster_to_pmtiles /usr/local/bin/raster_to_pmtiles
 COPY --from=builder /build/target/release/examples/parquet_to_pmtiles /usr/local/bin/parquet_to_pmtiles

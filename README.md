@@ -50,6 +50,8 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 - **Bounded Constant Memory ($O(\text{Scan Front}) < 15\text{ MB}$ RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
 - **Hardware-Saturating Multi-Core Throughput**: Processes **5.8M pixels/sec per core** on raw GeoTIFF ingestion, scaling to **26.0M pixels/sec on 8 CPU threads** with confirmed linear performance across 100M+ pixel rasters.
 - **Native PMTiles v3 Vector Pyramid Generation**: Converts raster aggregations directly into single-file Mapbox Vector Tile (`.pmtiles`) archives with zero intermediate GIS files, zero external `tippecanoe` builds, and strict mathematical H3 validity enforcement.
+- **Native H3 Parquet to PMTiles Conversion**: Convert any H3-indexed Parquet file directly to PMTiles v3 archives with auto-detected property schema and strict cell validation.
+- **Arbitrary SQL Execution in Docker**: Run continuous, categorical, or PMTiles export queries directly as 1-liners or piped scripts in Docker with zero manual extension loading.
 - **Sub-Pixel Area-Weighted Anti-Aliasing**: Supports multi-point super-sampling (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact area-proportional boundary aggregation.
 
 ---
@@ -220,53 +222,55 @@ docker build -t raster_h3:latest .
 docker run -it raster_h3:latest
 ```
 
-### 3. Process Your Local GeoTIFF Files
-Mount your local data directory into `/data`:
+### 3. Run Arbitrary SQL Statements Directly (1-Liners)
+You can execute any continuous, categorical, or PMTiles export query directly from your host shell without manual extension loading:
+
 ```bash
-docker run -it -v $(pwd)/data:/data raster_h3:latest
+# Execute continuous raster aggregation
+docker run --rm -v $(pwd):/data raster_h3:latest \
+  "SELECT h3_hex, round(mean, 2) AS avg_elevation, count FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8) LIMIT 5;"
+
+# Execute categorical aggregation
+docker run --rm -v $(pwd):/data raster_h3:latest \
+  "SELECT h3_hex, majority_class, round(majority_fraction * 100, 1) AS dominance_pct, total_count FROM h3_raster_categorical_aggregate('/data/sample_sf.tif', resolution := 8) LIMIT 5;"
+
+# Direct PMTiles v3 export from SQL
+docker run --rm -v $(pwd):/data raster_h3:latest \
+  "SELECT * FROM h3_raster_to_pmtiles('/data/sample_sf.tif', '/data/sample_sf.pmtiles', min_resolution := 6, max_resolution := 8);"
 ```
 
-Inside the DuckDB prompt:
-```sql
-LOAD '/extensions/libraster_h3.so';
+### 4. Pipe SQL Scripts via Stdin
+Pipe any arbitrary SQL file or pipeline directly into DuckDB inside the container:
 
--- Continuous aggregation (elevation, temperature, NDVI)
-SELECT
-    h3_hex,
-    round(mean, 2) AS avg_value,
-    count AS pixel_count
-FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8)
-ORDER BY pixel_count DESC
-LIMIT 10;
-
--- Categorical aggregation (land cover, zoning, soil)
-SELECT
-    h3_hex,
-    majority_class,
-    round(majority_fraction * 100, 1) AS dominance_pct,
-    histogram
-FROM h3_raster_categorical_aggregate('/data/landcover.tif', resolution := 8)
-LIMIT 10;
-
--- Direct PMTiles v3 Vector Pyramid Export
-SELECT * FROM h3_raster_to_pmtiles(
-    '/data/sample_sf.tif',
-    '/data/sample_sf.pmtiles',
-    min_resolution := 7,
-    max_resolution := 9,
-    sampling := 'rgss'
-);
+```bash
+cat my_analysis.sql | docker run --rm -i -v $(pwd):/data raster_h3:latest
 ```
 
-### 4. Direct 1-Line Docker PMTiles Converter
-Run standalone CLI tiling on any local raster without entering the interactive prompt:
+### 5. Interactive DuckDB Prompt with Auto-Loaded Extension
+```bash
+docker run -it -v $(pwd):/data raster_h3:latest
+```
+*(The `raster_h3` extension is pre-loaded automatically on startup.)*
+
+### 6. Direct 1-Line CLI Converters
+
+#### A. GeoTIFF to PMTiles:
 ```bash
 docker run --rm -v $(pwd):/data raster_h3:latest \
   raster_to_pmtiles \
-    --input /data/my_raster.tif \
-    --output /data/my_map.pmtiles \
+    --input /data/sample_sf.tif \
+    --output /data/sample_sf.pmtiles \
     --resolutions 6,7,8 \
     --sampling rgss
+```
+
+#### B. H3 Parquet to PMTiles:
+```bash
+docker run --rm -v $(pwd):/data raster_h3:latest \
+  parquet_to_pmtiles \
+    --input /data/demographics_h3.parquet \
+    --output /data/demographics.pmtiles \
+    --h3-col h3_index
 ```
 
 ---

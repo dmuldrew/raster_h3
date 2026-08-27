@@ -59,6 +59,14 @@ pub type duckdb_vector = *mut c_void;
 pub type duckdb_logical_type = *mut c_void;
 pub type duckdb_value = *mut c_void;
 pub type duckdb_scalar_function = *mut c_void;
+pub type duckdb_extension_info = *mut c_void;
+
+#[repr(C)]
+pub struct duckdb_extension_access {
+    pub get_api: Option<unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *mut c_void>,
+    pub get_database: Option<unsafe extern "C" fn(info: duckdb_extension_info) -> *mut duckdb_database>,
+    pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
+}
 
 pub type duckdb_table_function_bind_t = unsafe extern "C" fn(info: duckdb_bind_info);
 pub type duckdb_table_function_init_t = unsafe extern "C" fn(info: duckdb_init_info);
