@@ -718,6 +718,49 @@ WHERE fraction >= 0.10;
 
 ---
 
+### PMTiles v3 Export: `h3_raster_to_pmtiles(file_path, output_pmtiles, ...)`
+
+Generates a production-ready, cloud-native PMTiles v3 archive containing multi-resolution Mapbox Vector Tile (MVT) hexagonal pyramids in a **single SQL query**.
+
+```sql
+SELECT * FROM h3_raster_to_pmtiles(
+    'california_dem.tif',
+    'california_elevation.pmtiles',
+    min_resolution := 6,
+    max_resolution := 8,
+    sampling := 'center'
+);
+```
+
+#### Positional Parameters
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :---: | :--- | :--- |
+| `file_path` | `VARCHAR` | **Yes** | — | Input GeoTIFF file path. |
+| `output_pmtiles` | `VARCHAR` | **Yes** | — | Destination path for the single-file `.pmtiles` archive. |
+
+#### Named Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `resolution` | `BIGINT` | `8` | Target H3 resolution for single-zoom export. |
+| `min_resolution` | `BIGINT` | `None` | Minimum H3 resolution for multi-zoom pyramid export. |
+| `max_resolution` | `BIGINT` | `None` | Maximum H3 resolution for multi-zoom pyramid export. |
+| `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, etc.). |
+| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
+| `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
+
+#### Output Schema (1 Summary Row)
+| Column Name | Logical Type | Description |
+| :--- | :--- | :--- |
+| `total_hexagons` | `BIGINT` | Total H3 hexagons aggregated and packaged across all zoom levels. |
+| `pmtiles_size_bytes` | `BIGINT` | Total file size of the generated `.pmtiles` archive in bytes. |
+| `min_zoom` | `BIGINT` | Minimum Web Mercator tile zoom level in the archive. |
+| `max_zoom` | `BIGINT` | Maximum Web Mercator tile zoom level in the archive. |
+| `elapsed_ms` | `DOUBLE` | Total end-to-end execution time in milliseconds. |
+| `output_path` | `VARCHAR` | Path to the created `.pmtiles` file. |
+| `status` | `VARCHAR` | Execution status (`'SUCCESS'` or error message). |
+
+---
+
 ### Scalar Helper Functions
 
 | Function | Signature | Return Type | Description |

@@ -40,6 +40,12 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
         return false;
     }
 
+    // 4. Register h3_raster_to_pmtiles Table Function (Direct PMTiles v3 export)
+    if functions::register_pmtiles_table_function(con).is_err() {
+        duckdb_disconnect(&mut con);
+        return false;
+    }
+
     duckdb_disconnect(&mut con);
     true
 }
