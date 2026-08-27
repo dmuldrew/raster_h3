@@ -537,24 +537,21 @@ ORDER BY resolution ASC, pixels DESC;
 ### Motivation: Closing the Analytics-to-Visualization Gap
 While DuckDB and `raster_h3` can aggregate hundreds of millions of raster pixels into H3 hexagonal summaries in seconds, **visualizing and serving** these massive spatial datasets to web clients has traditionally remained a slow, fragmented, and infrastructure-heavy bottleneck.
 
-```
-                    TRADITIONAL 4-STEP ETL PIPELINE (SLOW & FRAGILE)
- ┌─────────┐      ┌─────────────┐      ┌─────────────┐      ┌──────────────┐      ┌─────────────┐
- │ GeoTIFF │ ───► │ DuckDB SQL  │ ───► │ 20 GB GeoJSON│ ───► │  Tippecanoe  │ ───► │ Tile Server │
- │ Raster  │      │ Aggregation │      │ on Disk     │      │ (C++ Build)  │      │ / S3 Bucket │
- └─────────┘      └─────────────┘      └─────────────┘      └──────────────┘      └─────────────┘
-                                                               ▲
-                                        Requires external C++ toolchains, GDAL,
-                                        and massive intermediate scratch files.
+```mermaid
+flowchart TD
+    subgraph Traditional ["TRADITIONAL 4-STEP ETL PIPELINE (Slow & Fragile)"]
+        direction LR
+        T1["📁 GeoTIFF Raster"] --> T2["🦆 DuckDB SQL Aggregation"]
+        T2 --> T3["💾 20 GB GeoJSON (Disk Clutter)"]
+        T3 --> T4["⚙️ Tippecanoe (C++ Build)"]
+        T4 --> T5["🌐 Tile Server / Martin / Tegola"]
+    end
 
-                    RASTER_H3 DIRECT IN-MEMORY PIPELINE (ZERO INTERMEDIATE FILES)
- ┌─────────┐      ┌────────────────────────────────────────────────────────┐      ┌─────────────┐
- │ GeoTIFF │ ───► │ MultiScanHorizonStreamer ──► Pure-Rust MVT Tile Encoder│ ───► │ PMTiles v3  │
- │ Raster  │      │ (Single-Pass Direct Ground-Truth In-Memory Stream)     │      │ Single File │
- └─────────┘      └────────────────────────────────────────────────────────┘      └─────────────┘
-                                                               ▲
-                                        100% Pure Rust. Zero intermediate files.
-                                        Ready for MapLibre, Kepler.gl, & Felt in < 1s.
+    subgraph RasterH3 ["RASTER_H3 DIRECT IN-MEMORY PIPELINE (Zero Intermediate Files)"]
+        direction LR
+        R1["📁 GeoTIFF / Parquet"] --> R2["⚡ MultiScanHorizonStreamer + Pure-Rust MVT Encoder\n(Single-Pass In-Memory Processing < 15 MB RAM)"]
+        R2 --> R3["📦 PMTiles v3 Single-File Archive\n(Instant Serverless Streaming for MapLibre / Kepler.gl / Felt)"]
+    end
 ```
 
 ### Why Traditional Vector Tiling Workflows Fail for Hexagonal Data
