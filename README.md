@@ -537,21 +537,20 @@ ORDER BY resolution ASC, pixels DESC;
 ### Motivation: Closing the Analytics-to-Visualization Gap
 While DuckDB and `raster_h3` can aggregate hundreds of millions of raster pixels into H3 hexagonal summaries in seconds, **visualizing and serving** these massive spatial datasets to web clients has traditionally remained a slow, fragmented, and infrastructure-heavy bottleneck.
 
+#### Traditional 4-Step ETL Pipeline (Slow & Fragile)
 ```mermaid
-flowchart TD
-    subgraph Traditional ["TRADITIONAL 4-STEP ETL PIPELINE (Slow & Fragile)"]
-        direction LR
-        T1["📁 GeoTIFF Raster"] --> T2["🦆 DuckDB SQL Aggregation"]
-        T2 --> T3["💾 20 GB GeoJSON (Disk Clutter)"]
-        T3 --> T4["⚙️ Tippecanoe (C++ Build)"]
-        T4 --> T5["🌐 Tile Server / Martin / Tegola"]
-    end
+flowchart LR
+    T1["📁 GeoTIFF Raster"] --> T2["🦆 DuckDB SQL Aggregation"]
+    T2 --> T3["💾 20 GB GeoJSON\n(Disk Clutter)"]
+    T3 --> T4["⚙️ Tippecanoe\n(C++ Build)"]
+    T4 --> T5["🌐 Tile Server\n(Martin / Tegola)"]
+```
 
-    subgraph RasterH3 ["RASTER_H3 DIRECT IN-MEMORY PIPELINE (Zero Intermediate Files)"]
-        direction LR
-        R1["📁 GeoTIFF / Parquet"] --> R2["⚡ MultiScanHorizonStreamer + Pure-Rust MVT Encoder\n(Single-Pass In-Memory Processing < 15 MB RAM)"]
-        R2 --> R3["📦 PMTiles v3 Single-File Archive\n(Instant Serverless Streaming for MapLibre / Kepler.gl / Felt)"]
-    end
+#### `raster_h3` Direct In-Memory Pipeline (Zero Intermediate Files)
+```mermaid
+flowchart LR
+    R1["📁 GeoTIFF / Parquet"] --> R2["⚡ MultiScanHorizonStreamer + Pure-Rust MVT Encoder\n(Single-Pass In-Memory Stream < 15 MB RAM)"]
+    R2 --> R3["📦 PMTiles v3 Single-File Archive\n(Instant Serverless Streaming for MapLibre / Kepler.gl / Felt)"]
 ```
 
 ### Why Traditional Vector Tiling Workflows Fail for Hexagonal Data
