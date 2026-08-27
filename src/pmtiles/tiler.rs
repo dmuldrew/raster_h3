@@ -60,10 +60,171 @@ pub fn h3_res_to_zoom(res: u8) -> u8 {
     }
 }
 
-/// High-level builder to convert GeoTIFF raster aggregations directly to PMTiles v3
+/// A generic H3 feature record with arbitrary properties for PMTiles export
+#[derive(Debug, Clone)]
+pub struct H3Feature {
+    pub h3_index: u64,
+    pub properties: Vec<(String, MvtValue)>,
+}
+
+impl H3Feature {
+    pub fn new(h3_index: u64, properties: Vec<(String, MvtValue)>) -> Self {
+        Self { h3_index, properties }
+    }
+}
+
+/// Result summary of PMTiles export
+#[derive(Debug, Clone)]
+pub struct PmtilesExportSummary {
+    pub total_features: usize,
+    pub valid_features: usize,
+    pub invalid_features_dropped: usize,
+    pub total_tiles: usize,
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+}
+
+/// High-level builder to convert H3 data and GeoTIFF raster aggregations directly to PMTiles v3
 pub struct H3PmtilesTiler;
 
 impl H3PmtilesTiler {
+    /// Export any collection of generic H3 features (with strict H3 validation) to a PMTiles v3 archive
+    pub fn export_h3_features<P: AsRef<Path>, I: IntoIterator<Item = H3Feature>>(
+        features: I,
+        output_path: P,
+    ) -> Result<PmtilesExportSummary, Box<dyn std::error::Error + Send + Sync>> {
+        let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+
+        let mut total_features = 0usize;
+        let mut valid_features = 0usize;
+        let mut invalid_dropped = 0usize;
+
+        let mut global_min_lon = 180.0f64;
+        let mut global_min_lat = 90.0f64;
+        let mut global_max_lon = -180.0f64;
+        let mut global_max_lat = -90.0f64;
+
+        let mut min_zoom = 255u8;
+        let mut max_zoom = 0u8;
+
+        for feat in features {
+            total_features += 1;
+
+            // Strict H3 Mathematical Validation: mode, base cell range, resolution bounds, directional digits
+            let cell = match CellIndex::try_from(feat.h3_index) {
+                Ok(c) => c,
+                Err(_) => {
+                    invalid_dropped += 1;
+                    continue;
+                }
+            };
+
+            valid_features += 1;
+            let center: LatLng = cell.into();
+            let c_lat = center.lat();
+            let c_lon = center.lng();
+
+            if c_lon < global_min_lon { global_min_lon = c_lon; }
+            if c_lon > global_max_lon { global_max_lon = c_lon; }
+            if c_lat < global_min_lat { global_min_lat = c_lat; }
+            if c_lat > global_max_lat { global_max_lat = c_lat; }
+
+            let res_u8: u8 = cell.resolution().into();
+            let zoom = h3_res_to_zoom(res_u8);
+            if zoom < min_zoom { min_zoom = zoom; }
+            if zoom > max_zoom { max_zoom = zoom; }
+
+            let (tx, ty) = lon_lat_to_tile_xy(c_lon, c_lat, zoom);
+            let tile_key = (zoom, tx, ty);
+
+            let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                MvtLayer::new("h3_hexagons")
+            });
+
+            let bbox = tile_xy_to_bbox(zoom, tx, ty);
+            let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
+
+            let mut properties = feat.properties;
+            let mut hex_buf = [0u8; 16];
+            let hex_bytes = fast_hex_u64(feat.h3_index, &mut hex_buf);
+            let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("").to_string();
+
+            if !properties.iter().any(|(k, _)| k == "h3_index") {
+                properties.push(("h3_index".to_string(), MvtValue::UInt(feat.h3_index)));
+            }
+            if !properties.iter().any(|(k, _)| k == "h3_hex") {
+                properties.push(("h3_hex".to_string(), MvtValue::String(hex_str)));
+            }
+            if !properties.iter().any(|(k, _)| k == "resolution") {
+                properties.push(("resolution".to_string(), MvtValue::UInt(res_u8 as u64)));
+            }
+
+            layer.add_hexagon(
+                feat.h3_index,
+                &boundary_vertices,
+                bbox[0],
+                bbox[2],
+                bbox[1],
+                bbox[3],
+                properties,
+            );
+        }
+
+        if valid_features == 0 {
+            global_min_lon = -180.0;
+            global_min_lat = -85.0;
+            global_max_lon = 180.0;
+            global_max_lat = 85.0;
+            min_zoom = 0;
+            max_zoom = 0;
+        }
+
+        let metadata = json!({
+            "name": "h3_pmtiles_export",
+            "description": "H3 vector hexagon tile pyramid exported by raster_h3",
+            "version": "3",
+            "minzoom": min_zoom,
+            "maxzoom": max_zoom,
+            "vector_layers": [
+                {
+                    "id": "h3_hexagons",
+                    "description": "H3 hexagonal vector polygons with attributes",
+                    "minzoom": min_zoom,
+                    "maxzoom": max_zoom,
+                    "fields": {
+                        "h3_index": "Number",
+                        "h3_hex": "String",
+                        "resolution": "Number"
+                    }
+                }
+            ]
+        });
+
+        let mut writer = PmtilesWriter::new(
+            min_zoom,
+            max_zoom,
+            [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
+            metadata.to_string(),
+        );
+
+        let total_tiles = tile_buckets.len();
+        for ((z, x, y), layer) in tile_buckets {
+            let mvt_bytes = layer.encode();
+            writer.add_tile(z, x, y, &mvt_bytes)?;
+        }
+
+        writer.finish(output_path)?;
+
+        Ok(PmtilesExportSummary {
+            total_features,
+            valid_features,
+            invalid_features_dropped: invalid_dropped,
+            total_tiles,
+            min_zoom,
+            max_zoom,
+        })
+    }
     /// Stream continuous raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
     pub fn generate_from_continuous_streamer<P: AsRef<Path>>(
         mut streamer: MultiScanHorizonStreamer,

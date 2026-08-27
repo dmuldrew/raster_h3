@@ -140,3 +140,48 @@ fn test_hilbert_zxy_tile_id_ordering() {
     assert_ne!(id_1_1_0, id_1_0_1);
     assert_ne!(id_1_0_1, id_1_1_1);
 }
+
+#[test]
+fn test_export_generic_h3_features_with_validation() {
+    use raster_h3::pmtiles::tiler::H3Feature;
+    use raster_h3::pmtiles::mvt::MvtValue;
+
+    let pmtiles_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
+
+    let valid_cell_1 = 0x8828308281fffffu64; // SF Res 8
+    let valid_cell_2 = 0x8828308283fffffu64; // SF Res 8 neighbor
+    let invalid_cell_1 = 0u64;
+    let invalid_cell_2 = 0xFFFFFFFFFFFFFFFFu64;
+
+    let features = vec![
+        H3Feature::new(valid_cell_1, vec![
+            ("population".to_string(), MvtValue::Double(1420.0)),
+            ("category".to_string(), MvtValue::String("Urban".to_string())),
+        ]),
+        H3Feature::new(invalid_cell_1, vec![
+            ("population".to_string(), MvtValue::Double(0.0)),
+        ]),
+        H3Feature::new(valid_cell_2, vec![
+            ("population".to_string(), MvtValue::Double(980.0)),
+            ("category".to_string(), MvtValue::String("Suburban".to_string())),
+        ]),
+        H3Feature::new(invalid_cell_2, vec![
+            ("population".to_string(), MvtValue::Double(12.0)),
+        ]),
+    ];
+
+    let summary = H3PmtilesTiler::export_h3_features(features, &pmtiles_path).unwrap();
+
+    assert_eq!(summary.total_features, 4);
+    assert_eq!(summary.valid_features, 2);
+    assert_eq!(summary.invalid_features_dropped, 2);
+    assert!(summary.total_tiles > 0);
+
+    // Verify PMTiles v3 archive
+    let mut header = [0u8; 127];
+    let mut f = File::open(&pmtiles_path).unwrap();
+    f.read_exact(&mut header).unwrap();
+    assert_eq!(&header[0..7], b"PMTiles");
+    assert_eq!(header[7], 3);
+}

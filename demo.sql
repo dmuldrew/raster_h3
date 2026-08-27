@@ -114,3 +114,19 @@ FROM h3_raster_categorical_aggregate(
 )
 LIMIT 10;
 
+-- 12. Direct Single-Pass PMTiles v3 Vector Pyramid Export
+SELECT * FROM h3_raster_to_pmtiles(
+    '/data/sample_sf.tif',
+    '/data/sample_sf.pmtiles',
+    min_resolution := 7,
+    max_resolution := 9,
+    sampling := 'center'
+);
+
+-- 13. Strict H3 Mathematical Validation Function
+SELECT
+    h3_is_valid('8828308281fffff') AS valid_sf_hex,
+    h3_is_valid(596823908204938239::UBIGINT) AS valid_sf_u64,
+    h3_is_valid('corrupted_string') AS invalid_hex,
+    h3_is_valid(0::UBIGINT) AS invalid_u64;
+

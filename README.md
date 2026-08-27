@@ -4,7 +4,7 @@
 [![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
 [![DuckDB Extension](https://img.shields.io/badge/DuckDB-Loadable_Extension-blue.svg)](https://duckdb.org)
 
-A high-performance, native DuckDB loadable extension written in pure Rust that aggregates multi-gigabyte geospatial raster files (GeoTIFF, Cloud-Optimized GeoTIFFs) directly into Uber H3 hexagonal grid cells at hardware limits.
+A high-performance, native DuckDB loadable extension written in pure Rust that aggregates multi-gigabyte geospatial raster files (GeoTIFF, Cloud-Optimized GeoTIFFs) directly into Uber H3 hexagonal grid cells at hardware limits, and exports cloud-native **PMTiles v3** multi-resolution vector pyramids for instant web visualization.
 
 Supports both **continuous** raster surfaces (elevation, temperature, NDVI) and **categorical** classification rasters (land cover, zoning, soil types) with dedicated aggregation engines.
 
@@ -49,6 +49,7 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 - **Zero Python / Zero GDAL C++ Dependencies**: A pure Rust engine compiled into a single self-contained native dynamic library (`.dylib`, `.so`, `.dll`).
 - **Bounded Constant Memory ($O(\text{Scan Front}) < 15\text{ MB}$ RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
 - **Hardware-Saturating Multi-Core Throughput**: Processes **5.8M pixels/sec per core** on raw GeoTIFF ingestion, scaling to **26.0M pixels/sec on 8 CPU threads** with confirmed linear performance across 100M+ pixel rasters.
+- **Native PMTiles v3 Vector Pyramid Generation**: Converts raster aggregations directly into single-file Mapbox Vector Tile (`.pmtiles`) archives with zero intermediate GIS files, zero external `tippecanoe` builds, and strict mathematical H3 validity enforcement.
 - **Sub-Pixel Area-Weighted Anti-Aliasing**: Supports multi-point super-sampling (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact area-proportional boundary aggregation.
 
 ---
@@ -77,7 +78,8 @@ Imagine going on a road trip across the country:
 | 2 | Re-calculate GPS math on 100M individual pixels | Set "Cruise Control" (1 math calculation per row) |
 | 3 | Search hash table on every pixel | "Run-Skip" 50 pixels at once |
 | 4 | Hold all results until the end | Evict finished hexagons from memory immediately |
-| **Result** | **Minutes & Memory Crashes** | **Milliseconds & < 15 MB RAM** |
+| 5 | Run C++ Tippecanoe & setup tile servers | Generate cloud-native `.pmtiles` in 1 step |
+| **Result** | **Minutes & Memory Crashes** | **Milliseconds, < 15 MB RAM & Web-Ready** |
 
 #### 1. The Moving Scanner Front (Constant Memory)
 Instead of loading a multi-gigabyte file into memory, `raster_h3` reads the image like an office document scanner—one paper-thin row at a time from North to South. The moment a row moves past the bottom edge of a hexagon, that hexagon is sealed, finished, and streamed directly into your SQL query results. 
@@ -94,6 +96,10 @@ Most pixels lie safely inside the interior of a hexagon rather than on its borde
 #### 4. In-Database Streaming (No Intermediate Files)
 Traditional pipelines require writing intermediate shapefiles or GeoTIFFs to disk, transferring data between Python and C++, and importing them into a database. `raster_h3` runs directly inside DuckDB, streaming results straight into your SQL queries, joins, and Parquet exports.
 - **The Benefit**: Zero intermediate files and instant query execution.
+
+#### 5. Direct Web-Ready Map Tiles (No Tippecanoe or Servers Needed)
+Visualizing massive hexagonal datasets traditionally required installing external C++ toolchains (`tippecanoe`), creating 20 GB temporary GeoJSON scratch files, and configuring backend tile server daemons (Tegola, Martin). `raster_h3` directly generates single-file **PMTiles v3** vector pyramids with built-in H3 validation, ready to drag-and-drop into MapLibre GL, Kepler.gl, or Felt.
+- **The Benefit**: Instant serverless web mapping from a single SQL query.
 
 ---
 
@@ -770,6 +776,7 @@ SELECT * FROM h3_raster_to_pmtiles(
 | `h3_to_lat` | `(UBIGINT)` | `DOUBLE` | Centroid latitude in WGS84 decimal degrees. |
 | `h3_to_lng` | `(UBIGINT)` | `DOUBLE` | Centroid longitude in WGS84 decimal degrees. |
 | `h3_get_resolution` | `(UBIGINT)` | `BIGINT` | 1-cycle bitshift extraction of H3 resolution level ($0 \dots 15$). |
+| `h3_is_valid` | `(UBIGINT)` / `(VARCHAR)` | `BOOLEAN` | Validates mode, base cell range ($0..121$), resolution ($0..15$), directional digits, and padding. |
 
 ---
 
