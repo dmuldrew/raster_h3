@@ -24,27 +24,16 @@ fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
     buf.push((val & 0x7F) as u8);
 }
 
-/// Calculate the 2D Hilbert curve index for (x, y) at zoom level z
-fn hilbert_xy(mut x: u64, mut y: u64, z: u8) -> u64 {
-    let mut d = 0;
-    if z == 0 {
-        return 0;
-    }
-    let mut s = 1 << (z - 1);
-    while s > 0 {
-        let rx = if (x & s) > 0 { 1 } else { 0 };
-        let ry = if (y & s) > 0 { 1 } else { 0 };
-        d += s * s * ((3 * rx) ^ ry);
-        if ry == 0 {
-            if rx == 1 {
-                x = (1 << z) - 1 - x;
-                y = (1 << z) - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
+#[inline(always)]
+fn rotate(n: u64, mut x: u64, mut y: u64, rx: u64, ry: u64) -> (u64, u64) {
+    if ry == 0 {
+        if rx != 0 {
+            x = n - 1 - x;
+            y = n - 1 - y;
         }
-        s >>= 1;
+        return (y, x);
     }
-    d
+    (x, y)
 }
 
 /// Compute the canonical PMTiles v3 Tile ID for (z, x, y)
@@ -52,10 +41,49 @@ pub fn zxy_to_tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z == 0 {
         return 0;
     }
-    // Base offset for zoom level z: sum_{i=0}^{z-1} 4^i = (4^z - 1) / 3
-    let base_offset = ((1u64 << (2 * z)) - 1) / 3;
-    let h = hilbert_xy(x as u64, y as u64, z);
-    base_offset + h
+    let acc = ((1u64 << (2 * z)) - 1) / 3;
+    let mut tx = x as u64;
+    let mut ty = y as u64;
+    let mut a = z as i32 - 1;
+    let mut d = 0u64;
+    while a >= 0 {
+        let s = 1u64 << a;
+        let rx = tx & s;
+        let ry = ty & s;
+        d += ((3 * rx) ^ ry) * (1u64 << a);
+        let (nx, ny) = rotate(s, tx, ty, rx, ry);
+        tx = nx;
+        ty = ny;
+        a -= 1;
+    }
+    acc + d
+}
+
+fn tile_id_to_z(i: u64) -> u8 {
+    let c = 3 * i + 1;
+    let leading = c.leading_zeros();
+    ((63 - leading) / 2) as u8
+}
+
+/// Convert a Hilbert TileID to (z, x, y)
+pub fn tile_id_to_zxy(i: u64) -> (u8, u32, u32) {
+    let z = tile_id_to_z(i);
+    let acc = ((1u64 << (2 * z)) - 1) / 3;
+    let mut t = i - acc;
+    let mut x = 0u64;
+    let mut y = 0u64;
+    let n = 1u64 << z;
+    let mut s = 1u64;
+    while s < n {
+        let rx = s & (t / 2);
+        let ry = s & (t ^ rx);
+        let (nx, ny) = rotate(s, x, y, rx, ry);
+        t /= 2;
+        x = nx + rx;
+        y = ny + ry;
+        s <<= 1;
+    }
+    (z, x as u32, y as u32)
 }
 
 /// A raw tile payload ready to be written

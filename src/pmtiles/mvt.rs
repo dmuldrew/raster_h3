@@ -133,9 +133,40 @@ impl MvtLayer {
         for v in vertices {
             // Map longitude to [0, extent]
             let px = ((v.lng() - tile_min_lon) / lon_span * extent_f).round() as i32;
-            // Map latitude to [0, extent] (North-to-South in tile space: 0 is top/North)
-            let py = ((tile_max_lat - v.lat()) / lat_span * extent_f).round() as i32;
+
+            // Map latitude to [0, extent] using exact Web Mercator projection
+            let lat_clamped = v.lat().max(-85.05112878).min(85.05112878);
+            let lat_rad = lat_clamped.to_radians();
+            let y_merc = (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+
+            let max_lat_rad = tile_max_lat.to_radians();
+            let min_lat_rad = tile_min_lat.to_radians();
+            let y_merc_top = (1.0 - (max_lat_rad.tan() + 1.0 / max_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+            let y_merc_bottom = (1.0 - (min_lat_rad.tan() + 1.0 / min_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+            let merc_span = y_merc_bottom - y_merc_top;
+
+            let py = if merc_span > 0.0 {
+                ((y_merc - y_merc_top) / merc_span * extent_f).round() as i32
+            } else {
+                ((tile_max_lat - v.lat()) / lat_span * extent_f).round() as i32
+            };
+
             polygon.push((px, py));
+        }
+
+        // In MVT v2.1 specification, exterior polygon rings MUST have positive signed area
+        // (Clockwise orientation in tile coordinate space where Y is positive downwards).
+        // Counter-clockwise rings are discarded as invalid interior rings/holes by MapLibre/Mapbox GL.
+        let mut signed_area: i64 = 0;
+        let n = polygon.len();
+        for i in 0..n {
+            let (x1, y1) = polygon[i];
+            let (x2, y2) = polygon[(i + 1) % n];
+            signed_area += (x1 as i64) * (y2 as i64) - (x2 as i64) * (y1 as i64);
+        }
+
+        if signed_area < 0 {
+            polygon.reverse();
         }
 
         self.features.push(MvtFeature {

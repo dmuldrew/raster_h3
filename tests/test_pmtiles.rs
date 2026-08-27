@@ -127,18 +127,25 @@ fn test_geotiff_to_pmtiles_end_to_end() {
 
 #[test]
 fn test_hilbert_zxy_tile_id_ordering() {
-    let id_0 = zxy_to_tile_id(0, 0, 0);
-    assert_eq!(id_0, 0);
+    use raster_h3::pmtiles::writer::tile_id_to_zxy;
 
-    let id_1_0_0 = zxy_to_tile_id(1, 0, 0);
-    let id_1_1_0 = zxy_to_tile_id(1, 1, 0);
-    let id_1_0_1 = zxy_to_tile_id(1, 0, 1);
-    let id_1_1_1 = zxy_to_tile_id(1, 1, 1);
+    assert_eq!(zxy_to_tile_id(0, 0, 0), 0);
+    assert_eq!(zxy_to_tile_id(1, 0, 0), 1);
+    assert_eq!(zxy_to_tile_id(1, 0, 1), 2);
+    assert_eq!(zxy_to_tile_id(1, 1, 1), 3);
+    assert_eq!(zxy_to_tile_id(1, 1, 0), 4);
+    assert_eq!(zxy_to_tile_id(2, 0, 0), 5);
 
-    assert!(id_1_0_0 > id_0);
-    assert_ne!(id_1_0_0, id_1_1_0);
-    assert_ne!(id_1_1_0, id_1_0_1);
-    assert_ne!(id_1_0_1, id_1_1_1);
+    // Test roundtrip conversion for all tiles up to zoom 7
+    for z in 0..=7 {
+        for x in 0..(1 << z) {
+            for y in 0..(1 << z) {
+                let id = zxy_to_tile_id(z, x, y);
+                let (rz, rx, ry) = tile_id_to_zxy(id);
+                assert_eq!((rz, rx, ry), (z, x, y));
+            }
+        }
+    }
 }
 
 #[test]
