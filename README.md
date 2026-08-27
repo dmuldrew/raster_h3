@@ -371,6 +371,18 @@ WHERE category = 50 AND fraction >= 0.25
 ORDER BY fraction DESC;
 ```
 
+### 8. Native PMTiles v3 Vector Pyramid Export from DuckDB
+```sql
+-- Convert any GeoTIFF directly to a multi-resolution PMTiles v3 archive in a single query
+SELECT * FROM h3_raster_to_pmtiles(
+    'california_elevation.tif',
+    'california_elevation.pmtiles',
+    min_resolution := 6,
+    max_resolution := 8,
+    sampling := 'rgss'
+);
+```
+
 ---
 
 ## 7. Sub-Pixel Super-Sampling Guide
@@ -548,8 +560,24 @@ While DuckDB and `raster_h3` can aggregate hundreds of millions of raster pixels
 
 ---
 
-### Standalone CLI Converter
-Convert any GeoTIFF directly into a production-ready `.pmtiles` archive:
+### How to Generate PMTiles: Two Simple Interfaces
+
+#### Option A: Directly from DuckDB SQL
+You can export directly inside any SQL query or data pipeline:
+
+```sql
+-- Convert a GeoTIFF to a multi-resolution PMTiles archive (Res 6, 7, 8 -> Zoom 10, 11, 13)
+SELECT * FROM h3_raster_to_pmtiles(
+    'data/california_dem.tif',
+    'data/california_elevation.pmtiles',
+    min_resolution := 6,
+    max_resolution := 8,
+    sampling := 'rgss'
+);
+```
+
+#### Option B: Standalone CLI Tool
+Convert any GeoTIFF directly from the command line without DuckDB:
 
 ```bash
 # Convert a GeoTIFF to a multi-resolution PMTiles vector archive (Zoom levels 11 & 13)
