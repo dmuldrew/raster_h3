@@ -134,14 +134,16 @@ fn encode_directory(entries: &[Entry]) -> io::Result<Vec<u8>> {
         write_varint(&mut uncompressed, e.length as u64);
     }
 
-    // 4. Offset deltas
-    let mut last_offset = 0u64;
-    for e in entries {
-        if e.run_length == 0 {
-            write_varint(&mut uncompressed, e.offset);
+    // 4. Offsets: 0 = contiguous with previous, else (offset + 1) to avoid
+    //    conflicting with the 0 sentinel. Matches go-pmtiles SerializeEntries.
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0
+            && e.offset
+                == entries[i - 1].offset + (entries[i - 1].length as u64)
+        {
+            write_varint(&mut uncompressed, 0);
         } else {
-            write_varint(&mut uncompressed, e.offset - last_offset);
-            last_offset = e.offset + (e.length as u64);
+            write_varint(&mut uncompressed, e.offset + 1);
         }
     }
 
@@ -219,10 +221,13 @@ impl PmtilesWriter {
         let json_metadata_offset = root_dir_offset + root_dir_length;
         let json_metadata_length = metadata_bytes.len() as u64;
 
-        let leaf_dirs_offset = 0u64;
+        // Even with no leaf directories, the offset must be a valid non-zero
+        // position (right after metadata) per the PMTiles v3 spec.
+        // See: go-pmtiles/examples/minimal.go
+        let leaf_dirs_offset = json_metadata_offset + json_metadata_length;
         let leaf_dirs_length = 0u64;
 
-        let tile_data_offset = json_metadata_offset + json_metadata_length;
+        let tile_data_offset = leaf_dirs_offset;
         let tile_data_length = current_offset;
 
         let addressed_tiles_count = self.tiles.len() as u64;

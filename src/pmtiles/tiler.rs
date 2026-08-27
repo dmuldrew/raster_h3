@@ -48,6 +48,25 @@ pub fn tile_xy_to_bbox(z: u8, x: u32, y: u32) -> [f64; 4] {
     [min_lon, min_lat, max_lon, max_lat]
 }
 
+/// Determine the range of tile coordinates (min_tx..=max_tx, min_ty..=max_ty)
+/// intersected by an H3 cell's boundary vertices and center at zoom level z.
+/// Ensures boundary-spanning hexagons are emitted into all overlapping tiles.
+pub fn cell_tile_range(center: LatLng, vertices: &[LatLng], z: u8) -> (u32, u32, u32, u32) {
+    let (mut min_tx, mut min_ty) = lon_lat_to_tile_xy(center.lng(), center.lat(), z);
+    let mut max_tx = min_tx;
+    let mut max_ty = min_ty;
+
+    for v in vertices {
+        let (tx, ty) = lon_lat_to_tile_xy(v.lng(), v.lat(), z);
+        min_tx = min_tx.min(tx);
+        max_tx = max_tx.max(tx);
+        min_ty = min_ty.min(ty);
+        max_ty = max_ty.max(ty);
+    }
+
+    (min_tx, max_tx, min_ty, max_ty)
+}
+
 /// Default mapping from H3 resolution to Web Mercator zoom level (scaling ratio ~1.4037)
 pub fn h3_res_to_zoom(res: u8) -> u8 {
     match res {
@@ -174,14 +193,6 @@ impl H3PmtilesTiler {
             if zoom < min_zoom { min_zoom = zoom; }
             if zoom > max_zoom { max_zoom = zoom; }
 
-            let (tx, ty) = lon_lat_to_tile_xy(c_lon, c_lat, zoom);
-            let tile_key = (zoom, tx, ty);
-
-            let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                MvtLayer::new("h3_hexagons")
-            });
-
-            let bbox = tile_xy_to_bbox(zoom, tx, ty);
             let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
 
             let mut properties = feat.properties;
@@ -199,15 +210,26 @@ impl H3PmtilesTiler {
                 properties.push(("resolution".to_string(), MvtValue::UInt(res_u8 as u64)));
             }
 
-            layer.add_hexagon(
-                feat.h3_index,
-                &boundary_vertices,
-                bbox[0],
-                bbox[2],
-                bbox[1],
-                bbox[3],
-                properties,
-            );
+            let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+            for tx in min_tx..=max_tx {
+                for ty in min_ty..=max_ty {
+                    let tile_key = (zoom, tx, ty);
+                    let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                        MvtLayer::new("h3_hexagons")
+                    });
+                    let bbox = tile_xy_to_bbox(zoom, tx, ty);
+
+                    layer.add_hexagon(
+                        feat.h3_index,
+                        &boundary_vertices,
+                        bbox[0],
+                        bbox[2],
+                        bbox[1],
+                        bbox[3],
+                        properties.clone(),
+                    );
+                }
+            }
         }
 
         if valid_features == 0 {
@@ -321,14 +343,6 @@ impl H3PmtilesTiler {
                     if c_lat > global_max_lat { global_max_lat = c_lat; }
 
                     let zoom = h3_res_to_zoom(resolution);
-                    let (tx, ty) = lon_lat_to_tile_xy(c_lon, c_lat, zoom);
-                    let tile_key = (zoom, tx, ty);
-
-                    let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                        MvtLayer::new("h3_hexagons")
-                    });
-
-                    let bbox = tile_xy_to_bbox(zoom, tx, ty);
                     let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
 
                     let mut hex_buf = [0u8; 16];
@@ -346,15 +360,26 @@ impl H3PmtilesTiler {
                         ("max".to_string(), MvtValue::Double(accumulator.max)),
                     ];
 
-                    layer.add_hexagon(
-                        h3_index,
-                        &boundary_vertices,
-                        bbox[0],
-                        bbox[2],
-                        bbox[1],
-                        bbox[3],
-                        properties,
-                    );
+                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+                    for tx in min_tx..=max_tx {
+                        for ty in min_ty..=max_ty {
+                            let tile_key = (zoom, tx, ty);
+                            let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                                MvtLayer::new("h3_hexagons")
+                            });
+                            let bbox = tile_xy_to_bbox(zoom, tx, ty);
+
+                            layer.add_hexagon(
+                                h3_index,
+                                &boundary_vertices,
+                                bbox[0],
+                                bbox[2],
+                                bbox[1],
+                                bbox[3],
+                                properties.clone(),
+                            );
+                        }
+                    }
 
                     total_hexagons += 1;
                 }
@@ -491,35 +516,38 @@ impl H3PmtilesTiler {
                     let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("").to_string();
 
                     for &zoom in &zooms {
-                        let (tx, ty) = lon_lat_to_tile_xy(c_lon, c_lat, zoom);
-                        let tile_key = (zoom, tx, ty);
+                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+                        for tx in min_tx..=max_tx {
+                            for ty in min_ty..=max_ty {
+                                let tile_key = (zoom, tx, ty);
+                                let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                                    MvtLayer::new("h3_hexagons")
+                                });
 
-                        let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                            MvtLayer::new("h3_hexagons")
-                        });
+                                let bbox = tile_xy_to_bbox(zoom, tx, ty);
 
-                        let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                                let properties = vec![
+                                    ("h3_index".to_string(), MvtValue::UInt(h3_index)),
+                                    ("h3_hex".to_string(), MvtValue::String(hex_str.clone())),
+                                    ("resolution".to_string(), MvtValue::UInt(res as u64)),
+                                    ("mean".to_string(), MvtValue::Double(accumulator.mean())),
+                                    ("stddev".to_string(), MvtValue::Double(accumulator.stddev())),
+                                    ("count".to_string(), MvtValue::Double(accumulator.count)),
+                                    ("min".to_string(), MvtValue::Double(accumulator.min)),
+                                    ("max".to_string(), MvtValue::Double(accumulator.max)),
+                                ];
 
-                        let properties = vec![
-                            ("h3_index".to_string(), MvtValue::UInt(h3_index)),
-                            ("h3_hex".to_string(), MvtValue::String(hex_str.clone())),
-                            ("resolution".to_string(), MvtValue::UInt(res as u64)),
-                            ("mean".to_string(), MvtValue::Double(accumulator.mean())),
-                            ("stddev".to_string(), MvtValue::Double(accumulator.stddev())),
-                            ("count".to_string(), MvtValue::Double(accumulator.count)),
-                            ("min".to_string(), MvtValue::Double(accumulator.min)),
-                            ("max".to_string(), MvtValue::Double(accumulator.max)),
-                        ];
-
-                        layer.add_hexagon(
-                            h3_index,
-                            &boundary_vertices,
-                            bbox[0],
-                            bbox[2],
-                            bbox[1],
-                            bbox[3],
-                            properties,
-                        );
+                                layer.add_hexagon(
+                                    h3_index,
+                                    &boundary_vertices,
+                                    bbox[0],
+                                    bbox[2],
+                                    bbox[1],
+                                    bbox[3],
+                                    properties,
+                                );
+                            }
+                        }
                     }
 
                     total_hexagons += 1;
