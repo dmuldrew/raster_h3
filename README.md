@@ -19,11 +19,12 @@ Supports both **continuous** raster surfaces (elevation, temperature, NDVI) and 
 - [6. SQL Usage & Practical Recipes](#6-sql-usage--practical-recipes)
 - [7. Sub-Pixel Super-Sampling Guide](#7-sub-pixel-super-sampling-guide)
 - [8. Supported Coordinate Reference Systems](#8-supported-coordinate-reference-systems)
-- [9. Complete API Reference](#9-complete-api-reference)
-- [10. Architecture Diagram](#10-architecture-diagram)
-- [11. Core Dependencies & Architectural Contributions](#11-core-dependencies--architectural-contributions)
-- [12. Building & Testing Locally](#12-building--testing-locally)
-- [13. License](#13-license)
+- [9. Direct Ground-Truth Multi-Resolution Spatial Pyramids](#9-direct-ground-truth-multi-resolution-spatial-pyramids)
+- [10. Complete API Reference](#10-complete-api-reference)
+- [11. Architecture Diagram](#11-architecture-diagram)
+- [12. Core Dependencies & Architectural Contributions](#12-core-dependencies--architectural-contributions)
+- [13. Building & Testing Locally](#13-building--testing-locally)
+- [14. License](#14-license)
 
 ---
 
@@ -440,7 +441,55 @@ SELECT * FROM h3_raster_continuous_aggregate(
 
 ---
 
-## 9. Complete API Reference
+## 9. Direct Ground-Truth Multi-Resolution Spatial Pyramids
+
+`raster_h3` provides single-pass multi-resolution streaming via `MultiScanHorizonStreamer` and `MultiCategoricalHorizonStreamer`, enabling simultaneous extraction across multiple H3 zoom levels (e.g. resolutions 7, 8, and 9) in a **single file read**.
+
+```
+       Direct Pixel Containment                  Hierarchical Parent Rollup
+    (100% True to Raster Pixels)               (Hex-to-Hex Approximation)
+ 
+         ┌───────────────┐                          ┌───────────────┐
+         │               │                          │               │
+      ●  │   Parent      │                       ┌──┴──┐  Parent    │
+  (Pixel)│   Hexagon     │                       │Child│  Hexagon   │
+         │               │                       └──┬──┘            │
+         └───────────────┘                          └───────────────┘
+  Pixel coordinate (x,y) is tested         Pixel assigned to Child Hex, then
+  directly inside Parent's true boundary   Child mapped to Parent (boundary bleed)
+```
+
+### The "Aperture 7" Challenge & True Ground-Truth Guarantee
+In the H3 Discrete Global Grid System, parent hexagons are **not** the strict geometric union of their 7 child hexagons due to an Aperture-7 angular rotation. As a result:
+* **Naive Parent Rollups (`cell.parent()`):** Suffer from boundary distortion near cell edges because child hexagons slightly overlap neighboring parent boundaries.
+* **`raster_h3` Direct Multi-Resolution Streaming:** Evaluates every pixel's exact coordinate center against the true polygon boundary of every requested resolution level simultaneously.
+
+> [!TIP]
+> **100.000% Exact Numerical Identity**: Running multi-resolution extraction on `[7, 8, 9]` produces cell indices, pixel counts, means, variances, mins, and maxes that are **100% identical** down to the exact pixel compared to running three separate single-resolution scans.
+
+### Key Performance Benefits
+1. **Zero Redundant I/O:** The GeoTIFF file is read from disk and decompressed **only once**.
+2. **L1 CPU Cache Reuse:** Decoded raster pixel memory is kept in high-speed L1 cache while parallel `SpatialCoherenceCache` instances update the active horizon front for each resolution level.
+3. **Stacked Table Output:** Yields a unified multi-resolution pyramid with a `resolution` column ready for partitioned parquet export:
+
+```sql
+-- Direct multi-resolution extraction across zoom levels 7, 8, and 9
+SELECT 
+    resolution,
+    h3_hex,
+    round(mean, 2) AS mean_elevation,
+    round(stddev, 2) AS ruggedness,
+    count AS pixels
+FROM h3_raster_continuous_aggregate(
+    'california_dem.tif',
+    resolutions := [7, 8, 9]
+)
+ORDER BY resolution ASC, pixels DESC;
+```
+
+---
+
+## 10. Complete API Reference
 
 ### Continuous Rasters: `h3_raster_continuous_aggregate(file_path, [resolution], ...)`
 *(Alias: `h3_raster_continuous`)*
@@ -570,7 +619,7 @@ WHERE fraction >= 0.10;
 
 ---
 
-## 10. Architecture Diagram
+## 11. Architecture Diagram
 
 ```mermaid
 flowchart TD
@@ -626,7 +675,7 @@ flowchart TD
 
 ---
 
-## 11. Core Dependencies & Architectural Contributions
+## 12. Core Dependencies & Architectural Contributions
 
 `raster_h3` is built using a carefully curated set of pure-Rust libraries to achieve zero external runtime dependencies and hardware-saturating performance:
 
@@ -642,7 +691,7 @@ flowchart TD
 
 ---
 
-## 12. Building & Testing Locally
+## 13. Building & Testing Locally
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (Edition 2021+, stable toolchain)
@@ -662,7 +711,7 @@ The compiled extension will be in:
 
 #### Locally with Cargo:
 ```bash
-# Run all unit and integration tests
+# Run all 64 unit and integration tests
 cargo test --release
 
 # Run with verbose test stdout output
@@ -680,18 +729,17 @@ docker build -t raster_h3 .
 docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release
 ```
 
-### 3. Run Real-World Scaling Benchmark
-To run the automated scaling benchmark across $1.0\text{ Mpx}$ to $100.0\text{ Mpx}$ GeoTIFFs:
+### 3. Run Performance & Scaling Benchmarks
 
 ```bash
-# Locally with Cargo
-cargo run --release --example benchmark_scaling
+# 1. Complete End-to-End Multi-Stage Pipeline Benchmark
+cargo run --release --example benchmark_e2e
 
-# In Docker
-docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo run --release --example benchmark_scaling
+# 2. Large-Scale Multi-Resolution Scaling Benchmark (1M to 100M pixels)
+cargo run --release --example benchmark_scaling
 ```
 
 ---
 
-## 13. License
+## 14. License
 This project is licensed under the [MIT License](LICENSE).

@@ -88,9 +88,9 @@ impl SpatialCoherenceCache {
         let res_u8: u8 = cell_index.resolution().into();
         let edge_deg = H3_EDGE_DEG.get(res_u8 as usize).copied().unwrap_or(0.001);
 
-        // Conservative safe factor: 0.45× edge length gives a safe inscribed box
-        // in latitude. In longitude, degrees expand by 1 / cos(lat) at higher latitudes.
-        let safe_r_lat = edge_deg * 0.45;
+        // Conservative safe factor: 0.25× edge length gives a guaranteed safe inscribed box
+        // across all hexagon rotations and icosahedron face distortions.
+        let safe_r_lat = edge_deg * 0.25;
         let cos_lat = center_lat.to_radians().cos().abs().max(0.05);
         let safe_r_lon = (safe_r_lat / cos_lat).min(180.0);
 
