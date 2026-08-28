@@ -151,3 +151,48 @@ impl H3Accumulator {
         }
     }
 }
+
+/// A highly optimized accumulator for tracking short, contiguous runs of pixels
+/// without the overhead of Welford's algorithm divisions per pixel.
+/// Automatically vectorizes nicely for SIMD architectures.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FastRunAccumulator {
+    pub sum: f64,
+    pub sum_sq: f64,
+    pub count: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl Default for FastRunAccumulator {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            sum: 0.0,
+            sum_sq: 0.0,
+            count: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl FastRunAccumulator {
+    /// Convert the fast run statistics into a numerically stable Welford accumulator
+    #[inline(always)]
+    pub fn into_h3(self) -> H3Accumulator {
+        let m2 = if self.count > 1.0 {
+            self.sum_sq - (self.sum * self.sum) / self.count
+        } else {
+            0.0
+        };
+        H3Accumulator {
+            sum: self.sum,
+            count: self.count,
+            min: self.min,
+            max: self.max,
+            m2: m2.max(0.0),
+        }
+    }
+}

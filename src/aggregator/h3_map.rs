@@ -4,7 +4,7 @@ use fxhash::FxBuildHasher;
 use rayon::prelude::*;
 use tiff::decoder::DecodingResult;
 
-use crate::aggregator::accumulator::H3Accumulator;
+use crate::aggregator::accumulator::{H3Accumulator, FastRunAccumulator};
 use crate::aggregator::coherence::SpatialCoherenceCache;
 use crate::aggregator::horizon_streamer::{is_chunk_all_nodata, AggregationConfig};
 use crate::crs::transformer::CrsTransformer;
@@ -68,7 +68,7 @@ fn aggregate_native_slice_hoisted<T, F, N>(
         let mut row_cache = SpatialCoherenceCache::default();
 
         let mut run_cell: u64 = 0;
-        let mut run_acc = H3Accumulator::default();
+        let mut run_acc = FastRunAccumulator::default();
 
         // Hoist latitude and starting longitude for the entire row
         let (x_start, y_row) = gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
@@ -119,12 +119,13 @@ fn aggregate_native_slice_hoisted<T, F, N>(
             if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, resolution) {
                 if cell_u64 != run_cell {
                     if run_cell != 0 && run_acc.count > 0.0 {
+                        let h3_acc = run_acc.into_h3();
                         map.entry(run_cell)
-                            .and_modify(|acc| acc.merge(&run_acc))
-                            .or_insert(run_acc);
+                            .and_modify(|acc| acc.merge(&h3_acc))
+                            .or_insert(h3_acc);
                     }
                     run_cell = cell_u64;
-                    run_acc = H3Accumulator::default();
+                    run_acc = FastRunAccumulator::default();
                 }
 
                 // Compute safe span length guaranteed to remain in this cell
@@ -139,24 +140,27 @@ fn aggregate_native_slice_hoisted<T, F, N>(
                 // Tight slice vector loop (auto-vectorizes with AVX2 / ARM NEON)
                 for i in c..span_end {
                     let val_raw = slice[slice_row_start + i];
-
+                    
+                    let mut is_valid = true;
                     if let Some(nd_nat) = native_nodata {
-                        if nd_nat == val_raw {
-                            continue;
-                        }
+                        is_valid &= nd_nat != val_raw;
                     }
 
                     let val = to_f64(val_raw);
-                    if !val.is_finite() {
-                        continue;
-                    }
+                    is_valid &= val.is_finite();
+                    
                     if let Some(nd) = nodata {
-                        if (val - nd).abs() < 1e-6 {
-                            continue;
-                        }
+                        is_valid &= (val - nd).abs() >= 1e-6;
                     }
 
-                    run_acc.update(val);
+                    let val_masked = if is_valid { val } else { 0.0 };
+                    let weight = if is_valid { 1.0 } else { 0.0 };
+
+                    run_acc.sum += val_masked;
+                    run_acc.sum_sq += val_masked * val_masked;
+                    run_acc.count += weight;
+                    run_acc.min = if is_valid { run_acc.min.min(val) } else { run_acc.min };
+                    run_acc.max = if is_valid { run_acc.max.max(val) } else { run_acc.max };
                 }
 
                 let num_stepped = span_end - c;
@@ -174,9 +178,10 @@ fn aggregate_native_slice_hoisted<T, F, N>(
 
         // Flush remaining run at end of row
         if run_cell != 0 && run_acc.count > 0.0 {
+            let h3_acc = run_acc.into_h3();
             map.entry(run_cell)
-                .and_modify(|acc| acc.merge(&run_acc))
-                .or_insert(run_acc);
+                .and_modify(|acc| acc.merge(&h3_acc))
+                .or_insert(h3_acc);
         }
     }
 }
