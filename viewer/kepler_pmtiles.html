@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Kepler.gl PMTiles Studio — Multi-Resolution H3 Hexagons</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
+  <style>
+    :root {
+      --kepler-bg: #1c1f24;
+      --kepler-panel: rgba(29, 32, 40, 0.94);
+      --kepler-panel-border: rgba(255, 255, 255, 0.08);
+      --kepler-card: #29323c;
+      --kepler-card-hover: #333f4d;
+      --kepler-accent: #1fbdbd;
+      --kepler-accent-hover: #26e6e6;
+      --kepler-accent-glow: rgba(31, 189, 189, 0.35);
+      --kepler-text: #ffffff;
+      --kepler-text-muted: #a0a7b4;
+      --kepler-text-dim: #6a7485;
+      --kepler-danger: #f25c54;
+      --kepler-border-radius: 8px;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--kepler-bg);
+      color: var(--kepler-text);
+      overflow: hidden;
+    }
+
+    #map {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Kepler Left Floating Workspace */
+    .kepler-sidebar {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      width: 380px;
+      max-height: calc(100vh - 32px);
+      background: var(--kepler-panel);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--kepler-panel-border);
+      border-radius: 12px;
+      box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.04);
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transition: all 0.25s ease;
+    }
+
+    .kepler-header {
+      padding: 16px 20px;
+      background: rgba(0, 0, 0, 0.25);
+      border-bottom: 1px solid var(--kepler-panel-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .kepler-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .kepler-logo-sq {
+      width: 28px;
+      height: 28px;
+      background: linear-gradient(135deg, #1fbdbd, #248bf5);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 14px;
+      color: #fff;
+      box-shadow: 0 0 14px var(--kepler-accent-glow);
+    }
+
+    .kepler-title {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+    }
+
+    .kepler-sub {
+      font-size: 11px;
+      color: var(--kepler-text-muted);
+      font-weight: 400;
+    }
+
+    /* Tabs */
+    .kepler-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--kepler-panel-border);
+      background: rgba(0, 0, 0, 0.15);
+    }
+
+    .kepler-tab {
+      flex: 1;
+      padding: 10px 0;
+      text-align: center;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--kepler-text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .kepler-tab.active {
+      color: var(--kepler-accent);
+      border-bottom-color: var(--kepler-accent);
+      background: rgba(31, 189, 189, 0.05);
+    }
+
+    .kepler-content {
+      padding: 18px 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Control items */
+    .control-block {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .control-head {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--kepler-text-muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .control-badge {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--kepler-accent);
+      font-size: 11px;
+    }
+
+    select, input[type="text"] {
+      width: 100%;
+      background: var(--kepler-card);
+      border: 1px solid var(--kepler-panel-border);
+      border-radius: var(--kepler-border-radius);
+      padding: 9px 12px;
+      color: var(--kepler-text);
+      font-size: 12.5px;
+      outline: none;
+      transition: all 0.2s;
+    }
+
+    select:focus, input[type="text"]:focus {
+      border-color: var(--kepler-accent);
+      box-shadow: 0 0 0 2px var(--kepler-accent-glow);
+    }
+
+    input[type="range"] {
+      -webkit-appearance: none;
+      width: 100%;
+      background: rgba(255, 255, 255, 0.12);
+      height: 4px;
+      border-radius: 2px;
+      outline: none;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      background: var(--kepler-accent);
+      cursor: pointer;
+      box-shadow: 0 0 10px var(--kepler-accent-glow);
+    }
+
+    /* Palette selection gallery */
+    .palette-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      max-height: 240px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .palette-card {
+      background: var(--kepler-card);
+      border: 1px solid var(--kepler-panel-border);
+      border-radius: 6px;
+      padding: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .palette-card:hover {
+      background: var(--kepler-card-hover);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .palette-card.selected {
+      border-color: var(--kepler-accent);
+      background: rgba(31, 189, 189, 0.12);
+      box-shadow: 0 0 8px var(--kepler-accent-glow);
+    }
+
+    .palette-name {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--kepler-text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .palette-strip {
+      height: 10px;
+      border-radius: 3px;
+      width: 100%;
+    }
+
+    /* Toggle switches */
+    .kepler-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: var(--kepler-card);
+      border-radius: var(--kepler-border-radius);
+      border: 1px solid var(--kepler-panel-border);
+    }
+
+    .kepler-toggle-title {
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+    }
+
+    .switch input { opacity: 0; width: 0; height: 0; }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: rgba(255, 255, 255, 0.16);
+      transition: .2s;
+      border-radius: 20px;
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .2s;
+      border-radius: 50%;
+    }
+
+    input:checked + .slider { background-color: var(--kepler-accent); }
+    input:checked + .slider:before { transform: translateX(16px); }
+
+    /* Hex Resolution Stat Cards */
+    .stat-card {
+      background: var(--kepler-card);
+      border: 1px solid var(--kepler-panel-border);
+      border-radius: 8px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: all 0.2s ease;
+    }
+
+    .stat-card.active-res {
+      border-color: var(--kepler-accent);
+      background: rgba(31, 189, 189, 0.08);
+      box-shadow: 0 0 10px var(--kepler-accent-glow);
+    }
+
+    .stat-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .stat-res-badge {
+      background: rgba(31, 189, 189, 0.2);
+      color: var(--kepler-accent);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .stat-zoom-badge {
+      font-size: 10px;
+      color: var(--kepler-text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    .stat-item {
+      background: rgba(0, 0, 0, 0.2);
+      padding: 6px 8px;
+      border-radius: 4px;
+    }
+
+    .stat-item-label {
+      font-size: 9px;
+      color: var(--kepler-text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .stat-item-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: #fff;
+      font-weight: 600;
+    }
+
+    /* Drag and Drop Zone */
+    .kepler-dropzone {
+      border: 1.5px dashed rgba(255, 255, 255, 0.2);
+      border-radius: var(--kepler-border-radius);
+      padding: 14px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .kepler-dropzone:hover, .kepler-dropzone.dragover {
+      border-color: var(--kepler-accent);
+      background: rgba(31, 189, 189, 0.08);
+    }
+
+    .kepler-dropzone-name {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--kepler-accent);
+      margin-bottom: 4px;
+    }
+
+    .kepler-dropzone-hint {
+      font-size: 10px;
+      color: var(--kepler-text-muted);
+    }
+
+    /* Floating Legend */
+    .kepler-legend {
+      position: absolute;
+      bottom: 24px;
+      right: 24px;
+      background: var(--kepler-panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--kepler-panel-border);
+      border-radius: 12px;
+      padding: 14px 18px;
+      z-index: 15;
+      min-width: 240px;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.6);
+    }
+
+    .kepler-legend-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .kepler-legend-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .kepler-legend-scale {
+      font-size: 10px;
+      color: var(--kepler-accent);
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .kepler-legend-gradient {
+      height: 14px;
+      border-radius: 4px;
+      margin-bottom: 6px;
+      box-shadow: inset 0 0 3px rgba(0,0,0,0.5);
+    }
+
+    .kepler-legend-ticks {
+      display: flex;
+      justify-content: space-between;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--kepler-text-muted);
+    }
+
+    /* Tooltip */
+    .maplibregl-popup-content {
+      background: rgba(20, 24, 33, 0.96) !important;
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-radius: 10px !important;
+      padding: 14px 16px !important;
+      color: #fff !important;
+      box-shadow: 0 16px 36px rgba(0,0,0,0.7) !important;
+      font-family: 'Inter', sans-serif !important;
+      max-width: 290px;
+    }
+
+    .tip-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .tip-hex {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--kepler-accent);
+    }
+
+    .tip-res {
+      background: rgba(31, 189, 189, 0.15);
+      color: var(--kepler-accent);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 9px;
+      font-weight: 600;
+    }
+
+    .tip-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    .tip-cell {
+      background: rgba(255, 255, 255, 0.04);
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    .tip-cell-title {
+      color: var(--kepler-text-dim);
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .tip-cell-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      color: #fff;
+    }
+
+    /* HUD */
+    .kepler-hud {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      background: var(--kepler-panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--kepler-panel-border);
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--kepler-text-muted);
+      z-index: 10;
+      display: flex;
+      gap: 16px;
+    }
+
+    .kepler-hud span { color: var(--kepler-text); font-weight: 600; }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <!-- HUD Real-Time Stats -->
+  <div class="kepler-hud">
+    <div>Zoom: <span id="hud-zoom">7.0</span></div>
+    <div>H3 Res: <span id="hud-h3-res">4</span></div>
+    <div>Pitch: <span id="hud-pitch">0°</span></div>
+  </div>
+
+  <!-- Kepler Control Studio -->
+  <div class="kepler-sidebar">
+    <div class="kepler-header">
+      <div class="kepler-brand">
+        <div class="kepler-logo-sq">K</div>
+        <div>
+          <div class="kepler-title">Kepler.gl PMTiles Studio</div>
+          <div class="kepler-sub">Hexagonal Raster Vector Engine</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="kepler-tabs">
+      <div class="kepler-tab active" data-tab="layers">Layers</div>
+      <div class="kepler-tab" data-tab="palettes">Colormaps</div>
+      <div class="kepler-tab" data-tab="stats">Hex Stats</div>
+      <div class="kepler-tab" data-tab="basemap">Basemap</div>
+    </div>
+
+    <!-- TAB 1: Layer & Style Controls -->
+    <div class="kepler-content" id="tab-layers">
+      <div class="control-block">
+        <div class="control-head">Active PMTiles Source</div>
+        <div class="kepler-dropzone" id="dropzone">
+          <div class="kepler-dropzone-name" id="dropzone-filename">data/CFL_HI_pyramid.pmtiles</div>
+          <div class="kepler-dropzone-hint">Click to browse or drop any .pmtiles</div>
+          <input type="file" id="file-input" accept=".pmtiles" style="display:none;" />
+        </div>
+      </div>
+
+      <div class="control-block">
+        <div class="control-head">Colorize Attribute</div>
+        <select id="property-select">
+          <option value="mean" selected>mean — Continuous Average</option>
+          <option value="sum">sum — Total Sum of Pixel Values</option>
+          <option value="max">max — Peak Pixel Intensity</option>
+          <option value="min">min — Minimum Pixel Value</option>
+          <option value="count">count — Valid Pixel Sampling Count</option>
+          <option value="stddev">stddev — Standard Deviation</option>
+          <option value="resolution">resolution — Native H3 Pyramid Resolution</option>
+        </select>
+      </div>
+
+      <div class="kepler-toggle">
+        <div>
+          <span class="kepler-toggle-title">Adaptive Scale by H3 Res</span>
+          <div style="font-size: 10px; color: var(--kepler-text-muted);">Calibrate color ramp dynamically per hex level</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="adaptive-color-toggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="control-block">
+        <div class="control-head">
+          <span>Active Colormap</span>
+          <span class="control-badge" id="active-palette-name">Viridis</span>
+        </div>
+        <div class="palette-strip" id="active-palette-bar"></div>
+      </div>
+
+      <div class="control-block">
+        <div class="control-head">
+          <span>Min Value Bound (Manual)</span>
+          <span class="control-badge" id="min-val-display">0.0</span>
+        </div>
+        <input type="range" id="min-val-slider" min="0" max="100" value="0" step="0.5">
+      </div>
+
+      <div class="control-block">
+        <div class="control-head">
+          <span>Max Value Bound (Manual)</span>
+          <span class="control-badge" id="max-val-display">60.0</span>
+        </div>
+        <input type="range" id="max-val-slider" min="1" max="150" value="60" step="0.5">
+      </div>
+
+      <div class="control-block">
+        <div class="control-head">
+          <span>Opacity</span>
+          <span class="control-badge" id="opacity-val">80%</span>
+        </div>
+        <input type="range" id="opacity-slider" min="10" max="100" value="80">
+      </div>
+
+      <div class="kepler-toggle">
+        <span class="kepler-toggle-title">3D Hexagon Extrusion</span>
+        <label class="switch">
+          <input type="checkbox" id="extrusion-toggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="control-block" id="extrusion-controls" style="display: none;">
+        <div class="control-head">
+          <span>Height Multiplier</span>
+          <span class="control-badge" id="height-val">250x</span>
+        </div>
+        <input type="range" id="height-slider" min="10" max="1000" value="250" step="10">
+      </div>
+
+      <div class="kepler-toggle">
+        <span class="kepler-toggle-title">Hexagon Wireframe Borders</span>
+        <label class="switch">
+          <input type="checkbox" id="wireframe-toggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="kepler-toggle">
+        <span class="kepler-toggle-title">Invert Colormap</span>
+        <label class="switch">
+          <input type="checkbox" id="invert-toggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- TAB 2: Extensive Colormap Gallery -->
+    <div class="kepler-content" id="tab-palettes" style="display:none;">
+      <div class="control-head">Select Colormap Palette (24 Choices)</div>
+      <div class="palette-grid" id="palette-grid">
+        <!-- Dynamically injected palette cards -->
+      </div>
+    </div>
+
+    <!-- TAB 3: Hex Resolution Stats Gallery -->
+    <div class="kepler-content" id="tab-stats" style="display:none;">
+      <div class="control-head">H3 Pyramid Resolution Breakdown</div>
+      <div id="stats-container" style="display: flex; flex-direction: column; gap: 10px;">
+        <div style="font-size: 11px; color: var(--kepler-text-muted);">Loading pyramid stats...</div>
+      </div>
+    </div>
+
+    <!-- TAB 4: Basemap Selection -->
+    <div class="kepler-content" id="tab-basemap" style="display:none;">
+      <div class="control-block">
+        <div class="control-head">Base Map Theme</div>
+        <select id="basemap-select">
+          <option value="carto-dark" selected>CartoDB Dark Matter (Kepler Default)</option>
+          <option value="esri-sat">ESRI World Satellite</option>
+          <option value="esri-clarity">ESRI Satellite Clarity</option>
+          <option value="carto-light">CartoDB Positron</option>
+          <option value="carto-voyager">CartoDB Voyager</option>
+          <option value="osm">OpenStreetMap Standard</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- Kepler Legend -->
+  <div class="kepler-legend">
+    <div class="kepler-legend-head">
+      <span class="kepler-legend-title" id="legend-attribute">mean</span>
+      <span class="kepler-legend-scale" id="legend-palette-label">VIRIDIS</span>
+    </div>
+    <div class="kepler-legend-gradient" id="legend-bar"></div>
+    <div class="kepler-legend-ticks">
+      <span id="legend-min">0.0</span>
+      <span id="legend-mid">30.0</span>
+      <span id="legend-max">60.0</span>
+    </div>
+  </div>
+
+  <script>
+    // 24 Professional Kepler & Scientific Colormaps
+    const COLOR_PALETTES = {
+      // Perceptually Uniform Scientific
+      'Viridis': ['#440154', '#482878', '#3e4989', '#31688e', '#26828e', '#1f9e89', '#35b779', '#6ece58', '#b5de2b', '#fde725'],
+      'Plasma': ['#0d0887', '#46039f', '#7201a8', '#9c179e', '#bd3786', '#d8576b', '#ed7953', '#fb9f3a', '#fdca26', '#f0f921'],
+      'Turbo': ['#30123b', '#4145ab', '#4675ed', '#39a2fc', '#1bcfd4', '#24eca6', '#61fc4c', '#a4fc3b', '#d1e834', '#f3c63a', '#fe9b2d', '#f36315', '#d93806', '#ad1a03', '#7a0402'],
+      'Inferno': ['#000004', '#160b39', '#420a68', '#6a176e', '#932667', '#ba3655', '#dd513a', '#f3761b', '#fca50a', '#f6d746', '#fcffa4'],
+      'Magma': ['#000004', '#180f3d', '#440f76', '#721f81', '#9e2f7f', '#cd4071', '#f1605d', '#fd9668', '#feca8d', '#fcfdbf'],
+      'Cividis': ['#00204d', '#002e6e', '#003c8f', '#414d6b', '#625f63', '#7f715b', '#9d8451', '#bc9943', '#deaf31', '#ffea46'],
+      
+      // Diverging
+      'Spectral': ['#9e0142', '#d53e4f', '#f46d43', '#fdae61', '#fee08b', '#ffffbf', '#e6f598', '#abdda4', '#66c2a5', '#3288bd', '#5e4fa2'],
+      'Coolwarm': ['#3b4cc0', '#5977e3', '#7b9ff9', '#9ebeff', '#c0d4f5', '#dddcdc', '#f2cbb7', '#f7a889', '#e36e53', '#b40426'],
+      'RdYlBu': ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee090', '#ffffbf', '#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695'],
+      'RdYlGn': ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#ffffbf', '#d9ef8b', '#a6d96a', '#66bd63', '#1a9850', '#006837'],
+      'PRGn': ['#40004b', '#762a83', '#9970ab', '#c2a5cf', '#e7d4e8', '#f7f7f7', '#d9f0d3', '#a6dba0', '#5aae61', '#1b7837', '#00441b'],
+      
+      // Sequential Multi-Hue
+      'YlOrRd': ['#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026'],
+      'YlGnBu': ['#ffffd9', '#edf8b1', '#c7e9b4', '#7fcdbb', '#41b6c4', '#1d91c0', '#225ea8', '#253494', '#081d58'],
+      'YlGn': ['#ffffe5', '#f7fcb9', '#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529'],
+      'Blues': ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#08519c', '#08306b'],
+      'Reds': ['#fff5f0', '#fee0d2', '#fcbba1', '#fc9272', '#fb6a4a', '#ef3b2c', '#cb181d', '#a50f15', '#67000d'],
+      'Greens': ['#f7fcf5', '#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#238b45', '#006d2c', '#00441b'],
+      'Purples': ['#fcfbfd', '#efedf5', '#dadaeb', '#bcbddc', '#9e9ac8', '#807dba', '#6a51a3', '#54278f', '#3f007d'],
+
+      // Ocean & Geophysical
+      'Thermal': ['#042333', '#0c3f5d', '#1d5e82', '#367fa1', '#57a1b8', '#80c3cc', '#b0e3dc', '#e5f5e0', '#f6d2a9', '#f39c6b', '#e35b3e', '#b81b2e'],
+      'Haline': ['#2b1055', '#4c1c72', '#6f2581', '#942b82', '#b73375', '#d6425e', '#ed5a40', '#f87b1a', '#f7a300', '#ebcd00', '#d2f438'],
+      'Solar': ['#331800', '#5c2a00', '#8a3c00', '#b84e00', '#e66500', '#ff8400', '#ffa71a', '#ffc74d', '#ffe380', '#ffffb3'],
+
+      // Kepler / Uber Cyberpunk Themes
+      'Emerald Neon': ['#042f2e', '#0f766e', '#0d9488', '#14b8a6', '#2dd4bf', '#5eead4', '#99f6e4', '#ccfbf1', '#22d3ee', '#38bdf8'],
+      'Cyberpunk': ['#1a0033', '#330066', '#660099', '#9900cc', '#cc00ff', '#ff00ff', '#ff00aa', '#ff0055', '#ff3300', '#ffcc00'],
+      'California Sunset': ['#180026', '#3b0d40', '#631853', '#8f205c', '#bc2a59', '#e33e49', '#f96131', '#fd8f21', '#f7c32e', '#f4f85e']
+    };
+
+    const BASEMAPS = {
+      'carto-dark': 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+      'esri-sat': {
+        version: 8,
+        sources: {
+          'esri-sat': {
+            type: 'raster',
+            tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+            tileSize: 256,
+            maxzoom: 19
+          }
+        },
+        layers: [{ id: 'esri-sat', type: 'raster', source: 'esri-sat' }]
+      },
+      'esri-clarity': {
+        version: 8,
+        sources: {
+          'esri-clarity': {
+            type: 'raster',
+            tiles: ['https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+            tileSize: 256,
+            maxzoom: 19
+          }
+        },
+        layers: [{ id: 'esri-clarity', type: 'raster', source: 'esri-clarity' }]
+      },
+      'carto-light': 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+      'carto-voyager': 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json',
+      'osm': {
+        version: 8,
+        sources: {
+          'osm': {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            maxzoom: 19,
+            attribution: '&copy; OpenStreetMap contributors'
+          }
+        },
+        layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+      }
+    };
+
+    // Initialize PMTiles protocol
+    const protocol = new pmtiles.Protocol();
+    maplibregl.addProtocol("pmtiles", protocol.tile);
+
+    let activePMTileSource = null;
+    let currentMetadata = null;
+    let sourceCounter = 0;
+
+    const ATTRIBUTE_RANGES = {
+      'mean': { min: 0, max: 100, defaultMin: 0, defaultMax: 60, step: 0.5 },
+      'sum': { min: 0, max: 250000, defaultMin: 0, defaultMax: 60000, step: 100 },
+      'max': { min: 0, max: 150, defaultMin: 0, defaultMax: 80, step: 0.5 },
+      'min': { min: 0, max: 100, defaultMin: 0, defaultMax: 40, step: 0.5 },
+      'count': { min: 1, max: 25000, defaultMin: 1, defaultMax: 5000, step: 10 },
+      'stddev': { min: 0, max: 50, defaultMin: 0, defaultMax: 20, step: 0.2 },
+      'resolution': { min: 0, max: 15, defaultMin: 0, defaultMax: 12, step: 1 },
+    };
+
+    function updateSliderRanges(prop) {
+      const config = ATTRIBUTE_RANGES[prop] || ATTRIBUTE_RANGES['mean'];
+      const minSlider = document.getElementById('min-val-slider');
+      const maxSlider = document.getElementById('max-val-slider');
+      
+      minSlider.min = config.min;
+      minSlider.max = config.max;
+      minSlider.step = config.step;
+      minSlider.value = config.defaultMin;
+      
+      maxSlider.min = config.min;
+      maxSlider.max = config.max;
+      maxSlider.step = config.step;
+      maxSlider.value = config.defaultMax;
+      
+      document.getElementById('min-val-display').innerText = Number(config.defaultMin).toLocaleString();
+      document.getElementById('max-val-display').innerText = Number(config.defaultMax).toLocaleString();
+    }
+
+    function renderPyramidStatsTab(metadata) {
+      const container = document.getElementById('stats-container');
+      if (!container) return;
+
+      const resStats = metadata?.h3_resolution_stats;
+      if (!resStats || typeof resStats !== 'object' || Object.keys(resStats).length === 0) {
+        container.innerHTML = `
+          <div style="font-size: 11px; color: var(--kepler-text-muted); padding: 10px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+            No per-resolution statistical metadata found in this PMTiles archive.
+          </div>
+        `;
+        return;
+      }
+
+      let html = '';
+      const sortedKeys = Object.keys(resStats).sort((a, b) => parseInt(a) - parseInt(b));
+
+      for (const resKey of sortedKeys) {
+        const s = resStats[resKey];
+        const zoomsStr = Array.isArray(s.zooms) ? s.zooms.join(', ') : '-';
+        html += `
+          <div class="stat-card" id="stat-card-res-${resKey}">
+            <div class="stat-card-head">
+              <span class="stat-res-badge">H3 Res ${resKey}</span>
+              <span class="stat-zoom-badge">Zooms: ${zoomsStr}</span>
+            </div>
+            <div style="font-size: 11px; color: var(--kepler-text); font-weight: 600;">
+              ${Number(s.cell_count).toLocaleString()} Hexagons
+            </div>
+            <div class="stat-grid">
+              <div class="stat-item">
+                <div class="stat-item-label">Sum Range</div>
+                <div class="stat-item-val">${Number(s.sum?.min || 0).toLocaleString()} – ${Number(s.sum?.max || 0).toLocaleString()}</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-item-label">Mean Range</div>
+                <div class="stat-item-val">${Number(s.mean?.min || 0).toFixed(1)} – ${Number(s.mean?.max || 0).toFixed(1)}</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-item-label">Avg Pixels/Hex</div>
+                <div class="stat-item-val">${Number(s.count?.avg || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-item-label">Avg StdDev</div>
+                <div class="stat-item-val">${Number(s.stddev?.avg || 0).toFixed(2)}</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+      container.innerHTML = html;
+    }
+
+    // Only attempt default HTTP fetch if served over HTTP/HTTPS.
+    if (window.location.protocol.startsWith('http')) {
+      const fullUrl = `${window.location.origin}/data/CFL_HI_pyramid.pmtiles`;
+      const pmtilesInstance = new pmtiles.PMTiles(fullUrl);
+      protocol.add(pmtilesInstance);
+      activePMTileSource = `pmtiles://${fullUrl}`;
+
+      pmtilesInstance.getMetadata().then(meta => {
+        currentMetadata = meta;
+        renderPyramidStatsTab(meta);
+        if (map.loaded()) {
+          addOrUpdateHexLayers();
+        }
+      }).catch(err => {
+        console.warn("Could not read metadata:", err);
+      });
+
+      pmtilesInstance.getHeader().then(h => {
+        if (h.minLon !== undefined && h.maxLon !== undefined && (h.minLon !== 0 || h.maxLon !== 0)) {
+          map.fitBounds([
+            [h.minLon, h.minLat],
+            [h.maxLon, h.maxLat]
+          ], { padding: 50, maxZoom: 12 });
+        }
+        if (map.loaded()) {
+          addOrUpdateHexLayers();
+        }
+      }).catch(err => {
+        console.warn("Could not auto-load default PMTiles file over HTTP:", err);
+        document.getElementById('dropzone-filename').innerText = "Drop .pmtiles file here";
+      });
+    }
+
+    let selectedPalette = 'Viridis';
+
+    // Build Palette Gallery Cards
+    const paletteGrid = document.getElementById('palette-grid');
+    for (const [name, colors] of Object.entries(COLOR_PALETTES)) {
+      const card = document.createElement('div');
+      card.className = `palette-card ${name === selectedPalette ? 'selected' : ''}`;
+      card.dataset.palette = name;
+      card.innerHTML = `
+        <div class="palette-name">${name}</div>
+        <div class="palette-strip" style="background: linear-gradient(to right, ${colors.join(', ')})"></div>
+      `;
+      card.addEventListener('click', () => {
+        document.querySelectorAll('.palette-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        selectedPalette = name;
+        document.getElementById('active-palette-name').innerText = name;
+        document.getElementById('legend-palette-label').innerText = name.toUpperCase();
+        addOrUpdateHexLayers();
+      });
+      paletteGrid.appendChild(card);
+    }
+
+    // Map Setup
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: BASEMAPS['carto-dark'],
+      center: [-157.8, 20.8],
+      zoom: 7,
+      pitch: 0,
+      bearing: 0
+    });
+
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+
+    function getActiveColors() {
+      let colors = COLOR_PALETTES[selectedPalette] || COLOR_PALETTES['Viridis'];
+      if (document.getElementById('invert-toggle').checked) {
+        colors = [...colors].reverse();
+      }
+      return colors;
+    }
+
+    function buildLinearColorRamp(prop, minVal, maxVal) {
+      const colors = getActiveColors();
+      const step = (maxVal - minVal) / Math.max(1, colors.length - 1);
+      const expr = ['interpolate', ['linear'], ['to-number', ['get', prop], minVal]];
+      for (let i = 0; i < colors.length; i++) {
+        const val = minVal + i * step;
+        expr.push(val, colors[i]);
+      }
+      return expr;
+    }
+
+    function buildColorExpression(prop, minVal, maxVal) {
+      const isAdaptive = document.getElementById('adaptive-color-toggle')?.checked;
+      const resStats = currentMetadata?.h3_resolution_stats;
+
+      if (isAdaptive && resStats && typeof resStats === 'object' && Object.keys(resStats).length > 0) {
+        const matchExpr = ['match', ['to-number', ['get', 'resolution'], 0]];
+        for (const [resStr, stats] of Object.entries(resStats)) {
+          const resNum = parseInt(resStr, 10);
+          const statRange = stats[prop];
+          let rMin = statRange?.min !== undefined ? statRange.min : minVal;
+          let rMax = statRange?.max !== undefined ? statRange.max : maxVal;
+          if (rMin >= rMax) rMax = rMin + 1.0;
+          matchExpr.push(resNum, buildLinearColorRamp(prop, rMin, rMax));
+        }
+        matchExpr.push(buildLinearColorRamp(prop, minVal, maxVal)); // default fallback
+        return matchExpr;
+      }
+
+      return buildLinearColorRamp(prop, minVal, maxVal);
+    }
+
+    function addOrUpdateHexLayers() {
+      if (!activePMTileSource) return;
+
+      if (!map.getSource('h3_source')) {
+        map.addSource('h3_source', {
+          type: 'vector',
+          url: activePMTileSource
+        });
+      }
+
+      const prop = document.getElementById('property-select').value;
+      const minVal = parseFloat(document.getElementById('min-val-slider').value);
+      const maxVal = parseFloat(document.getElementById('max-val-slider').value);
+      const opacity = parseFloat(document.getElementById('opacity-slider').value) / 100.0;
+      const is3D = document.getElementById('extrusion-toggle').checked;
+      const heightMult = parseFloat(document.getElementById('height-slider').value);
+      const showWireframe = document.getElementById('wireframe-toggle').checked;
+
+      const colors = getActiveColors();
+      const gradient = `linear-gradient(to right, ${colors.join(', ')})`;
+      document.getElementById('active-palette-bar').style.background = gradient;
+      document.getElementById('legend-bar').style.background = gradient;
+
+      const colorExpr = buildColorExpression(prop, minVal, maxVal);
+
+      if (map.getLayer('h3_fill')) map.removeLayer('h3_fill');
+      if (map.getLayer('h3_extrusion')) map.removeLayer('h3_extrusion');
+      if (map.getLayer('h3_line')) map.removeLayer('h3_line');
+
+      if (is3D) {
+        map.addLayer({
+          id: 'h3_extrusion',
+          type: 'fill-extrusion',
+          source: 'h3_source',
+          'source-layer': 'h3_hexagons',
+          paint: {
+            'fill-extrusion-color': colorExpr,
+            'fill-extrusion-height': ['*', ['max', 0, ['to-number', ['get', prop], 0]], heightMult],
+            'fill-extrusion-opacity': opacity
+          }
+        });
+      } else {
+        map.addLayer({
+          id: 'h3_fill',
+          type: 'fill',
+          source: 'h3_source',
+          'source-layer': 'h3_hexagons',
+          paint: {
+            'fill-color': colorExpr,
+            'fill-opacity': opacity
+          }
+        });
+      }
+
+      if (showWireframe && !is3D) {
+        map.addLayer({
+          id: 'h3_line',
+          type: 'line',
+          source: 'h3_source',
+          'source-layer': 'h3_hexagons',
+          paint: {
+            'line-color': 'rgba(255, 255, 255, 0.22)',
+            'line-width': 0.8
+          }
+        });
+      }
+
+      // Update Legend Text
+      document.getElementById('legend-attribute').innerText = prop;
+      document.getElementById('legend-min').innerText = Number(minVal).toLocaleString();
+      document.getElementById('legend-mid').innerText = Number((minVal + maxVal) / 2).toLocaleString();
+      document.getElementById('legend-max').innerText = Number(maxVal).toLocaleString();
+    }
+
+    // Popup Tooltip
+    const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
+
+    map.on('load', () => {
+      addOrUpdateHexLayers();
+    });
+
+    map.on('mousemove', (e) => {
+      const activeLayerId = document.getElementById('extrusion-toggle').checked ? 'h3_extrusion' : 'h3_fill';
+      const features = map.queryRenderedFeatures(e.point, { layers: [activeLayerId] });
+      
+      if (!features || !features.length) {
+        map.getCanvas().style.cursor = '';
+        popup.remove();
+        return;
+      }
+
+      map.getCanvas().style.cursor = 'pointer';
+      const p = features[0].properties;
+
+      const html = `
+        <div class="tip-header">
+          <span class="tip-hex">${p.h3_hex || 'Hexagon'}</span>
+          <span class="tip-res">Res ${p.resolution ?? '?'}</span>
+        </div>
+        <div class="tip-grid">
+          <div class="tip-cell">
+            <div class="tip-cell-title">Mean</div>
+            <div class="tip-cell-val">${p.mean !== undefined ? Number(p.mean).toFixed(2) : '-'}</div>
+          </div>
+          <div class="tip-cell">
+            <div class="tip-cell-title">Sum</div>
+            <div class="tip-cell-val">${p.sum !== undefined ? Number(p.sum).toLocaleString(undefined, {maximumFractionDigits: 2}) : '-'}</div>
+          </div>
+          <div class="tip-cell">
+            <div class="tip-cell-title">Max</div>
+            <div class="tip-cell-val">${p.max !== undefined ? Number(p.max).toFixed(2) : '-'}</div>
+          </div>
+          <div class="tip-cell">
+            <div class="tip-cell-title">Min</div>
+            <div class="tip-cell-val">${p.min !== undefined ? Number(p.min).toFixed(2) : '-'}</div>
+          </div>
+          <div class="tip-cell">
+            <div class="tip-cell-title">Pixel Count</div>
+            <div class="tip-cell-val">${p.count !== undefined ? Number(p.count).toLocaleString() : '-'}</div>
+          </div>
+          <div class="tip-cell">
+            <div class="tip-cell-title">Std Dev</div>
+            <div class="tip-cell-val">${p.stddev !== undefined ? Number(p.stddev).toFixed(2) : '-'}</div>
+          </div>
+        </div>
+      `;
+      popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+    });
+
+    function getEstimatedH3Res(z) {
+      const intZ = Math.floor(z);
+      const resStats = currentMetadata?.h3_resolution_stats;
+      if (resStats && typeof resStats === 'object') {
+        for (const [resStr, s] of Object.entries(resStats)) {
+          if (Array.isArray(s.zooms) && s.zooms.includes(intZ)) {
+            return parseInt(resStr, 10);
+          }
+        }
+      }
+      if (intZ >= 14) return 9;
+      if (intZ === 13) return 8;
+      if (intZ >= 11) return 7;
+      if (intZ === 10) return 6;
+      return 5;
+    }
+
+    map.on('move', () => {
+      const z = map.getZoom();
+      document.getElementById('hud-zoom').innerText = z.toFixed(1);
+      document.getElementById('hud-pitch').innerText = `${Math.round(map.getPitch())}°`;
+
+      const estimatedRes = getEstimatedH3Res(z);
+      document.getElementById('hud-h3-res').innerText = estimatedRes;
+
+      // Highlight active card in Hex Stats Tab
+      document.querySelectorAll('.stat-card').forEach(card => card.classList.remove('active-res'));
+      const activeCard = document.getElementById(`stat-card-res-${estimatedRes}`);
+      if (activeCard) activeCard.classList.add('active-res');
+
+      // If in adaptive color mode, update legend scale to active resolution
+      const isAdaptive = document.getElementById('adaptive-color-toggle')?.checked;
+      const prop = document.getElementById('property-select')?.value;
+      const resStats = currentMetadata?.h3_resolution_stats?.[estimatedRes.toString()];
+
+      if (isAdaptive && resStats && resStats[prop]) {
+        const rMin = resStats[prop].min ?? 0;
+        const rMax = resStats[prop].max ?? 100;
+        document.getElementById('legend-min').innerText = Number(rMin).toLocaleString();
+        document.getElementById('legend-mid').innerText = Number((rMin + rMax) / 2).toLocaleString();
+        document.getElementById('legend-max').innerText = Number(rMax).toLocaleString();
+        document.getElementById('legend-palette-label').innerText = `RES ${estimatedRes} (${selectedPalette.toUpperCase()})`;
+      } else {
+        document.getElementById('legend-palette-label').innerText = selectedPalette.toUpperCase();
+      }
+    });
+
+    // Tab Navigation
+    document.querySelectorAll('.kepler-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.kepler-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const tabKey = tab.dataset.tab;
+        document.getElementById('tab-layers').style.display = tabKey === 'layers' ? 'flex' : 'none';
+        document.getElementById('tab-palettes').style.display = tabKey === 'palettes' ? 'flex' : 'none';
+        document.getElementById('tab-stats').style.display = tabKey === 'stats' ? 'flex' : 'none';
+        document.getElementById('tab-basemap').style.display = tabKey === 'basemap' ? 'flex' : 'none';
+      });
+    });
+
+    // UI Listeners
+    document.getElementById('property-select').addEventListener('change', (e) => {
+      updateSliderRanges(e.target.value);
+      addOrUpdateHexLayers();
+    });
+    document.getElementById('adaptive-color-toggle')?.addEventListener('change', addOrUpdateHexLayers);
+    document.getElementById('wireframe-toggle').addEventListener('change', addOrUpdateHexLayers);
+    document.getElementById('invert-toggle').addEventListener('change', addOrUpdateHexLayers);
+
+    document.getElementById('opacity-slider').addEventListener('input', (e) => {
+      document.getElementById('opacity-val').innerText = `${e.target.value}%`;
+      addOrUpdateHexLayers();
+    });
+
+    document.getElementById('min-val-slider').addEventListener('input', (e) => {
+      document.getElementById('min-val-display').innerText = Number(e.target.value).toFixed(1);
+      addOrUpdateHexLayers();
+    });
+
+    document.getElementById('max-val-slider').addEventListener('input', (e) => {
+      document.getElementById('max-val-display').innerText = Number(e.target.value).toFixed(1);
+      addOrUpdateHexLayers();
+    });
+
+    document.getElementById('extrusion-toggle').addEventListener('change', (e) => {
+      document.getElementById('extrusion-controls').style.display = e.target.checked ? 'flex' : 'none';
+      if (e.target.checked) {
+        map.easeTo({ pitch: 55, bearing: -25, duration: 1000 });
+      } else {
+        map.easeTo({ pitch: 0, bearing: 0, duration: 800 });
+      }
+      addOrUpdateHexLayers();
+    });
+
+    document.getElementById('height-slider').addEventListener('input', (e) => {
+      document.getElementById('height-val').innerText = `${e.target.value}x`;
+      addOrUpdateHexLayers();
+    });
+
+    document.getElementById('basemap-select').addEventListener('change', (e) => {
+      const selectedStyle = BASEMAPS[e.target.value];
+      
+      const onStyleLoaded = () => {
+        addOrUpdateHexLayers();
+      };
+
+      // Register listener before setStyle
+      map.once('style.load', onStyleLoaded);
+      map.setStyle(selectedStyle);
+
+      // Robust fallback in case in-memory style objects (like ESRI Satellite) load synchronously
+      setTimeout(() => {
+        if (!map.getSource('h3_source')) {
+          addOrUpdateHexLayers();
+        }
+      }, 50);
+    });
+
+    // Drag and Drop
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('file-input');
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length) handlePMTilesFile(e.dataTransfer.files[0]);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length) handlePMTilesFile(e.target.files[0]);
+    });
+
+    function handlePMTilesFile(file) {
+      document.getElementById('dropzone-filename').innerText = file.name;
+      sourceCounter++;
+      const uniqueKey = `dropped_${sourceCounter}_${file.name}`;
+      
+      const fileSource = new pmtiles.FileSource(file);
+      fileSource.getKey = () => uniqueKey;
+      
+      const customPmtiles = new pmtiles.PMTiles(fileSource);
+      protocol.add(customPmtiles);
+      activePMTileSource = `pmtiles://${uniqueKey}`;
+
+      if (map.getLayer('h3_fill')) map.removeLayer('h3_fill');
+      if (map.getLayer('h3_extrusion')) map.removeLayer('h3_extrusion');
+      if (map.getLayer('h3_line')) map.removeLayer('h3_line');
+      if (map.getSource('h3_source')) map.removeSource('h3_source');
+
+      customPmtiles.getMetadata().then(meta => {
+        currentMetadata = meta;
+        renderPyramidStatsTab(meta);
+        addOrUpdateHexLayers();
+      }).catch(err => {
+        console.warn("Could not read metadata:", err);
+      });
+
+      customPmtiles.getHeader().then(h => {
+        if (h.minLon !== undefined && h.maxLon !== undefined && (h.minLon !== 0 || h.maxLon !== 0)) {
+          map.fitBounds([
+            [h.minLon, h.minLat],
+            [h.maxLon, h.maxLat]
+          ], { padding: 50 });
+        }
+
+        addOrUpdateHexLayers();
+      }).catch(err => {
+        console.error("Header reading error:", err);
+        addOrUpdateHexLayers();
+      });
+    }
+  </script>
+</body>
+</html>

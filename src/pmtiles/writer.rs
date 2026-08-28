@@ -24,18 +24,6 @@ fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
     buf.push((val & 0x7F) as u8);
 }
 
-#[inline(always)]
-fn rotate(n: u64, mut x: u64, mut y: u64, rx: u64, ry: u64) -> (u64, u64) {
-    if ry == 0 {
-        if rx != 0 {
-            x = n - 1 - x;
-            y = n - 1 - y;
-        }
-        return (y, x);
-    }
-    (x, y)
-}
-
 /// Compute the canonical PMTiles v3 Tile ID for (z, x, y)
 pub fn zxy_to_tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z == 0 {
@@ -44,17 +32,26 @@ pub fn zxy_to_tile_id(z: u8, x: u32, y: u32) -> u64 {
     let acc = ((1u64 << (2 * z)) - 1) / 3;
     let mut tx = x as u64;
     let mut ty = y as u64;
-    let mut a = z as i32 - 1;
     let mut d = 0u64;
-    while a >= 0 {
-        let s = 1u64 << a;
-        let rx = tx & s;
-        let ry = ty & s;
-        d += ((3 * rx) ^ ry) * (1u64 << a);
-        let (nx, ny) = rotate(s, tx, ty, rx, ry);
-        tx = nx;
-        ty = ny;
-        a -= 1;
+    let mut s = 1u64 << (z - 1);
+    while s > 0 {
+        let rx = if (tx & s) > 0 { 1 } else { 0 };
+        let ry = if (ty & s) > 0 { 1 } else { 0 };
+        d += s * s * ((3 * rx) ^ ry);
+        let mut lx = tx & (s - 1);
+        let mut ly = ty & (s - 1);
+        if ry == 0 {
+            if rx == 1 {
+                lx = s - 1 - lx;
+                ly = s - 1 - ly;
+            }
+            let t = lx;
+            lx = ly;
+            ly = t;
+        }
+        tx = lx;
+        ty = ly;
+        s >>= 1;
     }
     acc + d
 }
@@ -67,20 +64,30 @@ fn tile_id_to_z(i: u64) -> u8 {
 
 /// Convert a Hilbert TileID to (z, x, y)
 pub fn tile_id_to_zxy(i: u64) -> (u8, u32, u32) {
+    if i == 0 {
+        return (0, 0, 0);
+    }
     let z = tile_id_to_z(i);
     let acc = ((1u64 << (2 * z)) - 1) / 3;
     let mut t = i - acc;
     let mut x = 0u64;
     let mut y = 0u64;
-    let n = 1u64 << z;
     let mut s = 1u64;
-    while s < n {
-        let rx = s & (t / 2);
-        let ry = s & (t ^ rx);
-        let (nx, ny) = rotate(s, x, y, rx, ry);
-        t /= 2;
-        x = nx + rx;
-        y = ny + ry;
+    while s < (1u64 << z) {
+        let rx = 1 & (t / 2);
+        let ry = 1 & (t ^ rx);
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            let temp = x;
+            x = y;
+            y = temp;
+        }
+        x += s * rx;
+        y += s * ry;
+        t /= 4;
         s <<= 1;
     }
     (z, x as u32, y as u32)

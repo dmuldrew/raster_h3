@@ -92,17 +92,11 @@ pub fn h3_res_to_zoom(res: u8) -> u8 {
 
 /// Map an H3 resolution to the continuous range of Web Mercator zoom levels it covers
 pub fn zooms_for_h3_res(res: u8, min_res: u8) -> Vec<u8> {
-    match res {
+    let standard_zooms: Vec<u8> = match res {
         0 => vec![0, 1],
         1 => vec![2, 3],
         2 => vec![4],
-        3 => {
-            if min_res >= 3 {
-                (0..=5).collect()
-            } else {
-                vec![5]
-            }
-        }
+        3 => vec![5],
         4 => vec![6, 7],
         5 => vec![8, 9],
         6 => vec![10],
@@ -115,6 +109,145 @@ pub fn zooms_for_h3_res(res: u8, min_res: u8) -> Vec<u8> {
         13 => vec![20],
         14 => vec![21, 22],
         _ => vec![23, 24],
+    };
+
+    if res == min_res {
+        let max_z = standard_zooms.iter().copied().max().unwrap_or(0);
+        (0..=max_z).collect()
+    } else {
+        standard_zooms
+    }
+}
+
+/// Per-resolution statistics accumulator for multi-resolution pyramids
+#[derive(Debug, Clone)]
+pub struct ResolutionAccumulatorStats {
+    pub cell_count: usize,
+    pub min_mean: f64,
+    pub max_mean: f64,
+    pub total_mean: f64,
+    pub min_sum: f64,
+    pub max_sum: f64,
+    pub total_sum: f64,
+    pub min_max: f64,
+    pub max_max: f64,
+    pub min_min: f64,
+    pub max_min: f64,
+    pub min_count: f64,
+    pub max_count: f64,
+    pub total_pixel_count: f64,
+    pub min_stddev: f64,
+    pub max_stddev: f64,
+    pub total_stddev: f64,
+}
+
+impl Default for ResolutionAccumulatorStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResolutionAccumulatorStats {
+    pub fn new() -> Self {
+        Self {
+            cell_count: 0,
+            min_mean: f64::INFINITY,
+            max_mean: f64::NEG_INFINITY,
+            total_mean: 0.0,
+            min_sum: f64::INFINITY,
+            max_sum: f64::NEG_INFINITY,
+            total_sum: 0.0,
+            min_max: f64::INFINITY,
+            max_max: f64::NEG_INFINITY,
+            min_min: f64::INFINITY,
+            max_min: f64::NEG_INFINITY,
+            min_count: f64::INFINITY,
+            max_count: f64::NEG_INFINITY,
+            total_pixel_count: 0.0,
+            min_stddev: f64::INFINITY,
+            max_stddev: f64::NEG_INFINITY,
+            total_stddev: 0.0,
+        }
+    }
+
+    pub fn record(&mut self, acc: &crate::aggregator::accumulator::H3Accumulator) {
+        self.cell_count += 1;
+        let mean = acc.mean();
+        let sum = acc.sum;
+        let max = acc.max;
+        let min = acc.min;
+        let count = acc.count;
+        let stddev = acc.stddev();
+
+        if !mean.is_nan() {
+            if mean < self.min_mean { self.min_mean = mean; }
+            if mean > self.max_mean { self.max_mean = mean; }
+            self.total_mean += mean;
+        }
+
+        if !sum.is_nan() {
+            if sum < self.min_sum { self.min_sum = sum; }
+            if sum > self.max_sum { self.max_sum = sum; }
+            self.total_sum += sum;
+        }
+
+        if !max.is_nan() {
+            if max < self.min_max { self.min_max = max; }
+            if max > self.max_max { self.max_max = max; }
+        }
+
+        if !min.is_nan() {
+            if min < self.min_min { self.min_min = min; }
+            if min > self.max_min { self.max_min = min; }
+        }
+
+        if !count.is_nan() {
+            if count < self.min_count { self.min_count = count; }
+            if count > self.max_count { self.max_count = count; }
+            self.total_pixel_count += count;
+        }
+
+        if !stddev.is_nan() {
+            if stddev < self.min_stddev { self.min_stddev = stddev; }
+            if stddev > self.max_stddev { self.max_stddev = stddev; }
+            self.total_stddev += stddev;
+        }
+    }
+
+    pub fn to_json(&self, zooms: &[u8]) -> serde_json::Value {
+        let n = self.cell_count.max(1) as f64;
+        json!({
+            "cell_count": self.cell_count,
+            "zooms": zooms,
+            "mean": {
+                "min": if self.min_mean.is_infinite() { 0.0 } else { self.min_mean },
+                "max": if self.max_mean.is_infinite() { 0.0 } else { self.max_mean },
+                "avg": self.total_mean / n
+            },
+            "sum": {
+                "min": if self.min_sum.is_infinite() { 0.0 } else { self.min_sum },
+                "max": if self.max_sum.is_infinite() { 0.0 } else { self.max_sum },
+                "avg": self.total_sum / n
+            },
+            "max": {
+                "min": if self.min_max.is_infinite() { 0.0 } else { self.min_max },
+                "max": if self.max_max.is_infinite() { 0.0 } else { self.max_max }
+            },
+            "min": {
+                "min": if self.min_min.is_infinite() { 0.0 } else { self.min_min },
+                "max": if self.max_min.is_infinite() { 0.0 } else { self.max_min }
+            },
+            "count": {
+                "min": if self.min_count.is_infinite() { 0.0 } else { self.min_count },
+                "max": if self.max_count.is_infinite() { 0.0 } else { self.max_count },
+                "avg": self.total_pixel_count / n
+            },
+            "stddev": {
+                "min": if self.min_stddev.is_infinite() { 0.0 } else { self.min_stddev },
+                "max": if self.max_stddev.is_infinite() { 0.0 } else { self.max_stddev },
+                "avg": self.total_stddev / n
+            }
+        })
     }
 }
 
@@ -318,7 +451,9 @@ impl H3PmtilesTiler {
         let mut global_max_lon = -180.0f64;
         let mut global_max_lat = -90.0f64;
 
-        // Stream continuous records directly from the scan horizon engine
+        let mut res_stats: HashMap<u8, ResolutionAccumulatorStats, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+
         loop {
             let batch = streamer.fetch_next_batch(4096);
             if batch.is_empty() {
@@ -331,6 +466,11 @@ impl H3PmtilesTiler {
                     h3_index,
                     accumulator,
                 } = record;
+
+                res_stats
+                    .entry(resolution)
+                    .or_insert_with(ResolutionAccumulatorStats::new)
+                    .record(&accumulator);
 
                 if let Ok(cell) = CellIndex::try_from(h3_index) {
                     let center: LatLng = cell.into();
@@ -354,6 +494,7 @@ impl H3PmtilesTiler {
                         ("h3_hex".to_string(), MvtValue::String(hex_str)),
                         ("resolution".to_string(), MvtValue::UInt(resolution as u64)),
                         ("mean".to_string(), MvtValue::Double(accumulator.mean())),
+                        ("sum".to_string(), MvtValue::Double(accumulator.sum)),
                         ("stddev".to_string(), MvtValue::Double(accumulator.stddev())),
                         ("count".to_string(), MvtValue::Double(accumulator.count)),
                         ("min".to_string(), MvtValue::Double(accumulator.min)),
@@ -395,6 +536,18 @@ impl H3PmtilesTiler {
             max_zoom = 0;
         }
 
+        let mut sorted_res: Vec<u8> = res_stats.keys().copied().collect();
+        sorted_res.sort_unstable();
+        let min_res_val = sorted_res.first().copied().unwrap_or(0);
+
+        let mut res_stats_json = serde_json::Map::new();
+        for res in sorted_res {
+            if let Some(st) = res_stats.get(&res) {
+                let zooms = zooms_for_h3_res(res, min_res_val);
+                res_stats_json.insert(res.to_string(), st.to_json(&zooms));
+            }
+        }
+
         // Build vector layer JSON metadata for MapLibre / Kepler.gl
         let metadata = json!({
             "name": "raster_h3_pmtiles",
@@ -402,6 +555,7 @@ impl H3PmtilesTiler {
             "version": "3",
             "minzoom": min_zoom,
             "maxzoom": max_zoom,
+            "h3_resolution_stats": res_stats_json,
             "vector_layers": [
                 {
                     "id": "h3_hexagons",
@@ -413,6 +567,7 @@ impl H3PmtilesTiler {
                         "h3_hex": "String",
                         "resolution": "Number",
                         "mean": "Number",
+                        "sum": "Number",
                         "stddev": "Number",
                         "count": "Number",
                         "min": "Number",
@@ -487,6 +642,16 @@ impl H3PmtilesTiler {
             }
         }
 
+        let mut res_stats_json = serde_json::Map::new();
+        for (res, map) in &resolution_maps {
+            let zooms = zooms_for_h3_res(*res, min_res);
+            let mut st = ResolutionAccumulatorStats::new();
+            for (_idx, acc) in map {
+                st.record(acc);
+            }
+            res_stats_json.insert(res.to_string(), st.to_json(&zooms));
+        }
+
         let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
 
@@ -531,6 +696,7 @@ impl H3PmtilesTiler {
                                     ("h3_hex".to_string(), MvtValue::String(hex_str.clone())),
                                     ("resolution".to_string(), MvtValue::UInt(res as u64)),
                                     ("mean".to_string(), MvtValue::Double(accumulator.mean())),
+                                    ("sum".to_string(), MvtValue::Double(accumulator.sum)),
                                     ("stddev".to_string(), MvtValue::Double(accumulator.stddev())),
                                     ("count".to_string(), MvtValue::Double(accumulator.count)),
                                     ("min".to_string(), MvtValue::Double(accumulator.min)),
@@ -574,6 +740,7 @@ impl H3PmtilesTiler {
             "version": "2",
             "minzoom": min_zoom,
             "maxzoom": max_zoom,
+            "h3_resolution_stats": res_stats_json,
             "vector_layers": [
                 {
                     "id": "h3_hexagons",
@@ -585,6 +752,7 @@ impl H3PmtilesTiler {
                         "h3_hex": "String",
                         "resolution": "Number",
                         "mean": "Number",
+                        "sum": "Number",
                         "stddev": "Number",
                         "count": "Number",
                         "min": "Number",
@@ -599,9 +767,10 @@ impl H3PmtilesTiler {
                         "layer": "h3_hexagons",
                         "count": total_hexagons,
                         "geometry": "Polygon",
-                        "attributeCount": 8,
+                        "attributeCount": 9,
                         "attributes": [
                             { "attribute": "mean", "type": "number" },
+                            { "attribute": "sum", "type": "number" },
                             { "attribute": "max", "type": "number" },
                             { "attribute": "min", "type": "number" },
                             { "attribute": "count", "type": "number" },
