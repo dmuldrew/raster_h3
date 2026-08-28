@@ -1505,3 +1505,31 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
     assert!(class_10_total > 0.0);
     assert_eq!(class_1_total + class_2_total + class_10_total, expected_valid_pixels);
 }
+
+#[test]
+fn test_parallel_chunk_aggregation_hawaii_dataset() {
+    let tiff_path = Path::new("data/CFL_HI.tif");
+    if !tiff_path.exists() {
+        return;
+    }
+
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let config = AggregationConfig {
+        resolution: 8,
+        ..Default::default()
+    };
+
+    let map = raster_h3::aggregator::h3_map::aggregate_raster_stream(&reader, &config).unwrap();
+    assert_eq!(map.len(), 30959);
+
+    let mut total_samples = 0.0;
+    let mut total_sum = 0.0;
+    for (_idx, acc) in &map {
+        total_samples += acc.count;
+        total_sum += acc.sum;
+    }
+
+    assert!(total_samples > 20_000_000.0);
+    assert!(total_sum > 100_000_000.0);
+}
+
