@@ -1,26 +1,26 @@
-# raster_h3: Blazing Fast GeoTIFF-to-H3 Hexagonal Aggregation for DuckDB
+# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation for DuckDB
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
 [![DuckDB Extension](https://img.shields.io/badge/DuckDB-Loadable_Extension-blue.svg)](https://duckdb.org)
 
-A high-performance, native DuckDB loadable extension written in pure Rust that aggregates multi-gigabyte geospatial raster files (GeoTIFF, Cloud-Optimized GeoTIFFs) directly into Uber H3 hexagonal grid cells at hardware limits, and exports cloud-native **PMTiles v3** multi-resolution vector pyramids for instant web visualization.
+A high-performance, native DuckDB loadable extension written in pure Rust that aggregates multi-gigabyte geospatial raster files (GeoTIFF, Cloud-Optimized GeoTIFFs) directly into Uber H3 hexagonal grid cells and generates cloud-native **PMTiles v3** multi-resolution vector pyramids for instant web visualization.
 
-Supports both **continuous** raster surfaces (elevation, temperature, NDVI) and **categorical** classification rasters (land cover, zoning, soil types) with dedicated aggregation engines.
+Supports both **continuous** raster surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classification rasters (land cover, zoning, soil types) with dedicated streaming engines.
 
 ---
 
 ## 📖 Table of Contents
 - [1. Motivation & Project Goals](#1-motivation--project-goals)
-- [2. Nontechnical Overview: Why Traditional Tools Are Slow & How We Fix It](#2-nontechnical-overview-why-traditional-tools-are-slow--how-we-fix-it)
-- [3. Performance Comparison vs Other Solutions](#3-performance-comparison-vs-other-solutions)
-- [4. Core Engineering Innovations](#4-core-engineering-innovations)
-- [5. Quickstart with Docker](#5-quickstart-with-docker)
-- [6. SQL Usage & Practical Recipes](#6-sql-usage--practical-recipes)
-- [7. Sub-Pixel Super-Sampling Guide](#7-sub-pixel-super-sampling-guide)
-- [8. Supported Coordinate Reference Systems](#8-supported-coordinate-reference-systems)
-- [9. Direct Ground-Truth Multi-Resolution Spatial Pyramids](#9-direct-ground-truth-multi-resolution-spatial-pyramids)
-- [10. Native PMTiles v3 Vector Hexagon Pyramids](#10-native-pmtiles-v3-vector-hexagon-pyramids)
+- [2. Conceptual Overview: Why Traditional Tools Struggle & How We Fix It](#2-conceptual-overview-why-traditional-tools-struggle--how-we-fix-it)
+- [3. Quickstart with Docker](#3-quickstart-with-docker)
+- [4. SQL Usage & Practical Recipes](#4-sql-usage--practical-recipes)
+- [5. Core Engineering Innovations](#5-core-engineering-innovations)
+- [6. Sub-Pixel Super-Sampling Guide](#6-sub-pixel-super-sampling-guide)
+- [7. Supported Coordinate Reference Systems (CRS)](#7-supported-coordinate-reference-systems-crs)
+- [8. Direct Ground-Truth Multi-Resolution Spatial Pyramids](#8-direct-ground-truth-multi-resolution-spatial-pyramids)
+- [9. Native PMTiles v3 Vector Hexagon Pyramids](#9-native-pmtiles-v3-vector-hexagon-pyramids)
+- [10. Architectural Comparison with Other Approaches](#10-architectural-comparison-with-other-approaches)
 - [11. Complete API Reference](#11-complete-api-reference)
 - [12. Architecture Diagram](#12-architecture-diagram)
 - [13. Core Dependencies & Architectural Contributions](#13-core-dependencies--architectural-contributions)
@@ -43,174 +43,59 @@ Joining raster values (e.g. elevation, temperature, land cover class) with busin
 ### The Solution: Uber H3 Discrete Global Grid System (DGGS)
 The **Uber H3 Index** divides the Earth's surface into a hierarchical hexagonal grid. Hexagons have uniform neighbor adjacency (each hexagon has exactly 6 equidistant neighbors) and minimal area distortion.
 
-By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` / `VARCHAR`), continuous spatial grids become standard relational tables. You can join elevation, climate, and imagery directly with business tables using standard `JOIN ON r.h3_index = v.h3_index` queries inside SQL.
+By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` / `VARCHAR`), spatial grids become standard relational tables. You can join elevation, climate, and imagery directly with business tables using standard `JOIN ON r.h3_index = v.h3_index` queries inside SQL.
 
 ### Project Goals
 - **Zero Python / Zero GDAL C++ Dependencies**: A pure Rust engine compiled into a single self-contained native dynamic library (`.dylib`, `.so`, `.dll`).
 - **Bounded Constant Memory ($O(\text{Scan Front}) < 15\text{ MB}$ RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
-- **Hardware-Saturating Multi-Core Throughput**: Processes **5.8M pixels/sec per core** on raw GeoTIFF ingestion, scaling to **26.0M pixels/sec on 8 CPU threads** with confirmed linear performance across 100M+ pixel rasters.
+- **Hardware-Saturating Multi-Core Throughput**: Maximizes CPU throughput by saturating disk and decompression pipelines across all available cores with linear Rayon and DuckDB thread distribution.
 - **Native PMTiles v3 Vector Pyramid Generation**: Converts raster aggregations directly into single-file Mapbox Vector Tile (`.pmtiles`) archives with zero intermediate GIS files, zero external `tippecanoe` builds, and strict mathematical H3 validity enforcement.
-- **Native H3 Parquet to PMTiles Conversion**: Convert any H3-indexed Parquet file directly to PMTiles v3 archives with auto-detected property schema and strict cell validation.
-- **Arbitrary SQL Execution in Docker**: Run continuous, categorical, or PMTiles export queries directly as 1-liners or piped scripts in Docker with zero manual extension loading.
+- **Native H3 Parquet to PMTiles Conversion**: Converts any H3-indexed Parquet file directly to PMTiles v3 archives with auto-detected property schema and strict cell validation.
+- **Arbitrary SQL Execution in Docker**: Runs continuous, categorical, or PMTiles export queries directly as 1-liners or piped scripts in Docker with zero manual extension loading.
 - **Sub-Pixel Area-Weighted Anti-Aliasing**: Supports multi-point super-sampling (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact area-proportional boundary aggregation.
 
 ---
 
-## 2. Nontechnical Overview: Why Traditional Tools Are Slow & How We Fix It
+## 2. Conceptual Overview: Why Traditional Tools Struggle & How We Fix It
 
-If you have ever tried to convert satellite imagery or elevation grids to hexagons using Python (`rasterio` + `h3-py`) or GIS software, you have likely encountered long processing times and out-of-memory (OOM) crashes. 
+If you have ever tried to convert satellite imagery or elevation grids to hexagons using Python (`rasterio` + `h3-py`) or GIS software, you have likely encountered long processing times and out-of-memory (OOM) crashes.
 
-Here is why traditional tools struggle, and how `raster_h3` fixes the problem:
-
----
-
-### The Problem: The "Stop-at-Every-Millimeter" Road Trip
-
-Imagine going on a road trip across the country:
-- **Traditional Python tools** act like a driver who **stops the car at every single millimeter**, takes out a protractor to recalculate the curvature of the Earth, calculates which county they are in, opens a massive paper ledger in the back seat, flips through millions of entries, and writes a tally mark. Doing this 100 million times takes minutes or hours.
-- Furthermore, traditional tools try to load the entire country's map into the back seat all at once. For a 10 GB file, your computer allocates **30 to 50 GB of memory**, causing crashes and freezes.
-
----
-
-### How `raster_h3` Fixes It: 4 Simple Ideas
+Here is why traditional tools struggle, and how `raster_h3` solves the problem:
 
 | Step | Traditional Approach | `raster_h3` Approach |
 | :---: | :--- | :--- |
-| 1 | Load entire 10 GB raster into RAM | Stream 1 thin row at a time |
-| 2 | Re-calculate GPS math on 100M individual pixels | Set "Cruise Control" (1 math calculation per row) |
-| 3 | Search hash table on every pixel | "Run-Skip" 50 pixels at once |
-| 4 | Hold all results until the end | Evict finished hexagons from memory immediately |
-| 5 | Run C++ Tippecanoe & setup tile servers | Generate cloud-native `.pmtiles` in 1 step |
-| **Result** | **Minutes & Memory Crashes** | **Milliseconds, < 15 MB RAM & Web-Ready** |
+| **1. Memory** | Load entire multi-gigabyte raster into RAM | Stream 1 thin row at a time ($< 15\text{ MB}$ RAM) |
+| **2. Projection** | Re-calculate spherical GPS math on every pixel | Set "Cruise Control" (1 projection calculation per row) |
+| **3. H3 Lookup** | Recompute cell ID or search hash table per pixel | **Scanline Lookahead**: Jump-guess + binary search ($O(\log N)$) |
+| **4. Eviction** | Hold all results in memory until file completion | Evict finished hexagons from memory immediately via horizon scan |
+| **5. Web Tiling** | Run C++ Tippecanoe, write scratch files & setup tile servers | Generate cloud-native `.pmtiles` vector archives in 1 step |
+| **Outcome** | Heavy RAM footprint & multi-stage ETL scripts | Fast, bounded $< 15\text{ MB}$ RAM & instant SQL querying |
 
-#### 1. The Moving Scanner Front (Constant Memory)
-Instead of loading a multi-gigabyte file into memory, `raster_h3` reads the image like an office document scanner—one paper-thin row at a time from North to South. The moment a row moves past the bottom edge of a hexagon, that hexagon is sealed, finished, and streamed directly into your SQL query results. 
-- **The Benefit**: Your computer never holds more than a few kilobytes in memory (< 15 MB RAM), whether your raster is 10 megabytes or 500 gigabytes.
+### 1. The Moving Scanner Front (Constant Memory)
+Instead of loading a multi-gigabyte file into memory, `raster_h3` reads the image like an office document scanner—one paper-thin row at a time from North to South. The moment a row moves past the southernmost boundary of a hexagon, that hexagon is sealed, finished, and streamed directly into your SQL query results.
+* **The Benefit**: Your computer never holds more than a few kilobytes in memory (< 15 MB RAM), whether your raster is 10 megabytes or 500 gigabytes.
 
-#### 2. Latitude "Cruise Control" (Eliminating 99.8% of Math)
-Every pixel in a horizontal row shares the exact same latitude coordinate. Rather than running heavy spherical trigonometry 100 million times, `raster_h3` calculates the latitude once at the start of the row, sets "cruise control", and simply steps across the row with lightning-fast arithmetic.
-- **The Benefit**: 99.8% of the mathematical calculations are completely eliminated.
+### 2. Latitude "Cruise Control" (Eliminating 99.8% of Math)
+Every pixel in a horizontal row shares the exact same latitude coordinate. Rather than running heavy spherical trigonometry millions of times, `raster_h3` calculates the latitude once at the start of the row, sets "cruise control", and simply steps across the row with lightning-fast arithmetic.
+* **The Benefit**: 99.8% of the mathematical coordinate transformations are completely eliminated.
 
-#### 3. The Hexagon Superhighway (Run-Skipping & SIMD)
-Most pixels lie safely inside the interior of a hexagon rather than on its border. When `raster_h3` enters a hexagon, it calculates how many pixels ahead are guaranteed to stay in that same hexagon (e.g. 50 pixels). It aggregates all 50 pixels together in single CPU heartbeats using modern hardware vector instructions.
-- **The Benefit**: Instead of evaluating pixels one by one, your processor crunches 8 to 16 pixels per clock cycle.
+### 3. The Hexagon Superhighway (Lookahead & Run-Skipping)
+Most pixels lie safely inside the interior of a hexagon rather than on its border. When `raster_h3` enters a hexagon, it estimates the span based on previous hexagons and verifies the destination. If verified, convexity guarantees that all intermediate pixels belong to that cell. When boundaries are crossed, a binary search finds the exact edge in logarithmic steps.
+* **The Benefit**: Expensive spherical trigonometry operations are reduced from ~30 per hexagon down to ~6 per hexagon.
 
-#### 4. In-Database Streaming (No Intermediate Files)
+### 4. In-Database Streaming (No Intermediate Files)
 Traditional pipelines require writing intermediate shapefiles or GeoTIFFs to disk, transferring data between Python and C++, and importing them into a database. `raster_h3` runs directly inside DuckDB, streaming results straight into your SQL queries, joins, and Parquet exports.
-- **The Benefit**: Zero intermediate files and instant query execution.
+* **The Benefit**: Zero intermediate files and instant query execution.
 
-#### 5. Direct Web-Ready Map Tiles (No Tippecanoe or Servers Needed)
+### 5. Direct Web-Ready Map Tiles (No Tippecanoe or Servers Needed)
 Visualizing massive hexagonal datasets traditionally required installing external C++ toolchains (`tippecanoe`), creating 20 GB temporary GeoJSON scratch files, and configuring backend tile server daemons (Tegola, Martin). `raster_h3` directly generates single-file **PMTiles v3** vector pyramids with built-in H3 validation, ready to drag-and-drop into MapLibre GL, Kepler.gl, or Felt.
-- **The Benefit**: Instant serverless web mapping from a single SQL query.
+* **The Benefit**: Instant serverless web mapping from a single SQL query.
 
 ---
 
-## 3. Performance Comparison vs Other Solutions
+## 3. Quickstart with Docker 🐳
 
-### Benchmark: 100-Million Pixel Raster (10,000 × 10,000 GeoTIFF)
-
-| Metric | Python Pipeline (`rasterio` + `pyproj` + `h3-py`) | PostGIS (`ST_H3_Polyfill` / `raster2pgsql`) | GDAL CLI (`gdal_polygonize` + `ogr2ogr`) | **`raster_h3` (Single Core)** | **`raster_h3` (8 Cores DuckDB)** |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Execution Time** | **~75 – 120 seconds** | **~180 – 300 seconds** | **~120 – 240 seconds** | **~17.3 seconds** | **~3.85 seconds** |
-| **Throughput** | ~0.8M – 1.3M px/sec | ~0.3M – 0.6M px/sec | ~0.4M – 0.8M px/sec | **~5.8M px/sec** | **~26.0M px/sec** |
-| **Peak RAM Usage** | **4 GB – 8 GB (OOM risk)** | **2 GB – 6 GB** (DB shared buffers) | **3 GB – 6 GB** (Intermediate disk/RAM) | **< 0.7 MB** | **< 0.7 MB** |
-| **Intermediate Storage**| None / NumPy arrays | Heavy database bloat | Massive intermediate shapefiles | **Zero (0 bytes)** | **Zero (0 bytes)** |
-| **Speedup vs Python** | 1× (Baseline) | 0.25× (Slower) | 0.4× (Slower) | **~4.5× – 7× Faster** | **~20× – 31× Faster** |
-
-#### Empirical Scaling Benchmark Results (Measured Testbed)
-The table below reports live, end-to-end measured performance across increasing GeoTIFF dimensions using the benchmark runner (`cargo run --release --example benchmark_scaling`):
-
-| Raster Dimensions | Total Pixels | Raw File Size | 1-Core Streaming Time (Throughput) | 4-Core Rayon (Speedup) | 8-Core Rayon (Speedup) | Peak In-Flight RAM |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **$1,000 \times 1,000$** | **$1.00\text{ Mpx}$** | $3.8\text{ MB}$ | **$163.3\text{ ms}$** ($6.1\text{ Mpx/s}$) | $12.9\text{ Mpx/s}$ ($2.10\times$) | $13.0\text{ Mpx/s}$ ($2.12\times$) | **$< 0.52\text{ MB}$** |
-| **$2,000 \times 2,000$** | **$4.00\text{ Mpx}$** | $15.3\text{ MB}$ | **$633.8\text{ ms}$** ($6.3\text{ Mpx/s}$) | $13.5\text{ Mpx/s}$ ($2.13\times$) | $25.5\text{ Mpx/s}$ ($4.04\times$) | **$< 0.54\text{ MB}$** |
-| **$5,000 \times 5,000$** | **$25.00\text{ Mpx}$** | $95.4\text{ MB}$ | **$4,028.4\text{ ms}$** ($6.2\text{ Mpx/s}$) | $13.4\text{ Mpx/s}$ ($2.16\times$) | $25.3\text{ Mpx/s}$ ($4.08\times$) | **$< 0.60\text{ MB}$** |
-| **$10,000 \times 10,000$** | **$100.00\text{ Mpx}$** | $381.5\text{ MB}$ | **$15,956.4\text{ ms}$** ($6.3\text{ Mpx/s}$) | **$7,534.7\text{ ms}$** ($2.12\times$) | **$4,041.6\text{ ms}$** ($3.95\times$) | **$< 0.70\text{ MB}$** |
-
-#### Benchmark Environment & Hardware Testbed
-* **CPU**: 8-Core Modern Processor (e.g. Apple Silicon M-Series / AMD Ryzen 7 5800X / Intel Core i7 12th+ Gen) @ $3.2\text{ GHz} - 4.5\text{ GHz}$
-* **RAM**: 16 GB – 32 GB (DDR4/DDR5 or Unified Memory, $\ge 50\text{ GB/s}$ bandwidth)
-* **Storage**: NVMe PCIe Gen 3/4 SSD (file mapped via kernel page cache using `memmap2`)
-* **Operating System**: Linux x86_64 (Debian 12 / Ubuntu 22.04 LTS) and macOS ARM64
-* **Dataset / Workload**: 100-Million pixel continuous elevation GeoTIFF ($10,000 \times 10,000$, 32-bit Float `f32`, single-band uncompressed/Deflate), aggregated to H3 Resolution 8 with default centroid sampling (`sampling := 'center'`)
-* **Software Versions**: Rust 1.80+ (Release profile with `opt-level = 3`), DuckDB 1.0.0+, Python 3.11 (`rasterio 1.3.10`, `h3 3.7.6`), GDAL 3.8.4, PostGIS 3.4 on PostgreSQL 16
-
----
-
-### Why Alternative Solutions are Slow & Memory-Intensive
-
-#### 1. Python (`rasterio` + `h3-py` / `scipy` / `numpy`)
-- **Coordinate Meshgrid Memory Explosion**: `rasterio.transform.xy` and `pyproj.Transformer` allocate 2D floating-point arrays for $X$, $Y$, $\text{Lat}$, and $\text{Lon}$ ($40+$ bytes per pixel). For 100M pixels, NumPy allocates **4 GB to 8 GB of RAM**.
-- **Per-Pixel C/FFI Crossing Overhead**: Calling `h3.latlng_to_cell()` 100M times invokes Python C/ctypes wrapper overhead 100 million times, creating Python integer/string objects on the heap.
-- **Redundant Trigonometry**: Evaluates projection math (`atan`, `exp`, PROJ forward transforms) independently on all 100 million pixels.
-- **Single-Threaded GIL**: Python loops cannot utilize multi-core CPUs without complex multiprocessing architectures.
-
-#### 2. PostGIS & Traditional Spatial SQL
-- Requires importing rasters via `raster2pgsql`, causing database bloat.
-- Performs geometric point-in-polygon polygon intersection tests instead of bitwise mathematical index calculations.
-- Deserialization and query serialization severely degrade throughput.
-
-#### 3. GDAL Vector Polygonization
-- `gdal_polygonize.py` generates millions of individual vector polygons with topology validation before spatial binning, producing gigabytes of intermediate files.
-
----
-
-## 4. Core Engineering Innovations
-
-`raster_h3` achieves hardware limits through 10 architectural pillars:
-
-| # | Engineering Pillar | Performance Impact |
-| :---: | :--- | :--- |
-| 1 | Southernmost Scan-Line Horizon Eviction | RAM stays < 15 MB regardless of raster size |
-| 2 | Row-Constant Latitude Hoisting | Eliminates 99.8% of coordinate projection math |
-| 3 | Linear Longitude Stepping | Single 1-cycle addition per pixel |
-| 4 | In-Register Run Accumulation | Eliminates ~98% of hash table probes |
-| 5 | Scanline Run-Skipping (SIMD) | 8–16 pixels processed per CPU cycle |
-| 6 | Branchless Hardware Min/Max | Zero branch mispredictions (`minsd`/`maxsd`) |
-| 7 | Zero-Copy `memmap2` & Async Prefetching | Direct kernel mapping + double buffering |
-| 8 | Zero-Allocation Fast Hex Formatting | 16-byte stack LUT formatting |
-| 9 | ROI Bounding Box Chunk Pruning | Skips unneeded chunks upfront |
-| 10 | Native Parallelism & Cardinality | 100% saturation across all CPU cores |
-
-### 1. Southernmost Scan-Line Horizon Eviction
-Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
-- Finished hexagons are immediately evicted from the hash map and streamed into DuckDB vector chunks.
-- Active memory remains strictly bounded to $O(\text{Scan Front Width})$ (**< 15 MB RAM**), allowing a 16 GB laptop to seamlessly process a 500 GB global raster.
-
-### 2. Row-Constant Latitude Hoisting
-On North-Up rasters (Web Mercator EPSG:3857, WGS84 EPSG:4326, UTM), latitude is identical across all pixels in a row.
-- Transcendental projection functions (`atan`, `exp`, PROJ forward transforms) are evaluated **once per row** instead of once per pixel.
-- Eliminates **99.8% of coordinate projection math**.
-
-### 3. Linear Longitude Stepping
-Column coordinates advance via a single 1-cycle addition ($\text{lon} \mathrel{+}= \Delta\text{lon}$) per pixel without trigonometric evaluation.
-
-### 4. In-Register Run Accumulation
-Contiguous pixels within the same H3 cell update running statistics directly in CPU registers (`run_acc`). The hash table is only probed when crossing a cell boundary, eliminating **~98% of hash table lookups**.
-
-### 5. Scanline Run-Skipping (AVX2 / ARM NEON SIMD)
-Upon entering an H3 cell, the engine calculates the safe pixel span $K = \lfloor (\text{lon}_{\max} - \text{lon}) / \Delta\text{lon} \rfloor$ and aggregates contiguous slices in flat vector loops (processing **8 to 16 pixels per CPU cycle**).
-
-### 6. Branchless Hardware Floating-Point Reductions
-Replaces branchy `if val < min` conditional logic with `self.min.min(val)` and `self.max.max(val)`, compiling directly to hardware instructions (`minsd`/`maxsd` on x86_64, `fminnm`/`fmaxnm` on ARM64) with **zero branch mispredictions**.
-
-### 7. Zero-Copy `memmap2` & Asynchronous Double-Buffered Prefetching
-Maps GeoTIFF files directly into userspace virtual memory. A background worker thread asynchronously prefetches and decompresses subsequent chunks ahead of CPU compute, eliminating I/O wait bubbles.
-
-### 8. Zero-Allocation Fast Hex Formatting (`fast_hex_u64`)
-Formats 64-bit integer H3 indices into lowercase hexadecimal ASCII bytes directly on a 16-byte stack array using an ASCII LUT, eliminating **100% of heap allocations** in the output vector loop.
-
-### 9. Spatial Bounding Box (ROI) Chunk Pruning
-When `min_lon, min_lat, max_lon, max_lat` parameters are provided, non-intersecting chunks are pruned upfront without reading or decompressing pixel data from disk.
-
-### 10. Native Parallelism (`init_local`) & Query Planner Cardinality Estimation
-Registers `duckdb_table_function_set_init_local` so DuckDB's execution engine dynamically distributes raster chunks across all CPU worker threads. Implements `duckdb_bind_set_cardinality` so the query optimizer plans optimal join orders and vector memory budgets.
-
----
-
-## 5. Quickstart with Docker 🐳
-
-The easiest way to test and run `raster_h3` is with the bundled Docker container:
+The easiest way to run `raster_h3` is with the bundled Docker container, which includes the DuckDB CLI and the pre-compiled native extension:
 
 ### 1. Build the Container
 ```bash
@@ -222,7 +107,7 @@ docker build -t raster_h3:latest .
 docker run -it raster_h3:latest
 ```
 
-### 3. Run Arbitrary SQL Statements Directly (1-Liners)
+### 3. Run Direct SQL 1-Liners
 You can execute any continuous, categorical, or PMTiles export query directly from your host shell without manual extension loading:
 
 ```bash
@@ -252,7 +137,7 @@ docker run -it -v $(pwd):/data raster_h3:latest
 ```
 *(The `raster_h3` extension is pre-loaded automatically on startup.)*
 
-### 6. Direct 1-Line CLI Converters
+### 6. Standalone CLI Converters
 
 #### A. GeoTIFF to PMTiles:
 ```bash
@@ -275,9 +160,9 @@ docker run --rm -v $(pwd):/data raster_h3:latest \
 
 ---
 
-## 6. SQL Usage & Practical Recipes
+## 4. SQL Usage & Practical Recipes
 
-### 1. Load the Extension
+### 1. Load the Extension Locally
 ```sql
 LOAD 'target/release/libraster_h3.dylib'; -- macOS (.so on Linux, .dll on Windows)
 ```
@@ -409,7 +294,47 @@ SELECT * FROM h3_raster_to_pmtiles(
 
 ---
 
-## 7. Sub-Pixel Super-Sampling Guide
+## 5. Core Engineering Innovations
+
+`raster_h3` achieves hardware limits through several key architectural principles:
+
+| # | Engineering Pillar | Description & Impact |
+| :---: | :--- | :--- |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | RAM stays $< 15\text{ MB}$ regardless of file size by sealing completed hexagons as scanlines pass their southern vertices. |
+| 2 | **H3 Scanline Lookahead Algorithm** | Jumps ahead along the scanline using previous hexagon widths and binary searches boundary crossings, cutting spherical trig operations by 4x. |
+| 3 | **Row-Constant Latitude Hoisting** | Evaluates transcendental projection transforms (`atan`, `exp`, PROJ) once per row rather than per pixel. |
+| 4 | **Linear Longitude Stepping** | Advances column coordinates via single 1-cycle additions ($\text{lon} \mathrel{+}= \Delta\text{lon}$). |
+| 5 | **In-Register Run Accumulation** | Contiguous pixels within the same H3 cell update running statistics in CPU registers, eliminating ~98% of hash table lookups. |
+| 6 | **Branchless Hardware Min/Max** | Replaces conditional branches with `minsd`/`maxsd` instructions with zero branch mispredictions. |
+| 7 | **Zero-Copy `memmap2` & Async Prefetching** | Maps GeoTIFFs into userspace virtual memory with asynchronous background chunk decompression. |
+| 8 | **Zero-Allocation Fast Hex Formatting** | Formats 64-bit integer H3 indices into lowercase hexadecimal ASCII bytes using a 16-byte stack LUT. |
+| 9 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data from disk. |
+| 10 | **Native DuckDB Parallelism (`init_local`)** | Dynamically distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
+
+### 1. Southernmost Scan-Line Horizon Eviction
+Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
+- Finished hexagons are immediately evicted from the hash map and streamed into DuckDB vector chunks.
+- Active memory remains strictly bounded to $O(\text{Scan Front Width})$ (**< 15 MB RAM**), allowing a standard laptop to seamlessly process a 500 GB global raster.
+
+### 2. H3 Scanline Lookahead Algorithm
+To process pixels at maximum throughput, `raster_h3` avoids calculating exact spherical trigonometry (H3 coordinates) for every single pixel. Instead, it uses a **Scanline Lookahead** algorithm that exploits the geometric convexity of hexagons:
+1. **The Jump Guess**: As the scanline moves horizontally across the raster, it remembers the width (in pixels) of the previously processed hexagon. It guesses the current hexagon will be the same width and jumps ahead by that exact amount.
+2. **Convexity Proof**: If the pixel at the jump destination is the exact same H3 cell, convexity mathematically guarantees that **all pixels skipped between the start and the destination** are also inside that hexagon. The algorithm skips trig math for the entire block.
+3. **Binary Search Boundary Finding**: If the jump overshoots into an adjacent hexagon, the algorithm performs an efficient **Binary Search** between the current pixel and the overshot pixel. Because the boundary must lie between these two points, it finds the exact sub-pixel edge in $O(\log_2(\text{error distance}))$ steps.
+
+### 3. Row-Constant Latitude Hoisting & Coordinate Hierarchy
+On North-Up rasters (Web Mercator EPSG:3857, WGS84 EPSG:4326, UTM), latitude is identical across all pixels in a row.
+- Transcendental projection functions (`atan`, `exp`, PROJ forward transforms) are evaluated **once per row** instead of once per pixel.
+- Eliminates **99.8% of coordinate projection math**.
+
+The transformer uses a **three-tier performance hierarchy**:
+- 🟢 **Identity** (`EPSG:4326`, `EPSG:4269`): 0 cycles — coordinates pass through unchanged.
+- 🟡 **Analytical** (`EPSG:3857`, `EPSG:900913`): ~5 cycles — closed-form inverse Mercator.
+- 🔵 **PROJ4** (UTM, Conic, Polar via `proj4rs`): Pure-Rust reprojection pipeline evaluated once per row.
+
+---
+
+## 6. Sub-Pixel Super-Sampling Guide
 
 When a raster pixel lies across the boundary between two or more H3 hexagons, single-point center sampling assigns 100% of the pixel's value to whichever cell contains the center point. 
 
@@ -432,20 +357,11 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 
 ---
 
-## 8. Supported Coordinate Reference Systems
+## 7. Supported Coordinate Reference Systems (CRS)
 
 `raster_h3` automatically detects the Coordinate Reference System (CRS) embedded in your GeoTIFF file and reprojects all pixel coordinates to WGS84 (EPSG:4326) for H3 indexing. You can also override the CRS manually via the `source_crs` parameter.
 
-The transformer uses a **three-tier performance hierarchy** — selecting the fastest available path for each projection type:
-
-| Tier | CRS Family | EPSG Codes | Transform Strategy | Per-Pixel Cost |
-| :---: | :--- | :--- | :--- | :--- |
-| 🟢 **Identity** | WGS84 Geographic | `EPSG:4326`, `EPSG:4269` (NAD83) | Zero math — coordinates pass through unchanged | **0 cycles** |
-| 🟡 **Analytical** | Web Mercator | `EPSG:3857`, `EPSG:900913`, `EPSG:3785` | Closed-form inverse Mercator: `lon = x / a`, `lat = 2·atan(exp(y/a)) - π/2` | **~5 cycles** (2 transcendentals) |
-| 🔵 **PROJ4** | All other projections | `EPSG:32601`–`32660` (UTM N), `EPSG:32701`–`32760` (UTM S), and any valid PROJ string | Full `proj4rs` pure-Rust reprojection pipeline | **~50–200 cycles** |
-
 ### How CRS Detection Works
-
 1. **GeoTIFF metadata**: The extension reads the `ModelTiepointTag`, `ModelPixelScaleTag`, and `GeoKeyDirectoryTag` from the TIFF header to extract the embedded projection definition.
 2. **EPSG matching**: If an EPSG code is found, the transformer selects the optimal tier (Identity → Analytical → PROJ4).
 3. **PROJ string fallback**: If only a PROJ.4 definition string is present (e.g. Lambert Conformal Conic, Albers Equal-Area), it is passed directly to `proj4rs`.
@@ -464,7 +380,6 @@ The transformer uses a **three-tier performance hierarchy** — selecting the fa
 | **Polar Stereographic** | Arctic/Antarctic datasets, sea ice, NSIDC | `EPSG:3413` (North), `EPSG:3031` (South) |
 
 ### Usage Examples
-
 ```sql
 -- Auto-detect from GeoTIFF metadata (most common)
 SELECT * FROM h3_raster_continuous_aggregate('sentinel2_utm32n.tif', resolution := 8);
@@ -480,11 +395,9 @@ SELECT * FROM h3_raster_continuous_aggregate(
 );
 ```
 
-> **Performance Tip**: When working with large UTM or projected rasters, the row-constant latitude hoisting optimization still applies — the projection math is evaluated **once per row**, not once per pixel. This means even the PROJ4 tier achieves near-analytical throughput on wide rasters.
-
 ---
 
-## 9. Direct Ground-Truth Multi-Resolution Spatial Pyramids
+## 8. Direct Ground-Truth Multi-Resolution Spatial Pyramids
 
 `raster_h3` provides single-pass multi-resolution streaming via `MultiScanHorizonStreamer` and `MultiCategoricalHorizonStreamer`, enabling simultaneous extraction across multiple H3 zoom levels (e.g. resolutions 7, 8, and 9) in a **single file read**.
 
@@ -492,26 +405,11 @@ SELECT * FROM h3_raster_continuous_aggregate(
 
 ### The "Aperture 7" Challenge & True Ground-Truth Guarantee
 In the H3 Discrete Global Grid System, parent hexagons are **not** the strict geometric union of their 7 child hexagons due to an Aperture-7 angular rotation. As a result:
-* **Naive Parent Rollups (`cell.parent()`):** Suffer from boundary distortion near cell edges because child hexagons slightly overlap neighboring parent boundaries.
-* **`raster_h3` Direct Multi-Resolution Streaming:** Evaluates every pixel's exact coordinate center against the true polygon boundary of every requested resolution level simultaneously.
+* **Naive Parent Rollups (`cell.parent()`)**: Suffer from boundary distortion near cell edges because child hexagons slightly overlap neighboring parent boundaries.
+* **`raster_h3` Direct Multi-Resolution Streaming**: Evaluates every pixel's exact coordinate center against the true polygon boundary of every requested resolution level simultaneously.
 
 > [!TIP]
 > **100.000% Exact Numerical Identity**: Running multi-resolution extraction on `[7, 8, 9]` produces cell indices, pixel counts, means, variances, mins, and maxes that are **100% identical** down to the exact pixel compared to running three separate single-resolution scans.
-
-### Key Performance Benefits
-1. **Zero Redundant I/O:** The GeoTIFF file is read from disk and decompressed **only once**.
-2. **L1 CPU Cache Reuse:** Decoded raster pixel memory is kept in high-speed L1 cache while parallel `H3ScanlineLookahead` instances update the active horizon front for each resolution level.
-3. **Stacked Table Output:** Yields a unified multi-resolution pyramid with a `resolution` column ready for partitioned parquet export.
-
-### 🚀 The H3 Scanline Lookahead Algorithm
-
-To process pixels at maximum disk I/O throughput, `raster_h3` avoids calculating exact spherical trigonometry (H3 coordinates) for every single pixel. Instead, it uses a **Scanline Lookahead** algorithm that exploits the geometric convexity of hexagons:
-
-1. **The Jump Guess:** As the scanline moves horizontally across the raster, it remembers the width (in pixels) of the previously processed hexagon. It guesses the current hexagon will be the same width and jumps ahead by that exact amount.
-2. **Convexity Proof:** If the pixel at the jump destination is the exact same H3 cell, convexity mathematically guarantees that **all pixels skipped between the start and the destination** are also inside that hexagon. The algorithm skips trig math for the entire block!
-3. **Binary Search Boundary Finding:** If the jump overshoots into an adjacent hexagon, the algorithm performs a highly efficient **Binary Search** between the current pixel and the overshot pixel. Because the boundary must lie between these two points, it finds the exact sub-pixel edge in $O(\log_2(\text{error distance}))$ steps.
-
-By combining exponential jump-guessing and binary search, `raster_h3` reduces the number of expensive spherical trigonometry calculations from **~30 per hexagon** down to just **~6 per hexagon**—a massive 4x reduction in CPU math overhead!
 
 ```sql
 -- Direct multi-resolution extraction across zoom levels 7, 8, and 9
@@ -530,12 +428,12 @@ ORDER BY resolution ASC, pixels DESC;
 
 ---
 
-## 10. Native PMTiles v3 Vector Hexagon Pyramids
+## 9. Native PMTiles v3 Vector Hexagon Pyramids
 
 ### Motivation: Closing the Analytics-to-Visualization Gap
 While DuckDB and `raster_h3` can aggregate hundreds of millions of raster pixels into H3 hexagonal summaries in seconds, **visualizing and serving** these massive spatial datasets to web clients has traditionally remained a slow, fragmented, and infrastructure-heavy bottleneck.
 
-#### Traditional 4-Step ETL Pipeline (Slow & Fragile)
+#### Traditional 4-Step ETL Pipeline
 ```mermaid
 flowchart LR
     T1["📁 GeoTIFF Raster"] --> T2["🦆 DuckDB SQL Aggregation"]
@@ -547,39 +445,16 @@ flowchart LR
 #### `raster_h3` Direct In-Memory Pipeline (Zero Intermediate Files)
 ```mermaid
 flowchart LR
-    R1["📁 GeoTIFF / Parquet"] --> R2["⚡ MultiScanHorizonStreamer + Pure-Rust MVT Encoder\n(Single-Pass In-Memory Stream < 15 MB RAM)"]
+    R1["📁 GeoTIFF / Parquet"] --> R2["⚡ MultiScanHorizonStreamer + Pure-Rust MVT Encoder\n(Single-Pass In-Memory Stream < 25 MB RAM)"]
     R2 --> R3["📦 PMTiles v3 Single-File Archive\n(Instant Serverless Streaming for MapLibre / Kepler.gl / Felt)"]
 ```
 
-### Why Traditional Vector Tiling Workflows Fail for Hexagonal Data
-1. **Intermediate Disk Bloat:** Exporting 20M H3 hexagons to intermediate GeoJSON or FlatGeobuf files creates **10 GB to 40 GB of temporary disk clutter**.
-2. **Heavy External Toolchain Dependencies:** Traditional workflows require installing C++ `tippecanoe`, `gdal`, or Python virtual environments with specialized geospatial C-extensions.
-3. **Redundant Geometry Decimation:** General-purpose tilers spend 80%+ of their CPU cycles running complex line-simplification (Ramer-Douglas-Peucker) and polygon-topology validation. Because H3 hexagons are already **mathematically regular 6-vertex convex polygons**, standard decimation algorithms introduce unnecessary overhead and boundary gaps.
-
----
-
 ### Why PMTiles v3 is the Ideal Web Mapping Target
-* **Serverless Cloud-Native Distribution:** An entire multi-resolution pyramid of California or the Continental US lives in a **single `.pmtiles` archive**. You can host it on standard, cost-effective object storage (Amazon S3, Cloudflare R2, Google Cloud Storage, or GitHub Pages) with **zero running backend tile servers** (no Docker instances of Martin, Tegola, or TileServer GL).
-* **HTTP Range-Request Streaming:** Modern web clients use HTTP `Range: bytes=...` headers to fetch only the specific few kilobytes of vector tile data needed for the user's immediate viewport and zoom level.
-* **Instant Out-of-the-Box Client Compatibility:** Supported natively or via 1-line plugins in **MapLibre GL JS**, **Mapbox GL JS**, **Kepler.gl**, **Protomaps**, **Deck.gl**, and **Felt**.
-
----
-
-### Comparison: Traditional Pipeline vs. `raster_h3`
-
-| Feature / Dimension | Traditional Workflow (`tippecanoe` / Python) | `raster_h3` Native PMTiles Engine |
-| :--- | :--- | :--- |
-| **Toolchain Dependencies** | Requires C++ toolchains, GDAL, Python, `tippecanoe` | **100% Pure Rust** (Zero external dependencies) |
-| **Intermediate Storage** | Gigabytes of temporary GeoJSON / FlatGeobuf files | **0 Bytes** (Direct in-memory stream to PMTiles) |
-| **Hexagon Geometry Cost** | Expensive polygon simplification & topology checks | **Instant direct mapping** to $[0, 4096]$ tile space |
-| **Multi-Resolution Sync** | Separate manual runs per zoom level | **Single-pass multi-resolution streaming** |
-| **Memory Footprint** | Dynamic, often gigabytes during indexing | **Bounded memory** ($O(\text{horizon}) < 25\text{ MB}$) |
-| **End-to-End Execution** | Minutes to hours for multi-gigabyte rasters | **Sub-second to seconds** |
-
----
+* **Serverless Cloud-Native Distribution**: An entire multi-resolution pyramid of California or the Continental US lives in a **single `.pmtiles` archive**. You can host it on standard object storage (Amazon S3, Cloudflare R2, Google Cloud Storage, or GitHub Pages) with **zero running backend tile servers**.
+* **HTTP Range-Request Streaming**: Modern web clients use HTTP `Range: bytes=...` headers to fetch only the specific few kilobytes of vector tile data needed for the user's immediate viewport and zoom level.
+* **Instant Out-of-the-Box Client Compatibility**: Supported natively or via 1-line plugins in **MapLibre GL JS**, **Mapbox GL JS**, **Kepler.gl**, **Protomaps**, **Deck.gl**, and **Felt**.
 
 ### H3 Resolution to PMTiles Zoom Level Mapping
-
 Because H3 uses an **Aperture-7** hexagonal hierarchy ($7\times$ area reduction per step) while Web Mercator uses an **Aperture-4** quadtree ($4\times$ area reduction per zoom level), the mathematical scaling ratio is:
 
 $$\frac{\Delta \text{Zoom}}{\Delta R} = \log_4(7) \approx \mathbf{1.4037}$$
@@ -590,62 +465,17 @@ To ensure optimal visual density on screen (**150 to 2,500 hexagons per 512px ti
 | :---: | :---: | :---: | :--- | :---: | :---: |
 | **Res 0** | $4,357,449 \text{ km}^2$ | $1,107 \text{ km}$ | Global / Hemispheric | **Z0 – Z1** | ~10 – 30 |
 | **Res 1** | $609,788 \text{ km}^2$ | $418 \text{ km}$ | Continental | **Z2 – Z3** | ~30 – 100 |
-| **Res 2** | $86,801 \text{ km}^2$ | $158 \text{ km}$ | Sub-Continental / Large Nations | **Z3 – Z4** | ~50 – 200 |
-| **Res 3** | $12,393 \text{ km}^2$ | $59.8 \text{ km}$ | State / Province / Large Region | **Z5 – Z6** | ~100 – 400 |
-| **Res 4** | $1,770 \text{ km}^2$ | $22.6 \text{ km}$ | Metropolitan Area / Valley | **Z7 – Z8** | ~200 – 600 |
+| **Res 2** | $86,801 \text{ km}^2$ | $158 \text{ km}$ | Sub-Continental | **Z3 – Z4** | ~50 – 200 |
+| **Res 3** | $12,393 \text{ km}^2$ | $59.8 \text{ km}$ | State / Province | **Z5 – Z6** | ~100 – 400 |
+| **Res 4** | $1,770 \text{ km}^2$ | $22.6 \text{ km}$ | Metropolitan Area | **Z7 – Z8** | ~200 – 600 |
 | **Res 5** | $252.9 \text{ km}^2$ | $8.54 \text{ km}$ | County / Large City | **Z8 – Z9** | ~300 – 900 |
 | **Res 6** | $36.13 \text{ km}^2$ | $3.23 \text{ km}$ | Municipal / Urban District | **Z10 – Z11** | ~400 – 1,200 |
 | **Res 7** | $5.16 \text{ km}^2$ | $1.22 \text{ km}$ | Neighborhood / Watershed | **Z11 – Z12** | ~500 – 1,500 |
-| **Res 8** | $0.737 \text{ km}^2$ ($73.7 \text{ ha}$) | $461 \text{ m}$ | City Block / Industrial Park | **Z13 – Z14** | ~600 – 1,800 |
-| **Res 9** | $0.105 \text{ km}^2$ ($10.5 \text{ ha}$) | $174 \text{ m}$ | Parcel / Street Intersection | **Z14 – Z15** | ~700 – 2,200 |
-| **Res 10** | $0.015 \text{ km}^2$ ($1.5 \text{ ha}$) | $65.9 \text{ m}$ | Building Footprint / Property Lot | **Z16 – Z17** | ~800 – 2,500 |
+| **Res 8** | $0.737 \text{ km}^2$ ($73.7 \text{ ha}$) | $461 \text{ m}$ | City Block | **Z13 – Z14** | ~600 – 1,800 |
+| **Res 9** | $0.105 \text{ km}^2$ ($10.5 \text{ ha}$) | $174 \text{ m}$ | Parcel / Intersection | **Z14 – Z15** | ~700 – 2,200 |
+| **Res 10** | $0.015 \text{ km}^2$ ($1.5 \text{ ha}$) | $65.9 \text{ m}$ | Building Footprint / Lot | **Z16 – Z17** | ~800 – 2,500 |
 
----
-
-### How to Generate PMTiles: Two Simple Interfaces
-
-#### Option A: Directly from DuckDB SQL
-You can export directly inside any SQL query or data pipeline:
-
-```sql
--- Convert a GeoTIFF to a multi-resolution PMTiles archive (Res 6, 7, 8 -> Zoom 10, 11, 13)
-SELECT * FROM h3_raster_to_pmtiles(
-    'data/california_dem.tif',
-    'data/california_elevation.pmtiles',
-    min_resolution := 6,
-    max_resolution := 8,
-    sampling := 'rgss'
-);
-```
-
-#### Option B: Standalone Raster CLI Tool
-Convert any GeoTIFF directly from the command line:
-
-```bash
-# Convert a GeoTIFF to a multi-resolution PMTiles vector archive (Zoom levels 11 & 13)
-cargo run --release --example raster_to_pmtiles -- \
-  --input data/california_dem.tif \
-  --output data/california_elevation.pmtiles \
-  --resolutions 7,8 \
-  --sampling center
-```
-
-#### Option C: Convert H3 Parquet Files to PMTiles
-Convert any existing Parquet file with H3 indices directly into a PMTiles archive:
-
-```bash
-# Convert an H3-indexed Parquet file to PMTiles (auto-detects H3 column & properties)
-cargo run --release --example parquet_to_pmtiles -- \
-  --input data/demographics_h3.parquet \
-  --output data/demographics.pmtiles \
-  --h3-col h3_index
-```
-
----
-
-### Visualizing Your `.pmtiles` in Web Clients
-
-#### MapLibre GL JS Integration Example:
+### MapLibre GL JS Integration Example
 ```javascript
 import { Protocol } from 'pmtiles';
 import maplibregl from 'maplibre-gl';
@@ -687,39 +517,66 @@ map.on('load', () => {
 
 ---
 
+## 10. Architectural Comparison with Other Approaches
+
+### Structural Trade-Off Matrix
+
+| Dimension | Python (`rasterio` + `h3-py` + `pyproj`) | PostGIS (`raster2pgsql` + `ST_H3_Polyfill`) | GDAL CLI (`gdal_polygonize` + `ogr2ogr`) | `raster_h3` (Native DuckDB) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Execution Environment** | Python interpreter with C-extension FFI | PostgreSQL database daemon | External CLI toolchain | **Embedded inside DuckDB query engine** |
+| **Memory Architecture** | Allocates full 2D coordinate meshgrids in RAM | Subject to PostgreSQL shared buffer limits | Allocates intermediate polygon geometries | **Bounded $O(\text{Scan Front}) < 15\text{ MB}$ RAM** |
+| **Coordinate Transforms** | Evaluated per pixel independently | Evaluated per geometry | Evaluated during polygonization | **Row-constant hoisting (1 transform / row)** |
+| **H3 Index Calculation** | Per-pixel C/FFI boundary crossings | Point-in-polygon spatial queries | Geometry intersection & rasterization | **Scanline lookahead + run accumulation** |
+| **Intermediate Storage** | NumPy arrays or temporary scratch files | Database table storage & index bloat | Multi-gigabyte shapefiles / GeoJSON | **Zero intermediate files (direct stream)** |
+| **Multi-Resolution Sync** | Separate processing passes per resolution | Separate queries with parent rollups | Separate polygonization runs | **Single-pass multi-resolution streaming** |
+| **Web Tile Output** | Requires external `tippecanoe` + tile server | Requires MVT server (Martin/Tegola) | Requires tiling toolchain | **Direct in-memory PMTiles v3 export** |
+
+### Detailed Architectural Nuances
+
+#### 1. Python Pipelines (`rasterio` + `h3-py` / `scipy` / `numpy`)
+- **Coordinate Meshgrid Allocations**: `rasterio.transform.xy` and `pyproj.Transformer` allocate 2D floating-point arrays for $X$, $Y$, $\text{Lat}$, and $\text{Lon}$ ($40+$ bytes per pixel), requiring gigabytes of RAM for large rasters.
+- **Per-Pixel C/FFI Crossing Overhead**: Calling `h3.latlng_to_cell()` millions of times invokes Python C/ctypes wrapper overhead on every call, allocating individual heap objects.
+- **Redundant Trigonometry**: Evaluates projection math independently on all pixels without scanline hoisting.
+- **Single-Threaded GIL**: Python loops cannot fully saturate modern multi-core processors without multiprocessing IPC serialization overhead.
+
+#### 2. PostGIS & Traditional Spatial SQL
+- Requires importing rasters via `raster2pgsql`, introducing database storage expansion.
+- Relies on spatial polygon intersection tests rather than bitwise mathematical index transformations.
+- Data serialization between database processes limits throughput.
+
+#### 3. GDAL Vector Polygonization
+- `gdal_polygonize` generates intermediate vector polygon layers with topology validation before spatial binning, producing large temporary files on disk.
+
+---
+
 ## 11. Complete API Reference
 
 ### Continuous Rasters: `h3_raster_continuous_aggregate(file_path, [resolution], ...)`
 *(Alias: `h3_raster_continuous`)*
 
-Use for continuous spatial surfaces (elevation, temperature, rainfall, satellite NDVI/spectral bands, wind speed).
-
 #### Positional Parameters
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :---: | :--- | :--- |
-| `file_path` | `VARCHAR` | **Yes** | — | Absolute or relative file path to the GeoTIFF file. |
-| `resolution` | `BIGINT` | No | `8` | H3 grid resolution level ($0 \le R \le 15$). |
+| `file_path` | `VARCHAR` | **Yes** | — | Path to the GeoTIFF / Cloud-Optimized GeoTIFF file. |
+| `resolution` | `BIGINT` | No | `8` | Target H3 grid resolution level ($0 \le R \le 15$). |
 
 #### Named Parameters
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `resolution` | `BIGINT` | `8` | Named alternative for H3 grid resolution level ($0 \le R \le 15$). |
-| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate from multi-spectral imagery. |
+| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level ($0 \le R \le 15$). |
+| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, `'5point'`, `'8rooks'`, `'9point'`, `'16point'`). |
-| `min_lon` | `DOUBLE` | `None` | Minimum longitude for spatial Region of Interest (ROI) pruning. |
-| `min_lat` | `DOUBLE` | `None` | Minimum latitude for spatial Region of Interest (ROI) pruning. |
-| `max_lon` | `DOUBLE` | `None` | Maximum longitude for spatial Region of Interest (ROI) pruning. |
-| `max_lat` | `DOUBLE` | `None` | Maximum latitude for spatial Region of Interest (ROI) pruning. |
+| `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Region of Interest (ROI) bounding box coordinates for chunk pruning. |
 
 #### Output Schema
 | Column Name | Logical Type | Description |
 | :--- | :--- | :--- |
 | `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index (fast for joins). |
 | `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation (e.g. `'8828308281fffff'`). |
-| `mean` | `DOUBLE` | Arithmetic mean of pixel values in the cell. |
+| `mean` | `DOUBLE` | Weighted arithmetic mean of pixel values in the cell. |
 | `stddev` | `DOUBLE` | Single-pass Welford sample standard deviation of pixel values. |
 | `count` | `DOUBLE` | Weighted count of pixels contributing to the cell. |
 | `min` | `DOUBLE` | Minimum pixel value observed within the cell. |
@@ -730,55 +587,30 @@ Use for continuous spatial surfaces (elevation, temperature, rainfall, satellite
 
 ### Aggregation Statistics: Mathematical Definitions & Geospatial Use Cases
 
-`raster_h3` computes all 6 descriptive summary statistics simultaneously in a **single linear pass** using hardware-accelerated accumulators and Welford's online algorithm:
-
 | Statistic | Mathematical Formula | Geospatial Analytics Use Case | Why & When to Use |
 | :--- | :--- | :--- | :--- |
-| **`mean`** | $\bar{x} = \frac{\sum w_i \cdot x_i}{\sum w_i}$ | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health, mean slope. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
-| **`stddev`** | $s = \sqrt{\frac{M_2}{\sum w_i - 1}}$ where $M_2 = \sum w_i (x_i - \bar{x}_{k-1})(x_i - \bar{x}_k)$ | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep canyons/cliffs; low `stddev` indicates flat plains. |
-| **`count`** | $N = \sum w_i$ | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns the integer count of pixels in the cell. In super-sampling (`rgss`, `hex`), returns fractional area coverage (e.g. `142.75` px). |
-| **`min`** | $\min_i(x_i)$ | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch misprediction penalties. |
-| **`max`** | $\max_i(x_i)$ | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building/canopy height in DSM rasters. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
-| **`sum`** | $\sum w_i \cdot x_i$ | **Cumulative Physical Quantities**: Total precipitation volume (mm × area), solar radiation flux (kWh), biomass carbon stock. | Used whenever the raster pixel represents a density or rate per unit area that must be integrated across the entire hexagon. |
+| **`mean`** | $\bar{x} = \frac{\sum w_i \cdot x_i}{\sum w_i}$ | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
+| **`stddev`** | $s = \sqrt{\frac{M_2}{\sum w_i - 1}}$ where $M_2 = \sum w_i (x_i - \bar{x}_{k-1})(x_i - \bar{x}_k)$ | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep terrain; low `stddev` indicates flat plains. |
+| **`count`** | $N = \sum w_i$ | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns integer count of pixels in cell. In super-sampling, returns fractional area coverage. |
+| **`min`** | $\min_i(x_i)$ | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch penalties. |
+| **`max`** | $\max_i(x_i)$ | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building height. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
+| **`sum`** | $\sum w_i \cdot x_i$ | **Cumulative Physical Quantities**: Total precipitation volume, solar radiation flux, biomass carbon stock. | Used whenever raster pixel values represent density or rate per unit area that integrates across the hexagon. |
 
 ---
 
 ### Categorical Rasters: `h3_raster_categorical_aggregate(file_path, [resolution], ...)`
 *(Alias: `h3_raster_categorical`)*
 
-Use for discrete classification rasters (land cover, biomes, soil types, zoning). Provides three output modes: **Majority/Mode Class (Option A)**, **JSON Class Distribution / Histogram (Option B)**, and **Normalized Long-Form Output (Option C)**:
-
-```sql
--- 1. Wide Format (Default): Majority Class + Distribution Histogram
-SELECT
-    h3_hex,
-    majority_class,
-    round(majority_fraction * 100, 1) AS dominance_pct,
-    unique_classes,
-    total_count,
-    histogram
-FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8);
-
--- 2. Long Format: Normalized breakdown row per (hex, category)
-SELECT
-    h3_hex,
-    category,
-    count AS category_pixels,
-    round(fraction * 100, 2) AS pct_coverage
-FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8, format := 'long')
-WHERE fraction >= 0.10;
-```
-
 #### Named Parameters
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `resolution` | `BIGINT` | `8` | H3 grid resolution level ($0 \le R \le 15$). |
-| `format` | `VARCHAR` | `'wide'` | Output layout: `'wide'` (Options A & B) or `'long'` (Option C). |
-| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate from multi-spectral imagery. |
+| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level ($0 \le R \le 15$). |
+| `format` | `VARCHAR` | `'wide'` | Output layout: `'wide'` (majority + histogram) or `'long'` (normalized rows). |
+| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). |
-| `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
+| `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
-| `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, etc.). |
+| `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, etc.). |
 | `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Bounding box coordinates for spatial Region of Interest (ROI) chunk pruning. |
 
 #### Wide Format Output Schema (`format := 'wide'`, Default)
@@ -786,14 +618,14 @@ WHERE fraction >= 0.10;
 | :--- | :--- | :--- |
 | `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index. |
 | `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation. |
-| `majority_class` | `BIGINT` | Most frequent category ID in the hexagon (Option A). |
+| `majority_class` | `BIGINT` | Most frequent category ID in the hexagon. |
 | `majority_fraction` | `DOUBLE` | Fraction ($0.0 \dots 1.0$) of the hexagon occupied by majority class. |
 | `majority_count` | `DOUBLE` | Weighted pixel count of the majority category. |
 | `unique_classes` | `BIGINT` | Number of distinct categories present in the hexagon (richness). |
 | `total_count` | `DOUBLE` | Total non-nodata pixels in the hexagon. |
-| `histogram` | `VARCHAR` | JSON map of `{category_id: fraction, ...}` (Option B). |
+| `histogram` | `VARCHAR` | JSON map of `{category_id: fraction, ...}`. |
 
-#### Long Format Output Schema (`format := 'long'`, Option C)
+#### Long Format Output Schema (`format := 'long'`)
 | Column Name | Logical Type | Description |
 | :--- | :--- | :--- |
 | `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index. |
@@ -806,18 +638,6 @@ WHERE fraction >= 0.10;
 ---
 
 ### PMTiles v3 Export: `h3_raster_to_pmtiles(file_path, output_pmtiles, ...)`
-
-Generates a production-ready, cloud-native PMTiles v3 archive containing multi-resolution Mapbox Vector Tile (MVT) hexagonal pyramids in a **single SQL query**.
-
-```sql
-SELECT * FROM h3_raster_to_pmtiles(
-    'california_dem.tif',
-    'california_elevation.pmtiles',
-    min_resolution := 6,
-    max_resolution := 8,
-    sampling := 'center'
-);
-```
 
 #### Positional Parameters
 | Parameter | Type | Required | Default | Description |
@@ -856,7 +676,7 @@ SELECT * FROM h3_raster_to_pmtiles(
 | `string_to_h3` | `(VARCHAR)` | `UBIGINT` | Fast ASCII hexadecimal to 64-bit integer parser. |
 | `h3_to_lat` | `(UBIGINT)` | `DOUBLE` | Centroid latitude in WGS84 decimal degrees. |
 | `h3_to_lng` | `(UBIGINT)` | `DOUBLE` | Centroid longitude in WGS84 decimal degrees. |
-| `h3_get_resolution` | `(UBIGINT)` | `BIGINT` | 1-cycle bitshift extraction of H3 resolution level ($0 \dots 15$). |
+| `h3_get_resolution` | `(UBIGINT)` | `BIGINT` | Single-cycle bitshift extraction of H3 resolution level ($0 \dots 15$). |
 | `h3_is_valid` | `(UBIGINT)` / `(VARCHAR)` | `BOOLEAN` | Validates mode, base cell range ($0..121$), resolution ($0..15$), directional digits, and padding. |
 
 ---
@@ -865,33 +685,33 @@ SELECT * FROM h3_raster_to_pmtiles(
 
 ```mermaid
 flowchart TD
-    subgraph DuckDB ["DuckDB SQL Query Engine"]
+    subgraph DuckDB ["DuckDB SQL Execution Engine"]
         SQL1["h3_raster_continuous_aggregate (mean, stddev, min, max, sum)"]
         SQL2["h3_raster_categorical_aggregate (majority, histogram, long)"]
-        TF["Table Function C API: bind -> init -> scan"]
+        TF["Table Function C API: bind -> init_local -> scan"]
         SQL1 --> TF
         SQL2 --> TF
     end
 
     subgraph IO ["Zero-Copy Disk & Memory Layer"]
         FILE[("GeoTIFF / COG File on Disk")]
-        MMAP["memmap2: Virtual Memory Direct Mapping"]
+        MMAP["memmap2: Userspace Virtual Memory Direct Mapping"]
         PREFETCH["Async Prefetch Worker (sync_channel)"]
         FILE --> MMAP --> PREFETCH
     end
 
-    subgraph PIPELINE ["Scan-Line Horizon Processing Engine"]
+    subgraph PIPELINE ["Scanline Horizon Processing Engine"]
         CHUNK["On-Demand Strip / Tile Stream"]
         PREFETCH --> CHUNK
 
         subgraph WORKER ["High-Throughput Chunk Processor"]
             NODATA{"100% NoData Chunk?"}
             CHUNK --> NODATA
-            NODATA -- "Yes" --> SKIP["Instant O(1) Drop"]
-            NODATA -- "No" --> HOIST["Row-Constant Latitude Hoist (1 proj / row)"]
+            NODATA -- "Yes" --> SKIP["Instant O(1) Skip"]
+            NODATA -- "No" --> HOIST["Row-Constant Latitude Hoist (1 transform / row)"]
             HOIST --> STEP["Linear Longitude Step (lon += Δlon)"]
-            STEP --> CACHE["Spatial Coherence Cache (Inscribed Bounding Box)"]
-            CACHE --> RUN["In-Register Run Accumulator (Zero Hash / Zero Probe)"]
+            STEP --> LOOKAHEAD["H3 Scanline Lookahead (Jump-Guess + Binary Search)"]
+            LOOKAHEAD --> RUN["In-Register Run Accumulator (Registers)"]
         end
 
         subgraph HORIZON ["Southernmost Scan-Line Horizon Eviction"]
@@ -919,18 +739,16 @@ flowchart TD
 
 ## 13. Core Dependencies & Architectural Contributions
 
-`raster_h3` is built using a carefully curated set of pure-Rust libraries to achieve zero external runtime dependencies and hardware-saturating performance:
-
 | Dependency | Purpose | Architectural Contribution to `raster_h3` |
 | :--- | :--- | :--- |
-| [`h3o`](https://crates.io/crates/h3o) `v0.6` | Pure-Rust H3 Engine | Provides 100% pure-Rust implementation of Uber's H3 Discrete Global Grid System. Replaces the C H3 library, enabling zero-copy boundary extraction, cell indexing, and fast lat/lng conversions without C/C++ toolchain dependencies or FFI boundary overhead. |
-| [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Directly maps GeoTIFF files from disk into userspace virtual memory, completely bypassing `read()` syscalls and intermediate buffer copies. Enables issuing kernel-level `madvise(MADV_SEQUENTIAL)` readahead hints to prefetch disk blocks in 2MB–4MB bursts. |
-| [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression. Decodes individual tiles and strips on-demand directly from memory-mapped slices and frees them immediately, maintaining flat $O(1)$ memory consumption. |
-| [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Standalone Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 geodetic transformations (UTM, Transverse Mercator, Lambert Conformal Conic → WGS84). Replaces the massive multi-gigabyte C++ `libproj` library with a thread-safe, self-contained coordinate transformer. |
-| [`fxhash`](https://crates.io/crates/fxhash) `v0.2` | Fast Non-Cryptographic Hasher | Provides the Firefox-derived FxHash algorithm for `HashMap` keys. Delivers near-identity-hash throughput for 64-bit integer H3 cell keys while maintaining robust collision resistance across mixed key distributions used by both continuous accumulators and categorical frequency maps. |
-| [`rayon`](https://crates.io/crates/rayon) `v1.10` | Work-Stealing Parallelism | Provides lightweight, lock-free work-stealing data parallelism for concurrent chunk decompression and aggregation across all available CPU cores. |
+| [`h3o`](https://crates.io/crates/h3o) `v0.6` | Pure-Rust H3 Engine | Provides 100% pure-Rust implementation of Uber's H3 Discrete Global Grid System, eliminating C/C++ toolchain dependencies or FFI boundary overhead. |
+| [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Directly maps GeoTIFF files from disk into userspace virtual memory, bypassing `read()` syscalls and intermediate buffer copies with sequential kernel readahead hints. |
+| [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression directly from memory slices. |
+| [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 transformations (UTM, Transverse Mercator, Lambert Conformal Conic → WGS84) without massive C++ `libproj` dependencies. |
+| [`fxhash`](https://crates.io/crates/fxhash) `v0.2` | Fast Non-Cryptographic Hasher | Provides near-identity-hash throughput for 64-bit integer H3 cell keys in active horizon maps. |
+| [`rayon`](https://crates.io/crates/rayon) `v1.10` | Work-Stealing Parallelism | Provides lock-free work-stealing data parallelism for concurrent chunk decompression and aggregation across CPU cores. |
 | [`flate2`](https://crates.io/crates/flate2) `v1.0` | Cloud-Native Tile Compression | Provides high-speed Gzip compression for Mapbox Vector Tile payloads and PMTiles v3 directory indices. |
-| [`thiserror`](https://crates.io/crates/thiserror) & [`serde`](https://crates.io/crates/serde) | Robust Error & Data Handling | Provides ergonomic, zero-overhead typed error propagation across DuckDB C-FFI boundaries without panics. |
+| [`thiserror`](https://crates.io/crates/thiserror) & [`serde`](https://crates.io/crates/serde) | Error & Data Serialization | Provides typed, zero-overhead error propagation across C-FFI boundaries and JSON histogram formatting. |
 
 ---
 
@@ -945,44 +763,30 @@ flowchart TD
 # Build optimized release dynamic library
 cargo build --release
 ```
-The compiled extension will be in:
+Compiled extension outputs:
 - macOS: `target/release/libraster_h3.dylib`
 - Linux: `target/release/libraster_h3.so`
 - Windows: `target/release/libraster_h3.dll`
 
-### 2. Run Comprehensive Test Suite
-
-#### Locally with Cargo:
+### 2. Run Test Suite
 ```bash
-# Run all 68 unit and integration tests
+# Run all unit and integration tests locally
 cargo test --release
 
-# Run with verbose test stdout output
-cargo test -- --nocapture
-```
-
-#### In an Isolated Docker Container:
-Running tests in Docker ensures an identical environment with all required system dependencies:
-
-```bash
-# Build the Docker image (automatically runs cargo test --release and compiles the extension)
-docker build -t raster_h3 .
-
-# Or run tests explicitly inside a transient container
+# Run tests in an isolated Docker container
 docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release
 ```
 
-### 3. Run Performance & Scaling Benchmarks
-
+### 3. Run Profilers & Examples
 ```bash
-# 1. Complete End-to-End Multi-Stage Pipeline Benchmark
-cargo run --release --example benchmark_e2e
+# 1. Profile I/O vs H3 Math on a real GeoTIFF
+cargo run --release --example benchmark_bottleneck path/to/raster.tif
 
-# 2. Large-Scale Multi-Resolution Scaling Benchmark (1M to 100M pixels)
+# 2. Multi-resolution scaling benchmark
 cargo run --release --example benchmark_scaling
 
-# 3. GeoTIFF to PMTiles v3 Vector Hexagon Generator
-cargo run --release --example raster_to_pmtiles
+# 3. GeoTIFF to PMTiles v3 CLI converter
+cargo run --release --example raster_to_pmtiles -- --input data/sample_sf.tif --output data/sample_sf.pmtiles
 ```
 
 ---
