@@ -62,14 +62,14 @@ If you have ever tried to convert satellite imagery or elevation grids to hexago
 
 Here is why traditional tools struggle, and how `raster_h3` solves the problem:
 
-| Step | Traditional Approach | `raster_h3` Approach |
-| :---: | :--- | :--- |
-| **1. Memory** | Load entire multi-gigabyte raster into RAM | Stream 1 thin row at a time ($< 15\text{ MB}$ RAM) |
-| **2. Projection** | Re-calculate spherical GPS math on every pixel | Set "Cruise Control" (1 projection calculation per row) |
-| **3. H3 Lookup** | Recompute cell ID or search hash table per pixel | **Scanline Lookahead**: Jump-guess + binary search ($O(\log N)$) |
-| **4. Eviction** | Hold all results in memory until file completion | Evict finished hexagons from memory immediately via horizon scan |
-| **5. Web Tiling** | Run C++ Tippecanoe, write scratch files & setup tile servers | Generate cloud-native `.pmtiles` vector archives in 1 step |
-| **Outcome** | Heavy RAM footprint & multi-stage ETL scripts | Fast, bounded $< 15\text{ MB}$ RAM & instant SQL querying |
+| Step | Traditional Approach | raster_h3 Approach |
+| :--- | :--- | :--- |
+| 1. Memory | Load entire multi-gigabyte raster into RAM | Stream 1 thin row at a time (&lt; 15 MB RAM) |
+| 2. Projection | Re-calculate spherical GPS math on every pixel | Set "Cruise Control" (1 projection calculation per row) |
+| 3. H3 Lookup | Recompute cell ID or search hash table per pixel | Scanline Lookahead: Jump-guess + binary search (O(log N)) |
+| 4. Eviction | Hold all results in memory until file completion | Evict finished hexagons from memory immediately via horizon scan |
+| 5. Web Tiling | Run C++ Tippecanoe, write scratch files & setup tile servers | Generate cloud-native .pmtiles vector archives in 1 step |
+| **Outcome** | Heavy RAM footprint & multi-stage ETL scripts | Fast, bounded &lt; 15 MB RAM & instant SQL querying |
 
 ### 1. The Moving Scanner Front (Constant Memory)
 Instead of loading a multi-gigabyte file into memory, `raster_h3` reads the image like an office document scanner—one paper-thin row at a time from North to South. The moment a row moves past the southernmost boundary of a hexagon, that hexagon is sealed, finished, and streamed directly into your SQL query results.
