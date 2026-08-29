@@ -500,7 +500,7 @@ In the H3 Discrete Global Grid System, parent hexagons are **not** the strict ge
 
 ### Key Performance Benefits
 1. **Zero Redundant I/O:** The GeoTIFF file is read from disk and decompressed **only once**.
-2. **L1 CPU Cache Reuse:** Decoded raster pixel memory is kept in high-speed L1 cache while parallel `SpatialCoherenceCache` instances update the active horizon front for each resolution level.
+2. **L1 CPU Cache Reuse:** Decoded raster pixel memory is kept in high-speed L1 cache while parallel `H3ScanlineLookahead` instances update the active horizon front for each resolution level.
 3. **Stacked Table Output:** Yields a unified multi-resolution pyramid with a `resolution` column ready for partitioned parquet export:
 
 ```sql

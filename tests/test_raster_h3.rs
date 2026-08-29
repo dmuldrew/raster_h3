@@ -10,7 +10,7 @@ use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::{
     chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
     CategoricalAccumulator, CategoricalHorizonStreamer, H3Accumulator,
-    SamplingPattern, ScanHorizonStreamer, SpatialCoherenceCache,
+    SamplingPattern, ScanHorizonStreamer,
 };
 use raster_h3::crs::CrsTransformer;
 use raster_h3::error::RasterH3Error;
@@ -127,23 +127,6 @@ fn test_bitshift_resolution() {
 }
 
 #[test]
-fn test_spatial_coherence_cache_accuracy() {
-    let mut cache = SpatialCoherenceCache::default();
-    let res = h3o::Resolution::Eight;
-
-    let lat = 37.7749;
-    let lon = -122.4194;
-
-    let cell_cached = cache.get_or_compute(lat, lon, res).unwrap();
-    let lat_lng = h3o::LatLng::new(lat, lon).unwrap();
-    let cell_direct: u64 = lat_lng.to_cell(res).into();
-
-    assert_eq!(cell_cached, cell_direct);
-
-    // Adjacent pixel within 2 meters should return exact same cell from cache
-    let cell_adjacent = cache.get_or_compute(lat + 0.00001, lon + 0.00001, res).unwrap();
-    assert_eq!(cell_adjacent, cell_direct);
-}
 
 #[test]
 fn test_is_chunk_all_nodata() {

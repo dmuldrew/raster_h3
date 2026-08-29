@@ -4,7 +4,7 @@ use h3o::{LatLng, Resolution};
 use serde::{Deserialize, Serialize};
 use tiff::decoder::DecodingResult;
 
-use crate::aggregator::coherence::SpatialCoherenceCache;
+use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::aggregator::horizon_streamer::{
     chunk_intersects_bbox, compute_cell_south_lat, AggregationConfig,
     HexEvictionEntry,
@@ -261,15 +261,13 @@ impl CategoricalHorizonStreamer {
             let row_idx = (chunk.row_offset + r as u32) as usize;
             let slice_row_start = r * stride;
             let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-            let mut row_cache = SpatialCoherenceCache::default();
-
             if self.sampling.is_single_point() {
                 // Fast-path: Single-point center sampling with scanline run-skipping
+                let mut row_cache = H3ScanlineLookahead::default();
                 let mut run_cell: u64 = 0;
                 let mut run_acc = CategoricalAccumulator::default();
 
-                let (x_start, y_row) =
-                    self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
+                let (x_start, y_row) = self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
 
                 let (mut lon_curr, lat_row) = if is_wgs84 {
                     (x_start, y_row)
@@ -315,7 +313,7 @@ impl CategoricalHorizonStreamer {
                         }
                     }
 
-                    if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, self.resolution) {
+                    if let Some(cell_u64) = row_cache.get_or_compute_cell(lat, lon, self.resolution) {
                         if cell_u64 != run_cell {
                             if run_cell != 0 && run_acc.total_count > 0.0 {
                                 self.active_map
@@ -332,15 +330,14 @@ impl CategoricalHorizonStreamer {
                             }
                             run_cell = cell_u64;
                             run_acc = CategoricalAccumulator::default();
+                            row_cache.on_cell_changed();
                         }
 
-                        let safe_span = if is_wgs84 || is_web_mercator {
-                            row_cache.safe_span_length(lon_curr, d_lon_step)
+                        let span_end = if is_wgs84 || is_web_mercator {
+                            row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, self.resolution, run_cell)
                         } else {
-                            1
+                            c + 1
                         };
-
-                        let span_end = (c + safe_span).min(row_width);
 
                         let mut curr_cat: Option<i64> = None;
                         let mut curr_cat_count = 0.0;
@@ -377,6 +374,7 @@ impl CategoricalHorizonStreamer {
                         }
 
                         let num_stepped = span_end - c;
+                        row_cache.advance_span(num_stepped);
                         if is_wgs84 || is_web_mercator {
                             lon_curr += (num_stepped as f64) * d_lon_step;
                         }
@@ -442,49 +440,28 @@ impl CategoricalHorizonStreamer {
                         }
                     }
 
-                    if row_cache.contains(center_lat, center_lon) {
-                        let cell_u64 = row_cache.cell_u64;
-                        self.active_map
-                            .entry(cell_u64)
-                            .and_modify(|acc| acc.update_weighted(cat, 1.0))
-                            .or_insert_with(|| {
-                                let south_lat = compute_cell_south_lat(cell_u64);
-                                self.eviction_queue.push(HexEvictionEntry {
-                                    south_lat,
-                                    cell_u64,
-                                });
-                                let mut acc = CategoricalAccumulator::default();
-                                acc.update_weighted(cat, 1.0);
-                                acc
-                            });
-                    } else {
-                        for pt in &self.sampling.points {
-                            let (px, py) = self
-                                .gt
-                                .pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
-                            if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py)
-                            {
-                                if let Ok(lat_lng) = LatLng::new(lat_i, lon_i) {
-                                    let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
-                                    self.active_map
-                                        .entry(cell_u64)
-                                        .and_modify(|acc| acc.update_weighted(cat, pt.weight))
-                                        .or_insert_with(|| {
-                                            let south_lat = compute_cell_south_lat(cell_u64);
-                                            self.eviction_queue.push(HexEvictionEntry {
-                                                south_lat,
-                                                cell_u64,
-                                            });
-                                            let mut acc = CategoricalAccumulator::default();
-                                            acc.update_weighted(cat, pt.weight);
-                                            acc
+                    for pt in &self.sampling.points {
+                        let (px, py) = self
+                            .gt
+                            .pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
+                        if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py)
+                        {
+                            if let Ok(lat_lng) = LatLng::new(lat_i, lon_i) {
+                                let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
+                                self.active_map
+                                    .entry(cell_u64)
+                                    .and_modify(|acc| acc.update_weighted(cat, pt.weight))
+                                    .or_insert_with(|| {
+                                        let south_lat = compute_cell_south_lat(cell_u64);
+                                        self.eviction_queue.push(HexEvictionEntry {
+                                            south_lat,
+                                            cell_u64,
                                         });
-                                }
+                                        let mut acc = CategoricalAccumulator::default();
+                                        acc.update_weighted(cat, pt.weight);
+                                        acc
+                                    });
                             }
-                        }
-
-                        if let Ok(center_ll) = LatLng::new(center_lat, center_lon) {
-                            row_cache.update(center_ll.to_cell(self.resolution));
                         }
                     }
                 }

@@ -5,7 +5,6 @@ use rayon::prelude::*;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::{H3Accumulator, FastRunAccumulator};
-use crate::aggregator::coherence::SpatialCoherenceCache;
 use crate::aggregator::horizon_streamer::{is_chunk_all_nodata, AggregationConfig};
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
@@ -17,6 +16,42 @@ const WGS84_A: f64 = 6378137.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
 pub type H3HashMap = HashMap<u64, H3Accumulator, FxBuildHasher>;
+
+/// Binary search along a scanline to find the exact column index where the H3 cell changes.
+/// This requires convexity: if `c_start` is in `target_cell`, and `c_max` is outside,
+/// there is exactly one boundary crossing in between.
+#[inline(always)]
+fn find_hexagon_boundary(
+    c_start: usize,
+    c_max: usize,
+    lon_curr: f64,
+    lat_row: f64,
+    d_lon_step: f64,
+    resolution: Resolution,
+    target_cell: u64,
+) -> usize {
+    let mut left = c_start;
+    let mut right = c_max;
+
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let mid_lon = lon_curr + ((mid - c_start) as f64) * d_lon_step;
+        
+        if let Ok(ll) = h3o::LatLng::new(lat_row, mid_lon) {
+            let cell: u64 = ll.to_cell(resolution).into();
+            if cell == target_cell {
+                // mid is inside the target hexagon, boundary is strictly after mid
+                left = mid + 1;
+            } else {
+                // mid is outside, boundary is at mid or earlier
+                right = mid;
+            }
+        } else {
+            right = mid; // Invalid coordinate boundary
+        }
+    }
+    left
+}
 
 /// Helper to iterate through a typed native slice and aggregate into an H3 map using
 /// Row-Constant Latitude Hoisting, Linear Longitude Stepping, and In-Register Run Accumulation
@@ -65,10 +100,11 @@ fn aggregate_native_slice_hoisted<T, F, N>(
         let row_idx = (chunk.row_offset + r as u32) as usize;
         let slice_row_start = r * stride;
         let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-        let mut row_cache = SpatialCoherenceCache::default();
 
         let mut run_cell: u64 = 0;
         let mut run_acc = FastRunAccumulator::default();
+        let mut current_hex_span = 0;
+        let mut prev_hex_width: usize = 32; // initial adaptive guess
 
         // Hoist latitude and starting longitude for the entire row
         let (x_start, y_row) = gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
@@ -115,30 +151,71 @@ fn aggregate_native_slice_hoisted<T, F, N>(
                 }
             }
 
-            // Fast spatial coherence H3 lookup
-            if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, resolution) {
-                if cell_u64 != run_cell {
-                    if run_cell != 0 && run_acc.count > 0.0 {
-                        let h3_acc = run_acc.into_h3();
-                        map.entry(run_cell)
-                            .and_modify(|acc| acc.merge(&h3_acc))
-                            .or_insert(h3_acc);
+            let cell_u64 = if let Ok(ll) = h3o::LatLng::new(lat, lon) {
+                ll.to_cell(resolution).into()
+            } else {
+                c += 1;
+                if is_wgs84 || is_web_mercator {
+                    lon_curr += d_lon_step;
+                }
+                continue;
+            };
+
+            if cell_u64 != run_cell {
+                if run_cell != 0 && run_acc.count > 0.0 {
+                    let h3_acc = run_acc.into_h3();
+                    map.entry(run_cell)
+                        .and_modify(|acc| acc.merge(&h3_acc))
+                        .or_insert(h3_acc);
+                }
+                run_cell = cell_u64;
+                run_acc = FastRunAccumulator::default();
+                
+                if current_hex_span > 0 {
+                    prev_hex_width = current_hex_span;
+                }
+                current_hex_span = 0;
+            }
+
+            let span_end = if is_wgs84 || is_web_mercator {
+                let remaining_guess = prev_hex_width.saturating_sub(current_hex_span).max(1);
+                let mut guess_c = (c + remaining_guess).min(row_width);
+                let mut guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
+                
+                // Exponential Search (Galloping) if we underestimate the hexagon width
+                while guess_c < row_width {
+                    if let Ok(ll) = h3o::LatLng::new(lat_row, guess_lon) {
+                        let guess_cell: u64 = ll.to_cell(resolution).into();
+                        if guess_cell == run_cell {
+                            let step = (guess_c - c).max(1);
+                            let new_guess_c = (guess_c + step).min(row_width);
+                            if new_guess_c == guess_c { break; }
+                            guess_c = new_guess_c;
+                            guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
                     }
-                    run_cell = cell_u64;
-                    run_acc = FastRunAccumulator::default();
                 }
 
-                // Compute safe span length guaranteed to remain in this cell
-                let safe_span = if is_wgs84 || is_web_mercator {
-                    row_cache.safe_span_length(lon_curr, d_lon_step)
-                } else {
-                    1
-                };
+                // Binary search for exact boundary
+                find_hexagon_boundary(
+                    c + 1,
+                    guess_c,
+                    lon_curr + d_lon_step,
+                    lat_row,
+                    d_lon_step,
+                    resolution,
+                    run_cell
+                )
+            } else {
+                c + 1
+            };
 
-                let span_end = (c + safe_span).min(row_width);
-
-                // Tight slice vector loop (auto-vectorizes with AVX2 / ARM NEON)
-                for i in c..span_end {
+            // Tight slice vector loop (auto-vectorizes with AVX2 / ARM NEON)
+            for i in c..span_end {
                     let val_raw = slice[slice_row_start + i];
                     
                     let mut is_valid = true;
@@ -164,16 +241,11 @@ fn aggregate_native_slice_hoisted<T, F, N>(
                 }
 
                 let num_stepped = span_end - c;
+                current_hex_span += num_stepped;
                 if is_wgs84 || is_web_mercator {
                     lon_curr += (num_stepped as f64) * d_lon_step;
                 }
                 c = span_end;
-            } else {
-                c += 1;
-                if is_wgs84 || is_web_mercator {
-                    lon_curr += d_lon_step;
-                }
-            }
         }
 
         // Flush remaining run at end of row

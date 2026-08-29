@@ -10,7 +10,7 @@ use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::coherence::SpatialCoherenceCache;
+use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::aggregator::horizon_streamer::{
     chunk_intersects_bbox, compute_cell_south_lat, HexEvictionEntry,
 };
@@ -233,9 +233,8 @@ impl MultiScanHorizonStreamer {
                 let row_idx = (chunk.row_offset + r as u32) as usize;
                 let slice_row_start = r * stride;
                 let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-                let mut row_cache = SpatialCoherenceCache::default();
-
                 if self.sampling.is_single_point() {
+                    let mut row_cache = H3ScanlineLookahead::default();
                     let mut run_cell: u64 = 0;
                     let mut run_acc = H3Accumulator::default();
 
@@ -286,7 +285,7 @@ impl MultiScanHorizonStreamer {
                             }
                         }
 
-                        if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, res) {
+                        if let Some(cell_u64) = row_cache.get_or_compute_cell(lat, lon, res) {
                             if cell_u64 != run_cell {
                                 if run_cell != 0 && run_acc.count > 0.0 {
                                     active_map
@@ -303,15 +302,14 @@ impl MultiScanHorizonStreamer {
                                 }
                                 run_cell = cell_u64;
                                 run_acc = H3Accumulator::default();
-                            }
+                            row_cache.on_cell_changed();
+                        }
 
-                            let safe_span = if is_wgs84 || is_web_mercator {
-                                row_cache.safe_span_length(lon_curr, d_lon_step)
-                            } else {
-                                1
-                            };
-
-                            let span_end = (c + safe_span).min(row_width);
+                        let span_end = if is_wgs84 || is_web_mercator {
+                            row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, res, run_cell)
+                        } else {
+                            c + 1
+                        };
 
                             if native_nodata.is_none() && self.nodata.is_none() {
                                 for i in c..span_end {
@@ -402,43 +400,24 @@ impl MultiScanHorizonStreamer {
                             }
                         }
 
-                        if row_cache.contains(center_lat, center_lon) {
-                            let cell_u64 = row_cache.cell_u64;
-                            active_map
-                                .entry(cell_u64)
-                                .and_modify(|acc| acc.update_weighted(val, 1.0))
-                                .or_insert_with(|| {
-                                    let south_lat = compute_cell_south_lat(cell_u64);
-                                    eviction_queue.push(HexEvictionEntry {
-                                        south_lat,
-                                        cell_u64,
-                                    });
-                                    H3Accumulator::new_weighted(val, 1.0)
-                                });
-                        } else {
-                            let col_px = (chunk.col_offset as usize) + c;
-                            for pt in &self.sampling.points {
-                                let (px, py) = self.gt.pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
-                                if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py) {
-                                    if let Ok(lat_lng) = h3o::LatLng::new(lat_i, lon_i) {
-                                        let cell_u64: u64 = lat_lng.to_cell(res).into();
-                                        active_map
-                                            .entry(cell_u64)
-                                            .and_modify(|acc| acc.update_weighted(val, pt.weight))
-                                            .or_insert_with(|| {
-                                                let south_lat = compute_cell_south_lat(cell_u64);
-                                                eviction_queue.push(HexEvictionEntry {
-                                                    south_lat,
-                                                    cell_u64,
-                                                });
-                                                H3Accumulator::new_weighted(val, pt.weight)
+                        let col_px = (chunk.col_offset as usize) + c;
+                        for pt in &self.sampling.points {
+                            let (px, py) = self.gt.pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
+                            if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py) {
+                                if let Ok(lat_lng) = h3o::LatLng::new(lat_i, lon_i) {
+                                    let cell_u64: u64 = lat_lng.to_cell(res).into();
+                                    active_map
+                                        .entry(cell_u64)
+                                        .and_modify(|acc| acc.update_weighted(val, pt.weight))
+                                        .or_insert_with(|| {
+                                            let south_lat = compute_cell_south_lat(cell_u64);
+                                            eviction_queue.push(HexEvictionEntry {
+                                                south_lat,
+                                                cell_u64,
                                             });
-                                    }
+                                            H3Accumulator::new_weighted(val, pt.weight)
+                                        });
                                 }
-                            }
-
-                            if let Ok(center_ll) = h3o::LatLng::new(center_lat, center_lon) {
-                                row_cache.update(center_ll.to_cell(res));
                             }
                         }
                     }
@@ -729,9 +708,8 @@ impl MultiCategoricalHorizonStreamer {
                 let row_idx = (chunk.row_offset + r as u32) as usize;
                 let slice_row_start = r * stride;
                 let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-                let mut row_cache = SpatialCoherenceCache::default();
-
                 if self.sampling.is_single_point() {
+                    let mut row_cache = H3ScanlineLookahead::default();
                     let mut run_cell: u64 = 0;
                     let mut run_acc = CategoricalAccumulator::default();
 
@@ -782,7 +760,7 @@ impl MultiCategoricalHorizonStreamer {
                             }
                         }
 
-                        if let Some(cell_u64) = row_cache.get_or_compute(lat, lon, res) {
+                        if let Some(cell_u64) = row_cache.get_or_compute_cell(lat, lon, res) {
                             if cell_u64 != run_cell {
                                 if run_cell != 0 && run_acc.total_count > 0.0 {
                                     active_map
@@ -799,15 +777,14 @@ impl MultiCategoricalHorizonStreamer {
                                 }
                                 run_cell = cell_u64;
                                 run_acc = CategoricalAccumulator::default();
+                                row_cache.on_cell_changed();
                             }
 
-                            let safe_span = if is_wgs84 || is_web_mercator {
-                                row_cache.safe_span_length(lon_curr, d_lon_step)
+                            let span_end = if is_wgs84 || is_web_mercator {
+                                row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, res, run_cell)
                             } else {
-                                1
+                                c + 1
                             };
-
-                            let span_end = (c + safe_span).min(row_width);
 
                             let mut curr_cat: Option<i64> = None;
                             let mut curr_cat_count = 0.0;
@@ -898,47 +875,27 @@ impl MultiCategoricalHorizonStreamer {
                                 }
                             }
 
-                            if row_cache.contains(center_lat, center_lon) {
-                                let cell_u64 = row_cache.cell_u64;
-                                active_map
-                                    .entry(cell_u64)
-                                    .and_modify(|acc| acc.update_weighted(cat, 1.0))
-                                    .or_insert_with(|| {
-                                        let south_lat = compute_cell_south_lat(cell_u64);
-                                        eviction_queue.push(HexEvictionEntry {
-                                            south_lat,
-                                            cell_u64,
-                                        });
-                                        let mut acc = CategoricalAccumulator::new();
-                                        acc.update_weighted(cat, 1.0);
-                                        acc
-                                    });
-                            } else {
-                                let col_px = (chunk.col_offset as usize) + c;
-                                for pt in &self.sampling.points {
-                                    let (px, py) = self.gt.pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
-                                    if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py) {
-                                        if let Ok(lat_lng) = h3o::LatLng::new(lat_i, lon_i) {
-                                            let cell_u64: u64 = lat_lng.to_cell(res).into();
-                                            active_map
-                                                .entry(cell_u64)
-                                                .and_modify(|acc| acc.update_weighted(cat, pt.weight))
-                                                .or_insert_with(|| {
-                                                    let south_lat = compute_cell_south_lat(cell_u64);
-                                                    eviction_queue.push(HexEvictionEntry {
-                                                        south_lat,
-                                                        cell_u64,
-                                                    });
-                                                    let mut acc = CategoricalAccumulator::new();
-                                                    acc.update_weighted(cat, pt.weight);
-                                                    acc
-                                                });
-                                        }
-                                    }
-                                }
 
-                                if let Ok(center_ll) = h3o::LatLng::new(center_lat, center_lon) {
-                                    row_cache.update(center_ll.to_cell(res));
+                            let col_px = (chunk.col_offset as usize) + c;
+                            for pt in &self.sampling.points {
+                                let (px, py) = self.gt.pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
+                                if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py) {
+                                    if let Ok(lat_lng) = h3o::LatLng::new(lat_i, lon_i) {
+                                        let cell_u64: u64 = lat_lng.to_cell(res).into();
+                                        active_map
+                                            .entry(cell_u64)
+                                            .and_modify(|acc| acc.update_weighted(cat, pt.weight))
+                                            .or_insert_with(|| {
+                                                let south_lat = compute_cell_south_lat(cell_u64);
+                                                eviction_queue.push(HexEvictionEntry {
+                                                    south_lat,
+                                                    cell_u64,
+                                                });
+                                                let mut acc = CategoricalAccumulator::new();
+                                                acc.update_weighted(cat, pt.weight);
+                                                acc
+                                            });
+                                    }
                                 }
                             }
                         }
