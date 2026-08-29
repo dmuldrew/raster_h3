@@ -444,11 +444,11 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
 
                 for (cell_u64, acc) in batch {
-                    let mut sorted_cats: Vec<_> = acc.counts.keys().copied().collect();
-                    sorted_cats.sort_unstable();
+                    let mut entries: Vec<(i64, f64)> = Vec::with_capacity(acc.unique_classes());
+                    acc.for_each_class(|cat, cnt| entries.push((cat, cnt)));
+                    entries.sort_unstable_by_key(|&(cat, _)| cat);
 
-                    for cat in sorted_cats {
-                        let cnt = acc.counts.get(&cat).copied().unwrap_or(0.0);
+                    for (cat, cnt) in entries {
                         let fraction = if acc.total_count > 0.0 {
                             cnt / acc.total_count
                         } else {

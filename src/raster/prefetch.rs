@@ -56,4 +56,19 @@ impl PrefetchedChunkReader {
     pub fn next_chunk(&self) -> Option<PrefetchItem> {
         self.receiver.recv().ok()
     }
+
+    /// Pull next batch of ready chunks (blocks on the first chunk, then non-blockingly drains up to `max_batch` available chunks)
+    pub fn next_chunk_batch(&self, max_batch: usize) -> Vec<PrefetchItem> {
+        let mut batch = Vec::with_capacity(max_batch);
+        if let Ok(first) = self.receiver.recv() {
+            batch.push(first);
+            while batch.len() < max_batch {
+                match self.receiver.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break,
+                }
+            }
+        }
+        batch
+    }
 }

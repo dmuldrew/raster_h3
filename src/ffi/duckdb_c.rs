@@ -165,6 +165,7 @@ extern "C" {
     pub fn duckdb_get_int64(val: duckdb_value) -> i64;
     pub fn duckdb_get_uint64(val: duckdb_value) -> u64;
     pub fn duckdb_get_double(val: duckdb_value) -> f64;
+    pub fn duckdb_get_bool(val: duckdb_value) -> bool;
     pub fn duckdb_free(ptr: *mut c_void);
     pub fn duckdb_destroy_value(val: *mut duckdb_value);
 

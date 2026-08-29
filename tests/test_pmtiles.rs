@@ -45,7 +45,7 @@ fn test_mvt_protobuf_encoding() {
 fn test_pmtiles_v3_header_and_archive_validation() {
     let bbox = [-122.5, 37.7, -122.3, 37.9];
     let metadata_json = r#"{"name":"test_archive","vector_layers":[{"id":"h3_hexagons"}]}"#;
-    let mut writer = PmtilesWriter::new(10, 12, bbox, metadata_json.to_string());
+    let mut writer = PmtilesWriter::new(10, 12, bbox, metadata_json.to_string()).unwrap();
 
     let uncompressed_mvt = b"mock_mvt_tile_payload_bytes_for_testing";
     writer.add_tile(10, 163, 395, uncompressed_mvt).unwrap();

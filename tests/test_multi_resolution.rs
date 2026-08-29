@@ -211,7 +211,10 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
             let multi_rec = multi_cells.get(cell_u64).unwrap();
             assert_eq!(multi_rec.accumulator.total_count, single_acc.total_count);
             assert_eq!(multi_rec.accumulator.majority(), single_acc.majority());
-            assert_eq!(multi_rec.accumulator.counts, single_acc.counts);
+            assert_eq!(multi_rec.accumulator.unique_classes(), single_acc.unique_classes());
+            single_acc.for_each_class(|cat, cnt| {
+                assert_eq!(multi_rec.accumulator.get_class_count(cat), cnt);
+            });
         }
     }
 }

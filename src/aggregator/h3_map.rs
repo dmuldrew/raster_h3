@@ -5,6 +5,7 @@ use rayon::prelude::*;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::{H3Accumulator, FastRunAccumulator};
+use crate::aggregator::categorical::CategoricalAccumulator;
 use crate::aggregator::horizon_streamer::{is_chunk_all_nodata, AggregationConfig};
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
@@ -16,6 +17,7 @@ const WGS84_A: f64 = 6378137.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
 pub type H3HashMap = HashMap<u64, H3Accumulator, FxBuildHasher>;
+pub type H3CategoricalHashMap = HashMap<u64, CategoricalAccumulator, FxBuildHasher>;
 
 /// Binary search along a scanline to find the exact column index where the H3 cell changes.
 /// This requires convexity: if `c_start` is in `target_cell`, and `c_max` is outside,
@@ -359,6 +361,419 @@ pub fn aggregate_raster_stream(
         )
         .map(|(map, _decoder)| map)
         .reduce(H3HashMap::default, |mut map_a, map_b| {
+            if map_a.len() < map_b.len() {
+                let mut merged = map_b;
+                for (k, v) in map_a {
+                    merged
+                        .entry(k)
+                        .and_modify(|acc| acc.merge(&v))
+                        .or_insert(v);
+                }
+                merged
+            } else {
+                for (k, v) in map_b {
+                    map_a
+                        .entry(k)
+                        .and_modify(|acc| acc.merge(&v))
+                        .or_insert(v);
+                }
+                map_a
+            }
+        });
+
+    Ok(aggregated_map)
+}
+
+#[inline(always)]
+fn is_chunk_zero_nodata<T, F, N>(
+    slice: &[T],
+    nodata: Option<f64>,
+    to_i64: &F,
+    native_nodata: Option<N>,
+) -> bool
+where
+    T: Copy + PartialEq,
+    F: Fn(T) -> Option<i64>,
+    N: Copy + PartialEq<T>,
+{
+    if let Some(nd) = native_nodata {
+        !slice.iter().any(|&x| nd == x)
+    } else if let Some(nd_f64) = nodata {
+        !slice.iter().any(|&x| to_i64(x).map(|v| v as f64 == nd_f64).unwrap_or(false))
+    } else {
+        true
+    }
+}
+
+#[inline(always)]
+fn flush_categorical_run(
+    run_cell: u64,
+    run_total: f64,
+    run_counts: &[(i64, f64); 4],
+    run_counts_len: usize,
+    map: &mut H3CategoricalHashMap,
+) {
+    if run_cell != 0 && run_total > 0.0 {
+        let entry = map.entry(run_cell).or_insert_with(CategoricalAccumulator::default);
+        for i in 0..run_counts_len {
+            entry.update_weighted(run_counts[i].0, run_counts[i].1);
+        }
+    }
+}
+
+#[inline(always)]
+fn accumulate_cat_in_run(
+    cat: i64,
+    run_cell: u64,
+    run_counts: &mut [(i64, f64); 4],
+    run_counts_len: &mut usize,
+    run_total: &mut f64,
+    map: &mut H3CategoricalHashMap,
+) {
+    let mut found = false;
+    for i in 0..*run_counts_len {
+        if run_counts[i].0 == cat {
+            run_counts[i].1 += 1.0;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if *run_counts_len < 4 {
+            run_counts[*run_counts_len] = (cat, 1.0);
+            *run_counts_len += 1;
+        } else {
+            let entry = map.entry(run_cell).or_insert_with(CategoricalAccumulator::default);
+            entry.update(cat);
+        }
+    }
+    *run_total += 1.0;
+}
+
+#[inline(always)]
+fn aggregate_categorical_native_slice_hoisted<T, F, N>(
+    slice: &[T],
+    chunk: &RasterChunk,
+    chunk_stride: u32,
+    gt: &GeoTransform,
+    transformer: &CrsTransformer,
+    resolution: Resolution,
+    nodata: Option<f64>,
+    config_bbox: Option<[f64; 4]>,
+    map: &mut H3CategoricalHashMap,
+    to_i64: F,
+    native_nodata: Option<N>,
+) where
+    T: Copy + PartialEq,
+    F: Fn(T) -> Option<i64>,
+    N: Copy + PartialEq<T>,
+{
+    // 1. Fast NoData early-exit across entire chunk
+    if is_chunk_all_nodata(slice, nodata, &|x| to_i64(x).map(|v| v as f64).unwrap_or(f64::NAN)) {
+        return;
+    }
+
+    let is_zero_nodata = is_chunk_zero_nodata(slice, nodata, &to_i64, native_nodata);
+
+    let is_wgs84 = matches!(transformer, CrsTransformer::Wgs84Identity);
+    let is_web_mercator = matches!(transformer, CrsTransformer::WebMercatorFast);
+    let d_lon_step = if is_wgs84 {
+        gt.a
+    } else if is_web_mercator {
+        (gt.a / WGS84_A) * RAD_TO_DEG
+    } else {
+        0.0
+    };
+
+    let stride = if chunk_stride > 0 && slice.len() >= chunk_stride as usize {
+        chunk_stride as usize
+    } else {
+        (chunk.width as usize).max(1)
+    };
+    let actual_rows = (slice.len() / stride).min(chunk.height as usize);
+
+    for r in 0..actual_rows {
+        let row_idx = (chunk.row_offset + r as u32) as usize;
+        let slice_row_start = r * stride;
+        let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
+
+        let (x_start, y_row) = gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
+
+        let (mut lon_curr, lat_row) = if is_wgs84 {
+            (x_start, y_row)
+        } else if is_web_mercator {
+            let lat = (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
+            let lon = (x_start / WGS84_A) * RAD_TO_DEG;
+            (lon, lat)
+        } else {
+            match transformer.transform_point(x_start, y_row) {
+                Ok(coords) => coords,
+                Err(_) => (x_start, y_row),
+            }
+        };
+
+        let mut run_cell: u64 = 0;
+        let mut run_counts: [(i64, f64); 4] = [(0, 0.0); 4];
+        let mut run_counts_len = 0usize;
+        let mut run_total = 0.0f64;
+        let mut current_hex_span = 0usize;
+        let mut prev_hex_width: usize = 32;
+
+        let mut c = 0;
+        while c < row_width {
+            if is_wgs84 || is_web_mercator {
+                // Pre-check bbox if configured
+                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = config_bbox {
+                    if lon_curr < b_min_lon || lon_curr > b_max_lon || lat_row < b_min_lat || lat_row > b_max_lat {
+                        c += 1;
+                        lon_curr += d_lon_step;
+                        continue;
+                    }
+                }
+
+                let cell_u64 = if let Ok(ll) = h3o::LatLng::new(lat_row, lon_curr) {
+                    ll.to_cell(resolution).into()
+                } else {
+                    c += 1;
+                    lon_curr += d_lon_step;
+                    continue;
+                };
+
+                if cell_u64 != run_cell {
+                    flush_categorical_run(run_cell, run_total, &run_counts, run_counts_len, map);
+                    run_cell = cell_u64;
+                    run_counts_len = 0;
+                    run_total = 0.0;
+                    if current_hex_span > 0 {
+                        prev_hex_width = current_hex_span;
+                    }
+                    current_hex_span = 0;
+                }
+
+                // Galloping horizontal search to find the end of this hexagon span
+                let remaining_guess = prev_hex_width.saturating_sub(current_hex_span).max(1);
+                let mut guess_c = (c + remaining_guess).min(row_width);
+                let mut guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
+
+                while guess_c < row_width {
+                    if let Ok(ll) = h3o::LatLng::new(lat_row, guess_lon) {
+                        let guess_cell: u64 = ll.to_cell(resolution).into();
+                        if guess_cell == run_cell {
+                            let step = (guess_c - c).max(1);
+                            let new_guess_c = (guess_c + step).min(row_width);
+                            if new_guess_c == guess_c { break; }
+                            guess_c = new_guess_c;
+                            guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                let span_end = find_hexagon_boundary(
+                    c + 1,
+                    guess_c,
+                    lon_curr + d_lon_step,
+                    lat_row,
+                    d_lon_step,
+                    resolution,
+                    run_cell,
+                );
+
+                // Unswitched inner accumulation over the contiguous span
+                if is_zero_nodata {
+                    for i in c..span_end {
+                        let pixel_val = slice[slice_row_start + i];
+                        if let Some(cat) = to_i64(pixel_val) {
+                            accumulate_cat_in_run(cat, run_cell, &mut run_counts, &mut run_counts_len, &mut run_total, map);
+                        }
+                    }
+                } else {
+                    for i in c..span_end {
+                        let pixel_val = slice[slice_row_start + i];
+                        let is_nd = if let Some(nd) = native_nodata {
+                            nd == pixel_val
+                        } else if let Some(nd_f64) = nodata {
+                            to_i64(pixel_val).map(|v| v as f64 == nd_f64).unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if !is_nd {
+                            if let Some(cat) = to_i64(pixel_val) {
+                                accumulate_cat_in_run(cat, run_cell, &mut run_counts, &mut run_counts_len, &mut run_total, map);
+                            }
+                        }
+                    }
+                }
+
+                let num_stepped = span_end - c;
+                current_hex_span += num_stepped;
+                lon_curr += (num_stepped as f64) * d_lon_step;
+                c = span_end;
+            } else {
+                // Non-linear projection path (e.g. Albers Equal Area)
+                let pixel_val = slice[slice_row_start + c];
+
+                if !is_zero_nodata {
+                    let is_nd = if let Some(nd) = native_nodata {
+                        nd == pixel_val
+                    } else if let Some(nd_f64) = nodata {
+                        to_i64(pixel_val).map(|v| v as f64 == nd_f64).unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if is_nd {
+                        c += 1;
+                        continue;
+                    }
+                }
+
+                let (x, y) = gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
+                let (lon, lat) = match transformer.transform_point(x, y) {
+                    Ok(coords) => coords,
+                    Err(_) => {
+                        c += 1;
+                        continue;
+                    }
+                };
+
+                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = config_bbox {
+                    if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                        c += 1;
+                        continue;
+                    }
+                }
+
+                let cell_u64 = if let Ok(ll) = h3o::LatLng::new(lat, lon) {
+                    ll.to_cell(resolution).into()
+                } else {
+                    c += 1;
+                    continue;
+                };
+
+                if cell_u64 != run_cell {
+                    flush_categorical_run(run_cell, run_total, &run_counts, run_counts_len, map);
+                    run_cell = cell_u64;
+                    run_counts_len = 0;
+                    run_total = 0.0;
+                }
+
+                if let Some(cat) = to_i64(pixel_val) {
+                    accumulate_cat_in_run(cat, run_cell, &mut run_counts, &mut run_counts_len, &mut run_total, map);
+                }
+
+                c += 1;
+            }
+        }
+
+        // Flush remaining run at end of row
+        flush_categorical_run(run_cell, run_total, &run_counts, run_counts_len, map);
+    }
+}
+
+/// Aggregate categorical GeoTIFF chunks into an H3 map using Rayon data parallelism across chunks
+pub fn aggregate_categorical_raster_stream(
+    reader: &GeoTiffStreamReader,
+    config: &AggregationConfig,
+) -> Result<H3CategoricalHashMap> {
+    let resolution = Resolution::try_from(config.resolution).map_err(|_| {
+        RasterH3Error::InvalidParameter(format!("Invalid H3 resolution: {}", config.resolution))
+    })?;
+
+    let crs_transformer = CrsTransformer::from_crs_or_epsg(
+        reader.metadata.epsg,
+        config
+            .custom_crs
+            .as_deref()
+            .or(reader.metadata.proj_string.as_deref()),
+    )?;
+
+    let nodata_val = config.custom_nodata.or(reader.metadata.nodata);
+    let bbox = config.bbox;
+    let gt = reader.metadata.geotransform;
+    let chunk_stride = reader.chunk_layout.chunk_width;
+
+    let chunk_indices: Vec<u32> = (0..reader.chunk_layout.total_chunks)
+        .filter(|&idx| {
+            if let Some(ref b) = bbox {
+                let chunk_bounds = reader.chunk_layout.get_chunk_bounds(
+                    idx,
+                    reader.metadata.width,
+                    reader.metadata.height,
+                );
+                crate::aggregator::horizon_streamer::chunk_intersects_bbox(&chunk_bounds, &gt, &crs_transformer, b)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let aggregated_map = chunk_indices
+        .into_par_iter()
+        .fold(
+            || {
+                let decoder = reader.open_decoder().ok();
+                (H3CategoricalHashMap::default(), decoder)
+            },
+            |(mut local_map, mut decoder_opt), chunk_idx| {
+                let chunk_res = if let Some(ref mut dec) = decoder_opt {
+                    dec.read_chunk(chunk_idx)
+                } else {
+                    reader.read_chunk(chunk_idx)
+                };
+
+                if let Ok((chunk_bounds, data)) = chunk_res {
+                    match data {
+                        DecodingResult::U8(slice) => {
+                            let nd = nodata_val.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x as i64), nd);
+                        }
+                        DecodingResult::U16(slice) => {
+                            let nd = nodata_val.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x as i64), nd);
+                        }
+                        DecodingResult::U32(slice) => {
+                            let nd = nodata_val.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x as i64), nd);
+                        }
+                        DecodingResult::U64(slice) => {
+                            let nd = nodata_val.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd);
+                        }
+                        DecodingResult::I8(slice) => {
+                            let nd = nodata_val.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x as i64), nd);
+                        }
+                        DecodingResult::I16(slice) => {
+                            let nd = nodata_val.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x as i64), nd);
+                        }
+                        DecodingResult::I32(slice) => {
+                            let nd = nodata_val.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x as i64), nd);
+                        }
+                        DecodingResult::I64(slice) => {
+                            let nd = nodata_val.map(|v| v as i64);
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| Some(x), nd);
+                        }
+                        DecodingResult::F32(slice) => {
+                            let nd = nodata_val.map(|v| v as f32);
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd);
+                        }
+                        DecodingResult::F64(slice) => {
+                            let nd = nodata_val;
+                            aggregate_categorical_native_slice_hoisted(&slice, &chunk_bounds, chunk_stride, &gt, &crs_transformer, resolution, nodata_val, bbox, &mut local_map, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd);
+                        }
+                    }
+                }
+
+                (local_map, decoder_opt)
+            },
+        )
+        .map(|(map, _decoder)| map)
+        .reduce(H3CategoricalHashMap::default, |mut map_a, map_b| {
             if map_a.len() < map_b.len() {
                 let mut merged = map_b;
                 for (k, v) in map_a {

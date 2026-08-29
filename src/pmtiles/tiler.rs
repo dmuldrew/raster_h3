@@ -10,9 +10,7 @@ use h3o::{CellIndex, LatLng};
 use rayon::prelude::*;
 use serde_json::json;
 
-use crate::aggregator::h3_map::{H3HashMap, aggregate_raster_stream};
-use crate::aggregator::horizon_streamer::AggregationConfig;
-use crate::aggregator::multi_horizon::{MultiContinuousRecord, MultiScanHorizonStreamer, MultiResolutionConfig};
+use crate::aggregator::multi_horizon::{MultiContinuousRecord, MultiScanHorizonStreamer, MultiCategoricalRecord, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
 use crate::functions::fast_hex::fast_hex_u64;
 use crate::pmtiles::mvt::{MvtLayer, MvtValue};
 use crate::pmtiles::writer::PmtilesWriter;
@@ -400,7 +398,7 @@ impl H3PmtilesTiler {
             max_zoom,
             [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
             metadata.to_string(),
-        );
+        )?;
 
         let total_tiles = tile_buckets.len();
         let encoded_tiles: Vec<((u8, u32, u32), Vec<u8>)> = tile_buckets
@@ -429,20 +427,21 @@ impl H3PmtilesTiler {
         output_path: P,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let resolutions = streamer.resolution_u8s().to_vec();
+        let min_res = resolutions.iter().copied().min().unwrap_or(0);
         let mut min_zoom = 255u8;
         let mut max_zoom = 0u8;
 
         for &res in &resolutions {
-            let z = h3_res_to_zoom(res);
-            if z < min_zoom {
-                min_zoom = z;
-            }
-            if z > max_zoom {
-                max_zoom = z;
+            let zooms = zooms_for_h3_res(res, min_res);
+            for &z in &zooms {
+                if z < min_zoom { min_zoom = z; }
+                if z > max_zoom { max_zoom = z; }
             }
         }
 
         let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut tile_south_lats: HashMap<(u8, u32, u32), f64, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
 
         let mut total_hexagons = 0usize;
@@ -453,6 +452,13 @@ impl H3PmtilesTiler {
 
         let mut res_stats: HashMap<u8, ResolutionAccumulatorStats, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
+
+        let mut writer = PmtilesWriter::new(
+            min_zoom,
+            max_zoom,
+            [-180.0, -90.0, 180.0, 90.0],
+            String::new(),
+        )?;
 
         loop {
             let batch = streamer.fetch_next_batch(4096);
@@ -482,7 +488,6 @@ impl H3PmtilesTiler {
                     if c_lat < global_min_lat { global_min_lat = c_lat; }
                     if c_lat > global_max_lat { global_max_lat = c_lat; }
 
-                    let zoom = h3_res_to_zoom(resolution);
                     let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
 
                     let mut hex_buf = [0u8; 16];
@@ -501,37 +506,68 @@ impl H3PmtilesTiler {
                         ("max".to_string(), MvtValue::Double(accumulator.max)),
                     ];
 
-                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
-                    for tx in min_tx..=max_tx {
-                        for ty in min_ty..=max_ty {
-                            let tile_key = (zoom, tx, ty);
-                            let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                                MvtLayer::new("h3_hexagons")
-                            });
-                            let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                    let zooms = zooms_for_h3_res(resolution, min_res);
+                    for &zoom in &zooms {
+                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+                        for tx in min_tx..=max_tx {
+                            for ty in min_ty..=max_ty {
+                                let tile_key = (zoom, tx, ty);
+                                let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                                    MvtLayer::new("h3_hexagons")
+                                });
+                                let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                                tile_south_lats.entry(tile_key).or_insert(bbox[1]);
 
-                            layer.add_hexagon(
-                                h3_index,
-                                &boundary_vertices,
-                                bbox[0],
-                                bbox[2],
-                                bbox[1],
-                                bbox[3],
-                                properties.clone(),
-                            );
+                                layer.add_hexagon(
+                                    h3_index,
+                                    &boundary_vertices,
+                                    bbox[0],
+                                    bbox[2],
+                                    bbox[1],
+                                    bbox[3],
+                                    properties.clone(),
+                                );
+                            }
                         }
                     }
 
                     total_hexagons += 1;
                 }
             }
+
+            // Evict completed tiles whose southern boundary is North of the active scanline horizon
+            let horizon = streamer.current_lat_horizon();
+            if horizon.is_finite() && !tile_buckets.is_empty() {
+                let mut completed_keys = Vec::new();
+                for (&key, &south_lat) in &tile_south_lats {
+                    if south_lat > horizon {
+                        completed_keys.push(key);
+                    }
+                }
+
+                for key in completed_keys {
+                    tile_south_lats.remove(&key);
+                    if let Some(layer) = tile_buckets.remove(&key) {
+                        let (z, x, y) = key;
+                        let pbf_bytes = layer.encode();
+                        writer.add_tile(z, x, y, &pbf_bytes)?;
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining tiles at the end of the raster
+        for (key, layer) in tile_buckets {
+            let (z, x, y) = key;
+            let pbf_bytes = layer.encode();
+            writer.add_tile(z, x, y, &pbf_bytes)?;
         }
 
         if total_hexagons == 0 {
             global_min_lon = -180.0;
-            global_min_lat = -85.0;
+            global_min_lat = -90.0;
             global_max_lon = 180.0;
-            global_max_lat = 85.0;
+            global_max_lat = 90.0;
             min_zoom = 0;
             max_zoom = 0;
         }
@@ -548,7 +584,6 @@ impl H3PmtilesTiler {
             }
         }
 
-        // Build vector layer JSON metadata for MapLibre / Web Vector Clients
         let metadata = json!({
             "name": "raster_h3_pmtiles",
             "description": "Multi-resolution H3 hexagonal vector tile pyramid generated by raster_h3",
@@ -577,64 +612,27 @@ impl H3PmtilesTiler {
             ]
         });
 
-        let mut writer = PmtilesWriter::new(
-            min_zoom,
-            max_zoom,
+        writer.set_metadata(
             [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
             metadata.to_string(),
         );
-
-        let encoded_tiles: Vec<((u8, u32, u32), Vec<u8>)> = tile_buckets
-            .into_par_iter()
-            .map(|((z, x, y), layer)| ((z, x, y), layer.encode()))
-            .collect();
-
-        for ((z, x, y), mvt_bytes) in encoded_tiles {
-            writer.add_tile(z, x, y, &mvt_bytes)?;
-        }
 
         writer.finish(output_path)?;
         Ok(total_hexagons)
     }
 
-    /// Convenience helper to run complete GeoTIFF-to-PMTiles pipeline in parallel across all CPU cores
-    pub fn process_geotiff_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
-        tiff_path: P1,
-        pmtiles_path: P2,
-        config: MultiResolutionConfig,
+    /// Stream categorical raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
+    pub fn generate_from_categorical_streamer<P: AsRef<Path>>(
+        mut streamer: MultiCategoricalHorizonStreamer,
+        output_path: P,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let reader = GeoTiffStreamReader::open(tiff_path)?;
-        let resolutions = config.resolutions.clone();
-
-        // 1. Parallel multi-resolution chunk aggregation across all CPU cores
-        let agg_configs: Vec<(u8, AggregationConfig)> = resolutions
-            .iter()
-            .map(|&res| {
-                let single_cfg = AggregationConfig {
-                    resolution: res,
-                    custom_crs: config.custom_crs.clone(),
-                    custom_nodata: config.custom_nodata,
-                    bbox: config.bbox,
-                    sampling: config.sampling.clone(),
-                };
-                (res, single_cfg)
-            })
-            .collect();
-
-        let resolution_maps: Vec<(u8, H3HashMap)> = agg_configs
-            .into_par_iter()
-            .map(|(res, cfg)| {
-                let map = aggregate_raster_stream(&reader, &cfg).unwrap_or_default();
-                (res, map)
-            })
-            .collect();
-
-        // 2. Build multi-resolution continuous tile pyramid
-        let mut min_zoom = 255u8;
-        let mut max_zoom = 0u8;
+        let resolutions = streamer.resolution_u8s().to_vec();
         let min_res = resolutions.iter().copied().min().unwrap_or(0);
 
-        for &(res, _) in &resolution_maps {
+        let mut min_zoom = 255u8;
+        let mut max_zoom = 0u8;
+
+        for &res in &resolutions {
             let zooms = zooms_for_h3_res(res, min_res);
             for &z in &zooms {
                 if z < min_zoom { min_zoom = z; }
@@ -642,17 +640,9 @@ impl H3PmtilesTiler {
             }
         }
 
-        let mut res_stats_json = serde_json::Map::new();
-        for (res, map) in &resolution_maps {
-            let zooms = zooms_for_h3_res(*res, min_res);
-            let mut st = ResolutionAccumulatorStats::new();
-            for (_idx, acc) in map {
-                st.record(acc);
-            }
-            res_stats_json.insert(res.to_string(), st.to_json(&zooms));
-        }
-
         let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut tile_south_lats: HashMap<(u8, u32, u32), f64, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
 
         let mut total_hexagons = 0usize;
@@ -661,9 +651,48 @@ impl H3PmtilesTiler {
         let mut global_max_lon = -180.0f64;
         let mut global_max_lat = -90.0f64;
 
-        for (res, map) in resolution_maps {
-            let zooms = zooms_for_h3_res(res, min_res);
-            for (h3_index, accumulator) in map {
+        let mut res_cell_counts: HashMap<u8, usize, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_purity_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_class_counts: HashMap<u8, HashMap<i64, u64, FxBuildHasher>, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_entropy_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_distinct_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_pixel_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+
+        let mut writer = PmtilesWriter::new(
+            min_zoom,
+            max_zoom,
+            [-180.0, -90.0, 180.0, 90.0],
+            String::new(),
+        )?;
+
+        loop {
+            let batch = streamer.fetch_next_batch(4096);
+            if batch.is_empty() {
+                break;
+            }
+            for record in batch {
+                let MultiCategoricalRecord {
+                    resolution,
+                    h3_index,
+                    accumulator,
+                } = record;
+
+                let (majority_class, _maj_count, majority_fraction) = accumulator.majority();
+                let entropy = accumulator.shannon_entropy();
+                let distinct_classes = accumulator.unique_classes();
+                let pixel_count = accumulator.total_count;
+
+                *res_cell_counts.entry(resolution).or_insert(0) += 1;
+                *res_purity_sums.entry(resolution).or_insert(0.0) += majority_fraction;
+                *res_entropy_sums.entry(resolution).or_insert(0.0) += entropy;
+                *res_distinct_sums.entry(resolution).or_insert(0.0) += distinct_classes as f64;
+                *res_pixel_sums.entry(resolution).or_insert(0.0) += pixel_count;
+
+                let class_map = res_class_counts.entry(resolution).or_insert_with(|| HashMap::with_hasher(FxBuildHasher::default()));
+                accumulator.for_each_class(|cls, cnt| {
+                    *class_map.entry(cls).or_insert(0) += cnt as u64;
+                });
+
                 if let Ok(cell) = CellIndex::try_from(h3_index) {
                     let center: LatLng = cell.into();
                     let c_lat = center.lat();
@@ -680,6 +709,18 @@ impl H3PmtilesTiler {
                     let hex_bytes = fast_hex_u64(h3_index, &mut hex_buf);
                     let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("").to_string();
 
+                    let properties = vec![
+                        ("h3_index".to_string(), MvtValue::UInt(h3_index)),
+                        ("h3_hex".to_string(), MvtValue::String(hex_str)),
+                        ("resolution".to_string(), MvtValue::UInt(resolution as u64)),
+                        ("majority".to_string(), MvtValue::Int(majority_class)),
+                        ("majority_fraction".to_string(), MvtValue::Double(majority_fraction)),
+                        ("distinct_classes".to_string(), MvtValue::UInt(distinct_classes as u64)),
+                        ("entropy".to_string(), MvtValue::Double(entropy)),
+                        ("count".to_string(), MvtValue::Double(pixel_count)),
+                    ];
+
+                    let zooms = zooms_for_h3_res(resolution, min_res);
                     for &zoom in &zooms {
                         let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
                         for tx in min_tx..=max_tx {
@@ -688,20 +729,8 @@ impl H3PmtilesTiler {
                                 let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
                                     MvtLayer::new("h3_hexagons")
                                 });
-
                                 let bbox = tile_xy_to_bbox(zoom, tx, ty);
-
-                                let properties = vec![
-                                    ("h3_index".to_string(), MvtValue::UInt(h3_index)),
-                                    ("h3_hex".to_string(), MvtValue::String(hex_str.clone())),
-                                    ("resolution".to_string(), MvtValue::UInt(res as u64)),
-                                    ("mean".to_string(), MvtValue::Double(accumulator.mean())),
-                                    ("sum".to_string(), MvtValue::Double(accumulator.sum)),
-                                    ("stddev".to_string(), MvtValue::Double(accumulator.stddev())),
-                                    ("count".to_string(), MvtValue::Double(accumulator.count)),
-                                    ("min".to_string(), MvtValue::Double(accumulator.min)),
-                                    ("max".to_string(), MvtValue::Double(accumulator.max)),
-                                ];
+                                tile_south_lats.entry(tile_key).or_insert(bbox[1]);
 
                                 layer.add_hexagon(
                                     h3_index,
@@ -710,7 +739,7 @@ impl H3PmtilesTiler {
                                     bbox[2],
                                     bbox[1],
                                     bbox[3],
-                                    properties,
+                                    properties.clone(),
                                 );
                             }
                         }
@@ -719,6 +748,33 @@ impl H3PmtilesTiler {
                     total_hexagons += 1;
                 }
             }
+
+            // Evict completed tiles whose southern boundary is North of the active scanline horizon
+            let horizon = streamer.current_lat_horizon();
+            if horizon.is_finite() && !tile_buckets.is_empty() {
+                let mut completed_keys = Vec::new();
+                for (&key, &south_lat) in &tile_south_lats {
+                    if south_lat > horizon {
+                        completed_keys.push(key);
+                    }
+                }
+
+                for key in completed_keys {
+                    tile_south_lats.remove(&key);
+                    if let Some(layer) = tile_buckets.remove(&key) {
+                        let (z, x, y) = key;
+                        let pbf_bytes = layer.encode();
+                        writer.add_tile(z, x, y, &pbf_bytes)?;
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining tiles at the end of the raster
+        for (key, layer) in tile_buckets {
+            let (z, x, y) = key;
+            let pbf_bytes = layer.encode();
+            writer.add_tile(z, x, y, &pbf_bytes)?;
         }
 
         if total_hexagons == 0 {
@@ -726,18 +782,57 @@ impl H3PmtilesTiler {
             global_min_lat = -90.0;
             global_max_lon = 180.0;
             global_max_lat = 90.0;
-            if min_zoom == 255 {
-                min_zoom = 0;
-                max_zoom = 0;
-            }
+            min_zoom = 0;
+            max_zoom = 0;
         }
 
+        let mut sorted_res: Vec<u8> = res_cell_counts.keys().copied().collect();
+        sorted_res.sort_unstable();
+        let min_res_val = sorted_res.first().copied().unwrap_or(0);
+
+        let mut res_stats_json = serde_json::Map::new();
+        for res in sorted_res {
+            let zooms = zooms_for_h3_res(res, min_res_val);
+            let cell_count = res_cell_counts.get(&res).copied().unwrap_or(0);
+            let purity_sum = res_purity_sums.get(&res).copied().unwrap_or(0.0);
+            let entropy_sum = res_entropy_sums.get(&res).copied().unwrap_or(0.0);
+            let distinct_sum = res_distinct_sums.get(&res).copied().unwrap_or(0.0);
+            let pixel_sum = res_pixel_sums.get(&res).copied().unwrap_or(0.0);
+
+            let avg_purity = if cell_count > 0 { purity_sum / cell_count as f64 } else { 0.0 };
+            let avg_entropy = if cell_count > 0 { entropy_sum / cell_count as f64 } else { 0.0 };
+            let avg_distinct = if cell_count > 0 { distinct_sum / cell_count as f64 } else { 0.0 };
+            let avg_pixels = if cell_count > 0 { pixel_sum / cell_count as f64 } else { 0.0 };
+
+            let mut class_freq_json = serde_json::Map::new();
+            if let Some(cmap) = res_class_counts.get(&res) {
+                let mut sorted_classes: Vec<(&i64, &u64)> = cmap.iter().collect();
+                sorted_classes.sort_by(|a, b| b.1.cmp(a.1));
+                for (cls, cnt) in sorted_classes.into_iter().take(20) {
+                    class_freq_json.insert(cls.to_string(), json!(cnt));
+                }
+            }
+
+            let stat_entry = json!({
+                "zooms": zooms,
+                "cell_count": cell_count,
+                "avg_purity": avg_purity,
+                "entropy": { "avg": avg_entropy },
+                "distinct_classes": { "avg": avg_distinct },
+                "count": { "avg": avg_pixels },
+                "class_frequencies": class_freq_json
+            });
+            res_stats_json.insert(res.to_string(), stat_entry);
+        }
+
+        // Build vector layer JSON metadata for MapLibre / Web Vector Clients
         let metadata = json!({
-            "name": "raster_h3_pmtiles",
+            "name": "raster_h3_categorical_pmtiles",
             "format": "pbf",
             "type": "overlay",
-            "description": "Multi-resolution H3 hexagonal vector tile pyramid generated by raster_h3",
-            "version": "2",
+            "description": "Multi-resolution H3 categorical vector tile pyramid generated by raster_h3",
+            "version": "3",
+            "dataset_type": "categorical",
             "minzoom": min_zoom,
             "maxzoom": max_zoom,
             "h3_resolution_stats": res_stats_json,
@@ -751,58 +846,45 @@ impl H3PmtilesTiler {
                         "h3_index": "Number",
                         "h3_hex": "String",
                         "resolution": "Number",
-                        "mean": "Number",
-                        "sum": "Number",
-                        "stddev": "Number",
-                        "count": "Number",
-                        "min": "Number",
-                        "max": "Number"
+                        "majority": "Number",
+                        "majority_fraction": "Number",
+                        "distinct_classes": "Number",
+                        "entropy": "Number",
+                        "count": "Number"
                     }
                 }
-            ],
-            "tilestats": {
-                "layerCount": 1,
-                "layers": [
-                    {
-                        "layer": "h3_hexagons",
-                        "count": total_hexagons,
-                        "geometry": "Polygon",
-                        "attributeCount": 9,
-                        "attributes": [
-                            { "attribute": "mean", "type": "number" },
-                            { "attribute": "sum", "type": "number" },
-                            { "attribute": "max", "type": "number" },
-                            { "attribute": "min", "type": "number" },
-                            { "attribute": "count", "type": "number" },
-                            { "attribute": "stddev", "type": "number" },
-                            { "attribute": "resolution", "type": "number" },
-                            { "attribute": "h3_hex", "type": "string" },
-                            { "attribute": "h3_index", "type": "number" }
-                        ]
-                    }
-                ]
-            }
+            ]
         });
 
-        let mut writer = PmtilesWriter::new(
-            min_zoom,
-            max_zoom,
+        writer.set_metadata(
             [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
             metadata.to_string(),
         );
 
-        // 3. Parallel Rayon MVT Protobuf compression across all CPU cores
-        let encoded_tiles: Vec<((u8, u32, u32), Vec<u8>)> = tile_buckets
-            .into_par_iter()
-            .map(|((z, x, y), layer)| ((z, x, y), layer.encode()))
-            .collect();
-
-        for ((z, x, y), mvt_bytes) in encoded_tiles {
-            writer.add_tile(z, x, y, &mvt_bytes)?;
-        }
-
-        writer.finish(pmtiles_path)?;
+        writer.finish(output_path)?;
         Ok(total_hexagons)
+    }
+
+    /// Convenience helper to run categorical GeoTIFF-to-PMTiles pipeline in single-pass streaming mode
+    pub fn process_categorical_geotiff_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
+        tiff_path: P1,
+        pmtiles_path: P2,
+        config: MultiResolutionConfig,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let reader = GeoTiffStreamReader::open(tiff_path)?;
+        let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
+        Self::generate_from_categorical_streamer(streamer, pmtiles_path)
+    }
+
+    /// Convenience helper to run continuous GeoTIFF-to-PMTiles pipeline in single-pass streaming mode
+    pub fn process_geotiff_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
+        tiff_path: P1,
+        pmtiles_path: P2,
+        config: MultiResolutionConfig,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let reader = GeoTiffStreamReader::open(tiff_path)?;
+        let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
+        Self::generate_from_continuous_streamer(streamer, pmtiles_path)
     }
 
     /// Convert any H3-indexed Parquet file directly into a PMTiles v3 archive

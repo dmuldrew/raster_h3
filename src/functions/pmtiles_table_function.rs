@@ -22,6 +22,7 @@ pub struct PmtilesBindData {
     pub band: usize,
     pub custom_nodata: Option<f64>,
     pub sampling: SamplingPattern,
+    pub is_categorical: bool,
 }
 
 /// Global execution state for the single-row generator
@@ -76,6 +77,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
     let mut band = 1usize;
     let mut custom_nodata = None;
     let mut sampling = SamplingPattern::center();
+    let mut is_categorical = false;
 
     // Named parameter: resolution (BIGINT)
     let name_res = to_c_string("resolution");
@@ -124,6 +126,13 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
     let val_nodata = duckdb_bind_get_named_parameter(info, name_nodata.as_ptr());
     if !val_nodata.is_null() {
         custom_nodata = Some(duckdb_get_double(val_nodata));
+    }
+
+    // Named parameter: categorical (BOOLEAN)
+    let name_cat = to_c_string("categorical");
+    let val_cat = duckdb_bind_get_named_parameter(info, name_cat.as_ptr());
+    if !val_cat.is_null() {
+        is_categorical = duckdb_get_bool(val_cat);
     }
 
     // Declare output columns:
@@ -176,6 +185,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
         band,
         custom_nodata,
         sampling,
+        is_categorical,
     });
     duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_bind_data));
 }
@@ -204,11 +214,19 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
     config.sampling = bind_data.sampling.clone();
 
     let start = Instant::now();
-    let result = H3PmtilesTiler::process_geotiff_to_pmtiles(
-        &bind_data.file_path,
-        &bind_data.output_pmtiles,
-        config,
-    );
+    let result = if bind_data.is_categorical {
+        H3PmtilesTiler::process_categorical_geotiff_to_pmtiles(
+            &bind_data.file_path,
+            &bind_data.output_pmtiles,
+            config,
+        )
+    } else {
+        H3PmtilesTiler::process_geotiff_to_pmtiles(
+            &bind_data.file_path,
+            &bind_data.output_pmtiles,
+            config,
+        )
+    };
     let elapsed = start.elapsed();
 
     let (total_hexagons, size_bytes, status) = match result {
@@ -507,6 +525,11 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
     let type_double = duckdb_create_logical_type(DuckDBType::Double);
     duckdb_table_function_add_named_parameter(tf, name_nodata.as_ptr(), type_double);
 
+    // categorical (BOOLEAN)
+    let name_cat = to_c_string("categorical");
+    let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
+    duckdb_table_function_add_named_parameter(tf, name_cat.as_ptr(), type_bool);
+
     // Set callbacks
     duckdb_table_function_set_bind(tf, pmtiles_bind);
     duckdb_table_function_set_init(tf, pmtiles_init);
@@ -515,6 +538,8 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
     let state = duckdb_register_table_function(con, tf);
 
     // Cleanup types
+    let mut type_bool_mut = type_bool;
+    duckdb_destroy_logical_type(&mut type_bool_mut);
     let mut type_varchar_mut = type_varchar;
     duckdb_destroy_logical_type(&mut type_varchar_mut);
     let mut type_bigint_mut = type_bigint;

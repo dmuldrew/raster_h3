@@ -157,9 +157,20 @@ fn encode_directory(entries: &[Entry]) -> io::Result<Vec<u8>> {
     gzip_compress(&uncompressed)
 }
 
-/// PMTiles v3 Archive Builder
+use std::io::{Read, Seek, SeekFrom};
+
+#[derive(Debug, Clone, Copy)]
+struct SpillTileEntry {
+    tile_id: u64,
+    spill_offset: u64,
+    length: u32,
+}
+
+/// PMTiles v3 Streaming Archive Builder with Disk-Spill Storage
 pub struct PmtilesWriter {
-    tiles: Vec<TilePayload>,
+    spill_file: File,
+    entries: Vec<SpillTileEntry>,
+    current_spill_offset: u64,
     min_zoom: u8,
     max_zoom: u8,
     min_lon: f64,
@@ -170,10 +181,13 @@ pub struct PmtilesWriter {
 }
 
 impl PmtilesWriter {
-    /// Create a new PMTiles v3 archive builder
-    pub fn new(min_zoom: u8, max_zoom: u8, bbox: [f64; 4], metadata_json: String) -> Self {
-        Self {
-            tiles: Vec::new(),
+    /// Create a new PMTiles v3 streaming archive builder with disk spill storage
+    pub fn new(min_zoom: u8, max_zoom: u8, bbox: [f64; 4], metadata_json: String) -> io::Result<Self> {
+        let spill_file = tempfile::tempfile()?;
+        Ok(Self {
+            spill_file,
+            entries: Vec::new(),
+            current_spill_offset: 0,
             min_zoom,
             max_zoom,
             min_lon: bbox[0],
@@ -181,43 +195,55 @@ impl PmtilesWriter {
             max_lon: bbox[2],
             max_lat: bbox[3],
             metadata_json,
-        }
+        })
     }
 
-    /// Add a tile payload (automatically gzip compresses uncompressed MVT bytes)
+    /// Update bounding box and metadata JSON before finalizing
+    pub fn set_metadata(&mut self, bbox: [f64; 4], metadata_json: String) {
+        self.min_lon = bbox[0];
+        self.min_lat = bbox[1];
+        self.max_lon = bbox[2];
+        self.max_lat = bbox[3];
+        self.metadata_json = metadata_json;
+    }
+
+    /// Add a tile payload (automatically gzip compresses uncompressed MVT bytes and spills to disk)
     pub fn add_tile(&mut self, z: u8, x: u32, y: u32, uncompressed_mvt: &[u8]) -> io::Result<()> {
         let compressed = gzip_compress(uncompressed_mvt)?;
+        let len = compressed.len() as u32;
         let tile_id = zxy_to_tile_id(z, x, y);
-        self.tiles.push(TilePayload {
+        self.spill_file.write_all(&compressed)?;
+        self.entries.push(SpillTileEntry {
             tile_id,
-            z,
-            x,
-            y,
-            data: compressed,
+            spill_offset: self.current_spill_offset,
+            length: len,
         });
+        self.current_spill_offset += len as u64;
         Ok(())
     }
 
     /// Finalize and write the complete PMTiles v3 single-file archive to disk
     pub fn finish<P: AsRef<Path>>(mut self, path: P) -> io::Result<()> {
-        // Sort tiles by canonical Hilbert Tile ID
-        self.tiles.sort_by_key(|t| t.tile_id);
+        self.spill_file.flush()?;
 
-        let mut entries: Vec<Entry> = Vec::with_capacity(self.tiles.len());
-        let mut current_offset = 0u64;
+        // Sort entries by canonical Hilbert Tile ID
+        self.entries.sort_by_key(|e| e.tile_id);
 
-        for t in &self.tiles {
-            entries.push(Entry {
-                tile_id: t.tile_id,
-                offset: current_offset,
-                length: t.data.len() as u32,
+        let mut directory_entries: Vec<Entry> = Vec::with_capacity(self.entries.len());
+        let mut final_tile_offset = 0u64;
+
+        for e in &self.entries {
+            directory_entries.push(Entry {
+                tile_id: e.tile_id,
+                offset: final_tile_offset,
+                length: e.length,
                 run_length: 1,
             });
-            current_offset += t.data.len() as u64;
+            final_tile_offset += e.length as u64;
         }
 
         // Compress root directory
-        let root_dir_bytes = encode_directory(&entries)?;
+        let root_dir_bytes = encode_directory(&directory_entries)?;
         // Compress JSON metadata
         let metadata_bytes = gzip_compress(self.metadata_json.as_bytes())?;
 
@@ -230,16 +256,15 @@ impl PmtilesWriter {
 
         // Even with no leaf directories, the offset must be a valid non-zero
         // position (right after metadata) per the PMTiles v3 spec.
-        // See: go-pmtiles/examples/minimal.go
         let leaf_dirs_offset = json_metadata_offset + json_metadata_length;
         let leaf_dirs_length = 0u64;
 
         let tile_data_offset = leaf_dirs_offset;
-        let tile_data_length = current_offset;
+        let tile_data_length = final_tile_offset;
 
-        let addressed_tiles_count = self.tiles.len() as u64;
-        let tile_entries_count = entries.len() as u64;
-        let tile_contents_count = self.tiles.len() as u64;
+        let addressed_tiles_count = self.entries.len() as u64;
+        let tile_entries_count = directory_entries.len() as u64;
+        let tile_contents_count = self.entries.len() as u64;
 
         let center_zoom = (self.min_zoom + self.max_zoom) / 2;
         let center_lon = (self.min_lon + self.max_lon) / 2.0;
@@ -287,8 +312,17 @@ impl PmtilesWriter {
         file.write_all(&root_dir_bytes)?;
         file.write_all(&metadata_bytes)?;
 
-        for t in self.tiles {
-            file.write_all(&t.data)?;
+        // Stream tile data from spill_file to out_file in sorted Hilbert order
+        let mut read_buf = vec![0u8; 64 * 1024];
+        for e in &self.entries {
+            self.spill_file.seek(SeekFrom::Start(e.spill_offset))?;
+            let mut remaining = e.length as usize;
+            while remaining > 0 {
+                let to_read = remaining.min(read_buf.len());
+                self.spill_file.read_exact(&mut read_buf[..to_read])?;
+                file.write_all(&read_buf[..to_read])?;
+                remaining -= to_read;
+            }
         }
 
         file.flush()?;
