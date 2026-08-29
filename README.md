@@ -668,6 +668,34 @@ map.on('load', () => {
 
 ---
 
+### Parquet PMTiles v3 Export: `h3_parquet_to_pmtiles(parquet_path, output_pmtiles, ...)`
+
+Convert any H3-indexed Parquet dataset directly into an optimized PMTiles v3 vector archive from SQL.
+
+```sql
+SELECT * FROM h3_parquet_to_pmtiles(
+    'census_h3.parquet',
+    'census_h3.pmtiles',
+    h3_column := 'h3_index'
+);
+```
+
+#### Positional Parameters
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :---: | :--- | :--- |
+| `parquet_path` | `VARCHAR` | **Yes** | — | Input Parquet file path containing H3 indices and properties. |
+| `output_pmtiles` | `VARCHAR` | **Yes** | — | Destination path for the single-file `.pmtiles` archive. |
+
+#### Named Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `h3_column` | `VARCHAR` | `None` (auto-detect) | Name of the H3 index column (supports BIGINT/UBIGINT integer or hex VARCHAR). Alias: `h3_col`. |
+
+#### Output Schema (1 Summary Row)
+Returns the same 7-column summary schema as `h3_raster_to_pmtiles` (`total_hexagons`, `pmtiles_size_bytes`, `min_zoom`, `max_zoom`, `elapsed_ms`, `output_path`, `status`).
+
+---
+
 ### Scalar Helper Functions
 
 | Function | Signature | Return Type | Description |

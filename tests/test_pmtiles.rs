@@ -270,3 +270,51 @@ fn test_parquet_to_pmtiles_end_to_end() {
     assert_eq!(&header[0..7], b"PMTiles");
     assert_eq!(header[7], 3);
 }
+
+#[test]
+fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
+    use parquet::schema::parser::parse_message_type;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use std::sync::Arc;
+
+    let parquet_tmp = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_tmp.path().to_str().unwrap().to_string();
+
+    let message_type = "
+        message schema {
+            REQUIRED BYTE_ARRAY custom_hex_id (UTF8);
+            REQUIRED DOUBLE metric;
+        }
+    ";
+    let schema = Arc::new(parse_message_type(message_type).unwrap());
+    let props = Arc::new(WriterProperties::builder().build());
+    let file = File::create(&parquet_path).unwrap();
+    let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+    let mut row_group = writer.next_row_group().unwrap();
+
+    // Write column 0 (custom_hex_id as hex string)
+    let mut col_writer = row_group.next_column().unwrap().unwrap();
+    let val1 = parquet::data_type::ByteArray::from("8828308281fffff");
+    let val2 = parquet::data_type::ByteArray::from("8828308283fffff");
+    col_writer.typed::<parquet::data_type::ByteArrayType>().write_batch(&[val1, val2], None, None).unwrap();
+    col_writer.close().unwrap();
+
+    // Write column 1 (metric)
+    let mut col_writer = row_group.next_column().unwrap().unwrap();
+    col_writer.typed::<parquet::data_type::DoubleType>().write_batch(&[99.5, 42.1], None, None).unwrap();
+    col_writer.close().unwrap();
+
+    row_group.close().unwrap();
+    writer.close().unwrap();
+
+    let pmtiles_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
+
+    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, Some("custom_hex_id")).unwrap();
+    assert_eq!(summary.total_features, 2);
+    assert_eq!(summary.valid_features, 2);
+    assert_eq!(summary.invalid_features_dropped, 0);
+    assert!(summary.total_tiles > 0);
+}
+
