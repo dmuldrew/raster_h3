@@ -517,6 +517,18 @@ map.on('load', () => {
 
 ---
 
+### Lightweight Web Viewer (`pmtiles_viewer`)
+
+`raster_h3` includes a dedicated, lightweight browser-based PMTiles viewer in `pmtiles_viewer/` for inspecting and visualizing generated H3 vector pyramids with zero build steps or external dependencies:
+
+```bash
+# Launch local PMTiles server with HTTP byte-range support
+python3 pmtiles_viewer/server.py 8080
+```
+Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-line colormap selection, 3D hexagon extrusion, value filtering, and interactive property inspection.
+
+---
+
 ## 10. Architectural Comparison with Other Approaches
 
 ### Structural Trade-Off Matrix

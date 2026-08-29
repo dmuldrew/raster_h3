@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lightweight Static Server with HTTP Range Requests and CORS support for PMTiles.
+Lightweight Static HTTP Server with HTTP Range Requests and CORS support for PMTiles.
 """
 import os
 import re
@@ -59,10 +59,10 @@ class PMTilesHTTPRequestHandler(SimpleHTTPRequestHandler):
 
 def run(port=8080):
     server = HTTPServer(('0.0.0.0', port), PMTilesHTTPRequestHandler)
-    print(f"================================================================")
-    print(f"🚀 PMTiles HTTP Server running at: http://localhost:{port}/viewer/kepler_pmtiles.html")
-    print(f"   (HTTP Byte-Range & CORS enabled)")
-    print(f"================================================================")
+    print("================================================================")
+    print(f"🚀 PMTiles Hexagon Viewer running at: http://localhost:{port}/pmtiles_viewer/")
+    print("   (HTTP Byte-Range & CORS enabled)")
+    print("================================================================")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Kepler.gl PMTiles Studio — Multi-Resolution H3 Hexagons</title>
+  <title>PMTiles Hexagon Studio — Multi-Resolution H3 Pyramids</title>
   <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,19 +12,19 @@
   <script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
   <style>
     :root {
-      --kepler-bg: #1c1f24;
-      --kepler-panel: rgba(29, 32, 40, 0.94);
-      --kepler-panel-border: rgba(255, 255, 255, 0.08);
-      --kepler-card: #29323c;
-      --kepler-card-hover: #333f4d;
-      --kepler-accent: #1fbdbd;
-      --kepler-accent-hover: #26e6e6;
-      --kepler-accent-glow: rgba(31, 189, 189, 0.35);
-      --kepler-text: #ffffff;
-      --kepler-text-muted: #a0a7b4;
-      --kepler-text-dim: #6a7485;
-      --kepler-danger: #f25c54;
-      --kepler-border-radius: 8px;
+      --theme-bg: #1c1f24;
+      --theme-panel: rgba(29, 32, 40, 0.94);
+      --theme-panel-border: rgba(255, 255, 255, 0.08);
+      --theme-card: #29323c;
+      --theme-card-hover: #333f4d;
+      --theme-accent: #1fbdbd;
+      --theme-accent-hover: #26e6e6;
+      --theme-accent-glow: rgba(31, 189, 189, 0.35);
+      --theme-text: #ffffff;
+      --theme-text-muted: #a0a7b4;
+      --theme-text-dim: #6a7485;
+      --theme-danger: #f25c54;
+      --theme-border-radius: 8px;
     }
 
     * { box-sizing: border-box; }
@@ -32,8 +32,8 @@
       margin: 0;
       padding: 0;
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-      background: var(--kepler-bg);
-      color: var(--kepler-text);
+      background: var(--theme-bg);
+      color: var(--theme-text);
       overflow: hidden;
     }
 
@@ -47,42 +47,92 @@
       height: 100%;
     }
 
-    /* Kepler Left Floating Workspace */
-    .kepler-sidebar {
+    /* Left Floating Workspace */
+    .viewer-sidebar {
       position: absolute;
       top: 16px;
       left: 16px;
       width: 380px;
       max-height: calc(100vh - 32px);
-      background: var(--kepler-panel);
+      background: var(--theme-panel);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
-      border: 1px solid var(--kepler-panel-border);
+      border: 1px solid var(--theme-panel-border);
       border-radius: 12px;
       box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.04);
       z-index: 20;
       display: flex;
       flex-direction: column;
       overflow: hidden;
-      transition: all 0.25s ease;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
-    .kepler-header {
-      padding: 16px 20px;
+    .viewer-sidebar.collapsed {
+      width: 44px;
+      max-height: 44px;
+      border-radius: 22px;
+      cursor: pointer;
+      overflow: hidden;
+    }
+
+    .viewer-sidebar.collapsed .viewer-header,
+    .viewer-sidebar.collapsed .viewer-tabs,
+    .viewer-sidebar.collapsed .viewer-content {
+      display: none;
+    }
+
+    .viewer-sidebar.collapsed .sidebar-expand-btn {
+      display: flex;
+    }
+
+    .sidebar-expand-btn {
+      display: none;
+      width: 44px;
+      height: 44px;
+      align-items: center;
+      justify-content: center;
+      color: var(--theme-accent);
+      cursor: pointer;
+      font-size: 16px;
+    }
+
+    .sidebar-collapse-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--theme-panel-border);
+      border-radius: 6px;
+      color: var(--theme-text-muted);
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.15s ease;
+    }
+
+    .sidebar-collapse-btn:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: var(--theme-text);
+      border-color: var(--theme-accent);
+    }
+
+    .viewer-header {
+      padding: 14px 18px;
       background: rgba(0, 0, 0, 0.25);
-      border-bottom: 1px solid var(--kepler-panel-border);
+      border-bottom: 1px solid var(--theme-panel-border);
       display: flex;
       align-items: center;
       justify-content: space-between;
     }
 
-    .kepler-brand {
+    .viewer-brand {
       display: flex;
       align-items: center;
       gap: 10px;
     }
 
-    .kepler-logo-sq {
+    .viewer-logo-sq {
       width: 28px;
       height: 28px;
       background: linear-gradient(135deg, #1fbdbd, #248bf5);
@@ -91,49 +141,49 @@
       align-items: center;
       justify-content: center;
       font-weight: 900;
-      font-size: 14px;
+      font-size: 16px;
       color: #fff;
-      box-shadow: 0 0 14px var(--kepler-accent-glow);
+      box-shadow: 0 0 14px var(--theme-accent-glow);
     }
 
-    .kepler-title {
+    .viewer-title {
       font-size: 14px;
       font-weight: 700;
       letter-spacing: -0.2px;
     }
 
-    .kepler-sub {
+    .viewer-sub {
       font-size: 11px;
-      color: var(--kepler-text-muted);
+      color: var(--theme-text-muted);
       font-weight: 400;
     }
 
     /* Tabs */
-    .kepler-tabs {
+    .viewer-tabs {
       display: flex;
-      border-bottom: 1px solid var(--kepler-panel-border);
+      border-bottom: 1px solid var(--theme-panel-border);
       background: rgba(0, 0, 0, 0.15);
     }
 
-    .kepler-tab {
+    .viewer-tab {
       flex: 1;
       padding: 10px 0;
       text-align: center;
       font-size: 12px;
       font-weight: 600;
-      color: var(--kepler-text-muted);
+      color: var(--theme-text-muted);
       cursor: pointer;
       border-bottom: 2px solid transparent;
       transition: all 0.2s;
     }
 
-    .kepler-tab.active {
-      color: var(--kepler-accent);
-      border-bottom-color: var(--kepler-accent);
+    .viewer-tab.active {
+      color: var(--theme-accent);
+      border-bottom-color: var(--theme-accent);
       background: rgba(31, 189, 189, 0.05);
     }
 
-    .kepler-content {
+    .viewer-content {
       padding: 18px 20px;
       overflow-y: auto;
       display: flex;
@@ -149,120 +199,129 @@
     }
 
     .control-head {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--kepler-text-muted);
       display: flex;
       justify-content: space-between;
       align-items: center;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--theme-text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
     }
 
     .control-badge {
       font-family: 'JetBrains Mono', monospace;
-      color: var(--kepler-accent);
       font-size: 11px;
+      color: var(--theme-accent);
+      background: rgba(31, 189, 189, 0.12);
+      padding: 2px 6px;
+      border-radius: 4px;
     }
 
     select, input[type="text"] {
       width: 100%;
-      background: var(--kepler-card);
-      border: 1px solid var(--kepler-panel-border);
-      border-radius: var(--kepler-border-radius);
+      background: var(--theme-card);
+      border: 1px solid var(--theme-panel-border);
+      border-radius: var(--theme-border-radius);
       padding: 9px 12px;
-      color: var(--kepler-text);
-      font-size: 12.5px;
+      color: var(--theme-text);
+      font-size: 13px;
+      font-family: inherit;
       outline: none;
-      transition: all 0.2s;
+      transition: border 0.2s;
     }
 
     select:focus, input[type="text"]:focus {
-      border-color: var(--kepler-accent);
-      box-shadow: 0 0 0 2px var(--kepler-accent-glow);
+      border-color: var(--theme-accent);
+      box-shadow: 0 0 0 2px var(--theme-accent-glow);
     }
 
+    /* Range Sliders */
     input[type="range"] {
       -webkit-appearance: none;
+      appearance: none;
       width: 100%;
-      background: rgba(255, 255, 255, 0.12);
       height: 4px;
       border-radius: 2px;
+      background: rgba(255, 255, 255, 0.12);
       outline: none;
     }
 
     input[type="range"]::-webkit-slider-thumb {
       -webkit-appearance: none;
-      width: 15px;
-      height: 15px;
+      appearance: none;
+      width: 14px;
+      height: 14px;
       border-radius: 50%;
-      background: var(--kepler-accent);
+      background: var(--theme-accent);
       cursor: pointer;
-      box-shadow: 0 0 10px var(--kepler-accent-glow);
+      box-shadow: 0 0 10px var(--theme-accent-glow);
+      transition: transform 0.1s;
+    }
+
+    input[type="range"]::-webkit-slider-thumb:hover {
+      transform: scale(1.25);
     }
 
     /* Palette selection gallery */
     .palette-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(2, 1fr);
       gap: 8px;
-      max-height: 240px;
+      max-height: 380px;
       overflow-y: auto;
       padding-right: 4px;
     }
 
     .palette-card {
-      background: var(--kepler-card);
-      border: 1px solid var(--kepler-panel-border);
-      border-radius: 6px;
+      background: var(--theme-card);
+      border: 1px solid var(--theme-panel-border);
+      border-radius: var(--theme-border-radius);
       padding: 8px;
       cursor: pointer;
-      transition: all 0.15s ease;
       display: flex;
       flex-direction: column;
-      gap: 5px;
+      gap: 6px;
+      transition: all 0.15s ease;
     }
 
     .palette-card:hover {
-      background: var(--kepler-card-hover);
+      background: var(--theme-card-hover);
       border-color: rgba(255, 255, 255, 0.2);
     }
 
     .palette-card.selected {
-      border-color: var(--kepler-accent);
-      background: rgba(31, 189, 189, 0.12);
-      box-shadow: 0 0 8px var(--kepler-accent-glow);
+      border-color: var(--theme-accent);
+      background: rgba(31, 189, 189, 0.1);
+      box-shadow: 0 0 12px var(--theme-accent-glow);
     }
 
     .palette-name {
       font-size: 11px;
       font-weight: 600;
-      color: var(--kepler-text);
+      color: var(--theme-text);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
     .palette-strip {
-      height: 10px;
-      border-radius: 3px;
+      height: 8px;
+      border-radius: 4px;
       width: 100%;
     }
 
     /* Toggle switches */
-    .kepler-toggle {
+    .viewer-toggle {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 12px;
-      background: var(--kepler-card);
-      border-radius: var(--kepler-border-radius);
-      border: 1px solid var(--kepler-panel-border);
+      padding: 4px 0;
     }
 
-    .kepler-toggle-title {
-      font-size: 12px;
-      font-weight: 500;
+    .viewer-toggle-title {
+      font-size: 13px;
+      color: var(--theme-text);
     }
 
     .switch {
@@ -278,7 +337,8 @@
       position: absolute;
       cursor: pointer;
       top: 0; left: 0; right: 0; bottom: 0;
-      background-color: rgba(255, 255, 255, 0.16);
+      background-color: var(--theme-card);
+      border: 1px solid var(--theme-panel-border);
       transition: .2s;
       border-radius: 20px;
     }
@@ -288,32 +348,122 @@
       content: "";
       height: 14px;
       width: 14px;
-      left: 3px;
-      bottom: 3px;
-      background-color: white;
+      left: 2px;
+      bottom: 2px;
+      background-color: var(--theme-text-muted);
       transition: .2s;
       border-radius: 50%;
     }
 
-    input:checked + .slider { background-color: var(--kepler-accent); }
-    input:checked + .slider:before { transform: translateX(16px); }
+    input:checked + .slider {
+      background-color: var(--theme-accent);
+      border-color: var(--theme-accent);
+    }
 
-    /* Hex Resolution Stat Cards */
-    .stat-card {
-      background: var(--kepler-card);
-      border: 1px solid var(--kepler-panel-border);
-      border-radius: 8px;
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
+    input:checked + .slider:before {
+      transform: translateX(16px);
+      background-color: #fff;
+    }
+
+    /* Drag and Drop Zone */
+    .viewer-dropzone {
+      border: 2px dashed rgba(255, 255, 255, 0.15);
+      border-radius: var(--theme-border-radius);
+      padding: 18px 14px;
+      text-align: center;
+      background: rgba(0, 0, 0, 0.2);
+      cursor: pointer;
       transition: all 0.2s ease;
     }
 
+    .viewer-dropzone:hover, .viewer-dropzone.dragover {
+      border-color: var(--theme-accent);
+      background: rgba(31, 189, 189, 0.05);
+    }
+
+    .viewer-dropzone-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--theme-text);
+      word-break: break-all;
+    }
+
+    .viewer-dropzone-hint {
+      font-size: 11px;
+      color: var(--theme-text-muted);
+      margin-top: 4px;
+    }
+
+    /* Floating Legend */
+    .viewer-legend {
+      position: absolute;
+      bottom: 28px;
+      right: 28px;
+      background: var(--theme-panel);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--theme-panel-border);
+      border-radius: 10px;
+      padding: 14px 18px;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.6);
+      z-index: 10;
+      min-width: 240px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .viewer-legend-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .viewer-legend-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--theme-text);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .viewer-legend-scale {
+      font-size: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--theme-accent);
+    }
+
+    .viewer-legend-gradient {
+      height: 10px;
+      border-radius: 5px;
+      width: 100%;
+      margin: 2px 0;
+    }
+
+    .viewer-legend-ticks {
+      display: flex;
+      justify-content: space-between;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--theme-text-muted);
+    }
+
+    /* Stats Cards */
+    .stat-card {
+      background: var(--theme-card);
+      border: 1px solid var(--theme-panel-border);
+      border-radius: var(--theme-border-radius);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+
     .stat-card.active-res {
-      border-color: var(--kepler-accent);
+      border-color: var(--theme-accent);
       background: rgba(31, 189, 189, 0.08);
-      box-shadow: 0 0 10px var(--kepler-accent-glow);
+      box-shadow: 0 0 16px var(--theme-accent-glow);
     }
 
     .stat-card-head {
@@ -323,130 +473,55 @@
     }
 
     .stat-res-badge {
-      background: rgba(31, 189, 189, 0.2);
-      color: var(--kepler-accent);
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 700;
+      color: var(--theme-accent);
       font-family: 'JetBrains Mono', monospace;
     }
 
     .stat-zoom-badge {
       font-size: 10px;
-      color: var(--kepler-text-muted);
-      font-family: 'JetBrains Mono', monospace;
+      color: var(--theme-text-muted);
+      background: rgba(0, 0, 0, 0.25);
+      padding: 2px 6px;
+      border-radius: 4px;
     }
 
     .stat-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 6px;
+      margin-top: 4px;
     }
 
     .stat-item {
+      display: flex;
+      flex-direction: column;
       background: rgba(0, 0, 0, 0.2);
       padding: 6px 8px;
-      border-radius: 4px;
+      border-radius: 6px;
     }
 
     .stat-item-label {
       font-size: 9px;
-      color: var(--kepler-text-dim);
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.4px;
+      color: var(--theme-text-dim);
     }
 
     .stat-item-val {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
-      color: #fff;
       font-weight: 600;
+      color: var(--theme-text);
+      margin-top: 2px;
     }
 
-    /* Drag and Drop Zone */
-    .kepler-dropzone {
-      border: 1.5px dashed rgba(255, 255, 255, 0.2);
-      border-radius: var(--kepler-border-radius);
-      padding: 14px;
-      text-align: center;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      background: rgba(255, 255, 255, 0.02);
-    }
-
-    .kepler-dropzone:hover, .kepler-dropzone.dragover {
-      border-color: var(--kepler-accent);
-      background: rgba(31, 189, 189, 0.08);
-    }
-
-    .kepler-dropzone-name {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      color: var(--kepler-accent);
-      margin-bottom: 4px;
-    }
-
-    .kepler-dropzone-hint {
-      font-size: 10px;
-      color: var(--kepler-text-muted);
-    }
-
-    /* Floating Legend */
-    .kepler-legend {
-      position: absolute;
-      bottom: 24px;
-      right: 24px;
-      background: var(--kepler-panel);
-      backdrop-filter: blur(16px);
-      border: 1px solid var(--kepler-panel-border);
-      border-radius: 12px;
-      padding: 14px 18px;
-      z-index: 15;
-      min-width: 240px;
-      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.6);
-    }
-
-    .kepler-legend-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 8px;
-    }
-
-    .kepler-legend-title {
-      font-size: 12px;
-      font-weight: 700;
-      color: #fff;
-    }
-
-    .kepler-legend-scale {
-      font-size: 10px;
-      color: var(--kepler-accent);
-      text-transform: uppercase;
-      font-weight: 600;
-    }
-
-    .kepler-legend-gradient {
-      height: 14px;
-      border-radius: 4px;
-      margin-bottom: 6px;
-      box-shadow: inset 0 0 3px rgba(0,0,0,0.5);
-    }
-
-    .kepler-legend-ticks {
-      display: flex;
-      justify-content: space-between;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10px;
-      color: var(--kepler-text-muted);
-    }
-
-    /* Tooltip */
+    /* Tooltip popup override */
     .maplibregl-popup-content {
-      background: rgba(20, 24, 33, 0.96) !important;
-      backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      background: rgba(22, 27, 34, 0.94) !important;
+      backdrop-filter: blur(14px) !important;
+      border: 1px solid var(--theme-panel-border) !important;
       border-radius: 10px !important;
       padding: 14px 16px !important;
       color: #fff !important;
@@ -466,12 +541,12 @@
       font-family: 'JetBrains Mono', monospace;
       font-size: 12px;
       font-weight: 700;
-      color: var(--kepler-accent);
+      color: var(--theme-accent);
     }
 
     .tip-res {
       background: rgba(31, 189, 189, 0.15);
-      color: var(--kepler-accent);
+      color: var(--theme-accent);
       padding: 2px 6px;
       border-radius: 4px;
       font-size: 9px;
@@ -492,7 +567,7 @@
     }
 
     .tip-cell-title {
-      color: var(--kepler-text-dim);
+      color: var(--theme-text-dim);
       font-size: 9px;
       text-transform: uppercase;
       letter-spacing: 0.5px;
@@ -506,24 +581,24 @@
     }
 
     /* HUD */
-    .kepler-hud {
+    .viewer-hud {
       position: absolute;
       top: 16px;
       right: 16px;
-      background: var(--kepler-panel);
+      background: var(--theme-panel);
       backdrop-filter: blur(16px);
-      border: 1px solid var(--kepler-panel-border);
+      border: 1px solid var(--theme-panel-border);
       border-radius: 8px;
       padding: 8px 14px;
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
-      color: var(--kepler-text-muted);
+      color: var(--theme-text-muted);
       z-index: 10;
       display: flex;
       gap: 16px;
     }
 
-    .kepler-hud span { color: var(--kepler-text); font-weight: 600; }
+    .viewer-hud span { color: var(--theme-text); font-weight: 600; }
   </style>
 </head>
 <body>
@@ -531,38 +606,40 @@
   <div id="map"></div>
 
   <!-- HUD Real-Time Stats -->
-  <div class="kepler-hud">
+  <div class="viewer-hud">
     <div>Zoom: <span id="hud-zoom">7.0</span></div>
     <div>H3 Res: <span id="hud-h3-res">4</span></div>
     <div>Pitch: <span id="hud-pitch">0°</span></div>
   </div>
 
-  <!-- Kepler Control Studio -->
-  <div class="kepler-sidebar">
-    <div class="kepler-header">
-      <div class="kepler-brand">
-        <div class="kepler-logo-sq">K</div>
+  <!-- Left Control Studio -->
+  <div class="viewer-sidebar" id="viewer-sidebar">
+    <div class="sidebar-expand-btn" id="expand-sidebar-btn" title="Expand Workspace">⚙️</div>
+    <div class="viewer-header">
+      <div class="viewer-brand">
+        <div class="viewer-logo-sq">⬡</div>
         <div>
-          <div class="kepler-title">Kepler.gl PMTiles Studio</div>
-          <div class="kepler-sub">Hexagonal Raster Vector Engine</div>
+          <div class="viewer-title">PMTiles Hexagon Studio</div>
+          <div class="viewer-sub">H3 Multi-Resolution Vector Engine</div>
         </div>
       </div>
+      <button class="sidebar-collapse-btn" id="collapse-sidebar-btn" title="Collapse Workspace">◀</button>
     </div>
 
-    <div class="kepler-tabs">
-      <div class="kepler-tab active" data-tab="layers">Layers</div>
-      <div class="kepler-tab" data-tab="palettes">Colormaps</div>
-      <div class="kepler-tab" data-tab="stats">Hex Stats</div>
-      <div class="kepler-tab" data-tab="basemap">Basemap</div>
+    <div class="viewer-tabs">
+      <div class="viewer-tab active" data-tab="layers">Layers</div>
+      <div class="viewer-tab" data-tab="palettes">Colormaps</div>
+      <div class="viewer-tab" data-tab="stats">Metadata</div>
+      <div class="viewer-tab" data-tab="basemap">Basemap</div>
     </div>
 
     <!-- TAB 1: Layer & Style Controls -->
-    <div class="kepler-content" id="tab-layers">
+    <div class="viewer-content" id="tab-layers">
       <div class="control-block">
         <div class="control-head">Active PMTiles Source</div>
-        <div class="kepler-dropzone" id="dropzone">
-          <div class="kepler-dropzone-name" id="dropzone-filename">data/CFL_HI_pyramid.pmtiles</div>
-          <div class="kepler-dropzone-hint">Click to browse or drop any .pmtiles</div>
+        <div class="viewer-dropzone" id="dropzone">
+          <div class="viewer-dropzone-name" id="dropzone-filename">data/CFL_HI_pyramid.pmtiles</div>
+          <div class="viewer-dropzone-hint">Click to browse or drop any .pmtiles</div>
           <input type="file" id="file-input" accept=".pmtiles" style="display:none;" />
         </div>
       </div>
@@ -580,10 +657,10 @@
         </select>
       </div>
 
-      <div class="kepler-toggle">
+      <div class="viewer-toggle">
         <div>
-          <span class="kepler-toggle-title">Adaptive Scale by H3 Res</span>
-          <div style="font-size: 10px; color: var(--kepler-text-muted);">Calibrate color ramp dynamically per hex level</div>
+          <span class="viewer-toggle-title">Adaptive Scale by H3 Res</span>
+          <div style="font-size: 10px; color: var(--theme-text-muted);">Calibrate color ramp dynamically per hex level</div>
         </div>
         <label class="switch">
           <input type="checkbox" id="adaptive-color-toggle" checked>
@@ -623,8 +700,8 @@
         <input type="range" id="opacity-slider" min="10" max="100" value="80">
       </div>
 
-      <div class="kepler-toggle">
-        <span class="kepler-toggle-title">3D Hexagon Extrusion</span>
+      <div class="viewer-toggle">
+        <span class="viewer-toggle-title">3D Hexagon Extrusion</span>
         <label class="switch">
           <input type="checkbox" id="extrusion-toggle">
           <span class="slider"></span>
@@ -639,16 +716,16 @@
         <input type="range" id="height-slider" min="10" max="1000" value="250" step="10">
       </div>
 
-      <div class="kepler-toggle">
-        <span class="kepler-toggle-title">Hexagon Wireframe Borders</span>
+      <div class="viewer-toggle">
+        <span class="viewer-toggle-title">Hexagon Wireframe Borders</span>
         <label class="switch">
           <input type="checkbox" id="wireframe-toggle" checked>
           <span class="slider"></span>
         </label>
       </div>
 
-      <div class="kepler-toggle">
-        <span class="kepler-toggle-title">Invert Colormap</span>
+      <div class="viewer-toggle">
+        <span class="viewer-toggle-title">Invert Colormap</span>
         <label class="switch">
           <input type="checkbox" id="invert-toggle">
           <span class="slider"></span>
@@ -657,27 +734,27 @@
     </div>
 
     <!-- TAB 2: Extensive Colormap Gallery -->
-    <div class="kepler-content" id="tab-palettes" style="display:none;">
+    <div class="viewer-content" id="tab-palettes" style="display:none;">
       <div class="control-head">Select Colormap Palette (24 Choices)</div>
       <div class="palette-grid" id="palette-grid">
         <!-- Dynamically injected palette cards -->
       </div>
     </div>
 
-    <!-- TAB 3: Hex Resolution Stats Gallery -->
-    <div class="kepler-content" id="tab-stats" style="display:none;">
-      <div class="control-head">H3 Pyramid Resolution Breakdown</div>
+    <!-- TAB 3: PMTiles Metadata Gallery -->
+    <div class="viewer-content" id="tab-stats" style="display:none;">
+      <div class="control-head">PMTiles Pyramid Metadata</div>
       <div id="stats-container" style="display: flex; flex-direction: column; gap: 10px;">
-        <div style="font-size: 11px; color: var(--kepler-text-muted);">Loading pyramid stats...</div>
+        <div style="font-size: 11px; color: var(--theme-text-muted);">Loading pyramid stats...</div>
       </div>
     </div>
 
     <!-- TAB 4: Basemap Selection -->
-    <div class="kepler-content" id="tab-basemap" style="display:none;">
+    <div class="viewer-content" id="tab-basemap" style="display:none;">
       <div class="control-block">
         <div class="control-head">Base Map Theme</div>
         <select id="basemap-select">
-          <option value="carto-dark" selected>CartoDB Dark Matter (Kepler Default)</option>
+          <option value="carto-dark" selected>CartoDB Dark Matter (Default)</option>
           <option value="esri-sat">ESRI World Satellite</option>
           <option value="esri-clarity">ESRI Satellite Clarity</option>
           <option value="carto-light">CartoDB Positron</option>
@@ -688,14 +765,14 @@
     </div>
   </div>
 
-  <!-- Kepler Legend -->
-  <div class="kepler-legend">
-    <div class="kepler-legend-head">
-      <span class="kepler-legend-title" id="legend-attribute">mean</span>
-      <span class="kepler-legend-scale" id="legend-palette-label">VIRIDIS</span>
+  <!-- Legend -->
+  <div class="viewer-legend">
+    <div class="viewer-legend-head">
+      <span class="viewer-legend-title" id="legend-attribute">mean</span>
+      <span class="viewer-legend-scale" id="legend-palette-label">VIRIDIS</span>
     </div>
-    <div class="kepler-legend-gradient" id="legend-bar"></div>
-    <div class="kepler-legend-ticks">
+    <div class="viewer-legend-gradient" id="legend-bar"></div>
+    <div class="viewer-legend-ticks">
       <span id="legend-min">0.0</span>
       <span id="legend-mid">30.0</span>
       <span id="legend-max">60.0</span>
@@ -703,7 +780,7 @@
   </div>
 
   <script>
-    // 24 Professional Kepler & Scientific Colormaps
+    // 24 Professional Scientific Colormaps
     const COLOR_PALETTES = {
       // Perceptually Uniform Scientific
       'Viridis': ['#440154', '#482878', '#3e4989', '#31688e', '#26828e', '#1f9e89', '#35b779', '#6ece58', '#b5de2b', '#fde725'],
@@ -734,7 +811,7 @@
       'Haline': ['#2b1055', '#4c1c72', '#6f2581', '#942b82', '#b73375', '#d6425e', '#ed5a40', '#f87b1a', '#f7a300', '#ebcd00', '#d2f438'],
       'Solar': ['#331800', '#5c2a00', '#8a3c00', '#b84e00', '#e66500', '#ff8400', '#ffa71a', '#ffc74d', '#ffe380', '#ffffb3'],
 
-      // Kepler / Uber Cyberpunk Themes
+      // Cyberpunk & Neon Themes
       'Emerald Neon': ['#042f2e', '#0f766e', '#0d9488', '#14b8a6', '#2dd4bf', '#5eead4', '#99f6e4', '#ccfbf1', '#22d3ee', '#38bdf8'],
       'Cyberpunk': ['#1a0033', '#330066', '#660099', '#9900cc', '#cc00ff', '#ff00ff', '#ff00aa', '#ff0055', '#ff3300', '#ffcc00'],
       'California Sunset': ['#180026', '#3b0d40', '#631853', '#8f205c', '#bc2a59', '#e33e49', '#f96131', '#fd8f21', '#f7c32e', '#f4f85e']
@@ -827,7 +904,7 @@
       const resStats = metadata?.h3_resolution_stats;
       if (!resStats || typeof resStats !== 'object' || Object.keys(resStats).length === 0) {
         container.innerHTML = `
-          <div style="font-size: 11px; color: var(--kepler-text-muted); padding: 10px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+          <div style="font-size: 11px; color: var(--theme-text-muted); padding: 10px; background: rgba(0,0,0,0.2); border-radius: 6px;">
             No per-resolution statistical metadata found in this PMTiles archive.
           </div>
         `;
@@ -846,7 +923,7 @@
               <span class="stat-res-badge">H3 Res ${resKey}</span>
               <span class="stat-zoom-badge">Zooms: ${zoomsStr}</span>
             </div>
-            <div style="font-size: 11px; color: var(--kepler-text); font-weight: 600;">
+            <div style="font-size: 11px; color: var(--theme-text); font-weight: 600;">
               ${Number(s.cell_count).toLocaleString()} Hexagons
             </div>
             <div class="stat-grid">
@@ -1135,7 +1212,7 @@
       const estimatedRes = getEstimatedH3Res(z);
       document.getElementById('hud-h3-res').innerText = estimatedRes;
 
-      // Highlight active card in Hex Stats Tab
+      // Highlight active card in Metadata Tab
       document.querySelectorAll('.stat-card').forEach(card => card.classList.remove('active-res'));
       const activeCard = document.getElementById(`stat-card-res-${estimatedRes}`);
       if (activeCard) activeCard.classList.add('active-res');
@@ -1158,9 +1235,9 @@
     });
 
     // Tab Navigation
-    document.querySelectorAll('.kepler-tab').forEach(tab => {
+    document.querySelectorAll('.viewer-tab').forEach(tab => {
       tab.addEventListener('click', () => {
-        document.querySelectorAll('.kepler-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.viewer-tab').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         const tabKey = tab.dataset.tab;
         document.getElementById('tab-layers').style.display = tabKey === 'layers' ? 'flex' : 'none';
@@ -1168,6 +1245,15 @@
         document.getElementById('tab-stats').style.display = tabKey === 'stats' ? 'flex' : 'none';
         document.getElementById('tab-basemap').style.display = tabKey === 'basemap' ? 'flex' : 'none';
       });
+    });
+
+    // Sidebar Collapse / Expand
+    const sidebarEl = document.getElementById('viewer-sidebar');
+    document.getElementById('collapse-sidebar-btn').addEventListener('click', () => {
+      sidebarEl.classList.add('collapsed');
+    });
+    document.getElementById('expand-sidebar-btn').addEventListener('click', () => {
+      sidebarEl.classList.remove('collapsed');
     });
 
     // UI Listeners
