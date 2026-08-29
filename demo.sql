@@ -130,3 +130,11 @@ SELECT
     h3_is_valid('corrupted_string') AS invalid_hex,
     h3_is_valid(0::UBIGINT) AS invalid_u64;
 
+-- 14. Convert Existing H3 Parquet Dataset Directly to PMTiles v3
+SELECT * FROM h3_parquet_to_pmtiles(
+    '/data/sf_elevation_h3.parquet',
+    '/data/sf_from_parquet.pmtiles',
+    h3_column := 'h3_index'
+);
+
+
