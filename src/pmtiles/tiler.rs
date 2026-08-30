@@ -534,29 +534,9 @@ impl H3PmtilesTiler {
                     total_hexagons += 1;
                 }
             }
-
-            // Evict completed tiles whose southern boundary is North of the active scanline horizon
-            let horizon = streamer.current_lat_horizon();
-            if horizon.is_finite() && !tile_buckets.is_empty() {
-                let mut completed_keys = Vec::new();
-                for (&key, &south_lat) in &tile_south_lats {
-                    if south_lat > horizon {
-                        completed_keys.push(key);
-                    }
-                }
-
-                for key in completed_keys {
-                    tile_south_lats.remove(&key);
-                    if let Some(layer) = tile_buckets.remove(&key) {
-                        let (z, x, y) = key;
-                        let pbf_bytes = layer.encode();
-                        writer.add_tile(z, x, y, &pbf_bytes)?;
-                    }
-                }
-            }
         }
 
-        // Flush any remaining tiles at the end of the raster
+        // Encode all vector tiles exactly once at raster completion
         for (key, layer) in tile_buckets {
             let (z, x, y) = key;
             let pbf_bytes = layer.encode();
@@ -748,29 +728,9 @@ impl H3PmtilesTiler {
                     total_hexagons += 1;
                 }
             }
-
-            // Evict completed tiles whose southern boundary is North of the active scanline horizon
-            let horizon = streamer.current_lat_horizon();
-            if horizon.is_finite() && !tile_buckets.is_empty() {
-                let mut completed_keys = Vec::new();
-                for (&key, &south_lat) in &tile_south_lats {
-                    if south_lat > horizon {
-                        completed_keys.push(key);
-                    }
-                }
-
-                for key in completed_keys {
-                    tile_south_lats.remove(&key);
-                    if let Some(layer) = tile_buckets.remove(&key) {
-                        let (z, x, y) = key;
-                        let pbf_bytes = layer.encode();
-                        writer.add_tile(z, x, y, &pbf_bytes)?;
-                    }
-                }
-            }
         }
 
-        // Flush any remaining tiles at the end of the raster
+        // Encode all vector tiles exactly once at raster completion
         for (key, layer) in tile_buckets {
             let (z, x, y) = key;
             let pbf_bytes = layer.encode();
@@ -808,7 +768,7 @@ impl H3PmtilesTiler {
             if let Some(cmap) = res_class_counts.get(&res) {
                 let mut sorted_classes: Vec<(&i64, &u64)> = cmap.iter().collect();
                 sorted_classes.sort_by(|a, b| b.1.cmp(a.1));
-                for (cls, cnt) in sorted_classes.into_iter().take(20) {
+                for (cls, cnt) in sorted_classes.into_iter().take(256) {
                     class_freq_json.insert(cls.to_string(), json!(cnt));
                 }
             }

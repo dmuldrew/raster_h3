@@ -9,5 +9,10 @@ fn main() {
         reader.chunk_layout.chunk_height);
     println!("GeoTransform: {:?}", reader.metadata.geotransform);
     println!("EPSG: {:?}, Proj: {:?}", reader.metadata.epsg, reader.metadata.proj_string);
-    println!("NoData: {:?}", reader.metadata.nodata);
+    let ll = h3o::LatLng::new(21.3069, -157.8583).unwrap();
+    println!("LatLng degrees: lat={}, lng={}", ll.lat(), ll.lng());
+    println!("LatLng radians: lat_rad={}, lng_rad={}", ll.lat_radians(), ll.lng_radians());
+    let cell = ll.to_cell(h3o::Resolution::Eight);
+    let center: h3o::LatLng = cell.into();
+    println!("Cell center: lat={}, lng={}", center.lat(), center.lng());
 }

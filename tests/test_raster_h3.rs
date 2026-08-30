@@ -1212,9 +1212,9 @@ fn test_categorical_accumulator_merge_operations() {
 
     assert_eq!(acc1.total_count, 5.0);
     assert_eq!(acc1.unique_classes(), 3);
-    assert_eq!(acc1.counts[&10], 2.0);
-    assert_eq!(acc1.counts[&20], 2.0);
-    assert_eq!(acc1.counts[&30], 1.0);
+    assert_eq!(acc1.get_class_count(10), 2.0);
+    assert_eq!(acc1.get_class_count(20), 2.0);
+    assert_eq!(acc1.get_class_count(30), 1.0);
 
     let (maj_cat, maj_cnt, maj_frac) = acc1.majority();
     assert!(maj_cat == 10 || maj_cat == 20);
@@ -1469,16 +1469,10 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
         }
         for (_, acc) in batch {
             total_accumulated += acc.total_count;
-            if let Some(&cnt) = acc.counts.get(&1) {
-                class_1_total += cnt;
-            }
-            if let Some(&cnt) = acc.counts.get(&2) {
-                class_2_total += cnt;
-            }
-            if let Some(&cnt) = acc.counts.get(&10) {
-                class_10_total += cnt;
-            }
-            assert!(acc.counts.get(&255).is_none()); // NoData sentinel never recorded
+            class_1_total += acc.get_class_count(1);
+            class_2_total += acc.get_class_count(2);
+            class_10_total += acc.get_class_count(10);
+            assert_eq!(acc.get_class_count(255), 0.0); // NoData sentinel never recorded
         }
     }
 

@@ -157,6 +157,32 @@ fn encode_directory(entries: &[Entry]) -> io::Result<Vec<u8>> {
     gzip_compress(&uncompressed)
 }
 
+/// Partition directory entries into PMTiles v3 Leaf Directories and construct root pointers
+pub fn build_leaf_directories(entries: &[Entry], leaf_size: usize) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut root_pointers = Vec::new();
+    let mut all_leaf_bytes = Vec::new();
+    let mut current_leaf_offset = 0u64;
+
+    for chunk in entries.chunks(leaf_size) {
+        let leaf_bytes = encode_directory(chunk)?;
+        let leaf_len = leaf_bytes.len() as u32;
+        let first_tile_id = chunk[0].tile_id;
+
+        root_pointers.push(Entry {
+            tile_id: first_tile_id,
+            offset: current_leaf_offset,
+            length: leaf_len,
+            run_length: 0, // 0 signifies a pointer to a Leaf Directory in PMTiles v3
+        });
+
+        current_leaf_offset += leaf_len as u64;
+        all_leaf_bytes.extend_from_slice(&leaf_bytes);
+    }
+
+    let root_bytes = encode_directory(&root_pointers)?;
+    Ok((root_bytes, all_leaf_bytes))
+}
+
 use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Debug, Clone, Copy)]
@@ -242,8 +268,22 @@ impl PmtilesWriter {
             final_tile_offset += e.length as u64;
         }
 
-        // Compress root directory
-        let root_dir_bytes = encode_directory(&directory_entries)?;
+        // PMTiles v3 Specification requires the root directory to fit in the initial 16KB fetch
+        // (16,384 bytes - 127 bytes header = 16,257 bytes max root).
+        // For larger archives, split directory into leaf directories of 4,096 entries.
+        const MAX_ENTRIES_PER_LEAF: usize = 4096;
+
+        let (root_dir_bytes, leaf_dirs_bytes) = if directory_entries.len() <= MAX_ENTRIES_PER_LEAF {
+            let root_bytes = encode_directory(&directory_entries)?;
+            if root_bytes.len() <= 16257 {
+                (root_bytes, Vec::new())
+            } else {
+                build_leaf_directories(&directory_entries, MAX_ENTRIES_PER_LEAF)?
+            }
+        } else {
+            build_leaf_directories(&directory_entries, MAX_ENTRIES_PER_LEAF)?
+        };
+
         // Compress JSON metadata
         let metadata_bytes = gzip_compress(self.metadata_json.as_bytes())?;
 
@@ -254,12 +294,10 @@ impl PmtilesWriter {
         let json_metadata_offset = root_dir_offset + root_dir_length;
         let json_metadata_length = metadata_bytes.len() as u64;
 
-        // Even with no leaf directories, the offset must be a valid non-zero
-        // position (right after metadata) per the PMTiles v3 spec.
         let leaf_dirs_offset = json_metadata_offset + json_metadata_length;
-        let leaf_dirs_length = 0u64;
+        let leaf_dirs_length = leaf_dirs_bytes.len() as u64;
 
-        let tile_data_offset = leaf_dirs_offset;
+        let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
         let tile_data_length = final_tile_offset;
 
         let addressed_tiles_count = self.entries.len() as u64;
@@ -311,6 +349,7 @@ impl PmtilesWriter {
         file.write_all(&header)?;
         file.write_all(&root_dir_bytes)?;
         file.write_all(&metadata_bytes)?;
+        file.write_all(&leaf_dirs_bytes)?;
 
         // Stream tile data from spill_file to out_file in sorted Hilbert order
         let mut read_buf = vec![0u8; 64 * 1024];

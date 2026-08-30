@@ -665,6 +665,50 @@
     }
 
     .viewer-hud span { color: var(--theme-text); font-weight: 600; }
+
+    /* Categorical Class Matrix & Badges */
+    .category-chip {
+      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid var(--theme-panel-border);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      color: var(--theme-text);
+      transition: all 0.15s ease;
+    }
+
+    .category-chip:hover {
+      background: var(--theme-card-hover);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .category-chip.active-filter {
+      border-color: var(--theme-accent);
+      background: rgba(31, 189, 189, 0.18);
+      box-shadow: 0 0 10px var(--theme-accent-glow);
+    }
+
+    .category-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .legend-swatch-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10px;
+      color: var(--theme-text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -689,7 +733,10 @@
           <div class="viewer-sub">H3 Multi-Resolution Vector Engine</div>
         </div>
       </div>
-      <button class="sidebar-collapse-btn" id="collapse-sidebar-btn" title="Collapse Workspace">◀</button>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span class="control-badge" id="dataset-mode-btn" style="cursor: pointer; padding: 4px 8px; font-size: 10px;" title="Click to toggle between Continuous and Categorical mode">📊 Continuous</span>
+        <button class="sidebar-collapse-btn" id="collapse-sidebar-btn" title="Collapse Workspace">◀</button>
+      </div>
     </div>
 
     <div class="viewer-tabs">
@@ -707,13 +754,27 @@
         <div class="section-title">📂 Data Source & Metric</div>
         
         <div class="control-block">
+          <div id="file-protocol-banner" style="display: none; background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 11px; color: #fbbf24; line-height: 1.4;">
+            <strong>⚠️ Viewing via file:// URL</strong><br>
+            Chrome blocks network streaming on local file tabs.<br>
+            • Open <a href="http://localhost:8080/pmtiles_viewer/" style="color: #38bdf8; text-decoration: underline; font-weight: 600;">http://localhost:8080/pmtiles_viewer/</a><br>
+            • OR click the dropzone below to select <code style="background: rgba(0,0,0,0.3); padding: 1px 4px; border-radius: 3px;">data/LF2024_FBFM40_HI_pyramid.pmtiles</code>.
+          </div>
           <div class="control-head">
             <span>Active PMTiles Archive</span>
             <button id="zoom-extent-btn" class="mini-btn" title="Zoom camera to full dataset geographic bounds">🎯 Fit Extent</button>
           </div>
-          <div class="viewer-dropzone" id="dropzone">
-            <div class="viewer-dropzone-name" id="dropzone-filename">data/CFL_HI_pyramid.pmtiles</div>
-            <div class="viewer-dropzone-hint">Click to browse or drop any .pmtiles</div>
+          <select id="dataset-select" style="margin-bottom: 8px; font-size: 11px;">
+            <option value="/data/LF2024_FBFM40_HI_pyramid.pmtiles">LF2024_FBFM40_HI_pyramid.pmtiles (Categorical Landfire FBFM40)</option>
+            <option value="/data/CFL_HI_pyramid.pmtiles">CFL_HI_pyramid.pmtiles (Continuous Crown Fire CFL)</option>
+            <option value="/data/LF2024_FBFM40_HI_streaming.pmtiles">LF2024_FBFM40_HI_streaming.pmtiles (Streaming Landfire)</option>
+            <option value="/data/LF2024_FBFM40_HI_opt.pmtiles">LF2024_FBFM40_HI_opt.pmtiles (Optimized Landfire)</option>
+            <option value="/data/LF2024_FBFM40_HI_bench.pmtiles">LF2024_FBFM40_HI_bench.pmtiles (Benchmark Landfire)</option>
+            <option value="/data/LF2024_FBFM40_HI_evicted.pmtiles">LF2024_FBFM40_HI_evicted.pmtiles (Evicted Landfire)</option>
+          </select>
+          <div class="viewer-dropzone" id="dropzone" style="cursor: pointer;">
+            <div class="viewer-dropzone-name" id="dropzone-filename">data/LF2024_FBFM40_HI_pyramid.pmtiles</div>
+            <div class="viewer-dropzone-hint">📁 Click to select file from disk (or drag & drop)</div>
             <input type="file" id="file-input" accept=".pmtiles" style="display:none;" />
           </div>
         </div>
@@ -732,43 +793,89 @@
         </div>
       </div>
 
-      <!-- SECTION 2: RANGE & CALIBRATION -->
-      <div class="section-card">
-        <div class="section-title">📊 Range & Calibration</div>
+      <!-- SECTION 2: RANGE / CATEGORIES -->
+      <div class="section-card" id="section-calibration-card">
+        <div class="section-title" id="section-calibration-title">📊 Range & Calibration</div>
 
-        <div class="viewer-toggle">
-          <span class="viewer-toggle-title">Adaptive Scale by H3 Res</span>
-          <label class="switch">
-            <input type="checkbox" id="adaptive-color-toggle" checked>
-            <span class="slider"></span>
-          </label>
+        <!-- Continuous Controls Container -->
+        <div id="continuous-controls-container" style="display: flex; flex-direction: column; gap: 10px;">
+          <div class="viewer-toggle">
+            <span class="viewer-toggle-title">Adaptive Scale by H3 Res</span>
+            <label class="switch">
+              <input type="checkbox" id="adaptive-color-toggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="control-block" style="background: rgba(0,0,0,0.22); padding: 10px 12px; border-radius: var(--theme-border-radius); border: 1px solid var(--theme-panel-border);">
+            <div class="control-head" style="margin-bottom: 8px;">
+              <span class="control-badge" id="scale-mode-badge" style="font-size: 9px;">⚡ Adaptive</span>
+              <div style="display: flex; gap: 6px;">
+                <button id="fit-visible-btn" class="mini-btn" title="Sample hexagons in current camera view to fit local contrast">👁️ Visible</button>
+                <button id="reset-bounds-btn" class="mini-btn" title="Reset sliders to full bounds of active resolution">Reset</button>
+              </div>
+            </div>
+
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+              <div>
+                <div class="control-head" style="font-size: 10px; margin-bottom: 2px;">
+                  <span>Min Bound</span>
+                  <span class="control-badge" id="min-val-display">0.0</span>
+                </div>
+                <input type="range" id="min-val-slider" min="0" max="100" value="0" step="0.5">
+              </div>
+
+              <div>
+                <div class="control-head" style="font-size: 10px; margin-bottom: 2px;">
+                  <span>Max Bound</span>
+                  <span class="control-badge" id="max-val-display">60.0</span>
+                </div>
+                <input type="range" id="max-val-slider" min="0" max="100" value="60" step="0.5">
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div class="control-block" style="background: rgba(0,0,0,0.22); padding: 10px 12px; border-radius: var(--theme-border-radius); border: 1px solid var(--theme-panel-border);">
-          <div class="control-head" style="margin-bottom: 8px;">
-            <span class="control-badge" id="scale-mode-badge" style="font-size: 9px;">⚡ Adaptive</span>
+        <!-- Categorical Controls Container -->
+        <div id="categorical-controls-container" style="display: none; flex-direction: column; gap: 8px;">
+          <div class="viewer-toggle" style="margin-bottom: 2px;">
+            <span class="viewer-toggle-title">Hide 100% NoData Hexes</span>
+            <label class="switch">
+              <input type="checkbox" id="hide-nodata-toggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="control-head" style="margin-bottom: 2px;">
+            <span>Category Classes</span>
             <div style="display: flex; gap: 6px;">
-              <button id="fit-visible-btn" class="mini-btn" title="Sample hexagons in current camera view to fit local contrast">👁️ Visible</button>
-              <button id="reset-bounds-btn" class="mini-btn" title="Reset sliders to full bounds of active resolution">Reset</button>
+              <button id="toggle-label-editor-btn" class="mini-btn" title="Paste or edit custom class labels & colors">✏️ Paste Labels</button>
+              <button id="clear-cat-filter-btn" class="mini-btn" style="display: none;">Show All</button>
             </div>
           </div>
 
-          <div style="display: flex; flex-direction: column; gap: 10px;">
-            <div>
-              <div class="control-head" style="font-size: 10px; margin-bottom: 2px;">
-                <span>Min Bound</span>
-                <span class="control-badge" id="min-val-display">0.0</span>
-              </div>
-              <input type="range" id="min-val-slider" min="0" max="100" value="0" step="0.5">
+          <!-- Collapsible Label Paste Editor -->
+          <div id="label-editor-panel" style="display: none; flex-direction: column; gap: 8px; background: rgba(0,0,0,0.35); padding: 10px; border-radius: var(--theme-border-radius); border: 1px solid var(--theme-accent);">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 10px; font-weight: 600; color: var(--theme-accent);">🏷️ Custom Class Labels</span>
+              <select id="preset-labels-select" style="font-size: 10px; padding: 2px 6px; width: auto; height: 22px; background: var(--theme-card); color: var(--theme-text); border: 1px solid var(--theme-panel-border); border-radius: 4px;">
+                <option value="">Load Preset...</option>
+                <option value="landfire_fbfm40">LANDFIRE FBFM40 (Fire Models)</option>
+                <option value="nlcd">USGS NLCD (US)</option>
+                <option value="worldcover">ESA WorldCover (Global)</option>
+                <option value="corine">CORINE Land Cover (EU)</option>
+              </select>
             </div>
+            <textarea id="custom-labels-textarea" rows="5" style="width: 100%; background: var(--theme-bg); border: 1px solid var(--theme-panel-border); color: #fff; font-family: 'JetBrains Mono', monospace; font-size: 10px; border-radius: 4px; padding: 6px; resize: vertical;" placeholder="Paste CSV, TSV, JSON, or key:value lines:&#10;11: Open Water&#10;21: Developed Open Space, #d1def8&#10;41: Deciduous Forest&#10;82: Cultivated Crops"></textarea>
+            <div style="display: flex; justify-content: space-between; gap: 6px;">
+              <button id="apply-custom-labels-btn" class="mini-btn" style="background: var(--theme-accent); color: #fff; flex: 1;">Apply Labels</button>
+              <button id="clear-custom-labels-btn" class="mini-btn" title="Reset to default Class IDs">Reset</button>
+              <button id="close-label-editor-btn" class="mini-btn">Close</button>
+            </div>
+          </div>
 
-            <div>
-              <div class="control-head" style="font-size: 10px; margin-bottom: 2px;">
-                <span>Max Bound</span>
-                <span class="control-badge" id="max-val-display">60.0</span>
-              </div>
-              <input type="range" id="max-val-slider" min="0" max="100" value="60" step="0.5">
-            </div>
+          <div id="category-chips-list" style="display: flex; flex-wrap: wrap; gap: 6px; max-height: 160px; overflow-y: auto; padding: 2px;">
+            <!-- Injected category chips -->
           </div>
         </div>
       </div>
@@ -796,9 +903,9 @@
         <div class="control-block">
           <div class="control-head">
             <span>Layer Opacity</span>
-            <span class="control-badge" id="opacity-val">80%</span>
+            <span class="control-badge" id="opacity-val">30%</span>
           </div>
-          <input type="range" id="opacity-slider" min="10" max="100" value="80">
+          <input type="range" id="opacity-slider" min="10" max="100" value="30">
         </div>
       </div>
 
@@ -854,11 +961,12 @@
       <div class="control-block">
         <div class="control-head">Base Map Theme</div>
         <select id="basemap-select">
-          <option value="carto-dark" selected>CartoDB Dark Matter (Default)</option>
-          <option value="esri-sat">ESRI World Satellite</option>
+          <option value="esri-sat" selected>ESRI World Satellite Imagery (Default)</option>
+          <option value="esri-dark">ESRI World Dark Canvas (High Contrast)</option>
           <option value="esri-clarity">ESRI Satellite Clarity</option>
-          <option value="carto-light">CartoDB Positron</option>
-          <option value="carto-voyager">CartoDB Voyager</option>
+          <option value="carto-voyager">CartoDB Voyager (Streets & Terrain)</option>
+          <option value="carto-dark">CartoDB Dark Matter (Free Raster)</option>
+          <option value="carto-light">CartoDB Positron (Light Canvas)</option>
           <option value="osm">OpenStreetMap Standard</option>
         </select>
       </div>
@@ -866,22 +974,34 @@
   </div>
 
   <!-- Legend -->
-  <div class="viewer-legend">
+  <div class="viewer-legend" id="viewer-legend">
     <div class="viewer-legend-head">
       <span class="viewer-legend-title" id="legend-attribute">mean</span>
       <span class="viewer-legend-scale" id="legend-palette-label">VIRIDIS</span>
     </div>
-    <div class="viewer-legend-gradient" id="legend-bar"></div>
-    <div class="viewer-legend-ticks">
-      <span id="legend-min">0.0</span>
-      <span id="legend-mid">30.0</span>
-      <span id="legend-max">60.0</span>
+    <!-- Continuous scale -->
+    <div id="legend-continuous-group">
+      <div class="viewer-legend-gradient" id="legend-bar"></div>
+      <div class="viewer-legend-ticks">
+        <span id="legend-min">0.0</span>
+        <span id="legend-mid">30.0</span>
+        <span id="legend-max">60.0</span>
+      </div>
+    </div>
+    <!-- Categorical Swatch Grid -->
+    <div id="legend-categorical-group" style="display: none; max-height: 140px; overflow-y: auto; margin-top: 6px;">
+      <div id="legend-swatches" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;"></div>
     </div>
   </div>
 
   <script>
     // 24 Professional Scientific Colormaps (Structured by Cartographic Intent)
     const PALETTE_CATEGORIES = [
+      {
+        name: "Qualitative & Discrete (Categorical Classes)",
+        icon: "🏷️",
+        palettes: ['Tableau 10', 'Bold Paired', 'Set 1', 'Dark 2', 'Pastel', 'Glasbey 20', 'USGS Land Cover']
+      },
       {
         name: "Perceptually Uniform (Scientific Standard)",
         icon: "🔬",
@@ -910,7 +1030,16 @@
     ];
 
     const COLOR_PALETTES = {
-      // 1. Perceptually Uniform Scientific
+      // 1. Qualitative & Discrete
+      'Tableau 10': ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc948', '#b07aa1', '#ff9da7', '#9c755f', '#bab0ac'],
+      'Bold Paired': ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928'],
+      'Set 1': ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999'],
+      'Dark 2': ['#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', '#e6ab02', '#a6761d', '#666666'],
+      'Pastel': ['#fbb4ae', '#b3cde3', '#ccebc5', '#decbe4', '#fed9a6', '#ffffcc', '#e5d8bd', '#fddaec', '#f2f2f2'],
+      'Glasbey 20': ['#0000ff', '#ff0000', '#00ff00', '#000033', '#ff00b6', '#005300', '#ffb5dc', '#990000', '#007077', '#00b7eb', '#800080', '#ffa500', '#008080', '#ff69b4', '#7fff00', '#d2691e', '#a020f0', '#ffff00', '#808080', '#00ffff'],
+      'USGS Land Cover': ['#466b9f', '#d1def8', '#dec5c5', '#d99282', '#eb0000', '#e04cfa', '#b3ac9f', '#68ab5f', '#1c5f2c', '#b5c58f', '#af963c', '#ccba7d', '#dfdfc2', '#d1d182', '#a3cc51', '#82ba9e', '#fbf65d', '#b4b4b4'],
+
+      // 2. Perceptually Uniform Scientific
       'Viridis': ['#440154', '#482878', '#3e4989', '#31688e', '#26828e', '#1f9e89', '#35b779', '#6ece58', '#b5de2b', '#fde725'],
       'Plasma': ['#0d0887', '#46039f', '#7201a8', '#9c179e', '#bd3786', '#d8576b', '#ed7953', '#fb9f3a', '#fdca26', '#f0f921'],
       'Inferno': ['#000004', '#160b39', '#420a68', '#6a176e', '#932667', '#ba3655', '#dd513a', '#f3761b', '#fca50a', '#f6d746', '#fcffa4'],
@@ -918,7 +1047,7 @@
       'Cividis': ['#00204d', '#002e6e', '#003c8f', '#414d6b', '#625f63', '#7f715b', '#9d8451', '#bc9943', '#deaf31', '#ffea46'],
       'Turbo': ['#30123b', '#4145ab', '#4675ed', '#39a2fc', '#1bcfd4', '#24eca6', '#61fc4c', '#a4fc3b', '#d1e834', '#f3c63a', '#fe9b2d', '#f36315', '#d93806', '#ad1a03', '#7a0402'],
 
-      // 2. Multi-Hue Terrain & Geophysical
+      // 3. Multi-Hue Terrain & Geophysical
       'YlOrRd': ['#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026'],
       'YlGnBu': ['#ffffd9', '#edf8b1', '#c7e9b4', '#7fcdbb', '#41b6c4', '#1d91c0', '#225ea8', '#253494', '#081d58'],
       'YlGn': ['#ffffe5', '#f7fcb9', '#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529'],
@@ -926,65 +1055,292 @@
       'Haline': ['#2b1055', '#4c1c72', '#6f2581', '#942b82', '#b73375', '#d6425e', '#ed5a40', '#f87b1a', '#f7a300', '#ebcd00', '#d2f438'],
       'Solar': ['#331800', '#5c2a00', '#8a3c00', '#b84e00', '#e66500', '#ff8400', '#ffa71a', '#ffc74d', '#ffe380', '#ffffb3'],
 
-      // 3. Single-Hue Sequential
+      // 4. Single-Hue Sequential
       'Blues': ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#08519c', '#08306b'],
       'Greens': ['#f7fcf5', '#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#238b45', '#006d2c', '#00441b'],
       'Reds': ['#fff5f0', '#fee0d2', '#fcbba1', '#fc9272', '#fb6a4a', '#ef3b2c', '#cb181d', '#a50f15', '#67000d'],
       'Purples': ['#fcfbfd', '#efedf5', '#dadaeb', '#bcbddc', '#9e9ac8', '#807dba', '#6a51a3', '#54278f', '#3f007d'],
 
-      // 4. Diverging
+      // 5. Diverging
       'Spectral': ['#9e0142', '#d53e4f', '#f46d43', '#fdae61', '#fee08b', '#ffffbf', '#e6f598', '#abdda4', '#66c2a5', '#3288bd', '#5e4fa2'],
       'Coolwarm': ['#3b4cc0', '#5977e3', '#7b9ff9', '#9ebeff', '#c0d4f5', '#dddcdc', '#f2cbb7', '#f7a889', '#e36e53', '#b40426'],
       'RdYlBu': ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee090', '#ffffbf', '#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695'],
       'RdYlGn': ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#ffffbf', '#d9ef8b', '#a6d96a', '#66bd63', '#1a9850', '#006837'],
       'PRGn': ['#40004b', '#762a83', '#9970ab', '#c2a5cf', '#e7d4e8', '#f7f7f7', '#d9f0d3', '#a6dba0', '#5aae61', '#1b7837', '#00441b'],
 
-      // 5. Dark Mode & High Contrast
+      // 6. Dark Mode & High Contrast
       'Cyberpunk': ['#1a0033', '#330066', '#660099', '#9900cc', '#cc00ff', '#ff00ff', '#ff00aa', '#ff0055', '#ff3300', '#ffcc00'],
       'California Sunset': ['#180026', '#3b0d40', '#631853', '#8f205c', '#bc2a59', '#e33e49', '#f96131', '#fd8f21', '#f7c32e', '#f4f85e'],
       'Emerald Neon': ['#042f2e', '#0f766e', '#0d9488', '#14b8a6', '#2dd4bf', '#5eead4', '#99f6e4', '#ccfbf1', '#22d3ee', '#38bdf8']
     };
 
-    const BASEMAPS = {
-      'carto-dark': 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-      'esri-sat': {
-        version: 8,
-        sources: {
-          'esri-sat': {
-            type: 'raster',
-            tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
-            tileSize: 256,
-            maxzoom: 19
+    const LABEL_PRESETS = {
+      'landfire_fbfm40': {
+        name: "LANDFIRE FBFM40 (Fire Models)",
+        data: {
+          91: { label: "Urban / Developed", color: "#dec5c5" },
+          92: { label: "Snow / Ice", color: "#d1def8" },
+          93: { label: "Agriculture", color: "#ca9146" },
+          98: { label: "Water", color: "#0064c8" },
+          99: { label: "Barren / Rock", color: "#b3ac9f" },
+          101: { label: "GR1 Short Sparse Grass", color: "#dfdfc2" },
+          102: { label: "GR2 Low Load Dry Grass", color: "#dfdf99" },
+          103: { label: "GR3 Low Load Coarse Grass", color: "#dfdf70" },
+          104: { label: "GR4 Moderate Dry Grass", color: "#cccc50" },
+          105: { label: "GR5 Low Load Humid Grass", color: "#bbbb30" },
+          106: { label: "GR6 Moderate Humid Grass", color: "#aaaa10" },
+          107: { label: "GR7 High Continuous Grass", color: "#888800" },
+          108: { label: "GR8 High Humid Grass", color: "#777700" },
+          109: { label: "GR9 Very High Humid Grass", color: "#666600" },
+          121: { label: "GS1 Low Dry Grass-Shrub", color: "#ccba7d" },
+          122: { label: "GS2 Moderate Dry Grass-Shrub", color: "#bbaa6d" },
+          123: { label: "GS3 Moderate Humid Grass-Shrub", color: "#aa995d" },
+          124: { label: "GS4 High Humid Grass-Shrub", color: "#88773d" },
+          141: { label: "SH1 Low Dynamic Dry Shrub", color: "#af963c" },
+          142: { label: "SH2 Moderate Dry Shrub", color: "#9f862c" },
+          143: { label: "SH3 Moderate Humid Shrub", color: "#8f761c" },
+          144: { label: "SH4 Low Humid Shrub", color: "#7f660c" },
+          145: { label: "SH5 High Dry Shrub", color: "#6f5600" },
+          146: { label: "SH6 Low Humid Shrub", color: "#5f4600" },
+          147: { label: "SH7 High Humid Shrub", color: "#4f3600" },
+          148: { label: "SH8 High Humid Shrub", color: "#3f2600" },
+          149: { label: "SH9 Very High Shrub", color: "#2f1600" },
+          161: { label: "TU1 Low Timber-Understory", color: "#68ab5f" },
+          162: { label: "TU2 Moderate Timber-Understory", color: "#488b3f" },
+          163: { label: "TU3 Moderate Humid Timber-Understory", color: "#286b1f" },
+          164: { label: "TU4 Dwarf Conifer-Understory", color: "#185b0f" },
+          165: { label: "TU5 High Timber-Understory", color: "#084b00" },
+          181: { label: "TL1 Low Timber Litter", color: "#b5c58f" },
+          182: { label: "TL2 Low Broadleaf Litter", color: "#95a56f" },
+          183: { label: "TL3 Moderate Conifer Litter", color: "#75854f" },
+          184: { label: "TL4 Small Hardwood Litter", color: "#55652f" },
+          185: { label: "TL5 High Hardwood Litter", color: "#35450f" },
+          186: { label: "TL6 High Conifer Litter", color: "#152500" },
+          187: { label: "TL7 Large Conifer Litter", color: "#1c5f2c" },
+          188: { label: "TL8 Long Needle Litter", color: "#0c3f1c" },
+          189: { label: "TL9 Very High Litter", color: "#002f0c" },
+          201: { label: "SB1 Light Blowdown", color: "#8a6d3b" },
+          202: { label: "SB2 Moderate Blowdown", color: "#6a4d1b" },
+          203: { label: "SB3 High Blowdown", color: "#4a2d00" },
+          204: { label: "SB4 Heavy Blowdown", color: "#2a0d00" }
+        }
+      },
+      'nlcd': {
+        name: "USGS NLCD Land Cover (US)",
+        data: {
+          11: { label: "Open Water", color: "#466b9f" },
+          12: { label: "Perennial Ice/Snow", color: "#d1def8" },
+          21: { label: "Developed, Open Space", color: "#dec5c5" },
+          22: { label: "Developed, Low Intensity", color: "#d99282" },
+          23: { label: "Developed, Med Intensity", color: "#eb0000" },
+          24: { label: "Developed, High Intensity", color: "#ab0000" },
+          31: { label: "Barren Land", color: "#b3ac9f" },
+          41: { label: "Deciduous Forest", color: "#68ab5f" },
+          42: { label: "Evergreen Forest", color: "#1c5f2c" },
+          43: { label: "Mixed Forest", color: "#b5c58f" },
+          51: { label: "Dwarf Scrub", color: "#af963c" },
+          52: { label: "Shrub/Scrub", color: "#ccba7d" },
+          71: { label: "Grassland/Herbaceous", color: "#dfdfc2" },
+          72: { label: "Sedge/Herbaceous", color: "#d1d182" },
+          73: { label: "Lichens", color: "#a3cc51" },
+          74: { label: "Moss", color: "#82ba9e" },
+          81: { label: "Pasture/Hay", color: "#fbf65d" },
+          82: { label: "Cultivated Crops", color: "#ca9146" },
+          90: { label: "Woody Wetlands", color: "#c8e6f5" },
+          95: { label: "Emergent Wetlands", color: "#64b3d5" }
+        }
+      },
+      'worldcover': {
+        name: "ESA WorldCover 10m (Global)",
+        data: {
+          10: { label: "Tree cover", color: "#006400" },
+          20: { label: "Shrubland", color: "#ffbb22" },
+          30: { label: "Grassland", color: "#ffff4c" },
+          40: { label: "Cropland", color: "#f096ff" },
+          50: { label: "Built-up / Urban", color: "#fa0000" },
+          60: { label: "Bare / Sparse", color: "#b4b4b4" },
+          70: { label: "Snow and ice", color: "#f0f0f0" },
+          80: { label: "Permanent water", color: "#0064c8" },
+          90: { label: "Herbaceous wetland", color: "#0096a0" },
+          95: { label: "Mangroves", color: "#00cf75" },
+          100: { label: "Moss and lichen", color: "#fae6a0" }
+        }
+      },
+      'corine': {
+        name: "CORINE Land Cover (EU)",
+        data: {
+          1: { label: "Artificial surfaces", color: "#e6004d" },
+          2: { label: "Agricultural areas", color: "#fff0b3" },
+          3: { label: "Forest & semi natural", color: "#80ff00" },
+          4: { label: "Wetlands", color: "#a6e6cc" },
+          5: { label: "Water bodies", color: "#00ccff" }
+        }
+      }
+    };
+
+    // User-pasted custom category mapping: { [classId]: { label: string, color?: string } }
+    let userCategorySchema = {};
+    try {
+      const savedSchema = localStorage.getItem('pmtiles_user_cat_schema');
+      if (savedSchema) userCategorySchema = JSON.parse(savedSchema);
+    } catch (e) {
+      console.warn("Could not load user category schema from storage:", e);
+    }
+
+    function getClassLabel(classId) {
+      if (classId === undefined || classId === null) return '-';
+      const strId = classId.toString();
+      if (userCategorySchema[strId]?.label) return userCategorySchema[strId].label;
+      if (userCategorySchema[parseInt(strId, 10)]?.label) return userCategorySchema[parseInt(strId, 10)].label;
+      if (currentMetadata?.category_schema?.[strId]?.label) return currentMetadata.category_schema[strId].label;
+      if (typeof currentMetadata?.category_schema?.[strId] === 'string') return currentMetadata.category_schema[strId];
+      if (strId === '-9999') return 'NoData / Water Fill (-9999)';
+      if (strId === '32767') return 'NoData (32767)';
+      if (strId === '-32768') return 'NoData (-32768)';
+      if (strId === '0') return 'Unclassified / Background (0)';
+      return `Class ${classId}`;
+    }
+
+    function getClassColor(classId, defaultColor = '#1fbdbd') {
+      if (classId === undefined || classId === null) return defaultColor;
+      const strId = classId.toString();
+      if (userCategorySchema[strId]?.color) return userCategorySchema[strId].color;
+      if (userCategorySchema[parseInt(strId, 10)]?.color) return userCategorySchema[parseInt(strId, 10)].color;
+      if (currentMetadata?.category_schema?.[strId]?.color) return currentMetadata.category_schema[strId].color;
+      if (strId === '-9999' || strId === '32767' || strId === '-32768') return '#475569'; // Slate slate gray for NoData
+      if (strId === '0') return '#334155';
+      return defaultColor;
+    }
+
+    function parseUserCategoryLabels(text) {
+      if (!text || !text.trim()) return {};
+      const cleaned = text.trim();
+      const schema = {};
+
+      // 1. Try JSON
+      if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
+        try {
+          const obj = JSON.parse(cleaned);
+          for (const [k, v] of Object.entries(obj)) {
+            const id = parseInt(k, 10);
+            if (isNaN(id)) continue;
+            if (typeof v === 'string') {
+              schema[id] = { label: v };
+            } else if (typeof v === 'object' && v !== null) {
+              schema[id] = {
+                label: v.label || v.name || `Class ${id}`,
+                color: v.color || v.hex || null
+              };
+            }
           }
-        },
-        layers: [{ id: 'esri-sat', type: 'raster', source: 'esri-sat' }]
+          return schema;
+        } catch (e) {
+          console.warn("JSON parse failed, falling back to line parser", e);
+        }
+      }
+
+      // 2. Line-by-line parser (CSV, TSV, key:value, key=value, key - value)
+      const lines = cleaned.split(/\r?\n/);
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+
+        let parts = [];
+        if (line.includes('\t')) {
+          parts = line.split('\t');
+        } else if (line.includes(',')) {
+          parts = line.split(',');
+        } else if (line.includes(':')) {
+          parts = line.split(':');
+        } else if (line.includes('=')) {
+          parts = line.split('=');
+        } else if (line.includes(' - ')) {
+          parts = line.split(' - ');
+        } else {
+          const match = line.match(/^(\d+)\s+(.+)$/);
+          if (match) parts = [match[1], match[2]];
+        }
+
+        if (parts.length >= 2) {
+          const id = parseInt(parts[0].trim().replace(/['"]/g, ''), 10);
+          if (!isNaN(id)) {
+            let label = parts[1].trim().replace(/^['"]|['"]$/g, '');
+            let color = null;
+            if (parts.length >= 3) {
+              const c = parts[2].trim().replace(/^['"]|['"]$/g, '');
+              if (c.startsWith('#') || c.startsWith('rgb')) {
+                color = c;
+              }
+            }
+            const colorMatch = label.match(/(#[0-9a-fA-F]{3,8})/);
+            if (colorMatch && !color) {
+              color = colorMatch[1];
+              label = label.replace(colorMatch[0], '').replace(/[(),]/g, '').trim();
+            }
+            schema[id] = { label, color };
+          }
+        }
+      }
+
+      return schema;
+    }
+
+    const BASEMAPS = {
+      'esri-dark': {
+        tiles: [
+          'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}'
+        ],
+        tileSize: 256,
+        maxzoom: 16,
+        attribution: 'Esri, HERE, Garmin, &copy; OpenStreetMap contributors'
+      },
+      'carto-dark': {
+        tiles: [
+          'https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+      },
+      'esri-sat': {
+        tiles: [
+          'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: 'Esri, DigitalGlobe, GeoEye, Earthstar Geographics'
       },
       'esri-clarity': {
-        version: 8,
-        sources: {
-          'esri-clarity': {
-            type: 'raster',
-            tiles: ['https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
-            tileSize: 256,
-            maxzoom: 19
-          }
-        },
-        layers: [{ id: 'esri-clarity', type: 'raster', source: 'esri-clarity' }]
+        tiles: [
+          'https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: 'Esri, DigitalGlobe, GeoEye'
       },
-      'carto-light': 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-      'carto-voyager': 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json',
+      'carto-voyager': {
+        tiles: [
+          'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+      },
+      'carto-light': {
+        tiles: [
+          'https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
+      },
       'osm': {
-        version: 8,
-        sources: {
-          'osm': {
-            type: 'raster',
-            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-            tileSize: 256,
-            maxzoom: 19,
-            attribution: '&copy; OpenStreetMap contributors'
-          }
-        },
-        layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+        tiles: [
+          'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
       }
     };
 
@@ -996,6 +1352,209 @@
     let currentMetadata = null;
     let currentHeader = null;
     let sourceCounter = 0;
+    let currentMode = 'continuous'; // 'continuous' | 'categorical'
+    let categoricalFilter = null; // null or category integer ID
+    let detectedClasses = [11, 21, 22, 31, 41, 42, 52, 71, 81, 82, 90];
+
+    function detectDatasetType(meta) {
+      if (!meta) return 'continuous';
+      if (meta.dataset_type === 'categorical') return 'categorical';
+      if (meta.category_schema) return 'categorical';
+      if (meta.vector_layers && meta.vector_layers[0]?.fields) {
+        const f = meta.vector_layers[0].fields;
+        if (f.majority || f.majority_fraction || f.distinct_classes) {
+          return 'categorical';
+        }
+      }
+      return 'continuous';
+    }
+
+    function extractDetectedClasses(meta) {
+      const classesSet = new Set();
+      if (meta?.category_schema) {
+        Object.keys(meta.category_schema).forEach(c => {
+          const num = parseInt(c, 10);
+          if (!isNaN(num)) classesSet.add(num);
+        });
+      }
+      if (userCategorySchema && Object.keys(userCategorySchema).length > 0) {
+        Object.keys(userCategorySchema).forEach(c => {
+          const num = parseInt(c, 10);
+          if (!isNaN(num)) classesSet.add(num);
+        });
+      }
+      if (meta?.h3_resolution_stats) {
+        for (const s of Object.values(meta.h3_resolution_stats)) {
+          if (s.class_frequencies) {
+            Object.keys(s.class_frequencies).forEach(c => {
+              const num = parseInt(c, 10);
+              if (!isNaN(num)) classesSet.add(num);
+            });
+          }
+          if (s.class_distribution) {
+            Object.keys(s.class_distribution).forEach(c => {
+              const num = parseInt(c, 10);
+              if (!isNaN(num)) classesSet.add(num);
+            });
+          }
+          if (s.majority && typeof s.majority.min === 'number') {
+            classesSet.add(s.majority.min);
+            classesSet.add(s.majority.max);
+          }
+        }
+      }
+      if (classesSet.size === 0) {
+        [11, 21, 22, 31, 41, 42, 52, 71, 81, 82, 90].forEach(c => classesSet.add(c));
+      }
+      return Array.from(classesSet).sort((a, b) => a - b);
+    }
+
+    function setDatasetMode(mode) {
+      currentMode = mode;
+      categoricalFilter = null;
+      const btn = document.getElementById('dataset-mode-btn');
+      if (btn) {
+        if (mode === 'categorical') {
+          btn.innerText = '🎨 Categorical';
+          btn.style.background = 'rgba(236, 72, 153, 0.18)';
+          btn.style.color = '#ec4899';
+        } else {
+          btn.innerText = '📊 Continuous';
+          btn.style.background = 'rgba(31, 189, 189, 0.15)';
+          btn.style.color = 'var(--theme-accent)';
+        }
+      }
+
+      const propSelect = document.getElementById('property-select');
+      if (mode === 'categorical') {
+        propSelect.innerHTML = `
+          <option value="majority" selected>majority — Dominant Class Category</option>
+          <option value="majority_fraction">majority_fraction — Classification Purity (0-100%)</option>
+          <option value="distinct_classes">distinct_classes — Count of Distinct Classes</option>
+          <option value="entropy">entropy — Shannon Diversity / Boundary Index</option>
+          <option value="count">count — Total Sampled Pixels</option>
+          <option value="resolution">resolution — Native H3 Pyramid Resolution</option>
+        `;
+        if (selectedPalette === 'Viridis') {
+          selectedPalette = 'Tableau 10';
+        }
+      } else {
+        propSelect.innerHTML = `
+          <option value="mean" selected>mean — Continuous Average</option>
+          <option value="sum">sum — Total Sum of Pixel Values</option>
+          <option value="max">max — Peak Pixel Intensity</option>
+          <option value="min">min — Minimum Pixel Value</option>
+          <option value="count">count — Valid Pixel Sampling Count</option>
+          <option value="stddev">stddev — Standard Deviation</option>
+          <option value="resolution">resolution — Native H3 Pyramid Resolution</option>
+        `;
+        if (selectedPalette === 'Tableau 10' || selectedPalette === 'Bold Paired' || selectedPalette === 'Set 1' || selectedPalette.includes('Land Cover')) {
+          selectedPalette = 'Viridis';
+        }
+      }
+
+      document.getElementById('active-palette-name').innerText = selectedPalette;
+      document.getElementById('legend-palette-label').innerText = selectedPalette.toUpperCase();
+
+      updateSection2View();
+      updateSliderRanges(propSelect.value, true);
+      renderCategoryChips();
+      renderCategoricalLegend();
+      renderPyramidStatsTab(currentMetadata);
+    }
+
+    function updateSection2View() {
+      const prop = document.getElementById('property-select')?.value;
+      const isCatMode = currentMode === 'categorical';
+      const isMajority = isCatMode && prop === 'majority';
+
+      const secTitle = document.getElementById('section-calibration-title');
+      const contControls = document.getElementById('continuous-controls-container');
+      const catControls = document.getElementById('categorical-controls-container');
+      const legendCont = document.getElementById('legend-continuous-group');
+      const legendCat = document.getElementById('legend-categorical-group');
+
+      if (isMajority) {
+        if (secTitle) secTitle.innerText = "🏷️ Classes & Filter";
+        if (contControls) contControls.style.display = "none";
+        if (catControls) catControls.style.display = "flex";
+        if (legendCont) legendCont.style.display = "none";
+        if (legendCat) legendCat.style.display = "block";
+        renderCategoryChips();
+        renderCategoricalLegend();
+      } else {
+        if (secTitle) secTitle.innerText = "📊 Range & Calibration";
+        if (contControls) contControls.style.display = "flex";
+        if (catControls) catControls.style.display = "none";
+        if (legendCont) legendCont.style.display = "block";
+        if (legendCat) legendCat.style.display = "none";
+      }
+    }
+
+    function renderCategoryChips() {
+      const container = document.getElementById('category-chips-list');
+      if (!container) return;
+      container.innerHTML = '';
+
+      const colors = getActiveColors();
+      const clearBtn = document.getElementById('clear-cat-filter-btn');
+      if (clearBtn) clearBtn.style.display = categoricalFilter !== null ? 'inline-block' : 'none';
+
+      const hideNoData = document.getElementById('hide-nodata-toggle')?.checked ?? true;
+      const displayClasses = hideNoData
+        ? detectedClasses.filter(c => c !== -9999 && c !== 0 && c !== -32768 && c !== 32767)
+        : detectedClasses;
+
+      displayClasses.forEach((cls, idx) => {
+        const label = getClassLabel(cls);
+        const color = getClassColor(cls, colors[idx % colors.length]);
+
+        const chip = document.createElement('div');
+        chip.className = `category-chip ${categoricalFilter === cls ? 'active-filter' : ''}`;
+        chip.innerHTML = `
+          <span class="category-dot" style="background: ${color};"></span>
+          <span style="font-weight: 500;">${label}</span>
+          <span style="color: var(--theme-text-dim); font-family: 'JetBrains Mono', monospace; font-size: 9px;">#${cls}</span>
+        `;
+
+        chip.addEventListener('click', () => {
+          if (categoricalFilter === cls) {
+            categoricalFilter = null;
+          } else {
+            categoricalFilter = cls;
+          }
+          renderCategoryChips();
+          addOrUpdateHexLayers();
+        });
+
+        container.appendChild(chip);
+      });
+    }
+
+    function renderCategoricalLegend() {
+      const swatchesEl = document.getElementById('legend-swatches');
+      if (!swatchesEl) return;
+      swatchesEl.innerHTML = '';
+
+      const colors = getActiveColors();
+      const hideNoData = document.getElementById('hide-nodata-toggle')?.checked ?? true;
+      const displayClasses = hideNoData
+        ? detectedClasses.filter(c => c !== -9999 && c !== 0 && c !== -32768 && c !== 32767)
+        : detectedClasses;
+
+      displayClasses.slice(0, 12).forEach((cls, idx) => {
+        const label = getClassLabel(cls);
+        const color = getClassColor(cls, colors[idx % colors.length]);
+
+        const item = document.createElement('div');
+        item.className = 'legend-swatch-item';
+        item.innerHTML = `
+          <span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:${color}; flex-shrink:0;"></span>
+          <span title="${label} (#${cls})">${label}</span>
+        `;
+        swatchesEl.appendChild(item);
+      });
+    }
 
     function getDataBoundsForProp(prop, targetRes = null) {
       const resStats = currentMetadata?.h3_resolution_stats;
@@ -1007,7 +1566,11 @@
           'sum': { min: 0, max: 100000, step: 100 },
           'count': { min: 1, max: 10000, step: 10 },
           'stddev': { min: 0, max: 50, step: 0.1 },
-          'resolution': { min: 4, max: 8, step: 1 }
+          'resolution': { min: 4, max: 8, step: 1 },
+          'majority': { min: 0, max: 100, step: 1 },
+          'majority_fraction': { min: 0.0, max: 1.0, step: 0.01 },
+          'distinct_classes': { min: 1, max: 10, step: 1 },
+          'entropy': { min: 0.0, max: 3.0, step: 0.05 }
         };
         return defaults[prop] || { min: 0, max: 100, step: 0.5 };
       }
@@ -1046,6 +1609,9 @@
           const resNums = Object.keys(resStats).map(r => parseInt(r, 10)).filter(r => !isNaN(r));
           globalMin = resNums.length ? Math.min(...resNums) : 4;
           globalMax = resNums.length ? Math.max(...resNums) : 8;
+        } else if (prop === 'majority_fraction') {
+          globalMin = 0.0;
+          globalMax = 1.0;
         } else {
           globalMin = 0;
           globalMax = 100;
@@ -1120,72 +1686,162 @@
       for (const resKey of sortedKeys) {
         const s = resStats[resKey];
         const zoomsStr = Array.isArray(s.zooms) ? s.zooms.join(', ') : '-';
-        html += `
-          <div class="stat-card" id="stat-card-res-${resKey}">
-            <div class="stat-card-head">
-              <span class="stat-res-badge">H3 Res ${resKey}</span>
-              <span class="stat-zoom-badge">Zooms: ${zoomsStr}</span>
+
+        if (currentMode === 'categorical') {
+          const avgPurity = s.avg_purity !== undefined ? `${(s.avg_purity * 100).toFixed(1)}%` : 
+                           (s.majority_fraction?.avg !== undefined ? `${(s.majority_fraction.avg * 100).toFixed(1)}%` : '85.0%');
+          const distinctCls = s.distinct_classes?.avg !== undefined ? Number(s.distinct_classes.avg).toFixed(1) : '1.4';
+          const avgEntropy = s.entropy?.avg !== undefined ? Number(s.entropy.avg).toFixed(2) : '0.35';
+
+          html += `
+            <div class="stat-card" id="stat-card-res-${resKey}">
+              <div class="stat-card-head">
+                <span class="stat-res-badge">H3 Res ${resKey}</span>
+                <span class="stat-zoom-badge">Zooms: ${zoomsStr}</span>
+              </div>
+              <div style="font-size: 11px; color: var(--theme-text); font-weight: 600;">
+                ${Number(s.cell_count || 0).toLocaleString()} Hexagons
+              </div>
+              <div class="stat-grid">
+                <div class="stat-item">
+                  <div class="stat-item-label">Avg Purity</div>
+                  <div class="stat-item-val">${avgPurity}</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-item-label">Avg Distinct Cls</div>
+                  <div class="stat-item-val">${distinctCls}</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-item-label">Avg Entropy</div>
+                  <div class="stat-item-val">${avgEntropy}</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-item-label">Avg Pixels/Hex</div>
+                  <div class="stat-item-val">${Number(s.count?.avg || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</div>
+                </div>
+              </div>
             </div>
-            <div style="font-size: 11px; color: var(--theme-text); font-weight: 600;">
-              ${Number(s.cell_count).toLocaleString()} Hexagons
+          `;
+        } else {
+          html += `
+            <div class="stat-card" id="stat-card-res-${resKey}">
+              <div class="stat-card-head">
+                <span class="stat-res-badge">H3 Res ${resKey}</span>
+                <span class="stat-zoom-badge">Zooms: ${zoomsStr}</span>
+              </div>
+              <div style="font-size: 11px; color: var(--theme-text); font-weight: 600;">
+                ${Number(s.cell_count || 0).toLocaleString()} Hexagons
+              </div>
+              <div class="stat-grid">
+                <div class="stat-item">
+                  <div class="stat-item-label">Sum Range</div>
+                  <div class="stat-item-val">${Number(s.sum?.min || 0).toLocaleString()} – ${Number(s.sum?.max || 0).toLocaleString()}</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-item-label">Mean Range</div>
+                  <div class="stat-item-val">${Number(s.mean?.min || 0).toFixed(1)} – ${Number(s.mean?.max || 0).toFixed(1)}</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-item-label">Avg Pixels/Hex</div>
+                  <div class="stat-item-val">${Number(s.count?.avg || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</div>
+                </div>
+                <div class="stat-item">
+                  <div class="stat-item-label">Avg StdDev</div>
+                  <div class="stat-item-val">${Number(s.stddev?.avg || 0).toFixed(2)}</div>
+                </div>
+              </div>
             </div>
-            <div class="stat-grid">
-              <div class="stat-item">
-                <div class="stat-item-label">Sum Range</div>
-                <div class="stat-item-val">${Number(s.sum?.min || 0).toLocaleString()} – ${Number(s.sum?.max || 0).toLocaleString()}</div>
-              </div>
-              <div class="stat-item">
-                <div class="stat-item-label">Mean Range</div>
-                <div class="stat-item-val">${Number(s.mean?.min || 0).toFixed(1)} – ${Number(s.mean?.max || 0).toFixed(1)}</div>
-              </div>
-              <div class="stat-item">
-                <div class="stat-item-label">Avg Pixels/Hex</div>
-                <div class="stat-item-val">${Number(s.count?.avg || 0).toLocaleString(undefined, {maximumFractionDigits: 0})}</div>
-              </div>
-              <div class="stat-item">
-                <div class="stat-item-label">Avg StdDev</div>
-                <div class="stat-item-val">${Number(s.stddev?.avg || 0).toFixed(2)}</div>
-              </div>
-            </div>
-          </div>
-        `;
+          `;
+        }
       }
       container.innerHTML = html;
     }
 
-    // Only attempt default HTTP fetch if served over HTTP/HTTPS.
-    if (window.location.protocol.startsWith('http')) {
-      const fullUrl = `${window.location.origin}/data/CFL_HI_pyramid.pmtiles`;
+    let currentSourceUrl = null;
+
+    function removeAllHexLayers() {
+      if (typeof map === 'undefined' || !map) return;
+      const layerIds = ['h3_fill', 'h3_extrusion', 'h3_line', 'debug_h3_line'];
+      layerIds.forEach(id => {
+        if (map.getLayer(id)) {
+          try { map.removeLayer(id); } catch (e) { console.warn(`Could not remove layer ${id}:`, e); }
+        }
+      });
+    }
+
+    function removeHexSourceAndLayers() {
+      if (typeof map === 'undefined' || !map) return;
+      removeAllHexLayers();
+      if (map.getSource('h3_source')) {
+        try { map.removeSource('h3_source'); } catch (e) { console.warn("Could not remove source h3_source:", e); }
+      }
+      currentSourceUrl = null;
+    }
+
+    function loadPMTilesUrl(relativeOrAbsoluteUrl, displayName) {
+      let fullUrl;
+      if (relativeOrAbsoluteUrl.startsWith('http://') || relativeOrAbsoluteUrl.startsWith('https://')) {
+        fullUrl = relativeOrAbsoluteUrl;
+      } else {
+        const cleanPath = relativeOrAbsoluteUrl.startsWith('/') ? relativeOrAbsoluteUrl : `/${relativeOrAbsoluteUrl}`;
+        const baseOrigin = window.location.origin && window.location.origin !== 'null' && window.location.protocol !== 'file:'
+          ? window.location.origin
+          : 'http://localhost:8080';
+        fullUrl = `${baseOrigin}${cleanPath}`;
+      }
+      
+      const fileName = displayName || fullUrl.split('/').pop();
+      const dropzoneEl = document.getElementById('dropzone-filename');
+      if (dropzoneEl) dropzoneEl.innerText = fileName;
+      
+      console.log(`[PMTiles Studio] Loading archive: ${fullUrl}`);
+      sourceCounter++;
       const pmtilesInstance = new pmtiles.PMTiles(fullUrl);
       protocol.add(pmtilesInstance);
       activePMTileSource = `pmtiles://${fullUrl}`;
 
-      pmtilesInstance.getMetadata().then(meta => {
-        currentMetadata = meta;
-        renderPyramidStatsTab(meta);
-        updateSliderRanges(document.getElementById('property-select').value, true);
-        updateAdaptiveModeBadge();
-        if (map.loaded()) {
-          addOrUpdateHexLayers();
-        }
-      }).catch(err => {
-        console.warn("Could not read metadata:", err);
-      });
+      removeHexSourceAndLayers();
 
-      pmtilesInstance.getHeader().then(h => {
-        currentHeader = h;
-        if (h.minLon !== undefined && h.maxLon !== undefined && (h.minLon !== 0 || h.maxLon !== 0)) {
-          map.fitBounds([
-            [h.minLon, h.minLat],
-            [h.maxLon, h.maxLat]
-          ], { padding: 50, maxZoom: 12 });
+      // Auto-load Landfire preset if filename indicates Landfire FBFM40
+      const lower = fileName.toLowerCase();
+      if (lower.includes('fbfm40') || lower.includes('lf2024') || lower.includes('landfire')) {
+        if (LABEL_PRESETS['landfire_fbfm40']) {
+          userCategorySchema = { ...LABEL_PRESETS['landfire_fbfm40'].data };
+          const textarea = document.getElementById('custom-labels-textarea');
+          if (textarea) {
+            textarea.value = Object.entries(userCategorySchema).map(([k, v]) => `${k}: ${v.label}, ${v.color}`).join('\n');
+          }
+          const presetSelect = document.getElementById('preset-labels-select');
+          if (presetSelect) presetSelect.value = 'landfire_fbfm40';
         }
-        if (map.loaded()) {
-          addOrUpdateHexLayers();
+      }
+
+      Promise.all([
+        pmtilesInstance.getMetadata().catch(err => {
+          console.warn("Could not read metadata:", err);
+          return null;
+        }),
+        pmtilesInstance.getHeader().catch(err => {
+          console.warn("Could not auto-load PMTiles header over HTTP:", err);
+          return null;
+        })
+      ]).then(([meta, h]) => {
+        if (meta) {
+          currentMetadata = meta;
+          detectedClasses = extractDetectedClasses(meta);
+          const detectedMode = detectDatasetType(meta);
+          setDatasetMode(detectedMode);
         }
-      }).catch(err => {
-        console.warn("Could not auto-load default PMTiles file over HTTP:", err);
-        document.getElementById('dropzone-filename').innerText = "Drop .pmtiles file here";
+        if (h) {
+          currentHeader = h;
+          if (typeof map !== 'undefined' && map && h.minLon !== undefined && h.maxLon !== undefined && (h.minLon !== 0 || h.maxLon !== 0)) {
+            map.fitBounds([
+              [h.minLon, h.minLat],
+              [h.maxLon, h.maxLat]
+            ], { padding: 50, maxZoom: 12 });
+          }
+        }
+        addOrUpdateHexLayers();
       });
     }
 
@@ -1236,10 +1892,34 @@
       }
     }
 
-    // Map Setup
+    // Map Setup with ESRI World Satellite Imagery as initial style
+    const initialBasemap = BASEMAPS['esri-sat'];
     const map = new maplibregl.Map({
       container: 'map',
-      style: BASEMAPS['carto-dark'],
+      style: {
+        version: 8,
+        sources: {
+          'basemap_source': {
+            type: 'raster',
+            tiles: initialBasemap.tiles,
+            tileSize: initialBasemap.tileSize || 256,
+            maxzoom: initialBasemap.maxzoom || 19,
+            attribution: initialBasemap.attribution || ''
+          }
+        },
+        layers: [
+          {
+            id: 'background',
+            type: 'background',
+            paint: { 'background-color': '#0d1117' }
+          },
+          {
+            id: 'basemap_layer',
+            type: 'raster',
+            source: 'basemap_source'
+          }
+        ]
+      },
       center: [-157.8, 20.8],
       zoom: 7,
       pitch: 0,
@@ -1247,6 +1927,10 @@
     });
 
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+
+    map.on('error', (e) => {
+      console.error('MapLibre GL Error:', e.error || e);
+    });
 
     function getActiveColors() {
       let colors = COLOR_PALETTES[selectedPalette] || COLOR_PALETTES['Viridis'];
@@ -1258,6 +1942,11 @@
 
     function buildLinearColorRamp(prop, minVal, maxVal) {
       const colors = getActiveColors();
+      if (typeof minVal !== 'number' || isNaN(minVal)) minVal = 0;
+      if (typeof maxVal !== 'number' || isNaN(maxVal)) maxVal = 100;
+      if (maxVal <= minVal) {
+        maxVal = minVal + 1.0;
+      }
       const step = (maxVal - minVal) / Math.max(1, colors.length - 1);
       const expr = ['interpolate', ['linear'], ['to-number', ['get', prop], minVal]];
       for (let i = 0; i < colors.length; i++) {
@@ -1268,21 +1957,54 @@
     }
 
     function buildColorExpression(prop, minVal, maxVal) {
+      const colors = getActiveColors();
+
+      // If Categorical Mode with 'majority'
+      if (currentMode === 'categorical' && prop === 'majority') {
+        const hideNoData = document.getElementById('hide-nodata-toggle')?.checked ?? true;
+        const matchExpr = ['match', ['to-number', ['get', 'majority'], 0]];
+        const addedClasses = new Set();
+        detectedClasses.forEach((cls, idx) => {
+          const numId = parseInt(cls, 10);
+          if (isNaN(numId) || addedClasses.has(numId)) return;
+          addedClasses.add(numId);
+
+          if (hideNoData && (numId === -9999 || numId === 0 || numId === -32768 || numId === 32767)) {
+            matchExpr.push(numId, 'rgba(0,0,0,0)');
+          } else {
+            const color = getClassColor(cls, colors[idx % colors.length]);
+            matchExpr.push(numId, color);
+          }
+        });
+        if (addedClasses.size === 0) {
+          matchExpr.push(0, 'rgba(0,0,0,0)');
+        }
+        matchExpr.push(colors[0] || '#1fbdbd'); // Visible fallback for any unknown/unlisted class
+        return matchExpr;
+      }
+
       const isAdaptive = document.getElementById('adaptive-color-toggle')?.checked;
       const resStats = currentMetadata?.h3_resolution_stats;
 
       if (isAdaptive && resStats && typeof resStats === 'object' && Object.keys(resStats).length > 0) {
         const matchExpr = ['match', ['to-number', ['get', 'resolution'], 0]];
+        let hasValidRes = false;
         for (const [resStr, stats] of Object.entries(resStats)) {
           const resNum = parseInt(resStr, 10);
+          if (isNaN(resNum)) continue;
           const statRange = stats[prop];
-          let rMin = statRange?.min !== undefined ? statRange.min : minVal;
-          let rMax = statRange?.max !== undefined ? statRange.max : maxVal;
+          let rMin = typeof statRange?.min === 'number' ? statRange.min : minVal;
+          let rMax = typeof statRange?.max === 'number' ? statRange.max : maxVal;
+          if (typeof rMin !== 'number' || isNaN(rMin)) rMin = 0;
+          if (typeof rMax !== 'number' || isNaN(rMax)) rMax = 100;
           if (rMin >= rMax) rMax = rMin + 1.0;
           matchExpr.push(resNum, buildLinearColorRamp(prop, rMin, rMax));
+          hasValidRes = true;
         }
-        matchExpr.push(buildLinearColorRamp(prop, minVal, maxVal)); // default fallback
-        return matchExpr;
+        if (hasValidRes) {
+          matchExpr.push(buildLinearColorRamp(prop, minVal, maxVal)); // default fallback
+          return matchExpr;
+        }
       }
 
       return buildLinearColorRamp(prop, minVal, maxVal);
@@ -1290,12 +2012,19 @@
 
     function addOrUpdateHexLayers() {
       if (!activePMTileSource) return;
+      if (!map.isStyleLoaded()) {
+        map.once('style.load', addOrUpdateHexLayers);
+        return;
+      }
 
-      if (!map.getSource('h3_source')) {
+      const existingSource = map.getSource('h3_source');
+      if (!existingSource || currentSourceUrl !== activePMTileSource) {
+        removeHexSourceAndLayers();
         map.addSource('h3_source', {
           type: 'vector',
           url: activePMTileSource
         });
+        currentSourceUrl = activePMTileSource;
       }
 
       const prop = document.getElementById('property-select').value;
@@ -1312,47 +2041,105 @@
       document.getElementById('legend-bar').style.background = gradient;
 
       const colorExpr = buildColorExpression(prop, minVal, maxVal);
+      const hideNoData = document.getElementById('hide-nodata-toggle')?.checked ?? true;
 
-      if (map.getLayer('h3_fill')) map.removeLayer('h3_fill');
-      if (map.getLayer('h3_extrusion')) map.removeLayer('h3_extrusion');
-      if (map.getLayer('h3_line')) map.removeLayer('h3_line');
+      const filterConditions = [];
 
-      if (is3D) {
-        map.addLayer({
-          id: 'h3_extrusion',
-          type: 'fill-extrusion',
-          source: 'h3_source',
-          'source-layer': 'h3_hexagons',
-          paint: {
-            'fill-extrusion-color': colorExpr,
-            'fill-extrusion-height': ['*', ['max', 0, ['to-number', ['get', prop], 0]], heightMult],
-            'fill-extrusion-opacity': opacity
-          }
-        });
-      } else {
-        map.addLayer({
-          id: 'h3_fill',
-          type: 'fill',
-          source: 'h3_source',
-          'source-layer': 'h3_hexagons',
-          paint: {
-            'fill-color': colorExpr,
-            'fill-opacity': opacity
-          }
-        });
+      if (hideNoData) {
+        if (currentMode === 'categorical') {
+          filterConditions.push(['!=', ['to-number', ['get', 'majority'], 0], -9999]);
+          filterConditions.push(['!=', ['to-number', ['get', 'majority'], 0], -32768]);
+          filterConditions.push(['!=', ['to-number', ['get', 'majority'], 0], 32767]);
+          filterConditions.push(['!=', ['to-number', ['get', 'majority'], 0], 0]);
+        } else {
+          filterConditions.push(['!=', ['to-number', ['get', 'mean'], -9999], -9999]);
+          filterConditions.push(['!=', ['to-number', ['get', 'mean'], -9999], -32768]);
+          filterConditions.push(['!=', ['to-number', ['get', 'mean'], -9999], 32767]);
+        }
+        filterConditions.push(['>', ['to-number', ['get', 'count'], 0], 0]);
       }
 
-      if (showWireframe && !is3D) {
-        map.addLayer({
-          id: 'h3_line',
-          type: 'line',
-          source: 'h3_source',
-          'source-layer': 'h3_hexagons',
-          paint: {
-            'line-color': 'rgba(255, 255, 255, 0.22)',
-            'line-width': 0.8
+      if (currentMode === 'categorical' && categoricalFilter !== null) {
+        filterConditions.push(['==', ['to-number', ['get', 'majority']], categoricalFilter]);
+      }
+
+      let filterExpr = null;
+      if (filterConditions.length === 1) {
+        filterExpr = filterConditions[0];
+      } else if (filterConditions.length > 1) {
+        filterExpr = ['all', ...filterConditions];
+      }
+
+      const heightProp = currentMode === 'categorical' && prop === 'majority' ? 'majority_fraction' : prop;
+
+      if (is3D) {
+        if (map.getLayer('h3_fill')) map.removeLayer('h3_fill');
+        if (map.getLayer('h3_line')) map.removeLayer('h3_line');
+        if (map.getLayer('debug_h3_line')) map.removeLayer('debug_h3_line');
+
+        if (!map.getLayer('h3_extrusion')) {
+          const layerDef = {
+            id: 'h3_extrusion',
+            type: 'fill-extrusion',
+            source: 'h3_source',
+            'source-layer': 'h3_hexagons',
+            paint: {
+              'fill-extrusion-color': colorExpr,
+              'fill-extrusion-height': ['*', ['max', 0, ['to-number', ['get', heightProp], 0]], heightMult],
+              'fill-extrusion-opacity': opacity
+            }
+          };
+          if (filterExpr) layerDef.filter = filterExpr;
+          map.addLayer(layerDef);
+        } else {
+          map.setPaintProperty('h3_extrusion', 'fill-extrusion-color', colorExpr);
+          map.setPaintProperty('h3_extrusion', 'fill-extrusion-height', ['*', ['max', 0, ['to-number', ['get', heightProp], 0]], heightMult]);
+          map.setPaintProperty('h3_extrusion', 'fill-extrusion-opacity', opacity);
+          map.setFilter('h3_extrusion', filterExpr || null);
+        }
+      } else {
+        if (map.getLayer('h3_extrusion')) map.removeLayer('h3_extrusion');
+        if (map.getLayer('debug_h3_line')) map.removeLayer('debug_h3_line');
+
+        if (!map.getLayer('h3_fill')) {
+          const layerDef = {
+            id: 'h3_fill',
+            type: 'fill',
+            source: 'h3_source',
+            'source-layer': 'h3_hexagons',
+            paint: {
+              'fill-color': colorExpr,
+              'fill-opacity': opacity
+            }
+          };
+          if (filterExpr) layerDef.filter = filterExpr;
+          map.addLayer(layerDef);
+        } else {
+          map.setPaintProperty('h3_fill', 'fill-color', colorExpr);
+          map.setPaintProperty('h3_fill', 'fill-opacity', opacity);
+          map.setFilter('h3_fill', filterExpr || null);
+        }
+
+        if (showWireframe) {
+          if (!map.getLayer('h3_line')) {
+            const lineDef = {
+              id: 'h3_line',
+              type: 'line',
+              source: 'h3_source',
+              'source-layer': 'h3_hexagons',
+              paint: {
+                'line-color': 'rgba(255, 255, 255, 0.22)',
+                'line-width': 0.8
+              }
+            };
+            if (filterExpr) lineDef.filter = filterExpr;
+            map.addLayer(lineDef);
+          } else {
+            map.setFilter('h3_line', filterExpr || null);
           }
-        });
+        } else {
+          if (map.getLayer('h3_line')) map.removeLayer('h3_line');
+        }
       }
 
       // Update Legend Text
@@ -1365,12 +2152,47 @@
     // Popup Tooltip
     const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
 
+    function initViewer() {
+      // Connect dataset dropdown selector
+      const datasetSelect = document.getElementById('dataset-select');
+      if (datasetSelect) {
+        datasetSelect.addEventListener('change', (e) => {
+          if (e.target.value) {
+            loadPMTilesUrl(e.target.value);
+          }
+        });
+      }
+
+      // Initial dataset load: Check query parameter or default to Landfire FBFM40
+      if (window.location.protocol.startsWith('http')) {
+        const banner = document.getElementById('file-protocol-banner');
+        if (banner) banner.style.display = 'none';
+        const urlParams = new URLSearchParams(window.location.search);
+        const targetFile = urlParams.get('file') || '/data/LF2024_FBFM40_HI_pyramid.pmtiles';
+        if (datasetSelect) {
+          datasetSelect.value = targetFile;
+        }
+        loadPMTilesUrl(targetFile);
+      } else {
+        const banner = document.getElementById('file-protocol-banner');
+        if (banner) banner.style.display = 'block';
+      }
+    }
+
+    // Initialize dataset and UI immediately so metadata loads in parallel
+    initViewer();
+
     map.on('load', () => {
       addOrUpdateHexLayers();
     });
 
     map.on('mousemove', (e) => {
       const activeLayerId = document.getElementById('extrusion-toggle').checked ? 'h3_extrusion' : 'h3_fill';
+      if (!map.getLayer(activeLayerId)) {
+        map.getCanvas().style.cursor = '';
+        popup.remove();
+        return;
+      }
       const features = map.queryRenderedFeatures(e.point, { layers: [activeLayerId] });
       
       if (!features || !features.length) {
@@ -1381,6 +2203,64 @@
 
       map.getCanvas().style.cursor = 'pointer';
       const p = features[0].properties;
+      const hideNoData = document.getElementById('hide-nodata-toggle')?.checked ?? true;
+
+      if (hideNoData) {
+        const maj = parseInt(p.majority, 10);
+        const mean = parseFloat(p.mean);
+        const cnt = parseFloat(p.count);
+        if (maj === -9999 || maj === 0 || maj === -32768 || maj === 32767 || mean === -9999 || mean === -32768 || mean === 32767 || cnt === 0 || isNaN(cnt) || cnt <= 0) {
+          map.getCanvas().style.cursor = '';
+          popup.remove();
+          return;
+        }
+      }
+
+      if (currentMode === 'categorical') {
+        const majorityId = p.majority ?? '-';
+        const className = getClassLabel(majorityId);
+        const classIdx = detectedClasses.indexOf(parseInt(majorityId, 10));
+        const colors = getActiveColors();
+        const classColor = getClassColor(majorityId, classIdx >= 0 ? colors[classIdx % colors.length] : '#1fbdbd');
+        const purityPct = p.majority_fraction !== undefined ? (p.majority_fraction * 100).toFixed(1) + '%' : '-';
+        const entropyVal = p.entropy !== undefined ? Number(p.entropy).toFixed(2) : '-';
+        const countVal = p.count !== undefined ? Number(p.count).toLocaleString() : '-';
+
+        const html = `
+          <div class="tip-header">
+            <span class="tip-hex">${p.h3_hex || 'Hexagon'}</span>
+            <span class="tip-res">Res ${p.resolution ?? '?'}</span>
+          </div>
+          <div class="tip-grid">
+            <div class="tip-cell" style="grid-column: span 2;">
+              <div class="tip-cell-title">Dominant Category</div>
+              <div class="tip-cell-val" style="display: flex; align-items: center; gap: 6px; font-size: 11px;">
+                <span style="display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: ${classColor}; flex-shrink: 0;"></span>
+                <span>${className}</span>
+                <span style="color: var(--theme-text-dim); font-size: 9px;">(#${majorityId})</span>
+              </div>
+            </div>
+            <div class="tip-cell">
+              <div class="tip-cell-title">Purity / Certainty</div>
+              <div class="tip-cell-val">${purityPct}</div>
+            </div>
+            <div class="tip-cell">
+              <div class="tip-cell-title">Distinct Classes</div>
+              <div class="tip-cell-val">${p.distinct_classes ?? '-'}</div>
+            </div>
+            <div class="tip-cell">
+              <div class="tip-cell-title">Shannon Entropy</div>
+              <div class="tip-cell-val">${entropyVal}</div>
+            </div>
+            <div class="tip-cell">
+              <div class="tip-cell-title">Sampled Pixels</div>
+              <div class="tip-cell-val">${countVal}</div>
+            </div>
+          </div>
+        `;
+        popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+        return;
+      }
 
       const html = `
         <div class="tip-header">
@@ -1513,7 +2393,89 @@
       document.getElementById('tab-basemap').style.display = 'none';
     });
 
+    // Dataset Mode Switcher (Continuous vs. Categorical)
+    document.getElementById('dataset-mode-btn')?.addEventListener('click', () => {
+      const nextMode = currentMode === 'continuous' ? 'categorical' : 'continuous';
+      setDatasetMode(nextMode);
+    });
+
+    // Clear Categorical Filter Button
+    document.getElementById('clear-cat-filter-btn')?.addEventListener('click', () => {
+      categoricalFilter = null;
+      renderCategoryChips();
+      addOrUpdateHexLayers();
+    });
+
+    // Custom Label Editor Toggle / Presets / Apply / Clear
+    document.getElementById('toggle-label-editor-btn')?.addEventListener('click', () => {
+      const panel = document.getElementById('label-editor-panel');
+      if (panel) {
+        panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+        if (panel.style.display === 'flex' && Object.keys(userCategorySchema).length > 0) {
+          const lines = Object.entries(userCategorySchema).map(([k, v]) => {
+            if (v.color) return `${k}: ${v.label}, ${v.color}`;
+            return `${k}: ${v.label}`;
+          });
+          document.getElementById('custom-labels-textarea').value = lines.join('\n');
+        }
+      }
+    });
+
+    document.getElementById('close-label-editor-btn')?.addEventListener('click', () => {
+      const panel = document.getElementById('label-editor-panel');
+      if (panel) panel.style.display = 'none';
+    });
+
+    document.getElementById('preset-labels-select')?.addEventListener('change', (e) => {
+      const key = e.target.value;
+      if (!key || !LABEL_PRESETS[key]) return;
+      const preset = LABEL_PRESETS[key];
+      userCategorySchema = { ...preset.data };
+      try {
+        localStorage.setItem('pmtiles_user_cat_schema', JSON.stringify(userCategorySchema));
+      } catch (e) {}
+
+      const lines = Object.entries(preset.data).map(([k, v]) => `${k}: ${v.label}, ${v.color}`);
+      const textarea = document.getElementById('custom-labels-textarea');
+      if (textarea) textarea.value = lines.join('\n');
+
+      detectedClasses = extractDetectedClasses(currentMetadata);
+      renderCategoryChips();
+      renderCategoricalLegend();
+      addOrUpdateHexLayers();
+    });
+
+    document.getElementById('apply-custom-labels-btn')?.addEventListener('click', () => {
+      const text = document.getElementById('custom-labels-textarea')?.value || '';
+      userCategorySchema = parseUserCategoryLabels(text);
+      try {
+        localStorage.setItem('pmtiles_user_cat_schema', JSON.stringify(userCategorySchema));
+      } catch (e) {}
+
+      detectedClasses = extractDetectedClasses(currentMetadata);
+      renderCategoryChips();
+      renderCategoricalLegend();
+      addOrUpdateHexLayers();
+
+      const panel = document.getElementById('label-editor-panel');
+      if (panel) panel.style.display = 'none';
+    });
+
+    document.getElementById('clear-custom-labels-btn')?.addEventListener('click', () => {
+      userCategorySchema = {};
+      try {
+        localStorage.removeItem('pmtiles_user_cat_schema');
+      } catch (e) {}
+      document.getElementById('custom-labels-textarea').value = '';
+      document.getElementById('preset-labels-select').value = '';
+      detectedClasses = extractDetectedClasses(currentMetadata);
+      renderCategoryChips();
+      renderCategoricalLegend();
+      addOrUpdateHexLayers();
+    });
+
     document.getElementById('property-select').addEventListener('change', (e) => {
+      updateSection2View();
       const z = map.getZoom();
       const currentRes = getEstimatedH3Res(z);
       updateSliderRanges(e.target.value, true, currentRes);
@@ -1618,6 +2580,11 @@
 
     document.getElementById('min-val-slider').addEventListener('input', onManualSliderInput);
     document.getElementById('max-val-slider').addEventListener('input', onManualSliderInput);
+    document.getElementById('hide-nodata-toggle')?.addEventListener('change', () => {
+      renderCategoryChips();
+      renderCategoricalLegend();
+      addOrUpdateHexLayers();
+    });
     document.getElementById('wireframe-toggle').addEventListener('change', addOrUpdateHexLayers);
     document.getElementById('invert-toggle').addEventListener('change', addOrUpdateHexLayers);
 
@@ -1641,23 +2608,39 @@
       addOrUpdateHexLayers();
     });
 
+    function setBasemap(basemapKey) {
+      const config = BASEMAPS[basemapKey];
+      if (!config) return;
+
+      if (map.getLayer('basemap_layer')) {
+        try { map.removeLayer('basemap_layer'); } catch (e) {}
+      }
+      if (map.getSource('basemap_source')) {
+        try { map.removeSource('basemap_source'); } catch (e) {}
+      }
+
+      map.addSource('basemap_source', {
+        type: 'raster',
+        tiles: config.tiles,
+        tileSize: config.tileSize || 256,
+        maxzoom: config.maxzoom || 19,
+        attribution: config.attribution || ''
+      });
+
+      // Insert basemap_layer beneath all vector/hexagon layers
+      const firstHexLayerId = map.getLayer('h3_fill') 
+        ? 'h3_fill' 
+        : (map.getLayer('h3_extrusion') ? 'h3_extrusion' : (map.getLayer('h3_line') ? 'h3_line' : undefined));
+
+      map.addLayer({
+        id: 'basemap_layer',
+        type: 'raster',
+        source: 'basemap_source'
+      }, firstHexLayerId);
+    }
+
     document.getElementById('basemap-select').addEventListener('change', (e) => {
-      const selectedStyle = BASEMAPS[e.target.value];
-      
-      const onStyleLoaded = () => {
-        addOrUpdateHexLayers();
-      };
-
-      // Register listener before setStyle
-      map.once('style.load', onStyleLoaded);
-      map.setStyle(selectedStyle);
-
-      // Robust fallback in case in-memory style objects (like ESRI Satellite) load synchronously
-      setTimeout(() => {
-        if (!map.getSource('h3_source')) {
-          addOrUpdateHexLayers();
-        }
-      }, 50);
+      setBasemap(e.target.value);
     });
 
     // Drag and Drop
@@ -1679,6 +2662,7 @@
 
     function handlePMTilesFile(file) {
       document.getElementById('dropzone-filename').innerText = file.name;
+      categoricalFilter = null;
       sourceCounter++;
       const uniqueKey = `dropped_${sourceCounter}_${file.name}`;
       
@@ -1689,33 +2673,47 @@
       protocol.add(customPmtiles);
       activePMTileSource = `pmtiles://${uniqueKey}`;
 
-      if (map.getLayer('h3_fill')) map.removeLayer('h3_fill');
-      if (map.getLayer('h3_extrusion')) map.removeLayer('h3_extrusion');
-      if (map.getLayer('h3_line')) map.removeLayer('h3_line');
-      if (map.getSource('h3_source')) map.removeSource('h3_source');
+      removeHexSourceAndLayers();
 
-      customPmtiles.getMetadata().then(meta => {
-        currentMetadata = meta;
-        renderPyramidStatsTab(meta);
-        updateSliderRanges(document.getElementById('property-select').value, true);
-        updateAdaptiveModeBadge();
-        addOrUpdateHexLayers();
-      }).catch(err => {
-        console.warn("Could not read metadata:", err);
-      });
-
-      customPmtiles.getHeader().then(h => {
-        currentHeader = h;
-        if (h.minLon !== undefined && h.maxLon !== undefined && (h.minLon !== 0 || h.maxLon !== 0)) {
-          map.fitBounds([
-            [h.minLon, h.minLat],
-            [h.maxLon, h.maxLat]
-          ], { padding: 50 });
+      // Auto-load Landfire preset if filename indicates Landfire FBFM40
+      const lower = file.name.toLowerCase();
+      if (lower.includes('fbfm40') || lower.includes('lf2024') || lower.includes('landfire')) {
+        if (LABEL_PRESETS['landfire_fbfm40']) {
+          userCategorySchema = { ...LABEL_PRESETS['landfire_fbfm40'].data };
+          const textarea = document.getElementById('custom-labels-textarea');
+          if (textarea) {
+            textarea.value = Object.entries(userCategorySchema).map(([k, v]) => `${k}: ${v.label}, ${v.color}`).join('\n');
+          }
+          const presetSelect = document.getElementById('preset-labels-select');
+          if (presetSelect) presetSelect.value = 'landfire_fbfm40';
         }
+      }
 
-        addOrUpdateHexLayers();
-      }).catch(err => {
-        console.error("Header reading error:", err);
+      Promise.all([
+        customPmtiles.getMetadata().catch(err => {
+          console.warn("Could not read metadata:", err);
+          return null;
+        }),
+        customPmtiles.getHeader().catch(err => {
+          console.error("Header reading error:", err);
+          return null;
+        })
+      ]).then(([meta, h]) => {
+        if (meta) {
+          currentMetadata = meta;
+          detectedClasses = extractDetectedClasses(meta);
+          const detectedMode = detectDatasetType(meta);
+          setDatasetMode(detectedMode);
+        }
+        if (h) {
+          currentHeader = h;
+          if (h.minLon !== undefined && h.maxLon !== undefined && (h.minLon !== 0 || h.maxLon !== 0)) {
+            map.fitBounds([
+              [h.minLon, h.minLat],
+              [h.maxLon, h.maxLat]
+            ], { padding: 50, maxZoom: 12 });
+          }
+        }
         addOrUpdateHexLayers();
       });
     }
