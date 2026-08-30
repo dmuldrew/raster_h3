@@ -16,7 +16,7 @@ if [ "$#" -eq 0 ]; then
     echo ""
     echo "Running demonstration query on sample GeoTIFF..."
     echo "-----------------------------------------------------------------"
-    duckdb -unsigned < /app/demo.sql
+    duckdb -unsigned < /app/sql/demo.sql
     echo "-----------------------------------------------------------------"
     echo "Starting interactive DuckDB session..."
     echo "Example queries:"

@@ -73,8 +73,7 @@ COPY --from=builder /build/target/release/libraster_h3.so /extensions/libraster_
 COPY --from=builder /build/target/release/examples/raster_to_pmtiles /usr/local/bin/raster_to_pmtiles
 COPY --from=builder /build/target/release/examples/parquet_to_pmtiles /usr/local/bin/parquet_to_pmtiles
 COPY --from=builder /build/sample_sf.tif /data/sample_sf.tif
-COPY demo.sql /app/demo.sql
-COPY e2e_performance.sql /app/e2e_performance.sql
+COPY sql/ /app/sql/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh /usr/local/bin/raster_to_pmtiles /usr/local/bin/parquet_to_pmtiles
 
