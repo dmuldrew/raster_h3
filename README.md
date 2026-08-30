@@ -47,7 +47,7 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 
 ### Project Goals
 - **Zero Python / Zero GDAL C++ Dependencies**: A pure Rust engine compiled into a single self-contained native dynamic library (`.dylib`, `.so`, `.dll`).
-- **Bounded Constant Memory ($O(\text{Scan Front}) < 15\text{ MB}$ RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
+- **Bounded Constant Memory (O(Scan Front) < 15 MB RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
 - **Hardware-Saturating Multi-Core Throughput**: Maximizes CPU throughput by saturating disk and decompression pipelines across all available cores with linear Rayon and DuckDB thread distribution.
 - **Native PMTiles v3 Vector Pyramid Generation**: Converts raster aggregations directly into single-file Mapbox Vector Tile (`.pmtiles`) archives with zero intermediate GIS files, zero external `tippecanoe` builds, and strict mathematical H3 validity enforcement.
 - **Native H3 Parquet to PMTiles Conversion**: Converts any H3-indexed Parquet file directly to PMTiles v3 archives with auto-detected property schema and strict cell validation.
@@ -300,10 +300,10 @@ SELECT * FROM h3_raster_to_pmtiles(
 
 | # | Engineering Pillar | Description & Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | RAM stays $< 15\text{ MB}$ regardless of file size by sealing completed hexagons as scanlines pass their southern vertices. |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | RAM stays < 15 MB regardless of file size by sealing completed hexagons as scanlines pass their southern vertices. |
 | 2 | **H3 Scanline Lookahead Algorithm** | Jumps ahead along the scanline using previous hexagon widths and binary searches boundary crossings, cutting spherical trig operations by 4x. |
 | 3 | **Row-Constant Latitude Hoisting** | Evaluates transcendental projection transforms (`atan`, `exp`, PROJ) once per row rather than per pixel. |
-| 4 | **Linear Longitude Stepping** | Advances column coordinates via single 1-cycle additions ($\text{lon} \mathrel{+}= \Delta\text{lon}$). |
+| 4 | **Linear Longitude Stepping** | Advances column coordinates via single 1-cycle additions (lon += delta_lon). |
 | 5 | **In-Register Run Accumulation** | Contiguous pixels within the same H3 cell update running statistics in CPU registers, eliminating ~98% of hash table lookups. |
 | 6 | **Branchless Hardware Min/Max** | Replaces conditional branches with `minsd`/`maxsd` instructions with zero branch mispredictions. |
 | 7 | **Zero-Copy `memmap2` & Async Prefetching** | Maps GeoTIFFs into userspace virtual memory with asynchronous background chunk decompression. |
@@ -314,13 +314,13 @@ SELECT * FROM h3_raster_to_pmtiles(
 ### 1. Southernmost Scan-Line Horizon Eviction
 Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
 - Finished hexagons are immediately evicted from the hash map and streamed into DuckDB vector chunks.
-- Active memory remains strictly bounded to $O(\text{Scan Front Width})$ (**< 15 MB RAM**), allowing a standard laptop to seamlessly process a 500 GB global raster.
+- Active memory remains strictly bounded to O(Scan Front Width) (**< 15 MB RAM**), allowing a standard laptop to seamlessly process a 500 GB global raster.
 
 ### 2. H3 Scanline Lookahead Algorithm
 To process pixels at maximum throughput, `raster_h3` avoids calculating exact spherical trigonometry (H3 coordinates) for every single pixel. Instead, it uses a **Scanline Lookahead** algorithm that exploits the geometric convexity of hexagons:
 1. **The Jump Guess**: As the scanline moves horizontally across the raster, it remembers the width (in pixels) of the previously processed hexagon. It guesses the current hexagon will be the same width and jumps ahead by that exact amount.
 2. **Convexity Proof**: If the pixel at the jump destination is the exact same H3 cell, convexity mathematically guarantees that **all pixels skipped between the start and the destination** are also inside that hexagon. The algorithm skips trig math for the entire block.
-3. **Binary Search Boundary Finding**: If the jump overshoots into an adjacent hexagon, the algorithm performs an efficient **Binary Search** between the current pixel and the overshot pixel. Because the boundary must lie between these two points, it finds the exact sub-pixel edge in $O(\log_2(\text{error distance}))$ steps.
+3. **Binary Search Boundary Finding**: If the jump overshoots into an adjacent hexagon, the algorithm performs an efficient **Binary Search** between the current pixel and the overshot pixel. Because the boundary must lie between these two points, it finds the exact sub-pixel edge in O(log2(error distance)) steps.
 
 ### 3. Row-Constant Latitude Hoisting & Coordinate Hierarchy
 On North-Up rasters (Web Mercator EPSG:3857, WGS84 EPSG:4326, UTM), latitude is identical across all pixels in a row.
@@ -338,7 +338,7 @@ The transformer uses a **three-tier performance hierarchy**:
 
 When a raster pixel lies across the boundary between two or more H3 hexagons, single-point center sampling assigns 100% of the pixel's value to whichever cell contains the center point. 
 
-With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta y_i)$ are evaluated within each pixel's unit box $[0, 1] \times [0, 1]$ with fractional weights:
+With **Sub-Pixel Super-Sampling**, multiple sample offsets (dx_i, dy_i) are evaluated within each pixel's unit box [0, 1] x [0, 1] with fractional weights:
 
 ![Sub-Pixel Super-Sampling Patterns](assets/sampling_patterns.svg)
 
@@ -346,14 +346,14 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets $(\Delta x_i, \Delta 
 
 | Preset Name | Points | Weighting | Geometric Rationale | Why & When to Use |
 | :--- | :---: | :--- | :--- | :--- |
-| **`'center'`** *(default)* | 1 | $1.0$ (Center) | Centroid evaluation | **Maximum speed**: Best when raster pixels are much smaller than H3 cells (e.g. 10m Sentinel vs Res 7 cells). |
-| **`'rgss'`** / `'rotated4'` ⭐ | 4 | $0.25$ each | 26.6° rotated grid ($\arctan 0.5$) | **Best overall balance**: No two points share the same X or Y axis, eliminating collinear boundary blind spots with only 4 samples. |
-| **`'hex'`** / `'7point'` | 7 | $\frac{1}{7}$ each | Inscribed regular hexagon | **H3 Geometry Alignment**: Matches the natural hexagonal symmetry of H3 cell edges with zero directional bias. |
-| **`'gaussian'`** / `'psf'` | 5 | Center $0.50$, Edges $0.125$ | Gaussian Point Spread Function | **Optical Sensor Emulation**: Emulates real-world satellite sensor response where the pixel center is more sensitive than the corners. |
-| **`'5point'`** / `'quincunx'` | 5 | $0.20$ each | Center + 4 diagonal corners | **Classic Area Weighting**: Standard 5-point super-sampling. |
-| **`'8rooks'`** / `'stratified8'`| 8 | $\frac{1}{8}$ each | Latin Hypercube non-attacking rooks | **Diagonal Anti-Aliasing**: Eliminates sample clumping along diagonal hexagon edges. |
-| **`'9point'`** / `'3x3'` | 9 | $\frac{1}{9}$ each | Regular 3 × 3 grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
-| **`'16point'`** / `'4x4'` | 16 | $\frac{1}{16}$ each | Regular 4 × 4 grid | **Coarse → Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
+| **`'center'`** *(default)* | 1 | 1.0 (Center) | Centroid evaluation | **Maximum speed**: Best when raster pixels are much smaller than H3 cells (e.g. 10m Sentinel vs Res 7 cells). |
+| **`'rgss'`** / `'rotated4'` ⭐ | 4 | 0.25 each | 26.6° rotated grid (arctan 0.5) | **Best overall balance**: No two points share the same X or Y axis, eliminating collinear boundary blind spots with only 4 samples. |
+| **`'hex'`** / `'7point'` | 7 | 1/7 each | Inscribed regular hexagon | **H3 Geometry Alignment**: Matches the natural hexagonal symmetry of H3 cell edges with zero directional bias. |
+| **`'gaussian'`** / `'psf'` | 5 | Center 0.50, Edges 0.125 | Gaussian Point Spread Function | **Optical Sensor Emulation**: Emulates real-world satellite sensor response where the pixel center is more sensitive than the corners. |
+| **`'5point'`** / `'quincunx'` | 5 | 0.20 each | Center + 4 diagonal corners | **Classic Area Weighting**: Standard 5-point super-sampling. |
+| **`'8rooks'`** / `'stratified8'`| 8 | 1/8 each | Latin Hypercube non-attacking rooks | **Diagonal Anti-Aliasing**: Eliminates sample clumping along diagonal hexagon edges. |
+| **`'9point'`** / `'3x3'` | 9 | 1/9 each | Regular 3 × 3 grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
+| **`'16point'`** / `'4x4'` | 16 | 1/16 each | Regular 4 × 4 grid | **Coarse → Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
 
 ---
 
@@ -455,25 +455,48 @@ flowchart LR
 * **Instant Out-of-the-Box Client Compatibility**: Supported natively or via 1-line plugins in **MapLibre GL JS**, **Mapbox GL JS**, **Kepler.gl**, **Protomaps**, **Deck.gl**, and **Felt**.
 
 ### H3 Resolution to PMTiles Zoom Level Mapping
-Because H3 uses an **Aperture-7** hexagonal hierarchy ($7\times$ area reduction per step) while Web Mercator uses an **Aperture-4** quadtree ($4\times$ area reduction per zoom level), the mathematical scaling ratio is:
+Because H3 uses an Aperture-7 hexagonal hierarchy (7x area reduction per step) while Web Mercator uses an Aperture-4 quadtree (4x area reduction per zoom level), the mathematical scaling ratio is:
 
-$$\frac{\Delta \text{Zoom}}{\Delta R} = \log_4(7) \approx \mathbf{1.4037}$$
+Delta Zoom / Delta Resolution = log4(7) = 1.4037
 
-To ensure optimal visual density on screen (**150 to 2,500 hexagons per 512px tile**) without WebGL frame drops, `raster_h3` maps H3 resolutions to Web Mercator zoom levels as follows:
+To ensure optimal visual density on screen (150 to 2,500 hexagons per 512px tile) without WebGL frame drops, `raster_h3` maps H3 resolutions to Web Mercator zoom levels as follows:
 
-| H3 Res ($R$) | Avg Hexagon Area | Avg Edge Length | Geographic Scale | Recommended PMTiles Zoom | Hexagons / 512px Tile |
+| H3 Res (R) | Avg Hexagon Area | Avg Edge Length | Geographic Scale | Recommended PMTiles Zoom | Hexagons / 512px Tile |
 | :---: | :---: | :---: | :--- | :---: | :---: |
-| **Res 0** | $4,357,449 \text{ km}^2$ | $1,107 \text{ km}$ | Global / Hemispheric | **Z0 – Z1** | ~10 – 30 |
-| **Res 1** | $609,788 \text{ km}^2$ | $418 \text{ km}$ | Continental | **Z2 – Z3** | ~30 – 100 |
-| **Res 2** | $86,801 \text{ km}^2$ | $158 \text{ km}$ | Sub-Continental | **Z3 – Z4** | ~50 – 200 |
-| **Res 3** | $12,393 \text{ km}^2$ | $59.8 \text{ km}$ | State / Province | **Z5 – Z6** | ~100 – 400 |
-| **Res 4** | $1,770 \text{ km}^2$ | $22.6 \text{ km}$ | Metropolitan Area | **Z7 – Z8** | ~200 – 600 |
-| **Res 5** | $252.9 \text{ km}^2$ | $8.54 \text{ km}$ | County / Large City | **Z8 – Z9** | ~300 – 900 |
-| **Res 6** | $36.13 \text{ km}^2$ | $3.23 \text{ km}$ | Municipal / Urban District | **Z10 – Z11** | ~400 – 1,200 |
-| **Res 7** | $5.16 \text{ km}^2$ | $1.22 \text{ km}$ | Neighborhood / Watershed | **Z11 – Z12** | ~500 – 1,500 |
-| **Res 8** | $0.737 \text{ km}^2$ ($73.7 \text{ ha}$) | $461 \text{ m}$ | City Block | **Z13 – Z14** | ~600 – 1,800 |
-| **Res 9** | $0.105 \text{ km}^2$ ($10.5 \text{ ha}$) | $174 \text{ m}$ | Parcel / Intersection | **Z14 – Z15** | ~700 – 2,200 |
-| **Res 10** | $0.015 \text{ km}^2$ ($1.5 \text{ ha}$) | $65.9 \text{ m}$ | Building Footprint / Lot | **Z16 – Z17** | ~800 – 2,500 |
+| **Res 0** | 4,357,449 km² | 1,107 km | Global / Hemispheric | **Z0 – Z1** | ~10 – 30 |
+| **Res 1** | 609,788 km² | 418 km | Continental | **Z2 – Z3** | ~30 – 100 |
+| **Res 2** | 86,801 km² | 158 km | Sub-Continental | **Z3 – Z4** | ~50 – 200 |
+| **Res 3** | 12,393 km² | 59.8 km | State / Province | **Z5 – Z6** | ~100 – 400 |
+| **Res 4** | 1,770 km² | 22.6 km | Metropolitan Area | **Z7 – Z8** | ~200 – 600 |
+| **Res 5** | 252.9 km² | 8.54 km | County / Large City | **Z8 – Z9** | ~300 – 900 |
+| **Res 6** | 36.13 km² | 3.23 km | Municipal / Urban District | **Z10 – Z11** | ~400 – 1,200 |
+| **Res 7** | 5.16 km² | 1.22 km | Neighborhood / Watershed | **Z11 – Z12** | ~500 – 1,500 |
+| **Res 8** | 0.737 km² (73.7 ha) | 461 m | City Block | **Z13 – Z14** | ~600 – 1,800 |
+| **Res 9** | 0.105 km² (10.5 ha) | 174 m | Parcel / Intersection | **Z14 – Z15** | ~700 – 2,200 |
+| **Res 10** | 0.015 km² (1.5 ha) | 65.9 m | Building Footprint / Lot | **Z16 – Z17** | ~800 – 2,500 |
+
+### PMTiles v3 Leaf Directory Architecture
+For massive multi-resolution archives containing tens of thousands or millions of vector tiles, `raster_h3` automatically constructs **PMTiles v3 Leaf Directories**:
+* **16 KB Root Fetch Budget**: The PMTiles v3 specification specifies that web clients (e.g. `pmtiles.js`) fetch only the first 16 KB (bytes 0 to 16383) during initialization to retrieve the archive header and root directory index.
+* **4,096-Entry Leaf Chunks**: When tile counts exceed a single directory block, directory entries are partitioned into compressed leaf directory blocks (~4 to 8 KB each). The root directory retains lightweight pointer entries (`run_length = 0`, pointing to leaf byte offsets and lengths).
+* **Instant Scalability**: Compressed root directories remain under 150 bytes regardless of dataset size (e.g., 60,000+ tiles compressed from 87 KB down to 122 bytes), ensuring instantaneous startup and sub-millisecond viewport tile lookups.
+
+### Embedded Multi-Resolution Statistical Metadata (`h3_resolution_stats`)
+`raster_h3` automatically embeds rich statistical envelopes across all pyramid levels directly inside the PMTiles JSON metadata:
+```json
+{
+  "h3_resolution_stats": {
+    "5": {
+      "cell_count": 512,
+      "zooms": [5, 6],
+      "mean": { "min": 12.4, "max": 892.1, "avg": 341.2 },
+      "purity": 0.942,
+      "distinct_classes": { "min": 1, "max": 8, "avg": 1.4 }
+    }
+  }
+}
+```
+This enables client applications to adaptively normalize color ramps, configure dynamic slider bounds, and inspect cross-resolution aggregation metrics without downloading raw feature data.
 
 ### MapLibre GL JS Integration Example
 ```javascript
@@ -517,15 +540,26 @@ map.on('load', () => {
 
 ---
 
-### Lightweight Web Viewer (`pmtiles_viewer`)
+### PMTiles Hexagon Studio Web Viewer (`pmtiles_viewer`)
 
-`raster_h3` includes a dedicated, lightweight browser-based PMTiles viewer in `pmtiles_viewer/` for inspecting and visualizing generated H3 vector pyramids with zero build steps or external dependencies:
+`raster_h3` includes a dedicated browser-based visual exploration studio in `pmtiles_viewer/` for inspecting both continuous and categorical H3 vector pyramids:
 
+#### 1. Launch via Local Streaming Server (Recommended)
 ```bash
-# Launch local PMTiles server with HTTP byte-range support
+# Launch local server with HTTP byte-range and CORS support
 python3 pmtiles_viewer/server.py 8080
 ```
-Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-line colormap selection, 3D hexagon extrusion, value filtering, and interactive property inspection.
+Open **`http://localhost:8080/pmtiles_viewer/`** to stream multi-resolution PMTiles archives dynamically over HTTP byte-range requests.
+
+#### 2. Offline Mode via Local File Drag-and-Drop
+If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome blocks network HTTP fetch requests. You can click the left sidebar dropzone (**📁 Click to select file from disk**) or drag and drop any `.pmtiles` archive to load it 100% offline via the native browser `FileReader` API (`pmtiles.FileSource`).
+
+#### Viewer Features:
+* **Dual Visualization Modes**: Auto-detects Continuous (mean, stddev, sum, min, max) vs. Categorical (majority class, purity, histogram, distinct classes) data.
+* **Curated Color Palettes**: Built-in cartographic palettes (Viridis, Turbo, Magma, Plasma, Cividis, Inferno, Spectral, etc.).
+* **LANDFIRE & Custom Category Schemes**: Preloaded LANDFIRE 40 Fire Behavior Fuel Models (FBFM40) classification scheme with live category label and color editing.
+* **3D Hexagon Extrusion & Wireframe**: Real-time 3D volumetric extrusion scaled by physical quantities or majority class certainty.
+* **Resolution-Adaptive Color Normalization**: Synchronizes slider ranges dynamically as you zoom across H3 pyramid levels.
 
 ---
 
@@ -536,7 +570,7 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 | Dimension | Python (`rasterio` + `h3-py` + `pyproj`) | PostGIS (`raster2pgsql` + `ST_H3_Polyfill`) | GDAL CLI (`gdal_polygonize` + `ogr2ogr`) | `raster_h3` (Native DuckDB) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Execution Environment** | Python interpreter with C-extension FFI | PostgreSQL database daemon | External CLI toolchain | **Embedded inside DuckDB query engine** |
-| **Memory Architecture** | Allocates full 2D coordinate meshgrids in RAM | Subject to PostgreSQL shared buffer limits | Allocates intermediate polygon geometries | **Bounded $O(\text{Scan Front}) < 15\text{ MB}$ RAM** |
+| **Memory Architecture** | Allocates full 2D coordinate meshgrids in RAM | Subject to PostgreSQL shared buffer limits | Allocates intermediate polygon geometries | **Bounded O(Scan Front) < 15 MB RAM** |
 | **Coordinate Transforms** | Evaluated per pixel independently | Evaluated per geometry | Evaluated during polygonization | **Row-constant hoisting (1 transform / row)** |
 | **H3 Index Calculation** | Per-pixel C/FFI boundary crossings | Point-in-polygon spatial queries | Geometry intersection & rasterization | **Scanline lookahead + run accumulation** |
 | **Intermediate Storage** | NumPy arrays or temporary scratch files | Database table storage & index bloat | Multi-gigabyte shapefiles / GeoJSON | **Zero intermediate files (direct stream)** |
@@ -546,7 +580,7 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 ### Detailed Architectural Nuances
 
 #### 1. Python Pipelines (`rasterio` + `h3-py` / `scipy` / `numpy`)
-- **Coordinate Meshgrid Allocations**: `rasterio.transform.xy` and `pyproj.Transformer` allocate 2D floating-point arrays for $X$, $Y$, $\text{Lat}$, and $\text{Lon}$ ($40+$ bytes per pixel), requiring gigabytes of RAM for large rasters.
+- **Coordinate Meshgrid Allocations**: `rasterio.transform.xy` and `pyproj.Transformer` allocate 2D floating-point arrays for X, Y, Lat, and Lon (40+ bytes per pixel), requiring gigabytes of RAM for large rasters.
 - **Per-Pixel C/FFI Crossing Overhead**: Calling `h3.latlng_to_cell()` millions of times invokes Python C/ctypes wrapper overhead on every call, allocating individual heap objects.
 - **Redundant Trigonometry**: Evaluates projection math independently on all pixels without scanline hoisting.
 - **Single-Threaded GIL**: Python loops cannot fully saturate modern multi-core processors without multiprocessing IPC serialization overhead.
@@ -570,12 +604,12 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :---: | :--- | :--- |
 | `file_path` | `VARCHAR` | **Yes** | — | Path to the GeoTIFF / Cloud-Optimized GeoTIFF file. |
-| `resolution` | `BIGINT` | No | `8` | Target H3 grid resolution level ($0 \le R \le 15$). |
+| `resolution` | `BIGINT` | No | `8` | Target H3 grid resolution level (0 to 15). |
 
 #### Named Parameters
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level ($0 \le R \le 15$). |
+| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level (0 to 15). |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
@@ -601,12 +635,12 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 
 | Statistic | Mathematical Formula | Geospatial Analytics Use Case | Why & When to Use |
 | :--- | :--- | :--- | :--- |
-| **`mean`** | $\bar{x} = \frac{\sum w_i \cdot x_i}{\sum w_i}$ | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
-| **`stddev`** | $s = \sqrt{\frac{M_2}{\sum w_i - 1}}$ where $M_2 = \sum w_i (x_i - \bar{x}_{k-1})(x_i - \bar{x}_k)$ | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep terrain; low `stddev` indicates flat plains. |
-| **`count`** | $N = \sum w_i$ | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns integer count of pixels in cell. In super-sampling, returns fractional area coverage. |
-| **`min`** | $\min_i(x_i)$ | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch penalties. |
-| **`max`** | $\max_i(x_i)$ | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building height. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
-| **`sum`** | $\sum w_i \cdot x_i$ | **Cumulative Physical Quantities**: Total precipitation volume, solar radiation flux, biomass carbon stock. | Used whenever raster pixel values represent density or rate per unit area that integrates across the hexagon. |
+| **`mean`** | sum(w_i * x_i) / sum(w_i) | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
+| **`stddev`** | sqrt(M2 / (sum(w_i) - 1)) | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep terrain; low `stddev` indicates flat plains. |
+| **`count`** | sum(w_i) | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns integer count of pixels in cell. In super-sampling, returns fractional area coverage. |
+| **`min`** | min(x_i) | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch penalties. |
+| **`max`** | max(x_i) | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building height. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
+| **`sum`** | sum(w_i * x_i) | **Cumulative Physical Quantities**: Total precipitation volume, solar radiation flux, biomass carbon stock. | Used whenever raster pixel values represent density or rate per unit area that integrates across the hexagon. |
 
 ---
 
@@ -616,7 +650,7 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 #### Named Parameters
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level ($0 \le R \le 15$). |
+| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level (0 to 15). |
 | `format` | `VARCHAR` | `'wide'` | Output layout: `'wide'` (majority + histogram) or `'long'` (normalized rows). |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). |
@@ -631,7 +665,7 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 | `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index. |
 | `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation. |
 | `majority_class` | `BIGINT` | Most frequent category ID in the hexagon. |
-| `majority_fraction` | `DOUBLE` | Fraction ($0.0 \dots 1.0$) of the hexagon occupied by majority class. |
+| `majority_fraction` | `DOUBLE` | Fraction (0.0 to 1.0) of the hexagon occupied by majority class. |
 | `majority_count` | `DOUBLE` | Weighted pixel count of the majority category. |
 | `unique_classes` | `BIGINT` | Number of distinct categories present in the hexagon (richness). |
 | `total_count` | `DOUBLE` | Total non-nodata pixels in the hexagon. |
@@ -644,7 +678,7 @@ Open **`http://localhost:8080/pmtiles_viewer/`** to explore datasets with in-lin
 | `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation. |
 | `category` | `BIGINT` | Category ID present in this hexagon. |
 | `count` | `DOUBLE` | Weighted pixel count for this category. |
-| `fraction` | `DOUBLE` | Proportion ($0.0 \dots 1.0$) of this category in the hexagon. |
+| `fraction` | `DOUBLE` | Proportion (0.0 to 1.0) of this category in the hexagon. |
 | `total_count` | `DOUBLE` | Total pixels in the hexagon across all categories. |
 
 ---
@@ -716,8 +750,8 @@ Returns the same 7-column summary schema as `h3_raster_to_pmtiles` (`total_hexag
 | `string_to_h3` | `(VARCHAR)` | `UBIGINT` | Fast ASCII hexadecimal to 64-bit integer parser. |
 | `h3_to_lat` | `(UBIGINT)` | `DOUBLE` | Centroid latitude in WGS84 decimal degrees. |
 | `h3_to_lng` | `(UBIGINT)` | `DOUBLE` | Centroid longitude in WGS84 decimal degrees. |
-| `h3_get_resolution` | `(UBIGINT)` | `BIGINT` | Single-cycle bitshift extraction of H3 resolution level ($0 \dots 15$). |
-| `h3_is_valid` | `(UBIGINT)` / `(VARCHAR)` | `BOOLEAN` | Validates mode, base cell range ($0..121$), resolution ($0..15$), directional digits, and padding. |
+| `h3_get_resolution` | `(UBIGINT)` | `BIGINT` | Single-cycle bitshift extraction of H3 resolution level (0 to 15). |
+| `h3_is_valid` | `(UBIGINT)` / `(VARCHAR)` | `BOOLEAN` | Validates mode, base cell range (0 to 121), resolution (0 to 15), directional digits, and padding. |
 
 ---
 

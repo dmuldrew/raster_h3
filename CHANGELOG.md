@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-30
+
+### Added
+- **PMTiles v3 Leaf Directories Implementation**:
+  - Implemented automatic chunking of PMTiles directory indices into 4,096-entry leaf directory blocks with `run_length = 0` root pointer entries.
+  - Compressed root directories from ~87 KB down to ~122 bytes, strictly adhering to the PMTiles v3 initial 16 KB HTTP range request specification (`bytes=0-16383`) and eliminating `unexpected EOF` buffer truncation in `pmtiles.js`.
+- **Per-Resolution Statistical Metadata (`h3_resolution_stats`)**:
+  - Automatically computes and embeds multi-resolution statistical envelopes (cell count, min, max, mean, stddev, sum, purity, distinct classes, Shannon entropy) directly in PMTiles JSON metadata.
+- **Enhanced PMTiles Studio Viewer (`pmtiles_viewer/`)**:
+  - Dual Continuous and Categorical visualization modes with auto-detection from metadata.
+  - LANDFIRE FBFM40 fuel model preset colormaps, custom category label/color editor, and class-level filtering.
+  - Offline local file drag-and-drop and file picker support via `pmtiles.FileSource` (FileReader API) allowing 100% offline inspection on `file://` URLs.
+  - Interactive 3D hexagon extrusion, wireframe mesh overlay, and resolution-adaptive color normalization.
+  - Python HTTP server with wildcard CORS and byte-range request streaming support.
+
+### Changed
+- **Single-Pass Multi-Resolution Vector Tiler**:
+  - Eliminated premature mid-stream tile eviction to ensure all vector tiles are accumulated across the entire raster and encoded with unique Hilbert/ZXY tile IDs.
+  - Expanded categorical class frequency tracking from 20 up to 256 classes per hexagon.
+
+### Fixed
+- **PMTiles v3 Web Compatibility**:
+  - Resolved `Search engine null is not supported` extension collisions and added solid fallbacks in WebGL shaders for unmapped categorical classes.
+  - Added MapLibre GL error interceptors and diagnostic visual wireframes for instant debugging.
+
 ## [0.1.0] - 2026-08-26
 
 ### Added
