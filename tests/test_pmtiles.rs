@@ -20,10 +20,10 @@ fn test_mvt_protobuf_encoding() {
     let vertices: Vec<h3o::LatLng> = cell.boundary().iter().copied().collect();
 
     let properties = vec![
-        ("h3_index".to_string(), MvtValue::UInt(cell.into())),
-        ("h3_hex".to_string(), MvtValue::String("8728308281fffff".to_string())),
-        ("mean".to_string(), MvtValue::Double(123.45)),
-        ("count".to_string(), MvtValue::Double(42.0)),
+        ("h3_index".into(), MvtValue::UInt(cell.into())),
+        ("h3_hex".into(), MvtValue::String("8728308281fffff".to_string())),
+        ("mean".into(), MvtValue::Double(123.45)),
+        ("count".into(), MvtValue::Double(42.0)),
     ];
 
     layer.add_hexagon(

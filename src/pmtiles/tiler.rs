@@ -3,7 +3,8 @@
 //! Orchestrates the streaming aggregation of GeoTIFF rasters across multiple H3 resolutions
 //! and packages the resulting vector hexagons directly into a single PMTiles v3 archive.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, LatLng};
@@ -11,8 +12,7 @@ use rayon::prelude::*;
 use serde_json::json;
 
 use crate::aggregator::multi_horizon::{MultiContinuousRecord, MultiScanHorizonStreamer, MultiCategoricalRecord, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
-use crate::functions::fast_hex::fast_hex_u64;
-use crate::pmtiles::mvt::{MvtLayer, MvtValue};
+use crate::pmtiles::mvt::{MercatorPoint, MvtLayer, MvtValue};
 use crate::pmtiles::writer::PmtilesWriter;
 use crate::raster::geotiff::GeoTiffStreamReader;
 
@@ -29,6 +29,15 @@ pub fn lon_lat_to_tile_xy(lon: f64, lat: f64, z: u8) -> (u32, u32) {
         .min(n - 1.0) as u32;
 
     (x, y)
+}
+
+/// Convert a normalized MercatorPoint to tile coordinates (x, y) at zoom z using cheap bitshifts
+#[inline(always)]
+pub fn mercator_to_tile_xy(pt: MercatorPoint, z: u8) -> (u32, u32) {
+    let n = (1u32 << z) as f64;
+    let tx = (pt.x * n).floor().max(0.0).min(n - 1.0) as u32;
+    let ty = (pt.y * n).floor().max(0.0).min(n - 1.0) as u32;
+    (tx, ty)
 }
 
 /// Compute WGS84 bounding box [min_lon, min_lat, max_lon, max_lat] for tile (z, x, y)
@@ -56,6 +65,24 @@ pub fn cell_tile_range(center: LatLng, vertices: &[LatLng], z: u8) -> (u32, u32,
 
     for v in vertices {
         let (tx, ty) = lon_lat_to_tile_xy(v.lng(), v.lat(), z);
+        min_tx = min_tx.min(tx);
+        max_tx = max_tx.max(tx);
+        min_ty = min_ty.min(ty);
+        max_ty = max_ty.max(ty);
+    }
+
+    (min_tx, max_tx, min_ty, max_ty)
+}
+
+/// Determine the tile coordinate range for an H3 cell with precalculated normalized Mercator points
+#[inline(always)]
+pub fn cell_tile_range_mercator(center: MercatorPoint, vertices: &[MercatorPoint], z: u8) -> (u32, u32, u32, u32) {
+    let (mut min_tx, mut min_ty) = mercator_to_tile_xy(center, z);
+    let mut max_tx = min_tx;
+    let mut max_ty = min_ty;
+
+    for &v in vertices {
+        let (tx, ty) = mercator_to_tile_xy(v, z);
         min_tx = min_tx.min(tx);
         max_tx = max_tx.max(tx);
         min_ty = min_ty.min(ty);
@@ -114,6 +141,51 @@ pub fn zooms_for_h3_res(res: u8, min_res: u8) -> Vec<u8> {
         (0..=max_z).collect()
     } else {
         standard_zooms
+    }
+}
+
+/// Estimate maximum radius (in WGS84 degrees) of an H3 hexagon at resolution res
+pub fn max_hex_radius_deg(res: u8) -> f64 {
+    match res {
+        0 => 12.0,
+        1 => 4.5,
+        2 => 1.7,
+        3 => 0.65,
+        4 => 0.25,
+        5 => 0.10,
+        6 => 0.04,
+        7 => 0.015,
+        8 => 0.006,
+        9 => 0.0025,
+        10 => 0.001,
+        11 => 0.0004,
+        12 => 0.00015,
+        13 => 0.00006,
+        14 => 0.000025,
+        _ => 0.00001,
+    }
+}
+
+/// Priority queue entry for tile eviction ordered by southernmost latitude
+#[derive(Clone, Copy, PartialEq)]
+struct TileEvictionEntry {
+    safe_evict_lat: f64,
+    tile_key: (u8, u32, u32),
+}
+
+impl Eq for TileEvictionEntry {}
+
+impl Ord for TileEvictionEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.safe_evict_lat
+            .partial_cmp(&other.safe_evict_lat)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for TileEvictionEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -253,12 +325,15 @@ impl ResolutionAccumulatorStats {
 #[derive(Debug, Clone)]
 pub struct H3Feature {
     pub h3_index: u64,
-    pub properties: Vec<(String, MvtValue)>,
+    pub properties: Vec<(Cow<'static, str>, MvtValue)>,
 }
 
 impl H3Feature {
-    pub fn new(h3_index: u64, properties: Vec<(String, MvtValue)>) -> Self {
-        Self { h3_index, properties }
+    pub fn new<K: Into<Cow<'static, str>>>(h3_index: u64, properties: Vec<(K, MvtValue)>) -> Self {
+        Self {
+            h3_index,
+            properties: properties.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+        }
     }
 }
 
@@ -319,44 +394,42 @@ impl H3PmtilesTiler {
             if c_lat < global_min_lat { global_min_lat = c_lat; }
             if c_lat > global_max_lat { global_max_lat = c_lat; }
 
+            let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
+            let vertices_merc: Vec<MercatorPoint> = cell.boundary()
+                .iter()
+                .map(|v| MercatorPoint::from_lat_lng(v.lat(), v.lng()))
+                .collect();
+
             let res_u8: u8 = cell.resolution().into();
             let zoom = h3_res_to_zoom(res_u8);
             if zoom < min_zoom { min_zoom = zoom; }
             if zoom > max_zoom { max_zoom = zoom; }
 
-            let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
-
             let mut properties = feat.properties;
-            let mut hex_buf = [0u8; 16];
-            let hex_bytes = fast_hex_u64(feat.h3_index, &mut hex_buf);
-            let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("").to_string();
-
             if !properties.iter().any(|(k, _)| k == "h3_index") {
-                properties.push(("h3_index".to_string(), MvtValue::UInt(feat.h3_index)));
+                properties.push((Cow::Borrowed("h3_index"), MvtValue::UInt(feat.h3_index)));
             }
             if !properties.iter().any(|(k, _)| k == "h3_hex") {
-                properties.push(("h3_hex".to_string(), MvtValue::String(hex_str)));
+                properties.push((Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(feat.h3_index)));
             }
             if !properties.iter().any(|(k, _)| k == "resolution") {
-                properties.push(("resolution".to_string(), MvtValue::UInt(res_u8 as u64)));
+                properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));
             }
 
-            let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+            let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, &vertices_merc, zoom);
             for tx in min_tx..=max_tx {
                 for ty in min_ty..=max_ty {
                     let tile_key = (zoom, tx, ty);
                     let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
                         MvtLayer::new("h3_hexagons")
                     });
-                    let bbox = tile_xy_to_bbox(zoom, tx, ty);
 
-                    layer.add_hexagon(
+                    layer.add_hexagon_mercator(
                         feat.h3_index,
-                        &boundary_vertices,
-                        bbox[0],
-                        bbox[2],
-                        bbox[1],
-                        bbox[3],
+                        &vertices_merc,
+                        zoom,
+                        tx,
+                        ty,
                         properties.clone(),
                     );
                 }
@@ -403,11 +476,15 @@ impl H3PmtilesTiler {
         let total_tiles = tile_buckets.len();
         let encoded_tiles: Vec<((u8, u32, u32), Vec<u8>)> = tile_buckets
             .into_par_iter()
-            .map(|((z, x, y), layer)| ((z, x, y), layer.encode()))
+            .map(|((z, x, y), layer)| {
+                let pbf_bytes = layer.encode();
+                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
+                ((z, x, y), compressed)
+            })
             .collect();
 
-        for ((z, x, y), mvt_bytes) in encoded_tiles {
-            writer.add_tile(z, x, y, &mvt_bytes)?;
+        for ((z, x, y), compressed_bytes) in encoded_tiles {
+            writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
         }
 
         writer.finish(output_path)?;
@@ -439,10 +516,12 @@ impl H3PmtilesTiler {
             }
         }
 
+        let max_cell_radius = resolutions.iter().map(|&r| max_hex_radius_deg(r)).fold(0.0f64, f64::max);
+        let safety_margin = 2.5 * max_cell_radius;
+
         let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
-        let mut tile_south_lats: HashMap<(u8, u32, u32), f64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+        let mut tile_eviction_queue: BinaryHeap<TileEvictionEntry> = BinaryHeap::new();
 
         let mut total_hexagons = 0usize;
         let mut global_min_lon = 180.0f64;
@@ -488,43 +567,50 @@ impl H3PmtilesTiler {
                     if c_lat < global_min_lat { global_min_lat = c_lat; }
                     if c_lat > global_max_lat { global_max_lat = c_lat; }
 
-                    let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
-
-                    let mut hex_buf = [0u8; 16];
-                    let hex_bytes = fast_hex_u64(h3_index, &mut hex_buf);
-                    let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("").to_string();
+                    let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
+                    let vertices_merc: Vec<MercatorPoint> = cell.boundary()
+                        .iter()
+                        .map(|v| MercatorPoint::from_lat_lng(v.lat(), v.lng()))
+                        .collect();
 
                     let properties = vec![
-                        ("h3_index".to_string(), MvtValue::UInt(h3_index)),
-                        ("h3_hex".to_string(), MvtValue::String(hex_str)),
-                        ("resolution".to_string(), MvtValue::UInt(resolution as u64)),
-                        ("mean".to_string(), MvtValue::Double(accumulator.mean())),
-                        ("sum".to_string(), MvtValue::Double(accumulator.sum)),
-                        ("stddev".to_string(), MvtValue::Double(accumulator.stddev())),
-                        ("count".to_string(), MvtValue::Double(accumulator.count)),
-                        ("min".to_string(), MvtValue::Double(accumulator.min)),
-                        ("max".to_string(), MvtValue::Double(accumulator.max)),
+                        (Cow::Borrowed("h3_index"), MvtValue::UInt(h3_index)),
+                        (Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(h3_index)),
+                        (Cow::Borrowed("resolution"), MvtValue::UInt(resolution as u64)),
+                        (Cow::Borrowed("mean"), MvtValue::Double(accumulator.mean())),
+                        (Cow::Borrowed("sum"), MvtValue::Double(accumulator.sum)),
+                        (Cow::Borrowed("stddev"), MvtValue::Double(accumulator.stddev())),
+                        (Cow::Borrowed("count"), MvtValue::Double(accumulator.count)),
+                        (Cow::Borrowed("min"), MvtValue::Double(accumulator.min)),
+                        (Cow::Borrowed("max"), MvtValue::Double(accumulator.max)),
                     ];
 
                     let zooms = zooms_for_h3_res(resolution, min_res);
                     for &zoom in &zooms {
-                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, &vertices_merc, zoom);
                         for tx in min_tx..=max_tx {
                             for ty in min_ty..=max_ty {
                                 let tile_key = (zoom, tx, ty);
-                                let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                                    MvtLayer::new("h3_hexagons")
-                                });
-                                let bbox = tile_xy_to_bbox(zoom, tx, ty);
-                                tile_south_lats.entry(tile_key).or_insert(bbox[1]);
+                                let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
+                                    l
+                                } else {
+                                    let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                                    let safe_evict_lat = bbox[1] - safety_margin;
+                                    tile_eviction_queue.push(TileEvictionEntry {
+                                        safe_evict_lat,
+                                        tile_key,
+                                    });
+                                    tile_buckets.entry(tile_key).or_insert_with(|| {
+                                        MvtLayer::new("h3_hexagons")
+                                    })
+                                };
 
-                                layer.add_hexagon(
+                                layer.add_hexagon_mercator(
                                     h3_index,
-                                    &boundary_vertices,
-                                    bbox[0],
-                                    bbox[2],
-                                    bbox[1],
-                                    bbox[3],
+                                    &vertices_merc,
+                                    zoom,
+                                    tx,
+                                    ty,
                                     properties.clone(),
                                 );
                             }
@@ -534,13 +620,50 @@ impl H3PmtilesTiler {
                     total_hexagons += 1;
                 }
             }
+
+            // Evict completed tiles whose southernmost reach is north of current scanline horizon
+            let lat_horizon = streamer.current_lat_horizon();
+            let mut ready_tiles = Vec::new();
+            while let Some(top) = tile_eviction_queue.peek() {
+                if top.safe_evict_lat > lat_horizon {
+                    let entry = tile_eviction_queue.pop().unwrap();
+                    if let Some(layer) = tile_buckets.remove(&entry.tile_key) {
+                        ready_tiles.push((entry.tile_key, layer));
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if !ready_tiles.is_empty() {
+                let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = ready_tiles
+                    .into_par_iter()
+                    .map(|(key, layer)| {
+                        let pbf_bytes = layer.encode();
+                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
+                        (key, compressed)
+                    })
+                    .collect();
+
+                for ((z, x, y), compressed_bytes) in compressed_batch {
+                    writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
+                }
+            }
         }
 
-        // Encode all vector tiles exactly once at raster completion
-        for (key, layer) in tile_buckets {
-            let (z, x, y) = key;
-            let pbf_bytes = layer.encode();
-            writer.add_tile(z, x, y, &pbf_bytes)?;
+        // Flush any remaining active tiles at raster completion in parallel
+        let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = tile_buckets.into_iter().collect();
+        let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = remaining_tiles
+            .into_par_iter()
+            .map(|(key, layer)| {
+                let pbf_bytes = layer.encode();
+                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
+                (key, compressed)
+            })
+            .collect();
+
+        for ((z, x, y), compressed_bytes) in compressed_batch {
+            writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
         }
 
         if total_hexagons == 0 {
@@ -620,10 +743,12 @@ impl H3PmtilesTiler {
             }
         }
 
+        let max_cell_radius = resolutions.iter().map(|&r| max_hex_radius_deg(r)).fold(0.0f64, f64::max);
+        let safety_margin = 2.5 * max_cell_radius;
+
         let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
-        let mut tile_south_lats: HashMap<(u8, u32, u32), f64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+        let mut tile_eviction_queue: BinaryHeap<TileEvictionEntry> = BinaryHeap::new();
 
         let mut total_hexagons = 0usize;
         let mut global_min_lon = 180.0f64;
@@ -683,42 +808,49 @@ impl H3PmtilesTiler {
                     if c_lat < global_min_lat { global_min_lat = c_lat; }
                     if c_lat > global_max_lat { global_max_lat = c_lat; }
 
-                    let boundary_vertices: Vec<LatLng> = cell.boundary().iter().copied().collect();
-
-                    let mut hex_buf = [0u8; 16];
-                    let hex_bytes = fast_hex_u64(h3_index, &mut hex_buf);
-                    let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("").to_string();
+                    let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
+                    let vertices_merc: Vec<MercatorPoint> = cell.boundary()
+                        .iter()
+                        .map(|v| MercatorPoint::from_lat_lng(v.lat(), v.lng()))
+                        .collect();
 
                     let properties = vec![
-                        ("h3_index".to_string(), MvtValue::UInt(h3_index)),
-                        ("h3_hex".to_string(), MvtValue::String(hex_str)),
-                        ("resolution".to_string(), MvtValue::UInt(resolution as u64)),
-                        ("majority".to_string(), MvtValue::Int(majority_class)),
-                        ("majority_fraction".to_string(), MvtValue::Double(majority_fraction)),
-                        ("distinct_classes".to_string(), MvtValue::UInt(distinct_classes as u64)),
-                        ("entropy".to_string(), MvtValue::Double(entropy)),
-                        ("count".to_string(), MvtValue::Double(pixel_count)),
+                        (Cow::Borrowed("h3_index"), MvtValue::UInt(h3_index)),
+                        (Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(h3_index)),
+                        (Cow::Borrowed("resolution"), MvtValue::UInt(resolution as u64)),
+                        (Cow::Borrowed("majority"), MvtValue::Int(majority_class)),
+                        (Cow::Borrowed("majority_fraction"), MvtValue::Double(majority_fraction)),
+                        (Cow::Borrowed("distinct_classes"), MvtValue::UInt(distinct_classes as u64)),
+                        (Cow::Borrowed("entropy"), MvtValue::Double(entropy)),
+                        (Cow::Borrowed("count"), MvtValue::Double(pixel_count)),
                     ];
 
                     let zooms = zooms_for_h3_res(resolution, min_res);
                     for &zoom in &zooms {
-                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range(center, &boundary_vertices, zoom);
+                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, &vertices_merc, zoom);
                         for tx in min_tx..=max_tx {
                             for ty in min_ty..=max_ty {
                                 let tile_key = (zoom, tx, ty);
-                                let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                                    MvtLayer::new("h3_hexagons")
-                                });
-                                let bbox = tile_xy_to_bbox(zoom, tx, ty);
-                                tile_south_lats.entry(tile_key).or_insert(bbox[1]);
+                                let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
+                                    l
+                                } else {
+                                    let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                                    let safe_evict_lat = bbox[1] - safety_margin;
+                                    tile_eviction_queue.push(TileEvictionEntry {
+                                        safe_evict_lat,
+                                        tile_key,
+                                    });
+                                    tile_buckets.entry(tile_key).or_insert_with(|| {
+                                        MvtLayer::new("h3_hexagons")
+                                    })
+                                };
 
-                                layer.add_hexagon(
+                                layer.add_hexagon_mercator(
                                     h3_index,
-                                    &boundary_vertices,
-                                    bbox[0],
-                                    bbox[2],
-                                    bbox[1],
-                                    bbox[3],
+                                    &vertices_merc,
+                                    zoom,
+                                    tx,
+                                    ty,
                                     properties.clone(),
                                 );
                             }
@@ -728,13 +860,50 @@ impl H3PmtilesTiler {
                     total_hexagons += 1;
                 }
             }
+
+            // Evict completed tiles whose southernmost reach is north of current scanline horizon
+            let lat_horizon = streamer.current_lat_horizon();
+            let mut ready_tiles = Vec::new();
+            while let Some(top) = tile_eviction_queue.peek() {
+                if top.safe_evict_lat > lat_horizon {
+                    let entry = tile_eviction_queue.pop().unwrap();
+                    if let Some(layer) = tile_buckets.remove(&entry.tile_key) {
+                        ready_tiles.push((entry.tile_key, layer));
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if !ready_tiles.is_empty() {
+                let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = ready_tiles
+                    .into_par_iter()
+                    .map(|(key, layer)| {
+                        let pbf_bytes = layer.encode();
+                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
+                        (key, compressed)
+                    })
+                    .collect();
+
+                for ((z, x, y), compressed_bytes) in compressed_batch {
+                    writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
+                }
+            }
         }
 
-        // Encode all vector tiles exactly once at raster completion
-        for (key, layer) in tile_buckets {
-            let (z, x, y) = key;
-            let pbf_bytes = layer.encode();
-            writer.add_tile(z, x, y, &pbf_bytes)?;
+        // Flush any remaining active tiles at raster completion in parallel
+        let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = tile_buckets.into_iter().collect();
+        let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = remaining_tiles
+            .into_par_iter()
+            .map(|(key, layer)| {
+                let pbf_bytes = layer.encode();
+                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
+                (key, compressed)
+            })
+            .collect();
+
+        for ((z, x, y), compressed_bytes) in compressed_batch {
+            writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
         }
 
         if total_hexagons == 0 {

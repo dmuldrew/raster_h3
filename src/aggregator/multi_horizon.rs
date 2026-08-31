@@ -150,6 +150,8 @@ fn process_continuous_slice_into_maps<T, F, N>(
                 let mut run_cell: u64 = 0;
                 let mut run_acc = H3Accumulator::default();
 
+                let is_north_up = gt.b == 0.0 && gt.d == 0.0;
+                let dx_step = gt.a;
                 let (x_start, y_row) =
                     gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
 
@@ -167,10 +169,20 @@ fn process_continuous_slice_into_maps<T, F, N>(
                     }
                 };
 
+                let mut x_curr = x_start;
                 let mut c = 0;
                 while c < row_width {
                     let (lon, lat) = if is_wgs84 || is_web_mercator {
                         (lon_curr, lat_row)
+                    } else if is_north_up {
+                        match crs_transformer.transform_point(x_curr, y_row) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                c += 1;
+                                x_curr += dx_step;
+                                continue;
+                            }
+                        }
                     } else {
                         let (x, y) = gt
                             .pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
@@ -178,9 +190,6 @@ fn process_continuous_slice_into_maps<T, F, N>(
                             Ok(coords) => coords,
                             Err(_) => {
                                 c += 1;
-                                if is_wgs84 || is_web_mercator {
-                                    lon_curr += d_lon_step;
-                                }
                                 continue;
                             }
                         }
@@ -191,6 +200,8 @@ fn process_continuous_slice_into_maps<T, F, N>(
                             c += 1;
                             if is_wgs84 || is_web_mercator {
                                 lon_curr += d_lon_step;
+                            } else if is_north_up {
+                                x_curr += dx_step;
                             }
                             continue;
                         }
@@ -249,12 +260,16 @@ fn process_continuous_slice_into_maps<T, F, N>(
                         let num_stepped = span_end - c;
                         if is_wgs84 || is_web_mercator {
                             lon_curr += (num_stepped as f64) * d_lon_step;
+                        } else if is_north_up {
+                            x_curr += (num_stepped as f64) * dx_step;
                         }
                         c = span_end;
                     } else {
                         c += 1;
                         if is_wgs84 || is_web_mercator {
                             lon_curr += d_lon_step;
+                        } else if is_north_up {
+                            x_curr += dx_step;
                         }
                     }
                 }
@@ -510,9 +525,10 @@ impl MultiScanHorizonStreamer {
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiContinuousRecord> {
+        let batch_size = (rayon::current_num_threads() * 4).max(32);
         while self.completed_buffer.len() < max_rows && !self.is_finished {
             let chunk_items = if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.next_chunk_batch(32)
+                prefetcher.next_chunk_batch(batch_size)
             } else {
                 Vec::new()
             };
@@ -681,6 +697,8 @@ fn process_categorical_slice_into_maps<T, F, N>(
                 let mut run_cell: u64 = 0;
                 let mut run_acc = CategoricalAccumulator::default();
 
+                let is_north_up = gt.b == 0.0 && gt.d == 0.0;
+                let dx_step = gt.a;
                 let (x_start, y_row) =
                     gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
 
@@ -698,10 +716,20 @@ fn process_categorical_slice_into_maps<T, F, N>(
                     }
                 };
 
+                let mut x_curr = x_start;
                 let mut c = 0;
                 while c < row_width {
                     let (lon, lat) = if is_wgs84 || is_web_mercator {
                         (lon_curr, lat_row)
+                    } else if is_north_up {
+                        match crs_transformer.transform_point(x_curr, y_row) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                c += 1;
+                                x_curr += dx_step;
+                                continue;
+                            }
+                        }
                     } else {
                         let (x, y) = gt
                             .pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
@@ -709,9 +737,6 @@ fn process_categorical_slice_into_maps<T, F, N>(
                             Ok(coords) => coords,
                             Err(_) => {
                                 c += 1;
-                                if is_wgs84 || is_web_mercator {
-                                    lon_curr += d_lon_step;
-                                }
                                 continue;
                             }
                         }
@@ -722,6 +747,8 @@ fn process_categorical_slice_into_maps<T, F, N>(
                             c += 1;
                             if is_wgs84 || is_web_mercator {
                                 lon_curr += d_lon_step;
+                            } else if is_north_up {
+                                x_curr += dx_step;
                             }
                             continue;
                         }
@@ -783,12 +810,16 @@ fn process_categorical_slice_into_maps<T, F, N>(
                         let num_stepped = span_end - c;
                         if is_wgs84 || is_web_mercator {
                             lon_curr += (num_stepped as f64) * d_lon_step;
+                        } else if is_north_up {
+                            x_curr += (num_stepped as f64) * dx_step;
                         }
                         c = span_end;
                     } else {
                         c += 1;
                         if is_wgs84 || is_web_mercator {
                             lon_curr += d_lon_step;
+                        } else if is_north_up {
+                            x_curr += dx_step;
                         }
                     }
                 }
@@ -1042,9 +1073,10 @@ impl MultiCategoricalHorizonStreamer {
 
     /// Pull up to `max_rows` completed categorical multi-resolution records using multi-core chunk-row parallelism
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiCategoricalRecord> {
+        let batch_size = (rayon::current_num_threads() * 4).max(32);
         while self.completed_buffer.len() < max_rows && !self.is_finished {
             let chunk_items = if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.next_chunk_batch(32)
+                prefetcher.next_chunk_batch(batch_size)
             } else {
                 Vec::new()
             };

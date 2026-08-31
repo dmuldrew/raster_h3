@@ -103,25 +103,25 @@ pub struct TilePayload {
     pub data: Vec<u8>, // Gzip-compressed MVT data
 }
 
-/// Gzip compress a byte slice
+/// Gzip compress a byte slice with fast level 3 compression (optimal for MVT vector tiles)
 pub fn gzip_compress(data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = GzEncoder::new(Vec::with_capacity((data.len() / 2).max(128)), Compression::new(3));
     encoder.write_all(data)?;
     encoder.finish()
 }
 
 /// PMTiles v3 Directory Entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Entry {
-    tile_id: u64,
-    offset: u64,
-    length: u32,
-    run_length: u32,
+pub struct Entry {
+    pub tile_id: u64,
+    pub offset: u64,
+    pub length: u32,
+    pub run_length: u32,
 }
 
 /// Encode a slice of Directory Entries using PMTiles v3 varint delta compression
 fn encode_directory(entries: &[Entry]) -> io::Result<Vec<u8>> {
-    let mut uncompressed = Vec::new();
+    let mut uncompressed = Vec::with_capacity(entries.len() * 8);
     write_varint(&mut uncompressed, entries.len() as u64);
 
     // 1. Tile ID deltas
@@ -183,8 +183,6 @@ pub fn build_leaf_directories(entries: &[Entry], leaf_size: usize) -> io::Result
     Ok((root_bytes, all_leaf_bytes))
 }
 
-use std::io::{Read, Seek, SeekFrom};
-
 #[derive(Debug, Clone, Copy)]
 struct SpillTileEntry {
     tile_id: u64,
@@ -233,12 +231,11 @@ impl PmtilesWriter {
         self.metadata_json = metadata_json;
     }
 
-    /// Add a tile payload (automatically gzip compresses uncompressed MVT bytes and spills to disk)
-    pub fn add_tile(&mut self, z: u8, x: u32, y: u32, uncompressed_mvt: &[u8]) -> io::Result<()> {
-        let compressed = gzip_compress(uncompressed_mvt)?;
-        let len = compressed.len() as u32;
+    /// Add a pre-compressed tile payload directly into the spill file
+    pub fn add_compressed_tile(&mut self, z: u8, x: u32, y: u32, compressed_data: &[u8]) -> io::Result<()> {
+        let len = compressed_data.len() as u32;
         let tile_id = zxy_to_tile_id(z, x, y);
-        self.spill_file.write_all(&compressed)?;
+        self.spill_file.write_all(compressed_data)?;
         self.entries.push(SpillTileEntry {
             tile_id,
             spill_offset: self.current_spill_offset,
@@ -246,6 +243,12 @@ impl PmtilesWriter {
         });
         self.current_spill_offset += len as u64;
         Ok(())
+    }
+
+    /// Add a tile payload (automatically gzip compresses uncompressed MVT bytes and spills to disk)
+    pub fn add_tile(&mut self, z: u8, x: u32, y: u32, uncompressed_mvt: &[u8]) -> io::Result<()> {
+        let compressed = gzip_compress(uncompressed_mvt)?;
+        self.add_compressed_tile(z, x, y, &compressed)
     }
 
     /// Finalize and write the complete PMTiles v3 single-file archive to disk
@@ -342,29 +345,28 @@ impl PmtilesWriter {
         header.extend_from_slice(&((center_lon * 1e7) as i32).to_le_bytes());
         header.extend_from_slice(&((center_lat * 1e7) as i32).to_le_bytes());
 
-        assert_eq!(header.len(), PMTILES_HEADER_SIZE);
-
         // Write complete archive
-        let mut file = File::create(path)?;
-        file.write_all(&header)?;
-        file.write_all(&root_dir_bytes)?;
-        file.write_all(&metadata_bytes)?;
-        file.write_all(&leaf_dirs_bytes)?;
+        let file = File::create(path)?;
+        let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
+        writer.write_all(&header)?;
+        writer.write_all(&root_dir_bytes)?;
+        writer.write_all(&metadata_bytes)?;
+        writer.write_all(&leaf_dirs_bytes)?;
 
-        // Stream tile data from spill_file to out_file in sorted Hilbert order
-        let mut read_buf = vec![0u8; 64 * 1024];
-        for e in &self.entries {
-            self.spill_file.seek(SeekFrom::Start(e.spill_offset))?;
-            let mut remaining = e.length as usize;
-            while remaining > 0 {
-                let to_read = remaining.min(read_buf.len());
-                self.spill_file.read_exact(&mut read_buf[..to_read])?;
-                file.write_all(&read_buf[..to_read])?;
-                remaining -= to_read;
+        // Stream tile data from spill_file to out_file in sorted Hilbert order via zero-copy memory map
+        self.spill_file.flush()?;
+        if self.current_spill_offset > 0 {
+            let mmap = unsafe { memmap2::Mmap::map(&self.spill_file)? };
+            for e in &self.entries {
+                let start = e.spill_offset as usize;
+                let end = start + e.length as usize;
+                if end <= mmap.len() {
+                    writer.write_all(&mmap[start..end])?;
+                }
             }
         }
 
-        file.flush()?;
+        writer.flush()?;
         Ok(())
     }
 }

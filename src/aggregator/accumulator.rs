@@ -94,6 +94,39 @@ impl H3Accumulator {
         self.max = self.max.max(val);
     }
 
+    /// Two-pass SIMD-vectorizable accumulation over a contiguous slice of values
+    #[inline]
+    pub fn update_slice(&mut self, vals: &[f64]) {
+        if vals.is_empty() {
+            return;
+        }
+        let mut sum = 0.0;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut count = 0.0;
+        for &v in vals {
+            if v.is_finite() {
+                sum += v;
+                min = min.min(v);
+                max = max.max(v);
+                count += 1.0;
+            }
+        }
+        if count == 0.0 {
+            return;
+        }
+        let mean = sum / count;
+        let mut m2 = 0.0;
+        for &v in vals {
+            if v.is_finite() {
+                let d = v - mean;
+                m2 += d * d;
+            }
+        }
+        let chunk_acc = Self { sum, count, min, max, m2 };
+        self.merge(&chunk_acc);
+    }
+
     /// Branchless merge of another accumulator using parallel Chan-Golub-LeVeque combine formula
     #[inline(always)]
     pub fn merge(&mut self, other: &Self) {
