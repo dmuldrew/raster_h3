@@ -36,39 +36,71 @@ docker run -it --rm raster_h3:latest
 
 ```
 src/
-├── aggregator/              # Core aggregation engines
+├── aggregator/              # Core aggregation & scanline horizon streaming
 │   ├── accumulator.rs       # Welford online statistics (continuous)
 │   ├── categorical.rs       # Categorical frequency accumulator & streamer
-│   ├── coherence.rs         # Spatial coherence cache (inscribed bounding box)
-│   ├── h3_map.rs            # Legacy hash-map aggregation path
-│   ├── horizon_streamer.rs  # Scan-line horizon eviction engine (continuous)
-│   └── sampling.rs          # Sub-pixel super-sampling presets
-├── crs/
-│   └── transformer.rs       # CRS reprojection via proj4rs
+│   ├── h3_map.rs            # In-memory H3 aggregation map fallback
+│   ├── h3_scanline.rs       # Scanline lookahead & jump-guess traversal
+│   ├── horizon_streamer.rs  # Southernmost scanline horizon eviction engine
+│   ├── multi_horizon.rs     # Multi-resolution concurrent horizon aggregator
+│   └── sampling.rs          # Sub-pixel super-sampling presets (RGSS, Hex, 8-Rooks, Gaussian)
+├── bin/                     # Standalone CLI utilities
+│   ├── convert_to_pmtiles.rs# High-speed standalone TIFF-to-PMTiles converter
+│   └── inspect_tif.rs       # GeoTIFF metadata & CRS inspection tool
+├── crs/                     # Geodetic reprojection layer
+│   ├── mod.rs
+│   └── transformer.rs       # Standalone CRS reprojection via proj4rs
 ├── ffi/                     # DuckDB C-FFI bindings
-├── functions/
-│   ├── table_function.rs    # h3_raster_continuous_aggregate registration
+│   ├── duckdb_c.rs          # Low-level DuckDB C API types & function pointers
+│   └── mod.rs
+├── functions/               # DuckDB table & scalar function registrations
 │   ├── categorical_table_function.rs  # h3_raster_categorical_aggregate registration
-│   ├── scalar.rs            # Scalar helper functions
-│   └── fast_hex.rs          # Zero-allocation hex formatter
-├── raster/                  # GeoTIFF I/O, geotransform, prefetching
-├── error.rs                 # Error types
-└── lib.rs                   # Extension entry point
+│   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter
+│   ├── pmtiles_table_function.rs      # h3_raster_to_pmtiles registration
+│   ├── scalar.rs            # Scalar helper functions (h3_to_string, string_to_h3, etc.)
+│   ├── table_function.rs    # h3_raster_continuous_aggregate registration
+│   └── mod.rs
+├── pmtiles/                 # Native PMTiles v3 & Mapbox Vector Tile (MVT) generation
+│   ├── mvt.rs               # Pure-Rust Protobuf MVT vector tile encoder
+│   ├── tiler.rs             # Multi-resolution pyramid tiling & Hilbert indexer
+│   ├── writer.rs            # PMTiles v3 container writer & header serializer
+│   └── mod.rs
+├── raster/                  # GeoTIFF I/O & geotransform
+│   ├── geotiff.rs           # Baseline/tiled/BigTIFF reader & decompression
+│   ├── geotransform.rs      # Affine geotransform & coordinate mapping
+│   ├── prefetch.rs         # Lock-free background memory prefetcher
+│   └── mod.rs
+├── error.rs                 # Error types & conversions
+└── lib.rs                   # Extension entry point & registration
+
+pmtiles_viewer/              # MapLibre GL JS + PMTiles Studio Web Viewer
+├── index.html               # Web interface with colormaps, 3D extrusion, HUD
+├── server.py                # Python HTTP Range & CORS server
+└── debug/                   # Headless Puppeteer & MVT decoder test harness
+    ├── test.js              # Automated browser test
+    └── test_mvt.js          # Protobuf vector tile geometry validator
+
+examples/                    # CLI conversion & benchmark examples
+├── raster_to_pmtiles.rs     # CLI: GeoTIFF to PMTiles converter
+├── parquet_to_pmtiles.rs    # CLI: Parquet to PMTiles converter
+├── benchmark_e2e.rs         # End-to-end performance suite
+├── benchmark_scaling.rs     # Multi-resolution scaling benchmark
+└── debug/                   # Developer diagnostics (inspect_pmtiles, etc.)
 ```
 
 ## How to Contribute
 
 ### Reporting Bugs
 Open a GitHub Issue with:
-- DuckDB version and OS
-- Minimal reproducing SQL query
+- DuckDB version and OS (`uname -a`)
+- Minimal reproducing SQL query or CLI command
 - Sample GeoTIFF (or description of raster dimensions, CRS, and band layout)
 - Full error message or unexpected output
 
 ### Suggesting Features
 Open a GitHub Issue describing:
 - The use case and expected SQL interface
-- Whether it affects continuous, categorical, or both aggregation paths
+- Whether it affects continuous, categorical, or PMTiles export paths
 - Any relevant geospatial standards or references
 
 ### Submitting Pull Requests
@@ -76,8 +108,12 @@ Open a GitHub Issue describing:
 2. Write or update tests in `tests/test_raster_h3.rs`
 3. Ensure `cargo test` passes with no failures
 4. Ensure `cargo clippy` reports no warnings
-5. Update `README.md` and `CHANGELOG.md` if your change affects the public API
-6. Open a pull request with a clear description of what changed and why
+5. If modifying `pmtiles_viewer/`, run the browser debug suite:
+   ```bash
+   cd pmtiles_viewer/debug && npm test
+   ```
+6. Update `README.md` and `CHANGELOG.md` if your change affects the public API
+7. Open a pull request with a clear description of what changed and why
 
 ### Code Style
 - Follow standard Rust formatting: run `cargo fmt` before committing
@@ -87,12 +123,13 @@ Open a GitHub Issue describing:
 
 ## Architecture Notes
 
-The two aggregation engines share the same I/O pipeline (`memmap2` → prefetch → chunk decode) and scan-line traversal logic (latitude hoisting, longitude stepping, coherence cache). They diverge at the accumulator level:
+The aggregation engines share the same I/O pipeline (`memmap2` → prefetch → chunk decode) and scan-line traversal logic (latitude hoisting, longitude stepping, scanline lookahead). They diverge at the accumulator level:
 
 - **Continuous** (`ScanHorizonStreamer`): Uses `H3Accumulator` with Welford online stats
 - **Categorical** (`CategoricalHorizonStreamer`): Uses `CategoricalAccumulator` with `HashMap<i64, f64>` frequency tracking
+- **Multi-Resolution Pyramids** (`MultiHorizonStreamer` / `pmtiles`): Single-pass concurrent aggregation across multiple H3 resolutions directly generating MVT protobuf tiles and PMTiles v3 archives.
 
-Both use the Southernmost Scan-Line Horizon Eviction algorithm to maintain bounded memory.
+All engines use the Southernmost Scan-Line Horizon Eviction algorithm to maintain bounded memory (< 15 MB RAM).
 
 ## License
 

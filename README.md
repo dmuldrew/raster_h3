@@ -24,8 +24,9 @@ Supports both **continuous** raster surfaces (elevation, temperature, NDVI, prec
 - [11. Complete API Reference](#11-complete-api-reference)
 - [12. Architecture Diagram](#12-architecture-diagram)
 - [13. Core Dependencies & Architectural Contributions](#13-core-dependencies--architectural-contributions)
-- [14. Building & Testing Locally](#14-building--testing-locally)
-- [15. License](#15-license)
+- [14. Troubleshooting & Common Pitfalls](#14-troubleshooting--common-pitfalls)
+- [15. Building & Testing Locally](#15-building--testing-locally)
+- [16. License](#16-license)
 
 ---
 
@@ -157,6 +158,25 @@ docker run --rm -v $(pwd):/data raster_h3:latest \
     --output /data/demographics.pmtiles \
     --h3-col h3_index
 ```
+
+### 7. Launch the PMTiles Web Viewer with Docker
+You can run the built-in HTTP byte-range server and web studio using either Docker Compose or a standalone Docker container:
+
+#### A. Using Docker Compose (Recommended)
+```bash
+# Start the PMTiles viewer service
+docker compose up viewer
+
+# Or run in the background (detached mode)
+docker compose up -d viewer
+```
+
+#### B. Using Standalone Docker
+```bash
+docker run --rm -p 8080:8080 -v $(pwd):/app python:3.11-slim python3 -u /app/pmtiles_viewer/server.py 8080
+```
+
+Once started, open **`http://localhost:8080/pmtiles_viewer/`** (or **`http://localhost:8080/`**) in your browser. Any PMTiles file in `./data/` or your mounted repository (e.g. `/data/sample_sf.pmtiles`) can be immediately loaded and streamed.
 
 ---
 
@@ -292,6 +312,70 @@ SELECT * FROM h3_raster_to_pmtiles(
 );
 ```
 
+### 9. Python, Node.js, and R Integration Recipes
+
+`raster_h3` can be loaded dynamically in any DuckDB client library:
+
+#### Python (`duckdb` package)
+```python
+import duckdb
+
+# Initialize DuckDB connection with unsigned extensions enabled
+con = duckdb.connect(config={'allow_unsigned_extensions': 'true'})
+
+# Load the compiled dynamic library
+con.load_extension('target/release/libraster_h3.dylib')  # .so on Linux, .dll on Windows
+
+# Execute aggregation query directly into a Pandas or Polars DataFrame
+df = con.execute("""
+    SELECT 
+        h3_hex, 
+        round(mean, 2) AS mean_elevation, 
+        round(stddev, 2) AS ruggedness, 
+        count AS pixel_count
+    FROM h3_raster_continuous_aggregate('california_elevation.tif', resolution := 8, sampling := 'rgss')
+    ORDER BY pixel_count DESC
+    LIMIT 10;
+""").df()
+
+print(df)
+```
+
+#### Node.js (`duckdb` package)
+```javascript
+const duckdb = require('duckdb');
+const db = new duckdb.Database(':memory:', { allow_unsigned_extensions: 'true' });
+
+db.all("LOAD 'target/release/libraster_h3.dylib';", (err) => {
+  if (err) throw err;
+  
+  db.all(`
+    SELECT h3_hex, round(mean, 2) AS avg_elevation, count
+    FROM h3_raster_continuous_aggregate('california_elevation.tif', resolution := 8)
+    LIMIT 5;
+  `, (err, rows) => {
+    if (err) throw err;
+    console.table(rows);
+  });
+});
+```
+
+#### R (`duckdb` + `DBI` packages)
+```r
+library(DBI)
+library(duckdb)
+
+con <- dbConnect(duckdb::duckdb(), config = list("allow_unsigned_extensions" = "true"))
+dbExecute(con, "LOAD 'target/release/libraster_h3.dylib';")
+
+res <- dbGetQuery(con, "
+    SELECT h3_hex, majority_class, majority_fraction, total_count
+    FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8)
+    LIMIT 10;
+")
+print(res)
+```
+
 ---
 
 ## 5. Core Engineering Innovations
@@ -354,6 +438,22 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets (dx_i, dy_i) are eval
 | **`'8rooks'`** / `'stratified8'`| 8 | 1/8 each | Latin Hypercube non-attacking rooks | **Diagonal Anti-Aliasing**: Eliminates sample clumping along diagonal hexagon edges. |
 | **`'9point'`** / `'3x3'` | 9 | 1/9 each | Regular 3 × 3 grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
 | **`'16point'`** / `'4x4'` | 16 | 1/16 each | Regular 4 × 4 grid | **Coarse → Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
+
+### Performance & Precision Trade-Off Guide
+
+| Sampling Mode | Samples / Pixel | Relative Runtime | Boundary Precision | Recommended Use Case |
+| :--- | :---: | :---: | :--- | :--- |
+| **`center`** | 1 | **$1.0\times$** (Fastest) | Baseline | Fast exploratory scans, massive high-resolution rasters (10m pixels into Res 6–8 cells) |
+| **`rgss`** *(Recommended)* | 4 | **$\sim 0.75\times$** | High Anti-Aliasing | Default for production analytical queries; eliminates axis-aligned blind spots |
+| **`hex`** | 7 | **$\sim 0.60\times$** | True Hexagonal Symmetry | When strict hexagonal area weighting is required |
+| **`gaussian`** | 5 | **$\sim 0.68\times$** | Optical PSF Emulation | Remote sensing satellite imagery where pixel centers dominate sensor response |
+| **`8rooks`** | 8 | **$\sim 0.55\times$** | Full Stratified Anti-Aliasing | Highly complex boundary contours with diagonal edges |
+| **`16point`** | 16 | **$\sim 0.35\times$** | Sub-Grid Reconstruction | Coarse rasters (e.g. 1km climate grids) aggregated into fine H3 cells (Res 9–11) |
+
+#### Performance Tuning Tips
+1. **Match `chunk_size` to Tile Dimensions**: For tiled GeoTIFFs (e.g., $256 \times 256$ or $512 \times 512$ tiles), set `chunk_size := 512` to align DuckDB decompressor buffers with native TIFF block boundaries.
+2. **Region of Interest (ROI) Pruning**: Always specify `min_lon`, `min_lat`, `max_lon`, `max_lat` when analyzing spatial subsets. Non-overlapping GeoTIFF blocks are discarded instantly before reading from disk.
+3. **Multi-Resolution Single Passes**: When creating multi-zoom web layers, use `resolutions := [6, 7, 8]` or `h3_raster_to_pmtiles(...)` rather than separate SQL queries to read the underlying GeoTIFF only once.
 
 ---
 
@@ -544,14 +644,38 @@ map.on('load', () => {
 
 `raster_h3` includes a dedicated browser-based visual exploration studio in `pmtiles_viewer/` for inspecting both continuous and categorical H3 vector pyramids:
 
-#### 1. Launch via Local Streaming Server (Recommended)
+#### 1. Launch with Docker Compose (Recommended)
+The repository includes a configured `docker-compose.yml` that mounts the project root and serves the viewer with HTTP byte-range and CORS support:
+
+```bash
+# Start viewer in foreground
+docker compose up viewer
+
+# Or run in detached mode (background)
+docker compose up -d viewer
+```
+
+#### 2. Launch with Standalone Docker
+If you prefer running a one-liner without Docker Compose:
+
+```bash
+docker run --rm -p 8080:8080 -v $(pwd):/app python:3.11-slim python3 -u /app/pmtiles_viewer/server.py 8080
+```
+
+#### 3. Launch via Local Python Streaming Server
+If you have Python 3 installed locally:
+
 ```bash
 # Launch local server with HTTP byte-range and CORS support
 python3 pmtiles_viewer/server.py 8080
 ```
-Open **`http://localhost:8080/pmtiles_viewer/`** to stream multi-resolution PMTiles archives dynamically over HTTP byte-range requests.
 
-#### 2. Offline Mode via Local File Drag-and-Drop
+#### Accessing the Web Studio
+Once running, open **`http://localhost:8080/pmtiles_viewer/`** (or **`http://localhost:8080`**) in your browser.
+* **Loading Datasets**: In the left sidebar PMTiles path input, enter any PMTiles file relative to the repo root (e.g., `/data/CFL_HI_pyramid.pmtiles`, `/data/sample_sf.pmtiles`, or custom files created in `./data/`).
+* **Instant Dynamic Streaming**: The viewer uses HTTP byte-range requests (`pmtiles.FetchSource`) to query only the necessary tile byte ranges on the fly without downloading the entire multi-gigabyte file.
+
+#### 4. Offline Mode via Local File Drag-and-Drop
 If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome blocks network HTTP fetch requests. You can click the left sidebar dropzone (**📁 Click to select file from disk**) or drag and drop any `.pmtiles` archive to load it 100% offline via the native browser `FileReader` API (`pmtiles.FileSource`).
 
 #### Viewer Features:
@@ -826,7 +950,53 @@ flowchart TD
 
 ---
 
-## 14. Building & Testing Locally
+## 14. Troubleshooting & Common Pitfalls
+
+### 1. Unsigned Extension Loading Errors
+When loading `raster_h3` in DuckDB, you may encounter:
+`Error: Extension ".../libraster_h3.dylib" is not signed by DuckDB`
+
+**Resolution**:
+- **DuckDB CLI**: Launch DuckDB with the `-unsigned` flag:
+  ```bash
+  duckdb -unsigned
+  ```
+- **Python / Client Libraries**: Set `allow_unsigned_extensions` configuration flag before loading:
+  ```python
+  con = duckdb.connect(config={'allow_unsigned_extensions': 'true'})
+  con.load_extension('target/release/libraster_h3.dylib')
+  ```
+
+### 2. Missing or Non-Standard CRS GeoKeys
+If a GeoTIFF lacks embedded projection tags or uses an unrecognized local coordinate system, `raster_h3` will fail to identify the CRS automatically.
+
+**Resolution**:
+Explicitly specify the coordinate reference system using the `source_crs` parameter (accepts standard EPSG codes or full PROJ.4 parameter strings):
+```sql
+SELECT * FROM h3_raster_continuous_aggregate(
+    'unprojected_grid.tif', 
+    resolution := 8, 
+    source_crs := 'EPSG:32610'
+);
+```
+
+### 3. Antimeridian Crossing Rasters
+For global datasets that span across the $\pm 180^\circ$ longitude meridian (e.g. Russia, Fiji, Alaska, Pacific grids):
+- `raster_h3` automatically wraps longitudes into standard $[-180.0, +180.0]$ coordinates for H3 indexing.
+- When applying Region of Interest (ROI) bounding box filters across the Antimeridian, split the query into two queries or disjoint bounds (e.g. $[170.0, 180.0]$ and $[-180.0, -170.0]$).
+
+### 4. BigTIFF & Compression Codec Compatibility
+`raster_h3` natively decodes standard TIFF 6.0 and BigTIFF (>4 GB) files with:
+- **Compression**: Raw Uncompressed, Deflate (Zlib), LZW, PackBits.
+- **Pixel Datatypes**: `Float32`, `Float64`, `UInt8`, `UInt16`, `UInt32`, `Int8`, `Int16`, `Int32`.
+- If an unsupported proprietary codec (such as JPEG2000, WebP, or LERC) is encountered, convert the raster to standard Deflate/LZW Cloud-Optimized GeoTIFF beforehand using `gdal_translate -co COMPRESS=DEFLATE input.tif output.tif`.
+
+### 5. Memory Allocation & Container Sandboxes
+`raster_h3` relies on userspace virtual memory mapping (`memmap2`) and Southernmost Horizon Eviction to guarantee memory usage **< 15 MB RAM**. If running within strictly isolated container environments, ensure the runtime allows memory-mapped files (`mmap`).
+
+---
+
+## 15. Building & Testing Locally
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (Edition 2021+, stable toolchain)
@@ -865,5 +1035,5 @@ cargo run --release --example raster_to_pmtiles -- --input data/sample_sf.tif --
 
 ---
 
-## 15. License
+## 16. License
 This project is licensed under the [MIT License](LICENSE).
