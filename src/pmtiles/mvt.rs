@@ -405,8 +405,9 @@ impl MvtLayer {
             write_string_field(&mut layer_buf, 3, &k);
         }
         // Values (field 4)
+        let mut val_bytes = Vec::with_capacity(32);
         for v in values {
-            let mut val_bytes = Vec::new();
+            val_bytes.clear();
             v.write_to(&mut val_bytes);
             write_tag(&mut layer_buf, 4, 2);
             write_varint(&mut layer_buf, val_bytes.len() as u64);
@@ -417,7 +418,7 @@ impl MvtLayer {
         write_varint(&mut layer_buf, self.extent as u64);
 
         // 3. Wrap in Tile Message (field 3 = layers)
-        let mut tile_buf = Vec::new();
+        let mut tile_buf = Vec::with_capacity(layer_buf.len() + 16);
         write_tag(&mut tile_buf, 3, 2);
         write_varint(&mut tile_buf, layer_buf.len() as u64);
         tile_buf.extend_from_slice(&layer_buf);

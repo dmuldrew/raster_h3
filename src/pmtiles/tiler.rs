@@ -417,21 +417,36 @@ impl H3PmtilesTiler {
             }
 
             let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, &vertices_merc, zoom);
-            for tx in min_tx..=max_tx {
-                for ty in min_ty..=max_ty {
-                    let tile_key = (zoom, tx, ty);
-                    let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                        MvtLayer::new("h3_hexagons")
-                    });
+            if min_tx == max_tx && min_ty == max_ty {
+                let tile_key = (zoom, min_tx, min_ty);
+                let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                    MvtLayer::new("h3_hexagons")
+                });
+                layer.add_hexagon_mercator(
+                    feat.h3_index,
+                    &vertices_merc,
+                    zoom,
+                    min_tx,
+                    min_ty,
+                    properties,
+                );
+            } else {
+                for tx in min_tx..=max_tx {
+                    for ty in min_ty..=max_ty {
+                        let tile_key = (zoom, tx, ty);
+                        let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
+                            MvtLayer::new("h3_hexagons")
+                        });
 
-                    layer.add_hexagon_mercator(
-                        feat.h3_index,
-                        &vertices_merc,
-                        zoom,
-                        tx,
-                        ty,
-                        properties.clone(),
-                    );
+                        layer.add_hexagon_mercator(
+                            feat.h3_index,
+                            &vertices_merc,
+                            zoom,
+                            tx,
+                            ty,
+                            properties.clone(),
+                        );
+                    }
                 }
             }
         }

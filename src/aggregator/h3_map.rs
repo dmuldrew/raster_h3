@@ -360,28 +360,31 @@ pub fn aggregate_raster_stream(
             },
         )
         .map(|(map, _decoder)| map)
-        .reduce(H3HashMap::default, |mut map_a, map_b| {
-            if map_a.len() < map_b.len() {
-                let mut merged = map_b;
-                for (k, v) in map_a {
-                    merged
-                        .entry(k)
-                        .and_modify(|acc| acc.merge(&v))
-                        .or_insert(v);
-                }
-                merged
-            } else {
-                for (k, v) in map_b {
-                    map_a
-                        .entry(k)
-                        .and_modify(|acc| acc.merge(&v))
-                        .or_insert(v);
-                }
-                map_a
-            }
-        });
+        .reduce(H3HashMap::default, merge_h3_maps);
 
     Ok(aggregated_map)
+}
+
+/// Efficiently merge two H3 continuous hash maps with zero-copy swaps and pre-allocated capacity reservation
+#[inline]
+pub fn merge_h3_maps(mut map_a: H3HashMap, mut map_b: H3HashMap) -> H3HashMap {
+    if map_a.is_empty() {
+        return map_b;
+    }
+    if map_b.is_empty() {
+        return map_a;
+    }
+    if map_a.len() < map_b.len() {
+        std::mem::swap(&mut map_a, &mut map_b);
+    }
+    map_a.reserve(map_b.len());
+    for (k, v) in map_b {
+        map_a
+            .entry(k)
+            .and_modify(|acc| acc.merge(&v))
+            .or_insert(v);
+    }
+    map_a
 }
 
 #[inline(always)]
@@ -773,27 +776,30 @@ pub fn aggregate_categorical_raster_stream(
             },
         )
         .map(|(map, _decoder)| map)
-        .reduce(H3CategoricalHashMap::default, |mut map_a, map_b| {
-            if map_a.len() < map_b.len() {
-                let mut merged = map_b;
-                for (k, v) in map_a {
-                    merged
-                        .entry(k)
-                        .and_modify(|acc| acc.merge(&v))
-                        .or_insert(v);
-                }
-                merged
-            } else {
-                for (k, v) in map_b {
-                    map_a
-                        .entry(k)
-                        .and_modify(|acc| acc.merge(&v))
-                        .or_insert(v);
-                }
-                map_a
-            }
-        });
+        .reduce(H3CategoricalHashMap::default, merge_categorical_maps);
 
     Ok(aggregated_map)
+}
+
+/// Efficiently merge two H3 categorical hash maps with zero-copy swaps and pre-allocated capacity reservation
+#[inline]
+pub fn merge_categorical_maps(mut map_a: H3CategoricalHashMap, mut map_b: H3CategoricalHashMap) -> H3CategoricalHashMap {
+    if map_a.is_empty() {
+        return map_b;
+    }
+    if map_b.is_empty() {
+        return map_a;
+    }
+    if map_a.len() < map_b.len() {
+        std::mem::swap(&mut map_a, &mut map_b);
+    }
+    map_a.reserve(map_b.len());
+    for (k, v) in map_b {
+        map_a
+            .entry(k)
+            .and_modify(|acc| acc.merge(&v))
+            .or_insert(v);
+    }
+    map_a
 }
 

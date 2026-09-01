@@ -1,10 +1,7 @@
 use std::ffi::{c_char, c_void, CString};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::Mutex;
 
-use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::h3_map::aggregate_raster_stream;
-use crate::aggregator::horizon_streamer::AggregationConfig;
+use crate::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
@@ -23,10 +20,9 @@ pub struct RasterH3BindData {
     pub band: u32,
 }
 
-/// Global scan state holding aggregated H3 records with lock-free atomic cursor
+/// Global scan state holding the streaming horizon aggregator for bounded O(Scan Front) < 15 MB RAM
 pub struct RasterH3GlobalData {
-    pub records: Arc<Vec<(u64, H3Accumulator)>>,
-    pub next_row_idx: AtomicUsize,
+    pub streamer: Mutex<ScanHorizonStreamer>,
 }
 
 /// Thread-local state for parallel DuckDB execution threads
@@ -263,7 +259,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     );
 }
 
-/// Global init callback: opens GeoTIFF stream reader and performs parallel Rayon chunk aggregation
+/// Global init callback: opens GeoTIFF stream reader and initializes streaming scanline horizon aggregator
 pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     let bind_data_ptr = duckdb_init_get_bind_data(info) as *const RasterH3BindData;
     if bind_data_ptr.is_null() {
@@ -291,21 +287,18 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         sampling: bind_data.sampling.clone(),
     };
 
-    let map = match aggregate_raster_stream(&reader, &config) {
-        Ok(m) => m,
+    let streamer = match ScanHorizonStreamer::new(reader, &config) {
+        Ok(s) => s,
         Err(e) => {
-            let err_msg = CString::new(format!("Failed to aggregate raster: {}", e))
-                .unwrap_or_else(|_| CString::new("Failed to aggregate raster").unwrap());
+            let err_msg = CString::new(format!("Failed to initialize streamer: {}", e))
+                .unwrap_or_else(|_| CString::new("Failed to init streamer").unwrap());
             duckdb_init_set_error(info, err_msg.as_ptr());
             return;
         }
     };
 
-    let records: Vec<(u64, H3Accumulator)> = map.into_iter().collect();
-
     let global_data = Box::new(RasterH3GlobalData {
-        records: Arc::new(records),
-        next_row_idx: AtomicUsize::new(0),
+        streamer: Mutex::new(streamer),
     });
 
     duckdb_init_set_init_data(
@@ -325,7 +318,7 @@ pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
     );
 }
 
-/// Scan callback: lock-free atomic vector emission across all DuckDB execution threads
+/// Scan callback: streaming vector emission directly from scanline horizon eviction
 pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     let global_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3GlobalData;
     if global_data_ptr.is_null() {
@@ -334,18 +327,21 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     }
     let global_data = &*global_data_ptr;
 
-    let total_rows = global_data.records.len();
-    let start_idx = global_data.next_row_idx.fetch_add(2048, Ordering::Relaxed);
+    let batch = {
+        let mut streamer = match global_data.streamer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        streamer.fetch_next_batch(2048)
+    };
 
-    if start_idx >= total_rows {
-        // EOF: All hexagons emitted
+    if batch.is_empty() {
+        // EOF: All hexagons completed and emitted
         duckdb_data_chunk_set_size(output, 0);
         return;
     }
 
-    let end_idx = (start_idx + 2048).min(total_rows);
-    let batch_slice = &global_data.records[start_idx..end_idx];
-    let batch_size = batch_slice.len();
+    let batch_size = batch.len();
 
     // Get output vector pointers
     let v_h3 = duckdb_data_chunk_get_vector(output, 0);
@@ -367,7 +363,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 
     let mut hex_buf = [0u8; 16];
 
-    for (i, (cell_u64, acc)) in batch_slice.iter().enumerate() {
+    for (i, (cell_u64, acc)) in batch.iter().enumerate() {
         let row_idx = i as u64;
 
         *p_h3.add(i) = *cell_u64;
