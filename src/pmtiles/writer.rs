@@ -6,8 +6,7 @@
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use libdeflater::{CompressionLvl, Compressor};
 
 /// PMTiles v3 Constants
 const PMTILES_HEADER_SIZE: usize = 127;
@@ -103,11 +102,16 @@ pub struct TilePayload {
     pub data: Vec<u8>, // Gzip-compressed MVT data
 }
 
-/// Gzip compress a byte slice with fast level 3 compression (optimal for MVT vector tiles)
+/// Gzip compress a byte slice with fast level 3 compression using libdeflater (optimal for MVT vector tiles)
 pub fn gzip_compress(data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::with_capacity((data.len() / 2).max(128)), Compression::new(3));
-    encoder.write_all(data)?;
-    encoder.finish()
+    let mut compressor = Compressor::new(CompressionLvl::new(3).unwrap());
+    let max_len = compressor.gzip_compress_bound(data.len());
+    let mut compressed = vec![0u8; max_len];
+    let actual_size = compressor
+        .gzip_compress(data, &mut compressed)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("gzip compression error: {:?}", e)))?;
+    compressed.truncate(actual_size);
+    Ok(compressed)
 }
 
 /// PMTiles v3 Directory Entry

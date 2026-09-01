@@ -4,12 +4,132 @@ use crate::error::{RasterH3Error, Result};
 const WGS84_A: f64 = 6378137.0; // WGS84 semi-major axis in meters
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
+/// Precomputed constants for analytical, closed-form inverse Albers Equal Area Conic projection
+#[derive(Debug, Clone, Copy)]
+pub struct AlbersConicFast {
+    pub lat_origin_rad: f64,
+    pub lon_origin_rad: f64,
+    pub n: f64,
+    pub c: f64,
+    pub rho0: f64,
+    pub e: f64,
+    pub e2: f64,
+    pub a: f64,
+    pub qp: f64,
+}
+
+impl AlbersConicFast {
+    /// Initialize with standard 2 parallels and origin (in degrees) on GRS80/WGS84 spheroid
+    pub fn new(lat1_deg: f64, lat2_deg: f64, lat0_deg: f64, lon0_deg: f64) -> Self {
+        let a: f64 = 6378137.0; // GRS80/WGS84 semi-major axis
+        let f: f64 = 1.0 / 298.257222101; // GRS80 flattening
+        let e2: f64 = 2.0 * f - f * f;
+        let e: f64 = e2.sqrt();
+
+        let deg_to_rad: f64 = std::f64::consts::PI / 180.0;
+        let phi1 = lat1_deg * deg_to_rad;
+        let phi2 = lat2_deg * deg_to_rad;
+        let phi0 = lat0_deg * deg_to_rad;
+        let lam0 = lon0_deg * deg_to_rad;
+
+        let m = |phi: f64| -> f64 {
+            let sin_phi = phi.sin();
+            phi.cos() / (1.0 - e2 * sin_phi * sin_phi).sqrt()
+        };
+
+        let q = |phi: f64| -> f64 {
+            let sin_phi = phi.sin();
+            let e_sin = e * sin_phi;
+            let ratio: f64 = (1.0 - e_sin) / (1.0 + e_sin);
+            (1.0 - e2) * (sin_phi / (1.0 - e_sin * e_sin) - (1.0 / (2.0 * e)) * ratio.ln())
+        };
+
+        let m1 = m(phi1);
+        let m2 = m(phi2);
+        let q1 = q(phi1);
+        let q2 = q(phi2);
+        let q0 = q(phi0);
+        let qp = q(std::f64::consts::FRAC_PI_2);
+
+        let n = if (phi1 - phi2).abs() < 1e-10 {
+            phi1.sin()
+        } else {
+            (m1 * m1 - m2 * m2) / (q2 - q1)
+        };
+
+        let c = m1 * m1 + n * q1;
+        let rho0 = a * (c - n * q0).max(0.0).sqrt() / n;
+
+        Self {
+            lat_origin_rad: phi0,
+            lon_origin_rad: lam0,
+            n,
+            c,
+            rho0,
+            e,
+            e2,
+            a,
+            qp,
+        }
+    }
+
+    /// Preconfigured for EPSG:5070 (USA_Contiguous_Albers_Equal_Area_Conic)
+    pub fn epsg_5070() -> Self {
+        Self::new(29.5, 45.5, 23.0, -96.0)
+    }
+
+    /// Analytical inverse transformation from projected (x, y) to (lon, lat) in WGS84 degrees
+    #[inline(always)]
+    pub fn transform_point(&self, x: f64, y: f64) -> (f64, f64) {
+        let x_p = x;
+        let y_p = self.rho0 - y;
+        let rho = (x_p * x_p + y_p * y_p).sqrt();
+        let theta = if self.n >= 0.0 {
+            x_p.atan2(y_p)
+        } else {
+            (-x_p).atan2(-y_p)
+        };
+
+        let lon_rad = self.lon_origin_rad + theta / self.n;
+        let q = (self.c - (rho * rho * self.n * self.n) / (self.a * self.a)) / self.n;
+
+        // Newton-Raphson inverse for latitude from q
+        let sin_beta = (q / self.qp).max(-1.0).min(1.0);
+        let mut phi = sin_beta.asin();
+
+        // 2 iterations of Newton-Raphson provide nanometer precision
+        for _ in 0..2 {
+            let sin_phi = phi.sin();
+            let cos_phi = phi.cos();
+            if cos_phi.abs() < 1e-12 {
+                break;
+            }
+            let e_sin = self.e * sin_phi;
+            let one_minus_e2_sin2 = 1.0 - e_sin * e_sin;
+            let ratio: f64 = (1.0 - e_sin) / (1.0 + e_sin);
+            let q_curr = (1.0 - self.e2) * (sin_phi / one_minus_e2_sin2 - (1.0 / (2.0 * self.e)) * ratio.ln());
+            let dq_dphi = 2.0 * (1.0 - self.e2) * cos_phi / (one_minus_e2_sin2 * one_minus_e2_sin2);
+            let delta = (q - q_curr) / dq_dphi;
+            phi += delta;
+            if delta.abs() < 1e-12 {
+                break;
+            }
+        }
+
+        let lon_deg = lon_rad * RAD_TO_DEG;
+        let lat_deg = phi * RAD_TO_DEG;
+        (lon_deg, lat_deg)
+    }
+}
+
 /// High-performance CRS to WGS84 coordinate transformer
 pub enum CrsTransformer {
     /// Native WGS84 (EPSG:4326) - Zero math, zero overhead
     Wgs84Identity,
     /// Fast analytical Web Mercator (EPSG:3857 / EPSG:900913)
     WebMercatorFast,
+    /// Fast analytical Albers Equal Area Conic (EPSG:5070 CONUS Albers)
+    AlbersConic(AlbersConicFast),
     /// Pure Rust PROJ4 transformation for arbitrary projections
     Proj4 {
         from: Proj,
@@ -37,6 +157,7 @@ impl CrsTransformer {
             match code {
                 4326 | 4269 => return Ok(Self::Wgs84Identity),
                 3857 | 900913 | 3785 => return Ok(Self::WebMercatorFast),
+                5070 => return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070())),
                 32601..=32660 => {
                     let zone = code - 32600;
                     let p_str = format!("+proj=utm +zone={} +datum=WGS84 +units=m +no_defs", zone);
@@ -65,6 +186,9 @@ impl CrsTransformer {
             if lower.contains("3857") || lower.contains("900913") || (lower.contains("merc") && lower.contains("a=6378137")) {
                 return Ok(Self::WebMercatorFast);
             }
+            if lower.contains("5070") || (lower.contains("aea") && lower.contains("lat_1=29.5") && lower.contains("lat_2=45.5")) {
+                return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070()));
+            }
             return Self::from_proj_string(trimmed);
         }
 
@@ -92,6 +216,7 @@ impl CrsTransformer {
                 let lat = (2.0 * (y / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
                 Ok((lon, lat))
             }
+            Self::AlbersConic(albers) => Ok(albers.transform_point(x, y)),
             Self::Proj4 { from, to } => {
                 let mut point_3d = (x, y, 0.0);
                 proj4rs::transform::transform(from, to, &mut point_3d)
@@ -102,6 +227,18 @@ impl CrsTransformer {
                 Ok((lon_deg, lat_deg))
             }
         }
+    }
+
+    /// Transform a batch of (x, y) coordinates into destination (lon, lat) slices
+    #[inline]
+    pub fn transform_batch(&self, xs: &[f64], ys: &[f64], out_lon: &mut [f64], out_lat: &mut [f64]) -> Result<()> {
+        let count = xs.len().min(ys.len()).min(out_lon.len()).min(out_lat.len());
+        for i in 0..count {
+            let (lon, lat) = self.transform_point(xs[i], ys[i])?;
+            out_lon[i] = lon;
+            out_lat[i] = lat;
+        }
+        Ok(())
     }
 }
 
@@ -124,6 +261,23 @@ mod tests {
         let (lon, lat) = tf.transform_point(-13627665.27, 4547675.35).unwrap();
         assert!((lon - -122.4194).abs() < 1e-2);
         assert!((lat - 37.7749).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_albers_epsg5070_accuracy() {
+        let tf = CrsTransformer::from_crs_or_epsg(Some(5070), None).unwrap();
+        // Point in Washington DC area: (x = 1580000.0, y = 1940000.0) in EPSG:5070
+        let (lon, lat) = tf.transform_point(1580000.0, 1940000.0).unwrap();
+        // Should be approximately Lon -77.0, Lat 38.9
+        assert!((lon - (-77.05)).abs() < 0.5);
+        assert!((lat - 38.88).abs() < 0.5);
+
+        // Compare against PROJ4 reference
+        let proj4_tf = CrsTransformer::from_proj_string("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs").unwrap();
+        let (p4_lon, p4_lat) = proj4_tf.transform_point(1580000.0, 1940000.0).unwrap();
+
+        assert!((lon - p4_lon).abs() < 1e-5, "Lon mismatch: {} vs {}", lon, p4_lon);
+        assert!((lat - p4_lat).abs() < 1e-5, "Lat mismatch: {} vs {}", lat, p4_lat);
     }
 
     #[test]
