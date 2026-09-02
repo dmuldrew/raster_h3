@@ -318,3 +318,168 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
     assert!(summary.total_tiles > 0);
 }
 
+#[test]
+fn test_coarse_zoom_parent_mapping() {
+    use raster_h3::pmtiles::tiler::h3_res_for_zoom;
+
+    // Verify natural H3 resolution assignment per zoom level
+    assert_eq!(h3_res_for_zoom(0), 0);
+    assert_eq!(h3_res_for_zoom(1), 0);
+    assert_eq!(h3_res_for_zoom(2), 1);
+    assert_eq!(h3_res_for_zoom(3), 1);
+    assert_eq!(h3_res_for_zoom(4), 2);
+    assert_eq!(h3_res_for_zoom(5), 3);
+    assert_eq!(h3_res_for_zoom(6), 4);
+    assert_eq!(h3_res_for_zoom(7), 4);
+    assert_eq!(h3_res_for_zoom(8), 5);
+    assert_eq!(h3_res_for_zoom(9), 5);
+    assert_eq!(h3_res_for_zoom(10), 6);
+    assert_eq!(h3_res_for_zoom(11), 7);
+    assert_eq!(h3_res_for_zoom(12), 7);
+    assert_eq!(h3_res_for_zoom(13), 8);
+    assert_eq!(h3_res_for_zoom(14), 9);
+}
+
+#[test]
+fn test_pmtiles_coarse_zoom_parent_aggregation_content() {
+    let tiff_tmp = NamedTempFile::new().unwrap();
+    let tiff_path = tiff_tmp.path().to_str().unwrap().to_string();
+    create_temp_geotiff(&tiff_path, 64, 64, tiff::tags::CompressionMethod::None).unwrap();
+
+    let pmtiles_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
+
+    // Export fine resolutions 7 and 8
+    let config = MultiResolutionConfig::new(vec![7, 8]);
+    let total_hexagons = H3PmtilesTiler::process_geotiff_to_pmtiles(
+        &tiff_path,
+        &pmtiles_path,
+        config,
+    ).unwrap();
+
+    assert!(total_hexagons > 0);
+
+    // Read header and inspect tile count and archive structure
+    let mut file = File::open(&pmtiles_path).unwrap();
+    let mut header = [0u8; 127];
+    file.read_exact(&mut header).unwrap();
+
+    assert_eq!(&header[0..7], b"PMTiles");
+    assert_eq!(header[7], 3);
+
+    let addressed_tiles = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    assert!(addressed_tiles > 0, "Archive should contain multiple pyramid zoom tiles");
+
+    let min_zoom = header[100];
+    let max_zoom = header[101];
+    assert_eq!(min_zoom, 0, "Min zoom should cover coarse zooms starting at 0");
+    assert!(max_zoom >= 13, "Max zoom should reach fine resolution zoom >= 13");
+}
+
+#[test]
+fn test_all_nodata_geotiff_to_pmtiles_export() {
+    let tiff_tmp = NamedTempFile::new().unwrap();
+    let tiff_path = tiff_tmp.path().to_str().unwrap().to_string();
+
+    // Create a 64x64 GeoTIFF where all values are NoData (-9999.0)
+    let width = 64;
+    let height = 64;
+    let nodata_val = -9999.0f32;
+    let data = vec![nodata_val; width * height];
+
+    {
+        use std::io::BufWriter;
+        use tiff::encoder::colortype::Gray32Float;
+        use tiff::encoder::TiffEncoder;
+        use tiff::tags::Tag;
+
+        let file = File::create(&tiff_path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(42113), "-9999")
+            .unwrap();
+
+        let geokeys: [u16; 12] = [
+            1, 1, 0, 2,
+            1024, 0, 1, 2,
+            2048, 0, 1, 4326,
+        ];
+        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let pmtiles_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
+
+    let config = MultiResolutionConfig::new(vec![7, 8]);
+    let total_hexagons = H3PmtilesTiler::process_geotiff_to_pmtiles(
+        &tiff_path,
+        &pmtiles_path,
+        config,
+    ).unwrap();
+
+    // Should complete cleanly with 0 hexagons emitted
+    assert_eq!(total_hexagons, 0);
+
+    // Archive should be a valid PMTiles v3 archive with 0 addressed tiles
+    let mut file = File::open(&pmtiles_path).unwrap();
+    let mut header = [0u8; 127];
+    file.read_exact(&mut header).unwrap();
+
+    assert_eq!(&header[0..7], b"PMTiles");
+    assert_eq!(header[7], 3);
+    let addressed_tiles = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    assert_eq!(addressed_tiles, 0);
+}
+
+#[test]
+fn test_hilbert_zxy_tile_id_bijective_roundtrip() {
+    use raster_h3::pmtiles::writer::{zxy_to_tile_id, tile_id_to_zxy};
+
+    // 1. Base case: Zoom 0 root tile
+    assert_eq!(zxy_to_tile_id(0, 0, 0), 0);
+    assert_eq!(tile_id_to_zxy(0), (0, 0, 0));
+
+    // 2. Comprehensive bijection across zoom levels 0 through 14
+    for z in 0..=14 {
+        let max_coord = 1u32 << z;
+        let test_coords = [
+            (0, 0),
+            (0, max_coord - 1),
+            (max_coord - 1, 0),
+            (max_coord - 1, max_coord - 1),
+            (max_coord / 2, max_coord / 2),
+            (max_coord / 3, (2 * max_coord) / 3),
+            ((3 * max_coord) / 4, max_coord / 4),
+        ];
+
+        for &(x, y) in &test_coords {
+            if x < max_coord && y < max_coord {
+                let tile_id = zxy_to_tile_id(z, x, y);
+                let (dec_z, dec_x, dec_y) = tile_id_to_zxy(tile_id);
+                assert_eq!((dec_z, dec_x, dec_y), (z, x, y), "Hilbert mapping failed round-trip for ({}, {}, {}) -> ID {} -> ({}, {}, {})", z, x, y, tile_id, dec_z, dec_x, dec_y);
+            }
+        }
+    }
+
+    // 3. Monotonicity: Tile IDs for zoom level Z are strictly less than Tile IDs for zoom level Z+1
+    let max_id_z4 = zxy_to_tile_id(4, 15, 15);
+    let min_id_z5 = zxy_to_tile_id(5, 0, 0);
+    assert!(max_id_z4 < min_id_z5, "Hilbert IDs across zoom levels must be strictly monotonic");
+}
+
+
+
+

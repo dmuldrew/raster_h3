@@ -1510,3 +1510,208 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
     assert!(total_sum > 100_000_000.0);
 }
 
+#[test]
+fn test_spatial_filter_pushdown_chunk_skipping() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+
+    // Create a 200x200 GeoTIFF spanning [-122.5, -122.3] lon, [37.6, 37.8] lat
+    let width = 200;
+    let height = 200;
+    let data = vec![100.0f32; width * height];
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..])
+            .unwrap();
+
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
+            .unwrap();
+
+        let geokeys: [u16; 12] = [
+            1, 1, 0, 2,
+            1024, 0, 1, 2,
+            2048, 0, 1, 4326,
+        ];
+        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    // 1. Full Scan (No Pushdown)
+    let reader_full = GeoTiffStreamReader::open(&path).unwrap();
+    let config_full = AggregationConfig {
+        resolution: 8,
+        bbox: None,
+        ..Default::default()
+    };
+    let mut streamer_full = ScanHorizonStreamer::new(reader_full, &config_full).unwrap();
+    let mut full_pixels = 0.0f64;
+    loop {
+        let batch = streamer_full.fetch_next_batch(100);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            full_pixels += acc.count;
+        }
+    }
+    assert_eq!(full_pixels, 40000.0);
+
+    // 2. Filter Pushdown with Targeted Spatial Bounding Box
+    // Query quarter of the raster: lon [-122.45, -122.35], lat [37.65, 37.75]
+    let reader_filtered = GeoTiffStreamReader::open(&path).unwrap();
+    let target_bbox = [-122.45, 37.65, -122.35, 37.75];
+    let config_filtered = AggregationConfig {
+        resolution: 8,
+        bbox: Some(target_bbox),
+        ..Default::default()
+    };
+
+    let mut streamer_filtered = ScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
+    let mut filtered_pixels = 0.0f64;
+    loop {
+        let batch = streamer_filtered.fetch_next_batch(100);
+        if batch.is_empty() {
+            break;
+        }
+        for (_, acc) in batch {
+            filtered_pixels += acc.count;
+        }
+    }
+
+    // Filtered pixel mass must strictly match the spatial subset (~10,000 pixels)
+    assert!(filtered_pixels > 0.0);
+    assert!(filtered_pixels < full_pixels);
+    assert!((filtered_pixels - 10000.0).abs() < 500.0);
+}
+
+#[test]
+fn test_antimeridian_crossing_and_wrap() {
+    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
+    use raster_h3::pmtiles::mvt::MercatorPoint;
+
+    // 1. Longitude wrapping and clamping on Date Line
+    let (tx_west, ty_west) = lon_lat_to_tile_xy(-179.999, 51.5, 8);
+    let (tx_east, ty_east) = lon_lat_to_tile_xy(179.999, 51.5, 8);
+
+    assert_eq!(tx_west, 0, "Westmost longitude should map to tile column 0");
+    assert_eq!(tx_east, 255, "Eastmost longitude should map to tile column 255 (2^8 - 1)");
+    assert_eq!(ty_west, ty_east, "Identical latitudes must share tile row Y");
+
+    // 2. Normalized Mercator coordinates
+    let merc_west = MercatorPoint::from_lat_lng(51.5, -180.0);
+    let merc_east = MercatorPoint::from_lat_lng(51.5, 180.0);
+    assert!((merc_west.x - 0.0).abs() < 1e-6);
+    assert!((merc_east.x - 1.0).abs() < 1e-6);
+
+    // 3. H3 cell indexing across Date Line
+    let cell_west = LatLng::new(51.5, -179.99).unwrap().to_cell(Resolution::Eight);
+    let cell_east = LatLng::new(51.5, 179.99).unwrap().to_cell(Resolution::Eight);
+    let south_west = compute_cell_south_lat(cell_west.into());
+    let south_east = compute_cell_south_lat(cell_east.into());
+    assert!(south_west.is_finite());
+    assert!(south_east.is_finite());
+}
+
+#[test]
+fn test_extreme_polar_latitudes_clamping() {
+    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
+    use raster_h3::pmtiles::mvt::MercatorPoint;
+
+    // 1. Extreme North Pole (+89.99°)
+    let (tx_north, ty_north) = lon_lat_to_tile_xy(0.0, 89.99, 10);
+    assert_eq!(ty_north, 0, "North pole must clamp safely to tile Y=0");
+    assert!(tx_north < 1024);
+
+    // 2. Extreme South Pole (-89.99°)
+    let (tx_south, ty_south) = lon_lat_to_tile_xy(0.0, -89.99, 10);
+    assert_eq!(ty_south, 1023, "South pole must clamp safely to tile Y=1023 (2^10 - 1)");
+    assert!(tx_south < 1024);
+
+    // 3. Mercator coordinate finite clamping
+    let merc_north = MercatorPoint::from_lat_lng(90.0, 0.0);
+    let merc_south = MercatorPoint::from_lat_lng(-90.0, 0.0);
+    assert!(merc_north.y >= 0.0 && merc_north.y <= 1.0);
+    assert!(merc_south.y >= 0.0 && merc_south.y <= 1.0);
+    assert!(!merc_north.y.is_nan() && !merc_north.y.is_infinite());
+    assert!(!merc_south.y.is_nan() && !merc_south.y.is_infinite());
+}
+
+#[test]
+fn test_welford_accumulator_extreme_mixed_bathymetry_numerical_stability() {
+    let mut acc = H3Accumulator::default();
+
+    // 1,000,000 samples spanning from Mariana Trench (-10,928m) to Mt Everest (+8,848.86m)
+    let samples = [-10928.0f64, -5000.0, -100.0, 0.0, 500.0, 2500.0, 5895.0, 8848.86];
+    let num_repeats = 125_000; // 8 * 125,000 = 1,000,000 samples
+    let total_count = (samples.len() * num_repeats) as f64;
+
+    let true_sum: f64 = samples.iter().sum::<f64>() * (num_repeats as f64);
+    let true_mean: f64 = true_sum / total_count;
+    let true_var: f64 = samples
+        .iter()
+        .map(|&x| (x - true_mean) * (x - true_mean))
+        .sum::<f64>() * (num_repeats as f64) / (total_count - 1.0);
+
+    for _ in 0..num_repeats {
+        for &val in &samples {
+            acc.update(val);
+        }
+    }
+
+    assert_eq!(acc.count, total_count);
+    assert_eq!(acc.min, -10928.0);
+    assert_eq!(acc.max, 8848.86);
+
+    // Welford online mean and sample variance must match 2-pass exact reference
+    assert!((acc.mean() - true_mean).abs() < 1e-8, "Mean error must be < 1e-8");
+    assert!((acc.variance() - true_var).abs() < 1e-4, "Variance error must be < 1e-4");
+    assert!(acc.variance() >= 0.0, "Variance must never be negative");
+    assert!((acc.stddev() - true_var.sqrt()).abs() < 1e-6);
+}
+
+#[test]
+fn test_categorical_accumulator_high_cardinality_shannon_entropy() {
+    let mut acc = CategoricalAccumulator::default();
+
+    // Ingest 256 unique categories with uniform frequency (10 pixels each = 2560 pixels total)
+    for class_id in 0..=255i64 {
+        for _ in 0..10 {
+            acc.update(class_id);
+        }
+    }
+
+    assert_eq!(acc.unique_classes(), 256);
+    assert_eq!(acc.total_count, 2560.0);
+    let (_maj_cat, maj_count, maj_frac) = acc.majority();
+    assert_eq!(maj_count, 10.0);
+    assert_eq!(maj_frac, 10.0 / 2560.0);
+
+    // Analytical Shannon entropy for uniform distribution over N=256 is ln(256) nats
+    let entropy = acc.shannon_entropy();
+    let expected_entropy = (256.0f64).ln();
+    assert!((entropy - expected_entropy).abs() < 1e-10, "Entropy of uniform 256 classes must equal ln(256), got {}", entropy);
+
+    // Test extreme single-class concentration (100% pure class) -> Shannon entropy must be exactly 0.0
+    let mut pure_acc = CategoricalAccumulator::default();
+    for _ in 0..1000 {
+        pure_acc.update(42);
+    }
+    assert_eq!(pure_acc.unique_classes(), 1);
+    let (_pure_cat, pure_count, pure_frac) = pure_acc.majority();
+    assert_eq!(pure_count, 1000.0);
+    assert_eq!(pure_frac, 1.0);
+    assert_eq!(pure_acc.shannon_entropy(), 0.0);
+}
+
+
+
+

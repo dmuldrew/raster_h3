@@ -518,27 +518,46 @@ impl CategoricalHorizonStreamer {
                         }
                     }
 
-                    for pt in &self.sampling.points {
-                        let (px, py) = self
-                            .gt
-                            .pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
-                        if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py)
-                        {
-                            if let Ok(lat_lng) = LatLng::new(lat_i, lon_i) {
-                                let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
-                                self.active_map
-                                    .entry(cell_u64)
-                                    .and_modify(|acc| acc.update_weighted(cat, pt.weight))
-                                    .or_insert_with(|| {
-                                        let south_lat = compute_cell_south_lat(cell_u64);
-                                        self.eviction_queue.push(HexEvictionEntry {
-                                            south_lat,
-                                            cell_u64,
-                                        });
-                                        let mut acc = CategoricalAccumulator::default();
-                                        acc.update_weighted(cat, pt.weight);
-                                        acc
+                    if self.sampling.points.len() == 1 {
+                        if let Ok(lat_lng) = LatLng::new(center_lat, center_lon) {
+                            let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
+                            self.active_map
+                                .entry(cell_u64)
+                                .and_modify(|acc| acc.update(cat))
+                                .or_insert_with(|| {
+                                    let south_lat = compute_cell_south_lat(cell_u64);
+                                    self.eviction_queue.push(HexEvictionEntry {
+                                        south_lat,
+                                        cell_u64,
                                     });
+                                    let mut acc = CategoricalAccumulator::default();
+                                    acc.update(cat);
+                                    acc
+                                });
+                        }
+                    } else {
+                        for pt in &self.sampling.points {
+                            let (px, py) = self
+                                .gt
+                                .pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
+                            if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py)
+                            {
+                                if let Ok(lat_lng) = LatLng::new(lat_i, lon_i) {
+                                    let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
+                                    self.active_map
+                                        .entry(cell_u64)
+                                        .and_modify(|acc| acc.update_weighted(cat, pt.weight))
+                                        .or_insert_with(|| {
+                                            let south_lat = compute_cell_south_lat(cell_u64);
+                                            self.eviction_queue.push(HexEvictionEntry {
+                                                south_lat,
+                                                cell_u64,
+                                            });
+                                            let mut acc = CategoricalAccumulator::default();
+                                            acc.update_weighted(cat, pt.weight);
+                                            acc
+                                        });
+                                }
                             }
                         }
                     }

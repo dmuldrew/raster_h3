@@ -67,3 +67,57 @@ fn test_multithreaded_pool_scaling() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_multithreaded_streamer_high_contention_stress() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer, MultiContinuousRecord};
+    use rayon::prelude::*;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("contention_test.tif");
+    helpers::create_temp_geotiff(&path, 128, 128, CompressionMethod::None)?;
+
+    let reader = GeoTiffStreamReader::open(&path)?;
+    let config = MultiResolutionConfig::new(vec![7, 8]);
+    let streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+    let streamer_shared = Arc::new(Mutex::new(streamer));
+
+    // Spawn 16 worker threads concurrently draining the streamer in small batches
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+    let total_records: Vec<Vec<MultiContinuousRecord>> = pool.install(|| {
+        (0..16)
+            .into_par_iter()
+            .map(|_| {
+                let mut local_batch = Vec::new();
+                loop {
+                    let batch = {
+                        let mut guard = match streamer_shared.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        guard.fetch_next_batch(128)
+                    };
+                    if batch.is_empty() {
+                        break;
+                    }
+                    local_batch.extend(batch);
+                }
+                local_batch
+            })
+            .collect()
+    });
+
+    let all_records: Vec<MultiContinuousRecord> = total_records.into_iter().flatten().collect();
+    assert!(!all_records.is_empty(), "Should have received streamed multi-resolution records");
+
+    // Total pixel mass for 128x128 = 16,384 pixels across 2 resolutions (7 and 8) = 32,768 pixel units
+    let res7_pixels: f64 = all_records.iter().filter(|r| r.resolution == 7).map(|r| r.accumulator.count).sum();
+    let res8_pixels: f64 = all_records.iter().filter(|r| r.resolution == 8).map(|r| r.accumulator.count).sum();
+
+    assert_eq!(res7_pixels, 16384.0, "Resolution 7 must strictly conserve total pixel mass under high thread contention");
+    assert_eq!(res8_pixels, 16384.0, "Resolution 8 must strictly conserve total pixel mass under high thread contention");
+
+    Ok(())
+}
+
