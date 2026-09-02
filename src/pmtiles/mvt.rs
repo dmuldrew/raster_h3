@@ -246,6 +246,22 @@ impl MvtLayer {
         });
     }
 
+    /// Add an H3 parent hexagon feature in the layer if not already present, avoiding duplicate polygons
+    pub fn add_or_merge_hexagon_mercator(
+        &mut self,
+        id: u64,
+        vertices: &[MercatorPoint],
+        z: u8,
+        tx: u32,
+        ty: u32,
+        properties: Vec<(Cow<'static, str>, MvtValue)>,
+    ) {
+        if self.features.iter().any(|f| f.id == id) {
+            return;
+        }
+        self.add_hexagon_mercator(id, vertices, z, tx, ty, properties);
+    }
+
     /// Add an H3 hexagon feature with its boundary vertices converted to tile [0, 4096] coordinates
     pub fn add_hexagon(
         &mut self,

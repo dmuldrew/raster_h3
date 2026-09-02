@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use fxhash::FxBuildHasher;
-use h3o::{CellIndex, LatLng};
+use h3o::{CellIndex, LatLng, Resolution};
 use rayon::prelude::*;
 use serde_json::json;
 
@@ -112,6 +112,28 @@ pub fn h3_res_to_zoom(res: u8) -> u8 {
         14 => 21,
         15 => 23,
         _ => 24,
+    }
+}
+
+/// Determine the optimal H3 resolution for a given Web Mercator zoom level
+pub fn h3_res_for_zoom(zoom: u8) -> u8 {
+    match zoom {
+        0 | 1 => 0,
+        2 | 3 => 1,
+        4 => 2,
+        5 => 3,
+        6 | 7 => 4,
+        8 | 9 => 5,
+        10 => 6,
+        11 | 12 => 7,
+        13 => 8,
+        14 => 9,
+        15 | 16 => 10,
+        17 => 11,
+        18 | 19 => 12,
+        20 => 13,
+        21 | 22 => 14,
+        _ => 15,
     }
 }
 
@@ -602,6 +624,63 @@ impl H3PmtilesTiler {
 
                     let zooms = zooms_for_h3_res(resolution, min_res);
                     for &zoom in &zooms {
+                        let optimal_res = h3_res_for_zoom(zoom);
+                        if optimal_res < resolution {
+                            if let Ok(res_enum) = Resolution::try_from(optimal_res) {
+                                if let Some(parent_cell) = cell.parent(res_enum) {
+                                    let parent_h3: u64 = parent_cell.into();
+                                    let p_center: LatLng = parent_cell.into();
+                                    let p_center_merc = MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
+                                    let p_vertices_merc: Vec<MercatorPoint> = parent_cell.boundary()
+                                        .iter()
+                                        .map(|v| MercatorPoint::from_lat_lng(v.lat(), v.lng()))
+                                        .collect();
+
+                                    let parent_properties = vec![
+                                        (Cow::Borrowed("h3_index"), MvtValue::UInt(parent_h3)),
+                                        (Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(parent_h3)),
+                                        (Cow::Borrowed("resolution"), MvtValue::UInt(optimal_res as u64)),
+                                        (Cow::Borrowed("mean"), MvtValue::Double(accumulator.mean())),
+                                        (Cow::Borrowed("sum"), MvtValue::Double(accumulator.sum)),
+                                        (Cow::Borrowed("stddev"), MvtValue::Double(accumulator.stddev())),
+                                        (Cow::Borrowed("count"), MvtValue::Double(accumulator.count)),
+                                        (Cow::Borrowed("min"), MvtValue::Double(accumulator.min)),
+                                        (Cow::Borrowed("max"), MvtValue::Double(accumulator.max)),
+                                    ];
+
+                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(p_center_merc, &p_vertices_merc, zoom);
+                                    for tx in min_tx..=max_tx {
+                                        for ty in min_ty..=max_ty {
+                                            let tile_key = (zoom, tx, ty);
+                                            let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
+                                                l
+                                            } else {
+                                                let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                                                let safe_evict_lat = bbox[1] - safety_margin;
+                                                tile_eviction_queue.push(TileEvictionEntry {
+                                                    safe_evict_lat,
+                                                    tile_key,
+                                                });
+                                                tile_buckets.entry(tile_key).or_insert_with(|| {
+                                                    MvtLayer::new("h3_hexagons")
+                                                })
+                                            };
+
+                                            layer.add_or_merge_hexagon_mercator(
+                                                parent_h3,
+                                                &p_vertices_merc,
+                                                zoom,
+                                                tx,
+                                                ty,
+                                                parent_properties.clone(),
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, &vertices_merc, zoom);
                         for tx in min_tx..=max_tx {
                             for ty in min_ty..=max_ty {
@@ -842,6 +921,62 @@ impl H3PmtilesTiler {
 
                     let zooms = zooms_for_h3_res(resolution, min_res);
                     for &zoom in &zooms {
+                        let optimal_res = h3_res_for_zoom(zoom);
+                        if optimal_res < resolution {
+                            if let Ok(res_enum) = Resolution::try_from(optimal_res) {
+                                if let Some(parent_cell) = cell.parent(res_enum) {
+                                    let parent_h3: u64 = parent_cell.into();
+                                    let p_center: LatLng = parent_cell.into();
+                                    let p_center_merc = MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
+                                    let p_vertices_merc: Vec<MercatorPoint> = parent_cell.boundary()
+                                        .iter()
+                                        .map(|v| MercatorPoint::from_lat_lng(v.lat(), v.lng()))
+                                        .collect();
+
+                                    let parent_properties = vec![
+                                        (Cow::Borrowed("h3_index"), MvtValue::UInt(parent_h3)),
+                                        (Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(parent_h3)),
+                                        (Cow::Borrowed("resolution"), MvtValue::UInt(optimal_res as u64)),
+                                        (Cow::Borrowed("majority"), MvtValue::Int(majority_class)),
+                                        (Cow::Borrowed("majority_fraction"), MvtValue::Double(majority_fraction)),
+                                        (Cow::Borrowed("distinct_classes"), MvtValue::UInt(distinct_classes as u64)),
+                                        (Cow::Borrowed("entropy"), MvtValue::Double(entropy)),
+                                        (Cow::Borrowed("count"), MvtValue::Double(pixel_count)),
+                                    ];
+
+                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(p_center_merc, &p_vertices_merc, zoom);
+                                    for tx in min_tx..=max_tx {
+                                        for ty in min_ty..=max_ty {
+                                            let tile_key = (zoom, tx, ty);
+                                            let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
+                                                l
+                                            } else {
+                                                let bbox = tile_xy_to_bbox(zoom, tx, ty);
+                                                let safe_evict_lat = bbox[1] - safety_margin;
+                                                tile_eviction_queue.push(TileEvictionEntry {
+                                                    safe_evict_lat,
+                                                    tile_key,
+                                                });
+                                                tile_buckets.entry(tile_key).or_insert_with(|| {
+                                                    MvtLayer::new("h3_hexagons")
+                                                })
+                                            };
+
+                                            layer.add_or_merge_hexagon_mercator(
+                                                parent_h3,
+                                                &p_vertices_merc,
+                                                zoom,
+                                                tx,
+                                                ty,
+                                                parent_properties.clone(),
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, &vertices_merc, zoom);
                         for tx in min_tx..=max_tx {
                             for ty in min_ty..=max_ty {
