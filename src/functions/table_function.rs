@@ -16,6 +16,8 @@ use crate::raster::geotiff::GeoTiffStreamReader;
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
     pub file_path: String,
+    pub resolved_paths: Vec<std::path::PathBuf>,
+    pub overlap_rule: crate::raster::mosaic::OverlapRule,
     pub resolutions: Vec<u8>,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
@@ -349,6 +351,27 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         false
     };
 
+    // Named parameter: overlap_rule (VARCHAR, default: 'cutline')
+    let mut overlap_rule = crate::raster::mosaic::OverlapRule::default();
+    let name_overlap = to_c_string("overlap_rule");
+    let named_overlap_val = duckdb_bind_get_named_parameter(info, name_overlap.as_ptr());
+    if !named_overlap_val.is_null() {
+        let overlap_ptr = duckdb_get_varchar(named_overlap_val);
+        if let Some(s) = from_duckdb_string(overlap_ptr) {
+            overlap_rule = crate::raster::mosaic::OverlapRule::parse(&s);
+        }
+    }
+
+    let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
+        Ok(paths) => paths,
+        Err(e) => {
+            let err_msg = CString::new(format!("Failed to resolve raster source(s): {}", e))
+                .unwrap_or_else(|_| CString::new("Failed to resolve raster source(s)").unwrap());
+            duckdb_bind_set_error(info, err_msg.as_ptr());
+            return;
+        }
+    };
+
     // Add Output Columns:
     // 0: h3_index UBIGINT
     let col_h3 = to_c_string("h3_index");
@@ -412,29 +435,33 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         3.071e2, 4.387e1, 6.268e0, 8.954e-1,
     ];
 
-    let estimated_cardinality = if let Ok(reader) = GeoTiffStreamReader::open(&file_path) {
-        let w = reader.metadata.width as f64;
-        let h = reader.metadata.height as f64;
-        let total_pixels = (w * h) as u64;
+    let estimated_cardinality = if let Some(first_path) = resolved_paths.first() {
+        if let Ok(reader) = GeoTiffStreamReader::open(first_path) {
+            let w = reader.metadata.width as f64;
+            let h = reader.metadata.height as f64;
+            let total_pixels = (w * h) as u64 * resolved_paths.len() as u64;
 
-        let (x0, y0) = reader.metadata.geotransform.pixel_to_coord(0.0, 0.0);
-        let (x1, y1) = reader.metadata.geotransform.pixel_to_coord(w, h);
-        let dx = (x1 - x0).abs();
-        let dy = (y1 - y0).abs();
+            let (x0, y0) = reader.metadata.geotransform.pixel_to_coord(0.0, 0.0);
+            let (x1, y1) = reader.metadata.geotransform.pixel_to_coord(w, h);
+            let dx = (x1 - x0).abs();
+            let dy = (y1 - y0).abs();
 
-        let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
-            dx * 111_320.0 * dy * 110_540.0
+            let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
+                dx * 111_320.0 * dy * 110_540.0 * resolved_paths.len() as f64
+            } else {
+                dx * dy * resolved_paths.len() as f64
+            };
+
+            let mut total_hex_est = 0u64;
+            for &res in &resolutions {
+                let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
+                let hex_count = (area_m2 / hex_area).ceil() as u64;
+                total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
+            }
+            total_hex_est.max(1)
         } else {
-            dx * dy
-        };
-
-        let mut total_hex_est = 0u64;
-        for &res in &resolutions {
-            let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
-            let hex_count = (area_m2 / hex_area).ceil() as u64;
-            total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
+            10_000 * resolutions.len() as u64
         }
-        total_hex_est.max(1)
     } else {
         10_000 * resolutions.len() as u64
     };
@@ -443,6 +470,8 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
 
     let bind_data = Box::new(RasterH3BindData {
         file_path,
+        resolved_paths,
+        overlap_rule,
         resolutions,
         source_crs,
         nodata,
@@ -474,11 +503,16 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     }
     let bind_data = &*bind_data_ptr;
 
-    let reader = match GeoTiffStreamReader::open(&bind_data.file_path) {
-        Ok(r) => r,
+    let mosaic = match crate::raster::mosaic::MosaicReader::open(
+        &bind_data.resolved_paths,
+        bind_data.bbox,
+        bind_data.source_crs.as_deref(),
+        bind_data.overlap_rule,
+    ) {
+        Ok(m) => std::sync::Arc::new(m),
         Err(e) => {
-            let err_msg = CString::new(format!("Failed to open GeoTIFF: {}", e))
-                .unwrap_or_else(|_| CString::new("Failed to open GeoTIFF").unwrap());
+            let err_msg = CString::new(format!("Failed to open raster mosaic: {}", e))
+                .unwrap_or_else(|_| CString::new("Failed to open raster mosaic").unwrap());
             duckdb_init_set_error(info, err_msg.as_ptr());
             return;
         }
@@ -491,6 +525,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     }
 
     let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
+    config.overlap_rule = bind_data.overlap_rule;
     config.custom_crs = bind_data.source_crs.clone();
     config.custom_nodata = bind_data.nodata;
     config.bbox = bind_data.bbox;
@@ -502,7 +537,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     config.max_mean = bind_data.max_mean;
     config.compact = bind_data.compact;
 
-    let streamer = match MultiScanHorizonStreamer::new(reader, &config) {
+    let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
         Ok(s) => s,
         Err(e) => {
             let err_msg = CString::new(format!("Failed to initialize multi-streamer: {}", e))
@@ -845,6 +880,10 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
         let name_compact = to_c_string("compact");
         duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
+
+        // Overlap rule parameter
+        let name_overlap = to_c_string("overlap_rule");
+        duckdb_table_function_add_named_parameter(tf, name_overlap.as_ptr(), type_varchar);
 
         // Set callbacks including parallel init_local and projection pushdown
         duckdb_table_function_set_bind(tf, raster_h3_bind);

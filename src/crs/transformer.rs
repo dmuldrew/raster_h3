@@ -186,6 +186,7 @@ impl AlbersConicFast {
 }
 
 /// High-performance CRS to WGS84 coordinate transformer
+#[derive(Clone)]
 pub enum CrsTransformer {
     /// Native WGS84 (EPSG:4326) - Zero math, zero overhead
     Wgs84Identity,

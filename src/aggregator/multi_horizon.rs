@@ -7,6 +7,7 @@
 //! lock-free while strictly bounding RAM to the active scanline horizon.
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::Arc;
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, LatLng, Resolution};
 use rayon::prelude::*;
@@ -16,7 +17,7 @@ use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::aggregator::horizon_streamer::{
-    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, HexEvictionEntry,
+    compute_cell_south_lat, is_chunk_all_nodata, HexEvictionEntry,
 };
 use crate::aggregator::sampling::SamplingPattern;
 use crate::aggregator::simd::SimdSpanAccumulate;
@@ -24,7 +25,8 @@ use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::geotransform::GeoTransform;
-use crate::raster::prefetch::PrefetchedChunkReader;
+use crate::raster::mosaic::{MosaicReader, OverlapRule};
+use crate::raster::prefetch::PrefetchedMosaicReader;
 use crate::raster::RasterChunk;
 
 const WGS84_A: f64 = 6378137.0;
@@ -67,6 +69,7 @@ pub struct MultiResolutionConfig {
     pub max_mean: Option<f64>,
     pub min_majority_fraction: Option<f64>,
     pub compact: bool,
+    pub overlap_rule: OverlapRule,
 }
 
 impl MultiResolutionConfig {
@@ -86,6 +89,7 @@ impl MultiResolutionConfig {
             max_mean: None,
             min_majority_fraction: None,
             compact: false,
+            overlap_rule: OverlapRule::default(),
         }
     }
 }
@@ -104,27 +108,7 @@ pub struct MultiContinuousRecord {
     pub accumulator: H3Accumulator,
 }
 
-/// Calculate the minimum WGS84 latitude reached across a given raster row
 
-/// Calculate the minimum WGS84 latitude reached across a given raster row
-fn compute_row_lat(
-    row: usize,
-    width: usize,
-    gt: &GeoTransform,
-    crs_transformer: &CrsTransformer,
-) -> f64 {
-    let mut min_lat = f64::INFINITY;
-    let col_samples = [0, width / 2, width];
-    for &c in &col_samples {
-        let (x, y) = gt.pixel_to_coord(c as f64, row as f64);
-        if let Ok((_lon, lat)) = crs_transformer.transform_point(x, y) {
-            if lat < min_lat {
-                min_lat = lat;
-            }
-        }
-    }
-    min_lat
-}
 
 /// Fast check if an entire row slice consists purely of NoData values
 #[inline(always)]
@@ -147,6 +131,114 @@ where
     }
 }
 
+/// Direct pixel-by-pixel continuous slice aggregation with strict tile ownership resolution
+fn process_continuous_overlap_slice_into_maps<T>(
+    slice: &[T],
+    chunk: &RasterChunk,
+    native_nodata: Option<T>,
+    resolutions: &[Resolution],
+    crs_transformer: &CrsTransformer,
+    gt: &GeoTransform,
+    sampling: &SamplingPattern,
+    bbox: Option<[f64; 4]>,
+    chunk_stride: u32,
+    tile_idx: usize,
+    mosaic: &MosaicReader,
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
+) where
+    T: SimdSpanAccumulate,
+{
+    let stride = if chunk_stride > 0 && slice.len() >= chunk_stride as usize {
+        chunk_stride as usize
+    } else {
+        (chunk.width as usize).max(1)
+    };
+    let actual_rows = (slice.len() / stride).min(chunk.height as usize);
+    let num_res = resolutions.len();
+
+    for r in 0..actual_rows {
+        let row_idx = (chunk.row_offset + r as u32) as usize;
+        let slice_row_start = r * stride;
+        let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
+        if row_width == 0 {
+            continue;
+        }
+
+        for c in 0..row_width {
+            let val = slice[slice_row_start + c];
+            if !val.is_valid(native_nodata) {
+                continue;
+            }
+            let float_val = val.to_f64_val();
+
+            if sampling.is_single_point() {
+                let (x, y) = gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
+                let (lon, lat) = match crs_transformer.transform_point(x, y) {
+                    Ok(coords) => coords,
+                    Err(_) => continue,
+                };
+
+                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                    if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                        continue;
+                    }
+                }
+
+                if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
+                    continue;
+                }
+
+                if let Ok(ll) = LatLng::new(lat, lon) {
+                    for res_idx in 0..num_res {
+                        let res = resolutions[res_idx];
+                        let cell_u64: u64 = ll.to_cell(res).into();
+                        chunk_maps[res_idx]
+                            .entry(cell_u64)
+                            .and_modify(|acc| acc.update(float_val))
+                            .or_insert_with(|| {
+                                let mut acc = H3Accumulator::default();
+                                acc.update(float_val);
+                                acc
+                            });
+                    }
+                }
+            } else {
+                for sp in &sampling.points {
+                    let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
+                    let py = (chunk.row_offset as f64) + (r as f64) + sp.dy;
+                    let (x, y) = gt.pixel_to_coord(px, py);
+                    if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
+                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                            if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                                continue;
+                            }
+                        }
+
+                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
+                            continue;
+                        }
+
+                        if let Ok(ll) = LatLng::new(lat, lon) {
+                            for res_idx in 0..num_res {
+                                let res = resolutions[res_idx];
+                                let cell_u64: u64 = ll.to_cell(res).into();
+                                chunk_maps[res_idx]
+                                    .entry(cell_u64)
+                                    .and_modify(|acc| acc.update_weighted(float_val, sp.weight))
+                                    .or_insert_with(|| {
+                                        let mut acc = H3Accumulator::default();
+                                        acc.update_weighted(float_val, sp.weight);
+                                        acc
+                                    });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
 fn process_continuous_slice_into_maps<T>(
     slice: &[T],
@@ -158,11 +250,30 @@ fn process_continuous_slice_into_maps<T>(
     sampling: &SamplingPattern,
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) where
     T: SimdSpanAccumulate,
 {
     if slice.is_empty() {
+        return;
+    }
+
+    if let Some((tile_idx, mosaic)) = overlap_ctx {
+        process_continuous_overlap_slice_into_maps(
+            slice,
+            chunk,
+            native_nodata,
+            resolutions,
+            crs_transformer,
+            gt,
+            sampling,
+            bbox,
+            chunk_stride,
+            tile_idx,
+            mosaic,
+            chunk_maps,
+        );
         return;
     }
 
@@ -401,6 +512,7 @@ fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(
     samples_per_pixel: usize,
     band: usize,
     spectral_formula: Option<SpectralFormula>,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) {
     let row_width = chunk.width as usize;
@@ -516,6 +628,12 @@ fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(
                         }
                     }
 
+                    if let Some((tile_idx, mosaic)) = overlap_ctx {
+                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
+                            continue;
+                        }
+                    }
+
                     if let Ok(ll) = LatLng::new(lat, lon) {
                         for res_idx in 0..num_res {
                             let res = resolutions[res_idx];
@@ -550,6 +668,7 @@ fn process_continuous_chunk_payload_into(
     samples_per_pixel: u16,
     band: usize,
     spectral_formula: Option<SpectralFormula>,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
     let is_multisample = samples_per_pixel > 1 || spectral_formula.is_some() || band > 1;
@@ -576,86 +695,86 @@ fn process_continuous_chunk_payload_into(
         match decoding_result {
             DecodingResult::U8(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::U16(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::U32(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::U64(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::I8(slice) => {
                 let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::I16(slice) => {
                 let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::I32(slice) => {
                 let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::I64(slice) => {
                 let nd = nodata.map(|v| v as i64);
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::F32(slice) => {
                 let nd = nodata.map(|v| v as f32);
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
             DecodingResult::F64(slice) => {
                 let nd = nodata;
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
             }
         }
     } else {
         match decoding_result {
             DecodingResult::U8(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::U16(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::U32(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::U64(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::I8(slice) => {
                 let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::I16(slice) => {
                 let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::I32(slice) => {
                 let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::I64(slice) => {
                 let nd = nodata.map(|v| v as i64);
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::F32(slice) => {
                 let nd = nodata.map(|v| v as f32);
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
             DecodingResult::F64(slice) => {
                 let nd = nodata;
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
             }
         }
     }
@@ -664,26 +783,20 @@ fn process_continuous_chunk_payload_into(
 
 /// Single-pass streaming aggregator across multiple H3 resolutions (Continuous Data)
 pub struct MultiScanHorizonStreamer {
-    prefetcher: Option<PrefetchedChunkReader>,
-    crs_transformer: CrsTransformer,
+    prefetcher: Option<PrefetchedMosaicReader>,
+    pub mosaic: Arc<MosaicReader>,
     resolutions: Vec<Resolution>,
     resolution_u8s: Vec<u8>,
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
-    gt: GeoTransform,
-    chunk_stride: u32,
     active_maps: Vec<HashMap<u64, H3Accumulator, FxBuildHasher>>,
     eviction_queues: Vec<BinaryHeap<HexEvictionEntry>>,
     completed_buffer: VecDeque<MultiContinuousRecord>,
     is_finished: bool,
     current_lat_horizon: f64,
     pub profile_stats: [u64; 4],
-    raster_width: u32,
-    chunk_height: u32,
-    chunks_across: u32,
-    highest_processed_chunk: u32,
-    samples_per_pixel: u16,
+    processed_chunk_count: usize,
     band: usize,
     spectral_formula: Option<SpectralFormula>,
     min_count: Option<f64>,
@@ -694,8 +807,18 @@ pub struct MultiScanHorizonStreamer {
 }
 
 impl MultiScanHorizonStreamer {
-    /// Initialize a new MultiScanHorizonStreamer with background chunk prefetching
+    /// Initialize a new MultiScanHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
+        let mosaic = Arc::new(MosaicReader::from_single_reader(
+            reader,
+            config.bbox,
+            config.custom_crs.as_deref(),
+        )?);
+        Self::new_mosaic(mosaic, config)
+    }
+
+    /// Initialize a new MultiScanHorizonStreamer from a multi-file MosaicReader
+    pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
         if config.resolutions.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
                 "Resolutions list cannot be empty".to_string(),
@@ -712,40 +835,7 @@ impl MultiScanHorizonStreamer {
             resolution_u8s.push(res_u8);
         }
 
-        let crs_transformer = CrsTransformer::from_crs_or_epsg(
-            reader.metadata.epsg,
-            config
-                .custom_crs
-                .as_deref()
-                .or(reader.metadata.proj_string.as_deref()),
-        )?;
-
-        let nodata = config.custom_nodata.or(reader.metadata.nodata);
-        let bbox = config.bbox;
-        let gt = reader.metadata.geotransform;
-        let chunk_stride = reader.chunk_layout.chunk_width;
-        let total_chunks = reader.chunk_layout.total_chunks;
-        let raster_width = reader.metadata.width;
-        let chunk_height = reader.chunk_layout.chunk_height.max(1);
-        let chunk_width = reader.chunk_layout.chunk_width.max(1);
-        let chunks_across = ((raster_width + chunk_width - 1) / chunk_width).max(1);
-
-        let chunk_indices: Vec<u32> = (0..total_chunks)
-            .filter(|&idx| {
-                if let Some(ref b) = bbox {
-                    let chunk_bounds = reader.chunk_layout.get_chunk_bounds(
-                        idx,
-                        reader.metadata.width,
-                        reader.metadata.height,
-                    );
-                    chunk_intersects_bbox(&chunk_bounds, &gt, &crs_transformer, b)
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        let prefetcher = PrefetchedChunkReader::spawn(reader.clone(), chunk_indices, 256);
+        let prefetcher = PrefetchedMosaicReader::spawn(Arc::clone(&mosaic), 256);
         let num_res = resolutions.len();
 
         let mut active_maps = Vec::with_capacity(num_res);
@@ -755,7 +845,6 @@ impl MultiScanHorizonStreamer {
             eviction_queues.push(BinaryHeap::with_capacity(1024));
         }
 
-        let samples_per_pixel = reader.metadata.samples_per_pixel;
         let band = config.band;
         let spectral_formula = config.spectral_formula;
         let min_count = config.min_count;
@@ -766,25 +855,19 @@ impl MultiScanHorizonStreamer {
 
         Ok(Self {
             prefetcher: Some(prefetcher),
-            crs_transformer,
+            mosaic,
             resolutions,
             resolution_u8s,
-            nodata,
-            bbox,
+            nodata: config.custom_nodata,
+            bbox: config.bbox,
             sampling: config.sampling.clone(),
-            gt,
-            chunk_stride,
             active_maps,
             eviction_queues,
             completed_buffer: VecDeque::with_capacity(2048),
             is_finished: false,
             current_lat_horizon: f64::INFINITY,
             profile_stats: [0; 4],
-            raster_width,
-            chunk_height,
-            chunks_across,
-            highest_processed_chunk: 0,
-            samples_per_pixel,
+            processed_chunk_count: 0,
             band,
             spectral_formula,
             min_count,
@@ -953,30 +1036,19 @@ impl MultiScanHorizonStreamer {
                     }
                 }
                 self.flush_pending_compact();
-                eprintln!(
-                    "FETCH SUB-TIMINGS: prefetch_wait={:.3}s, rayon_compute={:.3}s, merge={:.3}s, evict={:.3}s",
-                    self.profile_stats[0] as f64 / 1e9,
-                    self.profile_stats[1] as f64 / 1e9,
-                    self.profile_stats[2] as f64 / 1e9,
-                    self.profile_stats[3] as f64 / 1e9,
-                );
                 break;
             }
 
             let resolutions = &self.resolutions;
-            let crs_transformer = &self.crs_transformer;
-            let gt = &self.gt;
             let sampling = &self.sampling;
             let bbox = self.bbox;
-            let chunk_stride = self.chunk_stride;
-            let nodata = self.nodata;
-            let samples_per_pixel = self.samples_per_pixel;
             let band = self.band;
             let spectral_formula = self.spectral_formula;
+            let mosaic = Arc::clone(&self.mosaic);
+            let user_nodata = self.nodata;
 
-            // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(u32, Vec<Vec<(u64, H3Accumulator)>>, DecodingResult)> = chunk_items
+            let parallel_results: Vec<(Vec<Vec<(u64, H3Accumulator)>>, DecodingResult)> = chunk_items
                 .par_iter_mut()
                 .map_init(
                     || {
@@ -988,10 +1060,23 @@ impl MultiScanHorizonStreamer {
                     },
                     |local_maps, item| {
                         match item {
-                            Ok((chunk_idx, chunk_bounds, decoding_result)) => {
+                            Ok((tile_idx, _chunk_idx, chunk_bounds, decoding_result, has_overlap)) => {
                                 for m in local_maps.iter_mut() {
                                     m.clear();
                                 }
+                                let tile = &mosaic.tiles[*tile_idx];
+                                let crs_transformer = &tile.crs_transformer;
+                                let gt = &tile.reader.metadata.geotransform;
+                                let chunk_stride = tile.reader.chunk_layout.chunk_width;
+                                let nodata = user_nodata.or(tile.reader.metadata.nodata);
+                                let samples_per_pixel = tile.reader.metadata.samples_per_pixel;
+
+                                let overlap_ctx = if *has_overlap {
+                                    Some((*tile_idx, &*mosaic))
+                                } else {
+                                    None
+                                };
+
                                 let has_data = process_continuous_chunk_payload_into(
                                     chunk_bounds,
                                     decoding_result,
@@ -1005,6 +1090,7 @@ impl MultiScanHorizonStreamer {
                                     samples_per_pixel,
                                     band,
                                     spectral_formula,
+                                    overlap_ctx,
                                     local_maps,
                                 );
                                 let mut chunk_entries = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
@@ -1015,7 +1101,7 @@ impl MultiScanHorizonStreamer {
                                     }
                                 }
                                 let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
-                                Some((*chunk_idx, chunk_entries, dec))
+                                Some((chunk_entries, dec))
                             }
                             Err(_) => None,
                         }
@@ -1028,9 +1114,9 @@ impl MultiScanHorizonStreamer {
             let mut recycled_buffers = Vec::with_capacity(parallel_results.len());
 
             let t2 = std::time::Instant::now();
-            for (chunk_idx, chunk_entries, decoding_result) in parallel_results {
-                self.highest_processed_chunk = self.highest_processed_chunk.max(chunk_idx);
+            self.processed_chunk_count += chunk_items.len();
 
+            for (chunk_entries, decoding_result) in parallel_results {
                 if !chunk_entries.is_empty() {
                     for (res_idx, entries) in chunk_entries.into_iter().enumerate() {
                         let active_map = &mut self.active_maps[res_idx];
@@ -1060,10 +1146,9 @@ impl MultiScanHorizonStreamer {
             }
             self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
 
-            let completed_rows = (self.highest_processed_chunk + 1) / self.chunks_across;
-            if completed_rows > 0 {
-                let safe_row = (completed_rows * self.chunk_height) as usize;
-                let safe_lat = compute_row_lat(safe_row, self.raster_width as usize, &self.gt, &self.crs_transformer);
+            if self.processed_chunk_count < self.mosaic.chunk_refs.len() {
+                let next_chunk = &self.mosaic.chunk_refs[self.processed_chunk_count];
+                let safe_lat = next_chunk.north_lat;
                 if safe_lat < self.current_lat_horizon {
                     let t3 = std::time::Instant::now();
                     self.current_lat_horizon = safe_lat;
@@ -1116,6 +1201,128 @@ pub struct MultiCategoricalRecord {
     pub accumulator: CategoricalAccumulator,
 }
 
+/// Direct pixel-by-pixel categorical slice aggregation with strict tile ownership resolution
+fn process_categorical_overlap_slice_into_maps<T, F, N>(
+    slice: &[T],
+    chunk: &RasterChunk,
+    to_i64: F,
+    native_nodata: Option<N>,
+    resolutions: &[Resolution],
+    crs_transformer: &CrsTransformer,
+    gt: &GeoTransform,
+    sampling: &SamplingPattern,
+    bbox: Option<[f64; 4]>,
+    chunk_stride: u32,
+    nodata: Option<f64>,
+    tile_idx: usize,
+    mosaic: &MosaicReader,
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
+) where
+    T: Copy + PartialEq,
+    F: Fn(T) -> Option<i64>,
+    N: Copy + PartialEq<T>,
+{
+    let stride = if chunk_stride > 0 && slice.len() >= chunk_stride as usize {
+        chunk_stride as usize
+    } else {
+        (chunk.width as usize).max(1)
+    };
+    let actual_rows = (slice.len() / stride).min(chunk.height as usize);
+    let num_res = resolutions.len();
+
+    for r in 0..actual_rows {
+        let row_idx = (chunk.row_offset + r as u32) as usize;
+        let slice_row_start = r * stride;
+        let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
+        if row_width == 0 {
+            continue;
+        }
+
+        for c in 0..row_width {
+            let val = slice[slice_row_start + c];
+            if let Some(nd) = native_nodata {
+                if nd == val {
+                    continue;
+                }
+            }
+            let cat = match to_i64(val) {
+                Some(k) => k,
+                None => continue,
+            };
+            if let Some(nd_f64) = nodata {
+                if (cat as f64 - nd_f64).abs() < 1e-6 {
+                    continue;
+                }
+            }
+
+            if sampling.is_single_point() {
+                let (x, y) = gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
+                let (lon, lat) = match crs_transformer.transform_point(x, y) {
+                    Ok(coords) => coords,
+                    Err(_) => continue,
+                };
+
+                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                    if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                        continue;
+                    }
+                }
+
+                if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
+                    continue;
+                }
+
+                if let Ok(ll) = LatLng::new(lat, lon) {
+                    for res_idx in 0..num_res {
+                        let res = resolutions[res_idx];
+                        let cell_u64: u64 = ll.to_cell(res).into();
+                        chunk_maps[res_idx]
+                            .entry(cell_u64)
+                            .and_modify(|acc| acc.update(cat))
+                            .or_insert_with(|| {
+                                let mut acc = CategoricalAccumulator::default();
+                                acc.update(cat);
+                                acc
+                            });
+                    }
+                }
+            } else {
+                for sp in &sampling.points {
+                    let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
+                    let py = (chunk.row_offset as f64) + (r as f64) + sp.dy;
+                    let (x, y) = gt.pixel_to_coord(px, py);
+                    if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
+                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                            if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                                continue;
+                            }
+                        }
+
+                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
+                            continue;
+                        }
+
+                        if let Ok(ll) = LatLng::new(lat, lon) {
+                            for res_idx in 0..num_res {
+                                let res = resolutions[res_idx];
+                                let cell_u64: u64 = ll.to_cell(res).into();
+                                chunk_maps[res_idx]
+                                    .entry(cell_u64)
+                                    .and_modify(|acc| acc.update_weighted(cat, sp.weight))
+                                    .or_insert_with(|| {
+                                        let mut acc = CategoricalAccumulator::default();
+                                        acc.update_weighted(cat, sp.weight);
+                                        acc
+                                    });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
 fn process_categorical_slice_into_maps<T, F, N>(
     slice: &[T],
@@ -1129,6 +1336,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
     nodata: Option<f64>,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) where
     T: Copy + PartialEq,
@@ -1136,6 +1344,26 @@ fn process_categorical_slice_into_maps<T, F, N>(
     N: Copy + PartialEq<T>,
 {
     if slice.is_empty() {
+        return;
+    }
+
+    if let Some((tile_idx, mosaic)) = overlap_ctx {
+        process_categorical_overlap_slice_into_maps(
+            slice,
+            chunk,
+            to_i64,
+            native_nodata,
+            resolutions,
+            crs_transformer,
+            gt,
+            sampling,
+            bbox,
+            chunk_stride,
+            nodata,
+            tile_idx,
+            mosaic,
+            chunk_maps,
+        );
         return;
     }
 
@@ -1441,6 +1669,7 @@ fn process_categorical_multisample_slice_into_maps<T, F>(
     chunk_stride: u32,
     samples_per_pixel: usize,
     band: usize,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 )
 where
@@ -1479,6 +1708,12 @@ where
                         }
                     }
 
+                    if let Some((tile_idx, mosaic)) = overlap_ctx {
+                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
+                            continue;
+                        }
+                    }
+
                     if let Ok(ll) = LatLng::new(lat, lon) {
                         for res_idx in 0..num_res {
                             let res = resolutions[res_idx];
@@ -1512,6 +1747,7 @@ fn process_categorical_chunk_payload_into(
     nodata: Option<f64>,
     samples_per_pixel: u16,
     band: usize,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) -> bool {
     let is_multisample = samples_per_pixel > 1 && band > 1;
@@ -1538,86 +1774,86 @@ fn process_categorical_chunk_payload_into(
         match decoding_result {
             DecodingResult::U8(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::U16(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::U32(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::U64(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::I8(slice) => {
                 let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::I16(slice) => {
                 let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::I32(slice) => {
                 let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::I64(slice) => {
                 let nd = nodata.map(|v| v as i64);
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::F32(slice) => {
                 let nd = nodata.map(|v| v as f32);
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
             DecodingResult::F64(slice) => {
                 let nd = nodata;
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, chunk_maps);
             }
         }
     } else {
         match decoding_result {
             DecodingResult::U8(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::U16(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::U32(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::U64(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::I8(slice) => {
                 let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::I16(slice) => {
                 let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::I32(slice) => {
                 let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::I64(slice) => {
                 let nd = nodata.map(|v| v as i64);
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::F32(slice) => {
                 let nd = nodata.map(|v| v as f32);
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
             DecodingResult::F64(slice) => {
                 let nd = nodata;
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, chunk_maps);
             }
         }
     }
@@ -1626,26 +1862,20 @@ fn process_categorical_chunk_payload_into(
 
 /// Single-pass streaming aggregator across multiple H3 resolutions (Categorical Data)
 pub struct MultiCategoricalHorizonStreamer {
-    prefetcher: Option<PrefetchedChunkReader>,
-    crs_transformer: CrsTransformer,
+    prefetcher: Option<PrefetchedMosaicReader>,
+    pub mosaic: Arc<MosaicReader>,
     resolutions: Vec<Resolution>,
     resolution_u8s: Vec<u8>,
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
-    gt: GeoTransform,
-    chunk_stride: u32,
     active_maps: Vec<HashMap<u64, CategoricalAccumulator, FxBuildHasher>>,
     eviction_queues: Vec<BinaryHeap<HexEvictionEntry>>,
     completed_buffer: VecDeque<MultiCategoricalRecord>,
     is_finished: bool,
     current_lat_horizon: f64,
     pub profile_stats: [u64; 4],
-    raster_width: u32,
-    chunk_height: u32,
-    chunks_across: u32,
-    highest_processed_chunk: u32,
-    samples_per_pixel: u16,
+    processed_chunk_count: usize,
     band: usize,
     min_count: Option<f64>,
     min_majority_fraction: Option<f64>,
@@ -1654,8 +1884,18 @@ pub struct MultiCategoricalHorizonStreamer {
 }
 
 impl MultiCategoricalHorizonStreamer {
-    /// Initialize a new MultiCategoricalHorizonStreamer with background chunk prefetching
+    /// Initialize a new MultiCategoricalHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
+        let mosaic = Arc::new(MosaicReader::from_single_reader(
+            reader,
+            config.bbox,
+            config.custom_crs.as_deref(),
+        )?);
+        Self::new_mosaic(mosaic, config)
+    }
+
+    /// Initialize a new MultiCategoricalHorizonStreamer from a multi-file MosaicReader
+    pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
         if config.resolutions.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
                 "Resolutions list cannot be empty".to_string(),
@@ -1672,47 +1912,7 @@ impl MultiCategoricalHorizonStreamer {
             resolution_u8s.push(res_u8);
         }
 
-        let crs_transformer = CrsTransformer::from_crs_or_epsg(
-            reader.metadata.epsg,
-            config
-                .custom_crs
-                .as_deref()
-                .or(reader.metadata.proj_string.as_deref()),
-        )?;
-
-        let nodata = config.custom_nodata.or(reader.metadata.nodata);
-        let bbox = config.bbox;
-        let gt = reader.metadata.geotransform;
-        let chunk_stride = reader.chunk_layout.chunk_width;
-        let total_chunks = reader.chunk_layout.total_chunks;
-        let raster_width = reader.metadata.width;
-        let chunk_height = reader.chunk_layout.chunk_height.max(1);
-        let chunk_width = reader.chunk_layout.chunk_width.max(1);
-        let chunks_across = ((raster_width + chunk_width - 1) / chunk_width).max(1);
-
-        let chunk_indices: Vec<u32> = (0..total_chunks)
-            .filter(|&idx| {
-                if let Some(ref b) = bbox {
-                    let chunk_bounds = reader.chunk_layout.get_chunk_bounds(
-                        idx,
-                        reader.metadata.width,
-                        reader.metadata.height,
-                    );
-                    chunk_intersects_bbox(&chunk_bounds, &gt, &crs_transformer, b)
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        let samples_per_pixel = reader.metadata.samples_per_pixel;
-        let band = config.band;
-        let min_count = config.min_count;
-        let min_majority_fraction = config.min_majority_fraction;
-        let compact = config.compact;
-        let pending_compact = HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default());
-
-        let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 256);
+        let prefetcher = PrefetchedMosaicReader::spawn(Arc::clone(&mosaic), 256);
         let num_res = resolutions.len();
 
         let mut active_maps = Vec::with_capacity(num_res);
@@ -1722,27 +1922,27 @@ impl MultiCategoricalHorizonStreamer {
             eviction_queues.push(BinaryHeap::with_capacity(1024));
         }
 
+        let band = config.band;
+        let min_count = config.min_count;
+        let min_majority_fraction = config.min_majority_fraction;
+        let compact = config.compact;
+        let pending_compact = HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default());
+
         Ok(Self {
             prefetcher: Some(prefetcher),
-            crs_transformer,
+            mosaic,
             resolutions,
             resolution_u8s,
-            nodata,
-            bbox,
+            nodata: config.custom_nodata,
+            bbox: config.bbox,
             sampling: config.sampling.clone(),
-            gt,
-            chunk_stride,
             active_maps,
             eviction_queues,
             completed_buffer: VecDeque::with_capacity(2048),
             is_finished: false,
             current_lat_horizon: f64::INFINITY,
             profile_stats: [0; 4],
-            raster_width,
-            chunk_height,
-            chunks_across,
-            highest_processed_chunk: 0,
-            samples_per_pixel,
+            processed_chunk_count: 0,
             band,
             min_count,
             min_majority_fraction,
@@ -1905,29 +2105,19 @@ impl MultiCategoricalHorizonStreamer {
                     }
                 }
                 self.flush_pending_compact();
-                eprintln!(
-                    "FETCH SUB-TIMINGS: prefetch_wait={:.3}s, rayon_compute={:.3}s, merge={:.3}s, evict={:.3}s",
-                    self.profile_stats[0] as f64 / 1e9,
-                    self.profile_stats[1] as f64 / 1e9,
-                    self.profile_stats[2] as f64 / 1e9,
-                    self.profile_stats[3] as f64 / 1e9,
-                );
                 break;
             }
 
             let resolutions = &self.resolutions;
-            let crs_transformer = &self.crs_transformer;
-            let gt = &self.gt;
             let sampling = &self.sampling;
             let bbox = self.bbox;
-            let chunk_stride = self.chunk_stride;
-            let nodata = self.nodata;
-            let samples_per_pixel = self.samples_per_pixel;
             let band = self.band;
+            let mosaic = Arc::clone(&self.mosaic);
+            let user_nodata = self.nodata;
 
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(u32, Vec<Vec<(u64, CategoricalAccumulator)>>, DecodingResult)> = chunk_items
+            let parallel_results: Vec<(Vec<Vec<(u64, CategoricalAccumulator)>>, DecodingResult)> = chunk_items
                 .par_iter_mut()
                 .map_init(
                     || {
@@ -1939,10 +2129,23 @@ impl MultiCategoricalHorizonStreamer {
                     },
                     |local_maps, item| {
                         match item {
-                            Ok((chunk_idx, chunk_bounds, decoding_result)) => {
+                            Ok((tile_idx, _chunk_idx, chunk_bounds, decoding_result, has_overlap)) => {
                                 for m in local_maps.iter_mut() {
                                     m.clear();
                                 }
+                                let tile = &mosaic.tiles[*tile_idx];
+                                let crs_transformer = &tile.crs_transformer;
+                                let gt = &tile.reader.metadata.geotransform;
+                                let chunk_stride = tile.reader.chunk_layout.chunk_width;
+                                let nodata = user_nodata.or(tile.reader.metadata.nodata);
+                                let samples_per_pixel = tile.reader.metadata.samples_per_pixel;
+
+                                let overlap_ctx = if *has_overlap {
+                                    Some((*tile_idx, &*mosaic))
+                                } else {
+                                    None
+                                };
+
                                 let has_data = process_categorical_chunk_payload_into(
                                     chunk_bounds,
                                     decoding_result,
@@ -1955,6 +2158,7 @@ impl MultiCategoricalHorizonStreamer {
                                     nodata,
                                     samples_per_pixel,
                                     band,
+                                    overlap_ctx,
                                     local_maps,
                                 );
                                 let mut chunk_entries = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
@@ -1965,7 +2169,7 @@ impl MultiCategoricalHorizonStreamer {
                                     }
                                 }
                                 let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
-                                Some((*chunk_idx, chunk_entries, dec))
+                                Some((chunk_entries, dec))
                             }
                             Err(_) => None,
                         }
@@ -1978,9 +2182,9 @@ impl MultiCategoricalHorizonStreamer {
             let mut recycled_buffers = Vec::with_capacity(parallel_results.len());
 
             let t2 = std::time::Instant::now();
-            for (chunk_idx, chunk_entries, decoding_result) in parallel_results {
-                self.highest_processed_chunk = self.highest_processed_chunk.max(chunk_idx);
+            self.processed_chunk_count += chunk_items.len();
 
+            for (chunk_entries, decoding_result) in parallel_results {
                 if !chunk_entries.is_empty() {
                     for (res_idx, entries) in chunk_entries.into_iter().enumerate() {
                         let active_map = &mut self.active_maps[res_idx];
@@ -2010,10 +2214,9 @@ impl MultiCategoricalHorizonStreamer {
             }
             self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
 
-            let completed_rows = (self.highest_processed_chunk + 1) / self.chunks_across;
-            if completed_rows > 0 {
-                let safe_row = (completed_rows * self.chunk_height) as usize;
-                let safe_lat = compute_row_lat(safe_row, self.raster_width as usize, &self.gt, &self.crs_transformer);
+            if self.processed_chunk_count < self.mosaic.chunk_refs.len() {
+                let next_chunk = &self.mosaic.chunk_refs[self.processed_chunk_count];
+                let safe_lat = next_chunk.north_lat;
                 if safe_lat < self.current_lat_horizon {
                     let t3 = std::time::Instant::now();
                     self.current_lat_horizon = safe_lat;

@@ -6,7 +6,8 @@ use std::thread::{self, JoinHandle};
 use tiff::decoder::DecodingResult;
 
 use crate::error::Result;
-use crate::raster::geotiff::GeoTiffStreamReader;
+use crate::raster::geotiff::{ChunkDecoder, GeoTiffStreamReader};
+use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
 
 /// Item yielded by the prefetch worker
@@ -259,6 +260,257 @@ impl PrefetchedChunkReader {
 
     /// Pull next batch of ready chunks (pulls up to `max_batch` chunks or until EOF)
     pub fn next_chunk_batch(&self, max_batch: usize) -> Vec<PrefetchItem> {
+        let mut batch = Vec::with_capacity(max_batch);
+        self.drain_chunk_batch_into(&mut batch, max_batch, max_batch);
+        batch
+    }
+}
+
+/// Item yielded by the mosaic prefetch worker: (tile_idx, chunk_idx, bounds, data, has_overlap)
+pub type MosaicPrefetchItem = Result<(usize, u32, RasterChunk, DecodingResult, bool)>;
+
+/// Multi-file mosaic prefetcher providing globally latitude-interleaved chunk decoding
+pub struct PrefetchedMosaicReader {
+    receiver: Receiver<MosaicPrefetchItem>,
+    recycle_sender: Option<SyncSender<DecodingResult>>,
+    _worker_handles: Vec<JoinHandle<()>>,
+}
+
+impl PrefetchedMosaicReader {
+    /// Spawn background prefetch thread pool for mosaic ingestion
+    pub fn spawn(mosaic: Arc<MosaicReader>, buffer_capacity: usize) -> Self {
+        let default_workers = if mosaic.chunk_refs.len() <= 4 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|p| (p.get() / 3).clamp(2, 4))
+                .unwrap_or(3)
+        };
+        let capacity = buffer_capacity.max(256);
+        Self::spawn_with_workers(mosaic, capacity, default_workers)
+    }
+
+    /// Spawn background prefetch workers with an explicit worker thread count
+    pub fn spawn_with_workers(
+        mosaic: Arc<MosaicReader>,
+        buffer_capacity: usize,
+        num_workers: usize,
+    ) -> Self {
+        if num_workers <= 1 || mosaic.chunk_refs.is_empty() {
+            let (sender, receiver): (SyncSender<MosaicPrefetchItem>, Receiver<MosaicPrefetchItem>) =
+                sync_channel(buffer_capacity.max(1));
+            let (recycle_sender, recycle_receiver): (SyncSender<DecodingResult>, Receiver<DecodingResult>) =
+                sync_channel(buffer_capacity.max(1));
+
+            let worker_handle = thread::spawn(move || {
+                let mut decoders: Vec<Option<ChunkDecoder>> =
+                    (0..mosaic.tiles.len()).map(|_| None).collect();
+
+                for chunk_ref in &mosaic.chunk_refs {
+                    let tile_idx = chunk_ref.tile_idx;
+                    let chunk_idx = chunk_ref.chunk_idx;
+                    let has_overlap = chunk_ref.has_overlap;
+
+                    if decoders[tile_idx].is_none() {
+                        match mosaic.tiles[tile_idx].reader.open_decoder() {
+                            Ok(d) => decoders[tile_idx] = Some(d),
+                            Err(e) => {
+                                let _ = sender.send(Err(e));
+                                return;
+                            }
+                        }
+                    }
+                    let decoder = decoders[tile_idx].as_mut().unwrap();
+
+                    let recycled_buf = recycle_receiver.try_recv().ok();
+                    let item = match recycled_buf {
+                        Some(buf) => decoder
+                            .read_chunk_into(chunk_idx, buf)
+                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
+                        None => decoder
+                            .read_chunk(chunk_idx)
+                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
+                    };
+
+                    if sender.send(item).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return Self {
+                receiver,
+                recycle_sender: Some(recycle_sender),
+                _worker_handles: vec![worker_handle],
+            };
+        }
+
+        let total_jobs = mosaic.chunk_refs.len();
+        let next_job_idx = Arc::new(AtomicUsize::new(0));
+
+        let internal_capacity = buffer_capacity.max(num_workers * 4);
+        let (result_sender, result_receiver) =
+            sync_channel::<(usize, MosaicPrefetchItem)>(internal_capacity);
+        let (out_sender, receiver): (SyncSender<MosaicPrefetchItem>, Receiver<MosaicPrefetchItem>) =
+            sync_channel(buffer_capacity.max(1));
+
+        let (recycle_sender, recycle_receiver) = sync_channel::<DecodingResult>(internal_capacity);
+        let recycle_receiver = Arc::new(Mutex::new(recycle_receiver));
+
+        let mut handles = Vec::with_capacity(num_workers + 1);
+
+        for _ in 0..num_workers {
+            let worker_mosaic = Arc::clone(&mosaic);
+            let worker_job_idx = Arc::clone(&next_job_idx);
+            let worker_sender = result_sender.clone();
+            let worker_recycle_rx = Arc::clone(&recycle_receiver);
+
+            let handle = thread::spawn(move || {
+                let mut decoders: Vec<Option<ChunkDecoder>> =
+                    (0..worker_mosaic.tiles.len()).map(|_| None).collect();
+
+                loop {
+                    let job_id = worker_job_idx.fetch_add(1, Ordering::Relaxed);
+                    if job_id >= worker_mosaic.chunk_refs.len() {
+                        break;
+                    }
+                    let chunk_ref = worker_mosaic.chunk_refs[job_id];
+                    let tile_idx = chunk_ref.tile_idx;
+                    let chunk_idx = chunk_ref.chunk_idx;
+                    let has_overlap = chunk_ref.has_overlap;
+
+                    if decoders[tile_idx].is_none() {
+                        match worker_mosaic.tiles[tile_idx].reader.open_decoder() {
+                            Ok(d) => decoders[tile_idx] = Some(d),
+                            Err(e) => {
+                                if worker_sender.send((job_id, Err(e))).is_err() {
+                                    break;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    let decoder = decoders[tile_idx].as_mut().unwrap();
+
+                    let recycled_buf =
+                        worker_recycle_rx.lock().ok().and_then(|rx| rx.try_recv().ok());
+                    let item = match recycled_buf {
+                        Some(buf) => decoder
+                            .read_chunk_into(chunk_idx, buf)
+                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
+                        None => decoder
+                            .read_chunk(chunk_idx)
+                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
+                    };
+
+                    if worker_sender.send((job_id, item)).is_err() {
+                        break;
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        drop(result_sender);
+
+        let collector_handle = thread::spawn(move || {
+            let mut next_expected = 0;
+            let mut pending = BTreeMap::new();
+
+            while next_expected < total_jobs {
+                if let Some(item) = pending.remove(&next_expected) {
+                    next_expected += 1;
+                    if out_sender.send(item).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+
+                match result_receiver.recv() {
+                    Ok((job_id, item)) => {
+                        if job_id == next_expected {
+                            next_expected += 1;
+                            if out_sender.send(item).is_err() {
+                                return;
+                            }
+                        } else {
+                            pending.insert(job_id, item);
+                        }
+                    }
+                    Err(_) => {
+                        while let Some(&first_key) = pending.keys().next() {
+                            let item = pending.remove(&first_key).unwrap();
+                            if out_sender.send(item).is_err() {
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        handles.push(collector_handle);
+
+        Self {
+            receiver,
+            recycle_sender: Some(recycle_sender),
+            _worker_handles: handles,
+        }
+    }
+
+    /// Return processed decoding buffers back to worker pool for zero-allocation reuse
+    pub fn recycle_batch(&self, buffers: impl IntoIterator<Item = DecodingResult>) {
+        if let Some(ref sender) = self.recycle_sender {
+            for buf in buffers {
+                if sender.try_send(buf).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Pull next prefetched chunk
+    pub fn next_chunk(&self) -> Option<MosaicPrefetchItem> {
+        self.receiver.recv().ok()
+    }
+
+    /// Pull next batch of ready chunks directly into `batch`
+    pub fn drain_chunk_batch_into(
+        &self,
+        batch: &mut Vec<MosaicPrefetchItem>,
+        min_batch: usize,
+        max_batch: usize,
+    ) -> usize {
+        let initial_len = batch.len();
+        let target_min = initial_len + min_batch.max(1);
+        let target_max = initial_len + max_batch.max(min_batch);
+
+        match self.receiver.recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => return batch.len() - initial_len,
+        }
+
+        while batch.len() < target_max {
+            match self.receiver.try_recv() {
+                Ok(item) => batch.push(item),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if batch.len() >= target_min {
+                        break;
+                    }
+                    match self.receiver.recv() {
+                        Ok(item) => batch.push(item),
+                        Err(_) => break,
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        batch.len() - initial_len
+    }
+
+    /// Pull next batch of ready chunks (pulls up to `max_batch` chunks or until EOF)
+    pub fn next_chunk_batch(&self, max_batch: usize) -> Vec<MosaicPrefetchItem> {
         let mut batch = Vec::with_capacity(max_batch);
         self.drain_chunk_batch_into(&mut batch, max_batch, max_batch);
         batch

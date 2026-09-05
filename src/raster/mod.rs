@@ -1,10 +1,12 @@
 pub mod geotiff;
 pub mod geotransform;
+pub mod mosaic;
 pub mod prefetch;
 
 pub use geotiff::{ChunkDecoder, ChunkLayout, GeoTiffMetadata, GeoTiffStreamReader};
 pub use geotransform::GeoTransform;
-pub use prefetch::PrefetchedChunkReader;
+pub use mosaic::{glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor};
+pub use prefetch::{MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader};
 
 /// Represents a 2D chunk / tile window of a raster
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

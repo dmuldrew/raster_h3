@@ -41,12 +41,15 @@ impl PartialOrd for HexEvictionEntry {
     }
 }
 
-/// Compute the approximate southernmost latitude for an H3 cell using center lat as a fast proxy.
-/// Center lat is always >= true south vertex lat, making eviction conservatively lazy (safe).
+/// Compute the conservative southernmost latitude for an H3 cell (center latitude minus max circumradius in degrees).
+/// This guarantees that any cell with south_lat > lat_horizon lies strictly north of lat_horizon,
+/// ensuring zero premature evictions and zero double-counting across batch boundaries.
 #[inline(always)]
 pub fn compute_cell_south_lat(cell_u64: u64) -> f64 {
     if let Ok(cell) = CellIndex::try_from(cell_u64) {
-        h3o::LatLng::from(cell).lat()
+        let center_lat = h3o::LatLng::from(cell).lat();
+        let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
+        center_lat - r
     } else {
         f64::NEG_INFINITY
     }
