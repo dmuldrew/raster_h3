@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::aggregator::multi_horizon::{MultiCategoricalHorizonStreamer, MultiResolutionConfig};
+use crate::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiResolutionConfig,
+};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
@@ -37,6 +40,8 @@ pub struct LongCategoricalRow {
 
 pub struct RasterH3CategoricalGlobalData {
     pub streamer: Mutex<MultiCategoricalHorizonStreamer>,
+    pub ready_batches: Mutex<VecDeque<Vec<MultiCategoricalRecord>>>,
+    pub is_finished: AtomicBool,
     pub format: CategoricalOutputFormat,
     pub projected_columns: Vec<usize>,
     pub long_queue: Mutex<VecDeque<LongCategoricalRow>>,
@@ -44,6 +49,7 @@ pub struct RasterH3CategoricalGlobalData {
 
 pub struct RasterH3CategoricalLocalData {
     pub thread_id: usize,
+    pub hex_buf: [u8; 16],
 }
 
 unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
@@ -377,6 +383,8 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
 
     let global_data = Box::new(RasterH3CategoricalGlobalData {
         streamer: Mutex::new(streamer),
+        ready_batches: Mutex::new(VecDeque::new()),
+        is_finished: AtomicBool::new(false),
         format: bind_data.format,
         projected_columns,
         long_queue: Mutex::new(VecDeque::new()),
@@ -391,7 +399,10 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
 
 /// Thread-local init callback for categorical aggregation
 pub unsafe extern "C" fn raster_h3_categorical_init_local(info: duckdb_init_info) {
-    let local_data = Box::new(RasterH3CategoricalLocalData { thread_id: 0 });
+    let local_data = Box::new(RasterH3CategoricalLocalData {
+        thread_id: 0,
+        hex_buf: [0u8; 16],
+    });
     duckdb_init_set_init_data(
         info,
         Box::into_raw(local_data) as *mut c_void,
@@ -411,17 +422,89 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
     }
     let global_data = &*global_data_ptr;
     let proj_cols = &global_data.projected_columns;
+    let local_data_ptr = duckdb_function_get_local_init_data(info) as *mut RasterH3CategoricalLocalData;
 
     match global_data.format {
         CategoricalOutputFormat::Wide => {
-            // Fast path: if 0 columns are projected (e.g. SELECT count(*))
-            if proj_cols.is_empty() {
-                let mut streamer = match global_data.streamer.lock() {
+            let batch_opt = {
+                let mut ready_q = match global_data.ready_batches.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let count = streamer.drain_completed_into(2048, |_i, _rec| {});
-                duckdb_data_chunk_set_size(output, count as idx_t);
+
+                if let Some(b) = ready_q.pop_front() {
+                    Some(b)
+                } else if global_data.is_finished.load(Ordering::Acquire) {
+                    None
+                } else {
+                    drop(ready_q);
+
+                    let mut streamer = match global_data.streamer.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
+                    let mut ready_q = match global_data.ready_batches.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
+                    if let Some(b) = ready_q.pop_front() {
+                        Some(b)
+                    } else if global_data.is_finished.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        const BATCH_SIZE: usize = 2048;
+                        const REFILL_SIZE: usize = BATCH_SIZE * 4;
+
+                        let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
+                        let mut my_batch = None;
+
+                        streamer.drain_completed_into(REFILL_SIZE, |_i, rec| {
+                            current_chunk.push(rec);
+                            if current_chunk.len() == BATCH_SIZE {
+                                if my_batch.is_none() {
+                                    my_batch = Some(std::mem::replace(
+                                        &mut current_chunk,
+                                        Vec::with_capacity(BATCH_SIZE),
+                                    ));
+                                } else {
+                                    ready_q.push_back(std::mem::replace(
+                                        &mut current_chunk,
+                                        Vec::with_capacity(BATCH_SIZE),
+                                    ));
+                                }
+                            }
+                        });
+
+                        if !current_chunk.is_empty() {
+                            if my_batch.is_none() {
+                                my_batch = Some(current_chunk);
+                            } else {
+                                ready_q.push_back(current_chunk);
+                            }
+                        }
+
+                        if my_batch.is_none() {
+                            global_data.is_finished.store(true, Ordering::Release);
+                        }
+
+                        my_batch
+                    }
+                }
+            };
+
+            let batch = match batch_opt {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    duckdb_data_chunk_set_size(output, 0);
+                    return;
+                }
+            };
+
+            // Fast path: if 0 columns are projected (e.g. SELECT count(*))
+            if proj_cols.is_empty() {
+                duckdb_data_chunk_set_size(output, batch.len() as idx_t);
                 return;
             }
 
@@ -459,123 +542,122 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             }
 
             let need_majority = vec_maj_cls.is_some() || vec_maj_frac.is_some() || vec_maj_cnt.is_some();
-            let mut hex_buf = [0u8; 16];
-
-            let num_emitted = {
-                let mut streamer = match global_data.streamer.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                streamer.drain_completed_into(2048, |i, rec| {
-                    let row_idx = i as u64;
-
-                    if let Some(p) = vec_h3 {
-                        *p.add(i) = rec.h3_index;
-                    }
-                    if let Some(v) = vec_hex {
-                        let hex_slice = fast_hex_u64(rec.h3_index, &mut hex_buf);
-                        duckdb_vector_assign_string_element_len(
-                            v,
-                            row_idx,
-                            hex_slice.as_ptr() as *const c_char,
-                            hex_slice.len() as idx_t,
-                        );
-                    }
-                    if need_majority {
-                        let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
-                        if let Some(p) = vec_maj_cls {
-                            *p.add(i) = maj_cls;
-                        }
-                        if let Some(p) = vec_maj_frac {
-                            *p.add(i) = maj_frac;
-                        }
-                        if let Some(p) = vec_maj_cnt {
-                            *p.add(i) = maj_cnt;
-                        }
-                    }
-                    if let Some(p) = vec_uniq {
-                        *p.add(i) = rec.accumulator.unique_classes() as i64;
-                    }
-                    if let Some(p) = vec_tot {
-                        *p.add(i) = rec.accumulator.total_count;
-                    }
-                    if let Some(v) = vec_hist {
-                        let hist_json = rec.accumulator.histogram_json();
-                        duckdb_vector_assign_string_element_len(
-                            v,
-                            row_idx,
-                            hist_json.as_ptr() as *const c_char,
-                            hist_json.len() as idx_t,
-                        );
-                    }
-                })
+            let mut fallback_hex_buf = [0u8; 16];
+            let hex_buf = if !local_data_ptr.is_null() {
+                &mut (*local_data_ptr).hex_buf
+            } else {
+                &mut fallback_hex_buf
             };
 
-            duckdb_data_chunk_set_size(output, num_emitted as idx_t);
-        }
-        CategoricalOutputFormat::Long => {
-            // Option C: Long format (1 row per (hex, category))
-            let mut long_queue = match global_data.long_queue.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let batch_len = batch.len();
+            for (i, rec) in batch.into_iter().enumerate() {
+                let row_idx = i as u64;
 
-            while long_queue.len() < 2048 {
-                let mut streamer = match global_data.streamer.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                let mut added_any = false;
-                streamer.drain_completed_into(256, |_i, rec| {
-                    added_any = true;
-                    let mut entries: Vec<(i64, f64)> = Vec::with_capacity(rec.accumulator.unique_classes());
-                    rec.accumulator.for_each_class(|cat, cnt| entries.push((cat, cnt)));
-                    entries.sort_unstable_by_key(|&(cat, _)| cat);
-
-                    for (cat, cnt) in entries {
-                        let fraction = if rec.accumulator.total_count > 0.0 {
-                            cnt / rec.accumulator.total_count
-                        } else {
-                            0.0
-                        };
-                        long_queue.push_back(LongCategoricalRow {
-                            cell_u64: rec.h3_index,
-                            category: cat,
-                            count: cnt,
-                            fraction,
-                            total_count: rec.accumulator.total_count,
-                        });
+                if let Some(p) = vec_h3 {
+                    *p.add(i) = rec.h3_index;
+                }
+                if let Some(v) = vec_hex {
+                    let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        row_idx,
+                        hex_slice.as_ptr() as *const c_char,
+                        hex_slice.len() as idx_t,
+                    );
+                }
+                if need_majority {
+                    let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
+                    if let Some(p) = vec_maj_cls {
+                        *p.add(i) = maj_cls;
                     }
-                });
-
-                if !added_any {
-                    break;
+                    if let Some(p) = vec_maj_frac {
+                        *p.add(i) = maj_frac;
+                    }
+                    if let Some(p) = vec_maj_cnt {
+                        *p.add(i) = maj_cnt;
+                    }
+                }
+                if let Some(p) = vec_uniq {
+                    *p.add(i) = rec.accumulator.unique_classes() as i64;
+                }
+                if let Some(p) = vec_tot {
+                    *p.add(i) = rec.accumulator.total_count;
+                }
+                if let Some(v) = vec_hist {
+                    let hist_json = rec.accumulator.histogram_json();
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        row_idx,
+                        hist_json.as_ptr() as *const c_char,
+                        hist_json.len() as idx_t,
+                    );
                 }
             }
 
-            let num_taken = 2048.min(long_queue.len());
+            duckdb_data_chunk_set_size(output, batch_len as idx_t);
+        }
+        CategoricalOutputFormat::Long => {
+            let rows = {
+                let mut long_queue = match global_data.long_queue.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                while long_queue.len() < 2048 * 4 {
+                    let mut streamer = match global_data.streamer.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
+                    let mut added_any = false;
+                    streamer.drain_completed_into(512, |_i, rec| {
+                        added_any = true;
+                        let mut entries: Vec<(i64, f64)> = Vec::with_capacity(rec.accumulator.unique_classes());
+                        rec.accumulator.for_each_class(|cat, cnt| entries.push((cat, cnt)));
+                        entries.sort_unstable_by_key(|&(cat, _)| cat);
+
+                        for (cat, cnt) in entries {
+                            let fraction = if rec.accumulator.total_count > 0.0 {
+                                cnt / rec.accumulator.total_count
+                            } else {
+                                0.0
+                            };
+                            long_queue.push_back(LongCategoricalRow {
+                                cell_u64: rec.h3_index,
+                                category: cat,
+                                count: cnt,
+                                fraction,
+                                total_count: rec.accumulator.total_count,
+                            });
+                        }
+                    });
+
+                    if !added_any {
+                        break;
+                    }
+                }
+
+                let num_taken = 2048.min(long_queue.len());
+                let mut chunk_rows = Vec::with_capacity(num_taken);
+                for _ in 0..num_taken {
+                    if let Some(r) = long_queue.pop_front() {
+                        chunk_rows.push(r);
+                    }
+                }
+                chunk_rows
+            };
+
+            let num_taken = rows.len();
             if num_taken == 0 {
                 duckdb_data_chunk_set_size(output, 0);
                 return;
             }
 
             if proj_cols.is_empty() {
-                for _ in 0..num_taken {
-                    long_queue.pop_front();
-                }
                 duckdb_data_chunk_set_size(output, num_taken as idx_t);
                 return;
             }
 
-            // Schema column mapping (Long):
-            // 0: h3_index UBIGINT
-            // 1: h3_hex VARCHAR
-            // 2: category BIGINT
-            // 3: count DOUBLE
-            // 4: fraction DOUBLE
-            // 5: total_count DOUBLE
             let mut vec_h3: Option<*mut u64> = None;
             let mut vec_hex: Option<duckdb_vector> = None;
             let mut vec_cat: Option<*mut i64> = None;
@@ -596,17 +678,21 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
             }
 
-            let mut hex_buf = [0u8; 16];
+            let mut fallback_hex_buf = [0u8; 16];
+            let hex_buf = if !local_data_ptr.is_null() {
+                &mut (*local_data_ptr).hex_buf
+            } else {
+                &mut fallback_hex_buf
+            };
 
-            for i in 0..num_taken {
-                let row = long_queue.pop_front().unwrap();
+            for (i, row) in rows.into_iter().enumerate() {
                 let row_idx = i as u64;
 
                 if let Some(p) = vec_h3 {
                     *p.add(i) = row.cell_u64;
                 }
                 if let Some(v) = vec_hex {
-                    let hex_slice = fast_hex_u64(row.cell_u64, &mut hex_buf);
+                    let hex_slice = fast_hex_u64(row.cell_u64, hex_buf);
                     duckdb_vector_assign_string_element_len(
                         v,
                         row_idx,

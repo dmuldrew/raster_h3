@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
+use crate::aggregator::multi_horizon::{
+    MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer,
+};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
@@ -20,15 +24,18 @@ pub struct RasterH3BindData {
     pub band: u32,
 }
 
-/// Global scan state holding the streaming multi-core horizon aggregator
+/// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
 pub struct RasterH3GlobalData {
     pub streamer: Mutex<MultiScanHorizonStreamer>,
+    pub ready_batches: Mutex<VecDeque<Vec<MultiContinuousRecord>>>,
+    pub is_finished: AtomicBool,
     pub projected_columns: Vec<usize>,
 }
 
 /// Thread-local state for parallel DuckDB execution threads
 pub struct RasterH3LocalData {
     pub thread_id: usize,
+    pub hex_buf: [u8; 16],
 }
 
 unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
@@ -332,6 +339,8 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
 
     let global_data = Box::new(RasterH3GlobalData {
         streamer: Mutex::new(streamer),
+        ready_batches: Mutex::new(VecDeque::new()),
+        is_finished: AtomicBool::new(false),
         projected_columns,
     });
 
@@ -344,7 +353,10 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
 
 /// Thread-local init callback for multi-threaded parallel DuckDB execution
 pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
-    let local_data = Box::new(RasterH3LocalData { thread_id: 0 });
+    let local_data = Box::new(RasterH3LocalData {
+        thread_id: 0,
+        hex_buf: [0u8; 16],
+    });
     duckdb_init_set_init_data(
         info,
         Box::into_raw(local_data) as *mut c_void,
@@ -361,16 +373,92 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     }
     let global_data = &*global_data_ptr;
 
+    let local_data_ptr = duckdb_function_get_local_init_data(info) as *mut RasterH3LocalData;
+
+    // Retrieve next batch of completed records concurrently across DuckDB worker threads
+    let batch_opt = {
+        // Fast path 1: check if ready_batches already has pre-evicted records (~10ns lock)
+        let mut ready_q = match global_data.ready_batches.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(b) = ready_q.pop_front() {
+            Some(b)
+        } else if global_data.is_finished.load(Ordering::Acquire) {
+            None
+        } else {
+            drop(ready_q);
+
+            // Path 2: acquire streamer lock to refill ready_batches with multiple chunks
+            let mut streamer = match global_data.streamer.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            let mut ready_q = match global_data.ready_batches.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if let Some(b) = ready_q.pop_front() {
+                Some(b)
+            } else if global_data.is_finished.load(Ordering::Acquire) {
+                None
+            } else {
+                const BATCH_SIZE: usize = 2048;
+                const REFILL_SIZE: usize = BATCH_SIZE * 4;
+
+                let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
+                let mut my_batch = None;
+
+                streamer.drain_completed_into(REFILL_SIZE, |_i, rec| {
+                    current_chunk.push(rec);
+                    if current_chunk.len() == BATCH_SIZE {
+                        if my_batch.is_none() {
+                            my_batch = Some(std::mem::replace(
+                                &mut current_chunk,
+                                Vec::with_capacity(BATCH_SIZE),
+                            ));
+                        } else {
+                            ready_q.push_back(std::mem::replace(
+                                &mut current_chunk,
+                                Vec::with_capacity(BATCH_SIZE),
+                            ));
+                        }
+                    }
+                });
+
+                if !current_chunk.is_empty() {
+                    if my_batch.is_none() {
+                        my_batch = Some(current_chunk);
+                    } else {
+                        ready_q.push_back(current_chunk);
+                    }
+                }
+
+                if my_batch.is_none() {
+                    global_data.is_finished.store(true, Ordering::Release);
+                }
+
+                my_batch
+            }
+        }
+    };
+
+    let batch = match batch_opt {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            duckdb_data_chunk_set_size(output, 0);
+            return;
+        }
+    };
+
     let proj_cols = &global_data.projected_columns;
 
     // Fast path: if 0 columns are projected (e.g. SELECT count(*))
     if proj_cols.is_empty() {
-        let mut streamer = match global_data.streamer.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let count = streamer.drain_completed_into(2048, |_i, _rec| {});
-        duckdb_data_chunk_set_size(output, count as idx_t);
+        duckdb_data_chunk_set_size(output, batch.len() as idx_t);
         return;
     }
 
@@ -408,49 +496,49 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         }
     }
 
-    let mut hex_buf = [0u8; 16];
-    let num_emitted = {
-        let mut streamer = match global_data.streamer.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        streamer.drain_completed_into(2048, |i, rec| {
-            let row_idx = i as u64;
-            if let Some(p) = vec_h3 {
-                *p.add(i) = rec.h3_index;
-            }
-            if let Some(v) = vec_hex {
-                let hex_slice = fast_hex_u64(rec.h3_index, &mut hex_buf);
-                duckdb_vector_assign_string_element_len(
-                    v,
-                    row_idx,
-                    hex_slice.as_ptr() as *const c_char,
-                    hex_slice.len() as idx_t,
-                );
-            }
-            if let Some(p) = vec_mean {
-                *p.add(i) = rec.accumulator.mean();
-            }
-            if let Some(p) = vec_stddev {
-                *p.add(i) = rec.accumulator.stddev();
-            }
-            if let Some(p) = vec_count {
-                *p.add(i) = rec.accumulator.count;
-            }
-            if let Some(p) = vec_min {
-                *p.add(i) = rec.accumulator.min;
-            }
-            if let Some(p) = vec_max {
-                *p.add(i) = rec.accumulator.max;
-            }
-            if let Some(p) = vec_sum {
-                *p.add(i) = rec.accumulator.sum;
-            }
-        })
+    let mut fallback_hex_buf = [0u8; 16];
+    let hex_buf = if !local_data_ptr.is_null() {
+        &mut (*local_data_ptr).hex_buf
+    } else {
+        &mut fallback_hex_buf
     };
 
-    duckdb_data_chunk_set_size(output, num_emitted as idx_t);
+    let batch_len = batch.len();
+    for (i, rec) in batch.into_iter().enumerate() {
+        let row_idx = i as u64;
+        if let Some(p) = vec_h3 {
+            *p.add(i) = rec.h3_index;
+        }
+        if let Some(v) = vec_hex {
+            let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
+            duckdb_vector_assign_string_element_len(
+                v,
+                row_idx,
+                hex_slice.as_ptr() as *const c_char,
+                hex_slice.len() as idx_t,
+            );
+        }
+        if let Some(p) = vec_mean {
+            *p.add(i) = rec.accumulator.mean();
+        }
+        if let Some(p) = vec_stddev {
+            *p.add(i) = rec.accumulator.stddev();
+        }
+        if let Some(p) = vec_count {
+            *p.add(i) = rec.accumulator.count;
+        }
+        if let Some(p) = vec_min {
+            *p.add(i) = rec.accumulator.min;
+        }
+        if let Some(p) = vec_max {
+            *p.add(i) = rec.accumulator.max;
+        }
+        if let Some(p) = vec_sum {
+            *p.add(i) = rec.accumulator.sum;
+        }
+    }
+
+    duckdb_data_chunk_set_size(output, batch_len as idx_t);
 }
 
 /// Register `h3_raster_continuous_aggregate` and `h3_raster_continuous` table functions
