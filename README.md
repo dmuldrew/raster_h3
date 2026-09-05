@@ -734,6 +734,9 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `resolution` | `BIGINT` | `8` | Target H3 grid resolution level (0 to 15). |
+| `resolutions` | `VARCHAR` | `None` | Comma/space-delimited multiple H3 resolutions (e.g. `'7,8'` or `'7, 8, 9'`) in a single pass. |
+| `min_resolution` | `BIGINT` | `None` | Minimum H3 resolution for multi-resolution pyramid range. |
+| `max_resolution` | `BIGINT` | `None` | Maximum H3 resolution for multi-resolution pyramid range. |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
@@ -752,6 +755,7 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `min` | `DOUBLE` | Minimum pixel value observed within the cell. |
 | `max` | `DOUBLE` | Maximum pixel value observed within the cell. |
 | `sum` | `DOUBLE` | Sum of all weighted pixel values in the cell. |
+| `resolution` | `UTINYINT` | H3 resolution level (0 to 15) of the cell. |
 
 ---
 
@@ -775,6 +779,9 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `resolution` | `BIGINT` | `8` | Target H3 grid resolution level (0 to 15). |
+| `resolutions` | `VARCHAR` | `None` | Comma/space-delimited multiple H3 resolutions (e.g. `'7,8'` or `'7, 8, 9'`) in a single pass. |
+| `min_resolution` | `BIGINT` | `None` | Minimum H3 resolution for multi-resolution pyramid range. |
+| `max_resolution` | `BIGINT` | `None` | Maximum H3 resolution for multi-resolution pyramid range. |
 | `format` | `VARCHAR` | `'wide'` | Output layout: `'wide'` (majority + histogram) or `'long'` (normalized rows). |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). |
@@ -794,6 +801,7 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `unique_classes` | `BIGINT` | Number of distinct categories present in the hexagon (richness). |
 | `total_count` | `DOUBLE` | Total non-nodata pixels in the hexagon. |
 | `histogram` | `VARCHAR` | JSON map of `{category_id: fraction, ...}`. |
+| `resolution` | `UTINYINT` | H3 resolution level (0 to 15) of the cell. |
 
 #### Long Format Output Schema (`format := 'long'`)
 | Column Name | Logical Type | Description |
@@ -804,6 +812,7 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `count` | `DOUBLE` | Weighted pixel count for this category. |
 | `fraction` | `DOUBLE` | Proportion (0.0 to 1.0) of this category in the hexagon. |
 | `total_count` | `DOUBLE` | Total pixels in the hexagon across all categories. |
+| `resolution` | `UTINYINT` | H3 resolution level (0 to 15) of the cell. |
 
 ---
 

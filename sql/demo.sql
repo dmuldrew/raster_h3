@@ -137,4 +137,29 @@ SELECT * FROM h3_parquet_to_pmtiles(
     h3_column := 'h3_index'
 );
 
+-- 15. Multi-Resolution Single-Pass Aggregation (Continuous & Categorical)
+-- Query multiple H3 resolutions (e.g. Res 7 and 8) in a single streaming pass over the GeoTIFF
+SELECT
+    resolution,
+    count(*) AS cell_count,
+    round(avg(mean), 2) AS avg_mean_val
+FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolutions := '7,8')
+GROUP BY resolution
+ORDER BY resolution;
+
+-- Range syntax: min_resolution and max_resolution
+SELECT
+    resolution,
+    majority_class,
+    count(*) AS hex_count
+FROM h3_raster_categorical_aggregate(
+    '/data/sample_sf.tif',
+    min_resolution := 7,
+    max_resolution := 8
+)
+GROUP BY resolution, majority_class
+ORDER BY resolution, hex_count DESC
+LIMIT 10;
+
+
 

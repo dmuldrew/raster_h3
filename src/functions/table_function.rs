@@ -15,7 +15,7 @@ use crate::raster::geotiff::GeoTiffStreamReader;
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
     pub file_path: String,
-    pub resolution: u8,
+    pub resolutions: Vec<u8>,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
     pub chunk_size: u32,
@@ -77,25 +77,65 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     };
 
-    // Param 1 (optional positional): resolution (BIGINT)
-    let mut resolution: u8 = 8;
-    if param_count >= 2 {
-        let res_val = duckdb_bind_get_parameter(info, 1);
-        let res_int = duckdb_get_int64(res_val);
-        if (0..=15).contains(&res_int) {
-            resolution = res_int as u8;
+    let mut parsed_resolutions: Option<Vec<u8>> = None;
+
+    // 1. Named parameter: resolutions (VARCHAR, e.g. '7,8' or '7, 8, 9')
+    let name_ress = to_c_string("resolutions");
+    let named_ress_val = duckdb_bind_get_named_parameter(info, name_ress.as_ptr());
+    if !named_ress_val.is_null() {
+        let ress_str_ptr = duckdb_get_varchar(named_ress_val);
+        if let Some(s) = from_duckdb_string(ress_str_ptr) {
+            let mut list: Vec<u8> = s
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|item| !item.is_empty())
+                .filter_map(|item| item.parse::<u8>().ok())
+                .filter(|&r| r <= 15)
+                .collect();
+            list.sort_unstable();
+            list.dedup();
+            if !list.is_empty() {
+                parsed_resolutions = Some(list);
+            }
         }
     }
 
-    // Named parameter: resolution
-    let name_res = to_c_string("resolution");
-    let named_res_val = duckdb_bind_get_named_parameter(info, name_res.as_ptr());
-    if !named_res_val.is_null() {
-        let res_int = duckdb_get_int64(named_res_val);
-        if (0..=15).contains(&res_int) {
-            resolution = res_int as u8;
+    // 2. Named parameters: min_resolution and max_resolution (BIGINT)
+    if parsed_resolutions.is_none() {
+        let name_min_res = to_c_string("min_resolution");
+        let name_max_res = to_c_string("max_resolution");
+        let min_res_val = duckdb_bind_get_named_parameter(info, name_min_res.as_ptr());
+        let max_res_val = duckdb_bind_get_named_parameter(info, name_max_res.as_ptr());
+        if !min_res_val.is_null() && !max_res_val.is_null() {
+            let min_r = duckdb_get_int64(min_res_val);
+            let max_r = duckdb_get_int64(max_res_val);
+            if (0..=15).contains(&min_r) && (0..=15).contains(&max_r) && min_r <= max_r {
+                parsed_resolutions = Some(((min_r as u8)..=(max_r as u8)).collect());
+            }
         }
     }
+
+    // 3. Named parameter: resolution (BIGINT)
+    if parsed_resolutions.is_none() {
+        let name_res = to_c_string("resolution");
+        let named_res_val = duckdb_bind_get_named_parameter(info, name_res.as_ptr());
+        if !named_res_val.is_null() {
+            let res_int = duckdb_get_int64(named_res_val);
+            if (0..=15).contains(&res_int) {
+                parsed_resolutions = Some(vec![res_int as u8]);
+            }
+        }
+    }
+
+    // 4. Positional param 1 (optional): resolution (BIGINT)
+    if parsed_resolutions.is_none() && param_count >= 2 {
+        let res_val = duckdb_bind_get_parameter(info, 1);
+        let res_int = duckdb_get_int64(res_val);
+        if (0..=15).contains(&res_int) {
+            parsed_resolutions = Some(vec![res_int as u8]);
+        }
+    }
+
+    let resolutions = parsed_resolutions.unwrap_or_else(|| vec![8]);
 
     // Named parameter: source_crs
     let name_crs = to_c_string("source_crs");
@@ -244,6 +284,13 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let mut type_double_mut = type_double;
     duckdb_destroy_logical_type(&mut type_double_mut);
 
+    // 8: resolution UTINYINT
+    let col_res = to_c_string("resolution");
+    let type_utinyint = duckdb_create_logical_type(DuckDBType::UTinyInt);
+    duckdb_bind_add_result_column(info, col_res.as_ptr(), type_utinyint);
+    let mut type_utinyint_mut = type_utinyint;
+    duckdb_destroy_logical_type(&mut type_utinyint_mut);
+
     // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
     const H3_AREA_M2: [f64; 16] = [
         4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
@@ -267,18 +314,22 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
             dx * dy
         };
 
-        let hex_area = H3_AREA_M2.get(resolution as usize).copied().unwrap_or(7.373e5);
-        let hex_count = (area_m2 / hex_area).ceil() as u64;
-        hex_count.min(total_pixels).max(1)
+        let mut total_hex_est = 0u64;
+        for &res in &resolutions {
+            let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
+            let hex_count = (area_m2 / hex_area).ceil() as u64;
+            total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
+        }
+        total_hex_est.max(1)
     } else {
-        10_000
+        10_000 * resolutions.len() as u64
     };
 
     duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
     let bind_data = Box::new(RasterH3BindData {
         file_path,
-        resolution,
+        resolutions,
         source_crs,
         nodata,
         chunk_size,
@@ -320,7 +371,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         projected_columns.push(duckdb_init_get_column_index(info, i) as usize);
     }
 
-    let mut config = MultiResolutionConfig::new(vec![bind_data.resolution]);
+    let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
     config.custom_crs = bind_data.source_crs.clone();
     config.custom_nodata = bind_data.nodata;
     config.bbox = bind_data.bbox;
@@ -472,6 +523,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     // 5: min DOUBLE
     // 6: max DOUBLE
     // 7: sum DOUBLE
+    // 8: resolution UTINYINT
     let mut vec_h3: Option<*mut u64> = None;
     let mut vec_hex: Option<duckdb_vector> = None;
     let mut vec_mean: Option<*mut f64> = None;
@@ -480,6 +532,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let mut vec_min: Option<*mut f64> = None;
     let mut vec_max: Option<*mut f64> = None;
     let mut vec_sum: Option<*mut f64> = None;
+    let mut vec_res: Option<*mut u8> = None;
 
     for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
         let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -492,6 +545,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             5 => vec_min = Some(duckdb_vector_get_data(v) as *mut f64),
             6 => vec_max = Some(duckdb_vector_get_data(v) as *mut f64),
             7 => vec_sum = Some(duckdb_vector_get_data(v) as *mut f64),
+            8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
             _ => {}
         }
     }
@@ -536,6 +590,9 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         if let Some(p) = vec_sum {
             *p.add(i) = rec.accumulator.sum;
         }
+        if let Some(p) = vec_res {
+            *p.add(i) = rec.resolution;
+        }
     }
 
     duckdb_data_chunk_set_size(output, batch_len as idx_t);
@@ -563,6 +620,18 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         let name_res = to_c_string("resolution");
         let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
         duckdb_table_function_add_named_parameter(tf, name_res.as_ptr(), type_bigint);
+
+        // resolutions (VARCHAR)
+        let name_ress = to_c_string("resolutions");
+        duckdb_table_function_add_named_parameter(tf, name_ress.as_ptr(), type_varchar);
+
+        // min_resolution (BIGINT)
+        let name_min_res = to_c_string("min_resolution");
+        duckdb_table_function_add_named_parameter(tf, name_min_res.as_ptr(), type_bigint);
+
+        // max_resolution (BIGINT)
+        let name_max_res = to_c_string("max_resolution");
+        duckdb_table_function_add_named_parameter(tf, name_max_res.as_ptr(), type_bigint);
 
         // source_crs (VARCHAR)
         let name_crs = to_c_string("source_crs");
