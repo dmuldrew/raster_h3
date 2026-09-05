@@ -23,6 +23,7 @@ pub struct PmtilesBindData {
     pub custom_nodata: Option<f64>,
     pub sampling: SamplingPattern,
     pub is_categorical: bool,
+    pub properties: Option<String>,
 }
 
 /// Global execution state for the single-row generator
@@ -135,6 +136,16 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
         is_categorical = duckdb_get_bool(val_cat);
     }
 
+    // Named parameter: properties (VARCHAR)
+    let mut properties = None;
+    let name_props = to_c_string("properties");
+    let val_props = duckdb_bind_get_named_parameter(info, name_props.as_ptr());
+    if !val_props.is_null() {
+        if let Some(s) = from_duckdb_string(duckdb_get_varchar(val_props)) {
+            properties = Some(s);
+        }
+    }
+
     // Declare output columns:
     // 0: total_hexagons (BIGINT)
     let col_hex = to_c_string("total_hexagons");
@@ -186,6 +197,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
         custom_nodata,
         sampling,
         is_categorical,
+        properties,
     });
     duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_bind_data));
 }
@@ -212,6 +224,7 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
     config.band = bind_data.band;
     config.custom_nodata = bind_data.custom_nodata;
     config.sampling = bind_data.sampling.clone();
+    config.properties = bind_data.properties.clone();
 
     let start = Instant::now();
     let result = if bind_data.is_categorical {
@@ -530,6 +543,10 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
     let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
     duckdb_table_function_add_named_parameter(tf, name_cat.as_ptr(), type_bool);
 
+    // properties (VARCHAR)
+    let name_props = to_c_string("properties");
+    duckdb_table_function_add_named_parameter(tf, name_props.as_ptr(), type_varchar);
+
     // Set callbacks
     duckdb_table_function_set_bind(tf, pmtiles_bind);
     duckdb_table_function_set_init(tf, pmtiles_init);
@@ -573,6 +590,9 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
     // Named parameter: h3_col (VARCHAR alias)
     let name_col2 = to_c_string("h3_col");
     duckdb_table_function_add_named_parameter(tf_parquet, name_col2.as_ptr(), type_varchar2);
+
+    // Named parameter: properties (VARCHAR)
+    duckdb_table_function_add_named_parameter(tf_parquet, name_props.as_ptr(), type_varchar2);
 
     // Set callbacks
     duckdb_table_function_set_bind(tf_parquet, parquet_pmtiles_bind);

@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::Read;
 use flate2::read::GzDecoder;
 use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
-use raster_h3::pmtiles::mvt::{MvtLayer, MvtValue};
+use raster_h3::pmtiles::mvt::{FeatureProperties, MercatorPoint, MvtLayer, MvtValue, PropertyFilter};
 use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3::pmtiles::writer::{zxy_to_tile_id, PmtilesWriter};
 use tempfile::NamedTempFile;
@@ -479,6 +479,98 @@ fn test_hilbert_zxy_tile_id_bijective_roundtrip() {
     let min_id_z5 = zxy_to_tile_id(5, 0, 0);
     assert!(max_id_z4 < min_id_z5, "Hilbert IDs across zoom levels must be strictly monotonic");
 }
+
+#[test]
+fn test_property_filter_and_mvt_encoding() {
+    let filter = PropertyFilter::parse("mean,count");
+    assert!(filter.is_custom);
+    assert!(filter.has_continuous(raster_h3::pmtiles::mvt::PROP_MEAN));
+    assert!(filter.has_continuous(raster_h3::pmtiles::mvt::PROP_COUNT));
+    assert!(!filter.has_continuous(raster_h3::pmtiles::mvt::PROP_STDDEV));
+    assert!(!filter.needs_stddev());
+
+    let mut layer = MvtLayer::with_filter("h3_hexagons", filter);
+    let cell_idx: u64 = 0x8828308281fffff;
+    let vertices = [
+        MercatorPoint { x: 0.1, y: 0.1 },
+        MercatorPoint { x: 0.2, y: 0.1 },
+        MercatorPoint { x: 0.2, y: 0.2 },
+    ];
+    let props = FeatureProperties::Continuous {
+        h3_index: cell_idx,
+        resolution: 8,
+        mean: 42.5,
+        sum: 850.0,
+        stddev: 1.2,
+        count: 20.0,
+        min: 40.0,
+        max: 45.0,
+    };
+    layer.add_hexagon_mercator(cell_idx, &vertices, 8, 10, 20, props);
+
+    let mvt_bytes = layer.encode();
+    assert!(!mvt_bytes.is_empty());
+
+    // Protobuf inspection: keys "mean" and "count" should be encoded, while "stddev", "min", "max" should not
+    let mvt_str = String::from_utf8_lossy(&mvt_bytes);
+    assert!(mvt_str.contains("mean"), "Should contain key 'mean'");
+    assert!(mvt_str.contains("count"), "Should contain key 'count'");
+    assert!(!mvt_str.contains("stddev"), "Should NOT contain key 'stddev'");
+    assert!(!mvt_str.contains("sum"), "Should NOT contain key 'sum'");
+    assert!(!mvt_str.contains("min"), "Should NOT contain key 'min'");
+    assert!(!mvt_str.contains("max"), "Should NOT contain key 'max'");
+}
+
+#[test]
+fn test_geotiff_to_pmtiles_selective_properties() {
+    let tiff_tmp = NamedTempFile::new().unwrap();
+    let tiff_path = tiff_tmp.path().to_str().unwrap().to_string();
+    create_temp_geotiff(&tiff_path, 256, 256, tiff::tags::CompressionMethod::None).unwrap();
+
+    // 1. Generate full archive with all properties
+    let pmtiles_all_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_all_path = pmtiles_all_tmp.path().to_str().unwrap().to_string();
+    let config_all = MultiResolutionConfig::new(vec![7, 8]);
+    let hex_all = H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_all_path, config_all).unwrap();
+    let size_all = File::open(&pmtiles_all_path).unwrap().metadata().unwrap().len();
+
+    // 2. Generate selective archive with only "mean,count"
+    let pmtiles_sel_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_sel_path = pmtiles_sel_tmp.path().to_str().unwrap().to_string();
+    let mut config_sel = MultiResolutionConfig::new(vec![7, 8]);
+    config_sel.properties = Some("mean,count".to_string());
+    let hex_sel = H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_sel_path, config_sel).unwrap();
+    let size_sel = File::open(&pmtiles_sel_path).unwrap().metadata().unwrap().len();
+
+    assert_eq!(hex_all, hex_sel, "Hexagon count should be identical");
+    assert!(size_sel < size_all, "Selective properties archive ({}) should be smaller than full archive ({})", size_sel, size_all);
+
+    // Read and validate JSON metadata fields in selective archive
+    let mut f = File::open(&pmtiles_sel_path).unwrap();
+    let mut header = [0u8; 127];
+    f.read_exact(&mut header).unwrap();
+    let json_metadata_offset = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let json_metadata_len = u64::from_le_bytes(header[32..40].try_into().unwrap());
+
+    let mut full_file = Vec::new();
+    let mut file_read = File::open(&pmtiles_sel_path).unwrap();
+    file_read.read_to_end(&mut full_file).unwrap();
+    let meta_slice = &full_file[(json_metadata_offset as usize)..((json_metadata_offset + json_metadata_len) as usize)];
+    let mut gz = GzDecoder::new(meta_slice);
+    let mut decompressed_json = String::new();
+    gz.read_to_string(&mut decompressed_json).unwrap();
+
+    let v: serde_json::Value = serde_json::from_str(&decompressed_json).unwrap();
+    let fields = &v["vector_layers"][0]["fields"];
+    assert!(fields.get("mean").is_some(), "Metadata fields must contain 'mean'");
+    assert!(fields.get("count").is_some(), "Metadata fields must contain 'count'");
+    assert!(fields.get("stddev").is_none(), "Metadata fields must NOT contain 'stddev'");
+    assert!(fields.get("sum").is_none(), "Metadata fields must NOT contain 'sum'");
+    assert!(fields.get("min").is_none(), "Metadata fields must NOT contain 'min'");
+    assert!(fields.get("max").is_none(), "Metadata fields must NOT contain 'max'");
+    assert!(fields.get("h3_hex").is_none(), "Metadata fields must NOT contain 'h3_hex'");
+}
+
 
 
 

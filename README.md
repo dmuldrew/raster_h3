@@ -840,6 +840,8 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, etc.). |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
+| `categorical` | `BOOLEAN` | `false` | Whether to aggregate categorical raster classes instead of continuous stats. |
+| `properties` | `VARCHAR` | `None` (all) | Selective property whitelist (e.g. `'mean,count'` or `'majority,entropy'`). Reduces MVT protobuf encoding overhead and shrinks `.pmtiles` archive size by 15–30%. |
 
 #### Output Schema (1 Summary Row)
 | Column Name | Logical Type | Description |

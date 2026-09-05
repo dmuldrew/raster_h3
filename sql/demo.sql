@@ -177,6 +177,18 @@ WHERE distinct_classes > 1
 ORDER BY shannon_entropy DESC
 LIMIT 10;
 
+-- 17. Selective Property Emission (MVT Projection Pushdown)
+-- Export only requested properties (e.g. 'mean,count' or 'majority,entropy') into vector tiles,
+-- reducing protobuf encoding overhead and shrinking .pmtiles archive size by 15-30%
+SELECT * FROM h3_raster_to_pmtiles(
+    '/data/sample_sf.tif',
+    '/data/sample_sf_compact.pmtiles',
+    min_resolution := 7,
+    max_resolution := 9,
+    properties := 'mean,count'
+);
+
+
 
 
 

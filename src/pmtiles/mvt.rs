@@ -184,6 +184,142 @@ impl MvtValue {
     }
 }
 
+/// Bitmask flags for continuous raster properties
+pub const PROP_H3_INDEX: u16 = 1 << 0;
+pub const PROP_H3_HEX: u16 = 1 << 1;
+pub const PROP_RESOLUTION: u16 = 1 << 2;
+pub const PROP_MEAN: u16 = 1 << 3;
+pub const PROP_SUM: u16 = 1 << 4;
+pub const PROP_STDDEV: u16 = 1 << 5;
+pub const PROP_COUNT: u16 = 1 << 6;
+pub const PROP_MIN: u16 = 1 << 7;
+pub const PROP_MAX: u16 = 1 << 8;
+pub const PROP_ALL_CONTINUOUS: u16 = (1 << 9) - 1;
+
+/// Bitmask flags for categorical raster properties
+pub const PROP_CAT_H3_INDEX: u16 = 1 << 0;
+pub const PROP_CAT_H3_HEX: u16 = 1 << 1;
+pub const PROP_CAT_RESOLUTION: u16 = 1 << 2;
+pub const PROP_CAT_MAJORITY: u16 = 1 << 3;
+pub const PROP_CAT_MAJORITY_FRACTION: u16 = 1 << 4;
+pub const PROP_CAT_DISTINCT_CLASSES: u16 = 1 << 5;
+pub const PROP_CAT_ENTROPY: u16 = 1 << 6;
+pub const PROP_CAT_COUNT: u16 = 1 << 7;
+pub const PROP_ALL_CATEGORICAL: u16 = (1 << 8) - 1;
+
+/// Filter determining which properties are encoded into Mapbox Vector Tile (MVT) protobufs
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyFilter {
+    pub continuous_mask: u16,
+    pub categorical_mask: u16,
+    pub generic_whitelist: Option<fxhash::FxHashSet<String>>,
+    pub is_custom: bool,
+}
+
+impl Default for PropertyFilter {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl PropertyFilter {
+    /// Allow all properties (default backwards-compatible behavior)
+    pub fn all() -> Self {
+        Self {
+            continuous_mask: PROP_ALL_CONTINUOUS,
+            categorical_mask: PROP_ALL_CATEGORICAL,
+            generic_whitelist: None,
+            is_custom: false,
+        }
+    }
+
+    /// Parse a comma-delimited whitelist string (e.g. "mean,count" or "majority,entropy")
+    pub fn parse(s: &str) -> Self {
+        let trimmed = s.trim();
+        if trimmed.is_empty() || trimmed == "*" || trimmed.eq_ignore_ascii_case("all") {
+            return Self::all();
+        }
+
+        let mut cont_mask = 0u16;
+        let mut cat_mask = 0u16;
+        let mut generic_set = fxhash::FxHashSet::default();
+
+        for part in trimmed.split(',') {
+            let token = part.trim().to_ascii_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            generic_set.insert(token.clone());
+
+            match token.as_str() {
+                "h3_index" | "index" | "h3" => {
+                    cont_mask |= PROP_H3_INDEX;
+                    cat_mask |= PROP_CAT_H3_INDEX;
+                }
+                "h3_hex" | "hex" => {
+                    cont_mask |= PROP_H3_HEX;
+                    cat_mask |= PROP_CAT_H3_HEX;
+                }
+                "resolution" | "res" => {
+                    cont_mask |= PROP_RESOLUTION;
+                    cat_mask |= PROP_CAT_RESOLUTION;
+                }
+                "mean" | "avg" => cont_mask |= PROP_MEAN,
+                "sum" | "total" => cont_mask |= PROP_SUM,
+                "stddev" | "std" | "variance" => cont_mask |= PROP_STDDEV,
+                "count" | "pixel_count" | "pixels" => {
+                    cont_mask |= PROP_COUNT;
+                    cat_mask |= PROP_CAT_COUNT;
+                }
+                "min" | "minimum" => cont_mask |= PROP_MIN,
+                "max" | "maximum" => cont_mask |= PROP_MAX,
+                "majority" | "mode" => cat_mask |= PROP_CAT_MAJORITY,
+                "majority_fraction" | "fraction" | "purity" => cat_mask |= PROP_CAT_MAJORITY_FRACTION,
+                "distinct_classes" | "unique_classes" | "num_classes" => cat_mask |= PROP_CAT_DISTINCT_CLASSES,
+                "entropy" | "shannon_entropy" => cat_mask |= PROP_CAT_ENTROPY,
+                _ => {}
+            }
+        }
+
+        Self {
+            continuous_mask: cont_mask,
+            categorical_mask: cat_mask,
+            generic_whitelist: Some(generic_set),
+            is_custom: true,
+        }
+    }
+
+    #[inline(always)]
+    pub fn has_continuous(&self, flag: u16) -> bool {
+        (self.continuous_mask & flag) != 0
+    }
+
+    #[inline(always)]
+    pub fn has_categorical(&self, flag: u16) -> bool {
+        (self.categorical_mask & flag) != 0
+    }
+
+    #[inline(always)]
+    pub fn allows_generic(&self, name: &str) -> bool {
+        match &self.generic_whitelist {
+            Some(set) => set.contains(&name.to_ascii_lowercase()),
+            None => true,
+        }
+    }
+
+    /// Check if continuous stddev is needed
+    #[inline(always)]
+    pub fn needs_stddev(&self) -> bool {
+        !self.is_custom || self.has_continuous(PROP_STDDEV)
+    }
+
+    /// Check if categorical entropy is needed
+    #[inline(always)]
+    pub fn needs_entropy(&self) -> bool {
+        !self.is_custom || self.has_categorical(PROP_CAT_ENTROPY)
+    }
+}
+
 /// Zero-allocation feature properties supporting fixed continuous/categorical schemas on the stack
 #[derive(Debug, Clone)]
 pub enum FeatureProperties {
@@ -217,7 +353,15 @@ impl Default for FeatureProperties {
 
 impl FeatureProperties {
     #[inline(always)]
-    pub fn for_each<F>(&self, mut f: F)
+    pub fn for_each<F>(&self, f: F)
+    where
+        F: FnMut(&str, &MvtValue),
+    {
+        self.for_each_filtered(&PropertyFilter::all(), f);
+    }
+
+    #[inline(always)]
+    pub fn for_each_filtered<F>(&self, filter: &PropertyFilter, mut f: F)
     where
         F: FnMut(&str, &MvtValue),
     {
@@ -232,15 +376,33 @@ impl FeatureProperties {
                 min,
                 max,
             } => {
-                f("h3_index", &MvtValue::UInt(*h3_index));
-                f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
-                f("resolution", &MvtValue::UInt(*resolution as u64));
-                f("mean", &MvtValue::Double(*mean));
-                f("sum", &MvtValue::Double(*sum));
-                f("stddev", &MvtValue::Double(*stddev));
-                f("count", &MvtValue::Double(*count));
-                f("min", &MvtValue::Double(*min));
-                f("max", &MvtValue::Double(*max));
+                if filter.has_continuous(PROP_H3_INDEX) {
+                    f("h3_index", &MvtValue::UInt(*h3_index));
+                }
+                if filter.has_continuous(PROP_H3_HEX) {
+                    f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
+                }
+                if filter.has_continuous(PROP_RESOLUTION) {
+                    f("resolution", &MvtValue::UInt(*resolution as u64));
+                }
+                if filter.has_continuous(PROP_MEAN) {
+                    f("mean", &MvtValue::Double(*mean));
+                }
+                if filter.has_continuous(PROP_SUM) {
+                    f("sum", &MvtValue::Double(*sum));
+                }
+                if filter.has_continuous(PROP_STDDEV) {
+                    f("stddev", &MvtValue::Double(*stddev));
+                }
+                if filter.has_continuous(PROP_COUNT) {
+                    f("count", &MvtValue::Double(*count));
+                }
+                if filter.has_continuous(PROP_MIN) {
+                    f("min", &MvtValue::Double(*min));
+                }
+                if filter.has_continuous(PROP_MAX) {
+                    f("max", &MvtValue::Double(*max));
+                }
             }
             FeatureProperties::Categorical {
                 h3_index,
@@ -251,18 +413,36 @@ impl FeatureProperties {
                 entropy,
                 count,
             } => {
-                f("h3_index", &MvtValue::UInt(*h3_index));
-                f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
-                f("resolution", &MvtValue::UInt(*resolution as u64));
-                f("majority", &MvtValue::Int(*majority));
-                f("majority_fraction", &MvtValue::Double(*majority_fraction));
-                f("distinct_classes", &MvtValue::UInt(*distinct_classes as u64));
-                f("entropy", &MvtValue::Double(*entropy));
-                f("count", &MvtValue::Double(*count));
+                if filter.has_categorical(PROP_CAT_H3_INDEX) {
+                    f("h3_index", &MvtValue::UInt(*h3_index));
+                }
+                if filter.has_categorical(PROP_CAT_H3_HEX) {
+                    f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
+                }
+                if filter.has_categorical(PROP_CAT_RESOLUTION) {
+                    f("resolution", &MvtValue::UInt(*resolution as u64));
+                }
+                if filter.has_categorical(PROP_CAT_MAJORITY) {
+                    f("majority", &MvtValue::Int(*majority));
+                }
+                if filter.has_categorical(PROP_CAT_MAJORITY_FRACTION) {
+                    f("majority_fraction", &MvtValue::Double(*majority_fraction));
+                }
+                if filter.has_categorical(PROP_CAT_DISTINCT_CLASSES) {
+                    f("distinct_classes", &MvtValue::UInt(*distinct_classes as u64));
+                }
+                if filter.has_categorical(PROP_CAT_ENTROPY) {
+                    f("entropy", &MvtValue::Double(*entropy));
+                }
+                if filter.has_categorical(PROP_CAT_COUNT) {
+                    f("count", &MvtValue::Double(*count));
+                }
             }
             FeatureProperties::Generic(props) => {
                 for (k, v) in props {
-                    f(k.as_ref(), v);
+                    if filter.allows_generic(k.as_ref()) {
+                        f(k.as_ref(), v);
+                    }
                 }
             }
         }
@@ -329,6 +509,7 @@ pub struct MvtLayer {
     pub name: String,
     pub extent: u32,
     pub features: Vec<MvtFeature>,
+    pub property_filter: PropertyFilter,
 }
 
 impl MvtLayer {
@@ -338,6 +519,17 @@ impl MvtLayer {
             name: name.to_string(),
             extent: 4096,
             features: Vec::new(),
+            property_filter: PropertyFilter::all(),
+        }
+    }
+
+    /// Create a new MVT layer with a custom property whitelist filter
+    pub fn with_filter(name: &str, filter: PropertyFilter) -> Self {
+        Self {
+            name: name.to_string(),
+            extent: 4096,
+            features: Vec::new(),
+            property_filter: filter,
         }
     }
 
@@ -459,7 +651,7 @@ impl MvtLayer {
 
         for feat in &self.features {
             tag_bytes.clear();
-            feat.properties.for_each(|k, v| {
+            feat.properties.for_each_filtered(&self.property_filter, |k, v| {
                 let key_idx = match key_map.get(k) {
                     Some(&idx) => idx,
                     None => {

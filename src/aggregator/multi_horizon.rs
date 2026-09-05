@@ -38,6 +38,7 @@ pub struct MultiResolutionConfig {
     pub bbox: Option<[f64; 4]>,
     pub sampling: SamplingPattern,
     pub custom_crs: Option<String>,
+    pub properties: Option<String>,
 }
 
 impl MultiResolutionConfig {
@@ -50,6 +51,7 @@ impl MultiResolutionConfig {
             bbox: None,
             sampling: SamplingPattern::center(),
             custom_crs: None,
+            properties: None,
         }
     }
 }
@@ -61,7 +63,7 @@ impl Default for MultiResolutionConfig {
 }
 
 /// Continuous record yielded by the multi-resolution streamer
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MultiContinuousRecord {
     pub resolution: u8,
     pub h3_index: u64,

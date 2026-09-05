@@ -13,8 +13,14 @@ use serde_json::json;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::multi_horizon::{MultiContinuousRecord, MultiScanHorizonStreamer, MultiCategoricalRecord, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
-use crate::pmtiles::mvt::{FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue};
+use crate::aggregator::multi_horizon::{MultiContinuousRecord, MultiScanHorizonStreamer, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
+use crate::pmtiles::mvt::{
+    FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter,
+    PROP_CAT_COUNT, PROP_CAT_DISTINCT_CLASSES, PROP_CAT_ENTROPY, PROP_CAT_H3_HEX,
+    PROP_CAT_H3_INDEX, PROP_CAT_MAJORITY, PROP_CAT_MAJORITY_FRACTION, PROP_CAT_RESOLUTION,
+    PROP_COUNT, PROP_H3_HEX, PROP_H3_INDEX, PROP_MAX, PROP_MEAN, PROP_MIN, PROP_RESOLUTION,
+    PROP_STDDEV, PROP_SUM,
+};
 use crate::pmtiles::writer::PmtilesWriter;
 use crate::raster::geotiff::GeoTiffStreamReader;
 
@@ -587,9 +593,21 @@ impl H3PmtilesTiler {
     }
     /// Stream continuous raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
     pub fn generate_from_continuous_streamer<P: AsRef<Path>>(
-        mut streamer: MultiScanHorizonStreamer,
+        streamer: MultiScanHorizonStreamer,
         output_path: P,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Self::generate_from_continuous_streamer_with_properties(streamer, output_path, None)
+    }
+
+    /// Stream continuous raster data from GeoTIFF across target resolutions and write PMTiles v3 archive with selective property filtering
+    pub fn generate_from_continuous_streamer_with_properties<P: AsRef<Path>>(
+        mut streamer: MultiScanHorizonStreamer,
+        output_path: P,
+        properties: Option<&str>,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let property_filter = properties.map(PropertyFilter::parse).unwrap_or_else(PropertyFilter::all);
+        let needs_stddev = property_filter.needs_stddev();
+
         let resolutions = streamer.resolution_u8s().to_vec();
         let min_res = resolutions.iter().copied().min().unwrap_or(0);
         let mut min_zoom = 255u8;
@@ -626,20 +644,25 @@ impl H3PmtilesTiler {
             String::new(),
         )?;
 
+        let mut batch = Vec::with_capacity(4096);
+
         loop {
-            let batch = streamer.fetch_next_batch(4096);
+            batch.clear();
+            streamer.drain_completed_into(4096, |_i, record| {
+                batch.push(record);
+            });
             if batch.is_empty() {
                 break;
             }
 
             let prepared_batch: Vec<PreparedContinuousHex> = batch
-                .into_par_iter()
+                .par_iter()
                 .filter_map(|record| {
                     let MultiContinuousRecord {
                         resolution,
                         h3_index,
                         accumulator,
-                    } = record;
+                    } = *record;
 
                     let cell = CellIndex::try_from(h3_index).ok()?;
                     let center: LatLng = cell.into();
@@ -650,12 +673,14 @@ impl H3PmtilesTiler {
                     let (v_merc, v_count) = cell_boundary_mercator(cell);
                     let vertices_merc = &v_merc[..v_count];
 
+                    let stddev = if needs_stddev { accumulator.stddev() } else { 0.0 };
+
                     let properties = FeatureProperties::Continuous {
                         h3_index,
                         resolution: resolution as u8,
                         mean: accumulator.mean(),
                         sum: accumulator.sum,
-                        stddev: accumulator.stddev(),
+                        stddev,
                         count: accumulator.count,
                         min: accumulator.min,
                         max: accumulator.max,
@@ -677,12 +702,13 @@ impl H3PmtilesTiler {
                                     let (p_v_merc, p_v_count) = cell_boundary_mercator(parent_cell);
                                     let p_vertices_merc = &p_v_merc[..p_v_count];
 
+                                    let parent_stddev = if needs_stddev { accumulator.stddev() } else { 0.0 };
                                     let parent_properties = FeatureProperties::Continuous {
                                         h3_index: parent_h3,
                                         resolution: optimal_res,
                                         mean: accumulator.mean(),
                                         sum: accumulator.sum,
-                                        stddev: accumulator.stddev(),
+                                        stddev: parent_stddev,
                                         count: accumulator.count,
                                         min: accumulator.min,
                                         max: accumulator.max,
@@ -800,7 +826,7 @@ impl H3PmtilesTiler {
                             tile_key,
                         });
                         tile_buckets.entry(tile_key).or_insert_with(|| {
-                            MvtLayer::new("h3_hexagons")
+                            MvtLayer::with_filter("h3_hexagons", property_filter.clone())
                         })
                     };
 
@@ -880,6 +906,32 @@ impl H3PmtilesTiler {
             }
         }
 
+        let fields_json = if property_filter.is_custom {
+            let mut m = serde_json::Map::new();
+            if property_filter.has_continuous(PROP_H3_INDEX) { m.insert("h3_index".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_H3_HEX) { m.insert("h3_hex".to_string(), json!("String")); }
+            if property_filter.has_continuous(PROP_RESOLUTION) { m.insert("resolution".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_MEAN) { m.insert("mean".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_SUM) { m.insert("sum".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_STDDEV) { m.insert("stddev".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_COUNT) { m.insert("count".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_MIN) { m.insert("min".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_MAX) { m.insert("max".to_string(), json!("Number")); }
+            serde_json::Value::Object(m)
+        } else {
+            json!({
+                "h3_index": "Number",
+                "h3_hex": "String",
+                "resolution": "Number",
+                "mean": "Number",
+                "sum": "Number",
+                "stddev": "Number",
+                "count": "Number",
+                "min": "Number",
+                "max": "Number"
+            })
+        };
+
         let metadata = json!({
             "name": "raster_h3_pmtiles",
             "description": "Multi-resolution H3 hexagonal vector tile pyramid generated by raster_h3",
@@ -893,17 +945,7 @@ impl H3PmtilesTiler {
                     "description": "Aggregated H3 hexagonal grid cells",
                     "minzoom": min_zoom,
                     "maxzoom": max_zoom,
-                    "fields": {
-                        "h3_index": "Number",
-                        "h3_hex": "String",
-                        "resolution": "Number",
-                        "mean": "Number",
-                        "sum": "Number",
-                        "stddev": "Number",
-                        "count": "Number",
-                        "min": "Number",
-                        "max": "Number"
-                    }
+                    "fields": fields_json
                 }
             ]
         });
@@ -919,9 +961,21 @@ impl H3PmtilesTiler {
 
     /// Stream categorical raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
     pub fn generate_from_categorical_streamer<P: AsRef<Path>>(
-        mut streamer: MultiCategoricalHorizonStreamer,
+        streamer: MultiCategoricalHorizonStreamer,
         output_path: P,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Self::generate_from_categorical_streamer_with_properties(streamer, output_path, None)
+    }
+
+    /// Stream categorical raster data from GeoTIFF across target resolutions and write PMTiles v3 archive with selective property filtering
+    pub fn generate_from_categorical_streamer_with_properties<P: AsRef<Path>>(
+        mut streamer: MultiCategoricalHorizonStreamer,
+        output_path: P,
+        properties: Option<&str>,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let property_filter = properties.map(PropertyFilter::parse).unwrap_or_else(PropertyFilter::all);
+        let needs_entropy = property_filter.needs_entropy();
+
         let resolutions = streamer.resolution_u8s().to_vec();
         let min_res = resolutions.iter().copied().min().unwrap_or(0);
 
@@ -963,22 +1017,25 @@ impl H3PmtilesTiler {
             String::new(),
         )?;
 
+        let mut batch = Vec::with_capacity(4096);
+
         loop {
-            let batch = streamer.fetch_next_batch(4096);
+            batch.clear();
+            streamer.drain_completed_into(4096, |_i, record| {
+                batch.push(record);
+            });
             if batch.is_empty() {
                 break;
             }
             let prepared_batch: Vec<PreparedCategoricalHex> = batch
-                .into_par_iter()
+                .par_iter()
                 .filter_map(|record| {
-                    let MultiCategoricalRecord {
-                        resolution,
-                        h3_index,
-                        accumulator,
-                    } = record;
+                    let resolution = record.resolution;
+                    let h3_index = record.h3_index;
+                    let accumulator = &record.accumulator;
 
                     let (majority_class, _maj_count, majority_fraction) = accumulator.majority();
-                    let entropy = accumulator.shannon_entropy();
+                    let entropy = if needs_entropy { accumulator.shannon_entropy() } else { 0.0 };
                     let distinct_classes = accumulator.unique_classes();
                     let pixel_count = accumulator.total_count;
 
@@ -1112,7 +1169,7 @@ impl H3PmtilesTiler {
                         entropy,
                         distinct_classes,
                         pixel_count,
-                        accumulator,
+                        accumulator: accumulator.clone(),
                         c_lat,
                         c_lon,
                         ops,
@@ -1149,7 +1206,7 @@ impl H3PmtilesTiler {
                             tile_key,
                         });
                         tile_buckets.entry(tile_key).or_insert_with(|| {
-                            MvtLayer::new("h3_hexagons")
+                            MvtLayer::with_filter("h3_hexagons", property_filter.clone())
                         })
                     };
 
@@ -1256,6 +1313,30 @@ impl H3PmtilesTiler {
             res_stats_json.insert(res.to_string(), stat_entry);
         }
 
+        let fields_json = if property_filter.is_custom {
+            let mut m = serde_json::Map::new();
+            if property_filter.has_categorical(PROP_CAT_H3_INDEX) { m.insert("h3_index".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_H3_HEX) { m.insert("h3_hex".to_string(), json!("String")); }
+            if property_filter.has_categorical(PROP_CAT_RESOLUTION) { m.insert("resolution".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_MAJORITY) { m.insert("majority".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_MAJORITY_FRACTION) { m.insert("majority_fraction".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_DISTINCT_CLASSES) { m.insert("distinct_classes".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_ENTROPY) { m.insert("entropy".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_COUNT) { m.insert("count".to_string(), json!("Number")); }
+            serde_json::Value::Object(m)
+        } else {
+            json!({
+                "h3_index": "Number",
+                "h3_hex": "String",
+                "resolution": "Number",
+                "majority": "Number",
+                "majority_fraction": "Number",
+                "distinct_classes": "Number",
+                "entropy": "Number",
+                "count": "Number"
+            })
+        };
+
         // Build vector layer JSON metadata for MapLibre / Web Vector Clients
         let metadata = json!({
             "name": "raster_h3_categorical_pmtiles",
@@ -1273,16 +1354,7 @@ impl H3PmtilesTiler {
                     "description": "Aggregated H3 hexagonal grid cells",
                     "minzoom": min_zoom,
                     "maxzoom": max_zoom,
-                    "fields": {
-                        "h3_index": "Number",
-                        "h3_hex": "String",
-                        "resolution": "Number",
-                        "majority": "Number",
-                        "majority_fraction": "Number",
-                        "distinct_classes": "Number",
-                        "entropy": "Number",
-                        "count": "Number"
-                    }
+                    "fields": fields_json
                 }
             ]
         });
@@ -1302,9 +1374,10 @@ impl H3PmtilesTiler {
         pmtiles_path: P2,
         config: MultiResolutionConfig,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let props = config.properties.clone();
         let reader = GeoTiffStreamReader::open(tiff_path)?;
         let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
-        Self::generate_from_categorical_streamer(streamer, pmtiles_path)
+        Self::generate_from_categorical_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
     }
 
     /// Convenience helper to run continuous GeoTIFF-to-PMTiles pipeline in single-pass streaming mode
@@ -1313,9 +1386,10 @@ impl H3PmtilesTiler {
         pmtiles_path: P2,
         config: MultiResolutionConfig,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let props = config.properties.clone();
         let reader = GeoTiffStreamReader::open(tiff_path)?;
         let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
-        Self::generate_from_continuous_streamer(streamer, pmtiles_path)
+        Self::generate_from_continuous_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
     }
 
     /// Convert any H3-indexed Parquet file directly into a PMTiles v3 archive
