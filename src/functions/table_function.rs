@@ -23,6 +23,11 @@ pub struct RasterH3BindData {
     pub bbox: Option<[f64; 4]>,
     pub sampling: SamplingPattern,
     pub band: u32,
+    pub spectral_formula: Option<crate::aggregator::multi_horizon::SpectralFormula>,
+    pub min_count: Option<f64>,
+    pub min_mean: Option<f64>,
+    pub max_mean: Option<f64>,
+    pub compact: bool,
 }
 
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
@@ -244,6 +249,106 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Named parameter: formula (VARCHAR)
+    let name_formula = to_c_string("formula");
+    let named_formula_val = duckdb_bind_get_named_parameter(info, name_formula.as_ptr());
+    let mut formula_str = None;
+    if !named_formula_val.is_null() {
+        let f_ptr = duckdb_get_varchar(named_formula_val);
+        formula_str = from_duckdb_string(f_ptr);
+    }
+
+    // Band parameters for formulas
+    let mut nir_band: usize = 4;
+    let name_nir = to_c_string("nir_band");
+    let named_nir_val = duckdb_bind_get_named_parameter(info, name_nir.as_ptr());
+    if !named_nir_val.is_null() {
+        let b = duckdb_get_int64(named_nir_val);
+        if b > 0 {
+            nir_band = b as usize;
+        }
+    }
+
+    let mut red_band: usize = 3;
+    let name_red = to_c_string("red_band");
+    let named_red_val = duckdb_bind_get_named_parameter(info, name_red.as_ptr());
+    if !named_red_val.is_null() {
+        let b = duckdb_get_int64(named_red_val);
+        if b > 0 {
+            red_band = b as usize;
+        }
+    }
+
+    let mut green_band: usize = 2;
+    let name_green = to_c_string("green_band");
+    let named_green_val = duckdb_bind_get_named_parameter(info, name_green.as_ptr());
+    if !named_green_val.is_null() {
+        let b = duckdb_get_int64(named_green_val);
+        if b > 0 {
+            green_band = b as usize;
+        }
+    }
+
+    let mut blue_band: usize = 1;
+    let name_blue = to_c_string("blue_band");
+    let named_blue_val = duckdb_bind_get_named_parameter(info, name_blue.as_ptr());
+    if !named_blue_val.is_null() {
+        let b = duckdb_get_int64(named_blue_val);
+        if b > 0 {
+            blue_band = b as usize;
+        }
+    }
+
+    let mut swir_band: usize = 6;
+    let name_swir = to_c_string("swir_band");
+    let named_swir_val = duckdb_bind_get_named_parameter(info, name_swir.as_ptr());
+    if !named_swir_val.is_null() {
+        let b = duckdb_get_int64(named_swir_val);
+        if b > 0 {
+            swir_band = b as usize;
+        }
+    }
+
+    let spectral_formula = formula_str.as_deref().and_then(|f| {
+        crate::aggregator::multi_horizon::SpectralFormula::parse(
+            f, nir_band, red_band, green_band, blue_band, swir_band,
+        )
+    });
+
+    // Predicates pushdown: min_count, min_mean, max_mean
+    let name_min_count = to_c_string("min_count");
+    let named_min_count_val = duckdb_bind_get_named_parameter(info, name_min_count.as_ptr());
+    let min_count = if !named_min_count_val.is_null() {
+        Some(duckdb_get_double(named_min_count_val))
+    } else {
+        None
+    };
+
+    let name_min_mean = to_c_string("min_mean");
+    let named_min_mean_val = duckdb_bind_get_named_parameter(info, name_min_mean.as_ptr());
+    let min_mean = if !named_min_mean_val.is_null() {
+        Some(duckdb_get_double(named_min_mean_val))
+    } else {
+        None
+    };
+
+    let name_max_mean = to_c_string("max_mean");
+    let named_max_mean_val = duckdb_bind_get_named_parameter(info, name_max_mean.as_ptr());
+    let max_mean = if !named_max_mean_val.is_null() {
+        Some(duckdb_get_double(named_max_mean_val))
+    } else {
+        None
+    };
+
+    // Compaction: compact
+    let name_compact = to_c_string("compact");
+    let named_compact_val = duckdb_bind_get_named_parameter(info, name_compact.as_ptr());
+    let compact = if !named_compact_val.is_null() {
+        duckdb_get_bool(named_compact_val)
+    } else {
+        false
+    };
+
     // Add Output Columns:
     // 0: h3_index UBIGINT
     let col_h3 = to_c_string("h3_index");
@@ -345,6 +450,11 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         bbox,
         sampling,
         band,
+        spectral_formula,
+        min_count,
+        min_mean,
+        max_mean,
+        compact,
     });
 
     duckdb_bind_set_bind_data(
@@ -386,6 +496,11 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     config.bbox = bind_data.bbox;
     config.sampling = bind_data.sampling.clone();
     config.band = bind_data.band as usize;
+    config.spectral_formula = bind_data.spectral_formula;
+    config.min_count = bind_data.min_count;
+    config.min_mean = bind_data.min_mean;
+    config.max_mean = bind_data.max_mean;
+    config.compact = bind_data.compact;
 
     let streamer = match MultiScanHorizonStreamer::new(reader, &config) {
         Ok(s) => s,
@@ -702,6 +817,35 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         let name_hex = to_c_string("h3_hex");
         duckdb_table_function_add_named_parameter(tf, name_hex.as_ptr(), type_varchar);
 
+        // formula (VARCHAR)
+        let name_formula = to_c_string("formula");
+        duckdb_table_function_add_named_parameter(tf, name_formula.as_ptr(), type_varchar);
+
+        // Band specification parameters for formulas
+        let name_nir = to_c_string("nir_band");
+        duckdb_table_function_add_named_parameter(tf, name_nir.as_ptr(), type_bigint);
+        let name_red = to_c_string("red_band");
+        duckdb_table_function_add_named_parameter(tf, name_red.as_ptr(), type_bigint);
+        let name_green = to_c_string("green_band");
+        duckdb_table_function_add_named_parameter(tf, name_green.as_ptr(), type_bigint);
+        let name_blue = to_c_string("blue_band");
+        duckdb_table_function_add_named_parameter(tf, name_blue.as_ptr(), type_bigint);
+        let name_swir = to_c_string("swir_band");
+        duckdb_table_function_add_named_parameter(tf, name_swir.as_ptr(), type_bigint);
+
+        // Predicate pushdown parameters
+        let name_min_count = to_c_string("min_count");
+        duckdb_table_function_add_named_parameter(tf, name_min_count.as_ptr(), type_double);
+        let name_min_mean = to_c_string("min_mean");
+        duckdb_table_function_add_named_parameter(tf, name_min_mean.as_ptr(), type_double);
+        let name_max_mean = to_c_string("max_mean");
+        duckdb_table_function_add_named_parameter(tf, name_max_mean.as_ptr(), type_double);
+
+        // Compaction parameter
+        let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
+        let name_compact = to_c_string("compact");
+        duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
+
         // Set callbacks including parallel init_local and projection pushdown
         duckdb_table_function_set_bind(tf, raster_h3_bind);
         duckdb_table_function_set_init(tf, raster_h3_init);
@@ -720,6 +864,8 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         duckdb_destroy_logical_type(&mut type_double_mut);
         let mut type_double_bbox_mut = type_double_bbox;
         duckdb_destroy_logical_type(&mut type_double_bbox_mut);
+        let mut type_bool_mut = type_bool;
+        duckdb_destroy_logical_type(&mut type_bool_mut);
 
         let mut tf_mut = tf;
         duckdb_destroy_table_function(&mut tf_mut);

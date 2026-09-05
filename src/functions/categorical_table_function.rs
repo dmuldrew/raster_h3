@@ -29,6 +29,9 @@ pub struct RasterH3CategoricalBindData {
     pub sampling: SamplingPattern,
     pub band: u32,
     pub format: CategoricalOutputFormat,
+    pub min_count: Option<f64>,
+    pub min_majority_fraction: Option<f64>,
+    pub compact: bool,
 }
 
 pub struct LongCategoricalRow {
@@ -274,6 +277,32 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Predicates pushdown: min_count, min_majority_fraction
+    let name_min_count = to_c_string("min_count");
+    let named_min_count_val = duckdb_bind_get_named_parameter(info, name_min_count.as_ptr());
+    let min_count = if !named_min_count_val.is_null() {
+        Some(duckdb_get_double(named_min_count_val))
+    } else {
+        None
+    };
+
+    let name_min_maj = to_c_string("min_majority_fraction");
+    let named_min_maj_val = duckdb_bind_get_named_parameter(info, name_min_maj.as_ptr());
+    let min_majority_fraction = if !named_min_maj_val.is_null() {
+        Some(duckdb_get_double(named_min_maj_val))
+    } else {
+        None
+    };
+
+    // Compaction: compact
+    let name_compact = to_c_string("compact");
+    let named_compact_val = duckdb_bind_get_named_parameter(info, name_compact.as_ptr());
+    let compact = if !named_compact_val.is_null() {
+        duckdb_get_bool(named_compact_val)
+    } else {
+        false
+    };
+
     // Define result columns based on format
     let type_ubigint = duckdb_create_logical_type(DuckDBType::UBigInt);
     let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
@@ -429,6 +458,9 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         sampling,
         band,
         format,
+        min_count,
+        min_majority_fraction,
+        compact,
     });
 
     duckdb_bind_set_bind_data(
@@ -470,6 +502,9 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
     config.bbox = bind_data.bbox;
     config.sampling = bind_data.sampling.clone();
     config.band = bind_data.band as usize;
+    config.min_count = bind_data.min_count;
+    config.min_majority_fraction = bind_data.min_majority_fraction;
+    config.compact = bind_data.compact;
 
     let streamer = match MultiCategoricalHorizonStreamer::new(reader, &config) {
         Ok(s) => s,
@@ -998,6 +1033,17 @@ pub unsafe fn register_categorical_table_function(
         let name_hex = to_c_string("h3_hex");
         duckdb_table_function_add_named_parameter(tf, name_hex.as_ptr(), type_varchar);
 
+        // Predicate pushdown parameters
+        let name_min_count = to_c_string("min_count");
+        duckdb_table_function_add_named_parameter(tf, name_min_count.as_ptr(), type_double);
+        let name_min_maj = to_c_string("min_majority_fraction");
+        duckdb_table_function_add_named_parameter(tf, name_min_maj.as_ptr(), type_double);
+
+        // Compaction parameter
+        let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
+        let name_compact = to_c_string("compact");
+        duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
+
         duckdb_table_function_set_bind(tf, raster_h3_categorical_bind);
         duckdb_table_function_set_init(tf, raster_h3_categorical_init);
         duckdb_table_function_set_local_init(tf, raster_h3_categorical_init_local);
@@ -1012,6 +1058,8 @@ pub unsafe fn register_categorical_table_function(
         duckdb_destroy_logical_type(&mut type_bigint_mut);
         let mut type_double_mut = type_double;
         duckdb_destroy_logical_type(&mut type_double_mut);
+        let mut type_bool_mut = type_bool;
+        duckdb_destroy_logical_type(&mut type_bool_mut);
 
         let mut tf_mut = tf;
         duckdb_destroy_table_function(&mut tf_mut);

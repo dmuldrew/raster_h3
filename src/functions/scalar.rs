@@ -258,6 +258,90 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_str(
     }
 }
 
+/// Scalar function: h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
+pub unsafe extern "C" fn scalar_h3_cell_to_parent_u64(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let count = duckdb_data_chunk_get_size(input);
+    let v_cell = duckdb_data_chunk_get_vector(input, 0);
+    let v_res = duckdb_data_chunk_get_vector(input, 1);
+    let p_cell = duckdb_vector_get_data(v_cell) as *const u64;
+    let p_res = duckdb_vector_get_data(v_res) as *const i64;
+    let p_out = duckdb_vector_get_data(output) as *mut u64;
+
+    for i in 0..count {
+        let cell_u64 = *p_cell.add(i as usize);
+        let parent_res_i64 = *p_res.add(i as usize);
+        if let Ok(cell) = CellIndex::try_from(cell_u64) {
+            if parent_res_i64 >= 0 && parent_res_i64 <= 15 {
+                if let Ok(target_res) = h3o::Resolution::try_from(parent_res_i64 as u8) {
+                    if let Some(parent) = cell.parent(target_res) {
+                        *p_out.add(i as usize) = parent.into();
+                        continue;
+                    }
+                }
+            }
+        }
+        *p_out.add(i as usize) = 0;
+    }
+}
+
+/// Scalar function: h3_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR
+pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let count = duckdb_data_chunk_get_size(input);
+    let v_cell = duckdb_data_chunk_get_vector(input, 0);
+    let v_res = duckdb_data_chunk_get_vector(input, 1);
+    let p_res = duckdb_vector_get_data(v_res) as *const i64;
+
+    let mut hex_buf = [0u8; 16];
+
+    for i in 0..count {
+        let str_ptr = duckdb_vector_get_data(v_cell) as *const duckdb_string_t;
+        let d_str = &*str_ptr.add(i as usize);
+
+        let s = if d_str.length <= 12 {
+            let bytes = &d_str.prefix[..d_str.length as usize];
+            std::str::from_utf8(bytes).unwrap_or("")
+        } else {
+            let ptr = d_str.ptr as *const u8;
+            if ptr.is_null() {
+                ""
+            } else {
+                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
+                std::str::from_utf8(slice).unwrap_or("")
+            }
+        };
+
+        let parent_res_i64 = *p_res.add(i as usize);
+        let cell_opt = parse_hex_u64(s).and_then(|u| CellIndex::try_from(u).ok());
+        let res_opt = if parent_res_i64 >= 0 && parent_res_i64 <= 15 {
+            h3o::Resolution::try_from(parent_res_i64 as u8).ok()
+        } else {
+            None
+        };
+
+        if let (Some(cell), Some(target_res)) = (cell_opt, res_opt) {
+            if let Some(parent) = cell.parent(target_res) {
+                let hex_slice = fast_hex_u64(parent.into(), &mut hex_buf);
+                duckdb_vector_assign_string_element_len(
+                    output,
+                    i,
+                    hex_slice.as_ptr() as *const c_char,
+                    hex_slice.len() as idx_t,
+                );
+                continue;
+            }
+        }
+        duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
+    }
+}
+
 /// Register scalar functions with DuckDB
 pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), String> {
     let type_ubigint = duckdb_create_logical_type(DuckDBType::UBigInt);
@@ -364,6 +448,29 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     let mut fn_wkb_str_mut = fn_wkb_str;
     duckdb_destroy_scalar_function(&mut fn_wkb_str_mut);
 
+    // 10. h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
+    let fn_parent_u64 = duckdb_create_scalar_function();
+    let name_parent = to_c_string("h3_cell_to_parent");
+    duckdb_scalar_function_set_name(fn_parent_u64, name_parent.as_ptr());
+    duckdb_scalar_function_add_parameter(fn_parent_u64, type_ubigint);
+    duckdb_scalar_function_add_parameter(fn_parent_u64, type_bigint);
+    duckdb_scalar_function_set_return_type(fn_parent_u64, type_ubigint);
+    duckdb_scalar_function_set_function(fn_parent_u64, scalar_h3_cell_to_parent_u64);
+    duckdb_register_scalar_function(con, fn_parent_u64);
+    let mut fn_parent_u64_mut = fn_parent_u64;
+    duckdb_destroy_scalar_function(&mut fn_parent_u64_mut);
+
+    // 11. h3_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR
+    let fn_parent_str = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(fn_parent_str, name_parent.as_ptr());
+    duckdb_scalar_function_add_parameter(fn_parent_str, type_varchar);
+    duckdb_scalar_function_add_parameter(fn_parent_str, type_bigint);
+    duckdb_scalar_function_set_return_type(fn_parent_str, type_varchar);
+    duckdb_scalar_function_set_function(fn_parent_str, scalar_h3_cell_to_parent_str);
+    duckdb_register_scalar_function(con, fn_parent_str);
+    let mut fn_parent_str_mut = fn_parent_str;
+    duckdb_destroy_scalar_function(&mut fn_parent_str_mut);
+
     // Cleanup types
     let mut type_ubigint_mut = type_ubigint;
     duckdb_destroy_logical_type(&mut type_ubigint_mut);
@@ -421,6 +528,22 @@ mod tests {
         assert_eq!(u32::from_le_bytes(buf[1..5].try_into().unwrap()), 3); // polygon
 
         assert!(h3_index_to_wkb(0, &mut buf).is_none());
+    }
+
+    #[test]
+    fn test_h3_cell_to_parent_logic() {
+        let valid_u64 = 0x8828308281fffffu64; // Res 8
+        let cell = CellIndex::try_from(valid_u64).unwrap();
+        assert_eq!(cell.resolution(), h3o::Resolution::Eight);
+
+        let parent_res7 = cell.parent(h3o::Resolution::Seven).unwrap();
+        assert_eq!(parent_res7.resolution(), h3o::Resolution::Seven);
+
+        let parent_res6 = cell.parent(h3o::Resolution::Six).unwrap();
+        assert_eq!(parent_res6.resolution(), h3o::Resolution::Six);
+
+        // Child cannot have parent at higher resolution
+        assert!(cell.parent(h3o::Resolution::Nine).is_none());
     }
 }
 

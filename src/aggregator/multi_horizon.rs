@@ -8,7 +8,7 @@
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use fxhash::FxBuildHasher;
-use h3o::{LatLng, Resolution};
+use h3o::{CellIndex, LatLng, Resolution};
 use rayon::prelude::*;
 use tiff::decoder::DecodingResult;
 
@@ -30,6 +30,27 @@ use crate::raster::RasterChunk;
 const WGS84_A: f64 = 6378137.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
+/// Supported on-the-fly spectral index formulas
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpectralFormula {
+    Ndvi { nir_band: usize, red_band: usize },
+    Ndwi { green_band: usize, nir_band: usize },
+    Nbr { nir_band: usize, swir_band: usize },
+    Evi { nir_band: usize, red_band: usize, blue_band: usize },
+}
+
+impl SpectralFormula {
+    pub fn parse(name: &str, nir: usize, red: usize, green: usize, blue: usize, swir: usize) -> Option<Self> {
+        match name.to_lowercase().trim() {
+            "ndvi" => Some(Self::Ndvi { nir_band: nir, red_band: red }),
+            "ndwi" => Some(Self::Ndwi { green_band: green, nir_band: nir }),
+            "nbr" => Some(Self::Nbr { nir_band: nir, swir_band: swir }),
+            "evi" => Some(Self::Evi { nir_band: nir, red_band: red, blue_band: blue }),
+            _ => None,
+        }
+    }
+}
+
 /// Configuration for multi-resolution aggregation
 #[derive(Debug, Clone)]
 pub struct MultiResolutionConfig {
@@ -40,6 +61,12 @@ pub struct MultiResolutionConfig {
     pub sampling: SamplingPattern,
     pub custom_crs: Option<String>,
     pub properties: Option<String>,
+    pub spectral_formula: Option<SpectralFormula>,
+    pub min_count: Option<f64>,
+    pub min_mean: Option<f64>,
+    pub max_mean: Option<f64>,
+    pub min_majority_fraction: Option<f64>,
+    pub compact: bool,
 }
 
 impl MultiResolutionConfig {
@@ -53,6 +80,12 @@ impl MultiResolutionConfig {
             sampling: SamplingPattern::center(),
             custom_crs: None,
             properties: None,
+            spectral_formula: None,
+            min_count: None,
+            min_mean: None,
+            max_mean: None,
+            min_majority_fraction: None,
+            compact: false,
         }
     }
 }
@@ -354,6 +387,155 @@ fn process_continuous_slice_into_maps<T>(
     }
 }
 
+/// Process a multi-sample or spectral formula continuous slice into thread-local hash maps
+fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(
+    slice: &[T],
+    chunk: &RasterChunk,
+    native_nodata: Option<T>,
+    resolutions: &[Resolution],
+    crs_transformer: &CrsTransformer,
+    gt: &GeoTransform,
+    sampling: &SamplingPattern,
+    bbox: Option<[f64; 4]>,
+    chunk_stride: u32,
+    samples_per_pixel: usize,
+    band: usize,
+    spectral_formula: Option<SpectralFormula>,
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
+) {
+    let row_width = chunk.width as usize;
+    let spp = samples_per_pixel.max(1);
+    let num_res = resolutions.len();
+
+    for row_idx in 0..chunk.height as usize {
+        let slice_row_start = (row_idx * (chunk_stride as usize)) * spp;
+
+        for c in 0..row_width {
+            let pixel_base = slice_row_start + c * spp;
+
+            let val_opt = match spectral_formula {
+                Some(SpectralFormula::Ndvi { nir_band, red_band }) => {
+                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
+                    let red_idx = (red_band.saturating_sub(1)).min(spp - 1);
+                    let nir_raw = slice[pixel_base + nir_idx];
+                    let red_raw = slice[pixel_base + red_idx];
+                    if nir_raw.is_valid(native_nodata) && red_raw.is_valid(native_nodata) {
+                        let nir = nir_raw.to_f64_val();
+                        let red = red_raw.to_f64_val();
+                        let denom = nir + red;
+                        if denom.abs() > 1e-12 {
+                            Some((nir - red) / denom)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Some(SpectralFormula::Ndwi { green_band, nir_band }) => {
+                    let green_idx = (green_band.saturating_sub(1)).min(spp - 1);
+                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
+                    let green_raw = slice[pixel_base + green_idx];
+                    let nir_raw = slice[pixel_base + nir_idx];
+                    if green_raw.is_valid(native_nodata) && nir_raw.is_valid(native_nodata) {
+                        let green = green_raw.to_f64_val();
+                        let nir = nir_raw.to_f64_val();
+                        let denom = green + nir;
+                        if denom.abs() > 1e-12 {
+                            Some((green - nir) / denom)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Some(SpectralFormula::Nbr { nir_band, swir_band }) => {
+                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
+                    let swir_idx = (swir_band.saturating_sub(1)).min(spp - 1);
+                    let nir_raw = slice[pixel_base + nir_idx];
+                    let swir_raw = slice[pixel_base + swir_idx];
+                    if nir_raw.is_valid(native_nodata) && swir_raw.is_valid(native_nodata) {
+                        let nir = nir_raw.to_f64_val();
+                        let swir = swir_raw.to_f64_val();
+                        let denom = nir + swir;
+                        if denom.abs() > 1e-12 {
+                            Some((nir - swir) / denom)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Some(SpectralFormula::Evi { nir_band, red_band, blue_band }) => {
+                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
+                    let red_idx = (red_band.saturating_sub(1)).min(spp - 1);
+                    let blue_idx = (blue_band.saturating_sub(1)).min(spp - 1);
+                    let nir_raw = slice[pixel_base + nir_idx];
+                    let red_raw = slice[pixel_base + red_idx];
+                    let blue_raw = slice[pixel_base + blue_idx];
+                    if nir_raw.is_valid(native_nodata) && red_raw.is_valid(native_nodata) && blue_raw.is_valid(native_nodata) {
+                        let nir = nir_raw.to_f64_val();
+                        let red = red_raw.to_f64_val();
+                        let blue = blue_raw.to_f64_val();
+                        let denom = nir + 6.0 * red - 7.5 * blue + 1.0;
+                        if denom.abs() > 1e-12 {
+                            Some(2.5 * (nir - red) / denom)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    let b_idx = (band.saturating_sub(1)).min(spp - 1);
+                    let raw = slice[pixel_base + b_idx];
+                    if raw.is_valid(native_nodata) {
+                        Some(raw.to_f64_val())
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            let val = match val_opt {
+                Some(v) => v,
+                None => continue,
+            };
+
+            for sp in &sampling.points {
+                let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
+                let py = (chunk.row_offset as f64) + (row_idx as f64) + sp.dy;
+                let (x, y) = gt.pixel_to_coord(px, py);
+                if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
+                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                            continue;
+                        }
+                    }
+
+                    if let Ok(ll) = LatLng::new(lat, lon) {
+                        for res_idx in 0..num_res {
+                            let res = resolutions[res_idx];
+                            let cell: u64 = ll.to_cell(res).into();
+                            chunk_maps[res_idx]
+                                .entry(cell)
+                                .and_modify(|acc| acc.update_weighted(val, sp.weight))
+                                .or_insert_with(|| {
+                                    let mut a = H3Accumulator::default();
+                                    a.update_weighted(val, sp.weight);
+                                    a
+                                });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Process a continuous chunk across all resolutions into thread-local hash maps
 fn process_continuous_chunk_payload_into(
     chunk_bounds: &RasterChunk,
@@ -365,65 +547,116 @@ fn process_continuous_chunk_payload_into(
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
     nodata: Option<f64>,
+    samples_per_pixel: u16,
+    band: usize,
+    spectral_formula: Option<SpectralFormula>,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
-    let is_all_nodata = match decoding_result {
-        DecodingResult::U8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::U16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::U32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::U64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::F32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::F64(slice) => is_chunk_all_nodata(slice, nodata, |x| x),
-    };
+    let is_multisample = samples_per_pixel > 1 || spectral_formula.is_some() || band > 1;
+    let spp = samples_per_pixel.max(1) as usize;
 
-    if is_all_nodata {
-        return false;
-    }
+    if !is_multisample {
+        let is_all_nodata = match decoding_result {
+            DecodingResult::U8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::U16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::U32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::U64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::F32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::F64(slice) => is_chunk_all_nodata(slice, nodata, |x| x),
+        };
 
-    match decoding_result {
-        DecodingResult::U8(slice) => {
-            let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+        if is_all_nodata {
+            return false;
         }
-        DecodingResult::U16(slice) => {
-            let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+
+        match decoding_result {
+            DecodingResult::U8(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::U16(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::U32(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::U64(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::I8(slice) => {
+                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::I16(slice) => {
+                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::I32(slice) => {
+                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::I64(slice) => {
+                let nd = nodata.map(|v| v as i64);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::F32(slice) => {
+                let nd = nodata.map(|v| v as f32);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
+            DecodingResult::F64(slice) => {
+                let nd = nodata;
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+            }
         }
-        DecodingResult::U32(slice) => {
-            let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::U64(slice) => {
-            let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::I8(slice) => {
-            let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::I16(slice) => {
-            let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::I32(slice) => {
-            let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::I64(slice) => {
-            let nd = nodata.map(|v| v as i64);
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::F32(slice) => {
-            let nd = nodata.map(|v| v as f32);
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
-        }
-        DecodingResult::F64(slice) => {
-            let nd = nodata;
-            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
+    } else {
+        match decoding_result {
+            DecodingResult::U8(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::U16(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::U32(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::U64(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::I8(slice) => {
+                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::I16(slice) => {
+                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::I32(slice) => {
+                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::I64(slice) => {
+                let nd = nodata.map(|v| v as i64);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::F32(slice) => {
+                let nd = nodata.map(|v| v as f32);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
+            DecodingResult::F64(slice) => {
+                let nd = nodata;
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, chunk_maps);
+            }
         }
     }
     true
@@ -450,6 +683,14 @@ pub struct MultiScanHorizonStreamer {
     chunk_height: u32,
     chunks_across: u32,
     highest_processed_chunk: u32,
+    samples_per_pixel: u16,
+    band: usize,
+    spectral_formula: Option<SpectralFormula>,
+    min_count: Option<f64>,
+    min_mean: Option<f64>,
+    max_mean: Option<f64>,
+    compact: bool,
+    pending_compact: HashMap<u64, (H3Accumulator, Vec<(u64, H3Accumulator)>), FxBuildHasher>,
 }
 
 impl MultiScanHorizonStreamer {
@@ -504,7 +745,7 @@ impl MultiScanHorizonStreamer {
             })
             .collect();
 
-        let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 256);
+        let prefetcher = PrefetchedChunkReader::spawn(reader.clone(), chunk_indices, 256);
         let num_res = resolutions.len();
 
         let mut active_maps = Vec::with_capacity(num_res);
@@ -513,6 +754,15 @@ impl MultiScanHorizonStreamer {
             active_maps.push(HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default()));
             eviction_queues.push(BinaryHeap::with_capacity(1024));
         }
+
+        let samples_per_pixel = reader.metadata.samples_per_pixel;
+        let band = config.band;
+        let spectral_formula = config.spectral_formula;
+        let min_count = config.min_count;
+        let min_mean = config.min_mean;
+        let max_mean = config.max_mean;
+        let compact = config.compact;
+        let pending_compact = HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default());
 
         Ok(Self {
             prefetcher: Some(prefetcher),
@@ -534,6 +784,14 @@ impl MultiScanHorizonStreamer {
             chunk_height,
             chunks_across,
             highest_processed_chunk: 0,
+            samples_per_pixel,
+            band,
+            spectral_formula,
+            min_count,
+            min_mean,
+            max_mean,
+            compact,
+            pending_compact,
         })
     }
 
@@ -552,6 +810,74 @@ impl MultiScanHorizonStreamer {
         &self.resolution_u8s
     }
 
+    fn push_continuous_record(&mut self, res_u8: u8, cell_u64: u64, acc: H3Accumulator) {
+        if let Some(min_c) = self.min_count {
+            if acc.count < min_c {
+                return;
+            }
+        }
+        if let Some(min_m) = self.min_mean {
+            if acc.mean() < min_m {
+                return;
+            }
+        }
+        if let Some(max_m) = self.max_mean {
+            if acc.mean() > max_m {
+                return;
+            }
+        }
+
+        if self.compact {
+            if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                if let Some(parent_res) = cell.resolution().pred() {
+                    if let Some(parent) = cell.parent(parent_res) {
+                        let parent_u64: u64 = parent.into();
+                        let entry = self.pending_compact.entry(parent_u64).or_insert_with(|| {
+                            (H3Accumulator::default(), Vec::with_capacity(7))
+                        });
+                        entry.0.merge(&acc);
+                        entry.1.push((cell_u64, acc));
+
+                        if entry.1.len() == 7 {
+                            let (parent_acc, _) = self.pending_compact.remove(&parent_u64).unwrap();
+                            let p_res_u8: u8 = parent_res.into();
+                            self.completed_buffer.push_back(MultiContinuousRecord {
+                                resolution: p_res_u8,
+                                h3_index: parent_u64,
+                                accumulator: parent_acc,
+                            });
+                            return;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.completed_buffer.push_back(MultiContinuousRecord {
+            resolution: res_u8,
+            h3_index: cell_u64,
+            accumulator: acc,
+        });
+    }
+
+    fn flush_pending_compact(&mut self) {
+        for (_, (_, children)) in self.pending_compact.drain() {
+            for (cell_u64, acc) in children {
+                let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                    cell.resolution().into()
+                } else {
+                    8
+                };
+                self.completed_buffer.push_back(MultiContinuousRecord {
+                    resolution: res_u8,
+                    h3_index: cell_u64,
+                    accumulator: acc,
+                });
+            }
+        }
+    }
+
     /// Evict completed cells across all resolutions that lie north of the given latitude horizon
     fn evict_completed(&mut self, lat_horizon: f64) {
         let num_res = self.resolutions.len();
@@ -561,14 +887,36 @@ impl MultiScanHorizonStreamer {
                 if top.south_lat > lat_horizon {
                     let entry = self.eviction_queues[res_idx].pop().unwrap();
                     if let Some(acc) = self.active_maps[res_idx].remove(&entry.cell_u64) {
-                        self.completed_buffer.push_back(MultiContinuousRecord {
-                            resolution: res_u8,
-                            h3_index: entry.cell_u64,
-                            accumulator: acc,
-                        });
+                        self.push_continuous_record(res_u8, entry.cell_u64, acc);
                     }
                 } else {
                     break;
+                }
+            }
+        }
+
+        if self.compact && !self.pending_compact.is_empty() {
+            let mut to_flush = Vec::new();
+            for (&parent_u64, _) in self.pending_compact.iter() {
+                let parent_south = compute_cell_south_lat(parent_u64);
+                if parent_south > lat_horizon {
+                    to_flush.push(parent_u64);
+                }
+            }
+            for p in to_flush {
+                if let Some((_, children)) = self.pending_compact.remove(&p) {
+                    for (cell_u64, acc) in children {
+                        let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                            cell.resolution().into()
+                        } else {
+                            8
+                        };
+                        self.completed_buffer.push_back(MultiContinuousRecord {
+                            resolution: res_u8,
+                            h3_index: cell_u64,
+                            accumulator: acc,
+                        });
+                    }
                 }
             }
         }
@@ -596,21 +944,15 @@ impl MultiScanHorizonStreamer {
                     let res_u8 = self.resolution_u8s[res_idx];
                     while let Some(entry) = self.eviction_queues[res_idx].pop() {
                         if let Some(acc) = self.active_maps[res_idx].remove(&entry.cell_u64) {
-                            self.completed_buffer.push_back(MultiContinuousRecord {
-                                resolution: res_u8,
-                                h3_index: entry.cell_u64,
-                                accumulator: acc,
-                            });
+                            self.push_continuous_record(res_u8, entry.cell_u64, acc);
                         }
                     }
-                    for (cell_u64, acc) in self.active_maps[res_idx].drain() {
-                        self.completed_buffer.push_back(MultiContinuousRecord {
-                            resolution: res_u8,
-                            h3_index: cell_u64,
-                            accumulator: acc,
-                        });
+                    let remaining: Vec<(u64, H3Accumulator)> = self.active_maps[res_idx].drain().collect();
+                    for (cell_u64, acc) in remaining {
+                        self.push_continuous_record(res_u8, cell_u64, acc);
                     }
                 }
+                self.flush_pending_compact();
                 eprintln!(
                     "FETCH SUB-TIMINGS: prefetch_wait={:.3}s, rayon_compute={:.3}s, merge={:.3}s, evict={:.3}s",
                     self.profile_stats[0] as f64 / 1e9,
@@ -628,6 +970,9 @@ impl MultiScanHorizonStreamer {
             let bbox = self.bbox;
             let chunk_stride = self.chunk_stride;
             let nodata = self.nodata;
+            let samples_per_pixel = self.samples_per_pixel;
+            let band = self.band;
+            let spectral_formula = self.spectral_formula;
 
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
@@ -657,6 +1002,9 @@ impl MultiScanHorizonStreamer {
                                     bbox,
                                     chunk_stride,
                                     nodata,
+                                    samples_per_pixel,
+                                    band,
+                                    spectral_formula,
                                     local_maps,
                                 );
                                 let mut chunk_entries = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
@@ -1079,6 +1427,78 @@ fn process_categorical_slice_into_maps<T, F, N>(
     }
 }
 
+/// Process a multi-sample categorical slice into thread-local hash maps for a specific band
+fn process_categorical_multisample_slice_into_maps<T, F>(
+    slice: &[T],
+    chunk: &RasterChunk,
+    to_class_fn: F,
+    native_nodata: Option<T>,
+    resolutions: &[Resolution],
+    crs_transformer: &CrsTransformer,
+    gt: &GeoTransform,
+    sampling: &SamplingPattern,
+    bbox: Option<[f64; 4]>,
+    chunk_stride: u32,
+    samples_per_pixel: usize,
+    band: usize,
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
+)
+where
+    T: Copy + PartialEq,
+    F: Fn(T) -> Option<i64>,
+{
+    let row_width = chunk.width as usize;
+    let spp = samples_per_pixel.max(1);
+    let b_idx = (band.saturating_sub(1)).min(spp - 1);
+    let num_res = resolutions.len();
+
+    for row_idx in 0..chunk.height as usize {
+        let slice_row_start = (row_idx * (chunk_stride as usize)) * spp;
+
+        for c in 0..row_width {
+            let raw = slice[slice_row_start + c * spp + b_idx];
+            if let Some(nd) = native_nodata {
+                if raw == nd {
+                    continue;
+                }
+            }
+
+            let cat = match to_class_fn(raw) {
+                Some(cls) => cls,
+                None => continue,
+            };
+
+            for sp in &sampling.points {
+                let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
+                let py = (chunk.row_offset as f64) + (row_idx as f64) + sp.dy;
+                let (x, y) = gt.pixel_to_coord(px, py);
+                if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
+                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                            continue;
+                        }
+                    }
+
+                    if let Ok(ll) = LatLng::new(lat, lon) {
+                        for res_idx in 0..num_res {
+                            let res = resolutions[res_idx];
+                            let cell: u64 = ll.to_cell(res).into();
+                            chunk_maps[res_idx]
+                                .entry(cell)
+                                .and_modify(|acc| acc.update_weighted(cat, sp.weight))
+                                .or_insert_with(|| {
+                                    let mut a = CategoricalAccumulator::default();
+                                    a.update_weighted(cat, sp.weight);
+                                    a
+                                });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Process a categorical chunk across all resolutions into thread-local hash maps
 fn process_categorical_chunk_payload_into(
     chunk_bounds: &RasterChunk,
@@ -1090,65 +1510,115 @@ fn process_categorical_chunk_payload_into(
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
     nodata: Option<f64>,
+    samples_per_pixel: u16,
+    band: usize,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) -> bool {
-    let is_all_nodata = match decoding_result {
-        DecodingResult::U8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::U16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::U32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::U64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::I64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::F32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-        DecodingResult::F64(slice) => is_chunk_all_nodata(slice, nodata, |x| x),
-    };
+    let is_multisample = samples_per_pixel > 1 && band > 1;
+    let spp = samples_per_pixel.max(1) as usize;
 
-    if is_all_nodata {
-        return false;
-    }
+    if !is_multisample {
+        let is_all_nodata = match decoding_result {
+            DecodingResult::U8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::U16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::U32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::U64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::I64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::F32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
+            DecodingResult::F64(slice) => is_chunk_all_nodata(slice, nodata, |x| x),
+        };
 
-    match decoding_result {
-        DecodingResult::U8(slice) => {
-            let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+        if is_all_nodata {
+            return false;
         }
-        DecodingResult::U16(slice) => {
-            let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+
+        match decoding_result {
+            DecodingResult::U8(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::U16(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::U32(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::U64(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::I8(slice) => {
+                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::I16(slice) => {
+                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::I32(slice) => {
+                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::I64(slice) => {
+                let nd = nodata.map(|v| v as i64);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::F32(slice) => {
+                let nd = nodata.map(|v| v as f32);
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
+            DecodingResult::F64(slice) => {
+                let nd = nodata;
+                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            }
         }
-        DecodingResult::U32(slice) => {
-            let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::U64(slice) => {
-            let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::I8(slice) => {
-            let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::I16(slice) => {
-            let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::I32(slice) => {
-            let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::I64(slice) => {
-            let nd = nodata.map(|v| v as i64);
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::F32(slice) => {
-            let nd = nodata.map(|v| v as f32);
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
-        }
-        DecodingResult::F64(slice) => {
-            let nd = nodata;
-            process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+    } else {
+        match decoding_result {
+            DecodingResult::U8(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::U16(slice) => {
+                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::U32(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::U64(slice) => {
+                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::I8(slice) => {
+                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::I16(slice) => {
+                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::I32(slice) => {
+                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::I64(slice) => {
+                let nd = nodata.map(|v| v as i64);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::F32(slice) => {
+                let nd = nodata.map(|v| v as f32);
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
+            DecodingResult::F64(slice) => {
+                let nd = nodata;
+                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, chunk_maps);
+            }
         }
     }
     true
@@ -1175,6 +1645,12 @@ pub struct MultiCategoricalHorizonStreamer {
     chunk_height: u32,
     chunks_across: u32,
     highest_processed_chunk: u32,
+    samples_per_pixel: u16,
+    band: usize,
+    min_count: Option<f64>,
+    min_majority_fraction: Option<f64>,
+    compact: bool,
+    pending_compact: HashMap<u64, (CategoricalAccumulator, Vec<(u64, CategoricalAccumulator)>), FxBuildHasher>,
 }
 
 impl MultiCategoricalHorizonStreamer {
@@ -1229,6 +1705,13 @@ impl MultiCategoricalHorizonStreamer {
             })
             .collect();
 
+        let samples_per_pixel = reader.metadata.samples_per_pixel;
+        let band = config.band;
+        let min_count = config.min_count;
+        let min_majority_fraction = config.min_majority_fraction;
+        let compact = config.compact;
+        let pending_compact = HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default());
+
         let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 256);
         let num_res = resolutions.len();
 
@@ -1259,6 +1742,12 @@ impl MultiCategoricalHorizonStreamer {
             chunk_height,
             chunks_across,
             highest_processed_chunk: 0,
+            samples_per_pixel,
+            band,
+            min_count,
+            min_majority_fraction,
+            compact,
+            pending_compact,
         })
     }
 
@@ -1277,6 +1766,70 @@ impl MultiCategoricalHorizonStreamer {
         &self.resolution_u8s
     }
 
+    fn push_categorical_record(&mut self, res_u8: u8, cell_u64: u64, acc: CategoricalAccumulator) {
+        if let Some(min_c) = self.min_count {
+            if acc.total_count < min_c {
+                return;
+            }
+        }
+        if let Some(min_frac) = self.min_majority_fraction {
+            let (_, _, frac) = acc.majority();
+            if frac < min_frac {
+                return;
+            }
+        }
+
+        if self.compact {
+            if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                if let Some(parent_res) = cell.resolution().pred() {
+                    if let Some(parent) = cell.parent(parent_res) {
+                        let parent_u64: u64 = parent.into();
+                        let entry = self.pending_compact.entry(parent_u64).or_insert_with(|| {
+                            (CategoricalAccumulator::default(), Vec::with_capacity(7))
+                        });
+                        entry.0.merge(&acc);
+                        entry.1.push((cell_u64, acc));
+
+                        if entry.1.len() == 7 {
+                            let (parent_acc, _) = self.pending_compact.remove(&parent_u64).unwrap();
+                            let p_res_u8: u8 = parent_res.into();
+                            self.completed_buffer.push_back(MultiCategoricalRecord {
+                                resolution: p_res_u8,
+                                h3_index: parent_u64,
+                                accumulator: parent_acc,
+                            });
+                            return;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.completed_buffer.push_back(MultiCategoricalRecord {
+            resolution: res_u8,
+            h3_index: cell_u64,
+            accumulator: acc,
+        });
+    }
+
+    fn flush_pending_compact(&mut self) {
+        for (_, (_, children)) in self.pending_compact.drain() {
+            for (cell_u64, acc) in children {
+                let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                    cell.resolution().into()
+                } else {
+                    8
+                };
+                self.completed_buffer.push_back(MultiCategoricalRecord {
+                    resolution: res_u8,
+                    h3_index: cell_u64,
+                    accumulator: acc,
+                });
+            }
+        }
+    }
+
     /// Evict completed cells across all resolutions that lie north of the given latitude horizon
     fn evict_completed(&mut self, lat_horizon: f64) {
         let num_res = self.resolutions.len();
@@ -1286,14 +1839,36 @@ impl MultiCategoricalHorizonStreamer {
                 if top.south_lat > lat_horizon {
                     let entry = self.eviction_queues[res_idx].pop().unwrap();
                     if let Some(acc) = self.active_maps[res_idx].remove(&entry.cell_u64) {
-                        self.completed_buffer.push_back(MultiCategoricalRecord {
-                            resolution: res_u8,
-                            h3_index: entry.cell_u64,
-                            accumulator: acc,
-                        });
+                        self.push_categorical_record(res_u8, entry.cell_u64, acc);
                     }
                 } else {
                     break;
+                }
+            }
+        }
+
+        if self.compact && !self.pending_compact.is_empty() {
+            let mut to_flush = Vec::new();
+            for (&parent_u64, _) in self.pending_compact.iter() {
+                let parent_south = compute_cell_south_lat(parent_u64);
+                if parent_south > lat_horizon {
+                    to_flush.push(parent_u64);
+                }
+            }
+            for p in to_flush {
+                if let Some((_, children)) = self.pending_compact.remove(&p) {
+                    for (cell_u64, acc) in children {
+                        let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                            cell.resolution().into()
+                        } else {
+                            8
+                        };
+                        self.completed_buffer.push_back(MultiCategoricalRecord {
+                            resolution: res_u8,
+                            h3_index: cell_u64,
+                            accumulator: acc,
+                        });
+                    }
                 }
             }
         }
@@ -1321,21 +1896,15 @@ impl MultiCategoricalHorizonStreamer {
                     let res_u8 = self.resolution_u8s[res_idx];
                     while let Some(entry) = self.eviction_queues[res_idx].pop() {
                         if let Some(acc) = self.active_maps[res_idx].remove(&entry.cell_u64) {
-                            self.completed_buffer.push_back(MultiCategoricalRecord {
-                                resolution: res_u8,
-                                h3_index: entry.cell_u64,
-                                accumulator: acc,
-                            });
+                            self.push_categorical_record(res_u8, entry.cell_u64, acc);
                         }
                     }
-                    for (cell_u64, acc) in self.active_maps[res_idx].drain() {
-                        self.completed_buffer.push_back(MultiCategoricalRecord {
-                            resolution: res_u8,
-                            h3_index: cell_u64,
-                            accumulator: acc,
-                        });
+                    let remaining: Vec<(u64, CategoricalAccumulator)> = self.active_maps[res_idx].drain().collect();
+                    for (cell_u64, acc) in remaining {
+                        self.push_categorical_record(res_u8, cell_u64, acc);
                     }
                 }
+                self.flush_pending_compact();
                 eprintln!(
                     "FETCH SUB-TIMINGS: prefetch_wait={:.3}s, rayon_compute={:.3}s, merge={:.3}s, evict={:.3}s",
                     self.profile_stats[0] as f64 / 1e9,
@@ -1353,6 +1922,8 @@ impl MultiCategoricalHorizonStreamer {
             let bbox = self.bbox;
             let chunk_stride = self.chunk_stride;
             let nodata = self.nodata;
+            let samples_per_pixel = self.samples_per_pixel;
+            let band = self.band;
 
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
@@ -1382,6 +1953,8 @@ impl MultiCategoricalHorizonStreamer {
                                     bbox,
                                     chunk_stride,
                                     nodata,
+                                    samples_per_pixel,
+                                    band,
                                     local_maps,
                                 );
                                 let mut chunk_entries = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });

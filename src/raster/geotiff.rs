@@ -19,6 +19,7 @@ pub struct GeoTiffMetadata {
     pub nodata: Option<f64>,
     pub epsg: Option<u32>,
     pub proj_string: Option<String>,
+    pub samples_per_pixel: u16,
 }
 
 /// Chunk layout information (tiled vs striped)
@@ -94,6 +95,7 @@ pub struct ChunkDecoder<'a> {
     chunk_layout: ChunkLayout,
     width: u32,
     height: u32,
+    samples_per_pixel: u16,
 }
 
 impl<'a> ChunkDecoder<'a> {
@@ -122,7 +124,8 @@ impl<'a> ChunkDecoder<'a> {
         );
 
         let data_dims = self.decoder.chunk_data_dimensions(chunk_index);
-        let required_len = (data_dims.0 as usize) * (data_dims.1 as usize);
+        let spp = self.samples_per_pixel.max(1) as usize;
+        let required_len = (data_dims.0 as usize) * (data_dims.1 as usize) * spp;
 
         let decoded_ok = match &mut buffer {
             DecodingResult::U8(ref mut v) => {
@@ -253,6 +256,11 @@ impl GeoTiffStreamReader {
         let geotransform = Self::extract_geotransform(&mut decoder)?;
         let nodata = Self::extract_nodata(&mut decoder);
         let (epsg, proj_string) = Self::extract_crs(&mut decoder);
+        let samples_per_pixel = decoder
+            .get_tag_u32(Tag::SamplesPerPixel)
+            .or_else(|_| decoder.get_tag_u32(Tag::Unknown(277)))
+            .map(|v| v as u16)
+            .unwrap_or(1);
 
         let (chunk_w, chunk_h) = decoder.chunk_dimensions();
         let chunks_across = (width + chunk_w - 1) / chunk_w;
@@ -274,6 +282,7 @@ impl GeoTiffStreamReader {
             nodata,
             epsg,
             proj_string,
+            samples_per_pixel,
         };
 
         Ok(Self {
@@ -295,6 +304,7 @@ impl GeoTiffStreamReader {
             chunk_layout: self.chunk_layout,
             width: self.metadata.width,
             height: self.metadata.height,
+            samples_per_pixel: self.metadata.samples_per_pixel,
         })
     }
 
