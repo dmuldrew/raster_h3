@@ -1,10 +1,12 @@
 pub mod geotiff;
 pub mod geotransform;
+pub mod http_range;
 pub mod mosaic;
 pub mod prefetch;
 
-pub use geotiff::{ChunkDecoder, ChunkLayout, GeoTiffMetadata, GeoTiffStreamReader};
+pub use geotiff::{ChunkDecoder, ChunkLayout, GeoTiffMetadata, GeoTiffStreamReader, RasterSource};
 pub use geotransform::GeoTransform;
+pub use http_range::{is_remote_url, normalize_url, HttpRangeReader, RemoteHttpSource};
 pub use mosaic::{glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor};
 pub use prefetch::{MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader};
 

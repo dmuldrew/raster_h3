@@ -8,6 +8,7 @@ use tiff::tags::Tag;
 
 use crate::error::Result;
 use crate::raster::geotransform::GeoTransform;
+use crate::raster::http_range::{is_remote_url, HttpRangeReader, RemoteHttpSource};
 use crate::raster::RasterChunk;
 
 /// Parsed GeoTIFF metadata
@@ -78,20 +79,64 @@ impl ChunkLayout {
     }
 }
 
-/// Zero-copy memory-mapped GeoTIFF reader that decodes chunks on-demand
+/// Backing storage for a GeoTIFF: local memory-mapped file or remote HTTP/S3 stream
+#[derive(Clone)]
+pub enum RasterSource {
+    Local(Arc<Mmap>),
+    Remote(Arc<RemoteHttpSource>),
+}
+
+/// Zero-copy memory-mapped or remote streaming GeoTIFF reader that decodes chunks on-demand
 #[derive(Clone)]
 pub struct GeoTiffStreamReader {
     pub file_path: PathBuf,
-    pub mmap: Arc<Mmap>,
+    pub source: RasterSource,
     pub metadata: GeoTiffMetadata,
     pub chunk_layout: ChunkLayout,
+}
+
+/// Internal decoder variant: Cursor over memory-mapped slice or streaming HttpRangeReader
+pub enum InnerDecoder<'a> {
+    Local(Decoder<Cursor<&'a [u8]>>),
+    Remote(Decoder<HttpRangeReader>),
+}
+
+impl<'a> InnerDecoder<'a> {
+    #[inline]
+    fn chunk_data_dimensions(&mut self, chunk: u32) -> (u32, u32) {
+        match self {
+            InnerDecoder::Local(d) => d.chunk_data_dimensions(chunk),
+            InnerDecoder::Remote(d) => d.chunk_data_dimensions(chunk),
+        }
+    }
+
+    #[inline]
+    fn read_chunk(&mut self, chunk: u32) -> Result<DecodingResult> {
+        match self {
+            InnerDecoder::Local(d) => Ok(d.read_chunk(chunk)?),
+            InnerDecoder::Remote(d) => Ok(d.read_chunk(chunk)?),
+        }
+    }
+
+    #[inline]
+    fn read_chunk_to_buffer(
+        &mut self,
+        buffer: DecodingBuffer<'_>,
+        chunk: u32,
+        width: usize,
+    ) -> tiff::TiffResult<()> {
+        match self {
+            InnerDecoder::Local(d) => d.read_chunk_to_buffer(buffer, chunk, width),
+            InnerDecoder::Remote(d) => d.read_chunk_to_buffer(buffer, chunk, width),
+        }
+    }
 }
 
 /// Persistent chunk decoder that reuses the TIFF decoder across reads.
 /// This avoids re-parsing IFD headers, tag tables, and strip/tile offset
 /// arrays on every chunk read — the single largest I/O optimization.
 pub struct ChunkDecoder<'a> {
-    decoder: Decoder<Cursor<&'a [u8]>>,
+    inner: InnerDecoder<'a>,
     chunk_layout: ChunkLayout,
     width: u32,
     height: u32,
@@ -107,7 +152,7 @@ impl<'a> ChunkDecoder<'a> {
             self.height,
         );
 
-        let data = self.decoder.read_chunk(chunk_index)?;
+        let data = self.inner.read_chunk(chunk_index)?;
         Ok((chunk_bounds, data))
     }
 
@@ -123,7 +168,7 @@ impl<'a> ChunkDecoder<'a> {
             self.height,
         );
 
-        let data_dims = self.decoder.chunk_data_dimensions(chunk_index);
+        let data_dims = self.inner.chunk_data_dimensions(chunk_index);
         let spp = self.samples_per_pixel.max(1) as usize;
         let required_len = (data_dims.0 as usize) * (data_dims.1 as usize) * spp;
 
@@ -131,7 +176,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::U8(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::U8(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -141,7 +186,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::U16(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::U16(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -151,7 +196,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::U32(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::U32(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -161,7 +206,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::U64(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::U64(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -171,7 +216,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::I8(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::I8(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -181,7 +226,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::I16(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::I16(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -191,7 +236,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::I32(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::I32(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -201,7 +246,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::I64(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::I64(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -211,7 +256,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::F32(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0.0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::F32(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -221,7 +266,7 @@ impl<'a> ChunkDecoder<'a> {
             DecodingResult::F64(ref mut v) => {
                 if v.capacity() >= required_len {
                     v.resize(required_len, 0.0);
-                    self.decoder
+                    self.inner
                         .read_chunk_to_buffer(DecodingBuffer::F64(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
                         .is_ok()
                 } else {
@@ -233,29 +278,29 @@ impl<'a> ChunkDecoder<'a> {
         if decoded_ok {
             Ok((chunk_bounds, buffer))
         } else {
-            let data = self.decoder.read_chunk(chunk_index)?;
+            let data = self.inner.read_chunk(chunk_index)?;
             Ok((chunk_bounds, data))
         }
     }
 }
 
 impl GeoTiffStreamReader {
-    /// Open and memory-map a GeoTIFF file, decoding only header tags and layout metadata
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path_buf = path.as_ref().to_path_buf();
-        let file = File::open(&path_buf)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::Sequential);
-        let mmap_arc = Arc::new(mmap);
+    /// Backward-compatible accessor for memory-mapped buffer if the source is local
+    pub fn mmap(&self) -> Option<&Arc<Mmap>> {
+        match &self.source {
+            RasterSource::Local(mmap) => Some(mmap),
+            RasterSource::Remote(_) => None,
+        }
+    }
 
-        let cursor = Cursor::new(&mmap_arc[..]);
-        let mut decoder = Decoder::new(cursor)?;
-
+    /// Extract common GeoTIFF metadata and chunk layout from an initialized Decoder
+    fn parse_metadata_and_layout<R: std::io::Read + Seek>(
+        decoder: &mut Decoder<R>,
+    ) -> Result<(GeoTiffMetadata, ChunkLayout)> {
         let (width, height) = decoder.dimensions()?;
-        let geotransform = Self::extract_geotransform(&mut decoder)?;
-        let nodata = Self::extract_nodata(&mut decoder);
-        let (epsg, proj_string) = Self::extract_crs(&mut decoder);
+        let geotransform = Self::extract_geotransform(decoder)?;
+        let nodata = Self::extract_nodata(decoder);
+        let (epsg, proj_string) = Self::extract_crs(decoder);
         let samples_per_pixel = decoder
             .get_tag_u32(Tag::SamplesPerPixel)
             .or_else(|_| decoder.get_tag_u32(Tag::Unknown(277)))
@@ -285,9 +330,41 @@ impl GeoTiffStreamReader {
             samples_per_pixel,
         };
 
+        Ok((metadata, chunk_layout))
+    }
+
+    /// Open and decode metadata for a local file (via mmap) or a remote URL (via HTTP Range)
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
+        let path_str = path_buf.to_string_lossy();
+
+        if is_remote_url(&path_str) {
+            let remote = Arc::new(RemoteHttpSource::open(&path_str)?);
+            let reader = HttpRangeReader::new(Arc::clone(&remote));
+            let mut decoder = Decoder::new(reader)?;
+            let (metadata, chunk_layout) = Self::parse_metadata_and_layout(&mut decoder)?;
+
+            return Ok(Self {
+                file_path: path_buf,
+                source: RasterSource::Remote(remote),
+                metadata,
+                chunk_layout,
+            });
+        }
+
+        let file = File::open(&path_buf)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let mmap_arc = Arc::new(mmap);
+
+        let cursor = Cursor::new(&mmap_arc[..]);
+        let mut decoder = Decoder::new(cursor)?;
+        let (metadata, chunk_layout) = Self::parse_metadata_and_layout(&mut decoder)?;
+
         Ok(Self {
             file_path: path_buf,
-            mmap: mmap_arc,
+            source: RasterSource::Local(mmap_arc),
             metadata,
             chunk_layout,
         })
@@ -296,11 +373,21 @@ impl GeoTiffStreamReader {
     /// Create a persistent ChunkDecoder that reuses the TIFF decoder for multiple chunk reads.
     /// The decoder parses the IFD once and then seeks directly to tile data on each read_chunk call.
     pub fn open_decoder(&self) -> Result<ChunkDecoder<'_>> {
-        let cursor = Cursor::new(&self.mmap[..]);
-        let decoder = Decoder::new(cursor)?;
+        let inner = match &self.source {
+            RasterSource::Local(mmap) => {
+                let cursor = Cursor::new(&mmap[..]);
+                let decoder = Decoder::new(cursor)?;
+                InnerDecoder::Local(decoder)
+            }
+            RasterSource::Remote(remote) => {
+                let reader = HttpRangeReader::new(Arc::clone(remote));
+                let decoder = Decoder::new(reader)?;
+                InnerDecoder::Remote(decoder)
+            }
+        };
 
         Ok(ChunkDecoder {
-            decoder,
+            inner,
             chunk_layout: self.chunk_layout,
             width: self.metadata.width,
             height: self.metadata.height,
@@ -308,20 +395,11 @@ impl GeoTiffStreamReader {
         })
     }
 
-    /// Read and decode a single chunk on-demand directly from memory-mapped pages.
+    /// Read and decode a single chunk on-demand directly from memory-mapped pages or remote stream.
     /// NOTE: This creates a fresh decoder per call. For sequential reads, prefer open_decoder().
     pub fn read_chunk(&self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
-        let cursor = Cursor::new(&self.mmap[..]);
-        let mut decoder = Decoder::new(cursor)?;
-
-        let chunk_bounds = self.chunk_layout.get_chunk_bounds(
-            chunk_index,
-            self.metadata.width,
-            self.metadata.height,
-        );
-
-        let data = decoder.read_chunk(chunk_index)?;
-        Ok((chunk_bounds, data))
+        let mut decoder = self.open_decoder()?;
+        decoder.read_chunk(chunk_index)
     }
 
     /// Extract affine geotransform from tags

@@ -10,6 +10,7 @@ use crate::aggregator::horizon_streamer::chunk_intersects_bbox;
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
+use crate::raster::http_range::is_remote_url;
 
 /// Overlap resolution strategy for overlapping tiles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,13 +98,17 @@ fn parse_vrt_sources(vrt_path: &Path) -> Result<Vec<PathBuf>> {
             let content_start = tag_start + tag_close + 1;
             if let Some(end_tag) = content[content_start..].find("</SourceFilename>") {
                 let filename_raw = content[content_start..content_start + end_tag].trim();
-                let full_path = parent_dir.join(filename_raw);
-                if full_path.exists() {
-                    sources.push(full_path);
-                } else if Path::new(filename_raw).exists() {
+                if is_remote_url(filename_raw) {
                     sources.push(PathBuf::from(filename_raw));
                 } else {
-                    sources.push(full_path);
+                    let full_path = parent_dir.join(filename_raw);
+                    if full_path.exists() {
+                        sources.push(full_path);
+                    } else if Path::new(filename_raw).exists() {
+                        sources.push(PathBuf::from(filename_raw));
+                    } else {
+                        sources.push(full_path);
+                    }
                 }
                 start_pos = content_start + end_tag + 17;
                 continue;
@@ -122,7 +127,7 @@ fn parse_vrt_sources(vrt_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(sources)
 }
 
-/// Resolve input string to a sorted list of GeoTIFF file paths
+/// Resolve input string to a sorted list of GeoTIFF file paths or remote URLs
 pub fn resolve_raster_sources(input: &str) -> Result<Vec<PathBuf>> {
     let trimmed = input.trim();
 
@@ -132,25 +137,34 @@ pub fn resolve_raster_sources(input: &str) -> Result<Vec<PathBuf>> {
         return parse_vrt_sources(path);
     }
 
-    // 2. Check for comma-separated list
+    // 2. Check for comma-separated list (can contain local paths or remote URLs)
     if trimmed.contains(',') {
         let mut paths = Vec::new();
         for part in trimmed.split(',') {
             let p_str = part.trim();
             if !p_str.is_empty() {
-                let p = PathBuf::from(p_str);
-                if !p.exists() {
-                    return Err(RasterH3Error::InvalidParameter(format!(
-                        "Source file does not exist: {:?}",
-                        p
-                    )));
+                if is_remote_url(p_str) {
+                    paths.push(PathBuf::from(p_str));
+                } else {
+                    let p = PathBuf::from(p_str);
+                    if !p.exists() {
+                        return Err(RasterH3Error::InvalidParameter(format!(
+                            "Source file does not exist: {:?}",
+                            p
+                        )));
+                    }
+                    paths.push(p);
                 }
-                paths.push(p);
             }
         }
         if !paths.is_empty() {
             return Ok(paths);
         }
+    }
+
+    // 3. Check for single remote URL (http://, https://, s3://)
+    if is_remote_url(trimmed) {
+        return Ok(vec![PathBuf::from(trimmed)]);
     }
 
     // 3. Check for glob wildcard pattern (* or ?)
