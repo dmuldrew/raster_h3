@@ -1,14 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+use crate::aggregator::quantiles::QuantileSketch;
+
 /// High-performance pixel accumulator for H3 cell statistics with single-pass Welford online variance
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// and optional streaming non-parametric quantile estimation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct H3Accumulator {
     pub sum: f64,
     pub count: f64,
     pub min: f64,
     pub max: f64,
     pub m2: f64, // Sum of squared deviations from mean (Welford's algorithm)
+    #[serde(skip)]
+    pub quantiles: Option<Box<QuantileSketch>>,
 }
 
 impl Default for H3Accumulator {
@@ -20,6 +24,7 @@ impl Default for H3Accumulator {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             m2: 0.0,
+            quantiles: None,
         }
     }
 }
@@ -34,6 +39,7 @@ impl H3Accumulator {
             min: val,
             max: val,
             m2: 0.0,
+            quantiles: None,
         }
     }
 
@@ -46,12 +52,56 @@ impl H3Accumulator {
             min: val,
             max: val,
             m2: 0.0,
+            quantiles: None,
+        }
+    }
+
+    /// Initialize with raw stats without quantiles
+    #[inline(always)]
+    pub fn from_stats(sum: f64, count: f64, min: f64, max: f64, m2: f64) -> Self {
+        Self {
+            sum,
+            count,
+            min,
+            max,
+            m2,
+            quantiles: None,
+        }
+    }
+
+    /// Initialize with streaming quantile tracking enabled
+    #[inline]
+    pub fn with_quantiles() -> Self {
+        Self {
+            sum: 0.0,
+            count: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            m2: 0.0,
+            quantiles: Some(Box::new(QuantileSketch::new())),
+        }
+    }
+
+    /// Reset statistics and clear quantile sketch while retaining capacity
+    #[inline]
+    pub fn clear(&mut self) {
+        self.sum = 0.0;
+        self.count = 0.0;
+        self.min = f64::INFINITY;
+        self.max = f64::NEG_INFINITY;
+        self.m2 = 0.0;
+        if let Some(ref mut q) = self.quantiles {
+            q.clear();
         }
     }
 
     /// Update running statistics with a full pixel (weight = 1.0)
     #[inline(always)]
     pub fn update(&mut self, val: f64) {
+        if let Some(ref mut q) = self.quantiles {
+            q.update(val, 1.0);
+        }
+
         if self.count == 0.0 {
             self.sum = val;
             self.count = 1.0;
@@ -76,6 +126,10 @@ impl H3Accumulator {
         if weight <= 0.0 {
             return;
         }
+        if let Some(ref mut q) = self.quantiles {
+            q.update(val, weight);
+        }
+
         if self.count == 0.0 {
             self.sum = val * weight;
             self.count = weight;
@@ -100,6 +154,13 @@ impl H3Accumulator {
         if vals.is_empty() {
             return;
         }
+        if let Some(ref mut q) = self.quantiles {
+            for &v in vals {
+                if v.is_finite() {
+                    q.update(v, 1.0);
+                }
+            }
+        }
         let mut sum = 0.0;
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
@@ -123,7 +184,7 @@ impl H3Accumulator {
                 m2 += d * d;
             }
         }
-        let chunk_acc = Self { sum, count, min, max, m2 };
+        let chunk_acc = Self { sum, count, min, max, m2, quantiles: None };
         self.merge(&chunk_acc);
     }
 
@@ -134,7 +195,18 @@ impl H3Accumulator {
             return;
         }
         if self.count == 0.0 {
-            *self = *other;
+            self.sum = other.sum;
+            self.count = other.count;
+            self.min = other.min;
+            self.max = other.max;
+            self.m2 = other.m2;
+            if let Some(ref q_other) = other.quantiles {
+                if let Some(ref mut q_self) = self.quantiles {
+                    q_self.merge(q_other);
+                } else {
+                    self.quantiles = Some(q_other.clone());
+                }
+            }
             return;
         }
 
@@ -149,6 +221,12 @@ impl H3Accumulator {
         self.m2 += other.m2 + delta * delta * (n1 * n2 / (n1 + n2));
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
+
+        if let (Some(ref mut q_self), Some(ref q_other)) = (&mut self.quantiles, &other.quantiles) {
+            q_self.merge(q_other);
+        } else if self.quantiles.is_none() && other.quantiles.is_some() {
+            self.quantiles = other.quantiles.clone();
+        }
     }
 
     /// Calculate arithmetic mean
@@ -183,13 +261,34 @@ impl H3Accumulator {
             var.max(0.0).sqrt()
         }
     }
+
+    /// Calculate estimated quantile q in [0.0, 1.0]
+    #[inline]
+    pub fn quantile(&self, q: f64) -> f64 {
+        if let Some(ref sketch) = self.quantiles {
+            sketch.quantile(q, self.min, self.max)
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Calculate interquartile range (p75 - p25)
+    #[inline]
+    pub fn iqr(&self) -> f64 {
+        if let Some(ref sketch) = self.quantiles {
+            let p75 = sketch.quantile(0.75, self.min, self.max);
+            let p25 = sketch.quantile(0.25, self.min, self.max);
+            (p75 - p25).max(0.0)
+        } else {
+            f64::NAN
+        }
+    }
 }
 
 /// A highly optimized accumulator for tracking short, contiguous runs of pixels
 /// without the overhead of Welford's algorithm divisions per pixel.
 /// Automatically vectorizes nicely for SIMD architectures.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FastRunAccumulator {
     pub sum: f64,
     pub sum_sq: f64,
@@ -226,6 +325,7 @@ impl FastRunAccumulator {
             min: self.min,
             max: self.max,
             m2: m2.max(0.0),
+            quantiles: None,
         }
     }
 }

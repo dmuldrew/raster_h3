@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::multi_horizon::{MultiContinuousRecord, MultiScanHorizonStreamer, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
+use crate::aggregator::multi_horizon::{MultiScanHorizonStreamer, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
 use crate::pmtiles::mvt::{
     FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter,
     PROP_CAT_COUNT, PROP_CAT_DISTINCT_CLASSES, PROP_CAT_ENTROPY, PROP_CAT_H3_HEX,
@@ -658,11 +658,9 @@ impl H3PmtilesTiler {
             let prepared_batch: Vec<PreparedContinuousHex> = batch
                 .par_iter()
                 .filter_map(|record| {
-                    let MultiContinuousRecord {
-                        resolution,
-                        h3_index,
-                        accumulator,
-                    } = *record;
+                    let resolution = record.resolution;
+                    let h3_index = record.h3_index;
+                    let accumulator = &record.accumulator;
 
                     let cell = CellIndex::try_from(h3_index).ok()?;
                     let center: LatLng = cell.into();
@@ -795,7 +793,7 @@ impl H3PmtilesTiler {
 
                     Some(PreparedContinuousHex {
                         resolution,
-                        accumulator,
+                        accumulator: accumulator.clone(),
                         c_lat,
                         c_lon,
                         ops,

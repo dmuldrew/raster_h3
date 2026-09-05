@@ -124,13 +124,7 @@ fn accumulate_span_f32_no_nodata(slice: &[f32]) -> H3Accumulator {
 
     // Fast-path: uniform span (e.g. flat water or uniform elevation) has zero variance
     if total_min == total_max {
-        return H3Accumulator {
-            sum: total_sum,
-            count: total_count,
-            min: total_min,
-            max: total_max,
-            m2: 0.0,
-        };
+        return H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, 0.0);
     }
 
     // Pass 2: Vectorized M2 variance computation
@@ -193,13 +187,7 @@ fn accumulate_span_f32_no_nodata(slice: &[f32]) -> H3Accumulator {
 
     let total_m2 = (m2_0 + m2_1) + (m2_2 + m2_3);
 
-    H3Accumulator {
-        sum: total_sum,
-        count: total_count,
-        min: total_min,
-        max: total_max,
-        m2: total_m2,
-    }
+    H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, total_m2)
 }
 
 #[inline]
@@ -278,13 +266,7 @@ fn accumulate_span_f32_with_nodata(slice: &[f32], nd: f32) -> H3Accumulator {
     let total_max = max0.max(max1).max(max2.max(max3)) as f64;
 
     if total_min == total_max {
-        return H3Accumulator {
-            sum: total_sum,
-            count: total_count,
-            min: total_min,
-            max: total_max,
-            m2: 0.0,
-        };
+        return H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, 0.0);
     }
 
     let mean = total_sum / total_count;
@@ -329,13 +311,7 @@ fn accumulate_span_f32_with_nodata(slice: &[f32], nd: f32) -> H3Accumulator {
 
     let total_m2 = (m2_0 + m2_1) + (m2_2 + m2_3);
 
-    H3Accumulator {
-        sum: total_sum,
-        count: total_count,
-        min: total_min,
-        max: total_max,
-        m2: total_m2,
-    }
+    H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, total_m2)
 }
 
 // =========================================================================
@@ -424,13 +400,7 @@ impl SimdSpanAccumulate for f64 {
         let total_max = max0.max(max1);
 
         if total_min == total_max {
-            return H3Accumulator {
-                sum: total_sum,
-                count: total_count,
-                min: total_min,
-                max: total_max,
-                m2: 0.0,
-            };
+            return H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, 0.0);
         }
 
         let mean = total_sum / total_count;
@@ -459,13 +429,13 @@ impl SimdSpanAccumulate for f64 {
             }
         }
 
-        H3Accumulator {
-            sum: total_sum,
-            count: total_count,
-            min: total_min,
-            max: total_max,
-            m2: m2_0 + m2_1,
-        }
+        H3Accumulator::from_stats(
+            total_sum,
+            total_count,
+            total_min,
+            total_max,
+            m2_0 + m2_1,
+        )
     }
 }
 
@@ -566,13 +536,7 @@ macro_rules! impl_simd_span_integer {
                 let total_max = max0.max(max1) as f64;
 
                 if total_min == total_max {
-                    return H3Accumulator {
-                        sum: total_sum,
-                        count: total_count,
-                        min: total_min,
-                        max: total_max,
-                        m2: 0.0,
-                    };
+                    return H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, 0.0);
                 }
 
                 let mean = total_sum / total_count;
@@ -617,13 +581,13 @@ macro_rules! impl_simd_span_integer {
                     }
                 }
 
-                H3Accumulator {
-                    sum: total_sum,
-                    count: total_count,
-                    min: total_min,
-                    max: total_max,
-                    m2: m2_0 + m2_1,
-                }
+                H3Accumulator::from_stats(
+                    total_sum,
+                    total_count,
+                    total_min,
+                    total_max,
+                    m2_0 + m2_1,
+                )
             }
         }
     };

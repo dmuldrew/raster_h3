@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::aggregator::multi_horizon::{
-    MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer,
+    MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
 };
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
@@ -30,6 +30,7 @@ pub struct RasterH3BindData {
     pub min_mean: Option<f64>,
     pub max_mean: Option<f64>,
     pub compact: bool,
+    pub quantiles: Vec<QuantileTarget>,
 }
 
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
@@ -38,6 +39,7 @@ pub struct RasterH3GlobalData {
     pub ready_batches: Mutex<VecDeque<Vec<MultiContinuousRecord>>>,
     pub is_finished: AtomicBool,
     pub projected_columns: Vec<usize>,
+    pub quantiles: Vec<QuantileTarget>,
 }
 
 /// Thread-local state for parallel DuckDB execution threads
@@ -362,6 +364,32 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Named parameter: quantiles (VARCHAR) or percentiles (VARCHAR)
+    let mut quantiles = Vec::new();
+    let name_quantiles = to_c_string("quantiles");
+    let name_percentiles = to_c_string("percentiles");
+    let named_quantiles_val = duckdb_bind_get_named_parameter(info, name_quantiles.as_ptr());
+    let named_percentiles_val = duckdb_bind_get_named_parameter(info, name_percentiles.as_ptr());
+    let q_param_val = if !named_quantiles_val.is_null() {
+        named_quantiles_val
+    } else {
+        named_percentiles_val
+    };
+    if !q_param_val.is_null() {
+        let q_str_ptr = duckdb_get_varchar(q_param_val);
+        if let Some(s) = from_duckdb_string(q_str_ptr) {
+            match QuantileTarget::parse_list(&s) {
+                Ok(q_targets) => quantiles = q_targets,
+                Err(e) => {
+                    let err_msg = CString::new(format!("Invalid quantiles parameter: {}", e))
+                        .unwrap_or_else(|_| CString::new("Invalid quantiles parameter").unwrap());
+                    duckdb_bind_set_error(info, err_msg.as_ptr());
+                    return;
+                }
+            }
+        }
+    }
+
     let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
         Ok(paths) => paths,
         Err(e) => {
@@ -428,6 +456,15 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let mut type_blob_mut = type_blob;
     duckdb_destroy_logical_type(&mut type_blob_mut);
 
+    // Quantile columns (10, 11, ...): target.column_name() DOUBLE
+    for target in &quantiles {
+        let col_q = to_c_string(target.column_name());
+        let type_double_q = duckdb_create_logical_type(DuckDBType::Double);
+        duckdb_bind_add_result_column(info, col_q.as_ptr(), type_double_q);
+        let mut type_double_q_mut = type_double_q;
+        duckdb_destroy_logical_type(&mut type_double_q_mut);
+    }
+
     // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
     const H3_AREA_M2: [f64; 16] = [
         4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
@@ -484,6 +521,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         min_mean,
         max_mean,
         compact,
+        quantiles,
     });
 
     duckdb_bind_set_bind_data(
@@ -536,6 +574,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     config.min_mean = bind_data.min_mean;
     config.max_mean = bind_data.max_mean;
     config.compact = bind_data.compact;
+    config.quantiles = bind_data.quantiles.clone();
 
     let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
         Ok(s) => s,
@@ -552,6 +591,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         ready_batches: Mutex::new(VecDeque::new()),
         is_finished: AtomicBool::new(false),
         projected_columns,
+        quantiles: bind_data.quantiles.clone(),
     });
 
     duckdb_init_set_init_data(
@@ -695,6 +735,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let mut vec_sum: Option<*mut f64> = None;
     let mut vec_res: Option<*mut u8> = None;
     let mut vec_wkb: Option<duckdb_vector> = None;
+    let mut vec_quantiles: Vec<(usize, *mut f64)> = Vec::new();
 
     for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
         let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -709,6 +750,12 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             7 => vec_sum = Some(duckdb_vector_get_data(v) as *mut f64),
             8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
             9 => vec_wkb = Some(v),
+            c if c >= 10 => {
+                let q_idx = c - 10;
+                if q_idx < global_data.quantiles.len() {
+                    vec_quantiles.push((q_idx, duckdb_vector_get_data(v) as *mut f64));
+                }
+            }
             _ => {}
         }
     }
@@ -772,6 +819,13 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                 duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
             }
         }
+        for &(q_idx, ptr) in &vec_quantiles {
+            let val = match &global_data.quantiles[q_idx] {
+                QuantileTarget::Percentile(q, _) => rec.accumulator.quantile(*q),
+                QuantileTarget::Iqr(_) => rec.accumulator.iqr(),
+            };
+            *ptr.add(i) = val;
+        }
     }
 
 
@@ -783,6 +837,7 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
     let names = [
         "h3_raster_continuous_aggregate",
         "h3_raster_continuous",
+        "raster_h3",
     ];
 
     for name in &names {
@@ -884,6 +939,12 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         // Overlap rule parameter
         let name_overlap = to_c_string("overlap_rule");
         duckdb_table_function_add_named_parameter(tf, name_overlap.as_ptr(), type_varchar);
+
+        // Quantile and percentile parameters (VARCHAR)
+        let name_quantiles = to_c_string("quantiles");
+        duckdb_table_function_add_named_parameter(tf, name_quantiles.as_ptr(), type_varchar);
+        let name_percentiles = to_c_string("percentiles");
+        duckdb_table_function_add_named_parameter(tf, name_percentiles.as_ptr(), type_varchar);
 
         // Set callbacks including parallel init_local and projection pushdown
         duckdb_table_function_set_bind(tf, raster_h3_bind);

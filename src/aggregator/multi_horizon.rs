@@ -53,6 +53,145 @@ impl SpectralFormula {
     }
 }
 
+/// Quantile target specification (percentile in [0.0, 1.0] or interquartile range)
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuantileTarget {
+    Percentile(f64, String),
+    Iqr(String),
+}
+
+impl QuantileTarget {
+    pub fn column_name(&self) -> &str {
+        match self {
+            Self::Percentile(_, name) => name,
+            Self::Iqr(name) => name,
+        }
+    }
+
+    /// Parse a comma- or space-separated list of quantile targets or presets.
+    ///
+    /// Presets:
+    /// - `"true"` / `"all"` / `"default"` -> p50, p90, p95, p99, iqr
+    /// - `"box"` -> p25, p50, p75, iqr
+    /// - `"tails"` -> p01, p05, p10, p90, p95, p99
+    /// - `"deciles"` -> p10, p20, p30, p40, p50, p60, p70, p80, p90
+    /// - `"false"` / `"none"` / `"off"` -> none
+    ///
+    /// Individual items:
+    /// - Percentiles: `p50`, `p95`, `p01`, `p5`, `p99.5`, `p99_5`
+    /// - Decimals: `0.5`, `0.05`, `0.95`, `0.99`
+    /// - Aliases: `median`, `q1`, `q2`, `q3`, `iqr`
+    pub fn parse_list(s: &str) -> Result<Vec<Self>> {
+        let mut targets = Vec::new();
+        for raw_token in s.split(|c: char| c == ',' || c.is_whitespace()) {
+            let token = raw_token.trim().to_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            match token.as_str() {
+                "false" | "none" | "off" => {}
+                "true" | "all" | "default" => {
+                    targets.push(Self::Percentile(0.50, "p50".to_string()));
+                    targets.push(Self::Percentile(0.90, "p90".to_string()));
+                    targets.push(Self::Percentile(0.95, "p95".to_string()));
+                    targets.push(Self::Percentile(0.99, "p99".to_string()));
+                    targets.push(Self::Iqr("iqr".to_string()));
+                }
+                "box" => {
+                    targets.push(Self::Percentile(0.25, "p25".to_string()));
+                    targets.push(Self::Percentile(0.50, "p50".to_string()));
+                    targets.push(Self::Percentile(0.75, "p75".to_string()));
+                    targets.push(Self::Iqr("iqr".to_string()));
+                }
+                "tails" => {
+                    targets.push(Self::Percentile(0.01, "p01".to_string()));
+                    targets.push(Self::Percentile(0.05, "p05".to_string()));
+                    targets.push(Self::Percentile(0.10, "p10".to_string()));
+                    targets.push(Self::Percentile(0.90, "p90".to_string()));
+                    targets.push(Self::Percentile(0.95, "p95".to_string()));
+                    targets.push(Self::Percentile(0.99, "p99".to_string()));
+                }
+                "deciles" => {
+                    for d in 1..=9 {
+                        let pct = d * 10;
+                        let q = pct as f64 / 100.0;
+                        let name = format!("p{}", pct);
+                        targets.push(Self::Percentile(q, name));
+                    }
+                }
+                "iqr" => {
+                    targets.push(Self::Iqr("iqr".to_string()));
+                }
+                "median" => {
+                    targets.push(Self::Percentile(0.50, "median".to_string()));
+                }
+                "q1" => {
+                    targets.push(Self::Percentile(0.25, "q1".to_string()));
+                }
+                "q2" => {
+                    targets.push(Self::Percentile(0.50, "q2".to_string()));
+                }
+                "q3" => {
+                    targets.push(Self::Percentile(0.75, "q3".to_string()));
+                }
+                _ => {
+                    if let Some(stripped) = token.strip_prefix('p') {
+                        let num_str = stripped.replace('_', ".");
+                        let val: f64 = num_str.parse().map_err(|_| {
+                            RasterH3Error::InvalidParameter(format!(
+                                "Invalid percentile specification '{}'",
+                                raw_token
+                            ))
+                        })?;
+                        if val <= 0.0 || val >= 100.0 {
+                            return Err(RasterH3Error::InvalidParameter(format!(
+                                "Percentile '{}' must be strictly between 0 and 100",
+                                raw_token
+                            )));
+                        }
+                        let q = val / 100.0;
+                        let name = if (val.round() - val).abs() < 1e-6 {
+                            format!("p{:02}", val.round() as u32)
+                        } else {
+                            format!("p{}", val).replace('.', "_")
+                        };
+                        targets.push(Self::Percentile(q, name));
+                    } else if let Ok(val) = token.parse::<f64>() {
+                        if val <= 0.0 || val >= 1.0 {
+                            return Err(RasterH3Error::InvalidParameter(format!(
+                                "Decimal quantile '{}' must be strictly between 0 and 1",
+                                raw_token
+                            )));
+                        }
+                        let pct = val * 100.0;
+                        let name = if (pct.round() - pct).abs() < 1e-6 {
+                            format!("p{:02}", pct.round() as u32)
+                        } else {
+                            format!("p{}", pct).replace('.', "_")
+                        };
+                        targets.push(Self::Percentile(val, name));
+                    } else {
+                        return Err(RasterH3Error::InvalidParameter(format!(
+                            "Unrecognized quantile/percentile target '{}'",
+                            raw_token
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Deduplicate while preserving order
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for t in targets {
+            if seen.insert(t.column_name().to_string()) {
+                deduped.push(t);
+            }
+        }
+        Ok(deduped)
+    }
+}
+
 /// Configuration for multi-resolution aggregation
 #[derive(Debug, Clone)]
 pub struct MultiResolutionConfig {
@@ -70,6 +209,7 @@ pub struct MultiResolutionConfig {
     pub min_majority_fraction: Option<f64>,
     pub compact: bool,
     pub overlap_rule: OverlapRule,
+    pub quantiles: Vec<QuantileTarget>,
 }
 
 impl MultiResolutionConfig {
@@ -90,7 +230,14 @@ impl MultiResolutionConfig {
             min_majority_fraction: None,
             compact: false,
             overlap_rule: OverlapRule::default(),
+            quantiles: Vec::new(),
         }
+    }
+
+    /// Check whether streaming quantile calculations are enabled
+    #[inline(always)]
+    pub fn track_quantiles(&self) -> bool {
+        !self.quantiles.is_empty()
     }
 }
 
@@ -101,7 +248,7 @@ impl Default for MultiResolutionConfig {
 }
 
 /// Continuous record yielded by the multi-resolution streamer
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiContinuousRecord {
     pub resolution: u8,
     pub h3_index: u64,
@@ -144,6 +291,7 @@ fn process_continuous_overlap_slice_into_maps<T>(
     chunk_stride: u32,
     tile_idx: usize,
     mosaic: &MosaicReader,
+    track_quantiles: bool,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) where
     T: SimdSpanAccumulate,
@@ -196,7 +344,11 @@ fn process_continuous_overlap_slice_into_maps<T>(
                             .entry(cell_u64)
                             .and_modify(|acc| acc.update(float_val))
                             .or_insert_with(|| {
-                                let mut acc = H3Accumulator::default();
+                                let mut acc = if track_quantiles {
+                                    H3Accumulator::with_quantiles()
+                                } else {
+                                    H3Accumulator::default()
+                                };
                                 acc.update(float_val);
                                 acc
                             });
@@ -226,7 +378,11 @@ fn process_continuous_overlap_slice_into_maps<T>(
                                     .entry(cell_u64)
                                     .and_modify(|acc| acc.update_weighted(float_val, sp.weight))
                                     .or_insert_with(|| {
-                                        let mut acc = H3Accumulator::default();
+                                        let mut acc = if track_quantiles {
+                                            H3Accumulator::with_quantiles()
+                                        } else {
+                                            H3Accumulator::default()
+                                        };
                                         acc.update_weighted(float_val, sp.weight);
                                         acc
                                     });
@@ -251,6 +407,7 @@ fn process_continuous_slice_into_maps<T>(
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
     overlap_ctx: Option<(usize, &MosaicReader)>,
+    track_quantiles: bool,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) where
     T: SimdSpanAccumulate,
@@ -272,6 +429,7 @@ fn process_continuous_slice_into_maps<T>(
             chunk_stride,
             tile_idx,
             mosaic,
+            track_quantiles,
             chunk_maps,
         );
         return;
@@ -337,7 +495,11 @@ fn process_continuous_slice_into_maps<T>(
                 let row_cache = &mut row_caches[res_idx];
                 row_cache.reset_row();
                 let mut run_cell: u64 = 0;
-                let mut run_acc = H3Accumulator::default();
+                let mut run_acc = if track_quantiles {
+                    H3Accumulator::with_quantiles()
+                } else {
+                    H3Accumulator::default()
+                };
 
                 let mut lon_curr = lon_start;
                 let mut x_curr = x_start;
@@ -392,10 +554,10 @@ fn process_continuous_slice_into_maps<T>(
                                 active_map
                                     .entry(run_cell)
                                     .and_modify(|acc| acc.merge(&run_acc))
-                                    .or_insert_with(|| run_acc);
+                                    .or_insert_with(|| run_acc.clone());
                             }
                             run_cell = cell_u64;
-                            run_acc = H3Accumulator::default();
+                            run_acc.clear();
                             row_cache.on_cell_changed();
                         }
 
@@ -429,6 +591,15 @@ fn process_continuous_slice_into_maps<T>(
                         let span_acc = T::accumulate_span(span_slice, native_nodata);
                         if span_acc.count > 0.0 {
                             run_acc.merge(&span_acc);
+                            if track_quantiles {
+                                if let Some(ref mut q) = run_acc.quantiles {
+                                    for &v in span_slice {
+                                        if v.is_valid(native_nodata) {
+                                            q.update(v.to_f64_val(), 1.0);
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         let num_stepped = span_end - c;
@@ -454,7 +625,7 @@ fn process_continuous_slice_into_maps<T>(
                     active_map
                         .entry(run_cell)
                         .and_modify(|acc| acc.merge(&run_acc))
-                        .or_insert_with(|| run_acc);
+                        .or_insert_with(|| run_acc.clone());
                 }
             }
         } else {
@@ -485,7 +656,11 @@ fn process_continuous_slice_into_maps<T>(
                                     .entry(cell)
                                     .and_modify(|acc| acc.update_weighted(val, sp.weight))
                                     .or_insert_with(|| {
-                                        let mut a = H3Accumulator::default();
+                                        let mut a = if track_quantiles {
+                                            H3Accumulator::with_quantiles()
+                                        } else {
+                                            H3Accumulator::default()
+                                        };
                                         a.update_weighted(val, sp.weight);
                                         a
                                     });
@@ -513,6 +688,7 @@ fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(
     band: usize,
     spectral_formula: Option<SpectralFormula>,
     overlap_ctx: Option<(usize, &MosaicReader)>,
+    track_quantiles: bool,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) {
     let row_width = chunk.width as usize;
@@ -642,7 +818,11 @@ fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(
                                 .entry(cell)
                                 .and_modify(|acc| acc.update_weighted(val, sp.weight))
                                 .or_insert_with(|| {
-                                    let mut a = H3Accumulator::default();
+                                    let mut a = if track_quantiles {
+                                        H3Accumulator::with_quantiles()
+                                    } else {
+                                        H3Accumulator::default()
+                                    };
                                     a.update_weighted(val, sp.weight);
                                     a
                                 });
@@ -669,6 +849,7 @@ fn process_continuous_chunk_payload_into(
     band: usize,
     spectral_formula: Option<SpectralFormula>,
     overlap_ctx: Option<(usize, &MosaicReader)>,
+    track_quantiles: bool,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
     let is_multisample = samples_per_pixel > 1 || spectral_formula.is_some() || band > 1;
@@ -695,86 +876,86 @@ fn process_continuous_chunk_payload_into(
         match decoding_result {
             DecodingResult::U8(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::U16(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::U32(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::U64(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I8(slice) => {
                 let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I16(slice) => {
                 let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I32(slice) => {
                 let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I64(slice) => {
                 let nd = nodata.map(|v| v as i64);
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::F32(slice) => {
                 let nd = nodata.map(|v| v as f32);
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::F64(slice) => {
                 let nd = nodata;
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, chunk_maps);
+                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
             }
         }
     } else {
         match decoding_result {
             DecodingResult::U8(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::U16(slice) => {
                 let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::U32(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::U64(slice) => {
                 let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I8(slice) => {
                 let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I16(slice) => {
                 let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I32(slice) => {
                 let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::I64(slice) => {
                 let nd = nodata.map(|v| v as i64);
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::F32(slice) => {
                 let nd = nodata.map(|v| v as f32);
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
             DecodingResult::F64(slice) => {
                 let nd = nodata;
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, chunk_maps);
+                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
             }
         }
     }
@@ -804,6 +985,7 @@ pub struct MultiScanHorizonStreamer {
     max_mean: Option<f64>,
     compact: bool,
     pending_compact: HashMap<u64, (H3Accumulator, Vec<(u64, H3Accumulator)>), FxBuildHasher>,
+    pub track_quantiles: bool,
 }
 
 impl MultiScanHorizonStreamer {
@@ -875,6 +1057,7 @@ impl MultiScanHorizonStreamer {
             max_mean,
             compact,
             pending_compact,
+            track_quantiles: config.track_quantiles(),
         })
     }
 
@@ -916,7 +1099,14 @@ impl MultiScanHorizonStreamer {
                     if let Some(parent) = cell.parent(parent_res) {
                         let parent_u64: u64 = parent.into();
                         let entry = self.pending_compact.entry(parent_u64).or_insert_with(|| {
-                            (H3Accumulator::default(), Vec::with_capacity(7))
+                            (
+                                if self.track_quantiles {
+                                    H3Accumulator::with_quantiles()
+                                } else {
+                                    H3Accumulator::default()
+                                },
+                                Vec::with_capacity(7),
+                            )
                         });
                         entry.0.merge(&acc);
                         entry.1.push((cell_u64, acc));
@@ -1046,6 +1236,7 @@ impl MultiScanHorizonStreamer {
             let spectral_formula = self.spectral_formula;
             let mosaic = Arc::clone(&self.mosaic);
             let user_nodata = self.nodata;
+            let track_quantiles = self.track_quantiles;
 
             let t1 = std::time::Instant::now();
             let parallel_results: Vec<(Vec<Vec<(u64, H3Accumulator)>>, DecodingResult)> = chunk_items
@@ -1091,6 +1282,7 @@ impl MultiScanHorizonStreamer {
                                     band,
                                     spectral_formula,
                                     overlap_ctx,
+                                    track_quantiles,
                                     local_maps,
                                 );
                                 let mut chunk_entries = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });

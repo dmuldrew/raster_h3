@@ -4,10 +4,12 @@ pub mod h3_map;
 pub mod h3_scanline;
 pub mod horizon_streamer;
 pub mod multi_horizon;
+pub mod quantiles;
 pub mod sampling;
 pub mod simd;
 
 pub use accumulator::H3Accumulator;
+pub use quantiles::QuantileSketch;
 pub use categorical::{CategoricalAccumulator, CategoricalHorizonStreamer};
 pub use h3_map::{aggregate_raster_stream, H3HashMap};
 pub use h3_scanline::H3ScanlineLookahead;
@@ -17,7 +19,7 @@ pub use horizon_streamer::{
 };
 pub use multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
-    MultiResolutionConfig, MultiScanHorizonStreamer,
+    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
 };
 pub use sampling::{SamplePoint, SamplingPattern};
 pub use simd::SimdSpanAccumulate;
