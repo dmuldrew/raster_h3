@@ -161,5 +161,22 @@ GROUP BY resolution, majority_class
 ORDER BY resolution, hex_count DESC
 LIMIT 10;
 
+-- 16. Landscape Diversity & Shannon Entropy Metrics
+-- Compute Shannon-Wiener entropy index (-sum(p_i * ln(p_i))) and distinct landcover classes
+SELECT
+    h3_hex,
+    majority_class,
+    distinct_classes,
+    round(shannon_entropy, 3) AS entropy,
+    total_count AS total_pixels
+FROM h3_raster_categorical_aggregate(
+    '/data/sample_sf.tif',
+    resolution := 8
+)
+WHERE distinct_classes > 1
+ORDER BY shannon_entropy DESC
+LIMIT 10;
+
+
 
 

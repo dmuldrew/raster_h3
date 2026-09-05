@@ -37,6 +37,8 @@ pub struct LongCategoricalRow {
     pub count: f64,
     pub fraction: f64,
     pub total_count: f64,
+    pub entropy: f64,
+    pub distinct_classes: i64,
 }
 
 pub struct RasterH3CategoricalGlobalData {
@@ -308,9 +310,21 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
             // 8: resolution UTINYINT
             let col_res = to_c_string("resolution");
             duckdb_bind_add_result_column(info, col_res.as_ptr(), type_utinyint);
+
+            // 9: shannon_entropy DOUBLE
+            let col_shannon = to_c_string("shannon_entropy");
+            duckdb_bind_add_result_column(info, col_shannon.as_ptr(), type_double);
+
+            // 10: entropy DOUBLE (alias for shannon_entropy)
+            let col_entropy = to_c_string("entropy");
+            duckdb_bind_add_result_column(info, col_entropy.as_ptr(), type_double);
+
+            // 11: distinct_classes BIGINT (alias for unique_classes)
+            let col_distinct = to_c_string("distinct_classes");
+            duckdb_bind_add_result_column(info, col_distinct.as_ptr(), type_bigint);
         }
         CategoricalOutputFormat::Long => {
-            // Option C: Long form (h3_index, h3_hex, category, count, fraction, total_count, resolution)
+            // Option C: Long form (h3_index, h3_hex, category, count, fraction, total_count, resolution, shannon_entropy, entropy, distinct_classes, unique_classes)
             let col_cat = to_c_string("category");
             duckdb_bind_add_result_column(info, col_cat.as_ptr(), type_bigint);
 
@@ -326,6 +340,22 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
             // 6: resolution UTINYINT
             let col_res = to_c_string("resolution");
             duckdb_bind_add_result_column(info, col_res.as_ptr(), type_utinyint);
+
+            // 7: shannon_entropy DOUBLE
+            let col_shannon = to_c_string("shannon_entropy");
+            duckdb_bind_add_result_column(info, col_shannon.as_ptr(), type_double);
+
+            // 8: entropy DOUBLE (alias for shannon_entropy)
+            let col_entropy = to_c_string("entropy");
+            duckdb_bind_add_result_column(info, col_entropy.as_ptr(), type_double);
+
+            // 9: distinct_classes BIGINT
+            let col_distinct = to_c_string("distinct_classes");
+            duckdb_bind_add_result_column(info, col_distinct.as_ptr(), type_bigint);
+
+            // 10: unique_classes BIGINT (alias for distinct_classes)
+            let col_uniq = to_c_string("unique_classes");
+            duckdb_bind_add_result_column(info, col_uniq.as_ptr(), type_bigint);
         }
     }
 
@@ -574,6 +604,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 6: total_count DOUBLE
             // 7: histogram VARCHAR
             // 8: resolution UTINYINT
+            // 9: shannon_entropy DOUBLE
+            // 10: entropy DOUBLE
+            // 11: distinct_classes BIGINT
             let mut vec_h3: Option<*mut u64> = None;
             let mut vec_hex: Option<duckdb_vector> = None;
             let mut vec_maj_cls: Option<*mut i64> = None;
@@ -583,6 +616,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             let mut vec_tot: Option<*mut f64> = None;
             let mut vec_hist: Option<duckdb_vector> = None;
             let mut vec_res: Option<*mut u8> = None;
+            let mut vec_shannon_entropy: Option<*mut f64> = None;
+            let mut vec_entropy: Option<*mut f64> = None;
+            let mut vec_distinct: Option<*mut i64> = None;
 
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -596,11 +632,17 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     6 => vec_tot = Some(duckdb_vector_get_data(v) as *mut f64),
                     7 => vec_hist = Some(v),
                     8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
+                    9 => vec_shannon_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
+                    10 => vec_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
+                    11 => vec_distinct = Some(duckdb_vector_get_data(v) as *mut i64),
                     _ => {}
                 }
             }
 
             let need_majority = vec_maj_cls.is_some() || vec_maj_frac.is_some() || vec_maj_cnt.is_some();
+            let need_entropy = vec_shannon_entropy.is_some() || vec_entropy.is_some();
+            let need_distinct = vec_uniq.is_some() || vec_distinct.is_some();
+
             let mut fallback_hex_buf = [0u8; 16];
             let hex_buf = if !local_data_ptr.is_null() {
                 &mut (*local_data_ptr).hex_buf
@@ -636,8 +678,14 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         *p.add(i) = maj_cnt;
                     }
                 }
-                if let Some(p) = vec_uniq {
-                    *p.add(i) = rec.accumulator.unique_classes() as i64;
+                if need_distinct {
+                    let distinct = rec.accumulator.unique_classes() as i64;
+                    if let Some(p) = vec_uniq {
+                        *p.add(i) = distinct;
+                    }
+                    if let Some(p) = vec_distinct {
+                        *p.add(i) = distinct;
+                    }
                 }
                 if let Some(p) = vec_tot {
                     *p.add(i) = rec.accumulator.total_count;
@@ -653,6 +701,15 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
                 if let Some(p) = vec_res {
                     *p.add(i) = rec.resolution;
+                }
+                if need_entropy {
+                    let ent = rec.accumulator.shannon_entropy();
+                    if let Some(p) = vec_shannon_entropy {
+                        *p.add(i) = ent;
+                    }
+                    if let Some(p) = vec_entropy {
+                        *p.add(i) = ent;
+                    }
                 }
             }
 
@@ -678,6 +735,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         rec.accumulator.for_each_class(|cat, cnt| entries.push((cat, cnt)));
                         entries.sort_unstable_by_key(|&(cat, _)| cat);
 
+                        let entropy = rec.accumulator.shannon_entropy();
+                        let distinct_classes = rec.accumulator.unique_classes() as i64;
+
                         for (cat, cnt) in entries {
                             let fraction = if rec.accumulator.total_count > 0.0 {
                                 cnt / rec.accumulator.total_count
@@ -691,6 +751,8 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                                 count: cnt,
                                 fraction,
                                 total_count: rec.accumulator.total_count,
+                                entropy,
+                                distinct_classes,
                             });
                         }
                     });
@@ -729,6 +791,10 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 4: fraction DOUBLE
             // 5: total_count DOUBLE
             // 6: resolution UTINYINT
+            // 7: shannon_entropy DOUBLE
+            // 8: entropy DOUBLE
+            // 9: distinct_classes BIGINT
+            // 10: unique_classes BIGINT
             let mut vec_h3: Option<*mut u64> = None;
             let mut vec_hex: Option<duckdb_vector> = None;
             let mut vec_cat: Option<*mut i64> = None;
@@ -736,6 +802,10 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             let mut vec_frac: Option<*mut f64> = None;
             let mut vec_tot: Option<*mut f64> = None;
             let mut vec_res: Option<*mut u8> = None;
+            let mut vec_shannon_entropy: Option<*mut f64> = None;
+            let mut vec_entropy: Option<*mut f64> = None;
+            let mut vec_distinct: Option<*mut i64> = None;
+            let mut vec_uniq: Option<*mut i64> = None;
 
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -747,6 +817,10 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     4 => vec_frac = Some(duckdb_vector_get_data(v) as *mut f64),
                     5 => vec_tot = Some(duckdb_vector_get_data(v) as *mut f64),
                     6 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
+                    7 => vec_shannon_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
+                    8 => vec_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
+                    9 => vec_distinct = Some(duckdb_vector_get_data(v) as *mut i64),
+                    10 => vec_uniq = Some(duckdb_vector_get_data(v) as *mut i64),
                     _ => {}
                 }
             }
@@ -787,6 +861,18 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
                 if let Some(p) = vec_res {
                     *p.add(i) = row.resolution;
+                }
+                if let Some(p) = vec_shannon_entropy {
+                    *p.add(i) = row.entropy;
+                }
+                if let Some(p) = vec_entropy {
+                    *p.add(i) = row.entropy;
+                }
+                if let Some(p) = vec_distinct {
+                    *p.add(i) = row.distinct_classes;
+                }
+                if let Some(p) = vec_uniq {
+                    *p.add(i) = row.distinct_classes;
                 }
             }
 

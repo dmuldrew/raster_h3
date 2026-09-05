@@ -240,6 +240,51 @@ fn main() {
     println!("      - Total Hexagons  : {} cells", r7_count + r8_count);
     println!("      - Multi-Res Time  : {:.2?}", dur_multi);
 
+    // =========================================================================
+    // TEST SUITE 4: Landscape Diversity & Shannon Entropy Metrics
+    // =========================================================================
+    println!("\n▶ [TEST SUITE 4] Landscape Diversity & Shannon Entropy (Maui ROI)");
+    let lf_reader_entropy = GeoTiffStreamReader::open(lf_path).unwrap();
+    let mut config_lf_ent = MultiResolutionConfig::new(vec![8]);
+    config_lf_ent.bbox = Some(maui_bbox);
+
+    let t_ent = Instant::now();
+    let mut streamer_ent = MultiCategoricalHorizonStreamer::new(lf_reader_entropy, &config_lf_ent).unwrap();
+    let mut total_ent_hexes = 0usize;
+    let mut pure_hexes = 0usize; // entropy == 0.0 (single class)
+    let mut diverse_hexes = 0usize; // entropy > 1.0 (multi-class ecotones)
+    let mut max_entropy = 0.0f64;
+    let mut max_distinct = 0usize;
+
+    loop {
+        let n = streamer_ent.drain_completed_into(2048, |_i, rec| {
+            total_ent_hexes += 1;
+            let entropy = rec.accumulator.shannon_entropy();
+            let distinct = rec.accumulator.unique_classes();
+            if entropy == 0.0 {
+                pure_hexes += 1;
+            }
+            if entropy > 1.0 {
+                diverse_hexes += 1;
+            }
+            if entropy > max_entropy {
+                max_entropy = entropy;
+            }
+            if distinct > max_distinct {
+                max_distinct = distinct;
+            }
+        });
+        if n == 0 { break; }
+    }
+    let dur_ent = t_ent.elapsed();
+    println!("      - Maui Hexagons    : {} cells", total_ent_hexes);
+    println!("      - Pure Cells (H=0) : {} cells ({:.1}%)",
+        pure_hexes, (pure_hexes as f64 / total_ent_hexes as f64) * 100.0);
+    println!("      - Diverse Ecotones : {} cells ({:.1}% with H > 1.0)",
+        diverse_hexes, (diverse_hexes as f64 / total_ent_hexes as f64) * 100.0);
+    println!("      - Max Diversity    : H={:.3}, Max Distinct Classes={}", max_entropy, max_distinct);
+    println!("      - Entropy Calc Time: {:.2?}", dur_ent);
+
     println!("\n=========================================================================================");
     println!("                              ALL HAWAII TESTS PASSED SUCCESSFULLY                       ");
     println!("=========================================================================================");

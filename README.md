@@ -802,6 +802,9 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `total_count` | `DOUBLE` | Total non-nodata pixels in the hexagon. |
 | `histogram` | `VARCHAR` | JSON map of `{category_id: fraction, ...}`. |
 | `resolution` | `UTINYINT` | H3 resolution level (0 to 15) of the cell. |
+| `shannon_entropy` | `DOUBLE` | Shannon-Wiener entropy index ($-\sum p_i \ln p_i$), measuring landscape diversity. |
+| `entropy` | `DOUBLE` | Alias for `shannon_entropy`. |
+| `distinct_classes`| `BIGINT` | Number of distinct categories present in the hexagon (alias for `unique_classes`). |
 
 #### Long Format Output Schema (`format := 'long'`)
 | Column Name | Logical Type | Description |
@@ -813,6 +816,10 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `fraction` | `DOUBLE` | Proportion (0.0 to 1.0) of this category in the hexagon. |
 | `total_count` | `DOUBLE` | Total pixels in the hexagon across all categories. |
 | `resolution` | `UTINYINT` | H3 resolution level (0 to 15) of the cell. |
+| `shannon_entropy` | `DOUBLE` | Shannon-Wiener entropy index of the parent hexagon. |
+| `entropy` | `DOUBLE` | Alias for `shannon_entropy`. |
+| `distinct_classes`| `BIGINT` | Number of distinct categories in the parent hexagon. |
+| `unique_classes`  | `BIGINT` | Alias for `distinct_classes`. |
 
 ---
 
