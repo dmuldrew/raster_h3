@@ -10,6 +10,7 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
 use crate::functions::fast_hex::fast_hex_u64;
+use crate::functions::wkb::h3_index_to_wkb;
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 /// User-data bound during table function query compilation
@@ -36,6 +37,7 @@ pub struct RasterH3GlobalData {
 pub struct RasterH3LocalData {
     pub thread_id: usize,
     pub hex_buf: [u8; 16],
+    pub wkb_buf: [u8; 128],
 }
 
 unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
@@ -291,6 +293,13 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let mut type_utinyint_mut = type_utinyint;
     duckdb_destroy_logical_type(&mut type_utinyint_mut);
 
+    // 9: wkb BLOB (OGC 2D Polygon)
+    let col_wkb = to_c_string("wkb");
+    let type_blob = duckdb_create_logical_type(DuckDBType::Blob);
+    duckdb_bind_add_result_column(info, col_wkb.as_ptr(), type_blob);
+    let mut type_blob_mut = type_blob;
+    duckdb_destroy_logical_type(&mut type_blob_mut);
+
     // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
     const H3_AREA_M2: [f64; 16] = [
         4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
@@ -407,6 +416,7 @@ pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
     let local_data = Box::new(RasterH3LocalData {
         thread_id: 0,
         hex_buf: [0u8; 16],
+        wkb_buf: [0u8; 128],
     });
     duckdb_init_set_init_data(
         info,
@@ -524,6 +534,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     // 6: max DOUBLE
     // 7: sum DOUBLE
     // 8: resolution UTINYINT
+    // 9: wkb BLOB
     let mut vec_h3: Option<*mut u64> = None;
     let mut vec_hex: Option<duckdb_vector> = None;
     let mut vec_mean: Option<*mut f64> = None;
@@ -533,6 +544,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let mut vec_max: Option<*mut f64> = None;
     let mut vec_sum: Option<*mut f64> = None;
     let mut vec_res: Option<*mut u8> = None;
+    let mut vec_wkb: Option<duckdb_vector> = None;
 
     for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
         let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -546,15 +558,20 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             6 => vec_max = Some(duckdb_vector_get_data(v) as *mut f64),
             7 => vec_sum = Some(duckdb_vector_get_data(v) as *mut f64),
             8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
+            9 => vec_wkb = Some(v),
             _ => {}
         }
     }
 
     let mut fallback_hex_buf = [0u8; 16];
-    let hex_buf = if !local_data_ptr.is_null() {
-        &mut (*local_data_ptr).hex_buf
+    let mut fallback_wkb_buf = [0u8; 128];
+    let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
+        (
+            &mut (*local_data_ptr).hex_buf,
+            &mut (*local_data_ptr).wkb_buf,
+        )
     } else {
-        &mut fallback_hex_buf
+        (&mut fallback_hex_buf, &mut fallback_wkb_buf)
     };
 
     let batch_len = batch.len();
@@ -593,7 +610,20 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         if let Some(p) = vec_res {
             *p.add(i) = rec.resolution;
         }
+        if let Some(v) = vec_wkb {
+            if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
+                duckdb_vector_assign_string_element_len(
+                    v,
+                    row_idx,
+                    wkb_buf.as_ptr() as *const c_char,
+                    wkb_len as idx_t,
+                );
+            } else {
+                duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+            }
+        }
     }
+
 
     duckdb_data_chunk_set_size(output, batch_len as idx_t);
 }

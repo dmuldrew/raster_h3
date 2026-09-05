@@ -1782,6 +1782,48 @@ fn test_categorical_accumulator_high_cardinality_shannon_entropy() {
     assert_eq!(pure_acc.shannon_entropy(), 0.0);
 }
 
+#[test]
+fn test_wkb_ogc_compliance() {
+    use raster_h3::functions::{cell_to_wkb, h3_index_to_wkb};
+
+    let coord = LatLng::new(21.3069, -157.8583).unwrap(); // Honolulu
+    let cell = coord.to_cell(Resolution::Eight);
+
+    let mut buf = [0u8; 128];
+    let len = cell_to_wkb(cell, &mut buf);
+    assert_eq!(len, 125, "Hexagon WKB must be exactly 125 bytes");
+
+    // Check OGC WKB header
+    assert_eq!(buf[0], 1, "Byte order must be Little Endian (1)");
+    let geom_type = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+    assert_eq!(geom_type, 3, "Geometry type must be wkbPolygon (3)");
+
+    let num_rings = u32::from_le_bytes(buf[5..9].try_into().unwrap());
+    assert_eq!(num_rings, 1, "Ring count must be 1");
+
+    let num_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    assert_eq!(num_points, 7, "Hexagon ring must have 7 points (6 vertices + 1 closing)");
+
+    // Check ring closure (point 0 == point 6)
+    let p0_x = f64::from_le_bytes(buf[13..21].try_into().unwrap());
+    let p0_y = f64::from_le_bytes(buf[21..29].try_into().unwrap());
+    let p6_x = f64::from_le_bytes(buf[109..117].try_into().unwrap());
+    let p6_y = f64::from_le_bytes(buf[117..125].try_into().unwrap());
+    assert_eq!(p0_x, p6_x, "Ring must be closed: X0 == X6");
+    assert_eq!(p0_y, p6_y, "Ring must be closed: Y0 == Y6");
+
+    // Coordinates should match Honolulu
+    assert!(p0_x > -158.5 && p0_x < -157.0);
+    assert!(p0_y > 21.0 && p0_y < 22.0);
+
+    // Also verify h3_index_to_wkb matches
+    let mut buf2 = [0u8; 128];
+    let len2 = h3_index_to_wkb(cell.into(), &mut buf2).expect("valid cell u64");
+    assert_eq!(len, len2);
+    assert_eq!(&buf[..len], &buf2[..len2]);
+}
+
+
 
 
 

@@ -693,13 +693,15 @@ impl MultiScanHorizonStreamer {
     /// Advance scanline horizon until at least `min_rows` completed records are available or finished
     pub fn advance_until_completed(&mut self, min_rows: usize) {
         let batch_size = (rayon::current_num_threads() * 4).max(32);
+        let min_batch = rayon::current_num_threads().clamp(4, 16);
+        let mut chunk_items = Vec::with_capacity(batch_size);
+
         while self.completed_buffer.len() < min_rows && !self.is_finished {
+            chunk_items.clear();
             let t0 = std::time::Instant::now();
-            let chunk_items = if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.next_chunk_batch(batch_size)
-            } else {
-                Vec::new()
-            };
+            if let Some(ref prefetcher) = self.prefetcher {
+                prefetcher.drain_chunk_batch_into(&mut chunk_items, min_batch, batch_size);
+            }
             self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
 
             if chunk_items.is_empty() {
@@ -739,7 +741,7 @@ impl MultiScanHorizonStreamer {
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
             let parallel_results: Vec<(f64, Vec<Vec<(u64, H3Accumulator)>>, DecodingResult)> = chunk_items
-                .into_par_iter()
+                .par_iter_mut()
                 .map_init(
                     || {
                         let mut maps = Vec::with_capacity(resolutions.len());
@@ -751,13 +753,13 @@ impl MultiScanHorizonStreamer {
                     |local_maps, item| {
                         match item {
                             Ok((_chunk_idx, chunk_bounds, decoding_result)) => {
-                                let bottom_lat = compute_chunk_bounds_bottom_lat(&chunk_bounds, gt, crs_transformer);
+                                let bottom_lat = compute_chunk_bounds_bottom_lat(chunk_bounds, gt, crs_transformer);
                                 for m in local_maps.iter_mut() {
                                     m.clear();
                                 }
                                 let has_data = process_continuous_chunk_payload_into(
-                                    &chunk_bounds,
-                                    &decoding_result,
+                                    chunk_bounds,
+                                    decoding_result,
                                     resolutions,
                                     crs_transformer,
                                     gt,
@@ -774,7 +776,8 @@ impl MultiScanHorizonStreamer {
                                         chunk_entries.push(entries);
                                     }
                                 }
-                                Some((bottom_lat, chunk_entries, decoding_result))
+                                let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
+                                Some((bottom_lat, chunk_entries, dec))
                             }
                             Err(_) => None,
                         }
@@ -783,6 +786,7 @@ impl MultiScanHorizonStreamer {
                 .filter_map(|x| x)
                 .collect();
             self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
+
 
             let mut min_batch_lat = f64::INFINITY;
             let mut recycled_buffers = Vec::with_capacity(parallel_results.len());
@@ -1369,13 +1373,15 @@ impl MultiCategoricalHorizonStreamer {
     /// Advance scanline horizon until at least `min_rows` completed records are available or finished
     pub fn advance_until_completed(&mut self, min_rows: usize) {
         let batch_size = (rayon::current_num_threads() * 4).max(32);
+        let min_batch = rayon::current_num_threads().clamp(4, 16);
+        let mut chunk_items = Vec::with_capacity(batch_size);
+
         while self.completed_buffer.len() < min_rows && !self.is_finished {
+            chunk_items.clear();
             let t0 = std::time::Instant::now();
-            let chunk_items = if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.next_chunk_batch(batch_size)
-            } else {
-                Vec::new()
-            };
+            if let Some(ref prefetcher) = self.prefetcher {
+                prefetcher.drain_chunk_batch_into(&mut chunk_items, min_batch, batch_size);
+            }
             self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
 
             if chunk_items.is_empty() {
@@ -1415,7 +1421,7 @@ impl MultiCategoricalHorizonStreamer {
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
             let parallel_results: Vec<(f64, Vec<Vec<(u64, CategoricalAccumulator)>>, DecodingResult)> = chunk_items
-                .into_par_iter()
+                .par_iter_mut()
                 .map_init(
                     || {
                         let mut maps = Vec::with_capacity(resolutions.len());
@@ -1427,13 +1433,13 @@ impl MultiCategoricalHorizonStreamer {
                     |local_maps, item| {
                         match item {
                             Ok((_chunk_idx, chunk_bounds, decoding_result)) => {
-                                let bottom_lat = compute_chunk_bounds_bottom_lat(&chunk_bounds, gt, crs_transformer);
+                                let bottom_lat = compute_chunk_bounds_bottom_lat(chunk_bounds, gt, crs_transformer);
                                 for m in local_maps.iter_mut() {
                                     m.clear();
                                 }
                                 let has_data = process_categorical_chunk_payload_into(
-                                    &chunk_bounds,
-                                    &decoding_result,
+                                    chunk_bounds,
+                                    decoding_result,
                                     resolutions,
                                     crs_transformer,
                                     gt,
@@ -1450,7 +1456,8 @@ impl MultiCategoricalHorizonStreamer {
                                         chunk_entries.push(entries);
                                     }
                                 }
-                                Some((bottom_lat, chunk_entries, decoding_result))
+                                let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
+                                Some((bottom_lat, chunk_entries, dec))
                             }
                             Err(_) => None,
                         }
@@ -1459,6 +1466,7 @@ impl MultiCategoricalHorizonStreamer {
                 .filter_map(|x| x)
                 .collect();
             self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
+
 
             let mut min_batch_lat = f64::INFINITY;
             let mut recycled_buffers = Vec::with_capacity(parallel_results.len());

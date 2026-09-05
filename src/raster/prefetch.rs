@@ -208,15 +208,60 @@ impl PrefetchedChunkReader {
         self.receiver.recv().ok()
     }
 
+    /// Pull next batch of ready chunks directly into `batch`.
+    ///
+    /// Guarantees that if any chunks are remaining, at least 1 chunk is fetched (blocking if necessary).
+    /// After the first chunk, non-blocking `try_recv()` drains any currently ready chunks up to `max_batch`.
+    /// If the count is below `min_batch`, it continues waiting with `recv()` until at least `min_batch`
+    /// chunks have been acquired or EOF/disconnection is reached.
+    ///
+    /// This provides true asynchronous double-buffering: Rayon can immediately begin processing
+    /// available chunks without stalling for full buffer filling, while background threads continue
+    /// decoding subsequent chunks concurrently.
+    pub fn drain_chunk_batch_into(
+        &self,
+        batch: &mut Vec<PrefetchItem>,
+        min_batch: usize,
+        max_batch: usize,
+    ) -> usize {
+        let initial_len = batch.len();
+        let target_min = initial_len + min_batch.max(1);
+        let target_max = initial_len + max_batch.max(min_batch);
+
+        // 1. First item: blocking wait to ensure we don't return 0 if chunks are still in progress
+        match self.receiver.recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => return batch.len() - initial_len,
+        }
+
+        // 2. Non-blocking drain for all chunks already decoded and sitting in the channel
+        while batch.len() < target_max {
+            match self.receiver.try_recv() {
+                Ok(item) => batch.push(item),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Channel is currently empty.
+                    // If we have met or exceeded target_min, return immediately to let Rayon crunch!
+                    if batch.len() >= target_min {
+                        break;
+                    }
+                    // Otherwise wait for the next chunk
+                    match self.receiver.recv() {
+                        Ok(item) => batch.push(item),
+                        Err(_) => break,
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        batch.len() - initial_len
+    }
+
     /// Pull next batch of ready chunks (pulls up to `max_batch` chunks or until EOF)
     pub fn next_chunk_batch(&self, max_batch: usize) -> Vec<PrefetchItem> {
         let mut batch = Vec::with_capacity(max_batch);
-        while batch.len() < max_batch {
-            match self.receiver.recv() {
-                Ok(item) => batch.push(item),
-                Err(_) => break, // Channel disconnected / EOF
-            }
-        }
+        self.drain_chunk_batch_into(&mut batch, max_batch, max_batch);
         batch
     }
 }
+

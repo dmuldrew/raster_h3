@@ -188,7 +188,23 @@ SELECT * FROM h3_raster_to_pmtiles(
     properties := 'mean,count'
 );
 
+-- 18. Native DuckDB GEOMETRY / WKB Interoperability
+-- Stream Well-Known Binary (WKB) 2D polygons directly into DuckDB Spatial extension
+-- (Zero-cost projection pushdown: polygon boundary calculations cost 0 CPU cycles unless 'wkb' is queried)
+-- INSTALL spatial;
+-- LOAD spatial;
+SELECT
+    h3_hex,
+    round(mean, 2) AS elevation,
+    ST_GeomFromWKB(wkb) AS geom
+FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8)
+LIMIT 5;
 
-
-
-
+-- 19. Standalone H3 Index to WKB Scalar Conversion
+-- Convert any H3 integer index or hex string into an OGC 2D Polygon WKB geometry (~10ns, zero heap alloc)
+SELECT
+    h3_hex,
+    ST_GeomFromWKB(h3_to_wkb(h3_index)) AS geom_from_int,
+    ST_GeomFromWKB(h3_to_wkb(h3_hex)) AS geom_from_str
+FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8)
+LIMIT 5;

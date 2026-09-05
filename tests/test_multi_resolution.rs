@@ -230,3 +230,33 @@ fn test_multi_resolution_empty_error_handling() {
     let result = MultiScanHorizonStreamer::new(reader, &empty_config);
     assert!(result.is_err());
 }
+
+#[test]
+fn test_prefetch_drain_chunk_batch_into() {
+    use raster_h3::raster::prefetch::PrefetchedChunkReader;
+
+    let temp_raster = create_test_geotiff(64, 64);
+    let reader = GeoTiffStreamReader::open(temp_raster.path()).unwrap();
+    let num_chunks = reader.chunk_layout.total_chunks as u32;
+
+    let indices: Vec<u32> = (0..num_chunks).collect();
+    let prefetcher = PrefetchedChunkReader::spawn_with_workers(reader, indices, num_chunks as usize, 2);
+
+    let mut batch = Vec::new();
+    let min_b = (num_chunks as usize / 2).max(1);
+    let fetched = prefetcher.drain_chunk_batch_into(&mut batch, min_b, num_chunks as usize);
+    assert!(fetched >= min_b);
+    assert_eq!(batch.len(), fetched);
+
+    // Verify chunk order
+    for (i, item) in batch.iter().enumerate() {
+        let (chunk_idx, _, _) = item.as_ref().unwrap();
+        assert_eq!(*chunk_idx, i as u32);
+    }
+
+    // Drain remainder if any
+    let fetched_rem = prefetcher.drain_chunk_batch_into(&mut batch, 1, num_chunks as usize);
+    assert_eq!(batch.len(), num_chunks as usize);
+    assert_eq!(fetched + fetched_rem, num_chunks as usize);
+}
+
