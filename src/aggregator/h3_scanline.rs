@@ -16,6 +16,32 @@ impl Default for H3ScanlineLookahead {
 
 impl H3ScanlineLookahead {
     #[inline(always)]
+    pub fn with_initial_width(width: usize) -> Self {
+        Self {
+            prev_hex_width: width.max(1),
+            current_hex_span: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn for_resolution(res: Resolution) -> Self {
+        let r_u8 = res as u8;
+        let initial_width = match r_u8 {
+            0..=6 => 64,
+            7 => 35,
+            8 => 14,
+            9 => 5,
+            _ => 2,
+        };
+        Self::with_initial_width(initial_width)
+    }
+
+    #[inline(always)]
+    pub fn reset_row(&mut self) {
+        self.current_hex_span = 0;
+    }
+
+    #[inline(always)]
     pub fn get_or_compute_cell(&mut self, lat: f64, lon: f64, res: Resolution) -> Option<u64> {
         if let Ok(ll) = LatLng::new(lat, lon) {
             Some(ll.to_cell(res).into())
@@ -47,10 +73,11 @@ impl H3ScanlineLookahead {
         d_lon_step: f64,
         res: Resolution,
         run_cell: u64,
-    ) -> usize {
+    ) -> (usize, Option<u64>) {
         let remaining_guess = self.prev_hex_width.saturating_sub(self.current_hex_span).max(1);
         let mut guess_c = (c + remaining_guess).min(row_width);
         let mut guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
+        let mut last_cell_at_right: Option<u64> = None;
         
         while guess_c < row_width {
             if let Ok(ll) = LatLng::new(lat_row, guess_lon) {
@@ -62,6 +89,7 @@ impl H3ScanlineLookahead {
                     guess_c = new_guess_c;
                     guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
                 } else {
+                    last_cell_at_right = Some(guess_cell);
                     break;
                 }
             } else {
@@ -80,11 +108,72 @@ impl H3ScanlineLookahead {
                     left = mid + 1;
                 } else {
                     right = mid;
+                    last_cell_at_right = Some(cell);
                 }
             } else {
                 right = mid;
+                last_cell_at_right = None;
             }
         }
-        left
+        (left, if left < row_width { last_cell_at_right } else { None })
+    }
+
+    /// Determine the end of the current H3 cell span for projected coordinates using exponential probe + binary search
+    #[inline(always)]
+    pub fn find_span_end_projected<F>(
+        &mut self,
+        c: usize,
+        row_width: usize,
+        x_start: f64,
+        y_row: f64,
+        dx_step: f64,
+        mut coord_to_cell: F,
+        run_cell: u64,
+    ) -> (usize, Option<u64>)
+    where
+        F: FnMut(f64, f64) -> Option<u64>,
+    {
+        let remaining_guess = self.prev_hex_width.saturating_sub(self.current_hex_span).max(1);
+        let mut guess_c = (c + remaining_guess).min(row_width);
+        let mut guess_x = x_start + (guess_c as f64) * dx_step;
+        let mut last_cell_at_right: Option<u64> = None;
+
+        while guess_c < row_width {
+            if let Some(guess_cell) = coord_to_cell(guess_x, y_row) {
+                if guess_cell == run_cell {
+                    let step = (guess_c - c).max(1);
+                    let new_guess_c = (guess_c + step).min(row_width);
+                    if new_guess_c == guess_c {
+                        break;
+                    }
+                    guess_c = new_guess_c;
+                    guess_x = x_start + (guess_c as f64) * dx_step;
+                } else {
+                    last_cell_at_right = Some(guess_cell);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let mut left = c + 1;
+        let mut right = guess_c;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let mid_x = x_start + (mid as f64) * dx_step;
+            if let Some(cell) = coord_to_cell(mid_x, y_row) {
+                if cell == run_cell {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                    last_cell_at_right = Some(cell);
+                }
+            } else {
+                right = mid;
+                last_cell_at_right = None;
+            }
+        }
+        (left, if left < row_width { last_cell_at_right } else { None })
     }
 }

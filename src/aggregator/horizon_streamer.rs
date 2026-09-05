@@ -277,6 +277,8 @@ impl ScanHorizonStreamer {
                 let mut run_acc = H3Accumulator::default();
                 let mut row_cache = H3ScanlineLookahead::default();
 
+                let is_north_up = self.gt.b == 0.0 && self.gt.d == 0.0;
+                let dx_step = self.gt.a;
                 let (x_start, y_row) = self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
 
                 let (mut lon_curr, lat_row) = if is_wgs84 {
@@ -340,10 +342,30 @@ impl ScanHorizonStreamer {
                             row_cache.on_cell_changed();
                         }
 
-                        let span_end = if is_wgs84 || is_web_mercator {
+                        let (span_end, _) = if is_wgs84 || is_web_mercator {
                             row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, self.resolution, run_cell)
+                        } else if is_north_up {
+                            row_cache.find_span_end_projected(
+                                c,
+                                row_width,
+                                x_start,
+                                y_row,
+                                dx_step,
+                                |x, y| match self.crs_transformer.transform_point(x, y) {
+                                    Ok((p_lon, p_lat)) => {
+                                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
+                                            if p_lon < b_min_lon || p_lon > b_max_lon || p_lat < b_min_lat || p_lat > b_max_lat {
+                                                return None;
+                                            }
+                                        }
+                                        LatLng::new(p_lat, p_lon).ok().map(|ll| ll.to_cell(self.resolution).into())
+                                    }
+                                    Err(_) => None,
+                                },
+                                run_cell,
+                            )
                         } else {
-                            c + 1
+                            (c + 1, None)
                         };
 
                         if native_nodata.is_none() && self.nodata.is_none() {
@@ -506,46 +528,46 @@ impl ScanHorizonStreamer {
             match next_item {
                 Some(Ok((_chunk_idx, chunk_bounds, decoding_result))) => {
                     // Process native pixels with row-constant latitude hoisting & native NoData
-                    match decoding_result {
+                    match &decoding_result {
                         DecodingResult::U8(slice) => {
                             let nd = self.nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::U16(slice) => {
                             let nd = self.nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::U32(slice) => {
                             let nd = self.nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::U64(slice) => {
                             let nd = self.nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::I8(slice) => {
                             let nd = self.nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::I16(slice) => {
                             let nd = self.nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::I32(slice) => {
                             let nd = self.nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::I64(slice) => {
                             let nd = self.nodata.map(|v| v as i64);
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::F32(slice) => {
                             let nd = self.nodata.map(|v| v as f32);
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x as f64, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
                         }
                         DecodingResult::F64(slice) => {
                             let nd = self.nodata;
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| x, nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| x, nd);
                         }
                     }
 
@@ -554,6 +576,10 @@ impl ScanHorizonStreamer {
 
                     // 3. Evict completed hexagons
                     self.evict_completed(lat_horizon);
+
+                    if let Some(ref prefetcher) = self.prefetcher {
+                        prefetcher.recycle_batch(std::iter::once(decoding_result));
+                    }
                 }
                 Some(Err(_)) | None => {
                     self.is_finished = true;

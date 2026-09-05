@@ -41,6 +41,10 @@ fn zigzag_encode(val: i32) -> u32 {
 /// Encode a Protobuf varint into a byte buffer
 #[inline(always)]
 fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
+    if val < 0x80 {
+        buf.push(val as u8);
+        return;
+    }
     while val >= 0x80 {
         buf.push(((val & 0x7F) | 0x80) as u8);
         val >>= 7;
@@ -180,16 +184,144 @@ impl MvtValue {
     }
 }
 
+/// Zero-allocation feature properties supporting fixed continuous/categorical schemas on the stack
+#[derive(Debug, Clone)]
+pub enum FeatureProperties {
+    Continuous {
+        h3_index: u64,
+        resolution: u8,
+        mean: f64,
+        sum: f64,
+        stddev: f64,
+        count: f64,
+        min: f64,
+        max: f64,
+    },
+    Categorical {
+        h3_index: u64,
+        resolution: u8,
+        majority: i64,
+        majority_fraction: f64,
+        distinct_classes: u32,
+        entropy: f64,
+        count: f64,
+    },
+    Generic(Vec<(Cow<'static, str>, MvtValue)>),
+}
+
+impl Default for FeatureProperties {
+    fn default() -> Self {
+        FeatureProperties::Generic(Vec::new())
+    }
+}
+
+impl FeatureProperties {
+    #[inline(always)]
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&str, &MvtValue),
+    {
+        match self {
+            FeatureProperties::Continuous {
+                h3_index,
+                resolution,
+                mean,
+                sum,
+                stddev,
+                count,
+                min,
+                max,
+            } => {
+                f("h3_index", &MvtValue::UInt(*h3_index));
+                f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
+                f("resolution", &MvtValue::UInt(*resolution as u64));
+                f("mean", &MvtValue::Double(*mean));
+                f("sum", &MvtValue::Double(*sum));
+                f("stddev", &MvtValue::Double(*stddev));
+                f("count", &MvtValue::Double(*count));
+                f("min", &MvtValue::Double(*min));
+                f("max", &MvtValue::Double(*max));
+            }
+            FeatureProperties::Categorical {
+                h3_index,
+                resolution,
+                majority,
+                majority_fraction,
+                distinct_classes,
+                entropy,
+                count,
+            } => {
+                f("h3_index", &MvtValue::UInt(*h3_index));
+                f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
+                f("resolution", &MvtValue::UInt(*resolution as u64));
+                f("majority", &MvtValue::Int(*majority));
+                f("majority_fraction", &MvtValue::Double(*majority_fraction));
+                f("distinct_classes", &MvtValue::UInt(*distinct_classes as u64));
+                f("entropy", &MvtValue::Double(*entropy));
+                f("count", &MvtValue::Double(*count));
+            }
+            FeatureProperties::Generic(props) => {
+                for (k, v) in props {
+                    f(k.as_ref(), v);
+                }
+            }
+        }
+    }
+}
+
+impl From<Vec<(Cow<'static, str>, MvtValue)>> for FeatureProperties {
+    #[inline(always)]
+    fn from(v: Vec<(Cow<'static, str>, MvtValue)>) -> Self {
+        FeatureProperties::Generic(v)
+    }
+}
+
 /// A single feature inside an MVT layer with stack-allocated polygon geometry
 #[derive(Debug, Clone)]
 pub struct MvtFeature {
     pub id: u64,
-    /// Properties as (key_name, value)
-    pub properties: Vec<(Cow<'static, str>, MvtValue)>,
+    /// Properties
+    pub properties: FeatureProperties,
     /// Boundary vertices in tile-local [0, 4096] integer coordinate space (stack allocated)
     pub polygon_x: [i32; 8],
     pub polygon_y: [i32; 8],
     pub num_points: u8,
+}
+
+impl MvtFeature {
+    /// Construct an MVT feature from normalized Mercator coordinates projected to tile space
+    #[inline(always)]
+    pub fn from_mercator<P: Into<FeatureProperties>>(
+        id: u64,
+        vertices: &[MercatorPoint],
+        z: u8,
+        tx: u32,
+        ty: u32,
+        extent: u32,
+        properties: P,
+    ) -> Self {
+        let n = (1u32 << z) as f64;
+        let extent_f = extent as f64;
+        let tile_x_min = (tx as f64) / n;
+        let tile_y_min = (ty as f64) / n;
+        let tile_span = 1.0 / n;
+
+        let count = vertices.len().min(8);
+        let mut px = [0i32; 8];
+        let mut py = [0i32; 8];
+        for (i, v) in vertices.iter().take(count).enumerate() {
+            px[i] = ((v.x - tile_x_min) / tile_span * extent_f).round() as i32;
+            py[i] = ((v.y - tile_y_min) / tile_span * extent_f).round() as i32;
+        }
+
+        Self {
+            id,
+            properties: properties.into(),
+            polygon_x: px,
+            polygon_y: py,
+            num_points: count as u8,
+        }
+    }
 }
 
 /// Mapbox Vector Tile layer builder
@@ -209,52 +341,49 @@ impl MvtLayer {
         }
     }
 
+    /// Add an MVT feature if not already present in this layer
+    #[inline(always)]
+    pub fn add_or_merge_feature(&mut self, feature: MvtFeature) {
+        if self.features.iter().any(|f| f.id == feature.id) {
+            return;
+        }
+        self.features.push(feature);
+    }
+
     /// Add an H3 hexagon feature with precalculated normalized Mercator coordinates
-    pub fn add_hexagon_mercator(
+    pub fn add_hexagon_mercator<P: Into<FeatureProperties>>(
         &mut self,
         id: u64,
         vertices: &[MercatorPoint],
         z: u8,
         tx: u32,
         ty: u32,
-        properties: Vec<(Cow<'static, str>, MvtValue)>,
+        properties: P,
     ) {
         if vertices.len() < 3 {
             return;
         }
 
-        let n = (1u32 << z) as f64;
-        let extent_f = self.extent as f64;
-        let tile_x_min = (tx as f64) / n;
-        let tile_y_min = (ty as f64) / n;
-        let tile_span = 1.0 / n;
-
-        let count = vertices.len().min(8);
-        let mut px = [0i32; 8];
-        let mut py = [0i32; 8];
-        for (i, v) in vertices.iter().take(count).enumerate() {
-            px[i] = ((v.x - tile_x_min) / tile_span * extent_f).round() as i32;
-            py[i] = ((v.y - tile_y_min) / tile_span * extent_f).round() as i32;
-        }
-
-        self.features.push(MvtFeature {
+        self.features.push(MvtFeature::from_mercator(
             id,
+            vertices,
+            z,
+            tx,
+            ty,
+            self.extent,
             properties,
-            polygon_x: px,
-            polygon_y: py,
-            num_points: count as u8,
-        });
+        ));
     }
 
     /// Add an H3 parent hexagon feature in the layer if not already present, avoiding duplicate polygons
-    pub fn add_or_merge_hexagon_mercator(
+    pub fn add_or_merge_hexagon_mercator<P: Into<FeatureProperties>>(
         &mut self,
         id: u64,
         vertices: &[MercatorPoint],
         z: u8,
         tx: u32,
         ty: u32,
-        properties: Vec<(Cow<'static, str>, MvtValue)>,
+        properties: P,
     ) {
         if self.features.iter().any(|f| f.id == id) {
             return;
@@ -308,7 +437,7 @@ impl MvtLayer {
 
         self.features.push(MvtFeature {
             id,
-            properties,
+            properties: properties.into(),
             polygon_x: px,
             polygon_y: py,
             num_points: count as u8,
@@ -330,28 +459,34 @@ impl MvtLayer {
 
         for feat in &self.features {
             tag_bytes.clear();
-            for (k, v) in &feat.properties {
+            feat.properties.for_each(|k, v| {
                 let key_idx = match key_map.get(k) {
                     Some(&idx) => idx,
                     None => {
                         let idx = keys.len() as u32;
                         keys.push(k.to_string());
-                        key_map.insert(k.clone(), idx);
+                        key_map.insert(Cow::Owned(k.to_string()), idx);
                         idx
                     }
                 };
-                let val_idx = match val_map.get(v) {
-                    Some(&idx) => idx,
-                    None => {
-                        let idx = values.len() as u32;
-                        values.push(v.clone());
-                        val_map.insert(v.clone(), idx);
-                        idx
+                let val_idx = if k == "h3_index" || k == "h3_hex" {
+                    let idx = values.len() as u32;
+                    values.push(v.clone());
+                    idx
+                } else {
+                    match val_map.get(v) {
+                        Some(&idx) => idx,
+                        None => {
+                            let idx = values.len() as u32;
+                            values.push(v.clone());
+                            val_map.insert(v.clone(), idx);
+                            idx
+                        }
                     }
                 };
                 write_varint(&mut tag_bytes, key_idx as u64);
                 write_varint(&mut tag_bytes, val_idx as u64);
-            }
+            });
 
             // Encode geometry commands: MoveTo(1) -> LineTo(N-1) -> ClosePath(1) directly to geom_bytes
             geom_bytes.clear();

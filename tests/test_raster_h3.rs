@@ -127,8 +127,6 @@ fn test_bitshift_resolution() {
 }
 
 #[test]
-
-#[test]
 fn test_is_chunk_all_nodata() {
     let empty_slice = vec![-9999.0f32; 100];
     assert!(is_chunk_all_nodata(&empty_slice, Some(-9999.0), |x| x as f64));
@@ -366,6 +364,78 @@ fn test_prefetched_chunk_reader() {
         count += 1;
     }
     assert_eq!(count, total_chunks);
+}
+
+#[test]
+fn test_prefetched_chunk_reader_multi_worker_ordering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi_worker_test.tif");
+    let width = 64usize;
+    let height = 64usize;
+    let data: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let total_chunks = reader.chunk_layout.total_chunks;
+    let indices: Vec<u32> = (0..total_chunks).collect();
+
+    // Verify ordering and correctness across 1, 2, and 4 worker threads
+    for num_workers in [1, 2, 4] {
+        let prefetcher = PrefetchedChunkReader::spawn_with_workers(
+            reader.clone(),
+            indices.clone(),
+            4,
+            num_workers,
+        );
+
+        let mut expected_chunk_idx = 0;
+        while let Some(res) = prefetcher.next_chunk() {
+            let (idx, bounds, _data) = res.expect("chunk decoding should succeed");
+            assert_eq!(idx, expected_chunk_idx, "Chunk out of order for num_workers={}", num_workers);
+            let expected_bounds = reader.chunk_layout.get_chunk_bounds(
+                idx,
+                reader.metadata.width,
+                reader.metadata.height,
+            );
+            assert_eq!(bounds.col_offset, expected_bounds.col_offset);
+            assert_eq!(bounds.row_offset, expected_bounds.row_offset);
+            expected_chunk_idx += 1;
+        }
+        assert_eq!(expected_chunk_idx, total_chunks);
+    }
+}
+
+#[test]
+fn test_prefetched_chunk_reader_early_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("early_drop_test.tif");
+    let width = 64usize;
+    let height = 64usize;
+    let data: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
+
+    {
+        let file = File::create(&path).unwrap();
+        let writer = BufWriter::new(file);
+        let mut encoder = TiffEncoder::new(writer).unwrap();
+        let image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        image.write_data(&data).unwrap();
+    }
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let total_chunks = reader.chunk_layout.total_chunks;
+    let indices: Vec<u32> = (0..total_chunks).collect();
+
+    // Drop prefetcher after consuming only 1 chunk with 4 workers running
+    let prefetcher = PrefetchedChunkReader::spawn_with_workers(reader, indices, 2, 4);
+    assert!(prefetcher.next_chunk().is_some());
+    drop(prefetcher); // should gracefully exit all threads without deadlock
 }
 
 #[test]

@@ -3,10 +3,17 @@
 //! Implements the open PMTiles v3 specification for cloud-native single-file
 //! vector tile archives with Gzip compression and Hilbert-indexed directory structure.
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use libdeflater::{CompressionLvl, Compressor};
+
+thread_local! {
+    static THREAD_COMPRESSOR: RefCell<Compressor> = RefCell::new(
+        Compressor::new(CompressionLvl::new(3).unwrap())
+    );
+}
 
 /// PMTiles v3 Constants
 const PMTILES_HEADER_SIZE: usize = 127;
@@ -16,6 +23,10 @@ const TILE_TYPE_MVT: u8 = 1;
 /// Encode a 64-bit unsigned integer as a Protobuf-style varint
 #[inline(always)]
 fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
+    if val < 0x80 {
+        buf.push(val as u8);
+        return;
+    }
     while val >= 0x80 {
         buf.push(((val & 0x7F) | 0x80) as u8);
         val >>= 7;
@@ -102,16 +113,18 @@ pub struct TilePayload {
     pub data: Vec<u8>, // Gzip-compressed MVT data
 }
 
-/// Gzip compress a byte slice with fast level 3 compression using libdeflater (optimal for MVT vector tiles)
+/// Gzip compress a byte slice with fast level 3 compression using a thread-local persistent libdeflater compressor
 pub fn gzip_compress(data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut compressor = Compressor::new(CompressionLvl::new(3).unwrap());
-    let max_len = compressor.gzip_compress_bound(data.len());
-    let mut compressed = vec![0u8; max_len];
-    let actual_size = compressor
-        .gzip_compress(data, &mut compressed)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("gzip compression error: {:?}", e)))?;
-    compressed.truncate(actual_size);
-    Ok(compressed)
+    THREAD_COMPRESSOR.with(|compressor_cell| {
+        let mut compressor = compressor_cell.borrow_mut();
+        let max_len = compressor.gzip_compress_bound(data.len());
+        let mut compressed = vec![0u8; max_len];
+        let actual_size = compressor
+            .gzip_compress(data, &mut compressed)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("gzip compression error: {:?}", e)))?;
+        compressed.truncate(actual_size);
+        Ok(compressed)
+    })
 }
 
 /// PMTiles v3 Directory Entry

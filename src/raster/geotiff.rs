@@ -3,7 +3,7 @@ use std::io::{Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use memmap2::Mmap;
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingBuffer, DecodingResult};
 use tiff::tags::Tag;
 
 use crate::error::Result;
@@ -107,6 +107,132 @@ impl<'a> ChunkDecoder<'a> {
 
         let data = self.decoder.read_chunk(chunk_index)?;
         Ok((chunk_bounds, data))
+    }
+
+    /// Read and decode a single chunk into an existing buffer if possible, avoiding reallocations
+    pub fn read_chunk_into(
+        &mut self,
+        chunk_index: u32,
+        mut buffer: DecodingResult,
+    ) -> Result<(RasterChunk, DecodingResult)> {
+        let chunk_bounds = self.chunk_layout.get_chunk_bounds(
+            chunk_index,
+            self.width,
+            self.height,
+        );
+
+        let data_dims = self.decoder.chunk_data_dimensions(chunk_index);
+        let required_len = (data_dims.0 as usize) * (data_dims.1 as usize);
+
+        let decoded_ok = match &mut buffer {
+            DecodingResult::U8(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::U8(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::U16(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::U16(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::U32(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::U32(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::U64(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::U64(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::I8(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::I8(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::I16(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::I16(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::I32(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::I32(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::I64(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::I64(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::F32(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0.0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::F32(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            DecodingResult::F64(ref mut v) => {
+                if v.capacity() >= required_len {
+                    v.resize(required_len, 0.0);
+                    self.decoder
+                        .read_chunk_to_buffer(DecodingBuffer::F64(&mut v[..required_len]), chunk_index, data_dims.0 as usize)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+        };
+
+        if decoded_ok {
+            Ok((chunk_bounds, buffer))
+        } else {
+            let data = self.decoder.read_chunk(chunk_index)?;
+            Ok((chunk_bounds, data))
+        }
     }
 }
 

@@ -345,6 +345,8 @@ impl CategoricalHorizonStreamer {
                 let mut run_cell: u64 = 0;
                 let mut run_acc = CategoricalAccumulator::default();
 
+                let is_north_up = self.gt.b == 0.0 && self.gt.d == 0.0;
+                let dx_step = self.gt.a;
                 let (x_start, y_row) = self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
 
                 let (mut lon_curr, lat_row) = if is_wgs84 {
@@ -411,10 +413,30 @@ impl CategoricalHorizonStreamer {
                             row_cache.on_cell_changed();
                         }
 
-                        let span_end = if is_wgs84 || is_web_mercator {
+                        let (span_end, _) = if is_wgs84 || is_web_mercator {
                             row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, self.resolution, run_cell)
+                        } else if is_north_up {
+                            row_cache.find_span_end_projected(
+                                c,
+                                row_width,
+                                x_start,
+                                y_row,
+                                dx_step,
+                                |x, y| match self.crs_transformer.transform_point(x, y) {
+                                    Ok((p_lon, p_lat)) => {
+                                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
+                                            if p_lon < b_min_lon || p_lon > b_max_lon || p_lat < b_min_lat || p_lat > b_max_lat {
+                                                return None;
+                                            }
+                                        }
+                                        LatLng::new(p_lat, p_lon).ok().map(|ll| ll.to_cell(self.resolution).into())
+                                    }
+                                    Err(_) => None,
+                                },
+                                run_cell,
+                            )
                         } else {
-                            c + 1
+                            (c + 1, None)
                         };
 
                         let mut curr_cat: Option<i64> = None;
@@ -591,7 +613,7 @@ impl CategoricalHorizonStreamer {
 
             match next_item {
                 Some(Ok((_chunk_idx, chunk_bounds, decoding_result))) => {
-                    match decoding_result {
+                    match &decoding_result {
                         DecodingResult::U8(slice) => {
                             let nd = self.nodata.and_then(|v| {
                                 if (0.0..=255.0).contains(&v) {
@@ -600,7 +622,7 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::U16(slice) => {
                             let nd = self.nodata.and_then(|v| {
@@ -610,7 +632,7 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::U32(slice) => {
                             let nd = self.nodata.and_then(|v| {
@@ -620,7 +642,7 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::U64(slice) => {
                             let nd = self.nodata.and_then(|v| {
@@ -630,7 +652,7 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::I8(slice) => {
                             let nd = self.nodata.and_then(|v| {
@@ -640,7 +662,7 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::I16(slice) => {
                             let nd = self.nodata.and_then(|v| {
@@ -650,7 +672,7 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::I32(slice) => {
                             let nd = self.nodata.and_then(|v| {
@@ -660,16 +682,16 @@ impl CategoricalHorizonStreamer {
                                     None
                                 }
                             });
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x as i64), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x as i64), nd);
                         }
                         DecodingResult::I64(slice) => {
                             let nd = self.nodata.map(|v| v as i64);
-                            self.process_chunk_slice(&slice, &chunk_bounds, |x| Some(x), nd);
+                            self.process_chunk_slice(slice, &chunk_bounds, |x| Some(x), nd);
                         }
                         DecodingResult::F32(slice) => {
                             let nd = self.nodata.map(|v| v as f32);
                             self.process_chunk_slice(
-                                &slice,
+                                slice,
                                 &chunk_bounds,
                                 |x| if x.is_finite() { Some(x.round() as i64) } else { None },
                                 nd,
@@ -678,7 +700,7 @@ impl CategoricalHorizonStreamer {
                         DecodingResult::F64(slice) => {
                             let nd = self.nodata;
                             self.process_chunk_slice(
-                                &slice,
+                                slice,
                                 &chunk_bounds,
                                 |x| if x.is_finite() { Some(x.round() as i64) } else { None },
                                 nd,
@@ -688,6 +710,10 @@ impl CategoricalHorizonStreamer {
 
                     let lat_horizon = self.compute_chunk_bottom_lat(&chunk_bounds);
                     self.evict_completed(lat_horizon);
+
+                    if let Some(ref prefetcher) = self.prefetcher {
+                        prefetcher.recycle_batch(std::iter::once(decoding_result));
+                    }
                 }
                 Some(Err(_)) | None => {
                     self.is_finished = true;

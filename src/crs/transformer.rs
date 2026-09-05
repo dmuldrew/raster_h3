@@ -9,6 +9,8 @@ const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 pub struct AlbersConicFast {
     pub lat_origin_rad: f64,
     pub lon_origin_rad: f64,
+    pub x_0: f64,
+    pub y_0: f64,
     pub n: f64,
     pub c: f64,
     pub rho0: f64,
@@ -21,6 +23,18 @@ pub struct AlbersConicFast {
 impl AlbersConicFast {
     /// Initialize with standard 2 parallels and origin (in degrees) on GRS80/WGS84 spheroid
     pub fn new(lat1_deg: f64, lat2_deg: f64, lat0_deg: f64, lon0_deg: f64) -> Self {
+        Self::with_offsets(lat1_deg, lat2_deg, lat0_deg, lon0_deg, 0.0, 0.0)
+    }
+
+    /// Initialize with standard parallels, origin, and false easting/northing offsets (in meters)
+    pub fn with_offsets(
+        lat1_deg: f64,
+        lat2_deg: f64,
+        lat0_deg: f64,
+        lon0_deg: f64,
+        x_0: f64,
+        y_0: f64,
+    ) -> Self {
         let a: f64 = 6378137.0; // GRS80/WGS84 semi-major axis
         let f: f64 = 1.0 / 298.257222101; // GRS80 flattening
         let e2: f64 = 2.0 * f - f * f;
@@ -63,6 +77,8 @@ impl AlbersConicFast {
         Self {
             lat_origin_rad: phi0,
             lon_origin_rad: lam0,
+            x_0,
+            y_0,
             n,
             c,
             rho0,
@@ -78,11 +94,58 @@ impl AlbersConicFast {
         Self::new(29.5, 45.5, 23.0, -96.0)
     }
 
+    /// Parse PROJ string parameters for an Albers Equal Area projection (+proj=aea)
+    pub fn from_proj_string(src: &str) -> Option<Self> {
+        let lower = src.to_lowercase();
+        if !lower.contains("proj=aea") {
+            return None;
+        }
+
+        // Fall back to proj4rs for non-GRS80/WGS84 ellipsoids requiring datum transforms
+        if lower.contains("clrk66") || lower.contains("nad27") || lower.contains("bessel") {
+            return None;
+        }
+
+        let mut lat_1 = None;
+        let mut lat_2 = None;
+        let mut lat_0 = None;
+        let mut lon_0 = None;
+        let mut x_0 = 0.0;
+        let mut y_0 = 0.0;
+
+        for token in lower.split(|c: char| c.is_whitespace() || c == '+') {
+            if token.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = token.split_once('=') {
+                match k.trim() {
+                    "lat_1" => lat_1 = v.parse::<f64>().ok(),
+                    "lat_2" => lat_2 = v.parse::<f64>().ok(),
+                    "lat_0" => lat_0 = v.parse::<f64>().ok(),
+                    "lon_0" => lon_0 = v.parse::<f64>().ok(),
+                    "x_0" => x_0 = v.parse::<f64>().unwrap_or(0.0),
+                    "y_0" => y_0 = v.parse::<f64>().unwrap_or(0.0),
+                    _ => {}
+                }
+            }
+        }
+
+        let l2_val = lat_2.or(lat_1);
+        let l0_val = lat_0.unwrap_or(0.0);
+
+        match (lat_1, l2_val, lon_0) {
+            (Some(l1), Some(l2), Some(ln0)) => {
+                Some(Self::with_offsets(l1, l2, l0_val, ln0, x_0, y_0))
+            }
+            _ => None,
+        }
+    }
+
     /// Analytical inverse transformation from projected (x, y) to (lon, lat) in WGS84 degrees
     #[inline(always)]
     pub fn transform_point(&self, x: f64, y: f64) -> (f64, f64) {
-        let x_p = x;
-        let y_p = self.rho0 - y;
+        let x_p = x - self.x_0;
+        let y_p = self.rho0 - (y - self.y_0);
         let rho = (x_p * x_p + y_p * y_p).sqrt();
         let theta = if self.n >= 0.0 {
             x_p.atan2(y_p)
@@ -158,6 +221,7 @@ impl CrsTransformer {
                 4326 | 4269 => return Ok(Self::Wgs84Identity),
                 3857 | 900913 | 3785 => return Ok(Self::WebMercatorFast),
                 5070 => return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070())),
+                3338 => return Ok(Self::AlbersConic(AlbersConicFast::new(55.0, 65.0, 50.0, -154.0))),
                 32601..=32660 => {
                     let zone = code - 32600;
                     let p_str = format!("+proj=utm +zone={} +datum=WGS84 +units=m +no_defs", zone);
@@ -180,13 +244,16 @@ impl CrsTransformer {
         if let Some(s) = proj_str {
             let trimmed = s.trim();
             let lower = trimmed.to_lowercase();
-            if lower.contains("longlat") || lower.contains("4326") || lower.contains("wgs84") {
+            if lower.contains("longlat") || lower.contains("latlong") || lower == "epsg:4326" || lower == "4326" {
                 return Ok(Self::Wgs84Identity);
             }
-            if lower.contains("3857") || lower.contains("900913") || (lower.contains("merc") && lower.contains("a=6378137")) {
+            if lower.contains("3857") || lower.contains("900913") || (lower.contains("proj=merc") && lower.contains("a=6378137")) {
                 return Ok(Self::WebMercatorFast);
             }
-            if lower.contains("5070") || (lower.contains("aea") && lower.contains("lat_1=29.5") && lower.contains("lat_2=45.5")) {
+            if let Some(albers) = AlbersConicFast::from_proj_string(trimmed) {
+                return Ok(Self::AlbersConic(albers));
+            }
+            if lower.contains("5070") {
                 return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070()));
             }
             return Self::from_proj_string(trimmed);
@@ -198,6 +265,21 @@ impl CrsTransformer {
 
     /// Construct from arbitrary PROJ string to WGS84
     pub fn from_proj_string(src_proj: &str) -> Result<Self> {
+        let trimmed = src_proj.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.contains("longlat") || lower.contains("latlong") || lower == "epsg:4326" || lower == "4326" {
+            return Ok(Self::Wgs84Identity);
+        }
+        if lower.contains("3857") || lower.contains("900913") || (lower.contains("proj=merc") && lower.contains("a=6378137")) {
+            return Ok(Self::WebMercatorFast);
+        }
+        if let Some(albers) = AlbersConicFast::from_proj_string(trimmed) {
+            return Ok(Self::AlbersConic(albers));
+        }
+        if lower.contains("5070") {
+            return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070()));
+        }
+
         let from = Proj::from_proj_string(src_proj)
             .map_err(|e| RasterH3Error::CrsError(format!("Failed to parse source PROJ string '{}': {:?}", src_proj, e)))?;
         let to = Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs")
@@ -287,5 +369,22 @@ mod tests {
         let (lon, lat) = tf.transform_point(500000.0, 4500000.0).unwrap();
         assert!((lon - 9.0).abs() < 0.1);
         assert!((lat - 40.65).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_hawaii_albers_parsing_and_accuracy() {
+        let proj_str = "+proj=aea +lat_1=8 +lat_2=18 +lat_0=13 +lon_0=-157 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs";
+        let tf = CrsTransformer::from_crs_or_epsg(None, Some(proj_str)).unwrap();
+
+        // Verify it was parsed as AlbersConicFast
+        match tf {
+            CrsTransformer::AlbersConic(_) => {}
+            _ => panic!("Expected AlbersConicFast for Hawaii Albers PROJ string"),
+        }
+
+        // Test origin point (0, 0) -> should be exactly (-157.0, 13.0)
+        let (lon, lat) = tf.transform_point(0.0, 0.0).unwrap();
+        assert!((lon - -157.0).abs() < 1e-6);
+        assert!((lat - 13.0).abs() < 1e-6);
     }
 }
