@@ -21,11 +21,11 @@ const WGS84_A: f64 = 6378137.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
 /// High-performance accumulator for categorical class frequencies per H3 cell.
-/// Uses an inline 4-slot array for zero-heap allocation in >98% of cells,
+/// Uses an inline 8-slot array for zero-heap allocation in >99.9% of cells,
 /// with an optional boxed hash map for complex multi-class boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CategoricalAccumulator {
-    pub inline_entries: [(i64, f64); 4],
+    pub inline_entries: [(i64, f64); 8],
     pub inline_len: u8,
     pub heap_counts: Option<Box<HashMap<i64, f64, FxBuildHasher>>>,
     pub total_count: f64,
@@ -35,7 +35,7 @@ impl Default for CategoricalAccumulator {
     #[inline(always)]
     fn default() -> Self {
         Self {
-            inline_entries: [(0, 0.0); 4],
+            inline_entries: [(0, 0.0); 8],
             inline_len: 0,
             heap_counts: None,
             total_count: 0.0,
@@ -105,13 +105,13 @@ impl CategoricalAccumulator {
             }
         }
 
-        if len < 4 {
+        if len < 8 {
             self.inline_entries[len] = (category, weight);
             self.inline_len += 1;
         } else {
             // Spill to heap
-            let mut map: HashMap<i64, f64, FxBuildHasher> = HashMap::with_capacity_and_hasher(8, FxBuildHasher::default());
-            for i in 0..4 {
+            let mut map: HashMap<i64, f64, FxBuildHasher> = HashMap::with_capacity_and_hasher(16, FxBuildHasher::default());
+            for i in 0..8 {
                 map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
             }
             map.insert(category, weight);

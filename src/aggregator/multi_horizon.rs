@@ -19,6 +19,7 @@ use crate::aggregator::horizon_streamer::{
     chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, HexEvictionEntry,
 };
 use crate::aggregator::sampling::SamplingPattern;
+use crate::aggregator::simd::SimdSpanAccumulate;
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
@@ -70,30 +71,25 @@ pub struct MultiContinuousRecord {
     pub accumulator: H3Accumulator,
 }
 
-/// Calculate the minimum WGS84 latitude reached by the bottom edge of a chunk bounds
-fn compute_chunk_bounds_bottom_lat(
-    chunk_bounds: &RasterChunk,
+/// Calculate the minimum WGS84 latitude reached across a given raster row
+
+/// Calculate the minimum WGS84 latitude reached across a given raster row
+fn compute_row_lat(
+    row: usize,
+    width: usize,
     gt: &GeoTransform,
     crs_transformer: &CrsTransformer,
 ) -> f64 {
-    let row_bottom = (chunk_bounds.row_offset + chunk_bounds.height) as usize;
     let mut min_lat = f64::INFINITY;
-
-    let col_samples = [
-        chunk_bounds.col_offset as usize,
-        (chunk_bounds.col_offset + chunk_bounds.width / 2) as usize,
-        (chunk_bounds.col_offset + chunk_bounds.width) as usize,
-    ];
-
+    let col_samples = [0, width / 2, width];
     for &c in &col_samples {
-        let (x, y) = gt.pixel_to_coord(c as f64, row_bottom as f64);
+        let (x, y) = gt.pixel_to_coord(c as f64, row as f64);
         if let Ok((_lon, lat)) = crs_transformer.transform_point(x, y) {
             if lat < min_lat {
                 min_lat = lat;
             }
         }
     }
-
     min_lat
 }
 
@@ -119,23 +115,19 @@ where
 }
 
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
-fn process_continuous_slice_into_maps<T, F, N>(
+fn process_continuous_slice_into_maps<T>(
     slice: &[T],
     chunk: &RasterChunk,
-    to_f64: F,
-    native_nodata: Option<N>,
+    native_nodata: Option<T>,
     resolutions: &[Resolution],
     crs_transformer: &CrsTransformer,
     gt: &GeoTransform,
     sampling: &SamplingPattern,
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
-    nodata: Option<f64>,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) where
-    T: Copy + PartialEq,
-    F: Fn(T) -> f64,
-    N: Copy + PartialEq<T>,
+    T: SimdSpanAccumulate,
 {
     if slice.is_empty() {
         return;
@@ -290,116 +282,9 @@ fn process_continuous_slice_into_maps<T, F, N>(
                         };
 
                         let span_slice = &slice[slice_row_start + c..slice_row_start + span_end];
-                        let mut span_sum = 0.0f64;
-                        let mut span_count = 0.0f64;
-                        let mut span_min = f64::INFINITY;
-                        let mut span_max = f64::NEG_INFINITY;
-
-                        if native_nodata.is_none() && nodata.is_none() {
-                            for &val_raw in span_slice {
-                                let val = to_f64(val_raw);
-                                if val.is_finite() {
-                                    span_sum += val;
-                                    span_min = span_min.min(val);
-                                    span_max = span_max.max(val);
-                                    span_count += 1.0;
-                                }
-                            }
-                            if span_count > 0.0 {
-                                let span_m2 = if span_min == span_max {
-                                    0.0f64
-                                } else {
-                                    let span_mean = span_sum / span_count;
-                                    let mut m2 = 0.0f64;
-                                    for &val_raw in span_slice {
-                                        let val = to_f64(val_raw);
-                                        if val.is_finite() {
-                                            let d = val - span_mean;
-                                            m2 += d * d;
-                                        }
-                                    }
-                                    m2
-                                };
-                                let span_acc = H3Accumulator {
-                                    sum: span_sum,
-                                    count: span_count,
-                                    min: span_min,
-                                    max: span_max,
-                                    m2: span_m2,
-                                };
-                                run_acc.merge(&span_acc);
-                            }
-                        } else {
-                            for &val_raw in span_slice {
-                                if let Some(nd_nat) = native_nodata {
-                                    if nd_nat == val_raw {
-                                        continue;
-                                    }
-                                }
-
-                                let val = to_f64(val_raw);
-                                if !val.is_finite() {
-                                    continue;
-                                }
-                                if native_nodata.is_none() {
-                                    if let Some(nd) = nodata {
-                                        if (val - nd).abs() < 1e-6 {
-                                            continue;
-                                        }
-                                    }
-                                }
-
-                                span_sum += val;
-                                span_min = span_min.min(val);
-                                span_max = span_max.max(val);
-                                span_count += 1.0;
-                            }
-                            if span_count > 0.0 {
-                                let span_m2 = if span_min == span_max {
-                                    0.0f64
-                                } else {
-                                    let span_mean = span_sum / span_count;
-                                    let mut m2 = 0.0f64;
-                                    if span_count as usize == span_slice.len() {
-                                        for &val_raw in span_slice {
-                                            let val = to_f64(val_raw);
-                                            let d = val - span_mean;
-                                            m2 += d * d;
-                                        }
-                                    } else {
-                                        for &val_raw in span_slice {
-                                            if let Some(nd_nat) = native_nodata {
-                                                if nd_nat == val_raw {
-                                                    continue;
-                                                }
-                                            }
-                                            let val = to_f64(val_raw);
-                                            if !val.is_finite() {
-                                                continue;
-                                            }
-                                            if native_nodata.is_none() {
-                                                if let Some(nd) = nodata {
-                                                    if (val - nd).abs() < 1e-6 {
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-
-                                            let d = val - span_mean;
-                                            m2 += d * d;
-                                        }
-                                    }
-                                    m2
-                                };
-                                let span_acc = H3Accumulator {
-                                    sum: span_sum,
-                                    count: span_count,
-                                    min: span_min,
-                                    max: span_max,
-                                    m2: span_m2,
-                                };
-                                run_acc.merge(&span_acc);
-                            }
+                        let span_acc = T::accumulate_span(span_slice, native_nodata);
+                        if span_acc.count > 0.0 {
+                            run_acc.merge(&span_acc);
                         }
 
                         let num_stepped = span_end - c;
@@ -431,23 +316,10 @@ fn process_continuous_slice_into_maps<T, F, N>(
         } else {
             for c in 0..row_width {
                 let val_raw = slice[slice_row_start + c];
-                if let Some(nd_nat) = native_nodata {
-                    if nd_nat == val_raw {
-                        continue;
-                    }
-                }
-
-                let val = to_f64(val_raw);
-                if !val.is_finite() {
+                if !val_raw.is_valid(native_nodata) {
                     continue;
                 }
-                if native_nodata.is_none() {
-                    if let Some(nd) = nodata {
-                        if (val - nd).abs() < 1e-6 {
-                            continue;
-                        }
-                    }
-                }
+                let val = val_raw.to_f64_val();
 
                 for sp in &sampling.points {
                     let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
@@ -515,43 +387,43 @@ fn process_continuous_chunk_payload_into(
     match decoding_result {
         DecodingResult::U8(slice) => {
             let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::U16(slice) => {
             let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::U32(slice) => {
             let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::U64(slice) => {
             let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::I8(slice) => {
             let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::I16(slice) => {
             let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::I32(slice) => {
             let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::I64(slice) => {
             let nd = nodata.map(|v| v as i64);
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::F32(slice) => {
             let nd = nodata.map(|v| v as f32);
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x as f64, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
         DecodingResult::F64(slice) => {
             let nd = nodata;
-            process_continuous_slice_into_maps(slice, chunk_bounds, |x| x, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, chunk_maps);
+            process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, chunk_maps);
         }
     }
     true
@@ -574,6 +446,10 @@ pub struct MultiScanHorizonStreamer {
     is_finished: bool,
     current_lat_horizon: f64,
     pub profile_stats: [u64; 4],
+    raster_width: u32,
+    chunk_height: u32,
+    chunks_across: u32,
+    highest_processed_chunk: u32,
 }
 
 impl MultiScanHorizonStreamer {
@@ -608,6 +484,10 @@ impl MultiScanHorizonStreamer {
         let gt = reader.metadata.geotransform;
         let chunk_stride = reader.chunk_layout.chunk_width;
         let total_chunks = reader.chunk_layout.total_chunks;
+        let raster_width = reader.metadata.width;
+        let chunk_height = reader.chunk_layout.chunk_height.max(1);
+        let chunk_width = reader.chunk_layout.chunk_width.max(1);
+        let chunks_across = ((raster_width + chunk_width - 1) / chunk_width).max(1);
 
         let chunk_indices: Vec<u32> = (0..total_chunks)
             .filter(|&idx| {
@@ -650,6 +530,10 @@ impl MultiScanHorizonStreamer {
             is_finished: false,
             current_lat_horizon: f64::INFINITY,
             profile_stats: [0; 4],
+            raster_width,
+            chunk_height,
+            chunks_across,
+            highest_processed_chunk: 0,
         })
     }
 
@@ -719,6 +603,13 @@ impl MultiScanHorizonStreamer {
                             });
                         }
                     }
+                    for (cell_u64, acc) in self.active_maps[res_idx].drain() {
+                        self.completed_buffer.push_back(MultiContinuousRecord {
+                            resolution: res_u8,
+                            h3_index: cell_u64,
+                            accumulator: acc,
+                        });
+                    }
                 }
                 eprintln!(
                     "FETCH SUB-TIMINGS: prefetch_wait={:.3}s, rayon_compute={:.3}s, merge={:.3}s, evict={:.3}s",
@@ -740,7 +631,7 @@ impl MultiScanHorizonStreamer {
 
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(f64, Vec<Vec<(u64, H3Accumulator)>>, DecodingResult)> = chunk_items
+            let parallel_results: Vec<(u32, Vec<Vec<(u64, H3Accumulator)>>, DecodingResult)> = chunk_items
                 .par_iter_mut()
                 .map_init(
                     || {
@@ -752,8 +643,7 @@ impl MultiScanHorizonStreamer {
                     },
                     |local_maps, item| {
                         match item {
-                            Ok((_chunk_idx, chunk_bounds, decoding_result)) => {
-                                let bottom_lat = compute_chunk_bounds_bottom_lat(chunk_bounds, gt, crs_transformer);
+                            Ok((chunk_idx, chunk_bounds, decoding_result)) => {
                                 for m in local_maps.iter_mut() {
                                     m.clear();
                                 }
@@ -777,7 +667,7 @@ impl MultiScanHorizonStreamer {
                                     }
                                 }
                                 let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
-                                Some((bottom_lat, chunk_entries, dec))
+                                Some((*chunk_idx, chunk_entries, dec))
                             }
                             Err(_) => None,
                         }
@@ -787,15 +677,11 @@ impl MultiScanHorizonStreamer {
                 .collect();
             self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
 
-
-            let mut min_batch_lat = f64::INFINITY;
             let mut recycled_buffers = Vec::with_capacity(parallel_results.len());
 
             let t2 = std::time::Instant::now();
-            for (bottom_lat, chunk_entries, decoding_result) in parallel_results {
-                if bottom_lat < min_batch_lat {
-                    min_batch_lat = bottom_lat;
-                }
+            for (chunk_idx, chunk_entries, decoding_result) in parallel_results {
+                self.highest_processed_chunk = self.highest_processed_chunk.max(chunk_idx);
 
                 if !chunk_entries.is_empty() {
                     for (res_idx, entries) in chunk_entries.into_iter().enumerate() {
@@ -826,11 +712,16 @@ impl MultiScanHorizonStreamer {
             }
             self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
 
-            if min_batch_lat.is_finite() {
-                let t3 = std::time::Instant::now();
-                self.current_lat_horizon = min_batch_lat;
-                self.evict_completed(min_batch_lat);
-                self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
+            let completed_rows = (self.highest_processed_chunk + 1) / self.chunks_across;
+            if completed_rows > 0 {
+                let safe_row = (completed_rows * self.chunk_height) as usize;
+                let safe_lat = compute_row_lat(safe_row, self.raster_width as usize, &self.gt, &self.crs_transformer);
+                if safe_lat < self.current_lat_horizon {
+                    let t3 = std::time::Instant::now();
+                    self.current_lat_horizon = safe_lat;
+                    self.evict_completed(safe_lat);
+                    self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
+                }
             }
         }
     }
@@ -1048,40 +939,66 @@ fn process_categorical_slice_into_maps<T, F, N>(
                             (c + 1, None)
                         };
 
-                        let mut curr_cat: Option<i64> = None;
-                        let mut curr_cat_count: f64 = 0.0;
+                        let span_slice = &slice[slice_row_start + c..slice_row_start + span_end];
+                        let first_val = span_slice[0];
+                        let is_uniform = span_slice.iter().all(|&v| v == first_val);
 
-                        for i in c..span_end {
-                            let val_raw = slice[slice_row_start + i];
-
+                        if is_uniform {
+                            let mut is_nd = false;
                             if let Some(nd_nat) = native_nodata {
-                                if nd_nat == val_raw {
-                                    continue;
+                                if nd_nat == first_val {
+                                    is_nd = true;
                                 }
                             }
-
-                            if let Some(cat) = to_i64(val_raw) {
-                                if native_nodata.is_none() {
-                                    if let Some(nd) = nodata {
-                                        if (cat as f64 - nd).abs() < 1e-6 {
-                                            continue;
+                            if !is_nd {
+                                if let Some(cat) = to_i64(first_val) {
+                                    let mut is_nd_float = false;
+                                    if native_nodata.is_none() {
+                                        if let Some(nd) = nodata {
+                                            if (cat as f64 - nd).abs() < 1e-6 {
+                                                is_nd_float = true;
+                                            }
                                         }
                                     }
-                                }
-                                if Some(cat) == curr_cat {
-                                    curr_cat_count += 1.0;
-                                } else {
-                                    if let Some(prev) = curr_cat {
-                                        run_acc.update_weighted(prev, curr_cat_count);
+                                    if !is_nd_float {
+                                        run_acc.update_weighted(cat, span_slice.len() as f64);
                                     }
-                                    curr_cat = Some(cat);
-                                    curr_cat_count = 1.0;
                                 }
                             }
-                        }
+                        } else {
+                            let mut curr_cat: Option<i64> = None;
+                            let mut curr_cat_count: f64 = 0.0;
 
-                        if let Some(prev) = curr_cat {
-                            run_acc.update_weighted(prev, curr_cat_count);
+                            for &val_raw in span_slice {
+                                if let Some(nd_nat) = native_nodata {
+                                    if nd_nat == val_raw {
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(cat) = to_i64(val_raw) {
+                                    if native_nodata.is_none() {
+                                        if let Some(nd) = nodata {
+                                            if (cat as f64 - nd).abs() < 1e-6 {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    if Some(cat) == curr_cat {
+                                        curr_cat_count += 1.0;
+                                    } else {
+                                        if let Some(prev) = curr_cat {
+                                            run_acc.update_weighted(prev, curr_cat_count);
+                                        }
+                                        curr_cat = Some(cat);
+                                        curr_cat_count = 1.0;
+                                    }
+                                }
+                            }
+
+                            if let Some(prev) = curr_cat {
+                                run_acc.update_weighted(prev, curr_cat_count);
+                            }
                         }
 
                         let num_stepped = span_end - c;
@@ -1254,6 +1171,10 @@ pub struct MultiCategoricalHorizonStreamer {
     is_finished: bool,
     current_lat_horizon: f64,
     pub profile_stats: [u64; 4],
+    raster_width: u32,
+    chunk_height: u32,
+    chunks_across: u32,
+    highest_processed_chunk: u32,
 }
 
 impl MultiCategoricalHorizonStreamer {
@@ -1288,6 +1209,10 @@ impl MultiCategoricalHorizonStreamer {
         let gt = reader.metadata.geotransform;
         let chunk_stride = reader.chunk_layout.chunk_width;
         let total_chunks = reader.chunk_layout.total_chunks;
+        let raster_width = reader.metadata.width;
+        let chunk_height = reader.chunk_layout.chunk_height.max(1);
+        let chunk_width = reader.chunk_layout.chunk_width.max(1);
+        let chunks_across = ((raster_width + chunk_width - 1) / chunk_width).max(1);
 
         let chunk_indices: Vec<u32> = (0..total_chunks)
             .filter(|&idx| {
@@ -1330,6 +1255,10 @@ impl MultiCategoricalHorizonStreamer {
             is_finished: false,
             current_lat_horizon: f64::INFINITY,
             profile_stats: [0; 4],
+            raster_width,
+            chunk_height,
+            chunks_across,
+            highest_processed_chunk: 0,
         })
     }
 
@@ -1399,6 +1328,13 @@ impl MultiCategoricalHorizonStreamer {
                             });
                         }
                     }
+                    for (cell_u64, acc) in self.active_maps[res_idx].drain() {
+                        self.completed_buffer.push_back(MultiCategoricalRecord {
+                            resolution: res_u8,
+                            h3_index: cell_u64,
+                            accumulator: acc,
+                        });
+                    }
                 }
                 eprintln!(
                     "FETCH SUB-TIMINGS: prefetch_wait={:.3}s, rayon_compute={:.3}s, merge={:.3}s, evict={:.3}s",
@@ -1420,7 +1356,7 @@ impl MultiCategoricalHorizonStreamer {
 
             // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
             let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(f64, Vec<Vec<(u64, CategoricalAccumulator)>>, DecodingResult)> = chunk_items
+            let parallel_results: Vec<(u32, Vec<Vec<(u64, CategoricalAccumulator)>>, DecodingResult)> = chunk_items
                 .par_iter_mut()
                 .map_init(
                     || {
@@ -1432,8 +1368,7 @@ impl MultiCategoricalHorizonStreamer {
                     },
                     |local_maps, item| {
                         match item {
-                            Ok((_chunk_idx, chunk_bounds, decoding_result)) => {
-                                let bottom_lat = compute_chunk_bounds_bottom_lat(chunk_bounds, gt, crs_transformer);
+                            Ok((chunk_idx, chunk_bounds, decoding_result)) => {
                                 for m in local_maps.iter_mut() {
                                     m.clear();
                                 }
@@ -1457,7 +1392,7 @@ impl MultiCategoricalHorizonStreamer {
                                     }
                                 }
                                 let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
-                                Some((bottom_lat, chunk_entries, dec))
+                                Some((*chunk_idx, chunk_entries, dec))
                             }
                             Err(_) => None,
                         }
@@ -1467,15 +1402,11 @@ impl MultiCategoricalHorizonStreamer {
                 .collect();
             self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
 
-
-            let mut min_batch_lat = f64::INFINITY;
             let mut recycled_buffers = Vec::with_capacity(parallel_results.len());
 
             let t2 = std::time::Instant::now();
-            for (bottom_lat, chunk_entries, decoding_result) in parallel_results {
-                if bottom_lat < min_batch_lat {
-                    min_batch_lat = bottom_lat;
-                }
+            for (chunk_idx, chunk_entries, decoding_result) in parallel_results {
+                self.highest_processed_chunk = self.highest_processed_chunk.max(chunk_idx);
 
                 if !chunk_entries.is_empty() {
                     for (res_idx, entries) in chunk_entries.into_iter().enumerate() {
@@ -1506,11 +1437,16 @@ impl MultiCategoricalHorizonStreamer {
             }
             self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
 
-            if min_batch_lat.is_finite() {
-                let t3 = std::time::Instant::now();
-                self.current_lat_horizon = min_batch_lat;
-                self.evict_completed(min_batch_lat);
-                self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
+            let completed_rows = (self.highest_processed_chunk + 1) / self.chunks_across;
+            if completed_rows > 0 {
+                let safe_row = (completed_rows * self.chunk_height) as usize;
+                let safe_lat = compute_row_lat(safe_row, self.raster_width as usize, &self.gt, &self.crs_transformer);
+                if safe_lat < self.current_lat_horizon {
+                    let t3 = std::time::Instant::now();
+                    self.current_lat_horizon = safe_lat;
+                    self.evict_completed(safe_lat);
+                    self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
+                }
             }
         }
     }

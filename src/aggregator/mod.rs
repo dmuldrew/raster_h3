@@ -5,6 +5,7 @@ pub mod h3_scanline;
 pub mod horizon_streamer;
 pub mod multi_horizon;
 pub mod sampling;
+pub mod simd;
 
 pub use accumulator::H3Accumulator;
 pub use categorical::{CategoricalAccumulator, CategoricalHorizonStreamer};
@@ -19,3 +20,4 @@ pub use multi_horizon::{
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 pub use sampling::{SamplePoint, SamplingPattern};
+pub use simd::SimdSpanAccumulate;

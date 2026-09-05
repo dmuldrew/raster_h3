@@ -1823,6 +1823,111 @@ fn test_wkb_ogc_compliance() {
     assert_eq!(&buf[..len], &buf2[..len2]);
 }
 
+#[test]
+fn test_simd_span_f32_accuracy_and_welford_equivalence() {
+    use raster_h3::aggregator::simd::SimdSpanAccumulate;
+
+    // 1. Test arbitrary floating-point values
+    let raw_vals: Vec<f32> = (0..127).map(|i| ((i * 7 + 13) % 97) as f32 * 1.5).collect();
+    let mut welford = H3Accumulator::default();
+    for &v in &raw_vals {
+        welford.update(v as f64);
+    }
+
+    let simd_acc = f32::accumulate_span(&raw_vals, None);
+
+    assert_eq!(simd_acc.count, welford.count);
+    assert!((simd_acc.sum - welford.sum).abs() < 1e-4);
+    assert!((simd_acc.mean() - welford.mean()).abs() < 1e-6);
+    assert!((simd_acc.variance() - welford.variance()).abs() < 1e-4);
+    assert_eq!(simd_acc.min, welford.min);
+    assert_eq!(simd_acc.max, welford.max);
+
+    // 2. Test uniform span shortcut (zero variance)
+    let uniform_vals = vec![42.5f32; 100];
+    let uniform_acc = f32::accumulate_span(&uniform_vals, None);
+    assert_eq!(uniform_acc.count, 100.0);
+    assert_eq!(uniform_acc.min, 42.5);
+    assert_eq!(uniform_acc.max, 42.5);
+    assert_eq!(uniform_acc.m2, 0.0);
+    assert_eq!(uniform_acc.variance(), 0.0);
+
+    // 3. Test with NoData filtering
+    let mut nodata_vals = raw_vals.clone();
+    nodata_vals[5] = -9999.0;
+    nodata_vals[15] = -9999.0;
+    nodata_vals[50] = -9999.0;
+
+    let nd_acc = f32::accumulate_span(&nodata_vals, Some(-9999.0));
+    assert_eq!(nd_acc.count, 124.0);
+    assert!((nd_acc.sum - (welford.sum - raw_vals[5] as f64 - raw_vals[15] as f64 - raw_vals[50] as f64)).abs() < 1e-4);
+}
+
+#[test]
+fn test_simd_span_integer_types() {
+    use raster_h3::aggregator::simd::SimdSpanAccumulate;
+
+    // Test u8
+    let u8_vals: Vec<u8> = (0..200).map(|i| (i % 50) as u8).collect();
+    let u8_acc = u8::accumulate_span(&u8_vals, Some(0));
+    assert_eq!(u8_acc.count, 196.0); // 4 zeroes skipped
+
+    // Test u16
+    let u16_vals: Vec<u16> = (0..500).map(|i| (i * 10) as u16).collect();
+    let u16_acc = u16::accumulate_span(&u16_vals, None);
+    assert_eq!(u16_acc.count, 500.0);
+    assert_eq!(u16_acc.min, 0.0);
+    assert_eq!(u16_acc.max, 4990.0);
+
+    // Test i32
+    let i32_vals: Vec<i32> = vec![-100, 200, 500, -300, 1000];
+    let i32_acc = i32::accumulate_span(&i32_vals, Some(-300));
+    assert_eq!(i32_acc.count, 4.0);
+    assert_eq!(i32_acc.sum, 1600.0);
+}
+
+#[test]
+fn test_categorical_8_slot_inline_and_heap_spillover() {
+    use raster_h3::aggregator::categorical::CategoricalAccumulator;
+
+    let mut cat = CategoricalAccumulator::new();
+
+    // 1. Add 8 distinct classes: should remain 100% inline with zero heap allocation
+    for c in 1..=8 {
+        cat.update_weighted(c, (c * 10) as f64);
+    }
+
+    assert_eq!(cat.inline_len, 8);
+    assert!(cat.heap_counts.is_none(), "Must stay inline up to 8 classes");
+    assert_eq!(cat.unique_classes(), 8);
+    assert_eq!(cat.total_count, 360.0);
+    assert_eq!(cat.get_class_count(5), 50.0);
+
+    let (maj_cls, maj_count, maj_frac) = cat.majority();
+    assert_eq!(maj_cls, 8);
+    assert_eq!(maj_count, 80.0);
+    assert!((maj_frac - (80.0 / 360.0)).abs() < 1e-6);
+
+    // 2. Add 9th class: should spill to heap
+    cat.update_weighted(9, 100.0);
+    assert!(cat.heap_counts.is_some(), "Must spill to heap on 9th class");
+    assert_eq!(cat.unique_classes(), 9);
+    assert_eq!(cat.total_count, 460.0);
+    assert_eq!(cat.get_class_count(9), 100.0);
+    assert_eq!(cat.majority().0, 9);
+
+    // 3. Merge with another inline accumulator
+    let mut cat2 = CategoricalAccumulator::new();
+    cat2.update_weighted(1, 20.0);
+    cat2.update_weighted(10, 50.0);
+
+    cat.merge(&cat2);
+    assert_eq!(cat.unique_classes(), 10);
+    assert_eq!(cat.get_class_count(1), 30.0);
+    assert_eq!(cat.get_class_count(10), 50.0);
+    assert_eq!(cat.total_count, 530.0);
+}
+
 
 
 
