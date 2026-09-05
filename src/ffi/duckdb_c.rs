@@ -138,6 +138,8 @@ extern "C" {
         destroy: Option<duckdb_delete_callback_t>,
     );
     pub fn duckdb_init_get_init_data(info: duckdb_init_info) -> *mut c_void;
+    pub fn duckdb_init_get_column_count(info: duckdb_init_info) -> idx_t;
+    pub fn duckdb_init_get_column_index(info: duckdb_init_info, column_index: idx_t) -> idx_t;
     pub fn duckdb_init_set_error(info: duckdb_init_info, error: *const c_char);
 
     // Function info

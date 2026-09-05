@@ -2,8 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Mutex;
 
-use crate::aggregator::categorical::CategoricalHorizonStreamer;
-use crate::aggregator::horizon_streamer::AggregationConfig;
+use crate::aggregator::multi_horizon::{MultiCategoricalHorizonStreamer, MultiResolutionConfig};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
@@ -37,8 +36,9 @@ pub struct LongCategoricalRow {
 }
 
 pub struct RasterH3CategoricalGlobalData {
-    pub streamer: Mutex<CategoricalHorizonStreamer>,
+    pub streamer: Mutex<MultiCategoricalHorizonStreamer>,
     pub format: CategoricalOutputFormat,
+    pub projected_columns: Vec<usize>,
     pub long_queue: Mutex<VecDeque<LongCategoricalRow>>,
 }
 
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
     let name_max_lat = to_c_string("max_lat");
     let named_max_lat_val = duckdb_bind_get_named_parameter(info, name_max_lat.as_ptr());
 
-    let bbox = if !named_min_lon_val.is_null()
+    let mut bbox = if !named_min_lon_val.is_null()
         && !named_min_lat_val.is_null()
         && !named_max_lon_val.is_null()
         && !named_max_lat_val.is_null()
@@ -195,6 +195,33 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
     } else {
         None
     };
+
+    // Optional spatial filter: h3_cell (BIGINT) or h3_hex (VARCHAR)
+    if bbox.is_none() {
+        let name_cell = to_c_string("h3_cell");
+        let named_cell_val = duckdb_bind_get_named_parameter(info, name_cell.as_ptr());
+        if !named_cell_val.is_null() {
+            let cell_u64 = duckdb_get_uint64(named_cell_val);
+            if let Ok(cell) = h3o::CellIndex::try_from(cell_u64) {
+                let ll: h3o::LatLng = cell.into();
+                let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
+                bbox = Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
+            }
+        } else {
+            let name_h3_hex = to_c_string("h3_hex");
+            let named_h3_hex_val = duckdb_bind_get_named_parameter(info, name_h3_hex.as_ptr());
+            if !named_h3_hex_val.is_null() {
+                let hex_str_ptr = duckdb_get_varchar(named_h3_hex_val);
+                if let Some(s) = from_duckdb_string(hex_str_ptr) {
+                    if let Ok(cell) = s.trim().parse::<h3o::CellIndex>() {
+                        let ll: h3o::LatLng = cell.into();
+                        let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
+                        bbox = Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
+                    }
+                }
+            }
+        }
+    }
 
     // Define result columns based on format
     let type_ubigint = duckdb_create_logical_type(DuckDBType::UBigInt);
@@ -255,11 +282,32 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
     let mut type_double_mut = type_double;
     duckdb_destroy_logical_type(&mut type_double_mut);
 
-    // Cardinality estimation
+    // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
+    const H3_AREA_M2: [f64; 16] = [
+        4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
+        3.613e7, 5.161e6, 7.373e5, 1.053e5, 1.505e4, 2.150e3,
+        3.071e2, 4.387e1, 6.268e0, 8.954e-1,
+    ];
+
     let estimated_cardinality = if let Ok(reader) = GeoTiffStreamReader::open(&file_path) {
-        let w = reader.metadata.width as u64;
-        let h = reader.metadata.height as u64;
-        (w * h / 10).max(1)
+        let w = reader.metadata.width as f64;
+        let h = reader.metadata.height as f64;
+        let total_pixels = (w * h) as u64;
+
+        let (x0, y0) = reader.metadata.geotransform.pixel_to_coord(0.0, 0.0);
+        let (x1, y1) = reader.metadata.geotransform.pixel_to_coord(w, h);
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+
+        let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
+            dx * 111_320.0 * dy * 110_540.0
+        } else {
+            dx * dy
+        };
+
+        let hex_area = H3_AREA_M2.get(resolution as usize).copied().unwrap_or(7.373e5);
+        let hex_count = (area_m2 / hex_area).ceil() as u64;
+        hex_count.min(total_pixels).max(1)
     } else {
         10_000
     };
@@ -304,15 +352,20 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         }
     };
 
-    let config = AggregationConfig {
-        resolution: bind_data.resolution,
-        custom_crs: bind_data.source_crs.clone(),
-        custom_nodata: bind_data.nodata,
-        bbox: bind_data.bbox,
-        sampling: bind_data.sampling.clone(),
-    };
+    let col_count = duckdb_init_get_column_count(info);
+    let mut projected_columns = Vec::with_capacity(col_count as usize);
+    for i in 0..col_count {
+        projected_columns.push(duckdb_init_get_column_index(info, i) as usize);
+    }
 
-    let streamer = match CategoricalHorizonStreamer::new(reader, &config) {
+    let mut config = MultiResolutionConfig::new(vec![bind_data.resolution]);
+    config.custom_crs = bind_data.source_crs.clone();
+    config.custom_nodata = bind_data.nodata;
+    config.bbox = bind_data.bbox;
+    config.sampling = bind_data.sampling.clone();
+    config.band = bind_data.band as usize;
+
+    let streamer = match MultiCategoricalHorizonStreamer::new(reader, &config) {
         Ok(s) => s,
         Err(e) => {
             let err_msg = CString::new(format!("Failed to initialize categorical streamer: {}", e))
@@ -325,6 +378,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
     let global_data = Box::new(RasterH3CategoricalGlobalData {
         streamer: Mutex::new(streamer),
         format: bind_data.format,
+        projected_columns,
         long_queue: Mutex::new(VecDeque::new()),
     });
 
@@ -356,72 +410,109 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
         return;
     }
     let global_data = &*global_data_ptr;
+    let proj_cols = &global_data.projected_columns;
 
     match global_data.format {
         CategoricalOutputFormat::Wide => {
-            // Options A & B: Wide format (1 row per hex)
-            let batch = {
+            // Fast path: if 0 columns are projected (e.g. SELECT count(*))
+            if proj_cols.is_empty() {
                 let mut streamer = match global_data.streamer.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                streamer.fetch_next_batch(2048)
-            };
-
-            let batch_size = batch.len();
-            if batch_size == 0 {
-                duckdb_data_chunk_set_size(output, 0);
+                let count = streamer.drain_completed_into(2048, |_i, _rec| {});
+                duckdb_data_chunk_set_size(output, count as idx_t);
                 return;
             }
 
-            let v_h3 = duckdb_data_chunk_get_vector(output, 0);
-            let v_hex = duckdb_data_chunk_get_vector(output, 1);
-            let v_maj_cls = duckdb_data_chunk_get_vector(output, 2);
-            let v_maj_frac = duckdb_data_chunk_get_vector(output, 3);
-            let v_maj_cnt = duckdb_data_chunk_get_vector(output, 4);
-            let v_uniq = duckdb_data_chunk_get_vector(output, 5);
-            let v_tot = duckdb_data_chunk_get_vector(output, 6);
-            let v_hist = duckdb_data_chunk_get_vector(output, 7);
+            // Schema column mapping (Wide):
+            // 0: h3_index UBIGINT
+            // 1: h3_hex VARCHAR
+            // 2: majority_class BIGINT
+            // 3: majority_fraction DOUBLE
+            // 4: majority_count DOUBLE
+            // 5: unique_classes BIGINT
+            // 6: total_count DOUBLE
+            // 7: histogram VARCHAR
+            let mut vec_h3: Option<*mut u64> = None;
+            let mut vec_hex: Option<duckdb_vector> = None;
+            let mut vec_maj_cls: Option<*mut i64> = None;
+            let mut vec_maj_frac: Option<*mut f64> = None;
+            let mut vec_maj_cnt: Option<*mut f64> = None;
+            let mut vec_uniq: Option<*mut i64> = None;
+            let mut vec_tot: Option<*mut f64> = None;
+            let mut vec_hist: Option<duckdb_vector> = None;
 
-            let p_h3 = duckdb_vector_get_data(v_h3) as *mut u64;
-            let p_maj_cls = duckdb_vector_get_data(v_maj_cls) as *mut i64;
-            let p_maj_frac = duckdb_vector_get_data(v_maj_frac) as *mut f64;
-            let p_maj_cnt = duckdb_vector_get_data(v_maj_cnt) as *mut f64;
-            let p_uniq = duckdb_vector_get_data(v_uniq) as *mut i64;
-            let p_tot = duckdb_vector_get_data(v_tot) as *mut f64;
-
-            let mut hex_buf = [0u8; 16];
-
-            for (i, (cell_u64, acc)) in batch.iter().enumerate() {
-                let row_idx = i as u64;
-
-                *p_h3.add(i) = *cell_u64;
-
-                let hex_slice = fast_hex_u64(*cell_u64, &mut hex_buf);
-                duckdb_vector_assign_string_element_len(
-                    v_hex,
-                    row_idx,
-                    hex_slice.as_ptr() as *const c_char,
-                    hex_slice.len() as idx_t,
-                );
-
-                let (maj_cls, maj_cnt, maj_frac) = acc.majority();
-                *p_maj_cls.add(i) = maj_cls;
-                *p_maj_frac.add(i) = maj_frac;
-                *p_maj_cnt.add(i) = maj_cnt;
-                *p_uniq.add(i) = acc.unique_classes() as i64;
-                *p_tot.add(i) = acc.total_count;
-
-                let hist_json = acc.histogram_json();
-                duckdb_vector_assign_string_element_len(
-                    v_hist,
-                    row_idx,
-                    hist_json.as_ptr() as *const c_char,
-                    hist_json.len() as idx_t,
-                );
+            for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
+                let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
+                match orig_col {
+                    0 => vec_h3 = Some(duckdb_vector_get_data(v) as *mut u64),
+                    1 => vec_hex = Some(v),
+                    2 => vec_maj_cls = Some(duckdb_vector_get_data(v) as *mut i64),
+                    3 => vec_maj_frac = Some(duckdb_vector_get_data(v) as *mut f64),
+                    4 => vec_maj_cnt = Some(duckdb_vector_get_data(v) as *mut f64),
+                    5 => vec_uniq = Some(duckdb_vector_get_data(v) as *mut i64),
+                    6 => vec_tot = Some(duckdb_vector_get_data(v) as *mut f64),
+                    7 => vec_hist = Some(v),
+                    _ => {}
+                }
             }
 
-            duckdb_data_chunk_set_size(output, batch_size as idx_t);
+            let need_majority = vec_maj_cls.is_some() || vec_maj_frac.is_some() || vec_maj_cnt.is_some();
+            let mut hex_buf = [0u8; 16];
+
+            let num_emitted = {
+                let mut streamer = match global_data.streamer.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                streamer.drain_completed_into(2048, |i, rec| {
+                    let row_idx = i as u64;
+
+                    if let Some(p) = vec_h3 {
+                        *p.add(i) = rec.h3_index;
+                    }
+                    if let Some(v) = vec_hex {
+                        let hex_slice = fast_hex_u64(rec.h3_index, &mut hex_buf);
+                        duckdb_vector_assign_string_element_len(
+                            v,
+                            row_idx,
+                            hex_slice.as_ptr() as *const c_char,
+                            hex_slice.len() as idx_t,
+                        );
+                    }
+                    if need_majority {
+                        let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
+                        if let Some(p) = vec_maj_cls {
+                            *p.add(i) = maj_cls;
+                        }
+                        if let Some(p) = vec_maj_frac {
+                            *p.add(i) = maj_frac;
+                        }
+                        if let Some(p) = vec_maj_cnt {
+                            *p.add(i) = maj_cnt;
+                        }
+                    }
+                    if let Some(p) = vec_uniq {
+                        *p.add(i) = rec.accumulator.unique_classes() as i64;
+                    }
+                    if let Some(p) = vec_tot {
+                        *p.add(i) = rec.accumulator.total_count;
+                    }
+                    if let Some(v) = vec_hist {
+                        let hist_json = rec.accumulator.histogram_json();
+                        duckdb_vector_assign_string_element_len(
+                            v,
+                            row_idx,
+                            hist_json.as_ptr() as *const c_char,
+                            hist_json.len() as idx_t,
+                        );
+                    }
+                })
+            };
+
+            duckdb_data_chunk_set_size(output, num_emitted as idx_t);
         }
         CategoricalOutputFormat::Long => {
             // Option C: Long format (1 row per (hex, category))
@@ -431,37 +522,36 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             };
 
             while long_queue.len() < 2048 {
-                let batch = {
-                    let mut streamer = match global_data.streamer.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    streamer.fetch_next_batch(256)
+                let mut streamer = match global_data.streamer.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
                 };
 
-                if batch.is_empty() {
-                    break;
-                }
-
-                for (cell_u64, acc) in batch {
-                    let mut entries: Vec<(i64, f64)> = Vec::with_capacity(acc.unique_classes());
-                    acc.for_each_class(|cat, cnt| entries.push((cat, cnt)));
+                let mut added_any = false;
+                streamer.drain_completed_into(256, |_i, rec| {
+                    added_any = true;
+                    let mut entries: Vec<(i64, f64)> = Vec::with_capacity(rec.accumulator.unique_classes());
+                    rec.accumulator.for_each_class(|cat, cnt| entries.push((cat, cnt)));
                     entries.sort_unstable_by_key(|&(cat, _)| cat);
 
                     for (cat, cnt) in entries {
-                        let fraction = if acc.total_count > 0.0 {
-                            cnt / acc.total_count
+                        let fraction = if rec.accumulator.total_count > 0.0 {
+                            cnt / rec.accumulator.total_count
                         } else {
                             0.0
                         };
                         long_queue.push_back(LongCategoricalRow {
-                            cell_u64,
+                            cell_u64: rec.h3_index,
                             category: cat,
                             count: cnt,
                             fraction,
-                            total_count: acc.total_count,
+                            total_count: rec.accumulator.total_count,
                         });
                     }
+                });
+
+                if !added_any {
+                    break;
                 }
             }
 
@@ -471,18 +561,40 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 return;
             }
 
-            let v_h3 = duckdb_data_chunk_get_vector(output, 0);
-            let v_hex = duckdb_data_chunk_get_vector(output, 1);
-            let v_cat = duckdb_data_chunk_get_vector(output, 2);
-            let v_cnt = duckdb_data_chunk_get_vector(output, 3);
-            let v_frac = duckdb_data_chunk_get_vector(output, 4);
-            let v_tot = duckdb_data_chunk_get_vector(output, 5);
+            if proj_cols.is_empty() {
+                for _ in 0..num_taken {
+                    long_queue.pop_front();
+                }
+                duckdb_data_chunk_set_size(output, num_taken as idx_t);
+                return;
+            }
 
-            let p_h3 = duckdb_vector_get_data(v_h3) as *mut u64;
-            let p_cat = duckdb_vector_get_data(v_cat) as *mut i64;
-            let p_cnt = duckdb_vector_get_data(v_cnt) as *mut f64;
-            let p_frac = duckdb_vector_get_data(v_frac) as *mut f64;
-            let p_tot = duckdb_vector_get_data(v_tot) as *mut f64;
+            // Schema column mapping (Long):
+            // 0: h3_index UBIGINT
+            // 1: h3_hex VARCHAR
+            // 2: category BIGINT
+            // 3: count DOUBLE
+            // 4: fraction DOUBLE
+            // 5: total_count DOUBLE
+            let mut vec_h3: Option<*mut u64> = None;
+            let mut vec_hex: Option<duckdb_vector> = None;
+            let mut vec_cat: Option<*mut i64> = None;
+            let mut vec_cnt: Option<*mut f64> = None;
+            let mut vec_frac: Option<*mut f64> = None;
+            let mut vec_tot: Option<*mut f64> = None;
+
+            for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
+                let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
+                match orig_col {
+                    0 => vec_h3 = Some(duckdb_vector_get_data(v) as *mut u64),
+                    1 => vec_hex = Some(v),
+                    2 => vec_cat = Some(duckdb_vector_get_data(v) as *mut i64),
+                    3 => vec_cnt = Some(duckdb_vector_get_data(v) as *mut f64),
+                    4 => vec_frac = Some(duckdb_vector_get_data(v) as *mut f64),
+                    5 => vec_tot = Some(duckdb_vector_get_data(v) as *mut f64),
+                    _ => {}
+                }
+            }
 
             let mut hex_buf = [0u8; 16];
 
@@ -490,20 +602,30 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 let row = long_queue.pop_front().unwrap();
                 let row_idx = i as u64;
 
-                *p_h3.add(i) = row.cell_u64;
-
-                let hex_slice = fast_hex_u64(row.cell_u64, &mut hex_buf);
-                duckdb_vector_assign_string_element_len(
-                    v_hex,
-                    row_idx,
-                    hex_slice.as_ptr() as *const c_char,
-                    hex_slice.len() as idx_t,
-                );
-
-                *p_cat.add(i) = row.category;
-                *p_cnt.add(i) = row.count;
-                *p_frac.add(i) = row.fraction;
-                *p_tot.add(i) = row.total_count;
+                if let Some(p) = vec_h3 {
+                    *p.add(i) = row.cell_u64;
+                }
+                if let Some(v) = vec_hex {
+                    let hex_slice = fast_hex_u64(row.cell_u64, &mut hex_buf);
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        row_idx,
+                        hex_slice.as_ptr() as *const c_char,
+                        hex_slice.len() as idx_t,
+                    );
+                }
+                if let Some(p) = vec_cat {
+                    *p.add(i) = row.category;
+                }
+                if let Some(p) = vec_cnt {
+                    *p.add(i) = row.count;
+                }
+                if let Some(p) = vec_frac {
+                    *p.add(i) = row.fraction;
+                }
+                if let Some(p) = vec_tot {
+                    *p.add(i) = row.total_count;
+                }
             }
 
             duckdb_data_chunk_set_size(output, num_taken as idx_t);
@@ -558,11 +680,17 @@ pub unsafe fn register_categorical_table_function(
         duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double);
         duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double);
 
+        // Spatial H3 cell filter parameters
+        let name_cell = to_c_string("h3_cell");
+        duckdb_table_function_add_named_parameter(tf, name_cell.as_ptr(), type_bigint);
+        let name_hex = to_c_string("h3_hex");
+        duckdb_table_function_add_named_parameter(tf, name_hex.as_ptr(), type_varchar);
+
         duckdb_table_function_set_bind(tf, raster_h3_categorical_bind);
         duckdb_table_function_set_init(tf, raster_h3_categorical_init);
         duckdb_table_function_set_local_init(tf, raster_h3_categorical_init_local);
         duckdb_table_function_set_function(tf, raster_h3_categorical_scan);
-        duckdb_table_function_supports_projection_pushdown(tf, false);
+        duckdb_table_function_supports_projection_pushdown(tf, true);
 
         let state = duckdb_register_table_function(con, tf);
 

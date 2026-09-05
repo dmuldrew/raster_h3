@@ -688,10 +688,10 @@ impl MultiScanHorizonStreamer {
         }
     }
 
-    /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiContinuousRecord> {
+    /// Advance scanline horizon until at least `min_rows` completed records are available or finished
+    pub fn advance_until_completed(&mut self, min_rows: usize) {
         let batch_size = (rayon::current_num_threads() * 4).max(32);
-        while self.completed_buffer.len() < max_rows && !self.is_finished {
+        while self.completed_buffer.len() < min_rows && !self.is_finished {
             let t0 = std::time::Instant::now();
             let chunk_items = if let Some(ref prefetcher) = self.prefetcher {
                 prefetcher.next_chunk_batch(batch_size)
@@ -827,7 +827,11 @@ impl MultiScanHorizonStreamer {
                 self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
             }
         }
+    }
 
+    /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
+    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiContinuousRecord> {
+        self.advance_until_completed(max_rows);
         let num_to_take = max_rows.min(self.completed_buffer.len());
         let mut batch = Vec::with_capacity(num_to_take);
         for _ in 0..num_to_take {
@@ -836,6 +840,21 @@ impl MultiScanHorizonStreamer {
             }
         }
         batch
+    }
+
+    /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, mut consumer: F) -> usize
+    where
+        F: FnMut(usize, MultiContinuousRecord),
+    {
+        self.advance_until_completed(max_rows);
+        let num_to_take = max_rows.min(self.completed_buffer.len());
+        for i in 0..num_to_take {
+            if let Some(record) = self.completed_buffer.pop_front() {
+                consumer(i, record);
+            }
+        }
+        num_to_take
     }
 
     /// Return total active in-flight cells across all resolutions
@@ -1345,10 +1364,10 @@ impl MultiCategoricalHorizonStreamer {
         }
     }
 
-    /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiCategoricalRecord> {
+    /// Advance scanline horizon until at least `min_rows` completed records are available or finished
+    pub fn advance_until_completed(&mut self, min_rows: usize) {
         let batch_size = (rayon::current_num_threads() * 4).max(32);
-        while self.completed_buffer.len() < max_rows && !self.is_finished {
+        while self.completed_buffer.len() < min_rows && !self.is_finished {
             let t0 = std::time::Instant::now();
             let chunk_items = if let Some(ref prefetcher) = self.prefetcher {
                 prefetcher.next_chunk_batch(batch_size)
@@ -1484,7 +1503,11 @@ impl MultiCategoricalHorizonStreamer {
                 self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
             }
         }
+    }
 
+    /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
+    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiCategoricalRecord> {
+        self.advance_until_completed(max_rows);
         let num_to_take = max_rows.min(self.completed_buffer.len());
         let mut batch = Vec::with_capacity(num_to_take);
         for _ in 0..num_to_take {
@@ -1493,6 +1516,21 @@ impl MultiCategoricalHorizonStreamer {
             }
         }
         batch
+    }
+
+    /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, mut consumer: F) -> usize
+    where
+        F: FnMut(usize, MultiCategoricalRecord),
+    {
+        self.advance_until_completed(max_rows);
+        let num_to_take = max_rows.min(self.completed_buffer.len());
+        for i in 0..num_to_take {
+            if let Some(record) = self.completed_buffer.pop_front() {
+                consumer(i, record);
+            }
+        }
+        num_to_take
     }
 
     /// Return total active in-flight cells across all resolutions

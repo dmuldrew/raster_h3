@@ -76,6 +76,7 @@ struct BenchmarkResult {
     multi_thread_8c_mpps: f64,
     categorical_time_ms: f64,
     categorical_mpps: f64,
+    #[allow(dead_code)]
     total_cells: usize,
     peak_in_flight_memory_kb: f64,
 }

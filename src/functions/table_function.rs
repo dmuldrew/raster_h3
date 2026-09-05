@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Mutex;
 
-use crate::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
+use crate::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
@@ -20,9 +20,10 @@ pub struct RasterH3BindData {
     pub band: u32,
 }
 
-/// Global scan state holding the streaming horizon aggregator for bounded O(Scan Front) < 15 MB RAM
+/// Global scan state holding the streaming multi-core horizon aggregator
 pub struct RasterH3GlobalData {
-    pub streamer: Mutex<ScanHorizonStreamer>,
+    pub streamer: Mutex<MultiScanHorizonStreamer>,
+    pub projected_columns: Vec<usize>,
 }
 
 /// Thread-local state for parallel DuckDB execution threads
@@ -152,7 +153,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let name_max_lat = to_c_string("max_lat");
     let named_max_lat_val = duckdb_bind_get_named_parameter(info, name_max_lat.as_ptr());
 
-    let bbox = if !named_min_lon_val.is_null()
+    let mut bbox = if !named_min_lon_val.is_null()
         && !named_min_lat_val.is_null()
         && !named_max_lon_val.is_null()
         && !named_max_lat_val.is_null()
@@ -166,6 +167,33 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     } else {
         None
     };
+
+    // Optional spatial filter: h3_cell (BIGINT) or h3_hex (VARCHAR)
+    if bbox.is_none() {
+        let name_cell = to_c_string("h3_cell");
+        let named_cell_val = duckdb_bind_get_named_parameter(info, name_cell.as_ptr());
+        if !named_cell_val.is_null() {
+            let cell_u64 = duckdb_get_uint64(named_cell_val);
+            if let Ok(cell) = h3o::CellIndex::try_from(cell_u64) {
+                let ll: h3o::LatLng = cell.into();
+                let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
+                bbox = Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
+            }
+        } else {
+            let name_h3_hex = to_c_string("h3_hex");
+            let named_h3_hex_val = duckdb_bind_get_named_parameter(info, name_h3_hex.as_ptr());
+            if !named_h3_hex_val.is_null() {
+                let hex_str_ptr = duckdb_get_varchar(named_h3_hex_val);
+                if let Some(s) = from_duckdb_string(hex_str_ptr) {
+                    if let Ok(cell) = s.trim().parse::<h3o::CellIndex>() {
+                        let ll: h3o::LatLng = cell.into();
+                        let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
+                        bbox = Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
+                    }
+                }
+            }
+        }
+    }
 
     // Add Output Columns:
     // 0: h3_index UBIGINT
@@ -279,18 +307,23 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         }
     };
 
-    let config = AggregationConfig {
-        resolution: bind_data.resolution,
-        custom_crs: bind_data.source_crs.clone(),
-        custom_nodata: bind_data.nodata,
-        bbox: bind_data.bbox,
-        sampling: bind_data.sampling.clone(),
-    };
+    let col_count = duckdb_init_get_column_count(info);
+    let mut projected_columns = Vec::with_capacity(col_count as usize);
+    for i in 0..col_count {
+        projected_columns.push(duckdb_init_get_column_index(info, i) as usize);
+    }
 
-    let streamer = match ScanHorizonStreamer::new(reader, &config) {
+    let mut config = MultiResolutionConfig::new(vec![bind_data.resolution]);
+    config.custom_crs = bind_data.source_crs.clone();
+    config.custom_nodata = bind_data.nodata;
+    config.bbox = bind_data.bbox;
+    config.sampling = bind_data.sampling.clone();
+    config.band = bind_data.band as usize;
+
+    let streamer = match MultiScanHorizonStreamer::new(reader, &config) {
         Ok(s) => s,
         Err(e) => {
-            let err_msg = CString::new(format!("Failed to initialize streamer: {}", e))
+            let err_msg = CString::new(format!("Failed to initialize multi-streamer: {}", e))
                 .unwrap_or_else(|_| CString::new("Failed to init streamer").unwrap());
             duckdb_init_set_error(info, err_msg.as_ptr());
             return;
@@ -299,6 +332,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
 
     let global_data = Box::new(RasterH3GlobalData {
         streamer: Mutex::new(streamer),
+        projected_columns,
     });
 
     duckdb_init_set_init_data(
@@ -318,7 +352,7 @@ pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
     );
 }
 
-/// Scan callback: streaming vector emission directly from scanline horizon eviction
+/// Scan callback: streaming vector emission directly from scanline horizon eviction with projection pushdown
 pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     let global_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3GlobalData;
     if global_data_ptr.is_null() {
@@ -327,65 +361,96 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     }
     let global_data = &*global_data_ptr;
 
-    let batch = {
+    let proj_cols = &global_data.projected_columns;
+
+    // Fast path: if 0 columns are projected (e.g. SELECT count(*))
+    if proj_cols.is_empty() {
         let mut streamer = match global_data.streamer.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        streamer.fetch_next_batch(2048)
-    };
-
-    if batch.is_empty() {
-        // EOF: All hexagons completed and emitted
-        duckdb_data_chunk_set_size(output, 0);
+        let count = streamer.drain_completed_into(2048, |_i, _rec| {});
+        duckdb_data_chunk_set_size(output, count as idx_t);
         return;
     }
 
-    let batch_size = batch.len();
+    // Map output vector pointers only for projected columns
+    // Schema column mapping:
+    // 0: h3_index UBIGINT
+    // 1: h3_hex VARCHAR
+    // 2: mean DOUBLE
+    // 3: stddev DOUBLE
+    // 4: count DOUBLE
+    // 5: min DOUBLE
+    // 6: max DOUBLE
+    // 7: sum DOUBLE
+    let mut vec_h3: Option<*mut u64> = None;
+    let mut vec_hex: Option<duckdb_vector> = None;
+    let mut vec_mean: Option<*mut f64> = None;
+    let mut vec_stddev: Option<*mut f64> = None;
+    let mut vec_count: Option<*mut f64> = None;
+    let mut vec_min: Option<*mut f64> = None;
+    let mut vec_max: Option<*mut f64> = None;
+    let mut vec_sum: Option<*mut f64> = None;
 
-    // Get output vector pointers
-    let v_h3 = duckdb_data_chunk_get_vector(output, 0);
-    let v_hex = duckdb_data_chunk_get_vector(output, 1);
-    let v_mean = duckdb_data_chunk_get_vector(output, 2);
-    let v_stddev = duckdb_data_chunk_get_vector(output, 3);
-    let v_cnt = duckdb_data_chunk_get_vector(output, 4);
-    let v_min = duckdb_data_chunk_get_vector(output, 5);
-    let v_max = duckdb_data_chunk_get_vector(output, 6);
-    let v_sum = duckdb_data_chunk_get_vector(output, 7);
-
-    let p_h3 = duckdb_vector_get_data(v_h3) as *mut u64;
-    let p_mean = duckdb_vector_get_data(v_mean) as *mut f64;
-    let p_stddev = duckdb_vector_get_data(v_stddev) as *mut f64;
-    let p_cnt = duckdb_vector_get_data(v_cnt) as *mut f64;
-    let p_min = duckdb_vector_get_data(v_min) as *mut f64;
-    let p_max = duckdb_vector_get_data(v_max) as *mut f64;
-    let p_sum = duckdb_vector_get_data(v_sum) as *mut f64;
-
-    let mut hex_buf = [0u8; 16];
-
-    for (i, (cell_u64, acc)) in batch.iter().enumerate() {
-        let row_idx = i as u64;
-
-        *p_h3.add(i) = *cell_u64;
-
-        // Zero-allocation hexadecimal string formatting
-        let hex_slice = fast_hex_u64(*cell_u64, &mut hex_buf);
-        duckdb_vector_assign_string_element_len(
-            v_hex,
-            row_idx,
-            hex_slice.as_ptr() as *const c_char,
-            hex_slice.len() as idx_t,
-        );
-
-        *p_mean.add(i) = acc.mean();
-        *p_stddev.add(i) = acc.stddev();
-        *p_cnt.add(i) = acc.count;
-        *p_min.add(i) = acc.min;
-        *p_max.add(i) = acc.max;
-        *p_sum.add(i) = acc.sum;
+    for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
+        let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
+        match orig_col {
+            0 => vec_h3 = Some(duckdb_vector_get_data(v) as *mut u64),
+            1 => vec_hex = Some(v),
+            2 => vec_mean = Some(duckdb_vector_get_data(v) as *mut f64),
+            3 => vec_stddev = Some(duckdb_vector_get_data(v) as *mut f64),
+            4 => vec_count = Some(duckdb_vector_get_data(v) as *mut f64),
+            5 => vec_min = Some(duckdb_vector_get_data(v) as *mut f64),
+            6 => vec_max = Some(duckdb_vector_get_data(v) as *mut f64),
+            7 => vec_sum = Some(duckdb_vector_get_data(v) as *mut f64),
+            _ => {}
+        }
     }
 
-    duckdb_data_chunk_set_size(output, batch_size as idx_t);
+    let mut hex_buf = [0u8; 16];
+    let num_emitted = {
+        let mut streamer = match global_data.streamer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        streamer.drain_completed_into(2048, |i, rec| {
+            let row_idx = i as u64;
+            if let Some(p) = vec_h3 {
+                *p.add(i) = rec.h3_index;
+            }
+            if let Some(v) = vec_hex {
+                let hex_slice = fast_hex_u64(rec.h3_index, &mut hex_buf);
+                duckdb_vector_assign_string_element_len(
+                    v,
+                    row_idx,
+                    hex_slice.as_ptr() as *const c_char,
+                    hex_slice.len() as idx_t,
+                );
+            }
+            if let Some(p) = vec_mean {
+                *p.add(i) = rec.accumulator.mean();
+            }
+            if let Some(p) = vec_stddev {
+                *p.add(i) = rec.accumulator.stddev();
+            }
+            if let Some(p) = vec_count {
+                *p.add(i) = rec.accumulator.count;
+            }
+            if let Some(p) = vec_min {
+                *p.add(i) = rec.accumulator.min;
+            }
+            if let Some(p) = vec_max {
+                *p.add(i) = rec.accumulator.max;
+            }
+            if let Some(p) = vec_sum {
+                *p.add(i) = rec.accumulator.sum;
+            }
+        })
+    };
+
+    duckdb_data_chunk_set_size(output, num_emitted as idx_t);
 }
 
 /// Register `h3_raster_continuous_aggregate` and `h3_raster_continuous` table functions
@@ -444,12 +509,18 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double_bbox);
         duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double_bbox);
 
+        // Spatial H3 cell filter parameters
+        let name_cell = to_c_string("h3_cell");
+        duckdb_table_function_add_named_parameter(tf, name_cell.as_ptr(), type_bigint);
+        let name_hex = to_c_string("h3_hex");
+        duckdb_table_function_add_named_parameter(tf, name_hex.as_ptr(), type_varchar);
+
         // Set callbacks including parallel init_local and projection pushdown
         duckdb_table_function_set_bind(tf, raster_h3_bind);
         duckdb_table_function_set_init(tf, raster_h3_init);
         duckdb_table_function_set_local_init(tf, raster_h3_init_local);
         duckdb_table_function_set_function(tf, raster_h3_scan);
-        duckdb_table_function_supports_projection_pushdown(tf, false);
+        duckdb_table_function_supports_projection_pushdown(tf, true);
 
         let state = duckdb_register_table_function(con, tf);
 
