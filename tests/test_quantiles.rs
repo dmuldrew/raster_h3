@@ -321,3 +321,67 @@ fn test_multi_scan_streamer_with_quantiles_disabled_zero_cost() {
     }
     assert!(total_records > 0);
 }
+
+#[test]
+fn test_fast_log_key_mapping_fidelity_and_wide_range() {
+    const LOG_GAMMA_INV: f64 = 1.0 / 0.02000066671111664;
+
+    // Test across a massive dynamic range from 1e-6 to 1e12
+    let mut test_vals = Vec::new();
+
+    // 1. Powers of 10 and 2
+    let mut v = 1e-6;
+    while v <= 1e12 {
+        test_vals.push(v);
+        test_vals.push(v * 1.5);
+        test_vals.push(v * 1.9999);
+        v *= 2.0;
+    }
+
+    // 2. Fractional values around bucket transitions
+    let gamma: f64 = 1.01 / 0.99;
+    for k in -500..500 {
+        let exact_boundary = gamma.powi(k);
+        if exact_boundary > 1e-6 && exact_boundary < 1e12 {
+            test_vals.push(exact_boundary * 0.999999);
+            test_vals.push(exact_boundary);
+            test_vals.push(exact_boundary * 1.000001);
+        }
+    }
+
+    // 3. Dense geometric series
+    let mut g = 0.001;
+    for _ in 0..10_000 {
+        test_vals.push(g);
+        g = g * 1.002 + 0.00001;
+    }
+
+    let mut exact_matches = 0usize;
+    let total = test_vals.len();
+
+    for &val in &test_vals {
+        let fast_key = QuantileSketch::key_for_positive(val);
+        let libc_key = (val.ln() * LOG_GAMMA_INV).floor() as i32;
+
+        if fast_key == libc_key {
+            exact_matches += 1;
+        } else {
+            // If there is any boundary difference, it must never differ by more than 1 unit
+            assert_eq!(
+                (fast_key - libc_key).abs(),
+                1,
+                "Key difference > 1 at val={}: fast={}, libc={}",
+                val,
+                fast_key,
+                libc_key
+            );
+        }
+    }
+
+    let match_rate = (exact_matches as f64 / total as f64) * 100.0;
+    assert!(
+        match_rate > 99.9,
+        "Fast key match rate should be > 99.9%, was {:.4}%",
+        match_rate
+    );
+}
