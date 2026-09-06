@@ -93,6 +93,52 @@ pub struct duckdb_extension_access {
     pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DuckDbStringPointer {
+    pub length: u32,
+    pub prefix: [u8; 4],
+    pub ptr: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DuckDbStringInlined {
+    pub length: u32,
+    pub inlined: [u8; 12],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union duckdb_string_t {
+    pub pointer: DuckDbStringPointer,
+    pub inlined: DuckDbStringInlined,
+}
+
+impl duckdb_string_t {
+    #[inline(always)]
+    pub unsafe fn length(&self) -> u32 {
+        self.inlined.length
+    }
+
+    #[inline(always)]
+    pub unsafe fn as_str(&self) -> &str {
+        let len = self.length() as usize;
+        if len <= 12 {
+            std::str::from_utf8(&self.inlined.inlined[..len]).unwrap_or("")
+        } else {
+            let ptr = self.pointer.ptr as *const u8;
+            if ptr.is_null() {
+                ""
+            } else {
+                let slice = std::slice::from_raw_parts(ptr, len);
+                std::str::from_utf8(slice).unwrap_or("")
+            }
+        }
+    }
+}
+
+
 pub type duckdb_table_function_bind_t = unsafe extern "C" fn(info: duckdb_bind_info);
 pub type duckdb_table_function_init_t = unsafe extern "C" fn(info: duckdb_init_info);
 pub type duckdb_table_function_t = unsafe extern "C" fn(info: duckdb_function_info, output: duckdb_data_chunk);

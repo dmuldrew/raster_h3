@@ -377,9 +377,16 @@ impl PmtilesWriter {
             for e in &self.entries {
                 let start = e.spill_offset as usize;
                 let end = start + e.length as usize;
-                if end <= mmap.len() {
-                    writer.write_all(&mmap[start..end])?;
+                if end > mmap.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Spill file truncated: tile offset {}+{} exceeds spill file size {}",
+                            start, e.length, mmap.len()
+                        ),
+                    ));
                 }
+                writer.write_all(&mmap[start..end])?;
             }
         }
 

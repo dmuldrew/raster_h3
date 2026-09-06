@@ -40,32 +40,11 @@ pub unsafe extern "C" fn scalar_string_to_h3(
     let p_out = duckdb_vector_get_data(output) as *mut u64;
 
     for i in 0..count {
-        // DuckDB string struct layout (16 bytes: length (4), prefix (4), pointer/inline (8))
         let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
         let d_str = &*str_ptr.add(i as usize);
-
-        let s = if d_str.length <= 12 {
-            let bytes = &d_str.prefix[..d_str.length as usize];
-            std::str::from_utf8(bytes).unwrap_or("")
-        } else {
-            let ptr = d_str.ptr as *const u8;
-            if ptr.is_null() {
-                ""
-            } else {
-                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
-                std::str::from_utf8(slice).unwrap_or("")
-            }
-        };
-
+        let s = d_str.as_str();
         *p_out.add(i as usize) = parse_hex_u64(s).unwrap_or(0);
     }
-}
-
-#[repr(C)]
-struct duckdb_string_t {
-    length: u32,
-    prefix: [u8; 4],
-    ptr: *const c_char,
 }
 
 /// Scalar function: h3_to_lat(UBIGINT) -> DOUBLE
@@ -165,19 +144,7 @@ pub unsafe extern "C" fn scalar_h3_is_valid_str(
     for i in 0..count {
         let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
         let d_str = &*str_ptr.add(i as usize);
-
-        let s = if d_str.length <= 12 {
-            let bytes = &d_str.prefix[..d_str.length as usize];
-            std::str::from_utf8(bytes).unwrap_or("")
-        } else {
-            let ptr = d_str.ptr as *const u8;
-            if ptr.is_null() {
-                ""
-            } else {
-                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
-                std::str::from_utf8(slice).unwrap_or("")
-            }
-        };
+        let s = d_str.as_str();
 
         let is_valid = match parse_hex_u64(s) {
             Some(u) => CellIndex::try_from(u).is_ok(),
@@ -228,22 +195,11 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_str(
     for i in 0..count {
         let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
         let d_str = &*str_ptr.add(i as usize);
-
-        let s = if d_str.length <= 12 {
-            let bytes = &d_str.prefix[..d_str.length as usize];
-            std::str::from_utf8(bytes).unwrap_or("")
-        } else {
-            let ptr = d_str.ptr as *const u8;
-            if ptr.is_null() {
-                ""
-            } else {
-                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
-                std::str::from_utf8(slice).unwrap_or("")
-            }
-        };
+        let s = d_str.as_str();
 
         let cell_u64_opt = parse_hex_u64(s);
         let wkb_len_opt = cell_u64_opt.and_then(|u| h3_index_to_wkb(u, &mut wkb_buf));
+
 
         if let Some(wkb_len) = wkb_len_opt {
             duckdb_vector_assign_string_element_len(
@@ -299,19 +255,7 @@ pub unsafe extern "C" fn scalar_h3_to_geometry_str(
     for i in 0..count {
         let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
         let d_str = &*str_ptr.add(i as usize);
-
-        let s = if d_str.length <= 12 {
-            let bytes = &d_str.prefix[..d_str.length as usize];
-            std::str::from_utf8(bytes).unwrap_or("")
-        } else {
-            let ptr = d_str.ptr as *const u8;
-            if ptr.is_null() {
-                ""
-            } else {
-                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
-                std::str::from_utf8(slice).unwrap_or("")
-            }
-        };
+        let s = d_str.as_str();
 
         let cell_u64_opt = parse_hex_u64(s);
         let wkb_len_opt = cell_u64_opt.and_then(|u| h3_index_to_wkb(u, &mut wkb_buf));
@@ -375,19 +319,7 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
     for i in 0..count {
         let str_ptr = duckdb_vector_get_data(v_cell) as *const duckdb_string_t;
         let d_str = &*str_ptr.add(i as usize);
-
-        let s = if d_str.length <= 12 {
-            let bytes = &d_str.prefix[..d_str.length as usize];
-            std::str::from_utf8(bytes).unwrap_or("")
-        } else {
-            let ptr = d_str.ptr as *const u8;
-            if ptr.is_null() {
-                ""
-            } else {
-                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
-                std::str::from_utf8(slice).unwrap_or("")
-            }
-        };
+        let s = d_str.as_str();
 
         let parent_res_i64 = *p_res.add(i as usize);
         let cell_opt = parse_hex_u64(s).and_then(|u| CellIndex::try_from(u).ok());
@@ -411,6 +343,7 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
         }
         duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
     }
+
 }
 
 /// Register scalar functions with DuckDB
@@ -659,6 +592,64 @@ mod tests {
 
         // Child cannot have parent at higher resolution
         assert!(cell.parent(h3o::Resolution::Nine).is_none());
+    }
+
+    #[test]
+    fn test_duckdb_string_t_inlined_and_pointer() {
+        use crate::ffi::duckdb_c::*;
+
+        // 1. Empty string (0 bytes)
+        let empty_s = duckdb_string_t {
+            inlined: DuckDbStringInlined {
+                length: 0,
+                inlined: [0u8; 12],
+            },
+        };
+        assert_eq!(unsafe { empty_s.as_str() }, "");
+
+        // 2. Short inline string (4 bytes)
+        let mut inlined4 = [0u8; 12];
+        inlined4[..4].copy_from_slice(b"test");
+        let s4 = duckdb_string_t {
+            inlined: DuckDbStringInlined {
+                length: 4,
+                inlined: inlined4,
+            },
+        };
+        assert_eq!(unsafe { s4.as_str() }, "test");
+
+        // 3. Medium inline string (8 bytes) - previously triggered slice bounds check panic!
+        let mut inlined8 = [0u8; 12];
+        inlined8[..8].copy_from_slice(b"12345678");
+        let s8 = duckdb_string_t {
+            inlined: DuckDbStringInlined {
+                length: 8,
+                inlined: inlined8,
+            },
+        };
+        assert_eq!(unsafe { s8.as_str() }, "12345678");
+
+        // 4. Max inline string (12 bytes)
+        let mut inlined12 = [0u8; 12];
+        inlined12.copy_from_slice(b"123456789012");
+        let s12 = duckdb_string_t {
+            inlined: DuckDbStringInlined {
+                length: 12,
+                inlined: inlined12,
+            },
+        };
+        assert_eq!(unsafe { s12.as_str() }, "123456789012");
+
+        // 5. Pointer string (15 bytes, standard H3 hex index string)
+        let h3_str = b"8828308281fffff\0";
+        let s15 = duckdb_string_t {
+            pointer: DuckDbStringPointer {
+                length: 15,
+                prefix: [h3_str[0], h3_str[1], h3_str[2], h3_str[3]],
+                ptr: h3_str.as_ptr() as *const std::os::raw::c_char,
+            },
+        };
+        assert_eq!(unsafe { s15.as_str() }, "8828308281fffff");
     }
 }
 

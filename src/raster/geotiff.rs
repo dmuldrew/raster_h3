@@ -575,8 +575,7 @@ impl<'a> ChunkDecoder<'a> {
                         return Ok(None);
                     }
                     _ => {
-                        let mut v = Vec::with_capacity(total_samples);
-                        unsafe { v.set_len(total_samples); }
+                        let mut v = vec![0i16; total_samples];
                         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 2) };
                         Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
                         return Ok(Some(DecodingResult::I16(v)));
@@ -590,8 +589,7 @@ impl<'a> ChunkDecoder<'a> {
                         return Ok(None);
                     }
                     _ => {
-                        let mut v = Vec::with_capacity(total_samples);
-                        unsafe { v.set_len(total_samples); }
+                        let mut v = vec![0u16; total_samples];
                         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 2) };
                         Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
                         return Ok(Some(DecodingResult::U16(v)));
@@ -605,8 +603,7 @@ impl<'a> ChunkDecoder<'a> {
                         return Ok(None);
                     }
                     _ => {
-                        let mut v = Vec::with_capacity(total_samples);
-                        unsafe { v.set_len(total_samples); }
+                        let mut v = vec![0.0f32; total_samples];
                         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
                         Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
                         return Ok(Some(DecodingResult::F32(v)));
@@ -619,8 +616,7 @@ impl<'a> ChunkDecoder<'a> {
                         return Ok(None);
                     }
                     _ => {
-                        let mut v = Vec::with_capacity(total_samples);
-                        unsafe { v.set_len(total_samples); }
+                        let mut v = vec![0u8; total_samples];
                         Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, &mut v[..total_samples])?;
                         return Ok(Some(DecodingResult::U8(v)));
                     }
@@ -633,8 +629,7 @@ impl<'a> ChunkDecoder<'a> {
                         return Ok(None);
                     }
                     _ => {
-                        let mut v = Vec::with_capacity(total_samples);
-                        unsafe { v.set_len(total_samples); }
+                        let mut v = vec![0u32; total_samples];
                         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
                         Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
                         return Ok(Some(DecodingResult::U32(v)));
@@ -648,8 +643,7 @@ impl<'a> ChunkDecoder<'a> {
                         return Ok(None);
                     }
                     _ => {
-                        let mut v = Vec::with_capacity(total_samples);
-                        unsafe { v.set_len(total_samples); }
+                        let mut v = vec![0i32; total_samples];
                         let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
                         Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
                         return Ok(Some(DecodingResult::I32(v)));

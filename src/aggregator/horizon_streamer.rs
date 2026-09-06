@@ -29,15 +29,15 @@ pub struct HexEvictionEntry {
 impl Eq for HexEvictionEntry {}
 
 impl Ord for HexEvictionEntry {
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Max-heap: highest south_lat (northernmost southern boundary) is popped first
-        self.south_lat
-            .partial_cmp(&other.south_lat)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        self.south_lat.total_cmp(&other.south_lat)
     }
 }
 
 impl PartialOrd for HexEvictionEntry {
+    #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }

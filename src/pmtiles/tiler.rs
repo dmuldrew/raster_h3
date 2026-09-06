@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
+use std::io;
 use std::path::Path;
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, LatLng, Resolution};
@@ -220,14 +221,14 @@ struct TileEvictionEntry {
 impl Eq for TileEvictionEntry {}
 
 impl Ord for TileEvictionEntry {
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.safe_evict_lat
-            .partial_cmp(&other.safe_evict_lat)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        self.safe_evict_lat.total_cmp(&other.safe_evict_lat)
     }
 }
 
 impl PartialOrd for TileEvictionEntry {
+    #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -571,10 +572,10 @@ impl H3PmtilesTiler {
             .into_par_iter()
             .map(|((z, x, y), layer)| {
                 let pbf_bytes = layer.encode();
-                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
-                ((z, x, y), compressed)
+                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+                Ok(((z, x, y), compressed))
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         for ((z, x, y), compressed_bytes) in encoded_tiles {
             writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
@@ -762,7 +763,7 @@ impl H3PmtilesTiler {
                                 min_tx,
                                 min_ty,
                                 4096,
-                                if is_last_zoom { properties.clone() } else { properties.clone() },
+                                properties.clone(),
                             );
                             ops.push(PreparedTileOp {
                                 tile_key: (zoom, min_tx, min_ty),
@@ -857,10 +858,10 @@ impl H3PmtilesTiler {
                     .into_par_iter()
                     .map(|(key, layer)| {
                         let pbf_bytes = layer.encode();
-                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
-                        (key, compressed)
+                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+                        Ok((key, compressed))
                     })
-                    .collect();
+                    .collect::<io::Result<Vec<_>>>()?;
 
                 for ((z, x, y), compressed_bytes) in compressed_batch {
                     writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
@@ -874,10 +875,10 @@ impl H3PmtilesTiler {
             .into_par_iter()
             .map(|(key, layer)| {
                 let pbf_bytes = layer.encode();
-                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
-                (key, compressed)
+                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+                Ok((key, compressed))
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         for ((z, x, y), compressed_bytes) in compressed_batch {
             writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
@@ -1132,7 +1133,7 @@ impl H3PmtilesTiler {
                                 min_tx,
                                 min_ty,
                                 4096,
-                                if is_last_zoom { properties.clone() } else { properties.clone() },
+                                properties.clone(),
                             );
                             ops.push(PreparedTileOp {
                                 tile_key: (zoom, min_tx, min_ty),
@@ -1237,10 +1238,10 @@ impl H3PmtilesTiler {
                     .into_par_iter()
                     .map(|(key, layer)| {
                         let pbf_bytes = layer.encode();
-                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
-                        (key, compressed)
+                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+                        Ok((key, compressed))
                     })
-                    .collect();
+                    .collect::<io::Result<Vec<_>>>()?;
 
                 for ((z, x, y), compressed_bytes) in compressed_batch {
                     writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
@@ -1254,10 +1255,10 @@ impl H3PmtilesTiler {
             .into_par_iter()
             .map(|(key, layer)| {
                 let pbf_bytes = layer.encode();
-                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes).unwrap();
-                (key, compressed)
+                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+                Ok((key, compressed))
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
 
         for ((z, x, y), compressed_bytes) in compressed_batch {
             writer.add_compressed_tile(z, x, y, &compressed_bytes)?;

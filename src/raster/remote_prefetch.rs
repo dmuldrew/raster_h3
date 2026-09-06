@@ -162,7 +162,7 @@ impl RemoteChunkPrefetchQueue {
         }
 
         let coalesced = coalesce_chunk_ranges(&locations, cfg.max_gap_bytes, cfg.max_range_bytes);
-        let sources = vec![Arc::clone(remote_source)];
+        let sources = vec![Some(Arc::clone(remote_source))];
         Some(Self::spawn_internal(sources, coalesced, cfg))
     }
 
@@ -215,18 +215,11 @@ impl RemoteChunkPrefetchQueue {
         }
 
         let coalesced = coalesce_chunk_ranges(&locations, cfg.max_gap_bytes, cfg.max_range_bytes);
-        let sources_arcs: Vec<Arc<RemoteHttpSource>> = sources.into_iter().map(|s| s.unwrap_or_else(|| {
-            // Dummy source for local tiles (never indexed because local chunks not in coalesced ranges)
-            Arc::new(RemoteHttpSource::open("http://127.0.0.1:9999/dummy.tif").unwrap_or_else(|_| {
-                panic!("dummy");
-            }))
-        })).collect();
-
-        Some(Self::spawn_internal(sources_arcs, coalesced, cfg))
+        Some(Self::spawn_internal(sources, coalesced, cfg))
     }
 
     fn spawn_internal(
-        sources: Vec<Arc<RemoteHttpSource>>,
+        sources: Vec<Option<Arc<RemoteHttpSource>>>,
         ranges: Vec<CoalescedRange>,
         config: RemotePrefetchConfig,
     ) -> Self {
@@ -278,7 +271,10 @@ impl RemoteChunkPrefetchQueue {
                     }
 
                     let range = &ranges[job];
-                    let source = &sources[range.tile_idx];
+                    let source = match sources.get(range.tile_idx).and_then(|s| s.as_ref()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
 
                     match source.fetch_range(range.start_offset, range.end_offset) {
                         Ok(data) => {
