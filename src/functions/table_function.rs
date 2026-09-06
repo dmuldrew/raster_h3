@@ -799,42 +799,76 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     };
 
     let batch_len = batch.len();
-    for (i, rec) in batch.into_iter().enumerate() {
-        let row_idx = i as u64;
-        if let Some(p) = vec_h3 {
+
+    if let Some(p) = vec_h3 {
+        for (i, rec) in batch.iter().enumerate() {
             *p.add(i) = rec.h3_index;
         }
-        if let Some(v) = vec_hex {
+    }
+    if let Some(p) = vec_mean {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.accumulator.mean();
+        }
+    }
+    if let Some(p) = vec_stddev {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.accumulator.stddev();
+        }
+    }
+    if let Some(p) = vec_count {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.accumulator.count;
+        }
+    }
+    if let Some(p) = vec_min {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.accumulator.min;
+        }
+    }
+    if let Some(p) = vec_max {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.accumulator.max;
+        }
+    }
+    if let Some(p) = vec_sum {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.accumulator.sum;
+        }
+    }
+    if let Some(p) = vec_res {
+        for (i, rec) in batch.iter().enumerate() {
+            *p.add(i) = rec.resolution;
+        }
+    }
+    for &(q_idx, ptr) in &vec_quantiles {
+        match &global_data.quantiles[q_idx] {
+            QuantileTarget::Percentile(q, _) => {
+                let q_val = *q;
+                for (i, rec) in batch.iter().enumerate() {
+                    *ptr.add(i) = rec.accumulator.quantile(q_val);
+                }
+            }
+            QuantileTarget::Iqr(_) => {
+                for (i, rec) in batch.iter().enumerate() {
+                    *ptr.add(i) = rec.accumulator.iqr();
+                }
+            }
+        }
+    }
+    if let Some(v) = vec_hex {
+        for (i, rec) in batch.iter().enumerate() {
             let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
             duckdb_vector_assign_string_element_len(
                 v,
-                row_idx,
+                i as u64,
                 hex_slice.as_ptr() as *const c_char,
                 hex_slice.len() as idx_t,
             );
         }
-        if let Some(p) = vec_mean {
-            *p.add(i) = rec.accumulator.mean();
-        }
-        if let Some(p) = vec_stddev {
-            *p.add(i) = rec.accumulator.stddev();
-        }
-        if let Some(p) = vec_count {
-            *p.add(i) = rec.accumulator.count;
-        }
-        if let Some(p) = vec_min {
-            *p.add(i) = rec.accumulator.min;
-        }
-        if let Some(p) = vec_max {
-            *p.add(i) = rec.accumulator.max;
-        }
-        if let Some(p) = vec_sum {
-            *p.add(i) = rec.accumulator.sum;
-        }
-        if let Some(p) = vec_res {
-            *p.add(i) = rec.resolution;
-        }
-        if vec_wkb.is_some() || vec_geom.is_some() {
+    }
+    if vec_wkb.is_some() || vec_geom.is_some() {
+        for (i, rec) in batch.iter().enumerate() {
+            let row_idx = i as u64;
             let wkb_len_opt = h3_index_to_wkb(rec.h3_index, wkb_buf);
             if let Some(v) = vec_wkb {
                 if let Some(wkb_len) = wkb_len_opt {
@@ -860,13 +894,6 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                     duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
                 }
             }
-        }
-        for &(q_idx, ptr) in &vec_quantiles {
-            let val = match &global_data.quantiles[q_idx] {
-                QuantileTarget::Percentile(q, _) => rec.accumulator.quantile(*q),
-                QuantileTarget::Iqr(_) => rec.accumulator.iqr(),
-            };
-            *ptr.add(i) = val;
         }
     }
 

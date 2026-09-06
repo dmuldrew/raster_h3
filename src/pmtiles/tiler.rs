@@ -689,8 +689,7 @@ impl H3PmtilesTiler {
                     let num_zooms = zooms.len();
                     let mut ops = Vec::with_capacity(num_zooms);
 
-                    for (z_idx, &zoom) in zooms.iter().enumerate() {
-                        let is_last_zoom = z_idx == num_zooms - 1;
+                    for &zoom in &zooms {
                         let optimal_res = h3_res_for_zoom(zoom);
                         if optimal_res < resolution {
                             if let Ok(res_enum) = Resolution::try_from(optimal_res) {
@@ -1061,8 +1060,7 @@ impl H3PmtilesTiler {
                     let num_zooms = zooms.len();
                     let mut ops = Vec::with_capacity(num_zooms);
 
-                    for (z_idx, &zoom) in zooms.iter().enumerate() {
-                        let is_last_zoom = z_idx == num_zooms - 1;
+                    for &zoom in &zooms {
                         let optimal_res = h3_res_for_zoom(zoom);
                         if optimal_res < resolution {
                             if let Ok(res_enum) = Resolution::try_from(optimal_res) {
@@ -1429,9 +1427,15 @@ impl H3PmtilesTiler {
 
         let h3_idx = h3_col_idx.unwrap_or(0);
 
-        let mut features = Vec::new();
-        for row_result in reader.into_iter() {
-            let row = row_result?;
+        // Pre-extract column names once so we don't allocate String per field per row
+        let col_names: Vec<Cow<'static, str>> = schema
+            .columns()
+            .iter()
+            .map(|f| Cow::Owned(f.name().to_string()))
+            .collect();
+
+        let features_iter = reader.into_iter().filter_map(move |row_result| {
+            let row = row_result.ok()?;
             let mut h3_val_u64 = None;
 
             if let Some((_, field_val)) = row.get_column_iter().nth(h3_idx) {
@@ -1450,32 +1454,34 @@ impl H3PmtilesTiler {
                 }
             }
 
-            if let Some(h3_u64) = h3_val_u64 {
-                let mut properties = Vec::new();
-                for (col_i, (name, field_val)) in row.get_column_iter().enumerate() {
-                    if col_i == h3_idx {
-                        continue;
-                    }
-                    match field_val {
-                        parquet::record::Field::Double(d) => properties.push((name.to_string(), MvtValue::Double(*d))),
-                        parquet::record::Field::Float(f) => properties.push((name.to_string(), MvtValue::Float(*f))),
-                        parquet::record::Field::Long(i) => properties.push((name.to_string(), MvtValue::Int(*i))),
-                        parquet::record::Field::ULong(u) => properties.push((name.to_string(), MvtValue::UInt(*u))),
-                        parquet::record::Field::Int(i) => properties.push((name.to_string(), MvtValue::Int(*i as i64))),
-                        parquet::record::Field::UInt(u) => properties.push((name.to_string(), MvtValue::UInt(*u as u64))),
-                        parquet::record::Field::Short(s) => properties.push((name.to_string(), MvtValue::Int(*s as i64))),
-                        parquet::record::Field::UShort(u) => properties.push((name.to_string(), MvtValue::UInt(*u as u64))),
-                        parquet::record::Field::Byte(b) => properties.push((name.to_string(), MvtValue::Int(*b as i64))),
-                        parquet::record::Field::UByte(u) => properties.push((name.to_string(), MvtValue::UInt(*u as u64))),
-                        parquet::record::Field::Str(s) => properties.push((name.to_string(), MvtValue::String(s.clone()))),
-                        parquet::record::Field::Bool(b) => properties.push((name.to_string(), MvtValue::Bool(*b))),
-                        _ => {}
-                    }
+            let h3_u64 = h3_val_u64?;
+            let mut properties = Vec::with_capacity(col_names.len().saturating_sub(1));
+            for (col_i, (_, field_val)) in row.get_column_iter().enumerate() {
+                if col_i == h3_idx {
+                    continue;
                 }
-                features.push(H3Feature::new(h3_u64, properties));
+                let mvt_val = match field_val {
+                    parquet::record::Field::Double(d) => MvtValue::Double(*d),
+                    parquet::record::Field::Float(f) => MvtValue::Float(*f),
+                    parquet::record::Field::Long(i) => MvtValue::Int(*i),
+                    parquet::record::Field::ULong(u) => MvtValue::UInt(*u),
+                    parquet::record::Field::Int(i) => MvtValue::Int(*i as i64),
+                    parquet::record::Field::UInt(u) => MvtValue::UInt(*u as u64),
+                    parquet::record::Field::Short(s) => MvtValue::Int(*s as i64),
+                    parquet::record::Field::UShort(u) => MvtValue::UInt(*u as u64),
+                    parquet::record::Field::Byte(b) => MvtValue::Int(*b as i64),
+                    parquet::record::Field::UByte(u) => MvtValue::UInt(*u as u64),
+                    parquet::record::Field::Str(s) => MvtValue::String(s.clone()),
+                    parquet::record::Field::Bool(b) => MvtValue::Bool(*b),
+                    _ => continue,
+                };
+                if let Some(col_name) = col_names.get(col_i) {
+                    properties.push((col_name.clone(), mvt_val));
+                }
             }
-        }
+            Some(H3Feature { h3_index: h3_u64, properties })
+        });
 
-        Self::export_h3_features(features, pmtiles_path)
+        Self::export_h3_features(features_iter, pmtiles_path)
     }
 }

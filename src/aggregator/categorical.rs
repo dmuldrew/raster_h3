@@ -162,35 +162,67 @@ impl CategoricalAccumulator {
         }
     }
 
-    /// Serialize histogram to a JSON string representation
-    pub fn histogram_json(&self) -> String {
+    /// Serialize histogram directly into a reusable string buffer without intermediate allocations
+    pub fn histogram_json_into(&self, s: &mut String) {
+        s.clear();
         let count = self.unique_classes();
         if count == 0 {
-            return "{}".to_string();
+            s.push_str("{}");
+            return;
         }
-        let mut entries: Vec<(i64, f64)> = Vec::with_capacity(count);
-        self.for_each_class(|cat, cnt| {
-            entries.push((cat, cnt));
-        });
-        entries.sort_unstable_by_key(|&(k, _)| k);
 
-        let mut s = String::with_capacity(32 + count * 20);
+        let mut stack_entries = [(0i64, 0.0f64); 16];
+        let use_stack = count <= 16;
+        let mut heap_entries;
+
+        let entries_slice: &mut [(i64, f64)] = if use_stack {
+            let mut idx = 0;
+            self.for_each_class(|cat, cnt| {
+                if idx < 16 {
+                    stack_entries[idx] = (cat, cnt);
+                    idx += 1;
+                }
+            });
+            &mut stack_entries[..count]
+        } else {
+            heap_entries = Vec::with_capacity(count);
+            self.for_each_class(|cat, cnt| {
+                heap_entries.push((cat, cnt));
+            });
+            heap_entries.as_mut_slice()
+        };
+
+        entries_slice.sort_unstable_by_key(|&(k, _)| k);
+
+        let required_cap = 32 + count * 20;
+        if s.capacity() < required_cap {
+            s.reserve(required_cap - s.capacity());
+        }
+
         s.push('{');
-        for (i, (k, cnt)) in entries.iter().enumerate() {
+        for (i, &(k, cnt)) in entries_slice.iter().enumerate() {
             if i > 0 {
                 s.push_str(", ");
             }
             let frac = if self.total_count > 0.0 {
-                cnt / self.total_count
+                (cnt / self.total_count).max(0.0).min(1.0)
             } else {
                 0.0
             };
-            s.push('"');
-            s.push_str(&k.to_string());
-            s.push_str("\": ");
-            s.push_str(&format!("{:.4}", frac));
+            let frac_i = (frac * 10000.0 + 0.5) as u32;
+            let int_part = frac_i / 10000;
+            let dec_part = frac_i % 10000;
+            use std::fmt::Write;
+            let _ = write!(s, "\"{}\": {}.{:04}", k, int_part, dec_part);
         }
         s.push('}');
+    }
+
+    /// Serialize histogram to a JSON string representation
+    pub fn histogram_json(&self) -> String {
+        let count = self.unique_classes();
+        let mut s = String::with_capacity(32 + count * 20);
+        self.histogram_json_into(&mut s);
         s
     }
 

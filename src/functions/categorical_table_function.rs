@@ -803,22 +803,23 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             };
 
             let batch_len = batch.len();
-            for (i, rec) in batch.into_iter().enumerate() {
-                let row_idx = i as u64;
-
-                if let Some(p) = vec_h3 {
+            if let Some(p) = vec_h3 {
+                for (i, rec) in batch.iter().enumerate() {
                     *p.add(i) = rec.h3_index;
                 }
-                if let Some(v) = vec_hex {
-                    let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        row_idx,
-                        hex_slice.as_ptr() as *const c_char,
-                        hex_slice.len() as idx_t,
-                    );
+            }
+            if let Some(p) = vec_res {
+                for (i, rec) in batch.iter().enumerate() {
+                    *p.add(i) = rec.resolution;
                 }
-                if need_majority {
+            }
+            if let Some(p) = vec_tot {
+                for (i, rec) in batch.iter().enumerate() {
+                    *p.add(i) = rec.accumulator.total_count;
+                }
+            }
+            if need_majority {
+                for (i, rec) in batch.iter().enumerate() {
                     let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
                     if let Some(p) = vec_maj_cls {
                         *p.add(i) = maj_cls;
@@ -830,7 +831,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         *p.add(i) = maj_cnt;
                     }
                 }
-                if need_distinct {
+            }
+            if need_distinct {
+                for (i, rec) in batch.iter().enumerate() {
                     let distinct = rec.accumulator.unique_classes() as i64;
                     if let Some(p) = vec_uniq {
                         *p.add(i) = distinct;
@@ -839,22 +842,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         *p.add(i) = distinct;
                     }
                 }
-                if let Some(p) = vec_tot {
-                    *p.add(i) = rec.accumulator.total_count;
-                }
-                if let Some(v) = vec_hist {
-                    let hist_json = rec.accumulator.histogram_json();
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        row_idx,
-                        hist_json.as_ptr() as *const c_char,
-                        hist_json.len() as idx_t,
-                    );
-                }
-                if let Some(p) = vec_res {
-                    *p.add(i) = rec.resolution;
-                }
-                if need_entropy {
+            }
+            if need_entropy {
+                for (i, rec) in batch.iter().enumerate() {
                     let ent = rec.accumulator.shannon_entropy();
                     if let Some(p) = vec_shannon_entropy {
                         *p.add(i) = ent;
@@ -863,7 +853,33 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         *p.add(i) = ent;
                     }
                 }
-                if vec_wkb.is_some() || vec_geom.is_some() {
+            }
+            if let Some(v) = vec_hex {
+                for (i, rec) in batch.iter().enumerate() {
+                    let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        i as u64,
+                        hex_slice.as_ptr() as *const c_char,
+                        hex_slice.len() as idx_t,
+                    );
+                }
+            }
+            if let Some(v) = vec_hist {
+                let mut hist_buf = String::with_capacity(256);
+                for (i, rec) in batch.iter().enumerate() {
+                    rec.accumulator.histogram_json_into(&mut hist_buf);
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        i as u64,
+                        hist_buf.as_ptr() as *const c_char,
+                        hist_buf.len() as idx_t,
+                    );
+                }
+            }
+            if vec_wkb.is_some() || vec_geom.is_some() {
+                for (i, rec) in batch.iter().enumerate() {
+                    let row_idx = i as u64;
                     let wkb_len_opt = h3_index_to_wkb(rec.h3_index, wkb_buf);
                     if let Some(v) = vec_wkb {
                         if let Some(wkb_len) = wkb_len_opt {

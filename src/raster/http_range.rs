@@ -200,17 +200,21 @@ impl RemoteHttpSource {
         Ok(buf)
     }
 
-    /// Read bytes starting at `offset` up to `len` bytes, using the block cache for small reads
-    pub fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        if offset >= self.total_size || len == 0 {
-            return Ok(Vec::new());
+    /// Read bytes starting at `offset` directly into `out`, using the block cache for small reads.
+    /// Eliminates intermediate buffer allocations.
+    pub fn read_range_into(&self, offset: u64, out: &mut [u8]) -> Result<usize> {
+        if offset >= self.total_size || out.is_empty() {
+            return Ok(0);
         }
 
-        let actual_len = len.min((self.total_size - offset) as usize);
+        let actual_len = out.len().min((self.total_size - offset) as usize);
 
         // For large reads (larger than 1 block), bypass the block cache and fetch exact range
         if actual_len > self.block_size {
-            return self.fetch_range(offset, offset + actual_len as u64 - 1);
+            let fetched = self.fetch_range(offset, offset + actual_len as u64 - 1)?;
+            let to_copy = fetched.len().min(actual_len);
+            out[..to_copy].copy_from_slice(&fetched[..to_copy]);
+            return Ok(to_copy);
         }
 
         let block_idx = offset / self.block_size as u64;
@@ -225,9 +229,8 @@ impl RemoteHttpSource {
             if let Some(block) = cache.get(&block_idx) {
                 if offset_in_block < block.len() {
                     let available = (block.len() - offset_in_block).min(actual_len);
-                    if available == actual_len {
-                        return Ok(block[offset_in_block..offset_in_block + actual_len].to_vec());
-                    }
+                    out[..available].copy_from_slice(&block[offset_in_block..offset_in_block + available]);
+                    return Ok(available);
                 }
             }
         }
@@ -249,7 +252,16 @@ impl RemoteHttpSource {
         };
 
         let available = (final_block.len().saturating_sub(offset_in_block)).min(actual_len);
-        Ok(final_block[offset_in_block..offset_in_block + available].to_vec())
+        out[..available].copy_from_slice(&final_block[offset_in_block..offset_in_block + available]);
+        Ok(available)
+    }
+
+    /// Read bytes starting at `offset` up to `len` bytes, using the block cache for small reads
+    pub fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        let n = self.read_range_into(offset, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
     }
 }
 
@@ -277,14 +289,13 @@ impl Read for HttpRangeReader {
         let to_read = buf
             .len()
             .min((self.source.total_size - self.cursor) as usize);
-        let bytes = self
+        let bytes_read = self
             .source
-            .read_range(self.cursor, to_read)
+            .read_range_into(self.cursor, &mut buf[..to_read])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        buf[..bytes.len()].copy_from_slice(&bytes);
-        self.cursor += bytes.len() as u64;
-        Ok(bytes.len())
+        self.cursor += bytes_read as u64;
+        Ok(bytes_read)
     }
 }
 
