@@ -97,6 +97,81 @@ pub enum RasterSource {
     Remote(Arc<RemoteHttpSource>),
 }
 
+/// Chunk byte payload: zero-copy borrowed slice (local mmap) or owned byte vector (remote HTTP / cache)
+#[derive(Debug, Clone)]
+pub enum ChunkPayload<'a> {
+    Borrowed(&'a [u8]),
+    ArcOwned(Arc<Vec<u8>>),
+    Owned(Vec<u8>),
+}
+
+impl<'a> AsRef<[u8]> for ChunkPayload<'a> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::ArcOwned(a) => a.as_slice(),
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+/// Unified chunk byte provider for ChunkDecoder: local slice or remote source with lifetime 'a
+#[derive(Clone)]
+pub enum DecoderSource<'a> {
+    Local(&'a [u8]),
+    Remote(Arc<RemoteHttpSource>),
+}
+
+impl<'a> DecoderSource<'a> {
+    /// Read chunk byte payload with lifetime `'a`
+    pub fn get_chunk_payload(
+        &self,
+        chunk_index: u32,
+        info: &TiffChunkInfo,
+    ) -> Result<ChunkPayload<'a>> {
+        let idx = chunk_index as usize;
+        let offset = *info
+            .chunk_offsets
+            .get(idx)
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("invalid chunk offset".into()))?;
+        let len = *info
+            .chunk_bytes
+            .get(idx)
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("invalid chunk bytes".into()))?
+            as usize;
+
+        match self {
+            DecoderSource::Local(mmap) => {
+                let off = offset as usize;
+                if off.checked_add(len).map_or(true, |end| end > mmap.len()) {
+                    return Err(RasterH3Error::InvalidMetadata("chunk offset out of bounds".into()));
+                }
+                Ok(ChunkPayload::Borrowed(&mmap[off..off + len]))
+            }
+            DecoderSource::Remote(remote) => {
+                let bytes = remote.read_range(offset, len)?;
+                Ok(ChunkPayload::Owned(bytes))
+            }
+        }
+    }
+}
+
+impl RasterSource {
+    /// Read chunk byte payload for a specific chunk index using chunk offsets and byte counts
+    pub fn get_chunk_payload(
+        &self,
+        chunk_index: u32,
+        info: &TiffChunkInfo,
+    ) -> Result<ChunkPayload<'_>> {
+        let ds = match self {
+            RasterSource::Local(mmap) => DecoderSource::Local(&mmap[..]),
+            RasterSource::Remote(remote) => DecoderSource::Remote(Arc::clone(remote)),
+        };
+        ds.get_chunk_payload(chunk_index, info)
+    }
+}
+
 /// TIFF chunk layout and compression metadata for SIMD-accelerated direct decoding
 #[derive(Debug, Clone)]
 pub struct TiffChunkInfo {
@@ -169,34 +244,61 @@ pub struct ChunkDecoder<'a> {
     height: u32,
     samples_per_pixel: u16,
     chunk_info: Option<Arc<TiffChunkInfo>>,
-    mmap: Option<&'a [u8]>,
+    source: DecoderSource<'a>,
     libdeflater: Option<libdeflater::Decompressor>,
     lzw_decoder: Option<weezl::decode::Decoder>,
     decomp_scratch: Vec<u8>,
 }
 
 impl<'a> ChunkDecoder<'a> {
+    /// Read chunk byte payload for a specific chunk index using decoder's backing source
+    pub fn read_chunk_payload(&self, chunk_index: u32) -> Result<ChunkPayload<'a>> {
+        let info = self
+            .chunk_info
+            .as_ref()
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
+        self.source.get_chunk_payload(chunk_index, info)
+    }
+
     /// Read and decode a single chunk using persistent fast decoder or fallback
+    #[inline]
     pub fn read_chunk(&mut self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
-        let chunk_bounds = self.chunk_layout.get_chunk_bounds(
-            chunk_index,
-            self.width,
-            self.height,
-        );
-
-        if let Ok(Some(data)) = self.decompress_chunk_fast(chunk_index, None) {
-            return Ok((chunk_bounds, data));
-        }
-
-        let data = self.inner.read_chunk(chunk_index)?;
-        Ok((chunk_bounds, data))
+        self.read_chunk_with_payload(chunk_index, None, None)
     }
 
     /// Read and decode a single chunk into an existing buffer if possible, avoiding reallocations
+    #[inline]
     pub fn read_chunk_into(
         &mut self,
         chunk_index: u32,
-        mut buffer: DecodingResult,
+        buffer: DecodingResult,
+    ) -> Result<(RasterChunk, DecodingResult)> {
+        self.read_chunk_with_payload(chunk_index, None, Some(buffer))
+    }
+
+    /// Read and decode a chunk directly from an in-memory compressed byte payload
+    /// (e.g. delivered by the asynchronous remote prefetch queue).
+    #[inline]
+    pub fn read_chunk_from_compressed_bytes(
+        &mut self,
+        chunk_index: u32,
+        compressed_bytes: &[u8],
+        target_buffer: Option<DecodingResult>,
+    ) -> Result<(RasterChunk, DecodingResult)> {
+        self.read_chunk_with_payload(chunk_index, Some(compressed_bytes), target_buffer)
+    }
+
+    /// Unified chunk decoding entry point:
+    /// - If `provided_bytes` is Some (e.g. from async prefetch queue), decodes from it directly.
+    /// - If `provided_bytes` is None, retrieves chunk payload via `self.source.get_chunk_payload`
+    ///   (zero-copy slice for local memory maps, range request for remote COGs).
+    /// - Uses SIMD Deflate or accelerated LZW first, populating `target_buffer` in-place if available.
+    /// - Falls back cleanly to standard TIFF decoder if fast decompression is unsupported or fails.
+    pub fn read_chunk_with_payload(
+        &mut self,
+        chunk_index: u32,
+        provided_bytes: Option<&[u8]>,
+        mut target_buffer: Option<DecodingResult>,
     ) -> Result<(RasterChunk, DecodingResult)> {
         let chunk_bounds = self.chunk_layout.get_chunk_bounds(
             chunk_index,
@@ -204,12 +306,41 @@ impl<'a> ChunkDecoder<'a> {
             self.height,
         );
 
-        match self.decompress_chunk_fast(chunk_index, Some(&mut buffer)) {
-            Ok(None) => return Ok((chunk_bounds, buffer)),
+        let fast_res = if let Some(bytes) = provided_bytes {
+            self.decompress_chunk_fast_bytes(chunk_index, bytes, target_buffer.as_mut())
+        } else if let Some(ref info) = self.chunk_info {
+            match self.source.get_chunk_payload(chunk_index, info) {
+                Ok(payload) => self.decompress_chunk_fast_bytes(
+                    chunk_index,
+                    payload.as_ref(),
+                    target_buffer.as_mut(),
+                ),
+                Err(e) => Err(e),
+            }
+        } else {
+            Err(RasterH3Error::InvalidMetadata("no chunk info".into()))
+        };
+
+        match fast_res {
+            Ok(None) => return Ok((chunk_bounds, target_buffer.unwrap())),
             Ok(Some(new_buf)) => return Ok((chunk_bounds, new_buf)),
             Err(_) => {}
         }
 
+        if let Some(buf) = target_buffer {
+            self.read_chunk_fallback_into(chunk_index, chunk_bounds, buf)
+        } else {
+            let data = self.inner.read_chunk(chunk_index)?;
+            Ok((chunk_bounds, data))
+        }
+    }
+
+    fn read_chunk_fallback_into(
+        &mut self,
+        chunk_index: u32,
+        chunk_bounds: RasterChunk,
+        mut buffer: DecodingResult,
+    ) -> Result<(RasterChunk, DecodingResult)> {
         let data_dims = self.inner.chunk_data_dimensions(chunk_index);
         let spp = self.samples_per_pixel.max(1) as usize;
         let required_len = (data_dims.0 as usize) * (data_dims.1 as usize) * spp;
@@ -392,27 +523,23 @@ impl<'a> ChunkDecoder<'a> {
             .as_ref()
             .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
 
-        let mmap = self
-            .mmap
-            .ok_or_else(|| RasterH3Error::InvalidMetadata("no mmap source".into()))?;
+        let payload = self.source.get_chunk_payload(chunk_index, info)?;
+        self.decompress_chunk_fast_bytes(chunk_index, payload.as_ref(), target_buffer)
+    }
 
-        let idx = chunk_index as usize;
-        let offset = *info
-            .chunk_offsets
-            .get(idx)
-            .ok_or_else(|| RasterH3Error::InvalidMetadata("invalid chunk offset".into()))?
-            as usize;
-        let compressed_len = *info
-            .chunk_bytes
-            .get(idx)
-            .ok_or_else(|| RasterH3Error::InvalidMetadata("invalid chunk bytes".into()))?
-            as usize;
+    /// Attempt accelerated chunk decompression with libdeflater (Deflate) or weezl (LZW)
+    /// directly from a compressed byte slice (works for both local mmap slices and remote prefetched payloads).
+    pub fn decompress_chunk_fast_bytes(
+        &mut self,
+        chunk_index: u32,
+        compressed_slice: &[u8],
+        target_buffer: Option<&mut DecodingResult>,
+    ) -> Result<Option<DecodingResult>> {
+        let info = self
+            .chunk_info
+            .as_ref()
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
 
-        if offset.checked_add(compressed_len).map_or(true, |end| end > mmap.len()) {
-            return Err(RasterH3Error::InvalidMetadata("chunk offset out of bounds".into()));
-        }
-
-        let compressed_slice = &mmap[offset..offset + compressed_len];
         let (chunk_w, chunk_h) = info.chunk_dimensions;
         let bounds = self.chunk_layout.get_chunk_bounds(chunk_index, self.width, self.height);
         let data_w = bounds.width as usize;
@@ -1196,6 +1323,28 @@ impl GeoTiffStreamReader {
         }
     }
 
+    /// Check if this reader streams from a remote HTTP / HTTPS / S3 source
+    pub fn is_remote(&self) -> bool {
+        matches!(self.source, RasterSource::Remote(_))
+    }
+
+    /// Return reference to remote source if remote
+    pub fn remote_source(&self) -> Option<&Arc<RemoteHttpSource>> {
+        match &self.source {
+            RasterSource::Remote(r) => Some(r),
+            RasterSource::Local(_) => None,
+        }
+    }
+
+    /// Read chunk byte payload for a specific chunk index (zero-copy borrowed slice for local mmap, fetched bytes for remote)
+    pub fn get_chunk_payload(&self, chunk_index: u32) -> Result<ChunkPayload<'_>> {
+        let info = self
+            .chunk_info
+            .as_ref()
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
+        self.source.get_chunk_payload(chunk_index, info)
+    }
+
     /// Extract common GeoTIFF metadata and chunk layout from an initialized Decoder
     fn parse_metadata_and_layout<R: std::io::Read + Seek>(
         decoder: &mut Decoder<R>,
@@ -1364,18 +1513,12 @@ impl GeoTiffStreamReader {
             }
         };
 
-        let mmap = match &self.source {
-            RasterSource::Local(mmap) => Some(&mmap[..]),
-            RasterSource::Remote(_) => None,
-        };
-
         let libdeflater = if self.chunk_info.as_ref().map_or(false, |info| {
             matches!(
                 info.compression,
                 CompressionMethod::Deflate | CompressionMethod::OldDeflate
             )
-        }) && mmap.is_some()
-        {
+        }) {
             Some(libdeflater::Decompressor::new())
         } else {
             None
@@ -1383,11 +1526,15 @@ impl GeoTiffStreamReader {
 
         let lzw_decoder = if self.chunk_info.as_ref().map_or(false, |info| {
             matches!(info.compression, CompressionMethod::LZW)
-        }) && mmap.is_some()
-        {
+        }) {
             Some(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8))
         } else {
             None
+        };
+
+        let source = match &self.source {
+            RasterSource::Local(mmap) => DecoderSource::Local(&mmap[..]),
+            RasterSource::Remote(remote) => DecoderSource::Remote(Arc::clone(remote)),
         };
 
         Ok(ChunkDecoder {
@@ -1397,7 +1544,7 @@ impl GeoTiffStreamReader {
             height: self.metadata.height,
             samples_per_pixel: self.metadata.samples_per_pixel,
             chunk_info: self.chunk_info.clone(),
-            mmap,
+            source,
             libdeflater,
             lzw_decoder,
             decomp_scratch: Vec::new(),

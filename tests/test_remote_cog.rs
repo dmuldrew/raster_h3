@@ -476,3 +476,179 @@ fn test_remote_end_to_end_multi_resolution_streamer() {
         records.len()
     );
 }
+
+#[test]
+fn test_remote_prefetch_queue_and_request_coalescing() {
+    use raster_h3::raster::prefetch::PrefetchedChunkReader;
+
+    let local_path = PathBuf::from("data/CFL_HI.tif");
+    if !local_path.exists() {
+        return;
+    }
+
+    let mut file = File::open(&local_path).unwrap();
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes).unwrap();
+
+    let server = MockHttpServer::start(file_bytes);
+    let remote_url = format!("{}/CFL_HI.tif", server.url_base);
+
+    let remote_reader = GeoTiffStreamReader::open(&remote_url).unwrap();
+    let local_reader = GeoTiffStreamReader::open(&local_path).unwrap();
+
+    let initial_reqs = server.request_count.load(Ordering::SeqCst);
+
+    // Request 16 consecutive chunks across scanlines
+    let chunk_indices: Vec<u32> = (0..16).collect();
+    let prefetcher = PrefetchedChunkReader::spawn_with_workers(remote_reader, chunk_indices.clone(), 32, 4);
+
+    let mut drained = Vec::new();
+    while let Some(item) = prefetcher.next_chunk() {
+        drained.push(item.unwrap());
+        if drained.len() == 16 {
+            break;
+        }
+    }
+
+    assert_eq!(drained.len(), 16);
+
+    // Verify bitwise/numerical parity against local decoder for all 16 chunks
+    let mut local_decoder = local_reader.open_decoder().unwrap();
+    for &(chunk_idx, ref bounds, ref data) in &drained {
+        let (loc_bounds, loc_data) = local_decoder.read_chunk(chunk_idx).unwrap();
+        assert_eq!(bounds, &loc_bounds);
+        match (data, &loc_data) {
+            (DecodingResult::F32(r_vals), DecodingResult::F32(l_vals)) => {
+                assert_eq!(r_vals, l_vals);
+            }
+            _ => panic!("Expected F32 sample format match"),
+        }
+    }
+
+    let total_reqs = server.request_count.load(Ordering::SeqCst) - initial_reqs;
+    println!(
+        "Drained 16 chunks in {} HTTP requests (coalescing efficiency: {:.1}x reduction)",
+        total_reqs,
+        16.0 / total_reqs.max(1) as f64
+    );
+
+    // Without coalescing, 16 individual chunks would require 16 separate range requests.
+    // With coalescing, adjacent tiles on rows are merged, requiring <= 8 requests.
+    assert!(
+        total_reqs <= 8,
+        "Expected range coalescing to reduce requests to <= 8, got {}",
+        total_reqs
+    );
+}
+
+#[test]
+fn test_remote_coalesce_chunk_ranges_algorithm() {
+    use raster_h3::raster::remote_prefetch::{coalesce_chunk_ranges, ChunkLocation};
+
+    let chunks = vec![
+        ChunkLocation { tile_idx: 0, chunk_idx: 0, offset: 1000, length: 2000 },
+        ChunkLocation { tile_idx: 0, chunk_idx: 1, offset: 3000, length: 2000 },
+        ChunkLocation { tile_idx: 0, chunk_idx: 2, offset: 5000, length: 2000 },
+        // Large gap (50,000 bytes > 32KB max gap)
+        ChunkLocation { tile_idx: 0, chunk_idx: 3, offset: 57000, length: 3000 },
+        ChunkLocation { tile_idx: 0, chunk_idx: 4, offset: 60000, length: 3000 },
+    ];
+
+    let coalesced = coalesce_chunk_ranges(&chunks, 32768, 1024 * 1024);
+    assert_eq!(coalesced.len(), 2);
+
+    // Range 1: Chunks 0, 1, 2
+    assert_eq!(coalesced[0].tile_idx, 0);
+    assert_eq!(coalesced[0].start_offset, 1000);
+    assert_eq!(coalesced[0].end_offset, 6999);
+    assert_eq!(coalesced[0].chunk_slices.len(), 3);
+    assert_eq!(coalesced[0].chunk_slices[0], (0, 0, 2000));
+    assert_eq!(coalesced[0].chunk_slices[1], (1, 2000, 2000));
+    assert_eq!(coalesced[0].chunk_slices[2], (2, 4000, 2000));
+
+    // Range 2: Chunks 3, 4
+    assert_eq!(coalesced[1].tile_idx, 0);
+    assert_eq!(coalesced[1].start_offset, 57000);
+    assert_eq!(coalesced[1].end_offset, 62999);
+    assert_eq!(coalesced[1].chunk_slices.len(), 2);
+    assert_eq!(coalesced[1].chunk_slices[0], (3, 0, 3000));
+    assert_eq!(coalesced[1].chunk_slices[1], (4, 3000, 3000));
+}
+
+#[test]
+fn test_unified_chunk_byte_pathway() {
+    use raster_h3::raster::geotiff::ChunkPayload;
+
+    let local_path = PathBuf::from("data/CFL_HI.tif");
+    if !local_path.exists() {
+        return;
+    }
+
+    let mut file = File::open(&local_path).unwrap();
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes).unwrap();
+
+    let server = MockHttpServer::start(file_bytes);
+    let remote_url = format!("{}/CFL_HI.tif", server.url_base);
+
+    let local_reader = GeoTiffStreamReader::open(&local_path).unwrap();
+    let remote_reader = GeoTiffStreamReader::open(&remote_url).unwrap();
+
+    // 1. Verify get_chunk_payload across local (zero-copy borrowed) and remote (range-fetched owned)
+    for chunk_idx in [0, 5, 10, 15] {
+        let local_payload = local_reader.get_chunk_payload(chunk_idx).unwrap();
+        let remote_payload = remote_reader.get_chunk_payload(chunk_idx).unwrap();
+
+        // Local must be zero-copy borrowed slice from mmap
+        assert!(matches!(local_payload, ChunkPayload::Borrowed(_)));
+        // Remote must be owned bytes fetched from remote range
+        assert!(matches!(remote_payload, ChunkPayload::Owned(_)));
+
+        // Both must be 100% byte-for-byte identical
+        assert_eq!(local_payload.as_ref(), remote_payload.as_ref());
+    }
+
+    // 2. Verify standalone read_chunk and read_chunk_into on remote decoders use SIMD/LZW directly
+    let mut local_decoder = local_reader.open_decoder().unwrap();
+    let mut remote_decoder = remote_reader.open_decoder().unwrap();
+
+    fn assert_decoding_result_eq(a: &DecodingResult, b: &DecodingResult) {
+        match (a, b) {
+            (DecodingResult::U8(v1), DecodingResult::U8(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::U16(v1), DecodingResult::U16(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::U32(v1), DecodingResult::U32(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::U64(v1), DecodingResult::U64(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::F32(v1), DecodingResult::F32(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::F64(v1), DecodingResult::F64(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::I8(v1), DecodingResult::I8(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::I16(v1), DecodingResult::I16(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::I32(v1), DecodingResult::I32(v2)) => assert_eq!(v1, v2),
+            (DecodingResult::I64(v1), DecodingResult::I64(v2)) => assert_eq!(v1, v2),
+            _ => panic!("Mismatched DecodingResult types"),
+        }
+    }
+
+    for chunk_idx in [0, 1, 2, 7, 12] {
+        // Test read_chunk
+        let (loc_bounds, loc_data) = local_decoder.read_chunk(chunk_idx).unwrap();
+        let (rem_bounds, rem_data) = remote_decoder.read_chunk(chunk_idx).unwrap();
+        assert_eq!(loc_bounds, rem_bounds);
+        assert_decoding_result_eq(&loc_data, &rem_data);
+
+        // Test read_chunk_into buffer recycling
+        let (loc_b2, loc_d2) = local_decoder.read_chunk_into(chunk_idx, loc_data).unwrap();
+        let (rem_b2, rem_d2) = remote_decoder.read_chunk_into(chunk_idx, rem_data).unwrap();
+        assert_eq!(loc_b2, rem_b2);
+        assert_decoding_result_eq(&loc_d2, &rem_d2);
+
+        // Test read_chunk_with_payload with externally provided bytes
+        let raw_payload = local_decoder.read_chunk_payload(chunk_idx).unwrap();
+        let (pay_b, pay_d) = remote_decoder
+            .read_chunk_with_payload(chunk_idx, Some(raw_payload.as_ref()), None)
+            .unwrap();
+        assert_eq!(loc_b2, pay_b);
+        assert_decoding_result_eq(&loc_d2, &pay_d);
+    }
+}
+
+

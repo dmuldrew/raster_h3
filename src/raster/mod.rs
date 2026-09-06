@@ -3,12 +3,19 @@ pub mod geotransform;
 pub mod http_range;
 pub mod mosaic;
 pub mod prefetch;
+pub mod remote_prefetch;
 
-pub use geotiff::{ChunkDecoder, ChunkLayout, GeoTiffMetadata, GeoTiffStreamReader, RasterSource};
+pub use geotiff::{
+    ChunkDecoder, ChunkLayout, ChunkPayload, GeoTiffMetadata, GeoTiffStreamReader, RasterSource,
+};
 pub use geotransform::GeoTransform;
 pub use http_range::{is_remote_url, normalize_url, HttpRangeReader, RemoteHttpSource};
 pub use mosaic::{glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor};
 pub use prefetch::{MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader};
+pub use remote_prefetch::{
+    coalesce_chunk_ranges, ChunkLocation, CoalescedRange, RemoteChunkPrefetchQueue,
+    RemotePrefetchConfig,
+};
 
 /// Represents a 2D chunk / tile window of a raster
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

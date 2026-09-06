@@ -8,6 +8,7 @@ use tiff::decoder::DecodingResult;
 use crate::error::Result;
 use crate::raster::geotiff::{ChunkDecoder, GeoTiffStreamReader};
 use crate::raster::mosaic::MosaicReader;
+use crate::raster::remote_prefetch::RemoteChunkPrefetchQueue;
 use crate::raster::RasterChunk;
 
 /// Item yielded by the prefetch worker
@@ -18,6 +19,7 @@ pub type PrefetchItem = Result<(u32, RasterChunk, DecodingResult)>;
 pub struct PrefetchedChunkReader {
     receiver: Receiver<PrefetchItem>,
     recycle_sender: Option<SyncSender<DecodingResult>>,
+    _remote_queue: Option<Arc<RemoteChunkPrefetchQueue>>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
 
@@ -25,7 +27,9 @@ impl PrefetchedChunkReader {
     /// Spawn a background prefetch thread pool with hardware-scaled worker count.
     /// Uses persistent decoders per worker thread to avoid IFD header re-parsing.
     pub fn spawn(reader: GeoTiffStreamReader, chunk_indices: Vec<u32>, buffer_capacity: usize) -> Self {
-        let default_workers = if chunk_indices.len() <= 4 {
+        let default_workers = if reader.is_remote() {
+            4
+        } else if chunk_indices.len() <= 4 {
             1
         } else {
             std::thread::available_parallelism()
@@ -47,12 +51,19 @@ impl PrefetchedChunkReader {
         buffer_capacity: usize,
         num_workers: usize,
     ) -> Self {
+        let remote_queue = if reader.is_remote() {
+            RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, None).map(Arc::new)
+        } else {
+            None
+        };
+
         if num_workers <= 1 || chunk_indices.is_empty() {
             let (sender, receiver): (SyncSender<PrefetchItem>, Receiver<PrefetchItem>) =
                 sync_channel(buffer_capacity.max(1));
             let (recycle_sender, recycle_receiver): (SyncSender<DecodingResult>, Receiver<DecodingResult>) =
                 sync_channel(buffer_capacity.max(1));
 
+            let worker_remote_queue = remote_queue.clone();
             let worker_handle = thread::spawn(move || {
                 let mut decoder = match reader.open_decoder() {
                     Ok(d) => d,
@@ -64,14 +75,13 @@ impl PrefetchedChunkReader {
 
                 for chunk_idx in chunk_indices {
                     let recycled_buf = recycle_receiver.try_recv().ok();
-                    let item = match recycled_buf {
-                        Some(buf) => decoder
-                            .read_chunk_into(chunk_idx, buf)
-                            .map(|(bounds, data)| (chunk_idx, bounds, data)),
-                        None => decoder
-                            .read_chunk(chunk_idx)
-                            .map(|(bounds, data)| (chunk_idx, bounds, data)),
-                    };
+                    let prefetched_bytes = worker_remote_queue
+                        .as_ref()
+                        .and_then(|q| q.get_chunk_payload(0, chunk_idx).ok().flatten());
+
+                    let item = decoder
+                        .read_chunk_with_payload(chunk_idx, prefetched_bytes.as_ref().map(|v| v.as_slice()), recycled_buf)
+                        .map(|(bounds, data)| (chunk_idx, bounds, data));
 
                     if sender.send(item).is_err() {
                         break;
@@ -82,6 +92,7 @@ impl PrefetchedChunkReader {
             return Self {
                 receiver,
                 recycle_sender: Some(recycle_sender),
+                _remote_queue: remote_queue,
                 _worker_handles: vec![worker_handle],
             };
         }
@@ -106,6 +117,7 @@ impl PrefetchedChunkReader {
             let worker_job_idx = Arc::clone(&next_job_idx);
             let worker_sender = result_sender.clone();
             let worker_recycle_rx = Arc::clone(&recycle_receiver);
+            let worker_remote_queue = remote_queue.clone();
 
             let handle = thread::spawn(move || {
                 let mut decoder = match worker_reader.open_decoder() {
@@ -126,14 +138,13 @@ impl PrefetchedChunkReader {
                     }
                     let chunk_idx = worker_indices[job_id];
                     let recycled_buf = worker_recycle_rx.lock().ok().and_then(|rx| rx.try_recv().ok());
-                    let item = match recycled_buf {
-                        Some(buf) => decoder
-                            .read_chunk_into(chunk_idx, buf)
-                            .map(|(bounds, data)| (chunk_idx, bounds, data)),
-                        None => decoder
-                            .read_chunk(chunk_idx)
-                            .map(|(bounds, data)| (chunk_idx, bounds, data)),
-                    };
+                    let prefetched_bytes = worker_remote_queue
+                        .as_ref()
+                        .and_then(|q| q.get_chunk_payload(0, chunk_idx).ok().flatten());
+
+                    let item = decoder
+                        .read_chunk_with_payload(chunk_idx, prefetched_bytes.as_ref().map(|v| v.as_slice()), recycled_buf)
+                        .map(|(bounds, data)| (chunk_idx, bounds, data));
 
                     if worker_sender.send((job_id, item)).is_err() {
                         break; // Collector or downstream dropped
@@ -189,6 +200,7 @@ impl PrefetchedChunkReader {
         Self {
             receiver,
             recycle_sender: Some(recycle_sender),
+            _remote_queue: remote_queue,
             _worker_handles: handles,
         }
     }
@@ -273,13 +285,16 @@ pub type MosaicPrefetchItem = Result<(usize, u32, RasterChunk, DecodingResult, b
 pub struct PrefetchedMosaicReader {
     receiver: Receiver<MosaicPrefetchItem>,
     recycle_sender: Option<SyncSender<DecodingResult>>,
+    _remote_queue: Option<Arc<RemoteChunkPrefetchQueue>>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
 
 impl PrefetchedMosaicReader {
     /// Spawn background prefetch thread pool for mosaic ingestion
     pub fn spawn(mosaic: Arc<MosaicReader>, buffer_capacity: usize) -> Self {
-        let default_workers = if mosaic.chunk_refs.len() <= 4 {
+        let default_workers = if mosaic.tiles.iter().any(|t| t.reader.is_remote()) {
+            4
+        } else if mosaic.chunk_refs.len() <= 4 {
             1
         } else {
             std::thread::available_parallelism()
@@ -296,12 +311,15 @@ impl PrefetchedMosaicReader {
         buffer_capacity: usize,
         num_workers: usize,
     ) -> Self {
+        let remote_queue = RemoteChunkPrefetchQueue::spawn_mosaic(&mosaic, None).map(Arc::new);
+
         if num_workers <= 1 || mosaic.chunk_refs.is_empty() {
             let (sender, receiver): (SyncSender<MosaicPrefetchItem>, Receiver<MosaicPrefetchItem>) =
                 sync_channel(buffer_capacity.max(1));
             let (recycle_sender, recycle_receiver): (SyncSender<DecodingResult>, Receiver<DecodingResult>) =
                 sync_channel(buffer_capacity.max(1));
 
+            let worker_remote_queue = remote_queue.clone();
             let worker_handle = thread::spawn(move || {
                 let mut decoders: Vec<Option<ChunkDecoder>> =
                     (0..mosaic.tiles.len()).map(|_| None).collect();
@@ -323,14 +341,13 @@ impl PrefetchedMosaicReader {
                     let decoder = decoders[tile_idx].as_mut().unwrap();
 
                     let recycled_buf = recycle_receiver.try_recv().ok();
-                    let item = match recycled_buf {
-                        Some(buf) => decoder
-                            .read_chunk_into(chunk_idx, buf)
-                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
-                        None => decoder
-                            .read_chunk(chunk_idx)
-                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
-                    };
+                    let prefetched_bytes = worker_remote_queue
+                        .as_ref()
+                        .and_then(|q| q.get_chunk_payload(tile_idx, chunk_idx).ok().flatten());
+
+                    let item = decoder
+                        .read_chunk_with_payload(chunk_idx, prefetched_bytes.as_ref().map(|v| v.as_slice()), recycled_buf)
+                        .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap));
 
                     if sender.send(item).is_err() {
                         break;
@@ -341,6 +358,7 @@ impl PrefetchedMosaicReader {
             return Self {
                 receiver,
                 recycle_sender: Some(recycle_sender),
+                _remote_queue: remote_queue,
                 _worker_handles: vec![worker_handle],
             };
         }
@@ -364,6 +382,7 @@ impl PrefetchedMosaicReader {
             let worker_job_idx = Arc::clone(&next_job_idx);
             let worker_sender = result_sender.clone();
             let worker_recycle_rx = Arc::clone(&recycle_receiver);
+            let worker_remote_queue = remote_queue.clone();
 
             let handle = thread::spawn(move || {
                 let mut decoders: Vec<Option<ChunkDecoder>> =
@@ -394,14 +413,13 @@ impl PrefetchedMosaicReader {
 
                     let recycled_buf =
                         worker_recycle_rx.lock().ok().and_then(|rx| rx.try_recv().ok());
-                    let item = match recycled_buf {
-                        Some(buf) => decoder
-                            .read_chunk_into(chunk_idx, buf)
-                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
-                        None => decoder
-                            .read_chunk(chunk_idx)
-                            .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap)),
-                    };
+                    let prefetched_bytes = worker_remote_queue
+                        .as_ref()
+                        .and_then(|q| q.get_chunk_payload(tile_idx, chunk_idx).ok().flatten());
+
+                    let item = decoder
+                        .read_chunk_with_payload(chunk_idx, prefetched_bytes.as_ref().map(|v| v.as_slice()), recycled_buf)
+                        .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap));
 
                     if worker_sender.send((job_id, item)).is_err() {
                         break;
@@ -454,6 +472,7 @@ impl PrefetchedMosaicReader {
         Self {
             receiver,
             recycle_sender: Some(recycle_sender),
+            _remote_queue: remote_queue,
             _worker_handles: handles,
         }
     }

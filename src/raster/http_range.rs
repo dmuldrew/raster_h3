@@ -232,28 +232,24 @@ impl RemoteHttpSource {
             }
         }
 
-        // 2. Slow path: fetch block under write lock
-        let mut cache = self.cache.write().map_err(|_| {
-            RasterH3Error::InvalidParameter("Remote HTTP cache lock poisoned".to_string())
-        })?;
-
-        // Re-check under write lock
-        if let Some(block) = cache.get(&block_idx) {
-            if offset_in_block < block.len() {
-                let available = (block.len() - offset_in_block).min(actual_len);
-                if available == actual_len {
-                    return Ok(block[offset_in_block..offset_in_block + actual_len].to_vec());
-                }
-            }
-        }
-
+        // 2. Slow path: fetch block without holding write lock to allow parallel fetches
         let block_end = (block_start + self.block_size as u64).min(self.total_size);
         let fetched_bytes = self.fetch_range(block_start, block_end - 1)?;
         let block_arc = Arc::new(fetched_bytes);
-        cache.insert(block_idx, Arc::clone(&block_arc));
 
-        let available = (block_arc.len().saturating_sub(offset_in_block)).min(actual_len);
-        Ok(block_arc[offset_in_block..offset_in_block + available].to_vec())
+        // Insert into cache under write lock (retaining existing if race occurred)
+        let final_block = {
+            let mut cache = self.cache.write().map_err(|_| {
+                RasterH3Error::InvalidParameter("Remote HTTP cache lock poisoned".to_string())
+            })?;
+            cache
+                .entry(block_idx)
+                .or_insert_with(|| Arc::clone(&block_arc))
+                .clone()
+        };
+
+        let available = (final_block.len().saturating_sub(offset_in_block)).min(actual_len);
+        Ok(final_block[offset_in_block..offset_in_block + available].to_vec())
     }
 }
 
