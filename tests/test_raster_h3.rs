@@ -1864,6 +1864,53 @@ fn test_simd_span_f32_accuracy_and_welford_equivalence() {
 }
 
 #[test]
+fn test_simd_span_f64_accuracy_and_welford_equivalence() {
+    use raster_h3::aggregator::simd::SimdSpanAccumulate;
+
+    let raw_vals: Vec<f64> = (0..127).map(|i| ((i * 11 + 7) % 89) as f64 * 2.25).collect();
+    let mut welford = H3Accumulator::default();
+    for &v in &raw_vals {
+        welford.update(v);
+    }
+
+    let simd_acc = f64::accumulate_span(&raw_vals, None);
+    assert_eq!(simd_acc.count, welford.count);
+    assert!((simd_acc.sum - welford.sum).abs() < 1e-4);
+    assert!((simd_acc.mean() - welford.mean()).abs() < 1e-6);
+    assert!((simd_acc.variance() - welford.variance()).abs() < 1e-4);
+    assert_eq!(simd_acc.min, welford.min);
+    assert_eq!(simd_acc.max, welford.max);
+
+    // Test with NoData
+    let mut nodata_vals = raw_vals.clone();
+    nodata_vals[10] = -999.0;
+    nodata_vals[20] = -999.0;
+    let nd_acc = f64::accumulate_span(&nodata_vals, Some(-999.0));
+    assert_eq!(nd_acc.count, 125.0);
+}
+
+#[test]
+fn test_simd_span_variable_lengths() {
+    use raster_h3::aggregator::simd::SimdSpanAccumulate;
+
+    // Test slice lengths from 0 to 33 to test all remainder combinations of 8-lane chunks
+    for len in 0..=33 {
+        let vals: Vec<f32> = (0..len).map(|i| (i as f32) + 1.0).collect();
+        let mut expected = H3Accumulator::default();
+        for &v in &vals {
+            expected.update(v as f64);
+        }
+
+        let acc = f32::accumulate_span(&vals, None);
+        assert_eq!(acc.count, expected.count, "Count mismatch for len {}", len);
+        if len > 0 {
+            assert!((acc.sum - expected.sum).abs() < 1e-4, "Sum mismatch for len {}", len);
+            assert!((acc.mean() - expected.mean()).abs() < 1e-6, "Mean mismatch for len {}", len);
+        }
+    }
+}
+
+#[test]
 fn test_simd_span_integer_types() {
     use raster_h3::aggregator::simd::SimdSpanAccumulate;
 

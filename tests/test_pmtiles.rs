@@ -571,7 +571,19 @@ fn test_geotiff_to_pmtiles_selective_properties() {
     assert!(fields.get("h3_hex").is_none(), "Metadata fields must NOT contain 'h3_hex'");
 }
 
+#[test]
+fn test_cell_to_tile_coordinate_mapping() {
+    use h3o::{CellIndex, LatLng};
+    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
 
+    let cell_u64 = 0x83464efffffffffu64;
+    let cell = CellIndex::try_from(cell_u64).expect("valid cell index");
+    let center: LatLng = cell.into();
 
+    let (tx5, ty5) = lon_lat_to_tile_xy(center.lng(), center.lat(), 5);
+    let (tx7, ty7) = lon_lat_to_tile_xy(center.lng(), center.lat(), 7);
 
-
+    // Zoom 7 coordinates should be consistent with Zoom 5 parent tile (4x4 sub-tiles)
+    assert_eq!(tx7 >> 2, tx5, "Z7 tile x shifted by 2 must match Z5 tile x");
+    assert_eq!(ty7 >> 2, ty5, "Z7 tile y shifted by 2 must match Z5 tile y");
+}

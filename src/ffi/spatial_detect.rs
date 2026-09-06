@@ -23,9 +23,9 @@ pub fn parse_version_string(ver_str: &str, req_major: u32, req_minor: u32) -> bo
     false
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 const RTLD_DEFAULT: *mut std::ffi::c_void = -2isize as *mut std::ffi::c_void;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();
 
 #[cfg(unix)]
@@ -33,6 +33,15 @@ extern "C" {
     fn dlsym(
         handle: *mut std::ffi::c_void,
         symbol: *const std::os::raw::c_char,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn GetModuleHandleA(lpModuleName: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+    fn GetProcAddress(
+        hModule: *mut std::ffi::c_void,
+        lpProcName: *const std::os::raw::c_char,
     ) -> *mut std::ffi::c_void;
 }
 
@@ -44,6 +53,30 @@ pub fn is_duckdb_version_at_least(req_major: u32, req_minor: u32) -> bool {
             RTLD_DEFAULT,
             b"duckdb_library_version\0".as_ptr() as *const _,
         );
+        if !sym.is_null() {
+            let func: unsafe extern "C" fn() -> *const std::os::raw::c_char =
+                std::mem::transmute(sym);
+            let ptr = func();
+            if !ptr.is_null() {
+                let ver_str = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+                return parse_version_string(&ver_str, req_major, req_minor);
+            }
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        let mut handle = GetModuleHandleA(std::ptr::null());
+        let mut sym = if !handle.is_null() {
+            GetProcAddress(handle, b"duckdb_library_version\0".as_ptr() as *const _)
+        } else {
+            std::ptr::null_mut()
+        };
+        if sym.is_null() {
+            handle = GetModuleHandleA(b"duckdb.dll\0".as_ptr() as *const _);
+            if !handle.is_null() {
+                sym = GetProcAddress(handle, b"duckdb_library_version\0".as_ptr() as *const _);
+            }
+        }
         if !sym.is_null() {
             let func: unsafe extern "C" fn() -> *const std::os::raw::c_char =
                 std::mem::transmute(sym);
