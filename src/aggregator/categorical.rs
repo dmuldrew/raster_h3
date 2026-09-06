@@ -1,4 +1,5 @@
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::Arc;
 use fxhash::FxBuildHasher;
 use h3o::{LatLng, Resolution};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use crate::aggregator::horizon_streamer::{
     chunk_intersects_bbox, compute_cell_south_lat, AggregationConfig,
     HexEvictionEntry,
 };
+use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
@@ -218,6 +220,7 @@ pub struct CategoricalHorizonStreamer {
     sampling: SamplingPattern,
     gt: GeoTransform,
     chunk_stride: u32,
+    pub remapper: Option<Arc<CategoryRemapper>>,
     active_map: HashMap<u64, CategoricalAccumulator, FxBuildHasher>,
     eviction_queue: BinaryHeap<HexEvictionEntry>,
     completed_buffer: VecDeque<(u64, CategoricalAccumulator)>,
@@ -271,6 +274,7 @@ impl CategoricalHorizonStreamer {
             sampling: config.sampling.clone(),
             gt,
             chunk_stride,
+            remapper: config.remapper.clone(),
             active_map: HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default()),
             eviction_queue: BinaryHeap::with_capacity(1024),
             completed_buffer: VecDeque::with_capacity(2048),
@@ -451,12 +455,20 @@ impl CategoricalHorizonStreamer {
                                 }
                             }
 
-                            if let Some(cat) = to_i64(val_raw) {
+                            if let Some(val) = to_i64(val_raw) {
                                 if let Some(nd) = self.nodata {
-                                    if (cat as f64 - nd).abs() < 1e-6 {
+                                    if (val as f64 - nd).abs() < 1e-6 {
                                         continue;
                                     }
                                 }
+                                let cat = if let Some(ref rem) = self.remapper {
+                                    match rem.remap(val) {
+                                        Some(c) => c,
+                                        None => continue,
+                                    }
+                                } else {
+                                    val
+                                };
                                 if Some(cat) == curr_cat {
                                     curr_cat_count += 1.0;
                                 } else {
@@ -511,16 +523,25 @@ impl CategoricalHorizonStreamer {
                         }
                     }
 
-                    let cat = match to_i64(val_raw) {
+                    let val = match to_i64(val_raw) {
                         Some(v) => v,
                         None => continue,
                     };
 
                     if let Some(nd) = self.nodata {
-                        if (cat as f64 - nd).abs() < 1e-6 {
+                        if (val as f64 - nd).abs() < 1e-6 {
                             continue;
                         }
                     }
+
+                    let cat = if let Some(ref rem) = self.remapper {
+                        match rem.remap(val) {
+                            Some(c) => c,
+                            None => continue,
+                        }
+                    } else {
+                        val
+                    };
 
                     let col_px = (chunk.col_offset as usize) + c;
                     let (center_x, center_y) = self.gt.pixel_center_to_coord(col_px, row_idx);

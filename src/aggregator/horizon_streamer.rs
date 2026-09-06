@@ -1,4 +1,5 @@
 use std::collections::{BinaryHeap, VecDeque};
+use std::sync::Arc;
 use h3o::{CellIndex, LatLng, Resolution};
 use std::collections::HashMap;
 use fxhash::FxBuildHasher;
@@ -6,6 +7,7 @@ use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;
+use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
@@ -91,6 +93,7 @@ pub struct AggregationConfig {
     pub custom_nodata: Option<f64>,
     pub bbox: Option<[f64; 4]>, // [min_lon, min_lat, max_lon, max_lat]
     pub sampling: SamplingPattern,
+    pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
 impl Default for AggregationConfig {
@@ -101,6 +104,7 @@ impl Default for AggregationConfig {
             custom_nodata: None,
             bbox: None,
             sampling: SamplingPattern::default(),
+            remapper: None,
         }
     }
 }

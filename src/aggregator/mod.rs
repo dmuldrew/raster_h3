@@ -5,11 +5,13 @@ pub mod h3_scanline;
 pub mod horizon_streamer;
 pub mod multi_horizon;
 pub mod quantiles;
+pub mod remap;
 pub mod sampling;
 pub mod simd;
 
 pub use accumulator::H3Accumulator;
 pub use quantiles::QuantileSketch;
+pub use remap::{CategoryRemapper, RemapRule, UnmappedAction};
 pub use categorical::{CategoricalAccumulator, CategoricalHorizonStreamer};
 pub use h3_map::{aggregate_raster_stream, H3HashMap};
 pub use h3_scanline::H3ScanlineLookahead;

@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiResolutionConfig,
 };
+use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{from_duckdb_string, to_c_string};
@@ -35,6 +36,7 @@ pub struct RasterH3CategoricalBindData {
     pub min_majority_fraction: Option<f64>,
     pub compact: bool,
     pub emit_geom: bool,
+    pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
 pub struct LongCategoricalRow {
@@ -327,6 +329,28 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         crate::ffi::is_geometry_available()
     };
 
+    // Named parameter: remap (VARCHAR, e.g. '{101..109: 1, 121..124: 2, else: null}')
+    let name_remap = to_c_string("remap");
+    let named_remap_val = duckdb_bind_get_named_parameter(info, name_remap.as_ptr());
+    let remapper = if !named_remap_val.is_null() {
+        let remap_ptr = duckdb_get_varchar(named_remap_val);
+        if let Some(s) = from_duckdb_string(remap_ptr) {
+            match CategoryRemapper::parse(&s) {
+                Ok(rem) => Some(rem.into_arc()),
+                Err(e) => {
+                    let err_msg = CString::new(format!("Failed to parse remap parameter: {}", e))
+                        .unwrap_or_else(|_| CString::new("Failed to parse remap parameter").unwrap());
+                    duckdb_bind_set_error(info, err_msg.as_ptr());
+                    return;
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
         Ok(paths) => paths,
         Err(e) => {
@@ -520,6 +544,7 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         min_majority_fraction,
         compact,
         emit_geom,
+        remapper,
     });
 
     duckdb_bind_set_bind_data(
@@ -570,6 +595,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
     config.min_count = bind_data.min_count;
     config.min_majority_fraction = bind_data.min_majority_fraction;
     config.compact = bind_data.compact;
+    config.remapper = bind_data.remapper.clone();
 
     let streamer = match MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config) {
         Ok(s) => s,
@@ -1153,6 +1179,10 @@ pub unsafe fn register_categorical_table_function(
         // Overlap rule parameter
         let name_overlap = to_c_string("overlap_rule");
         duckdb_table_function_add_named_parameter(tf, name_overlap.as_ptr(), type_varchar);
+
+        // Remap parameter
+        let name_remap = to_c_string("remap");
+        duckdb_table_function_add_named_parameter(tf, name_remap.as_ptr(), type_varchar);
 
         duckdb_table_function_set_bind(tf, raster_h3_categorical_bind);
         duckdb_table_function_set_init(tf, raster_h3_categorical_init);

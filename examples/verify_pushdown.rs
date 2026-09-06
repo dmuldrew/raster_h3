@@ -24,6 +24,7 @@ fn main() {
         custom_nodata: None,
         bbox: None,
         sampling: Default::default(),
+        ..Default::default()
     };
 
     let start_full = Instant::now();
@@ -61,6 +62,7 @@ fn main() {
         custom_nodata: None,
         bbox: Some(oahu_bbox),
         sampling: Default::default(),
+        ..Default::default()
     };
 
     let start_filtered = Instant::now();
