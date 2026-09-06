@@ -3,13 +3,24 @@ use std::io::{Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use memmap2::Mmap;
-use tiff::decoder::{Decoder, DecodingBuffer, DecodingResult};
-use tiff::tags::Tag;
+use tiff::decoder::{
+    fp_predict_f32, fp_predict_f64, ChunkType, Decoder, DecodingBuffer, DecodingResult,
+};
+use tiff::tags::{
+    CompressionMethod, PhotometricInterpretation, Predictor, SampleFormat, Tag,
+};
 
-use crate::error::Result;
+use crate::error::{RasterH3Error, Result};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::http_range::{is_remote_url, HttpRangeReader, RemoteHttpSource};
 use crate::raster::RasterChunk;
+
+/// TIFF byte order (Intel Little-Endian vs Motorola Big-Endian)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiffByteOrder {
+    LittleEndian,
+    BigEndian,
+}
 
 /// Parsed GeoTIFF metadata
 #[derive(Debug, Clone)]
@@ -86,6 +97,21 @@ pub enum RasterSource {
     Remote(Arc<RemoteHttpSource>),
 }
 
+/// TIFF chunk layout and compression metadata for SIMD-accelerated direct decoding
+#[derive(Debug, Clone)]
+pub struct TiffChunkInfo {
+    pub compression: CompressionMethod,
+    pub predictor: Predictor,
+    pub chunk_type: ChunkType,
+    pub chunk_offsets: Arc<[u64]>,
+    pub chunk_bytes: Arc<[u64]>,
+    pub chunk_dimensions: (u32, u32),
+    pub bits_per_sample: u8,
+    pub sample_format: SampleFormat,
+    pub byte_order: TiffByteOrder,
+    pub photometric: PhotometricInterpretation,
+}
+
 /// Zero-copy memory-mapped or remote streaming GeoTIFF reader that decodes chunks on-demand
 #[derive(Clone)]
 pub struct GeoTiffStreamReader {
@@ -93,6 +119,7 @@ pub struct GeoTiffStreamReader {
     pub source: RasterSource,
     pub metadata: GeoTiffMetadata,
     pub chunk_layout: ChunkLayout,
+    pub chunk_info: Option<Arc<TiffChunkInfo>>,
 }
 
 /// Internal decoder variant: Cursor over memory-mapped slice or streaming HttpRangeReader
@@ -141,16 +168,24 @@ pub struct ChunkDecoder<'a> {
     width: u32,
     height: u32,
     samples_per_pixel: u16,
+    chunk_info: Option<Arc<TiffChunkInfo>>,
+    mmap: Option<&'a [u8]>,
+    libdeflater: Option<libdeflater::Decompressor>,
+    decomp_scratch: Vec<u8>,
 }
 
 impl<'a> ChunkDecoder<'a> {
-    /// Read and decode a single chunk using the persistent decoder (no header re-parse)
+    /// Read and decode a single chunk using persistent decoder or SIMD libdeflater
     pub fn read_chunk(&mut self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
         let chunk_bounds = self.chunk_layout.get_chunk_bounds(
             chunk_index,
             self.width,
             self.height,
         );
+
+        if let Ok(Some(data)) = self.decompress_chunk_simd(chunk_index, None) {
+            return Ok((chunk_bounds, data));
+        }
 
         let data = self.inner.read_chunk(chunk_index)?;
         Ok((chunk_bounds, data))
@@ -167,6 +202,12 @@ impl<'a> ChunkDecoder<'a> {
             self.width,
             self.height,
         );
+
+        match self.decompress_chunk_simd(chunk_index, Some(&mut buffer)) {
+            Ok(None) => return Ok((chunk_bounds, buffer)),
+            Ok(Some(new_buf)) => return Ok((chunk_bounds, new_buf)),
+            Err(_) => {}
+        }
 
         let data_dims = self.inner.chunk_data_dimensions(chunk_index);
         let spp = self.samples_per_pixel.max(1) as usize;
@@ -282,6 +323,643 @@ impl<'a> ChunkDecoder<'a> {
             Ok((chunk_bounds, data))
         }
     }
+
+    /// Attempt SIMD-accelerated chunk decompression with libdeflater.
+    /// If target_buffer is provided and of matching type, it will be populated in-place.
+    /// Returns Ok(None) if target_buffer was populated in-place.
+    /// Returns Ok(Some(new_result)) if a new DecodingResult was created.
+    /// Returns Err(_) if anything is unsupported or failed, triggering standard fallback.
+    fn decompress_chunk_simd(
+        &mut self,
+        chunk_index: u32,
+        target_buffer: Option<&mut DecodingResult>,
+    ) -> Result<Option<DecodingResult>> {
+        let info = self
+            .chunk_info
+            .as_ref()
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
+
+        if !matches!(
+            info.compression,
+            CompressionMethod::Deflate | CompressionMethod::OldDeflate
+        ) {
+            return Err(RasterH3Error::InvalidMetadata("not deflate".into()));
+        }
+
+        let mmap = self
+            .mmap
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("no mmap source".into()))?;
+
+        let decompressor = self
+            .libdeflater
+            .as_mut()
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("no decompressor".into()))?;
+
+        let idx = chunk_index as usize;
+        let offset = *info
+            .chunk_offsets
+            .get(idx)
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("invalid chunk offset".into()))?
+            as usize;
+        let compressed_len = *info
+            .chunk_bytes
+            .get(idx)
+            .ok_or_else(|| RasterH3Error::InvalidMetadata("invalid chunk bytes".into()))?
+            as usize;
+
+        if offset.checked_add(compressed_len).map_or(true, |end| end > mmap.len()) {
+            return Err(RasterH3Error::InvalidMetadata("chunk offset out of bounds".into()));
+        }
+
+        let compressed_slice = &mmap[offset..offset + compressed_len];
+        let (chunk_w, chunk_h) = info.chunk_dimensions;
+        let bounds = self.chunk_layout.get_chunk_bounds(chunk_index, self.width, self.height);
+        let data_w = bounds.width as usize;
+        let data_h = bounds.height as usize;
+        let spp = (self.samples_per_pixel.max(1)) as usize;
+        let byte_len = (info.bits_per_sample as usize / 8).max(1);
+
+        let raw_chunk_bytes = match info.chunk_type {
+            ChunkType::Tile => (chunk_w as usize) * (chunk_h as usize) * spp * byte_len,
+            ChunkType::Strip => (chunk_w as usize) * data_h * spp * byte_len,
+        };
+
+        if self.decomp_scratch.len() < raw_chunk_bytes {
+            self.decomp_scratch.resize(raw_chunk_bytes, 0);
+        }
+
+        let decomp_slice = &mut self.decomp_scratch[..raw_chunk_bytes];
+        let decomp_res = decompressor.zlib_decompress(compressed_slice, decomp_slice);
+        let decomp_ok = match decomp_res {
+            Ok(_) => true,
+            Err(_) => decompressor.deflate_decompress(compressed_slice, decomp_slice).is_ok(),
+        };
+
+        if !decomp_ok {
+            return Err(RasterH3Error::InvalidMetadata("decompress failed".into()));
+        }
+
+        let total_samples = data_w * data_h * spp;
+        let tile_w = chunk_w as usize;
+
+        match (info.sample_format, info.bits_per_sample) {
+            (SampleFormat::Uint, 8) => match target_buffer {
+                Some(DecodingResult::U8(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_u8(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0u8; total_samples];
+                    Self::unpack_u8(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::U8(v)))
+                }
+            },
+            (SampleFormat::Uint, 16) => match target_buffer {
+                Some(DecodingResult::U16(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_u16(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0u16; total_samples];
+                    Self::unpack_u16(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::U16(v)))
+                }
+            },
+            (SampleFormat::Uint, 32) => match target_buffer {
+                Some(DecodingResult::U32(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_u32(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0u32; total_samples];
+                    Self::unpack_u32(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::U32(v)))
+                }
+            },
+            (SampleFormat::Uint, 64) => match target_buffer {
+                Some(DecodingResult::U64(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_u64(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0u64; total_samples];
+                    Self::unpack_u64(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::U64(v)))
+                }
+            },
+            (SampleFormat::Int, 8) => match target_buffer {
+                Some(DecodingResult::I8(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_i8(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0i8; total_samples];
+                    Self::unpack_i8(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::I8(v)))
+                }
+            },
+            (SampleFormat::Int, 16) => match target_buffer {
+                Some(DecodingResult::I16(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_i16(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0i16; total_samples];
+                    Self::unpack_i16(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::I16(v)))
+                }
+            },
+            (SampleFormat::Int, 32) => match target_buffer {
+                Some(DecodingResult::I32(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_i32(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0i32; total_samples];
+                    Self::unpack_i32(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::I32(v)))
+                }
+            },
+            (SampleFormat::Int, 64) => match target_buffer {
+                Some(DecodingResult::I64(ref mut v)) => {
+                    v.resize(total_samples, 0);
+                    Self::unpack_i64(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0i64; total_samples];
+                    Self::unpack_i64(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::I64(v)))
+                }
+            },
+            (SampleFormat::IEEEFP, 32) => match target_buffer {
+                Some(DecodingResult::F32(ref mut v)) => {
+                    v.resize(total_samples, 0.0);
+                    Self::unpack_f32(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0.0f32; total_samples];
+                    Self::unpack_f32(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::F32(v)))
+                }
+            },
+            (SampleFormat::IEEEFP, 64) => match target_buffer {
+                Some(DecodingResult::F64(ref mut v)) => {
+                    v.resize(total_samples, 0.0);
+                    Self::unpack_f64(decomp_slice, &mut v[..total_samples], tile_w, data_w, data_h, spp, info)?;
+                    Ok(None)
+                }
+                _ => {
+                    let mut v = vec![0.0f64; total_samples];
+                    Self::unpack_f64(decomp_slice, &mut v, tile_w, data_w, data_h, spp, info)?;
+                    Ok(Some(DecodingResult::F64(v)))
+                }
+            },
+            _ => Err(RasterH3Error::InvalidMetadata("unsupported format".into())),
+        }
+    }
+
+    fn unpack_u8(
+        src: &[u8],
+        dst: &mut [u8],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride = tile_w * spp;
+        let dst_stride = data_w * spp;
+        if src_stride == dst_stride {
+            dst.copy_from_slice(&src[..data_w * data_h * spp]);
+        } else {
+            for r in 0..data_h {
+                let s = &src[r * src_stride..r * src_stride + dst_stride];
+                let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                d.copy_from_slice(s);
+            }
+        }
+        if info.predictor == Predictor::Horizontal {
+            for r in 0..data_h {
+                let row = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                for col in spp..row.len() {
+                    row[col] = row[col].wrapping_add(row[col - spp]);
+                }
+            }
+        }
+        if info.photometric == PhotometricInterpretation::WhiteIsZero {
+            for val in dst.iter_mut() {
+                *val = 255 - *val;
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_i8(
+        src: &[u8],
+        dst: &mut [i8],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride = tile_w * spp;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride..r * src_stride + dst_stride];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            for (i, item) in d.iter_mut().enumerate() {
+                *item = s[i] as i8;
+            }
+        }
+        if info.predictor == Predictor::Horizontal {
+            for r in 0..data_h {
+                let row = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                for col in spp..row.len() {
+                    row[col] = row[col].wrapping_add(row[col - spp]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_u16(
+        src: &[u8],
+        dst: &mut [u16],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 2;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 2];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            match info.byte_order {
+                TiffByteOrder::LittleEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+                    }
+                }
+                TiffByteOrder::BigEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                    }
+                }
+            }
+            if info.predictor == Predictor::Horizontal {
+                for col in spp..d.len() {
+                    d[col] = d[col].wrapping_add(d[col - spp]);
+                }
+            }
+            if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                for item in d.iter_mut() {
+                    *item = 65535 - *item;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_i16(
+        src: &[u8],
+        dst: &mut [i16],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 2;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 2];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            match info.byte_order {
+                TiffByteOrder::LittleEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = i16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+                    }
+                }
+                TiffByteOrder::BigEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = i16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                    }
+                }
+            }
+            if info.predictor == Predictor::Horizontal {
+                for col in spp..d.len() {
+                    d[col] = d[col].wrapping_add(d[col - spp]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_u32(
+        src: &[u8],
+        dst: &mut [u32],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 4;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 4];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            match info.byte_order {
+                TiffByteOrder::LittleEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = u32::from_le_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
+                    }
+                }
+                TiffByteOrder::BigEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = u32::from_be_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
+                    }
+                }
+            }
+            if info.predictor == Predictor::Horizontal {
+                for col in spp..d.len() {
+                    d[col] = d[col].wrapping_add(d[col - spp]);
+                }
+            }
+            if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                for item in d.iter_mut() {
+                    *item = u32::MAX - *item;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_i32(
+        src: &[u8],
+        dst: &mut [i32],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 4;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 4];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            match info.byte_order {
+                TiffByteOrder::LittleEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = i32::from_le_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
+                    }
+                }
+                TiffByteOrder::BigEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = i32::from_be_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
+                    }
+                }
+            }
+            if info.predictor == Predictor::Horizontal {
+                for col in spp..d.len() {
+                    d[col] = d[col].wrapping_add(d[col - spp]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_u64(
+        src: &[u8],
+        dst: &mut [u64],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 8;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 8];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            match info.byte_order {
+                TiffByteOrder::LittleEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = u64::from_le_bytes([
+                            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
+                            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                        ]);
+                    }
+                }
+                TiffByteOrder::BigEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = u64::from_be_bytes([
+                            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
+                            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                        ]);
+                    }
+                }
+            }
+            if info.predictor == Predictor::Horizontal {
+                for col in spp..d.len() {
+                    d[col] = d[col].wrapping_add(d[col - spp]);
+                }
+            }
+            if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                for item in d.iter_mut() {
+                    *item = u64::MAX - *item;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_i64(
+        src: &[u8],
+        dst: &mut [i64],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 8;
+        let dst_stride = data_w * spp;
+        for r in 0..data_h {
+            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 8];
+            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+            match info.byte_order {
+                TiffByteOrder::LittleEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = i64::from_le_bytes([
+                            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
+                            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                        ]);
+                    }
+                }
+                TiffByteOrder::BigEndian => {
+                    for (i, item) in d.iter_mut().enumerate() {
+                        *item = i64::from_be_bytes([
+                            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
+                            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                        ]);
+                    }
+                }
+            }
+            if info.predictor == Predictor::Horizontal {
+                for col in spp..d.len() {
+                    d[col] = d[col].wrapping_add(d[col - spp]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_f32(
+        src: &mut [u8],
+        dst: &mut [f32],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 4;
+        let dst_stride = data_w * spp;
+        match info.predictor {
+            Predictor::FloatingPoint => {
+                for r in 0..data_h {
+                    let s = &mut src[r * src_stride_bytes..(r + 1) * src_stride_bytes];
+                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                    fp_predict_f32(s, d, spp);
+                    if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                        for item in d.iter_mut() {
+                            *item = 1.0 - *item;
+                        }
+                    }
+                }
+            }
+            Predictor::None => {
+                for r in 0..data_h {
+                    let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 4];
+                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                    match info.byte_order {
+                        TiffByteOrder::LittleEndian => {
+                            for (i, item) in d.iter_mut().enumerate() {
+                                *item = f32::from_bits(u32::from_le_bytes([
+                                    s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
+                                ]));
+                            }
+                        }
+                        TiffByteOrder::BigEndian => {
+                            for (i, item) in d.iter_mut().enumerate() {
+                                *item = f32::from_bits(u32::from_be_bytes([
+                                    s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
+                                ]));
+                            }
+                        }
+                    }
+                    if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                        for item in d.iter_mut() {
+                            *item = 1.0 - *item;
+                        }
+                    }
+                }
+            }
+            Predictor::Horizontal => {
+                return Err(RasterH3Error::InvalidMetadata(
+                    "horizontal predictor unsupported for f32".into(),
+                ));
+            }
+            _ => {
+                return Err(RasterH3Error::InvalidMetadata(
+                    "unsupported predictor for f32".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn unpack_f64(
+        src: &mut [u8],
+        dst: &mut [f64],
+        tile_w: usize,
+        data_w: usize,
+        data_h: usize,
+        spp: usize,
+        info: &TiffChunkInfo,
+    ) -> Result<()> {
+        let src_stride_bytes = tile_w * spp * 8;
+        let dst_stride = data_w * spp;
+        match info.predictor {
+            Predictor::FloatingPoint => {
+                for r in 0..data_h {
+                    let s = &mut src[r * src_stride_bytes..(r + 1) * src_stride_bytes];
+                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                    fp_predict_f64(s, d, spp);
+                    if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                        for item in d.iter_mut() {
+                            *item = 1.0 - *item;
+                        }
+                    }
+                }
+            }
+            Predictor::None => {
+                for r in 0..data_h {
+                    let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 8];
+                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                    match info.byte_order {
+                        TiffByteOrder::LittleEndian => {
+                            for (i, item) in d.iter_mut().enumerate() {
+                                *item = f64::from_bits(u64::from_le_bytes([
+                                    s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
+                                    s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                                ]));
+                            }
+                        }
+                        TiffByteOrder::BigEndian => {
+                            for (i, item) in d.iter_mut().enumerate() {
+                                *item = f64::from_bits(u64::from_be_bytes([
+                                    s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
+                                    s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                                ]));
+                            }
+                        }
+                    }
+                    if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                        for item in d.iter_mut() {
+                            *item = 1.0 - *item;
+                        }
+                    }
+                }
+            }
+            Predictor::Horizontal => {
+                return Err(RasterH3Error::InvalidMetadata(
+                    "horizontal predictor unsupported for f64".into(),
+                ));
+            }
+            _ => {
+                return Err(RasterH3Error::InvalidMetadata(
+                    "unsupported predictor for f64".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl GeoTiffStreamReader {
@@ -296,7 +974,7 @@ impl GeoTiffStreamReader {
     /// Extract common GeoTIFF metadata and chunk layout from an initialized Decoder
     fn parse_metadata_and_layout<R: std::io::Read + Seek>(
         decoder: &mut Decoder<R>,
-    ) -> Result<(GeoTiffMetadata, ChunkLayout)> {
+    ) -> Result<(GeoTiffMetadata, ChunkLayout, Option<Arc<TiffChunkInfo>>)> {
         let (width, height) = decoder.dimensions()?;
         let geotransform = Self::extract_geotransform(decoder)?;
         let nodata = Self::extract_nodata(decoder);
@@ -330,7 +1008,80 @@ impl GeoTiffStreamReader {
             samples_per_pixel,
         };
 
-        Ok((metadata, chunk_layout))
+        let compression = match decoder.get_tag_u32(Tag::Compression) {
+            Ok(v) => CompressionMethod::from_u16(v as u16).unwrap_or(CompressionMethod::None),
+            Err(_) => CompressionMethod::None,
+        };
+
+        let predictor = match decoder.get_tag_u32(Tag::Predictor) {
+            Ok(v) => Predictor::from_u16(v as u16).unwrap_or(Predictor::None),
+            Err(_) => Predictor::None,
+        };
+
+        let chunk_type = decoder.get_chunk_type();
+
+        let bits_per_sample = decoder
+            .get_tag_u32(Tag::BitsPerSample)
+            .or_else(|_| {
+                decoder
+                    .get_tag_u16_vec(Tag::BitsPerSample)
+                    .map(|v| v.first().copied().unwrap_or(8) as u32)
+            })
+            .unwrap_or(8) as u8;
+
+        let sample_format = match decoder
+            .get_tag_u32(Tag::SampleFormat)
+            .or_else(|_| {
+                decoder
+                    .get_tag_u16_vec(Tag::SampleFormat)
+                    .map(|v| v.first().copied().unwrap_or(1) as u32)
+            }) {
+            Ok(v) => SampleFormat::from_u16(v as u16).unwrap_or(SampleFormat::Uint),
+            Err(_) => SampleFormat::Uint,
+        };
+
+        let photometric = match decoder.get_tag_u32(Tag::PhotometricInterpretation) {
+            Ok(v) => PhotometricInterpretation::from_u16(v as u16)
+                .unwrap_or(PhotometricInterpretation::BlackIsZero),
+            Err(_) => PhotometricInterpretation::BlackIsZero,
+        };
+
+        let byte_order = if format!("{:?}", decoder.byte_order()).contains("BigEndian") {
+            TiffByteOrder::BigEndian
+        } else {
+            TiffByteOrder::LittleEndian
+        };
+
+        let (offsets, bytes) = match chunk_type {
+            ChunkType::Tile => {
+                let offs = decoder.find_tag_unsigned_vec::<u64>(Tag::TileOffsets).ok().flatten();
+                let bts = decoder.find_tag_unsigned_vec::<u64>(Tag::TileByteCounts).ok().flatten();
+                (offs, bts)
+            }
+            ChunkType::Strip => {
+                let offs = decoder.find_tag_unsigned_vec::<u64>(Tag::StripOffsets).ok().flatten();
+                let bts = decoder.find_tag_unsigned_vec::<u64>(Tag::StripByteCounts).ok().flatten();
+                (offs, bts)
+            }
+        };
+
+        let chunk_info = match (offsets, bytes) {
+            (Some(offs), Some(bts)) if offs.len() == bts.len() => Some(Arc::new(TiffChunkInfo {
+                compression,
+                predictor,
+                chunk_type,
+                chunk_offsets: offs.into(),
+                chunk_bytes: bts.into(),
+                chunk_dimensions: (chunk_w, chunk_h),
+                bits_per_sample,
+                sample_format,
+                byte_order,
+                photometric,
+            })),
+            _ => None,
+        };
+
+        Ok((metadata, chunk_layout, chunk_info))
     }
 
     /// Open and decode metadata for a local file (via mmap) or a remote URL (via HTTP Range)
@@ -342,13 +1093,14 @@ impl GeoTiffStreamReader {
             let remote = Arc::new(RemoteHttpSource::open(&path_str)?);
             let reader = HttpRangeReader::new(Arc::clone(&remote));
             let mut decoder = Decoder::new(reader)?;
-            let (metadata, chunk_layout) = Self::parse_metadata_and_layout(&mut decoder)?;
+            let (metadata, chunk_layout, chunk_info) = Self::parse_metadata_and_layout(&mut decoder)?;
 
             return Ok(Self {
                 file_path: path_buf,
                 source: RasterSource::Remote(remote),
                 metadata,
                 chunk_layout,
+                chunk_info,
             });
         }
 
@@ -360,13 +1112,14 @@ impl GeoTiffStreamReader {
 
         let cursor = Cursor::new(&mmap_arc[..]);
         let mut decoder = Decoder::new(cursor)?;
-        let (metadata, chunk_layout) = Self::parse_metadata_and_layout(&mut decoder)?;
+        let (metadata, chunk_layout, chunk_info) = Self::parse_metadata_and_layout(&mut decoder)?;
 
         Ok(Self {
             file_path: path_buf,
             source: RasterSource::Local(mmap_arc),
             metadata,
             chunk_layout,
+            chunk_info,
         })
     }
 
@@ -386,12 +1139,33 @@ impl GeoTiffStreamReader {
             }
         };
 
+        let mmap = match &self.source {
+            RasterSource::Local(mmap) => Some(&mmap[..]),
+            RasterSource::Remote(_) => None,
+        };
+
+        let libdeflater = if self.chunk_info.as_ref().map_or(false, |info| {
+            matches!(
+                info.compression,
+                CompressionMethod::Deflate | CompressionMethod::OldDeflate
+            )
+        }) && mmap.is_some()
+        {
+            Some(libdeflater::Decompressor::new())
+        } else {
+            None
+        };
+
         Ok(ChunkDecoder {
             inner,
             chunk_layout: self.chunk_layout,
             width: self.metadata.width,
             height: self.metadata.height,
             samples_per_pixel: self.metadata.samples_per_pixel,
+            chunk_info: self.chunk_info.clone(),
+            mmap,
+            libdeflater,
+            decomp_scratch: Vec::new(),
         })
     }
 
