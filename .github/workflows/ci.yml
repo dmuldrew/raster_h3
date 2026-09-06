@@ -1,0 +1,65 @@
+name: CI & Extension Build Matrix
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test & Package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux_amd64
+            lib_file: libraster_h3.so
+          - os: macos-latest
+            platform: osx_arm64
+            lib_file: libraster_h3.dylib
+          - os: windows-latest
+            platform: windows_amd64
+            lib_file: raster_h3.dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests
+        run: cargo test --release
+
+      - name: Build Dynamic Library & Binaries
+        run: cargo build --release
+
+      - name: Package DuckDB Extension (Uncompressed & Gzipped)
+        shell: bash
+        run: |
+          cargo run --release --bin package_extension -- \
+            --input target/release/${{ matrix.lib_file }} \
+            --output target/release/raster_h3.duckdb_extension \
+            --platform ${{ matrix.platform }} \
+            --duckdb-version v1.2.0
+
+          cargo run --release --bin package_extension -- \
+            --input target/release/${{ matrix.lib_file }} \
+            --output target/release/raster_h3.duckdb_extension.gz \
+            --platform ${{ matrix.platform }} \
+            --duckdb-version v1.2.0 \
+            --gzip
+
+      - name: Upload Extension Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-extension-${{ matrix.platform }}
+          path: |
+            target/release/raster_h3.duckdb_extension
+            target/release/raster_h3.duckdb_extension.gz
+          if-no-files-found: error

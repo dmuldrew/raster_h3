@@ -15,15 +15,10 @@ COPY examples/ ./examples/
 RUN cargo test --release && \
     cargo build --release && \
     cargo build --release --examples && \
-    cargo run --release --example generate_sample sample_sf.tif && \
-    cargo install cargo-duckdb-ext-tools && \
-    ARCH=$(uname -m); \
-    case "$ARCH" in \
-        x86_64)  DUCK_PLAT="linux_amd64" ;; \
-        aarch64|arm64) DUCK_PLAT="linux_arm64" ;; \
-        *) DUCK_PLAT="linux_amd64" ;; \
-    esac; \
-    cargo-duckdb-ext package -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension -v v0.1.0 -p "$DUCK_PLAT" -d v1.5.5
+    cargo run --release --bin package_extension -- \
+        --input target/release/libraster_h3.so \
+        --output target/release/raster_h3.duckdb_extension \
+        --duckdb-version v1.5.5
 
 # ==============================================================================
 # Stage 2: Runtime Environment with DuckDB CLI

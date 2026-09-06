@@ -42,11 +42,17 @@ src/
 │   ├── h3_map.rs            # In-memory H3 aggregation map fallback
 │   ├── h3_scanline.rs       # Scanline lookahead & jump-guess traversal
 │   ├── horizon_streamer.rs  # Southernmost scanline horizon eviction engine
-│   ├── multi_horizon.rs     # Multi-resolution concurrent horizon aggregator
+│   ├── multi_horizon/       # Multi-resolution concurrent horizon aggregator submodules
+│   │   ├── config.rs        # Configuration & quantile/spectral formula targets
+│   │   ├── continuous.rs    # Continuous numeric chunk aggregation
+│   │   ├── continuous_streamer.rs # Multi-resolution continuous horizon streamer
+│   │   ├── categorical.rs   # Categorical landcover chunk aggregation
+│   │   └── categorical_streamer.rs # Multi-resolution categorical horizon streamer
 │   └── sampling.rs          # Sub-pixel super-sampling presets (RGSS, Hex, 8-Rooks, Gaussian)
 ├── bin/                     # Standalone CLI utilities
 │   ├── convert_to_pmtiles.rs# High-speed standalone TIFF-to-PMTiles converter
-│   └── inspect_tif.rs       # GeoTIFF metadata & CRS inspection tool
+│   ├── inspect_tif.rs       # GeoTIFF metadata & CRS inspection tool
+│   └── package_extension.rs # Pure-Rust DuckDB extension packager & footer generator
 ├── crs/                     # Geodetic reprojection layer
 │   ├── mod.rs
 │   └── transformer.rs       # Standalone CRS reprojection via proj4rs
