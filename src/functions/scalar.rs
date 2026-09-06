@@ -258,6 +258,77 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_str(
     }
 }
 
+/// Scalar function: h3_to_geometry(UBIGINT) -> GEOMETRY (Zero-allocation WKB polygon encoder)
+pub unsafe extern "C" fn scalar_h3_to_geometry_u64(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let count = duckdb_data_chunk_get_size(input);
+    let v_in = duckdb_data_chunk_get_vector(input, 0);
+    let p_in = duckdb_vector_get_data(v_in) as *const u64;
+
+    let mut wkb_buf = [0u8; 128];
+
+    for i in 0..count {
+        let cell_u64 = *p_in.add(i as usize);
+        if let Some(wkb_len) = h3_index_to_wkb(cell_u64, &mut wkb_buf) {
+            duckdb_vector_assign_string_element_len(
+                output,
+                i,
+                wkb_buf.as_ptr() as *const c_char,
+                wkb_len as idx_t,
+            );
+        } else {
+            duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
+        }
+    }
+}
+
+/// Scalar function: h3_to_geometry(VARCHAR) -> GEOMETRY (Zero-allocation WKB polygon encoder)
+pub unsafe extern "C" fn scalar_h3_to_geometry_str(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let count = duckdb_data_chunk_get_size(input);
+    let v_in = duckdb_data_chunk_get_vector(input, 0);
+
+    let mut wkb_buf = [0u8; 128];
+
+    for i in 0..count {
+        let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
+        let d_str = &*str_ptr.add(i as usize);
+
+        let s = if d_str.length <= 12 {
+            let bytes = &d_str.prefix[..d_str.length as usize];
+            std::str::from_utf8(bytes).unwrap_or("")
+        } else {
+            let ptr = d_str.ptr as *const u8;
+            if ptr.is_null() {
+                ""
+            } else {
+                let slice = std::slice::from_raw_parts(ptr, d_str.length as usize);
+                std::str::from_utf8(slice).unwrap_or("")
+            }
+        };
+
+        let cell_u64_opt = parse_hex_u64(s);
+        let wkb_len_opt = cell_u64_opt.and_then(|u| h3_index_to_wkb(u, &mut wkb_buf));
+
+        if let Some(wkb_len) = wkb_len_opt {
+            duckdb_vector_assign_string_element_len(
+                output,
+                i,
+                wkb_buf.as_ptr() as *const c_char,
+                wkb_len as idx_t,
+            );
+        } else {
+            duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
+        }
+    }
+}
+
 /// Scalar function: h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
 pub unsafe extern "C" fn scalar_h3_cell_to_parent_u64(
     _info: duckdb_function_info,
@@ -471,6 +542,49 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     let mut fn_parent_str_mut = fn_parent_str;
     duckdb_destroy_scalar_function(&mut fn_parent_str_mut);
 
+    // 12. h3_to_geometry(UBIGINT) -> GEOMETRY
+    let type_geom = crate::ffi::create_geometry_logical_type();
+    let fn_geom_u64 = duckdb_create_scalar_function();
+    let name_geom = to_c_string("h3_to_geometry");
+    duckdb_scalar_function_set_name(fn_geom_u64, name_geom.as_ptr());
+    duckdb_scalar_function_add_parameter(fn_geom_u64, type_ubigint);
+    duckdb_scalar_function_set_return_type(fn_geom_u64, type_geom);
+    duckdb_scalar_function_set_function(fn_geom_u64, scalar_h3_to_geometry_u64);
+    duckdb_register_scalar_function(con, fn_geom_u64);
+    let mut fn_geom_u64_mut = fn_geom_u64;
+    duckdb_destroy_scalar_function(&mut fn_geom_u64_mut);
+
+    // 13. h3_to_geometry(VARCHAR) -> GEOMETRY
+    let fn_geom_str = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(fn_geom_str, name_geom.as_ptr());
+    duckdb_scalar_function_add_parameter(fn_geom_str, type_varchar);
+    duckdb_scalar_function_set_return_type(fn_geom_str, type_geom);
+    duckdb_scalar_function_set_function(fn_geom_str, scalar_h3_to_geometry_str);
+    duckdb_register_scalar_function(con, fn_geom_str);
+    let mut fn_geom_str_mut = fn_geom_str;
+    duckdb_destroy_scalar_function(&mut fn_geom_str_mut);
+
+    // 14. h3_cell_to_geometry(UBIGINT) -> GEOMETRY (standard alias)
+    let fn_cell_geom_u64 = duckdb_create_scalar_function();
+    let name_cell_geom = to_c_string("h3_cell_to_geometry");
+    duckdb_scalar_function_set_name(fn_cell_geom_u64, name_cell_geom.as_ptr());
+    duckdb_scalar_function_add_parameter(fn_cell_geom_u64, type_ubigint);
+    duckdb_scalar_function_set_return_type(fn_cell_geom_u64, type_geom);
+    duckdb_scalar_function_set_function(fn_cell_geom_u64, scalar_h3_to_geometry_u64);
+    duckdb_register_scalar_function(con, fn_cell_geom_u64);
+    let mut fn_cell_geom_u64_mut = fn_cell_geom_u64;
+    duckdb_destroy_scalar_function(&mut fn_cell_geom_u64_mut);
+
+    // 15. h3_cell_to_geometry(VARCHAR) -> GEOMETRY (standard alias)
+    let fn_cell_geom_str = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(fn_cell_geom_str, name_cell_geom.as_ptr());
+    duckdb_scalar_function_add_parameter(fn_cell_geom_str, type_varchar);
+    duckdb_scalar_function_set_return_type(fn_cell_geom_str, type_geom);
+    duckdb_scalar_function_set_function(fn_cell_geom_str, scalar_h3_to_geometry_str);
+    duckdb_register_scalar_function(con, fn_cell_geom_str);
+    let mut fn_cell_geom_str_mut = fn_cell_geom_str;
+    duckdb_destroy_scalar_function(&mut fn_cell_geom_str_mut);
+
     // Cleanup types
     let mut type_ubigint_mut = type_ubigint;
     duckdb_destroy_logical_type(&mut type_ubigint_mut);
@@ -484,7 +598,8 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     duckdb_destroy_logical_type(&mut type_bool_mut);
     let mut type_blob_mut = type_blob;
     duckdb_destroy_logical_type(&mut type_blob_mut);
-
+    let mut type_geom_mut = type_geom;
+    duckdb_destroy_logical_type(&mut type_geom_mut);
 
     Ok(())
 }

@@ -1,6 +1,8 @@
 pub mod duckdb_c;
+pub mod spatial_detect;
 
 pub use duckdb_c::*;
+pub use spatial_detect::*;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;

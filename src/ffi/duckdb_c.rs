@@ -39,6 +39,7 @@ pub enum DuckDBType {
     TimeTz = 28,
     TimestampTz = 29,
     UHugeInt = 32,
+    Geometry = 40,
 }
 
 #[repr(C)]
@@ -62,6 +63,30 @@ pub type duckdb_scalar_function = *mut c_void;
 pub type duckdb_extension_info = *mut c_void;
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+pub struct duckdb_result {
+    pub deprecated_column_count: idx_t,
+    pub deprecated_row_count: idx_t,
+    pub deprecated_rows_changed: idx_t,
+    pub deprecated_columns: *mut c_void,
+    pub deprecated_error_message: *mut c_char,
+    pub internal_data: *mut c_void,
+}
+
+impl Default for duckdb_result {
+    fn default() -> Self {
+        Self {
+            deprecated_column_count: 0,
+            deprecated_row_count: 0,
+            deprecated_rows_changed: 0,
+            deprecated_columns: std::ptr::null_mut(),
+            deprecated_error_message: std::ptr::null_mut(),
+            internal_data: std::ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
 pub struct duckdb_extension_access {
     pub get_api: Option<unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *mut c_void>,
     pub get_database: Option<unsafe extern "C" fn(info: duckdb_extension_info) -> *mut duckdb_database>,
@@ -82,6 +107,8 @@ extern "C" {
     // Logical types
     pub fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb_logical_type;
     pub fn duckdb_destroy_logical_type(type_: *mut duckdb_logical_type);
+    pub fn duckdb_logical_type_set_alias(type_: duckdb_logical_type, alias: *const c_char);
+    pub fn duckdb_logical_type_get_alias(type_: duckdb_logical_type) -> *mut c_char;
 
     // Table functions
     pub fn duckdb_create_table_function() -> duckdb_table_function;
@@ -193,4 +220,15 @@ extern "C" {
     ) -> DuckDBState;
 
     pub fn duckdb_library_version() -> *const c_char;
+
+    // Queries
+    pub fn duckdb_query(
+        connection: duckdb_connection,
+        query: *const c_char,
+        out_result: *mut duckdb_result,
+    ) -> DuckDBState;
+    pub fn duckdb_destroy_result(result: *mut duckdb_result);
+    pub fn duckdb_row_count(result: *mut duckdb_result) -> idx_t;
+    pub fn duckdb_column_count(result: *mut duckdb_result) -> idx_t;
+    pub fn duckdb_result_error(result: *mut duckdb_result) -> *const c_char;
 }

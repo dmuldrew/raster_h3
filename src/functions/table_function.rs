@@ -31,6 +31,7 @@ pub struct RasterH3BindData {
     pub max_mean: Option<f64>,
     pub compact: bool,
     pub quantiles: Vec<QuantileTarget>,
+    pub emit_geom: bool,
 }
 
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
@@ -40,6 +41,7 @@ pub struct RasterH3GlobalData {
     pub is_finished: AtomicBool,
     pub projected_columns: Vec<usize>,
     pub quantiles: Vec<QuantileTarget>,
+    pub emit_geom: bool,
 }
 
 /// Thread-local state for parallel DuckDB execution threads
@@ -390,6 +392,15 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Named parameter: geom (BOOLEAN, default: auto-detected based on DuckDB GEOMETRY availability)
+    let name_geom = to_c_string("geom");
+    let named_geom_val = duckdb_bind_get_named_parameter(info, name_geom.as_ptr());
+    let emit_geom = if !named_geom_val.is_null() {
+        duckdb_get_bool(named_geom_val)
+    } else {
+        crate::ffi::is_geometry_available()
+    };
+
     let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
         Ok(paths) => paths,
         Err(e) => {
@@ -456,7 +467,16 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let mut type_blob_mut = type_blob;
     duckdb_destroy_logical_type(&mut type_blob_mut);
 
-    // Quantile columns (10, 11, ...): target.column_name() DOUBLE
+    // 10: geom GEOMETRY (Native DuckDB Geometry)
+    if emit_geom {
+        let col_geom = to_c_string("geom");
+        let type_geom = crate::ffi::create_geometry_logical_type();
+        duckdb_bind_add_result_column(info, col_geom.as_ptr(), type_geom);
+        let mut type_geom_mut = type_geom;
+        duckdb_destroy_logical_type(&mut type_geom_mut);
+    }
+
+    // Quantile columns (10/11, ...): target.column_name() DOUBLE
     for target in &quantiles {
         let col_q = to_c_string(target.column_name());
         let type_double_q = duckdb_create_logical_type(DuckDBType::Double);
@@ -522,6 +542,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         max_mean,
         compact,
         quantiles,
+        emit_geom,
     });
 
     duckdb_bind_set_bind_data(
@@ -592,6 +613,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         is_finished: AtomicBool::new(false),
         projected_columns,
         quantiles: bind_data.quantiles.clone(),
+        emit_geom: bind_data.emit_geom,
     });
 
     duckdb_init_set_init_data(
@@ -725,6 +747,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     // 7: sum DOUBLE
     // 8: resolution UTINYINT
     // 9: wkb BLOB
+    // 10: geom GEOMETRY (if emit_geom)
     let mut vec_h3: Option<*mut u64> = None;
     let mut vec_hex: Option<duckdb_vector> = None;
     let mut vec_mean: Option<*mut f64> = None;
@@ -735,7 +758,10 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let mut vec_sum: Option<*mut f64> = None;
     let mut vec_res: Option<*mut u8> = None;
     let mut vec_wkb: Option<duckdb_vector> = None;
+    let mut vec_geom: Option<duckdb_vector> = None;
     let mut vec_quantiles: Vec<(usize, *mut f64)> = Vec::new();
+
+    let q_start_col = if global_data.emit_geom { 11 } else { 10 };
 
     for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
         let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -750,8 +776,9 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             7 => vec_sum = Some(duckdb_vector_get_data(v) as *mut f64),
             8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
             9 => vec_wkb = Some(v),
-            c if c >= 10 => {
-                let q_idx = c - 10;
+            10 if global_data.emit_geom => vec_geom = Some(v),
+            c if c >= q_start_col => {
+                let q_idx = c - q_start_col;
                 if q_idx < global_data.quantiles.len() {
                     vec_quantiles.push((q_idx, duckdb_vector_get_data(v) as *mut f64));
                 }
@@ -807,16 +834,31 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         if let Some(p) = vec_res {
             *p.add(i) = rec.resolution;
         }
-        if let Some(v) = vec_wkb {
-            if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
-                duckdb_vector_assign_string_element_len(
-                    v,
-                    row_idx,
-                    wkb_buf.as_ptr() as *const c_char,
-                    wkb_len as idx_t,
-                );
-            } else {
-                duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+        if vec_wkb.is_some() || vec_geom.is_some() {
+            let wkb_len_opt = h3_index_to_wkb(rec.h3_index, wkb_buf);
+            if let Some(v) = vec_wkb {
+                if let Some(wkb_len) = wkb_len_opt {
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        row_idx,
+                        wkb_buf.as_ptr() as *const c_char,
+                        wkb_len as idx_t,
+                    );
+                } else {
+                    duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                }
+            }
+            if let Some(v) = vec_geom {
+                if let Some(wkb_len) = wkb_len_opt {
+                    duckdb_vector_assign_string_element_len(
+                        v,
+                        row_idx,
+                        wkb_buf.as_ptr() as *const c_char,
+                        wkb_len as idx_t,
+                    );
+                } else {
+                    duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                }
             }
         }
         for &(q_idx, ptr) in &vec_quantiles {
@@ -935,6 +977,10 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
         let name_compact = to_c_string("compact");
         duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
+
+        // Native GEOMETRY emission parameter
+        let name_geom = to_c_string("geom");
+        duckdb_table_function_add_named_parameter(tf, name_geom.as_ptr(), type_bool);
 
         // Overlap rule parameter
         let name_overlap = to_c_string("overlap_rule");

@@ -22,6 +22,11 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
         return false;
     }
 
+    // Auto-detect if spatial extension or GEOMETRY type is active
+    if ffi::is_spatial_loaded_query(con) {
+        ffi::set_spatial_loaded(true);
+    }
+
     // 1. Register h3_raster_continuous_aggregate Table Function (Continuous: mean, stddev, sum, min, max)
     if register_table_function(con).is_err() {
         duckdb_disconnect(&mut con);

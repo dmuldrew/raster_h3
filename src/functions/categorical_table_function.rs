@@ -34,6 +34,7 @@ pub struct RasterH3CategoricalBindData {
     pub min_count: Option<f64>,
     pub min_majority_fraction: Option<f64>,
     pub compact: bool,
+    pub emit_geom: bool,
 }
 
 pub struct LongCategoricalRow {
@@ -54,6 +55,7 @@ pub struct RasterH3CategoricalGlobalData {
     pub format: CategoricalOutputFormat,
     pub projected_columns: Vec<usize>,
     pub long_queue: Mutex<VecDeque<LongCategoricalRow>>,
+    pub emit_geom: bool,
 }
 
 pub struct RasterH3CategoricalLocalData {
@@ -316,6 +318,15 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         }
     }
 
+    // Named parameter: geom (BOOLEAN, default: auto-detected based on DuckDB GEOMETRY availability)
+    let name_geom = to_c_string("geom");
+    let named_geom_val = duckdb_bind_get_named_parameter(info, name_geom.as_ptr());
+    let emit_geom = if !named_geom_val.is_null() {
+        duckdb_get_bool(named_geom_val)
+    } else {
+        crate::ffi::is_geometry_available()
+    };
+
     let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
         Ok(paths) => paths,
         Err(e) => {
@@ -381,9 +392,18 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
             // 12: wkb BLOB (OGC 2D Polygon)
             let col_wkb = to_c_string("wkb");
             duckdb_bind_add_result_column(info, col_wkb.as_ptr(), type_blob);
+
+            // 13: geom GEOMETRY (Native DuckDB Geometry)
+            if emit_geom {
+                let col_geom = to_c_string("geom");
+                let type_geom = crate::ffi::create_geometry_logical_type();
+                duckdb_bind_add_result_column(info, col_geom.as_ptr(), type_geom);
+                let mut type_geom_mut = type_geom;
+                duckdb_destroy_logical_type(&mut type_geom_mut);
+            }
         }
         CategoricalOutputFormat::Long => {
-            // Option C: Long form (h3_index, h3_hex, category, count, fraction, total_count, resolution, shannon_entropy, entropy, distinct_classes, unique_classes, wkb)
+            // Option C: Long form (h3_index, h3_hex, category, count, fraction, total_count, resolution, shannon_entropy, entropy, distinct_classes, unique_classes, wkb, geom)
             let col_cat = to_c_string("category");
             duckdb_bind_add_result_column(info, col_cat.as_ptr(), type_bigint);
 
@@ -419,6 +439,15 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
             // 11: wkb BLOB (OGC 2D Polygon)
             let col_wkb = to_c_string("wkb");
             duckdb_bind_add_result_column(info, col_wkb.as_ptr(), type_blob);
+
+            // 12: geom GEOMETRY (Native DuckDB Geometry)
+            if emit_geom {
+                let col_geom = to_c_string("geom");
+                let type_geom = crate::ffi::create_geometry_logical_type();
+                duckdb_bind_add_result_column(info, col_geom.as_ptr(), type_geom);
+                let mut type_geom_mut = type_geom;
+                duckdb_destroy_logical_type(&mut type_geom_mut);
+            }
         }
     }
 
@@ -490,6 +519,7 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         min_count,
         min_majority_fraction,
         compact,
+        emit_geom,
     });
 
     duckdb_bind_set_bind_data(
@@ -558,6 +588,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         format: bind_data.format,
         projected_columns,
         long_queue: Mutex::new(VecDeque::new()),
+        emit_geom: bind_data.emit_geom,
     });
 
     duckdb_init_set_init_data(
@@ -693,6 +724,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 10: entropy DOUBLE
             // 11: distinct_classes BIGINT
             // 12: wkb BLOB
+            // 13: geom GEOMETRY (if emit_geom)
             let mut vec_h3: Option<*mut u64> = None;
             let mut vec_hex: Option<duckdb_vector> = None;
             let mut vec_maj_cls: Option<*mut i64> = None;
@@ -706,6 +738,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             let mut vec_entropy: Option<*mut f64> = None;
             let mut vec_distinct: Option<*mut i64> = None;
             let mut vec_wkb: Option<duckdb_vector> = None;
+            let mut vec_geom: Option<duckdb_vector> = None;
 
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -723,6 +756,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     10 => vec_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
                     11 => vec_distinct = Some(duckdb_vector_get_data(v) as *mut i64),
                     12 => vec_wkb = Some(v),
+                    13 if global_data.emit_geom => vec_geom = Some(v),
                     _ => {}
                 }
             }
@@ -803,16 +837,31 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         *p.add(i) = ent;
                     }
                 }
-                if let Some(v) = vec_wkb {
-                    if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
-                        duckdb_vector_assign_string_element_len(
-                            v,
-                            row_idx,
-                            wkb_buf.as_ptr() as *const c_char,
-                            wkb_len as idx_t,
-                        );
-                    } else {
-                        duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                if vec_wkb.is_some() || vec_geom.is_some() {
+                    let wkb_len_opt = h3_index_to_wkb(rec.h3_index, wkb_buf);
+                    if let Some(v) = vec_wkb {
+                        if let Some(wkb_len) = wkb_len_opt {
+                            duckdb_vector_assign_string_element_len(
+                                v,
+                                row_idx,
+                                wkb_buf.as_ptr() as *const c_char,
+                                wkb_len as idx_t,
+                            );
+                        } else {
+                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                        }
+                    }
+                    if let Some(v) = vec_geom {
+                        if let Some(wkb_len) = wkb_len_opt {
+                            duckdb_vector_assign_string_element_len(
+                                v,
+                                row_idx,
+                                wkb_buf.as_ptr() as *const c_char,
+                                wkb_len as idx_t,
+                            );
+                        } else {
+                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                        }
                     }
                 }
             }
@@ -901,6 +950,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 9: distinct_classes BIGINT
             // 10: unique_classes BIGINT
             // 11: wkb BLOB
+            // 12: geom GEOMETRY (if emit_geom)
             let mut vec_h3: Option<*mut u64> = None;
             let mut vec_hex: Option<duckdb_vector> = None;
             let mut vec_cat: Option<*mut i64> = None;
@@ -913,6 +963,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             let mut vec_distinct: Option<*mut i64> = None;
             let mut vec_uniq: Option<*mut i64> = None;
             let mut vec_wkb: Option<duckdb_vector> = None;
+            let mut vec_geom: Option<duckdb_vector> = None;
 
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
@@ -929,6 +980,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     9 => vec_distinct = Some(duckdb_vector_get_data(v) as *mut i64),
                     10 => vec_uniq = Some(duckdb_vector_get_data(v) as *mut i64),
                     11 => vec_wkb = Some(v),
+                    12 if global_data.emit_geom => vec_geom = Some(v),
                     _ => {}
                 }
             }
@@ -986,16 +1038,31 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 if let Some(p) = vec_uniq {
                     *p.add(i) = row.distinct_classes;
                 }
-                if let Some(v) = vec_wkb {
-                    if let Some(wkb_len) = h3_index_to_wkb(row.cell_u64, wkb_buf) {
-                        duckdb_vector_assign_string_element_len(
-                            v,
-                            row_idx,
-                            wkb_buf.as_ptr() as *const c_char,
-                            wkb_len as idx_t,
-                        );
-                    } else {
-                        duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                if vec_wkb.is_some() || vec_geom.is_some() {
+                    let wkb_len_opt = h3_index_to_wkb(row.cell_u64, wkb_buf);
+                    if let Some(v) = vec_wkb {
+                        if let Some(wkb_len) = wkb_len_opt {
+                            duckdb_vector_assign_string_element_len(
+                                v,
+                                row_idx,
+                                wkb_buf.as_ptr() as *const c_char,
+                                wkb_len as idx_t,
+                            );
+                        } else {
+                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                        }
+                    }
+                    if let Some(v) = vec_geom {
+                        if let Some(wkb_len) = wkb_len_opt {
+                            duckdb_vector_assign_string_element_len(
+                                v,
+                                row_idx,
+                                wkb_buf.as_ptr() as *const c_char,
+                                wkb_len as idx_t,
+                            );
+                        } else {
+                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                        }
                     }
                 }
             }
@@ -1078,6 +1145,10 @@ pub unsafe fn register_categorical_table_function(
         let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
         let name_compact = to_c_string("compact");
         duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
+
+        // Native GEOMETRY parameter
+        let name_geom = to_c_string("geom");
+        duckdb_table_function_add_named_parameter(tf, name_geom.as_ptr(), type_bool);
 
         // Overlap rule parameter
         let name_overlap = to_c_string("overlap_rule");
