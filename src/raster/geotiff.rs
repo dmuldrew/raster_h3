@@ -171,11 +171,12 @@ pub struct ChunkDecoder<'a> {
     chunk_info: Option<Arc<TiffChunkInfo>>,
     mmap: Option<&'a [u8]>,
     libdeflater: Option<libdeflater::Decompressor>,
+    lzw_decoder: Option<weezl::decode::Decoder>,
     decomp_scratch: Vec<u8>,
 }
 
 impl<'a> ChunkDecoder<'a> {
-    /// Read and decode a single chunk using persistent decoder or SIMD libdeflater
+    /// Read and decode a single chunk using persistent fast decoder or fallback
     pub fn read_chunk(&mut self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
         let chunk_bounds = self.chunk_layout.get_chunk_bounds(
             chunk_index,
@@ -183,7 +184,7 @@ impl<'a> ChunkDecoder<'a> {
             self.height,
         );
 
-        if let Ok(Some(data)) = self.decompress_chunk_simd(chunk_index, None) {
+        if let Ok(Some(data)) = self.decompress_chunk_fast(chunk_index, None) {
             return Ok((chunk_bounds, data));
         }
 
@@ -203,7 +204,7 @@ impl<'a> ChunkDecoder<'a> {
             self.height,
         );
 
-        match self.decompress_chunk_simd(chunk_index, Some(&mut buffer)) {
+        match self.decompress_chunk_fast(chunk_index, Some(&mut buffer)) {
             Ok(None) => return Ok((chunk_bounds, buffer)),
             Ok(Some(new_buf)) => return Ok((chunk_bounds, new_buf)),
             Err(_) => {}
@@ -324,12 +325,64 @@ impl<'a> ChunkDecoder<'a> {
         }
     }
 
-    /// Attempt SIMD-accelerated chunk decompression with libdeflater.
+    #[inline]
+    fn decode_chunk_bytes_into(
+        libdeflater: Option<&mut libdeflater::Decompressor>,
+        lzw_decoder: Option<&mut weezl::decode::Decoder>,
+        compression: CompressionMethod,
+        compressed: &[u8],
+        out: &mut [u8],
+    ) -> Result<()> {
+        match compression {
+            CompressionMethod::Deflate | CompressionMethod::OldDeflate => {
+                let decompressor = libdeflater
+                    .ok_or_else(|| RasterH3Error::InvalidMetadata("no decompressor".into()))?;
+                let decomp_res = decompressor.zlib_decompress(compressed, out);
+                let decomp_ok = match decomp_res {
+                    Ok(_) => true,
+                    Err(_) => decompressor.deflate_decompress(compressed, out).is_ok(),
+                };
+                if !decomp_ok {
+                    return Err(RasterH3Error::InvalidMetadata("decompress failed".into()));
+                }
+            }
+            CompressionMethod::LZW => {
+                let lzw = lzw_decoder
+                    .ok_or_else(|| RasterH3Error::InvalidMetadata("no lzw decompressor".into()))?;
+                lzw.reset();
+                let mut inp = compressed;
+                let mut target_out = out;
+                while !inp.is_empty() && !target_out.is_empty() {
+                    let res = lzw.decode_bytes(inp, target_out);
+                    inp = &inp[res.consumed_in..];
+                    target_out = &mut target_out[res.consumed_out..];
+                    match res.status {
+                        Ok(weezl::LzwStatus::Done) | Ok(weezl::LzwStatus::NoProgress) => break,
+                        Ok(weezl::LzwStatus::Ok) => {
+                            if res.consumed_in == 0 && res.consumed_out == 0 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            return Err(RasterH3Error::InvalidMetadata(format!("lzw error: {:?}", e)));
+                        }
+                    }
+                }
+                if !target_out.is_empty() {
+                    return Err(RasterH3Error::InvalidMetadata("lzw chunk did not fill buffer".into()));
+                }
+            }
+            _ => return Err(RasterH3Error::InvalidMetadata("unsupported fast compression".into())),
+        }
+        Ok(())
+    }
+
+    /// Attempt accelerated chunk decompression with libdeflater (Deflate) or weezl (LZW).
     /// If target_buffer is provided and of matching type, it will be populated in-place.
     /// Returns Ok(None) if target_buffer was populated in-place.
     /// Returns Ok(Some(new_result)) if a new DecodingResult was created.
     /// Returns Err(_) if anything is unsupported or failed, triggering standard fallback.
-    fn decompress_chunk_simd(
+    fn decompress_chunk_fast(
         &mut self,
         chunk_index: u32,
         target_buffer: Option<&mut DecodingResult>,
@@ -339,21 +392,9 @@ impl<'a> ChunkDecoder<'a> {
             .as_ref()
             .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
 
-        if !matches!(
-            info.compression,
-            CompressionMethod::Deflate | CompressionMethod::OldDeflate
-        ) {
-            return Err(RasterH3Error::InvalidMetadata("not deflate".into()));
-        }
-
         let mmap = self
             .mmap
             .ok_or_else(|| RasterH3Error::InvalidMetadata("no mmap source".into()))?;
-
-        let decompressor = self
-            .libdeflater
-            .as_mut()
-            .ok_or_else(|| RasterH3Error::InvalidMetadata("no decompressor".into()))?;
 
         let idx = chunk_index as usize;
         let offset = *info
@@ -384,23 +425,119 @@ impl<'a> ChunkDecoder<'a> {
             ChunkType::Strip => (chunk_w as usize) * data_h * spp * byte_len,
         };
 
+        let total_samples = data_w * data_h * spp;
+        let tile_w = chunk_w as usize;
+
+        #[cfg(target_endian = "little")]
+        let is_native_endian = info.byte_order == TiffByteOrder::LittleEndian;
+        #[cfg(not(target_endian = "little"))]
+        let is_native_endian = info.byte_order == TiffByteOrder::BigEndian;
+
+        let can_direct_decode = tile_w == data_w
+            && info.predictor == Predictor::None
+            && is_native_endian
+            && info.photometric != PhotometricInterpretation::WhiteIsZero;
+
+        if can_direct_decode {
+            match (info.sample_format, info.bits_per_sample) {
+                (SampleFormat::Int, 16) => match target_buffer {
+                    Some(DecodingResult::I16(ref mut v)) => {
+                        v.resize(total_samples, 0);
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 2) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(None);
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(total_samples);
+                        unsafe { v.set_len(total_samples); }
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 2) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(Some(DecodingResult::I16(v)));
+                    }
+                },
+                (SampleFormat::Uint, 16) => match target_buffer {
+                    Some(DecodingResult::U16(ref mut v)) => {
+                        v.resize(total_samples, 0);
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 2) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(None);
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(total_samples);
+                        unsafe { v.set_len(total_samples); }
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 2) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(Some(DecodingResult::U16(v)));
+                    }
+                },
+                (SampleFormat::IEEEFP, 32) => match target_buffer {
+                    Some(DecodingResult::F32(ref mut v)) => {
+                        v.resize(total_samples, 0.0);
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(None);
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(total_samples);
+                        unsafe { v.set_len(total_samples); }
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(Some(DecodingResult::F32(v)));
+                    }
+                },
+                (SampleFormat::Uint, 8) => match target_buffer {
+                    Some(DecodingResult::U8(ref mut v)) => {
+                        v.resize(total_samples, 0);
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, &mut v[..total_samples])?;
+                        return Ok(None);
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(total_samples);
+                        unsafe { v.set_len(total_samples); }
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, &mut v[..total_samples])?;
+                        return Ok(Some(DecodingResult::U8(v)));
+                    }
+                },
+                (SampleFormat::Uint, 32) => match target_buffer {
+                    Some(DecodingResult::U32(ref mut v)) => {
+                        v.resize(total_samples, 0);
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(None);
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(total_samples);
+                        unsafe { v.set_len(total_samples); }
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(Some(DecodingResult::U32(v)));
+                    }
+                },
+                (SampleFormat::Int, 32) => match target_buffer {
+                    Some(DecodingResult::I32(ref mut v)) => {
+                        v.resize(total_samples, 0);
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(None);
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(total_samples);
+                        unsafe { v.set_len(total_samples); }
+                        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, total_samples * 4) };
+                        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, b)?;
+                        return Ok(Some(DecodingResult::I32(v)));
+                    }
+                },
+                _ => {}
+            }
+        }
+
         if self.decomp_scratch.len() < raw_chunk_bytes {
             self.decomp_scratch.resize(raw_chunk_bytes, 0);
         }
 
         let decomp_slice = &mut self.decomp_scratch[..raw_chunk_bytes];
-        let decomp_res = decompressor.zlib_decompress(compressed_slice, decomp_slice);
-        let decomp_ok = match decomp_res {
-            Ok(_) => true,
-            Err(_) => decompressor.deflate_decompress(compressed_slice, decomp_slice).is_ok(),
-        };
-
-        if !decomp_ok {
-            return Err(RasterH3Error::InvalidMetadata("decompress failed".into()));
-        }
-
-        let total_samples = data_w * data_h * spp;
-        let tile_w = chunk_w as usize;
+        Self::decode_chunk_bytes_into(self.libdeflater.as_mut(), self.lzw_decoder.as_mut(), info.compression, compressed_slice, decomp_slice)?;
 
         match (info.sample_format, info.bits_per_sample) {
             (SampleFormat::Uint, 8) => match target_buffer {
@@ -603,30 +740,57 @@ impl<'a> ChunkDecoder<'a> {
     ) -> Result<()> {
         let src_stride_bytes = tile_w * spp * 2;
         let dst_stride = data_w * spp;
-        for r in 0..data_h {
-            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 2];
-            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
-            match info.byte_order {
-                TiffByteOrder::LittleEndian => {
-                    for (i, item) in d.iter_mut().enumerate() {
-                        *item = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
-                    }
+        let dst_stride_bytes = dst_stride * 2;
+
+        #[cfg(target_endian = "little")]
+        let is_native_endian = info.byte_order == TiffByteOrder::LittleEndian;
+        #[cfg(not(target_endian = "little"))]
+        let is_native_endian = info.byte_order == TiffByteOrder::BigEndian;
+
+        if is_native_endian {
+            if src_stride_bytes == dst_stride_bytes {
+                let total_bytes = data_w * data_h * spp * 2;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, total_bytes);
                 }
-                TiffByteOrder::BigEndian => {
-                    for (i, item) in d.iter_mut().enumerate() {
-                        *item = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+            } else {
+                for r in 0..data_h {
+                    let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
+                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, dst_stride_bytes);
                     }
                 }
             }
-            if info.predictor == Predictor::Horizontal {
+        } else {
+            for r in 0..data_h {
+                let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 2];
+                let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                match info.byte_order {
+                    TiffByteOrder::LittleEndian => {
+                        for (i, item) in d.iter_mut().enumerate() {
+                            *item = u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+                        }
+                    }
+                    TiffByteOrder::BigEndian => {
+                        for (i, item) in d.iter_mut().enumerate() {
+                            *item = u16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                        }
+                    }
+                }
+            }
+        }
+        if info.predictor == Predictor::Horizontal {
+            for r in 0..data_h {
+                let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
                 for col in spp..d.len() {
                     d[col] = d[col].wrapping_add(d[col - spp]);
                 }
             }
-            if info.photometric == PhotometricInterpretation::WhiteIsZero {
-                for item in d.iter_mut() {
-                    *item = 65535 - *item;
-                }
+        }
+        if info.photometric == PhotometricInterpretation::WhiteIsZero {
+            for item in dst.iter_mut() {
+                *item = 65535 - *item;
             }
         }
         Ok(())
@@ -643,22 +807,49 @@ impl<'a> ChunkDecoder<'a> {
     ) -> Result<()> {
         let src_stride_bytes = tile_w * spp * 2;
         let dst_stride = data_w * spp;
-        for r in 0..data_h {
-            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 2];
-            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
-            match info.byte_order {
-                TiffByteOrder::LittleEndian => {
-                    for (i, item) in d.iter_mut().enumerate() {
-                        *item = i16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
-                    }
+        let dst_stride_bytes = dst_stride * 2;
+
+        #[cfg(target_endian = "little")]
+        let is_native_endian = info.byte_order == TiffByteOrder::LittleEndian;
+        #[cfg(not(target_endian = "little"))]
+        let is_native_endian = info.byte_order == TiffByteOrder::BigEndian;
+
+        if is_native_endian {
+            if src_stride_bytes == dst_stride_bytes {
+                let total_bytes = data_w * data_h * spp * 2;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, total_bytes);
                 }
-                TiffByteOrder::BigEndian => {
-                    for (i, item) in d.iter_mut().enumerate() {
-                        *item = i16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+            } else {
+                for r in 0..data_h {
+                    let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
+                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, dst_stride_bytes);
                     }
                 }
             }
-            if info.predictor == Predictor::Horizontal {
+        } else {
+            for r in 0..data_h {
+                let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 2];
+                let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                match info.byte_order {
+                    TiffByteOrder::LittleEndian => {
+                        for (i, item) in d.iter_mut().enumerate() {
+                            *item = i16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+                        }
+                    }
+                    TiffByteOrder::BigEndian => {
+                        for (i, item) in d.iter_mut().enumerate() {
+                            *item = i16::from_be_bytes([s[i * 2], s[i * 2 + 1]]);
+                        }
+                    }
+                }
+            }
+        }
+        if info.predictor == Predictor::Horizontal {
+            for r in 0..data_h {
+                let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
                 for col in spp..d.len() {
                     d[col] = d[col].wrapping_add(d[col - spp]);
                 }
@@ -854,29 +1045,53 @@ impl<'a> ChunkDecoder<'a> {
                 }
             }
             Predictor::None => {
-                for r in 0..data_h {
-                    let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 4];
-                    let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
-                    match info.byte_order {
-                        TiffByteOrder::LittleEndian => {
-                            for (i, item) in d.iter_mut().enumerate() {
-                                *item = f32::from_bits(u32::from_le_bytes([
-                                    s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
-                                ]));
-                            }
+                let dst_stride_bytes = dst_stride * 4;
+
+                #[cfg(target_endian = "little")]
+                let is_native_endian = info.byte_order == TiffByteOrder::LittleEndian;
+                #[cfg(not(target_endian = "little"))]
+                let is_native_endian = info.byte_order == TiffByteOrder::BigEndian;
+
+                if is_native_endian {
+                    if src_stride_bytes == dst_stride_bytes {
+                        let total_bytes = data_w * data_h * spp * 4;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, total_bytes);
                         }
-                        TiffByteOrder::BigEndian => {
-                            for (i, item) in d.iter_mut().enumerate() {
-                                *item = f32::from_bits(u32::from_be_bytes([
-                                    s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
-                                ]));
+                    } else {
+                        for r in 0..data_h {
+                            let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
+                            let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, dst_stride_bytes);
                             }
                         }
                     }
-                    if info.photometric == PhotometricInterpretation::WhiteIsZero {
-                        for item in d.iter_mut() {
-                            *item = 1.0 - *item;
+                } else {
+                    for r in 0..data_h {
+                        let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride * 4];
+                        let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                        match info.byte_order {
+                            TiffByteOrder::LittleEndian => {
+                                for (i, item) in d.iter_mut().enumerate() {
+                                    *item = f32::from_bits(u32::from_le_bytes([
+                                        s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
+                                    ]));
+                                }
+                            }
+                            TiffByteOrder::BigEndian => {
+                                for (i, item) in d.iter_mut().enumerate() {
+                                    *item = f32::from_bits(u32::from_be_bytes([
+                                        s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
+                                    ]));
+                                }
+                            }
                         }
+                    }
+                }
+                if info.photometric == PhotometricInterpretation::WhiteIsZero {
+                    for item in dst.iter_mut() {
+                        *item = 1.0 - *item;
                     }
                 }
             }
@@ -959,6 +1174,16 @@ impl<'a> ChunkDecoder<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Backward-compatible alias for decompress_chunk_fast
+    #[inline]
+    pub fn decompress_chunk_simd(
+        &mut self,
+        chunk_index: u32,
+        target_buffer: Option<&mut DecodingResult>,
+    ) -> Result<Option<DecodingResult>> {
+        self.decompress_chunk_fast(chunk_index, target_buffer)
     }
 }
 
@@ -1156,6 +1381,15 @@ impl GeoTiffStreamReader {
             None
         };
 
+        let lzw_decoder = if self.chunk_info.as_ref().map_or(false, |info| {
+            matches!(info.compression, CompressionMethod::LZW)
+        }) && mmap.is_some()
+        {
+            Some(weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8))
+        } else {
+            None
+        };
+
         Ok(ChunkDecoder {
             inner,
             chunk_layout: self.chunk_layout,
@@ -1165,6 +1399,7 @@ impl GeoTiffStreamReader {
             chunk_info: self.chunk_info.clone(),
             mmap,
             libdeflater,
+            lzw_decoder,
             decomp_scratch: Vec::new(),
         })
     }

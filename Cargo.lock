@@ -838,6 +838,7 @@ dependencies = [
  "tiff",
  "ureq",
  "url",
+ "weezl",
 ]
 
 [[package]]
