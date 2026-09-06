@@ -492,6 +492,51 @@ fn process_continuous_slice_into_maps<T>(
                 }
             };
 
+            if is_wgs84 || is_web_mercator {
+                if let Some([_, b_min_lat, _, b_max_lat]) = bbox {
+                    if lat_row < b_min_lat || lat_row > b_max_lat {
+                        continue;
+                    }
+                }
+            }
+
+            let (row_c_start, row_c_end) = if (is_wgs84 || is_web_mercator) && bbox.is_some() {
+                let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
+                if d_lon_step > 0.0 {
+                    let c_s = if lon_start < b_min_lon {
+                        ((b_min_lon - lon_start) / d_lon_step).ceil().max(0.0) as usize
+                    } else {
+                        0
+                    };
+                    let c_e = if lon_start < b_max_lon {
+                        (((b_max_lon - lon_start) / d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
+                    } else {
+                        0
+                    };
+                    (c_s, c_e)
+                } else if d_lon_step < 0.0 {
+                    let c_s = if lon_start > b_max_lon {
+                        ((b_max_lon - lon_start) / d_lon_step).ceil().max(0.0) as usize
+                    } else {
+                        0
+                    };
+                    let c_e = if lon_start > b_min_lon {
+                        (((b_min_lon - lon_start) / d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
+                    } else {
+                        0
+                    };
+                    (c_s, c_e)
+                } else {
+                    (0, row_width)
+                }
+            } else {
+                (0, row_width)
+            };
+
+            if row_c_start >= row_c_end || row_c_start >= row_width {
+                continue;
+            }
+
             for res_idx in 0..num_res {
                 let res = resolutions[res_idx];
                 let active_map = &mut chunk_maps[res_idx];
@@ -504,52 +549,51 @@ fn process_continuous_slice_into_maps<T>(
                     H3Accumulator::default()
                 };
 
-                let mut lon_curr = lon_start;
-                let mut x_curr = x_start;
-                let mut c = 0;
+                let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
+                let mut x_curr = x_start + (row_c_start as f64) * dx_step;
+                let mut c = row_c_start;
                 let mut known_next_cell: Option<u64> = None;
 
-                while c < row_width {
-                    let cell_opt = if let Some(known) = known_next_cell.take() {
-                        Some(known)
+                while c < row_c_end {
+                    let (lon, lat) = if is_wgs84 || is_web_mercator {
+                        (lon_curr, lat_row)
+                    } else if is_north_up {
+                        match crs_transformer.transform_point(x_curr, y_row) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                known_next_cell = None;
+                                c += 1;
+                                x_curr += dx_step;
+                                continue;
+                            }
+                        }
                     } else {
-                        let (lon, lat) = if is_wgs84 || is_web_mercator {
-                            (lon_curr, lat_row)
-                        } else if is_north_up {
-                            match crs_transformer.transform_point(x_curr, y_row) {
-                                Ok(coords) => coords,
-                                Err(_) => {
-                                    c += 1;
-                                    x_curr += dx_step;
-                                    continue;
-                                }
+                        let (x, y) = gt
+                            .pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
+                        match crs_transformer.transform_point(x, y) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                known_next_cell = None;
+                                c += 1;
+                                continue;
                             }
-                        } else {
-                            let (x, y) = gt
-                                .pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
-                            match crs_transformer.transform_point(x, y) {
-                                Ok(coords) => coords,
-                                Err(_) => {
-                                    c += 1;
-                                    continue;
-                                }
-                            }
-                        };
+                        }
+                    };
 
+                    if !is_wgs84 && !is_web_mercator {
                         if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
                             if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                                known_next_cell = None;
                                 c += 1;
-                                if is_wgs84 || is_web_mercator {
-                                    lon_curr += d_lon_step;
-                                } else if is_north_up {
+                                if is_north_up {
                                     x_curr += dx_step;
                                 }
                                 continue;
                             }
                         }
+                    }
 
-                        row_cache.get_or_compute_cell(lat, lon, res)
-                    };
+                    let cell_opt = known_next_cell.take().or_else(|| row_cache.get_or_compute_cell(lat, lon, res));
 
                     if let Some(cell_u64) = cell_opt {
                         if cell_u64 != run_cell {
@@ -565,11 +609,11 @@ fn process_continuous_slice_into_maps<T>(
                         }
 
                         let (span_end, next_cell) = if is_wgs84 || is_web_mercator {
-                            row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, res, run_cell)
+                            row_cache.find_span_end(c, row_c_end, lon_curr, lat_row, d_lon_step, res, run_cell)
                         } else if is_north_up {
                             row_cache.find_span_end_projected(
                                 c,
-                                row_width,
+                                row_c_end,
                                 x_start,
                                 y_row,
                                 dx_step,
@@ -1627,6 +1671,51 @@ fn process_categorical_slice_into_maps<T, F, N>(
                 }
             };
 
+            if is_wgs84 || is_web_mercator {
+                if let Some([_, b_min_lat, _, b_max_lat]) = bbox {
+                    if lat_row < b_min_lat || lat_row > b_max_lat {
+                        continue;
+                    }
+                }
+            }
+
+            let (row_c_start, row_c_end) = if (is_wgs84 || is_web_mercator) && bbox.is_some() {
+                let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
+                if d_lon_step > 0.0 {
+                    let c_s = if lon_start < b_min_lon {
+                        ((b_min_lon - lon_start) / d_lon_step).ceil().max(0.0) as usize
+                    } else {
+                        0
+                    };
+                    let c_e = if lon_start < b_max_lon {
+                        (((b_max_lon - lon_start) / d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
+                    } else {
+                        0
+                    };
+                    (c_s, c_e)
+                } else if d_lon_step < 0.0 {
+                    let c_s = if lon_start > b_max_lon {
+                        ((b_max_lon - lon_start) / d_lon_step).ceil().max(0.0) as usize
+                    } else {
+                        0
+                    };
+                    let c_e = if lon_start > b_min_lon {
+                        (((b_min_lon - lon_start) / d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
+                    } else {
+                        0
+                    };
+                    (c_s, c_e)
+                } else {
+                    (0, row_width)
+                }
+            } else {
+                (0, row_width)
+            };
+
+            if row_c_start >= row_c_end || row_c_start >= row_width {
+                continue;
+            }
+
             for res_idx in 0..num_res {
                 let res = resolutions[res_idx];
                 let active_map = &mut chunk_maps[res_idx];
@@ -1635,52 +1724,51 @@ fn process_categorical_slice_into_maps<T, F, N>(
                 let mut run_cell: u64 = 0;
                 let mut run_acc = CategoricalAccumulator::default();
 
-                let mut lon_curr = lon_start;
-                let mut x_curr = x_start;
-                let mut c = 0;
+                let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
+                let mut x_curr = x_start + (row_c_start as f64) * dx_step;
+                let mut c = row_c_start;
                 let mut known_next_cell: Option<u64> = None;
 
-                while c < row_width {
-                    let cell_opt = if let Some(known) = known_next_cell.take() {
-                        Some(known)
+                while c < row_c_end {
+                    let (lon, lat) = if is_wgs84 || is_web_mercator {
+                        (lon_curr, lat_row)
+                    } else if is_north_up {
+                        match crs_transformer.transform_point(x_curr, y_row) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                known_next_cell = None;
+                                c += 1;
+                                x_curr += dx_step;
+                                continue;
+                            }
+                        }
                     } else {
-                        let (lon, lat) = if is_wgs84 || is_web_mercator {
-                            (lon_curr, lat_row)
-                        } else if is_north_up {
-                            match crs_transformer.transform_point(x_curr, y_row) {
-                                Ok(coords) => coords,
-                                Err(_) => {
-                                    c += 1;
-                                    x_curr += dx_step;
-                                    continue;
-                                }
+                        let (x, y) = gt
+                            .pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
+                        match crs_transformer.transform_point(x, y) {
+                            Ok(coords) => coords,
+                            Err(_) => {
+                                known_next_cell = None;
+                                c += 1;
+                                continue;
                             }
-                        } else {
-                            let (x, y) = gt
-                                .pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
-                            match crs_transformer.transform_point(x, y) {
-                                Ok(coords) => coords,
-                                Err(_) => {
-                                    c += 1;
-                                    continue;
-                                }
-                            }
-                        };
+                        }
+                    };
 
+                    if !is_wgs84 && !is_web_mercator {
                         if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
                             if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                                known_next_cell = None;
                                 c += 1;
-                                if is_wgs84 || is_web_mercator {
-                                    lon_curr += d_lon_step;
-                                } else if is_north_up {
+                                if is_north_up {
                                     x_curr += dx_step;
                                 }
                                 continue;
                             }
                         }
+                    }
 
-                        row_cache.get_or_compute_cell(lat, lon, res)
-                    };
+                    let cell_opt = known_next_cell.take().or_else(|| row_cache.get_or_compute_cell(lat, lon, res));
 
                     if let Some(cell_u64) = cell_opt {
                         if cell_u64 != run_cell {
@@ -1696,11 +1784,11 @@ fn process_categorical_slice_into_maps<T, F, N>(
                         }
 
                         let (span_end, next_cell) = if is_wgs84 || is_web_mercator {
-                            row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, res, run_cell)
+                            row_cache.find_span_end(c, row_c_end, lon_curr, lat_row, d_lon_step, res, run_cell)
                         } else if is_north_up {
                             row_cache.find_span_end_projected(
                                 c,
-                                row_width,
+                                row_c_end,
                                 x_start,
                                 y_row,
                                 dx_step,

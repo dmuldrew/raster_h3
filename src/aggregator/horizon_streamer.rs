@@ -1,23 +1,15 @@
-use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
-use h3o::{CellIndex, LatLng, Resolution};
-use std::collections::HashMap;
-use fxhash::FxBuildHasher;
-use tiff::decoder::DecodingResult;
+use h3o::CellIndex;
 
 use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::h3_scanline::H3ScanlineLookahead;
+use crate::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
-use crate::error::{RasterH3Error, Result};
+use crate::error::Result;
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::geotransform::GeoTransform;
-use crate::raster::prefetch::PrefetchedChunkReader;
 use crate::raster::RasterChunk;
-
-const WGS84_A: f64 = 6378137.0;
-const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
 /// Priority queue entry for H3 cell eviction ordered by southernmost latitude
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -147,471 +139,43 @@ pub fn chunk_intersects_bbox(
     c_min_lon <= b_max_lon && c_max_lon >= b_min_lon && c_min_lat <= b_max_lat && c_max_lat >= b_min_lat
 }
 
-/// Streaming aggregator using Southernmost Scan-Line Horizon Eviction,
-/// Row-Constant Latitude Hoisting, Zero-Copy mmap, and Identity Hasher.
+impl From<&AggregationConfig> for MultiResolutionConfig {
+    fn from(config: &AggregationConfig) -> Self {
+        let mut multi = MultiResolutionConfig::new(vec![config.resolution]);
+        multi.custom_crs = config.custom_crs.clone();
+        multi.custom_nodata = config.custom_nodata;
+        multi.bbox = config.bbox;
+        multi.sampling = config.sampling.clone();
+        multi.remapper = config.remapper.clone();
+        multi
+    }
+}
+
+/// Streaming aggregator using Southernmost Scan-Line Horizon Eviction.
+/// Delegates to the optimized multi-resolution streaming engine.
 pub struct ScanHorizonStreamer {
-    prefetcher: Option<PrefetchedChunkReader>,
-    crs_transformer: CrsTransformer,
-    resolution: Resolution,
-    nodata: Option<f64>,
-    bbox: Option<[f64; 4]>,
-    sampling: SamplingPattern,
-    gt: GeoTransform,
-    chunk_stride: u32,
-    active_map: HashMap<u64, H3Accumulator, FxBuildHasher>,
-    eviction_queue: BinaryHeap<HexEvictionEntry>,
-    completed_buffer: VecDeque<(u64, H3Accumulator)>,
-    is_finished: bool,
+    inner: MultiScanHorizonStreamer,
 }
 
 impl ScanHorizonStreamer {
     /// Initialize a new ScanHorizonStreamer with background async prefetching and bbox pruning
     pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {
-        let resolution = Resolution::try_from(config.resolution)
-            .map_err(|_| RasterH3Error::InvalidParameter(format!("Invalid H3 resolution: {}", config.resolution)))?;
-
-        let crs_transformer = CrsTransformer::from_crs_or_epsg(
-            reader.metadata.epsg,
-            config.custom_crs.as_deref().or(reader.metadata.proj_string.as_deref()),
-        )?;
-
-        let nodata = config.custom_nodata.or(reader.metadata.nodata);
-        let bbox = config.bbox;
-        let gt = reader.metadata.geotransform;
-        let chunk_stride = reader.chunk_layout.chunk_width;
-        let total_chunks = reader.chunk_layout.total_chunks;
-
-        // Prune chunks upfront against bounding box if specified
-        let chunk_indices: Vec<u32> = (0..total_chunks)
-            .filter(|&idx| {
-                if let Some(ref b) = bbox {
-                    let chunk_bounds = reader.chunk_layout.get_chunk_bounds(
-                        idx,
-                        reader.metadata.width,
-                        reader.metadata.height,
-                    );
-                    chunk_intersects_bbox(&chunk_bounds, &gt, &crs_transformer, b)
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        let prefetcher = PrefetchedChunkReader::spawn(reader, chunk_indices, 8);
-
-        Ok(Self {
-            prefetcher: Some(prefetcher),
-            crs_transformer,
-            resolution,
-            nodata,
-            bbox,
-            sampling: config.sampling.clone(),
-            gt,
-            chunk_stride,
-            active_map: HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default()),
-            eviction_queue: BinaryHeap::with_capacity(1024),
-            completed_buffer: VecDeque::with_capacity(2048),
-            is_finished: false,
-        })
-    }
-
-    /// Calculate the minimum WGS84 latitude reached by the bottom edge of a chunk row
-    fn compute_chunk_bottom_lat(&self, chunk_bounds: &RasterChunk) -> f64 {
-        let row_bottom = (chunk_bounds.row_offset + chunk_bounds.height) as usize;
-        let mut min_lat = f64::INFINITY;
-
-        let col_samples = [
-            chunk_bounds.col_offset as usize,
-            (chunk_bounds.col_offset + chunk_bounds.width / 2) as usize,
-            (chunk_bounds.col_offset + chunk_bounds.width) as usize,
-        ];
-
-        for &c in &col_samples {
-            let (x, y) = self.gt.pixel_to_coord(c as f64, row_bottom as f64);
-            if let Ok((_lon, lat)) = self.crs_transformer.transform_point(x, y) {
-                if lat < min_lat {
-                    min_lat = lat;
-                }
-            }
-        }
-
-        min_lat
-    }
-
-    /// Process a typed chunk using Row-Constant Latitude Hoisting and Linear Longitude Stepping
-    fn process_chunk_slice<T, F, N>(
-        &mut self,
-        slice: &[T],
-        chunk: &RasterChunk,
-        to_f64: F,
-        native_nodata: Option<N>,
-    ) where
-        T: Copy + PartialEq,
-        F: Fn(T) -> f64,
-        N: Copy + PartialEq<T>,
-    {
-        // 1. Fast NoData early-exit
-        if is_chunk_all_nodata(slice, self.nodata, &to_f64) {
-            return;
-        }
-
-        // 2. Pre-calculate coordinate step parameters
-        let is_wgs84 = matches!(self.crs_transformer, CrsTransformer::Wgs84Identity);
-        let is_web_mercator = matches!(self.crs_transformer, CrsTransformer::WebMercatorFast);
-        let d_lon_step = if is_wgs84 {
-            self.gt.a
-        } else if is_web_mercator {
-            (self.gt.a / WGS84_A) * RAD_TO_DEG
-        } else {
-            0.0
-        };
-
-        // 3. Row-by-row processing
-        let stride = if self.chunk_stride > 0 && slice.len() >= self.chunk_stride as usize {
-            self.chunk_stride as usize
-        } else {
-            (chunk.width as usize).max(1)
-        };
-        let actual_rows = (slice.len() / stride).min(chunk.height as usize);
-
-        for r in 0..actual_rows {
-            let row_idx = (chunk.row_offset + r as u32) as usize;
-            let slice_row_start = r * stride;
-            let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-            if self.sampling.is_single_point() {
-                // Fast-path: Single-point center sampling with scanline run-skipping
-                let mut run_cell: u64 = 0;
-                let mut run_acc = H3Accumulator::default();
-                let mut row_cache = H3ScanlineLookahead::default();
-
-                let is_north_up = self.gt.b == 0.0 && self.gt.d == 0.0;
-                let dx_step = self.gt.a;
-                let (x_start, y_row) = self.gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
-
-                let (mut lon_curr, lat_row) = if is_wgs84 {
-                    (x_start, y_row)
-                } else if is_web_mercator {
-                    let lat = (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
-                    let lon = (x_start / WGS84_A) * RAD_TO_DEG;
-                    (lon, lat)
-                } else {
-                    match self.crs_transformer.transform_point(x_start, y_row) {
-                        Ok(coords) => coords,
-                        Err(_) => (x_start, y_row),
-                    }
-                };
-
-                let mut c = 0;
-                while c < row_width {
-                    let (lon, lat) = if is_wgs84 || is_web_mercator {
-                        (lon_curr, lat_row)
-                    } else {
-                        let (x, y) = self.gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
-                        match self.crs_transformer.transform_point(x, y) {
-                            Ok(coords) => coords,
-                            Err(_) => {
-                                c += 1;
-                                if is_wgs84 || is_web_mercator {
-                                    lon_curr += d_lon_step;
-                                }
-                                continue;
-                            }
-                        }
-                    };
-
-                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
-                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
-                            c += 1;
-                            if is_wgs84 || is_web_mercator {
-                                lon_curr += d_lon_step;
-                            }
-                            continue;
-                        }
-                    }
-
-                    if let Some(cell_u64) = row_cache.get_or_compute_cell(lat, lon, self.resolution) {
-                        if cell_u64 != run_cell {
-                            if run_cell != 0 && run_acc.count > 0.0 {
-                                self.active_map
-                                    .entry(run_cell)
-                                    .and_modify(|acc| acc.merge(&run_acc))
-                                    .or_insert_with(|| {
-                                        let south_lat = compute_cell_south_lat(run_cell);
-                                        self.eviction_queue.push(HexEvictionEntry {
-                                            south_lat,
-                                            cell_u64: run_cell,
-                                        });
-                                        run_acc
-                                    });
-                            }
-                            run_cell = cell_u64;
-                            run_acc = H3Accumulator::default();
-                            row_cache.on_cell_changed();
-                        }
-
-                        let (span_end, _) = if is_wgs84 || is_web_mercator {
-                            row_cache.find_span_end(c, row_width, lon_curr, lat_row, d_lon_step, self.resolution, run_cell)
-                        } else if is_north_up {
-                            row_cache.find_span_end_projected(
-                                c,
-                                row_width,
-                                x_start,
-                                y_row,
-                                dx_step,
-                                |x, y| match self.crs_transformer.transform_point(x, y) {
-                                    Ok((p_lon, p_lat)) => {
-                                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
-                                            if p_lon < b_min_lon || p_lon > b_max_lon || p_lat < b_min_lat || p_lat > b_max_lat {
-                                                return None;
-                                            }
-                                        }
-                                        LatLng::new(p_lat, p_lon).ok().map(|ll| ll.to_cell(self.resolution).into())
-                                    }
-                                    Err(_) => None,
-                                },
-                                run_cell,
-                            )
-                        } else {
-                            (c + 1, None)
-                        };
-
-                        if native_nodata.is_none() && self.nodata.is_none() {
-                            for i in c..span_end {
-                                let val = to_f64(slice[slice_row_start + i]);
-                                if val.is_finite() {
-                                    run_acc.update(val);
-                                }
-                            }
-                        } else {
-                            for i in c..span_end {
-                                let val_raw = slice[slice_row_start + i];
-
-                                if let Some(nd_nat) = native_nodata {
-                                    if nd_nat == val_raw {
-                                        continue;
-                                    }
-                                }
-
-                                let val = to_f64(val_raw);
-                                if !val.is_finite() {
-                                    continue;
-                                }
-                                if let Some(nd) = self.nodata {
-                                    if (val - nd).abs() < 1e-6 {
-                                        continue;
-                                    }
-                                }
-
-                                run_acc.update(val);
-                            }
-                        }
-
-                        let num_stepped = span_end - c;
-                        row_cache.advance_span(num_stepped);
-                        if is_wgs84 || is_web_mercator {
-                            lon_curr += (num_stepped as f64) * d_lon_step;
-                        }
-                        c = span_end;
-                    } else {
-                        c += 1;
-                        if is_wgs84 || is_web_mercator {
-                            lon_curr += d_lon_step;
-                        }
-                    }
-                }
-
-                if run_cell != 0 && run_acc.count > 0.0 {
-                    self.active_map
-                        .entry(run_cell)
-                        .and_modify(|acc| acc.merge(&run_acc))
-                        .or_insert_with(|| {
-                            let south_lat = compute_cell_south_lat(run_cell);
-                            self.eviction_queue.push(HexEvictionEntry {
-                                south_lat,
-                                cell_u64: run_cell,
-                            });
-                            run_acc
-                        });
-                }
-            } else {
-                // Multi-point sub-pixel super-sampling
-                for c in 0..row_width {
-                    let val_raw = slice[slice_row_start + c];
-
-                    if let Some(nd_nat) = native_nodata {
-                        if nd_nat == val_raw {
-                            continue;
-                        }
-                    }
-
-                    let val = to_f64(val_raw);
-                    if !val.is_finite() {
-                        continue;
-                    }
-                    if let Some(nd) = self.nodata {
-                        if (val - nd).abs() < 1e-6 {
-                            continue;
-                        }
-                    }
-
-                    let col_px = (chunk.col_offset as usize) + c;
-                    let (center_x, center_y) = self.gt.pixel_center_to_coord(col_px, row_idx);
-                    let (center_lon, center_lat) = match self.crs_transformer.transform_point(center_x, center_y) {
-                        Ok(coords) => coords,
-                        Err(_) => continue,
-                    };
-
-                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = self.bbox {
-                        if center_lon < b_min_lon || center_lon > b_max_lon || center_lat < b_min_lat || center_lat > b_max_lat {
-                            continue;
-                        }
-                    }
-
-                    if self.sampling.points.len() == 1 {
-                        if let Ok(lat_lng) = LatLng::new(center_lat, center_lon) {
-                            let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
-                            self.active_map
-                                .entry(cell_u64)
-                                .and_modify(|acc| acc.update(val))
-                                .or_insert_with(|| {
-                                    let south_lat = compute_cell_south_lat(cell_u64);
-                                    self.eviction_queue.push(HexEvictionEntry {
-                                        south_lat,
-                                        cell_u64,
-                                    });
-                                    H3Accumulator::new(val)
-                                });
-                        }
-                    } else {
-                        // Evaluate each sub-pixel offset
-                        for pt in &self.sampling.points {
-                            let (px, py) = self.gt.pixel_to_coord(col_px as f64 + pt.dx, row_idx as f64 + pt.dy);
-                            if let Ok((lon_i, lat_i)) = self.crs_transformer.transform_point(px, py) {
-                                if let Ok(lat_lng) = LatLng::new(lat_i, lon_i) {
-                                    let cell_u64: u64 = lat_lng.to_cell(self.resolution).into();
-                                    self.active_map
-                                        .entry(cell_u64)
-                                        .and_modify(|acc| acc.update_weighted(val, pt.weight))
-                                        .or_insert_with(|| {
-                                            let south_lat = compute_cell_south_lat(cell_u64);
-                                            self.eviction_queue.push(HexEvictionEntry {
-                                                south_lat,
-                                                cell_u64,
-                                            });
-                                            H3Accumulator::new_weighted(val, pt.weight)
-                                        });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Evict all completed hexagons whose southernmost latitude is strictly above lat_horizon
-    fn evict_completed(&mut self, lat_horizon: f64) {
-        while let Some(top) = self.eviction_queue.peek() {
-            if top.south_lat > lat_horizon {
-                let entry = self.eviction_queue.pop().unwrap();
-                if let Some(acc) = self.active_map.remove(&entry.cell_u64) {
-                    self.completed_buffer.push_back((entry.cell_u64, acc));
-                }
-            } else {
-                break;
-            }
-        }
+        let multi_config = MultiResolutionConfig::from(config);
+        let inner = MultiScanHorizonStreamer::new(reader, &multi_config)?;
+        Ok(Self { inner })
     }
 
     /// Pull up to `max_rows` completed records from the stream
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<(u64, H3Accumulator)> {
-        while self.completed_buffer.len() < max_rows && !self.is_finished {
-            let next_item = if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.next_chunk()
-            } else {
-                None
-            };
-
-            match next_item {
-                Some(Ok((_chunk_idx, chunk_bounds, decoding_result))) => {
-                    // Process native pixels with row-constant latitude hoisting & native NoData
-                    match &decoding_result {
-                        DecodingResult::U8(slice) => {
-                            let nd = self.nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::U16(slice) => {
-                            let nd = self.nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::U32(slice) => {
-                            let nd = self.nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::U64(slice) => {
-                            let nd = self.nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::I8(slice) => {
-                            let nd = self.nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::I16(slice) => {
-                            let nd = self.nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::I32(slice) => {
-                            let nd = self.nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::I64(slice) => {
-                            let nd = self.nodata.map(|v| v as i64);
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::F32(slice) => {
-                            let nd = self.nodata.map(|v| v as f32);
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x as f64, nd);
-                        }
-                        DecodingResult::F64(slice) => {
-                            let nd = self.nodata;
-                            self.process_chunk_slice(slice, &chunk_bounds, |x| x, nd);
-                        }
-                    }
-
-                    // 2. Compute the current scan horizon at bottom of this chunk row
-                    let lat_horizon = self.compute_chunk_bottom_lat(&chunk_bounds);
-
-                    // 3. Evict completed hexagons
-                    self.evict_completed(lat_horizon);
-
-                    if let Some(ref prefetcher) = self.prefetcher {
-                        prefetcher.recycle_batch(std::iter::once(decoding_result));
-                    }
-                }
-                Some(Err(_)) | None => {
-                    self.is_finished = true;
-                    while let Some(entry) = self.eviction_queue.pop() {
-                        if let Some(acc) = self.active_map.remove(&entry.cell_u64) {
-                            self.completed_buffer.push_back((entry.cell_u64, acc));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        let num_to_take = max_rows.min(self.completed_buffer.len());
-        let mut batch = Vec::with_capacity(num_to_take);
-        for _ in 0..num_to_take {
-            if let Some(record) = self.completed_buffer.pop_front() {
-                batch.push(record);
-            }
-        }
-        batch
+        self.inner
+            .fetch_next_batch(max_rows)
+            .into_iter()
+            .map(|record| (record.h3_index, record.accumulator))
+            .collect()
     }
 
     /// Return current number of active cells in memory
     pub fn active_cell_count(&self) -> usize {
-        self.active_map.len()
+        self.inner.active_cell_count()
     }
 }
