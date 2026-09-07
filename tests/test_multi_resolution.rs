@@ -12,6 +12,7 @@ use raster_h3::aggregator::multi_horizon::{
     MultiScanHorizonStreamer,
 };
 use raster_h3::aggregator::CategoricalHorizonStreamer;
+use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 fn create_test_geotiff(width: usize, height: usize) -> NamedTempFile {
@@ -258,5 +259,175 @@ fn test_prefetch_drain_chunk_batch_into() {
     let fetched_rem = prefetcher.drain_chunk_batch_into(&mut batch, 1, num_chunks as usize);
     assert_eq!(batch.len(), num_chunks as usize);
     assert_eq!(fetched + fetched_rem, num_chunks as usize);
+}
+
+#[test]
+fn test_multi_resolution_fusion_supersampling_exact_match() {
+    let width = 64;
+    let height = 64;
+    let total_pixels = (width * height) as f64;
+    let temp_raster = create_test_geotiff(width, height);
+    let raster_path = temp_raster.path();
+
+    // 1. Run single-pass multi-resolution streaming on [8, 9] with 5-point super-sampling
+    let multi_config = MultiResolutionConfig {
+        resolutions: vec![8, 9],
+        sampling: SamplingPattern::five_point(),
+        ..Default::default()
+    };
+    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+    let mut multi_streamer = MultiScanHorizonStreamer::new(reader, &multi_config).unwrap();
+
+    let mut multi_res_map: HashMap<u8, HashMap<u64, MultiContinuousRecord>> = HashMap::new();
+    multi_res_map.insert(8, HashMap::new());
+    multi_res_map.insert(9, HashMap::new());
+
+    loop {
+        let batch = multi_streamer.fetch_next_batch(32);
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            let res = rec.resolution;
+            multi_res_map.get_mut(&res).unwrap().insert(rec.h3_index, rec);
+        }
+    }
+
+    // 2. Run standalone single-resolution streaming for 8 and 9 with 5-point super-sampling
+    for &target_res in &[8, 9] {
+        let single_config = AggregationConfig {
+            resolution: target_res,
+            sampling: SamplingPattern::five_point(),
+            ..Default::default()
+        };
+        let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
+        let mut single_streamer = ScanHorizonStreamer::new(single_reader, &single_config).unwrap();
+
+        let mut single_cells = HashMap::new();
+        let mut total_single_mass = 0.0;
+
+        loop {
+            let batch = single_streamer.fetch_next_batch(32);
+            if batch.is_empty() {
+                break;
+            }
+            for (cell, acc) in batch {
+                total_single_mass += acc.count;
+                single_cells.insert(cell, acc);
+            }
+        }
+
+        assert!((total_single_mass - total_pixels).abs() < 1e-6);
+
+        let multi_cells = multi_res_map.get(&target_res).unwrap();
+        assert_eq!(
+            multi_cells.len(),
+            single_cells.len(),
+            "Cell count mismatch at res {}",
+            target_res
+        );
+
+        let mut total_multi_mass = 0.0;
+        for (cell_u64, single_acc) in &single_cells {
+            let multi_rec = multi_cells.get(cell_u64).unwrap_or_else(|| {
+                panic!("Cell {:x} missing at res {}", cell_u64, target_res);
+            });
+            total_multi_mass += multi_rec.accumulator.count;
+
+            assert!(
+                (multi_rec.accumulator.count - single_acc.count).abs() < 1e-6,
+                "Count mismatch at cell {:x} (res {}): multi = {}, single = {}",
+                cell_u64, target_res, multi_rec.accumulator.count, single_acc.count
+            );
+            assert!(
+                (multi_rec.accumulator.sum - single_acc.sum).abs() < 1e-5,
+                "Sum mismatch at cell {:x} (res {}): multi = {}, single = {}",
+                cell_u64, target_res, multi_rec.accumulator.sum, single_acc.sum
+            );
+            assert!(
+                (multi_rec.accumulator.mean() - single_acc.mean()).abs() < 1e-5,
+                "Mean mismatch at cell {:x} (res {})",
+                cell_u64, target_res
+            );
+        }
+
+        assert!((total_multi_mass - total_pixels).abs() < 1e-6);
+        assert!((total_multi_mass - total_single_mass).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn test_multi_resolution_categorical_supersampling_exact_match() {
+    let width = 64;
+    let height = 64;
+    let total_pixels = (width * height) as f64;
+    let temp_raster = create_test_geotiff(width, height);
+    let raster_path = temp_raster.path();
+
+    let multi_config = MultiResolutionConfig {
+        resolutions: vec![8, 9],
+        sampling: SamplingPattern::five_point(),
+        ..Default::default()
+    };
+    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+    let mut multi_cat_streamer = MultiCategoricalHorizonStreamer::new(reader, &multi_config).unwrap();
+
+    let mut multi_cat_map: HashMap<u8, HashMap<u64, _>> = HashMap::new();
+    multi_cat_map.insert(8, HashMap::new());
+    multi_cat_map.insert(9, HashMap::new());
+
+    loop {
+        let batch = multi_cat_streamer.fetch_next_batch(32);
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            let res = rec.resolution;
+            multi_cat_map.get_mut(&res).unwrap().insert(rec.h3_index, rec);
+        }
+    }
+
+    for &target_res in &[8, 9] {
+        let single_config = AggregationConfig {
+            resolution: target_res,
+            sampling: SamplingPattern::five_point(),
+            ..Default::default()
+        };
+        let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
+        let mut single_streamer = CategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
+
+        let mut single_cells = HashMap::new();
+        let mut total_single_mass = 0.0;
+
+        loop {
+            let batch = single_streamer.fetch_next_batch(32);
+            if batch.is_empty() {
+                break;
+            }
+            for (cell, acc) in batch {
+                total_single_mass += acc.total_count;
+                single_cells.insert(cell, acc);
+            }
+        }
+
+        assert!((total_single_mass - total_pixels).abs() < 1e-6);
+        let multi_cells = multi_cat_map.get(&target_res).unwrap();
+        assert_eq!(multi_cells.len(), single_cells.len());
+
+        for (cell_u64, single_acc) in &single_cells {
+            let multi_rec = multi_cells.get(cell_u64).unwrap();
+            assert!(
+                (multi_rec.accumulator.total_count - single_acc.total_count).abs() < 1e-6,
+                "Total count mismatch at cell {:x}", cell_u64
+            );
+            assert_eq!(multi_rec.accumulator.majority(), single_acc.majority());
+            single_acc.for_each_class(|cat, cnt| {
+                assert!(
+                    (multi_rec.accumulator.get_class_count(cat) - cnt).abs() < 1e-6,
+                    "Class count mismatch for cat {} at cell {:x}", cat, cell_u64
+                );
+            });
+        }
+    }
 }
 

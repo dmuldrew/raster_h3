@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Single-Pass Multi-Resolution Fusion**:
+  - Concurrent multi-resolution aggregation (e.g. H3 Res 8 + Res 9) in a single unified scanline pass over each row slice.
+  - Common sub-span stepping ($\text{step\_end} = \min_i(\text{span\_ends}[i])$) with single SIMD vectorized accumulation across active resolutions.
+  - Multi-resolution super-sampling core intersection lookahead with boundary isolation.
+  - Unified categorical run-length and class frequency evaluation.
+  - Zero-overhead fast path preserved for single-resolution aggregation (`num_res == 1`).
+  - Delivers up to 1.31× speedup on in-memory rasters and 1.17× speedup on 257-Megapixel datasets while halving I/O reads and tile decompression passes.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added
