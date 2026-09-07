@@ -1365,16 +1365,65 @@ impl H3PmtilesTiler {
         Ok(total_hexagons)
     }
 
+    /// Convenience helper to run categorical GeoTIFF or multi-file mosaic pipeline to PMTiles v3
+    pub fn process_categorical_source_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
+        source: P1,
+        pmtiles_path: P2,
+        config: MultiResolutionConfig,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let source_str = source.as_ref().to_string_lossy();
+        let resolved_paths = crate::raster::mosaic::resolve_raster_sources(&source_str)?;
+        let props = config.properties.clone();
+
+        if resolved_paths.len() == 1 && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or("")) {
+            let reader = GeoTiffStreamReader::open(&resolved_paths[0])?;
+            let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
+            Self::generate_from_categorical_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+        } else {
+            let mosaic = std::sync::Arc::new(crate::raster::mosaic::MosaicReader::open(
+                &resolved_paths,
+                config.bbox,
+                config.custom_crs.as_deref(),
+                config.overlap_rule,
+            )?);
+            let streamer = MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config)?;
+            Self::generate_from_categorical_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+        }
+    }
+
     /// Convenience helper to run categorical GeoTIFF-to-PMTiles pipeline in single-pass streaming mode
     pub fn process_categorical_geotiff_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         tiff_path: P1,
         pmtiles_path: P2,
         config: MultiResolutionConfig,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Self::process_categorical_source_to_pmtiles(tiff_path, pmtiles_path, config)
+    }
+
+    /// Convenience helper to run continuous GeoTIFF or multi-file mosaic pipeline to PMTiles v3
+    pub fn process_raster_source_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
+        source: P1,
+        pmtiles_path: P2,
+        config: MultiResolutionConfig,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let source_str = source.as_ref().to_string_lossy();
+        let resolved_paths = crate::raster::mosaic::resolve_raster_sources(&source_str)?;
         let props = config.properties.clone();
-        let reader = GeoTiffStreamReader::open(tiff_path)?;
-        let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
-        Self::generate_from_categorical_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+
+        if resolved_paths.len() == 1 && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or("")) {
+            let reader = GeoTiffStreamReader::open(&resolved_paths[0])?;
+            let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
+            Self::generate_from_continuous_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+        } else {
+            let mosaic = std::sync::Arc::new(crate::raster::mosaic::MosaicReader::open(
+                &resolved_paths,
+                config.bbox,
+                config.custom_crs.as_deref(),
+                config.overlap_rule,
+            )?);
+            let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;
+            Self::generate_from_continuous_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+        }
     }
 
     /// Convenience helper to run continuous GeoTIFF-to-PMTiles pipeline in single-pass streaming mode
@@ -1383,10 +1432,7 @@ impl H3PmtilesTiler {
         pmtiles_path: P2,
         config: MultiResolutionConfig,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let props = config.properties.clone();
-        let reader = GeoTiffStreamReader::open(tiff_path)?;
-        let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
-        Self::generate_from_continuous_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+        Self::process_raster_source_to_pmtiles(tiff_path, pmtiles_path, config)
     }
 
     /// Convert any H3-indexed Parquet file directly into a PMTiles v3 archive

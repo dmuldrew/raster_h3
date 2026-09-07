@@ -229,6 +229,10 @@ fn process_continuous_slice_into_maps<T>(
         .map(|&res| H3ScanlineLookahead::for_resolution(res))
         .collect();
 
+    let is_single_point = sampling.is_single_point();
+    let dx_bounds = sampling.dx_bounds();
+    let dy_bounds = sampling.dy_bounds();
+
     for r in 0..actual_rows {
         let row_idx = (chunk.row_offset + r as u32) as usize;
         let slice_row_start = r * stride;
@@ -242,8 +246,7 @@ fn process_continuous_slice_into_maps<T>(
             continue;
         }
 
-        if sampling.is_single_point() {
-            let (x_start, y_row) = gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
+        let (x_start, y_row) = gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
             let (lon_start, lat_row) = if is_wgs84 {
                 (x_start, y_row)
             } else if is_web_mercator {
@@ -256,6 +259,28 @@ fn process_continuous_slice_into_maps<T>(
                     Ok(coords) => coords,
                     Err(_) => (x_start, y_row),
                 }
+            };
+
+            let (d_lon_dx, d_lat_dx, d_lon_dy, d_lat_dy) = if !is_single_point {
+                if is_wgs84 {
+                    (gt.a, gt.d, gt.b, gt.e)
+                } else if is_web_mercator {
+                    let lon_dx = ((x_start + gt.a) / WGS84_A) * RAD_TO_DEG;
+                    let lat_dy = (2.0 * ((y_row + gt.e) / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
+                    (lon_dx - lon_start, 0.0, 0.0, lat_dy - lat_row)
+                } else {
+                    let (lon_x, lat_x) = match crs_transformer.transform_point(x_start + dx_step, y_row) {
+                        Ok(coords) => coords,
+                        Err(_) => (lon_start, lat_row),
+                    };
+                    let (lon_y, lat_y) = match crs_transformer.transform_point(x_start, y_row + gt.e) {
+                        Ok(coords) => coords,
+                        Err(_) => (lon_start, lat_row),
+                    };
+                    (lon_x - lon_start, lat_x - lat_row, lon_y - lon_start, lat_y - lat_row)
+                }
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
             };
 
             if is_wgs84 || is_web_mercator {
@@ -400,18 +425,127 @@ fn process_continuous_slice_into_maps<T>(
                             (c + 1, None)
                         };
 
-                        let span_slice = &slice[slice_row_start + c..slice_row_start + span_end];
-                        let span_acc = T::accumulate_span(span_slice, native_nodata);
-                        if span_acc.count > 0.0 {
-                            run_acc.merge(&span_acc);
-                            if track_quantiles {
-                                if let Some(ref mut q) = run_acc.quantiles {
-                                    for &v in span_slice {
-                                        if v.is_valid(native_nodata) {
-                                            q.update(v.to_f64_val(), 1.0);
+                        if is_single_point {
+                            let span_slice = &slice[slice_row_start + c..slice_row_start + span_end];
+                            let span_acc = T::accumulate_span(span_slice, native_nodata);
+                            if span_acc.count > 0.0 {
+                                run_acc.merge(&span_acc);
+                                if track_quantiles {
+                                    if let Some(ref mut q) = run_acc.quantiles {
+                                        for &v in span_slice {
+                                            if v.is_valid(native_nodata) {
+                                                q.update(v.to_f64_val(), 1.0);
+                                            }
                                         }
                                     }
                                 }
+                            }
+                        } else {
+                            let (core_start, core_end) = row_cache.find_core_span(
+                                c,
+                                span_end,
+                                dx_bounds,
+                                dy_bounds,
+                                |px, py| {
+                                    let (lon, lat) = if is_wgs84 {
+                                        let test_lon = lon_start + (px - 0.5) * d_lon_step;
+                                        let test_lat = lat_row + (py - 0.5) * gt.e;
+                                        (test_lon, test_lat)
+                                    } else if is_web_mercator {
+                                        let test_lon = lon_start + (px - 0.5) * d_lon_step;
+                                        let test_lat = lat_row + (py - 0.5) * d_lat_dy;
+                                        (test_lon, test_lat)
+                                    } else {
+                                        let d_col = px - 0.5;
+                                        let d_row = py - 0.5;
+                                        let lon = lon_start + d_col * d_lon_dx + d_row * d_lon_dy;
+                                        let lat = lat_row + d_col * d_lat_dx + d_row * d_lat_dy;
+                                        (lon, lat)
+                                    };
+                                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                                            return false;
+                                        }
+                                    }
+                                    LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into()) == Some(run_cell)
+                                },
+                            );
+
+                            let mut evaluate_boundary = |k: usize| {
+                                let val_raw = slice[slice_row_start + k];
+                                if !val_raw.is_valid(native_nodata) {
+                                    return;
+                                }
+                                let val = val_raw.to_f64_val();
+
+                                let (k_lon, k_lat) = if is_wgs84 || is_web_mercator {
+                                    (lon_start + (k as f64) * d_lon_step, lat_row)
+                                } else if is_north_up {
+                                    let x_k = x_start + (k as f64) * dx_step;
+                                    match crs_transformer.transform_point(x_k, y_row) {
+                                        Ok(coords) => coords,
+                                        Err(_) => (lon_start + (k as f64) * d_lon_dx, lat_row + (k as f64) * d_lat_dx),
+                                    }
+                                } else {
+                                    let (x_k, y_k) = gt.pixel_center_to_coord((chunk.col_offset as usize) + k, row_idx);
+                                    match crs_transformer.transform_point(x_k, y_k) {
+                                        Ok(coords) => coords,
+                                        Err(_) => (lon_start + (k as f64) * d_lon_dx, lat_row + (k as f64) * d_lat_dx),
+                                    }
+                                };
+
+                                for sp in &sampling.points {
+                                    let d_x = sp.dx - 0.5;
+                                    let d_y = sp.dy - 0.5;
+                                    let lon = k_lon + d_x * d_lon_dx + d_y * d_lon_dy;
+                                    let lat = k_lat + d_x * d_lat_dx + d_y * d_lat_dy;
+
+                                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+                                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                                            continue;
+                                        }
+                                    }
+                                    if let Ok(ll) = LatLng::new(lat, lon) {
+                                        let cell: u64 = ll.to_cell(res).into();
+                                        active_map
+                                            .entry(cell)
+                                            .and_modify(|acc| acc.update_weighted(val, sp.weight))
+                                            .or_insert_with(|| {
+                                                let mut a = if track_quantiles {
+                                                    H3Accumulator::with_quantiles()
+                                                } else {
+                                                    H3Accumulator::default()
+                                                };
+                                                a.update_weighted(val, sp.weight);
+                                                a
+                                            });
+                                    }
+                                }
+                            };
+
+                            for k in c..core_start {
+                                evaluate_boundary(k);
+                            }
+
+                            if core_start < core_end {
+                                let core_slice = &slice[slice_row_start + core_start..slice_row_start + core_end];
+                                let core_acc = T::accumulate_span(core_slice, native_nodata);
+                                if core_acc.count > 0.0 {
+                                    run_acc.merge(&core_acc);
+                                    if track_quantiles {
+                                        if let Some(ref mut q) = run_acc.quantiles {
+                                            for &v in core_slice {
+                                                if v.is_valid(native_nodata) {
+                                                    q.update(v.to_f64_val(), 1.0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            for k in core_end..span_end {
+                                evaluate_boundary(k);
                             }
                         }
 
@@ -441,50 +575,8 @@ fn process_continuous_slice_into_maps<T>(
                         .or_insert_with(|| run_acc.clone());
                 }
             }
-        } else {
-            for c in 0..row_width {
-                let val_raw = slice[slice_row_start + c];
-                if !val_raw.is_valid(native_nodata) {
-                    continue;
-                }
-                let val = val_raw.to_f64_val();
-
-                for sp in &sampling.points {
-                    let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
-                    let py = (row_idx as f64) + sp.dy;
-                    let (x, y) = gt.pixel_to_coord(px, py);
-                    if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
-                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                            if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
-                                continue;
-                            }
-                        }
-
-                        if let Ok(ll) = LatLng::new(lat, lon) {
-                            for res_idx in 0..num_res {
-                                let res = resolutions[res_idx];
-                                let active_map = &mut chunk_maps[res_idx];
-                                let cell: u64 = ll.to_cell(res).into();
-                                active_map
-                                    .entry(cell)
-                                    .and_modify(|acc| acc.update_weighted(val, sp.weight))
-                                    .or_insert_with(|| {
-                                        let mut a = if track_quantiles {
-                                            H3Accumulator::with_quantiles()
-                                        } else {
-                                            H3Accumulator::default()
-                                        };
-                                        a.update_weighted(val, sp.weight);
-                                        a
-                                    });
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
-}
 
 /// Process a multi-sample or spectral formula continuous slice into thread-local hash maps
 fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(

@@ -176,4 +176,63 @@ impl H3ScanlineLookahead {
         }
         (left, if left < row_width { last_cell_at_right } else { None })
     }
+
+    /// Find the sub-pixel core interval `[core_start, core_end)` within `[c, span_end)`
+    /// where all sample points in the sampling pattern are guaranteed to lie within `run_cell`.
+    ///
+    /// The closure `is_point_in_cell(px, py)` tests whether sub-pixel coordinate `(px, py)`
+    /// lies within `run_cell`.
+    #[inline(always)]
+    pub fn find_core_span<F>(
+        &self,
+        c: usize,
+        span_end: usize,
+        dx_bounds: (f64, f64),
+        dy_bounds: (f64, f64),
+        mut is_point_in_cell: F,
+    ) -> (usize, usize)
+    where
+        F: FnMut(f64, f64) -> bool,
+    {
+        if span_end.saturating_sub(c) <= 2 {
+            return (span_end, span_end);
+        }
+
+        let (min_dx, max_dx) = dx_bounds;
+        let (min_dy, max_dy) = dy_bounds;
+
+        let mut is_pixel_core = |k: usize| -> bool {
+            let k_f = k as f64;
+            // Test 4 extremal corners of pixel k:
+            // Top-Left, Top-Right, Bottom-Left, Bottom-Right
+            is_point_in_cell(k_f + min_dx, min_dy)
+                && is_point_in_cell(k_f + max_dx, min_dy)
+                && is_point_in_cell(k_f + min_dx, max_dy)
+                && is_point_in_cell(k_f + max_dx, max_dy)
+        };
+
+        let mut core_start = c + 1;
+        let mut core_end = span_end - 1;
+
+        while core_start < core_end {
+            if is_pixel_core(core_start) {
+                break;
+            }
+            core_start += 1;
+        }
+
+        while core_end > core_start {
+            if is_pixel_core(core_end - 1) {
+                break;
+            }
+            core_end -= 1;
+        }
+
+        if core_start < core_end {
+            (core_start, core_end)
+        } else {
+            (span_end, span_end)
+        }
+    }
 }
+

@@ -149,6 +149,30 @@ impl SamplingPattern {
     pub fn is_single_point(&self) -> bool {
         self.points.len() == 1
     }
+
+    /// Returns (min_dx, max_dx) across all sample points in pattern
+    #[inline(always)]
+    pub fn dx_bounds(&self) -> (f64, f64) {
+        let mut min_dx = 1.0f64;
+        let mut max_dx = 0.0f64;
+        for p in &self.points {
+            if p.dx < min_dx { min_dx = p.dx; }
+            if p.dx > max_dx { max_dx = p.dx; }
+        }
+        (min_dx, max_dx)
+    }
+
+    /// Returns (min_dy, max_dy) across all sample points in pattern
+    #[inline(always)]
+    pub fn dy_bounds(&self) -> (f64, f64) {
+        let mut min_dy = 1.0f64;
+        let mut max_dy = 0.0f64;
+        for p in &self.points {
+            if p.dy < min_dy { min_dy = p.dy; }
+            if p.dy > max_dy { max_dy = p.dy; }
+        }
+        (min_dy, max_dy)
+    }
 }
 
 #[cfg(test)]
