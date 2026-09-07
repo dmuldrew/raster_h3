@@ -1,7 +1,10 @@
+use std::env;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 fn main() {
-    let reader = GeoTiffStreamReader::open("data/LF2024_FBFM40_HI.tif").unwrap();
+    let path = env::args().nth(1).unwrap_or_else(|| "data/LF2024_FBFM40_HI.tif".to_string());
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    println!("File: {}", path);
     println!("Width: {}, Height: {}", reader.metadata.width, reader.metadata.height);
     println!("Total chunks: {}, Chunk width: {}, Chunk height: {}", 
         reader.chunk_layout.total_chunks,
