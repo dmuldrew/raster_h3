@@ -4,7 +4,7 @@ use h3o::{LatLng, Resolution};
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::h3_scanline::H3ScanlineLookahead;
+use crate::aggregator::h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
 use crate::aggregator::horizon_streamer::is_chunk_all_nodata;
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
@@ -335,6 +335,27 @@ fn process_categorical_slice_into_maps<T, F, N>(
                 continue;
             }
 
+            let cos_lat = lat_row.to_radians().cos();
+            let cos_lat_sq = cos_lat * cos_lat;
+
+            let px_diag_m = if !is_single_point {
+                if is_wgs84 {
+                    let dx_m = d_lon_step.abs() * 111_320.0 * cos_lat;
+                    let dy_m = gt.e.abs() * 110_540.0;
+                    dx_m.hypot(dy_m)
+                } else if is_web_mercator {
+                    let dx_m = d_lon_step.abs() * 111_320.0 * cos_lat;
+                    let dy_m = d_lat_dy.abs() * 110_540.0;
+                    dx_m.hypot(dy_m)
+                } else {
+                    let dx_m = (d_lon_dx * cos_lat).hypot(d_lat_dx) * 111_320.0;
+                    let dy_m = (d_lon_dy * cos_lat).hypot(d_lat_dy) * 110_540.0;
+                    dx_m.hypot(dy_m)
+                }
+            } else {
+                0.0
+            };
+
             if num_res == 1 {
                 for res_idx in 0..num_res {
                     let res = resolutions[res_idx];
@@ -343,6 +364,9 @@ fn process_categorical_slice_into_maps<T, F, N>(
                     row_cache.reset_row();
                     let mut run_cell: u64 = 0;
                     let mut run_acc = CategoricalAccumulator::default();
+
+                    let use_neighbor_cache = !is_single_point && can_use_neighbor_cache(px_diag_m, res);
+                    let mut disk_cache = H3NeighborDiskCache::default();
 
                     let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
                     let mut x_curr = x_start + (row_c_start as f64) * dx_step;
@@ -401,6 +425,9 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                 run_cell = cell_u64;
                                 run_acc = CategoricalAccumulator::default();
                                 row_cache.on_cell_changed();
+                                if use_neighbor_cache {
+                                    disk_cache.update(run_cell, cos_lat_sq);
+                                }
                             }
 
                             let (span_end, next_cell) = if is_wgs84 || is_web_mercator {
@@ -538,7 +565,11 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                                 return false;
                                             }
                                         }
-                                        LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into()) == Some(run_cell)
+                                        if use_neighbor_cache {
+                                            disk_cache.is_in_run_cell(lat, lon)
+                                        } else {
+                                            LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into()) == Some(run_cell)
+                                        }
                                     },
                                 );
 
@@ -595,17 +626,24 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                                 }
                                             }
 
-                                            if let Ok(ll) = LatLng::new(lat, lon) {
-                                                let cell: u64 = ll.to_cell(res).into();
-                                                active_map
-                                                    .entry(cell)
-                                                    .and_modify(|acc| acc.update_weighted(cat, sp.weight))
-                                                    .or_insert_with(|| {
-                                                        let mut a = CategoricalAccumulator::default();
-                                                        a.update_weighted(cat, sp.weight);
-                                                        a
-                                                    });
-                                            }
+                                            let cell: u64 = if d_x.abs() < 1e-9 && d_y.abs() < 1e-9 {
+                                                run_cell
+                                            } else if use_neighbor_cache {
+                                                disk_cache.resolve_point(lat, lon)
+                                            } else if let Ok(ll) = LatLng::new(lat, lon) {
+                                                ll.to_cell(res).into()
+                                            } else {
+                                                continue;
+                                            };
+
+                                            active_map
+                                                .entry(cell)
+                                                .and_modify(|acc| acc.update_weighted(cat, sp.weight))
+                                                .or_insert_with(|| {
+                                                    let mut a = CategoricalAccumulator::default();
+                                                    a.update_weighted(cat, sp.weight);
+                                                    a
+                                                });
                                         }
                                     }
                                 };
@@ -651,6 +689,12 @@ fn process_categorical_slice_into_maps<T, F, N>(
                     }
                 }
             } else {
+                let use_neighbor_caches: Vec<bool> = resolutions
+                    .iter()
+                    .map(|&r| !is_single_point && can_use_neighbor_cache(px_diag_m, r))
+                    .collect();
+                let mut disk_caches = vec![H3NeighborDiskCache::default(); num_res];
+
                 for i in 0..num_res {
                     row_caches[i].reset_row();
                     run_cells[i] = 0;
@@ -755,6 +799,9 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                     }
                                     run_cells[i] = cell_u64;
                                     row_caches[i].on_cell_changed();
+                                    if use_neighbor_caches[i] {
+                                        disk_caches[i].update(run_cells[i], cos_lat_sq);
+                                    }
                                 }
 
                                 let (span_end, next_cell) = if is_wgs84 || is_web_mercator {
@@ -826,8 +873,12 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                                     return false;
                                                 }
                                             }
-                                            LatLng::new(test_lat, test_lon).ok().map(|ll| ll.to_cell(res).into())
-                                                == Some(run_cells[i])
+                                            if use_neighbor_caches[i] {
+                                                disk_caches[i].is_in_run_cell(test_lat, test_lon)
+                                            } else {
+                                                LatLng::new(test_lat, test_lon).ok().map(|ll| ll.to_cell(res).into())
+                                                    == Some(run_cells[i])
+                                            }
                                         },
                                     );
                                     core_starts[i] = c_start;
@@ -1038,17 +1089,24 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                                 }
                                             }
 
-                                            if let Ok(ll) = LatLng::new(lat, lon) {
-                                                let cell: u64 = ll.to_cell(res).into();
-                                                chunk_maps[i]
-                                                    .entry(cell)
-                                                    .and_modify(|acc| acc.update_weighted(cat, sp.weight))
-                                                    .or_insert_with(|| {
-                                                        let mut a = CategoricalAccumulator::default();
-                                                        a.update_weighted(cat, sp.weight);
-                                                        a
-                                                    });
-                                            }
+                                            let cell: u64 = if d_x.abs() < 1e-9 && d_y.abs() < 1e-9 {
+                                                run_cells[i]
+                                            } else if use_neighbor_caches[i] {
+                                                disk_caches[i].resolve_point(lat, lon)
+                                            } else if let Ok(ll) = LatLng::new(lat, lon) {
+                                                ll.to_cell(res).into()
+                                            } else {
+                                                continue;
+                                            };
+
+                                            chunk_maps[i]
+                                                .entry(cell)
+                                                .and_modify(|acc| acc.update_weighted(cat, sp.weight))
+                                                .or_insert_with(|| {
+                                                    let mut a = CategoricalAccumulator::default();
+                                                    a.update_weighted(cat, sp.weight);
+                                                    a
+                                                });
                                         }
                                     }
                                 }

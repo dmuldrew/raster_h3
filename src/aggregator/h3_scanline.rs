@@ -1,4 +1,83 @@
-use h3o::{LatLng, Resolution};
+use h3o::{CellIndex, LatLng, Resolution};
+
+/// H3 average edge length in meters for resolutions 0..=15
+pub const H3_EDGE_LENGTH_M: [f64; 16] = [
+    1_107_712.0, 418_676.0, 158_244.0, 59_810.0, 22_606.0, 8_544.0, 3_229.0, 1_220.0,
+    461.3, 174.4, 65.9, 24.9, 9.41, 3.56, 1.35, 0.509,
+];
+
+/// Helper to determine if a pixel size in meters is safe for 1-ring Voronoi neighbor caching
+#[inline(always)]
+pub fn can_use_neighbor_cache(px_diag_meters: f64, res: Resolution) -> bool {
+    let r_idx = (res as usize).min(15);
+    px_diag_meters < H3_EDGE_LENGTH_M[r_idx]
+}
+
+/// Cache of 1-ring neighbor cell centroids for ultra-fast boundary sub-pixel Voronoi resolution
+#[derive(Clone, Copy, Debug)]
+pub struct H3NeighborDiskCache {
+    pub cell: u64,
+    pub cos_lat_sq: f64,
+    pub count: usize,
+    pub centers: [(f64, f64, u64); 7],
+}
+
+impl Default for H3NeighborDiskCache {
+    fn default() -> Self {
+        Self {
+            cell: 0,
+            cos_lat_sq: 1.0,
+            count: 0,
+            centers: [(0.0, 0.0, 0); 7],
+        }
+    }
+}
+
+impl H3NeighborDiskCache {
+    #[inline(always)]
+    pub fn update(&mut self, cell_u64: u64, cos_lat_sq: f64) {
+        if self.cell == cell_u64 && (self.cos_lat_sq - cos_lat_sq).abs() < 1e-6 {
+            return;
+        }
+        self.cell = cell_u64;
+        self.cos_lat_sq = cos_lat_sq;
+        if let Ok(cell) = CellIndex::try_from(cell_u64) {
+            let disk: Vec<CellIndex> = cell.grid_disk(1);
+            self.count = disk.len().min(7);
+            for (idx, &c) in disk.iter().take(7).enumerate() {
+                let ctr = LatLng::from(c);
+                self.centers[idx] = (ctr.lat(), ctr.lng(), c.into());
+            }
+        } else {
+            self.count = 0;
+        }
+    }
+
+    #[inline(always)]
+    pub fn resolve_point(&self, p_lat: f64, p_lon: f64) -> u64 {
+        if self.count == 0 {
+            return self.cell;
+        }
+        let mut min_d2 = f64::INFINITY;
+        let mut best_c = self.cell;
+        for i in 0..self.count {
+            let (c_lat, c_lon, c_u64) = self.centers[i];
+            let d_lat = p_lat - c_lat;
+            let d_lon = p_lon - c_lon;
+            let d2 = d_lat * d_lat + d_lon * d_lon * self.cos_lat_sq;
+            if d2 < min_d2 {
+                min_d2 = d2;
+                best_c = c_u64;
+            }
+        }
+        best_c
+    }
+
+    #[inline(always)]
+    pub fn is_in_run_cell(&self, p_lat: f64, p_lon: f64) -> bool {
+        self.resolve_point(p_lat, p_lon) == self.cell
+    }
+}
 
 pub struct H3ScanlineLookahead {
     prev_hex_width: usize,
