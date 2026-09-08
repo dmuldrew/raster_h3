@@ -4,6 +4,7 @@
 //! standard MVT protocol buffer byte streams without intermediate GIS allocations.
 
 use std::borrow::Cow;
+use fxhash::FxHashSet;
 use h3o::LatLng;
 
 /// Normalized Web Mercator point with coordinates in [0.0, 1.0]
@@ -504,12 +505,13 @@ impl MvtFeature {
     }
 }
 
-/// Mapbox Vector Tile layer builder
+///// Mapbox Vector Tile layer builder
 pub struct MvtLayer {
     pub name: String,
     pub extent: u32,
     pub features: Vec<MvtFeature>,
     pub property_filter: PropertyFilter,
+    pub seen_ids: FxHashSet<u64>,
 }
 
 impl MvtLayer {
@@ -520,6 +522,7 @@ impl MvtLayer {
             extent: 4096,
             features: Vec::new(),
             property_filter: PropertyFilter::all(),
+            seen_ids: FxHashSet::default(),
         }
     }
 
@@ -530,13 +533,21 @@ impl MvtLayer {
             extent: 4096,
             features: Vec::new(),
             property_filter: filter,
+            seen_ids: FxHashSet::default(),
         }
     }
 
-    /// Add an MVT feature if not already present in this layer
+    /// Add an MVT feature and record its ID in seen_ids
+    #[inline(always)]
+    pub fn add_feature(&mut self, feature: MvtFeature) {
+        self.seen_ids.insert(feature.id);
+        self.features.push(feature);
+    }
+
+    /// Add an MVT feature if not already present in this layer in O(1) time
     #[inline(always)]
     pub fn add_or_merge_feature(&mut self, feature: MvtFeature) {
-        if self.features.iter().any(|f| f.id == feature.id) {
+        if !self.seen_ids.insert(feature.id) {
             return;
         }
         self.features.push(feature);
@@ -556,6 +567,7 @@ impl MvtLayer {
             return;
         }
 
+        self.seen_ids.insert(id);
         self.features.push(MvtFeature::from_mercator(
             id,
             vertices,
@@ -577,10 +589,21 @@ impl MvtLayer {
         ty: u32,
         properties: P,
     ) {
-        if self.features.iter().any(|f| f.id == id) {
+        if !self.seen_ids.insert(id) {
             return;
         }
-        self.add_hexagon_mercator(id, vertices, z, tx, ty, properties);
+        if vertices.len() < 3 {
+            return;
+        }
+        self.features.push(MvtFeature::from_mercator(
+            id,
+            vertices,
+            z,
+            tx,
+            ty,
+            self.extent,
+            properties,
+        ));
     }
 
     /// Add an H3 hexagon feature with its boundary vertices converted to tile [0, 4096] coordinates
@@ -615,8 +638,10 @@ impl MvtLayer {
         let count = vertices.len().min(8);
         let mut px = [0i32; 8];
         let mut py = [0i32; 8];
+
         for (i, v) in vertices.iter().take(count).enumerate() {
             px[i] = ((v.lng() - tile_min_lon) / lon_span * extent_f).round() as i32;
+
             let lat_clamped = v.lat().max(-85.05112878).min(85.05112878);
             let lat_rad = lat_clamped.to_radians();
             let y_merc = (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
@@ -627,6 +652,7 @@ impl MvtLayer {
             };
         }
 
+        self.seen_ids.insert(id);
         self.features.push(MvtFeature {
             id,
             properties: properties.into(),

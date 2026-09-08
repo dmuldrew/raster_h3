@@ -14,7 +14,10 @@ use serde_json::json;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::multi_horizon::{MultiScanHorizonStreamer, MultiCategoricalHorizonStreamer, MultiResolutionConfig};
+use crate::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
+    MultiResolutionConfig, MultiScanHorizonStreamer,
+};
 use crate::pmtiles::mvt::{
     FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter,
     PROP_CAT_COUNT, PROP_CAT_DISTINCT_CLASSES, PROP_CAT_ENTROPY, PROP_CAT_H3_HEX,
@@ -261,6 +264,85 @@ struct PreparedCategoricalHex {
     c_lat: f64,
     c_lon: f64,
     ops: Vec<PreparedTileOp>,
+}
+
+/// Batch of continuous records transferred from the background scanline producer thread
+struct ContinuousStreamBatch {
+    records: Vec<MultiContinuousRecord>,
+    lat_horizon: f64,
+}
+
+/// Batch of categorical records transferred from the background scanline producer thread
+struct CategoricalStreamBatch {
+    records: Vec<MultiCategoricalRecord>,
+    lat_horizon: f64,
+}
+
+/// Evict all tiles whose southernmost reach is strictly north of lat_horizon,
+/// encode to MVT protobuf and Gzip compress across Rayon workers, and stream to PMTiles
+fn evict_and_write_tiles(
+    tile_buckets: &mut HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher>,
+    tile_eviction_queue: &mut BinaryHeap<TileEvictionEntry>,
+    lat_horizon: f64,
+    writer: &mut PmtilesWriter,
+) -> io::Result<usize> {
+    let mut ready_tiles = Vec::new();
+    while let Some(top) = tile_eviction_queue.peek() {
+        if top.safe_evict_lat > lat_horizon {
+            let entry = tile_eviction_queue.pop().unwrap();
+            if let Some(layer) = tile_buckets.remove(&entry.tile_key) {
+                ready_tiles.push((entry.tile_key, layer));
+            }
+        } else {
+            break;
+        }
+    }
+
+    if ready_tiles.is_empty() {
+        return Ok(0);
+    }
+
+    let count = ready_tiles.len();
+    let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = ready_tiles
+        .into_par_iter()
+        .map(|(key, layer)| {
+            let pbf_bytes = layer.encode();
+            let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+            Ok((key, compressed))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    for ((z, x, y), compressed_bytes) in compressed_batch {
+        writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
+    }
+
+    Ok(count)
+}
+
+/// Flush all remaining active tiles at raster/stream completion in parallel
+fn flush_all_tiles(
+    tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher>,
+    writer: &mut PmtilesWriter,
+) -> io::Result<usize> {
+    let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = tile_buckets.into_iter().collect();
+    if remaining_tiles.is_empty() {
+        return Ok(0);
+    }
+    let count = remaining_tiles.len();
+    let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = remaining_tiles
+        .into_par_iter()
+        .map(|(key, layer)| {
+            let pbf_bytes = layer.encode();
+            let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
+            Ok((key, compressed))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    for ((z, x, y), compressed_bytes) in compressed_batch {
+        writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
+    }
+
+    Ok(count)
 }
 
 /// Per-resolution statistics accumulator for multi-resolution pyramids
@@ -568,18 +650,7 @@ impl H3PmtilesTiler {
         )?;
 
         let total_tiles = tile_buckets.len();
-        let encoded_tiles: Vec<((u8, u32, u32), Vec<u8>)> = tile_buckets
-            .into_par_iter()
-            .map(|((z, x, y), layer)| {
-                let pbf_bytes = layer.encode();
-                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-                Ok(((z, x, y), compressed))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-
-        for ((z, x, y), compressed_bytes) in encoded_tiles {
-            writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
-        }
+        flush_all_tiles(tile_buckets, &mut writer)?;
 
         writer.finish(output_path)?;
 
@@ -645,23 +716,31 @@ impl H3PmtilesTiler {
             String::new(),
         )?;
 
-        let mut batch = Vec::with_capacity(4096);
-
-        loop {
-            batch.clear();
-            streamer.drain_completed_into(4096, |_i, record| {
-                batch.push(record);
-            });
-            if batch.is_empty() {
-                break;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ContinuousStreamBatch>(4);
+        let producer_handle = std::thread::spawn(move || {
+            loop {
+                let mut records = Vec::with_capacity(8192);
+                streamer.drain_completed_into(8192, |_i, record| {
+                    records.push(record);
+                });
+                if records.is_empty() {
+                    break;
+                }
+                let lat_horizon = streamer.current_lat_horizon();
+                if tx.send(ContinuousStreamBatch { records, lat_horizon }).is_err() {
+                    break;
+                }
             }
+        });
 
+        while let Ok(batch) = rx.recv() {
             let prepared_batch: Vec<PreparedContinuousHex> = batch
-                .par_iter()
+                .records
+                .into_par_iter()
                 .filter_map(|record| {
                     let resolution = record.resolution;
                     let h3_index = record.h3_index;
-                    let accumulator = &record.accumulator;
+                    let accumulator = record.accumulator;
 
                     let cell = CellIndex::try_from(h3_index).ok()?;
                     let center: LatLng = cell.into();
@@ -793,7 +872,7 @@ impl H3PmtilesTiler {
 
                     Some(PreparedContinuousHex {
                         resolution,
-                        accumulator: accumulator.clone(),
+                        accumulator,
                         c_lat,
                         c_lon,
                         ops,
@@ -831,57 +910,21 @@ impl H3PmtilesTiler {
                     if op.is_parent {
                         layer.add_or_merge_feature(op.feature);
                     } else {
-                        layer.features.push(op.feature);
+                        layer.add_feature(op.feature);
                     }
                 }
 
                 total_hexagons += 1;
             }
 
-            // Evict completed tiles whose southernmost reach is north of current scanline horizon
-            let lat_horizon = streamer.current_lat_horizon();
-            let mut ready_tiles = Vec::new();
-            while let Some(top) = tile_eviction_queue.peek() {
-                if top.safe_evict_lat > lat_horizon {
-                    let entry = tile_eviction_queue.pop().unwrap();
-                    if let Some(layer) = tile_buckets.remove(&entry.tile_key) {
-                        ready_tiles.push((entry.tile_key, layer));
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            if !ready_tiles.is_empty() {
-                let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = ready_tiles
-                    .into_par_iter()
-                    .map(|(key, layer)| {
-                        let pbf_bytes = layer.encode();
-                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-                        Ok((key, compressed))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-
-                for ((z, x, y), compressed_bytes) in compressed_batch {
-                    writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
-                }
-            }
+            evict_and_write_tiles(&mut tile_buckets, &mut tile_eviction_queue, batch.lat_horizon, &mut writer)?;
         }
 
-        // Flush any remaining active tiles at raster completion in parallel
-        let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = tile_buckets.into_iter().collect();
-        let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = remaining_tiles
-            .into_par_iter()
-            .map(|(key, layer)| {
-                let pbf_bytes = layer.encode();
-                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-                Ok((key, compressed))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-
-        for ((z, x, y), compressed_bytes) in compressed_batch {
-            writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
+        if let Err(e) = producer_handle.join() {
+            return Err(format!("Producer thread panicked: {:?}", e).into());
         }
+
+        flush_all_tiles(tile_buckets, &mut writer)?;
 
         if total_hexagons == 0 {
             global_min_lon = -180.0;
@@ -1015,22 +1058,31 @@ impl H3PmtilesTiler {
             String::new(),
         )?;
 
-        let mut batch = Vec::with_capacity(4096);
-
-        loop {
-            batch.clear();
-            streamer.drain_completed_into(4096, |_i, record| {
-                batch.push(record);
-            });
-            if batch.is_empty() {
-                break;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CategoricalStreamBatch>(4);
+        let producer_handle = std::thread::spawn(move || {
+            loop {
+                let mut records = Vec::with_capacity(8192);
+                streamer.drain_completed_into(8192, |_i, record| {
+                    records.push(record);
+                });
+                if records.is_empty() {
+                    break;
+                }
+                let lat_horizon = streamer.current_lat_horizon();
+                if tx.send(CategoricalStreamBatch { records, lat_horizon }).is_err() {
+                    break;
+                }
             }
+        });
+
+        while let Ok(batch) = rx.recv() {
             let prepared_batch: Vec<PreparedCategoricalHex> = batch
-                .par_iter()
+                .records
+                .into_par_iter()
                 .filter_map(|record| {
                     let resolution = record.resolution;
                     let h3_index = record.h3_index;
-                    let accumulator = &record.accumulator;
+                    let accumulator = record.accumulator;
 
                     let (majority_class, _maj_count, majority_fraction) = accumulator.majority();
                     let entropy = if needs_entropy { accumulator.shannon_entropy() } else { 0.0 };
@@ -1166,7 +1218,7 @@ impl H3PmtilesTiler {
                         entropy,
                         distinct_classes,
                         pixel_count,
-                        accumulator: accumulator.clone(),
+                        accumulator,
                         c_lat,
                         c_lon,
                         ops,
@@ -1210,57 +1262,21 @@ impl H3PmtilesTiler {
                     if op.is_parent {
                         layer.add_or_merge_feature(op.feature);
                     } else {
-                        layer.features.push(op.feature);
+                        layer.add_feature(op.feature);
                     }
                 }
 
                 total_hexagons += 1;
             }
 
-            // Evict completed tiles whose southernmost reach is north of current scanline horizon
-            let lat_horizon = streamer.current_lat_horizon();
-            let mut ready_tiles = Vec::new();
-            while let Some(top) = tile_eviction_queue.peek() {
-                if top.safe_evict_lat > lat_horizon {
-                    let entry = tile_eviction_queue.pop().unwrap();
-                    if let Some(layer) = tile_buckets.remove(&entry.tile_key) {
-                        ready_tiles.push((entry.tile_key, layer));
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            if !ready_tiles.is_empty() {
-                let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = ready_tiles
-                    .into_par_iter()
-                    .map(|(key, layer)| {
-                        let pbf_bytes = layer.encode();
-                        let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-                        Ok((key, compressed))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-
-                for ((z, x, y), compressed_bytes) in compressed_batch {
-                    writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
-                }
-            }
+            evict_and_write_tiles(&mut tile_buckets, &mut tile_eviction_queue, batch.lat_horizon, &mut writer)?;
         }
 
-        // Flush any remaining active tiles at raster completion in parallel
-        let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = tile_buckets.into_iter().collect();
-        let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = remaining_tiles
-            .into_par_iter()
-            .map(|(key, layer)| {
-                let pbf_bytes = layer.encode();
-                let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-                Ok((key, compressed))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-
-        for ((z, x, y), compressed_bytes) in compressed_batch {
-            writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
+        if let Err(e) = producer_handle.join() {
+            return Err(format!("Producer thread panicked: {:?}", e).into());
         }
+
+        flush_all_tiles(tile_buckets, &mut writer)?;
 
         if total_hexagons == 0 {
             global_min_lon = -180.0;
