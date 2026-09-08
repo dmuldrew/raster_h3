@@ -268,6 +268,11 @@ impl PmtilesWriter {
         self.add_compressed_tile(z, x, y, &compressed)
     }
 
+    /// Return number of tiles currently written to disk spill storage
+    pub fn tile_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Finalize and write the complete PMTiles v3 single-file archive to disk
     pub fn finish<P: AsRef<Path>>(mut self, path: P) -> io::Result<()> {
         self.spill_file.flush()?;

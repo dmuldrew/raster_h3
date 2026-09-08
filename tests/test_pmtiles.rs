@@ -319,6 +319,80 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
 }
 
 #[test]
+fn test_parquet_to_pmtiles_multi_row_group_eviction() {
+    use parquet::schema::parser::parse_message_type;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use std::sync::Arc;
+    use h3o::{LatLng, Resolution};
+
+    let parquet_tmp = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_tmp.path().to_str().unwrap().to_string();
+
+    let message_type = "
+        message schema {
+            REQUIRED INT64 h3_index;
+            REQUIRED DOUBLE val;
+        }
+    ";
+    let schema = Arc::new(parse_message_type(message_type).unwrap());
+    let props = Arc::new(WriterProperties::builder().build());
+    let file = File::create(&parquet_path).unwrap();
+    let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+
+    // RG 0: Los Angeles (South, lat ~34.0)
+    let la_cell = LatLng::new(34.0522, -118.2437).unwrap().to_cell(Resolution::Eight);
+    let mut rg0 = writer.next_row_group().unwrap();
+    let mut c0 = rg0.next_column().unwrap().unwrap();
+    c0.typed::<parquet::data_type::Int64Type>().write_batch(&[u64::from(la_cell) as i64], None, None).unwrap();
+    c0.close().unwrap();
+    let mut c1 = rg0.next_column().unwrap().unwrap();
+    c1.typed::<parquet::data_type::DoubleType>().write_batch(&[10.0], None, None).unwrap();
+    c1.close().unwrap();
+    rg0.close().unwrap();
+
+    // RG 1: Seattle (North, lat ~47.6)
+    let sea_cell = LatLng::new(47.6062, -122.3321).unwrap().to_cell(Resolution::Eight);
+    let mut rg1 = writer.next_row_group().unwrap();
+    let mut c0 = rg1.next_column().unwrap().unwrap();
+    c0.typed::<parquet::data_type::Int64Type>().write_batch(&[u64::from(sea_cell) as i64], None, None).unwrap();
+    c0.close().unwrap();
+    let mut c1 = rg1.next_column().unwrap().unwrap();
+    c1.typed::<parquet::data_type::DoubleType>().write_batch(&[20.0], None, None).unwrap();
+    c1.close().unwrap();
+    rg1.close().unwrap();
+
+    // RG 2: San Francisco (Mid, lat ~37.7)
+    let sf_cell = LatLng::new(37.7749, -122.4194).unwrap().to_cell(Resolution::Eight);
+    let mut rg2 = writer.next_row_group().unwrap();
+    let mut c0 = rg2.next_column().unwrap().unwrap();
+    c0.typed::<parquet::data_type::Int64Type>().write_batch(&[u64::from(sf_cell) as i64], None, None).unwrap();
+    c0.close().unwrap();
+    let mut c1 = rg2.next_column().unwrap().unwrap();
+    c1.typed::<parquet::data_type::DoubleType>().write_batch(&[30.0], None, None).unwrap();
+    c1.close().unwrap();
+    rg2.close().unwrap();
+
+    writer.close().unwrap();
+
+    let pmtiles_tmp = NamedTempFile::new().unwrap();
+    let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
+
+    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
+    assert_eq!(summary.total_features, 3);
+    assert_eq!(summary.valid_features, 3);
+    assert_eq!(summary.invalid_features_dropped, 0);
+    assert!(summary.total_tiles >= 3);
+
+    // Verify PMTiles v3 archive header
+    let mut header = [0u8; 127];
+    let mut f = File::open(&pmtiles_path).unwrap();
+    f.read_exact(&mut header).unwrap();
+    assert_eq!(&header[0..7], b"PMTiles");
+    assert_eq!(header[7], 3);
+}
+
+#[test]
 fn test_coarse_zoom_parent_mapping() {
     use raster_h3::pmtiles::tiler::h3_res_for_zoom;
 
