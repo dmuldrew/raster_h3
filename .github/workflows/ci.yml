@@ -3,27 +3,36 @@ name: CI & Extension Build Matrix
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
 jobs:
-  test:
-    name: Test & Package (${{ matrix.platform }})
+  build:
+    name: Build & Package (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             platform: linux_amd64
             lib_file: libraster_h3.so
           - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: osx_amd64
+            lib_file: libraster_h3.dylib
+          - os: macos-latest
+            target: aarch64-apple-darwin
             platform: osx_arm64
             lib_file: libraster_h3.dylib
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             platform: windows_amd64
             lib_file: raster_h3.dll
-
+    env:
+      LIB_NAME: ${{ matrix.lib_file }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,20 +46,20 @@ jobs:
         run: cargo test --release
 
       - name: Build Dynamic Library & Binaries
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package DuckDB Extension (Uncompressed & Gzipped)
         shell: bash
         run: |
           cargo run --release --bin package_extension -- \
-            --input target/release/${{ matrix.lib_file }} \
-            --output target/release/raster_h3.duckdb_extension \
+            --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+            --output target/${{ matrix.target }}/release/raster_h3.duckdb_extension \
             --platform ${{ matrix.platform }} \
             --duckdb-version v1.2.0
 
           cargo run --release --bin package_extension -- \
-            --input target/release/${{ matrix.lib_file }} \
-            --output target/release/raster_h3.duckdb_extension.gz \
+            --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+            --output target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz \
             --platform ${{ matrix.platform }} \
             --duckdb-version v1.2.0 \
             --gzip
@@ -60,6 +69,6 @@ jobs:
         with:
           name: duckdb-extension-${{ matrix.platform }}
           path: |
-            target/release/raster_h3.duckdb_extension
-            target/release/raster_h3.duckdb_extension.gz
+            target/${{ matrix.target }}/release/raster_h3.duckdb_extension
+            target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz
           if-no-files-found: error
