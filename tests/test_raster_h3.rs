@@ -1934,45 +1934,99 @@ fn test_simd_span_integer_types() {
 }
 
 #[test]
-fn test_categorical_8_slot_inline_and_heap_spillover() {
+fn test_categorical_16_slot_inline_and_heap_spillover() {
     use raster_h3::aggregator::categorical::CategoricalAccumulator;
 
     let mut cat = CategoricalAccumulator::new();
 
-    // 1. Add 8 distinct classes: should remain 100% inline with zero heap allocation
-    for c in 1..=8 {
+    // 1. Add 16 distinct classes: should remain 100% inline with zero heap allocation
+    for c in 1..=16 {
         cat.update_weighted(c, (c * 10) as f64);
     }
 
-    assert_eq!(cat.inline_len, 8);
-    assert!(cat.heap_counts.is_none(), "Must stay inline up to 8 classes");
-    assert_eq!(cat.unique_classes(), 8);
-    assert_eq!(cat.total_count, 360.0);
+    assert_eq!(cat.inline_len, 16);
+    assert!(cat.heap_counts.is_none(), "Must stay inline up to 16 classes");
+    assert_eq!(cat.unique_classes(), 16);
+    let expected_sum: f64 = (1..=16).map(|c| (c * 10) as f64).sum();
+    assert_eq!(cat.total_count, expected_sum);
     assert_eq!(cat.get_class_count(5), 50.0);
+    assert_eq!(cat.get_class_count(16), 160.0);
 
     let (maj_cls, maj_count, maj_frac) = cat.majority();
-    assert_eq!(maj_cls, 8);
-    assert_eq!(maj_count, 80.0);
-    assert!((maj_frac - (80.0 / 360.0)).abs() < 1e-6);
+    assert_eq!(maj_cls, 16);
+    assert_eq!(maj_count, 160.0);
+    assert!((maj_frac - (160.0 / expected_sum)).abs() < 1e-6);
 
-    // 2. Add 9th class: should spill to heap
-    cat.update_weighted(9, 100.0);
-    assert!(cat.heap_counts.is_some(), "Must spill to heap on 9th class");
-    assert_eq!(cat.unique_classes(), 9);
-    assert_eq!(cat.total_count, 460.0);
-    assert_eq!(cat.get_class_count(9), 100.0);
-    assert_eq!(cat.majority().0, 9);
+    // 2. Add 17th class: should spill to heap
+    cat.update_weighted(17, 200.0);
+    assert!(cat.heap_counts.is_some(), "Must spill to heap on 17th class");
+    assert_eq!(cat.unique_classes(), 17);
+    assert_eq!(cat.total_count, expected_sum + 200.0);
+    assert_eq!(cat.get_class_count(17), 200.0);
+    assert_eq!(cat.majority().0, 17);
 
     // 3. Merge with another inline accumulator
     let mut cat2 = CategoricalAccumulator::new();
     cat2.update_weighted(1, 20.0);
-    cat2.update_weighted(10, 50.0);
+    cat2.update_weighted(18, 50.0);
 
     cat.merge(&cat2);
-    assert_eq!(cat.unique_classes(), 10);
+    assert_eq!(cat.unique_classes(), 18);
     assert_eq!(cat.get_class_count(1), 30.0);
-    assert_eq!(cat.get_class_count(10), 50.0);
-    assert_eq!(cat.total_count, 530.0);
+    assert_eq!(cat.get_class_count(18), 50.0);
+    assert_eq!(cat.total_count, expected_sum + 200.0 + 70.0);
+}
+
+#[test]
+fn test_categorical_simd_uniformity_types_and_spans() {
+    use raster_h3::aggregator::categorical::CategoricalUniformity;
+
+    // Test helper for various lengths and mismatch positions
+    fn check_uniformity<T: CategoricalUniformity + std::fmt::Debug>(val: T, diff_val: T) {
+        // Empty & single
+        assert!(T::is_uniform(&[]));
+        assert!(T::is_uniform(&[val]));
+
+        // Various span sizes: 2, 7, 8, 15, 16, 31, 32, 63, 64, 100
+        for len in [2, 7, 8, 15, 16, 31, 32, 63, 64, 100] {
+            let uniform_vec = vec![val; len];
+            assert!(T::is_uniform(&uniform_vec), "Expected uniform for len {}", len);
+
+            // Mismatch at start
+            let mut diff_start = uniform_vec.clone();
+            diff_start[0] = diff_val;
+            assert!(!T::is_uniform(&diff_start), "Expected non-uniform at start for len {}", len);
+
+            // Mismatch at end
+            let mut diff_end = uniform_vec.clone();
+            diff_end[len - 1] = diff_val;
+            assert!(!T::is_uniform(&diff_end), "Expected non-uniform at end for len {}", len);
+
+            // Mismatch at middle
+            if len > 2 {
+                let mut diff_mid = uniform_vec.clone();
+                diff_mid[len / 2] = diff_val;
+                assert!(!T::is_uniform(&diff_mid), "Expected non-uniform at mid for len {}", len);
+            }
+        }
+    }
+
+    check_uniformity::<u8>(42, 99);
+    check_uniformity::<i8>(-10, 20);
+    check_uniformity::<u16>(1000, 2000);
+    check_uniformity::<i16>(-500, 500);
+    check_uniformity::<u32>(100_000, 200_000);
+    check_uniformity::<i32>(-100_000, 100_000);
+    check_uniformity::<u64>(1_000_000_000, 2_000_000_000);
+    check_uniformity::<i64>(-1_000_000_000, 1_000_000_000);
+    check_uniformity::<f32>(3.14, 2.71);
+    check_uniformity::<f64>(1.414213, 1.73205);
+
+    // Float +0.0 and -0.0 equivalence
+    let zeros_f32 = vec![0.0f32, -0.0f32, 0.0f32, -0.0f32];
+    assert!(f32::is_uniform(&zeros_f32));
+    let zeros_f64 = vec![0.0f64, -0.0f64, 0.0f64, -0.0f64];
+    assert!(f64::is_uniform(&zeros_f64));
 }
 
 

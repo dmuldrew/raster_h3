@@ -3,7 +3,7 @@ use fxhash::FxBuildHasher;
 use h3o::{LatLng, Resolution};
 use tiff::decoder::DecodingResult;
 
-use crate::aggregator::categorical::CategoricalAccumulator;
+use crate::aggregator::categorical::{CategoricalAccumulator, CategoricalUniformity};
 use crate::aggregator::h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
 use crate::aggregator::horizon_streamer::is_chunk_all_nodata;
 use crate::aggregator::remap::CategoryRemapper;
@@ -171,7 +171,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) where
-    T: Copy + PartialEq,
+    T: CategoricalUniformity,
     F: Fn(T) -> Option<i64>,
     N: Copy + PartialEq<T>,
 {
@@ -459,7 +459,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                             let aggregate_cat_span = |sub_slice: &[T], acc: &mut CategoricalAccumulator| {
                                 if sub_slice.is_empty() { return; }
                                 let first_val = sub_slice[0];
-                                let is_uniform = sub_slice.iter().all(|&v| v == first_val);
+                                let is_uniform = T::is_uniform(sub_slice);
 
                                 if is_uniform {
                                     let mut is_nd = false;
@@ -913,7 +913,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                             return;
                         }
                         let first_val = sub_slice[0];
-                        let is_uniform = sub_slice.iter().all(|&v| v == first_val);
+                        let is_uniform = T::is_uniform(sub_slice);
 
                         if is_uniform {
                             let mut is_nd = false;

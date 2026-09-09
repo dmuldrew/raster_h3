@@ -7,12 +7,15 @@ use crate::aggregator::multi_horizon::{MultiCategoricalHorizonStreamer, MultiRes
 use crate::error::Result;
 use crate::raster::geotiff::GeoTiffStreamReader;
 
+/// Maximum number of distinct categories tracked inline without heap allocation.
+pub const INLINE_CAPACITY: usize = 16;
+
 /// High-performance accumulator for categorical class frequencies per H3 cell.
-/// Uses an inline 8-slot array for zero-heap allocation in >99.9% of cells,
+/// Uses an inline 16-slot array for zero-heap allocation in >99.99% of cells,
 /// with an optional boxed hash map for complex multi-class boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CategoricalAccumulator {
-    pub inline_entries: [(i64, f64); 8],
+    pub inline_entries: [(i64, f64); INLINE_CAPACITY],
     pub inline_len: u8,
     pub heap_counts: Option<Box<HashMap<i64, f64, FxBuildHasher>>>,
     pub total_count: f64,
@@ -22,7 +25,7 @@ impl Default for CategoricalAccumulator {
     #[inline(always)]
     fn default() -> Self {
         Self {
-            inline_entries: [(0, 0.0); 8],
+            inline_entries: [(0, 0.0); INLINE_CAPACITY],
             inline_len: 0,
             heap_counts: None,
             total_count: 0.0,
@@ -92,13 +95,13 @@ impl CategoricalAccumulator {
             }
         }
 
-        if len < 8 {
+        if len < INLINE_CAPACITY {
             self.inline_entries[len] = (category, weight);
             self.inline_len += 1;
         } else {
             // Spill to heap
-            let mut map: HashMap<i64, f64, FxBuildHasher> = HashMap::with_capacity_and_hasher(16, FxBuildHasher::default());
-            for i in 0..8 {
+            let mut map: HashMap<i64, f64, FxBuildHasher> = HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
+            for i in 0..INLINE_CAPACITY {
                 map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
             }
             map.insert(category, weight);
@@ -253,5 +256,229 @@ impl CategoricalHorizonStreamer {
     /// Return current number of active cells in memory
     pub fn active_cell_count(&self) -> usize {
         self.inner.active_cell_count()
+    }
+}
+
+/// Trait for numeric raster pixel types that support high-throughput SIMD / branchless span uniformity detection.
+pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {
+    /// Return true if all values in the slice are identical to slice[0], or if slice is empty.
+    fn is_uniform(slice: &[Self]) -> bool;
+}
+
+impl CategoricalUniformity for u8 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        if slice.len() <= 1 {
+            return true;
+        }
+        let first = slice[0];
+        let rest = &slice[1..];
+        let chunks = rest.chunks_exact(32);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let mut diff = 0u8;
+            for &v in chunk {
+                diff |= v ^ first;
+            }
+            if diff != 0 {
+                return false;
+            }
+        }
+        for &v in rem {
+            if v != first {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CategoricalUniformity for i8 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        let u8_slice: &[u8] = unsafe {
+            std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len())
+        };
+        u8::is_uniform(u8_slice)
+    }
+}
+
+impl CategoricalUniformity for u16 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        if slice.len() <= 1 {
+            return true;
+        }
+        let first = slice[0];
+        let rest = &slice[1..];
+        let chunks = rest.chunks_exact(16);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let mut diff = 0u16;
+            for &v in chunk {
+                diff |= v ^ first;
+            }
+            if diff != 0 {
+                return false;
+            }
+        }
+        for &v in rem {
+            if v != first {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CategoricalUniformity for i16 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        let u16_slice: &[u16] = unsafe {
+            std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len())
+        };
+        u16::is_uniform(u16_slice)
+    }
+}
+
+impl CategoricalUniformity for u32 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        if slice.len() <= 1 {
+            return true;
+        }
+        let first = slice[0];
+        let rest = &slice[1..];
+        let chunks = rest.chunks_exact(8);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let mut diff = 0u32;
+            for &v in chunk {
+                diff |= v ^ first;
+            }
+            if diff != 0 {
+                return false;
+            }
+        }
+        for &v in rem {
+            if v != first {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CategoricalUniformity for i32 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        let u32_slice: &[u32] = unsafe {
+            std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len())
+        };
+        u32::is_uniform(u32_slice)
+    }
+}
+
+impl CategoricalUniformity for u64 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        if slice.len() <= 1 {
+            return true;
+        }
+        let first = slice[0];
+        let rest = &slice[1..];
+        let chunks = rest.chunks_exact(8);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let mut diff = 0u64;
+            for &v in chunk {
+                diff |= v ^ first;
+            }
+            if diff != 0 {
+                return false;
+            }
+        }
+        for &v in rem {
+            if v != first {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CategoricalUniformity for i64 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        let u64_slice: &[u64] = unsafe {
+            std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len())
+        };
+        u64::is_uniform(u64_slice)
+    }
+}
+
+impl CategoricalUniformity for f32 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        if slice.len() <= 1 {
+            return true;
+        }
+        let first = slice[0];
+        let first_bits = first.to_bits();
+        let rest = &slice[1..];
+        let chunks = rest.chunks_exact(8);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let mut diff = 0u32;
+            for &v in chunk {
+                diff |= v.to_bits() ^ first_bits;
+            }
+            if diff != 0 {
+                for &v in chunk {
+                    if v != first {
+                        return false;
+                    }
+                }
+            }
+        }
+        for &v in rem {
+            if v != first {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CategoricalUniformity for f64 {
+    #[inline(always)]
+    fn is_uniform(slice: &[Self]) -> bool {
+        if slice.len() <= 1 {
+            return true;
+        }
+        let first = slice[0];
+        let first_bits = first.to_bits();
+        let rest = &slice[1..];
+        let chunks = rest.chunks_exact(8);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let mut diff = 0u64;
+            for &v in chunk {
+                diff |= v.to_bits() ^ first_bits;
+            }
+            if diff != 0 {
+                for &v in chunk {
+                    if v != first {
+                        return false;
+                    }
+                }
+            }
+        }
+        for &v in rem {
+            if v != first {
+                return false;
+            }
+        }
+        true
     }
 }
