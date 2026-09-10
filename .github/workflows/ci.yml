@@ -86,6 +86,10 @@ jobs:
           echo "LIB=$WIN_LIB_DIR;$LIB" >> $GITHUB_ENV
           echo "RUSTFLAGS=-L native=$WIN_LIB_DIR" >> $GITHUB_ENV
           echo "$(pwd)/target/duckdb_lib" >> $GITHUB_PATH
+          mkdir -p target/release/deps
+          cp target/duckdb_lib/duckdb.dll target/release/deps/ || true
+          cp target/duckdb_lib/duckdb.dll target/release/ || true
+          cp target/duckdb_lib/duckdb.dll . || true
 
       - name: Run Tests
         run: cargo test --release
@@ -133,6 +137,7 @@ jobs:
           DUCKDB_BIN="./duckdb"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             DUCKDB_BIN="./duckdb.exe"
+            cp target/duckdb_lib/duckdb.dll . || true
           fi
           
           chmod +x $DUCKDB_BIN || true

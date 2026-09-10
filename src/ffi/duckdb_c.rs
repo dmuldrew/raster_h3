@@ -146,6 +146,7 @@ pub type duckdb_scalar_function_t =
     unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector);
 pub type duckdb_delete_callback_t = unsafe extern "C" fn(data: *mut c_void);
 
+#[cfg_attr(windows, link(name = "duckdb"))]
 extern "C" {
     pub fn duckdb_connect(database: duckdb_database, out_connection: *mut duckdb_connection) -> DuckDBState;
     pub fn duckdb_disconnect(connection: *mut duckdb_connection);
