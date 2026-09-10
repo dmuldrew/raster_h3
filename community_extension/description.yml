@@ -1,0 +1,45 @@
+extension:
+  name: raster_h3
+  description: High-performance GeoTIFF to H3 hexagonal aggregation and PMTiles v3 vector pyramids
+  version: 0.1.0
+  language: Rust
+  build: cargo
+  license: MIT
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;linux_amd64_musl"
+  requires_toolchains: "rust;python3"
+  maintainers:
+    - dmuldrew
+
+repo:
+  github: dmuldrew/raster_h3_hexification
+  ref: cf05bb8a5c9618d778ea95b869f3ea311a2fa492
+
+docs:
+  hello_world: |
+    -- 1. Continuous Surface Aggregation (elevation, temperature, NDVI)
+    SELECT h3_to_string(h3_index) AS hex, count, mean, min, max
+    FROM h3_raster_continuous_aggregate('elevation.tif', h3_res := 9)
+    LIMIT 10;
+
+    -- 2. Categorical Aggregation (land cover, zoning)
+    SELECT h3_to_string(h3_index) AS hex, majority_class, majority_fraction
+    FROM h3_raster_categorical_aggregate('landcover.tif', h3_res := 8)
+    LIMIT 10;
+
+    -- 3. Export directly to PMTiles v3 Vector Pyramid for WebGL Visualization
+    SELECT * FROM h3_raster_to_pmtiles(
+      'elevation.tif',
+      'elevation.pmtiles',
+      min_res := 4,
+      max_res := 9
+    );
+
+  extended_description: |
+    `raster_h3` is a high-performance, native DuckDB extension written in pure Rust that aggregates multi-gigabyte geospatial raster files (GeoTIFF, Cloud-Optimized GeoTIFFs) directly into Uber H3 hexagonal grid cells and generates cloud-native PMTiles v3 vector pyramids.
+
+    ### Key Features:
+    - **Zero Python / Zero GDAL C++ Dependencies**: 100% self-contained pure Rust engine.
+    - **Bounded Memory O(Scan Front) < 15 MB RAM**: Horizon eviction streams multi-gigabyte rasters in constant memory.
+    - **Scanline Lookahead Acceleration**: Hoisted row-constant latitude projection and exponential jump-guessing for hardware-saturating throughput.
+    - **Native PMTiles v3 Vector Pyramids**: Emits serverless web-ready vector tile archives in a single SQL query.
+    - **Sub-Pixel Area-Weighted Super-Sampling**: Supports 8 anti-aliasing patterns (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact boundary precision.
