@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
+
 jobs:
   build:
     name: Build & Package (${{ matrix.platform }})
@@ -15,37 +19,64 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             platform: linux_amd64
             lib_file: libraster_h3.so
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            platform: osx_amd64
-            lib_file: libraster_h3.dylib
+            cli_arch: linux-amd64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux_amd64_musl
+            lib_file: libraster_h3.so
+            cli_arch: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux_arm64
+            lib_file: libraster_h3.so
+            cli_arch: linux-aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: osx_arm64
             lib_file: libraster_h3.dylib
+            cli_arch: osx-universal
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: osx_amd64
+            lib_file: libraster_h3.dylib
+            cli_arch: osx-universal
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows_amd64
             lib_file: raster_h3.dll
+            cli_arch: windows-amd64
     env:
       LIB_NAME: ${{ matrix.lib_file }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Run Tests
         run: cargo test --release
 
       - name: Build Dynamic Library & Binaries
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package DuckDB Extension (Uncompressed & Gzipped)
@@ -64,6 +95,33 @@ jobs:
             --duckdb-version v1.2.0 \
             --gzip
 
+          # Create platform-tagged files for direct release asset downloads
+          cp target/${{ matrix.target }}/release/raster_h3.duckdb_extension target/${{ matrix.target }}/release/raster_h3-${{ matrix.platform }}.duckdb_extension
+          cp target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz target/${{ matrix.target }}/release/raster_h3-${{ matrix.platform }}.duckdb_extension.gz
+
+          # Stage repository layout: dist/v1.2.0/<platform>/raster_h3.duckdb_extension[.gz]
+          mkdir -p dist/v1.2.0/${{ matrix.platform }}
+          cp target/${{ matrix.target }}/release/raster_h3.duckdb_extension dist/v1.2.0/${{ matrix.platform }}/
+          cp target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz dist/v1.2.0/${{ matrix.platform }}/
+
+      - name: Verify Extension Loading with DuckDB CLI
+        if: matrix.cli_arch != ''
+        shell: bash
+        run: |
+          CLI_URL="https://github.com/duckdb/duckdb/releases/download/v1.2.0/duckdb_cli-${{ matrix.cli_arch }}.zip"
+          echo "Downloading DuckDB CLI from $CLI_URL..."
+          curl -sLO "$CLI_URL"
+          unzip -o -q "duckdb_cli-${{ matrix.cli_arch }}.zip"
+          
+          DUCKDB_BIN="./duckdb"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            DUCKDB_BIN="./duckdb.exe"
+          fi
+          
+          chmod +x $DUCKDB_BIN || true
+          $DUCKDB_BIN -unsigned -c "LOAD 'target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
+          echo "Smoke test passed successfully on ${{ matrix.platform }}!"
+
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -71,4 +129,55 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/raster_h3.duckdb_extension
             target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz
+            target/${{ matrix.target }}/release/raster_h3-${{ matrix.platform }}.duckdb_extension
+            target/${{ matrix.target }}/release/raster_h3-${{ matrix.platform }}.duckdb_extension.gz
+            dist/v1.2.0/${{ matrix.platform }}/*
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all extension artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          pattern: duckdb-extension-*
+          merge-multiple: false
+
+      - name: Prepare Release Assets and Repository Bundle
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          mkdir -p duckdb-repository/v1.2.0
+
+          # Copy flat release binaries (both uncompressed and gzipped)
+          find all-artifacts -name "raster_h3-*.duckdb_extension*" -exec cp {} release-assets/ \;
+
+          # Assemble repository layout: v1.2.0/<platform>/raster_h3.duckdb_extension[.gz]
+          find all-artifacts -path "*/dist/v1.2.0/*" -type f | while read -r file; do
+            plat=$(basename $(dirname "$file"))
+            mkdir -p "duckdb-repository/v1.2.0/$plat"
+            cp "$file" "duckdb-repository/v1.2.0/$plat/"
+          done
+
+          # Archive repository bundle for custom_extension_repository distribution
+          (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0)
+
+          echo "Staged release assets:"
+          ls -la release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+

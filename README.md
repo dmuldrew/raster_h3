@@ -13,7 +13,7 @@ Supports both **continuous** raster surfaces (elevation, temperature, NDVI, prec
 ## 📖 Table of Contents
 - [1. Motivation & Project Goals](#1-motivation--project-goals)
 - [2. Conceptual Overview: Why Traditional Tools Struggle & How We Fix It](#2-conceptual-overview-why-traditional-tools-struggle--how-we-fix-it)
-- [3. Quickstart with Docker](#3-quickstart-with-docker)
+- [3. Pre-Compiled Extension Installation & Docker Quickstart](#3-pre-compiled-extension-installation--docker-quickstart-)
 - [4. SQL Usage & Practical Recipes](#4-sql-usage--practical-recipes)
 - [5. Core Engineering Innovations](#5-core-engineering-innovations)
 - [6. Sub-Pixel Super-Sampling Guide](#6-sub-pixel-super-sampling-guide)
@@ -94,9 +94,58 @@ Visualizing massive hexagonal datasets traditionally required installing externa
 
 ---
 
-## 3. Quickstart with Docker 🐳
+## 3. Pre-Compiled Extension Installation & Docker Quickstart 📦
 
-The easiest way to run `raster_h3` is with the bundled Docker container, which includes the DuckDB CLI and the pre-compiled native extension:
+### 1. Direct Installation via DuckDB (No Compilation Required)
+Pre-compiled binaries with native DuckDB extension footers and gzip compression are published for all major architectures on every release:
+
+| DuckDB Architecture | Platform Identifier | Compatible Environments | Asset Filename |
+| :--- | :--- | :--- | :--- |
+| **`osx_arm64`** | Apple Silicon | macOS M1/M2/M3/M4 (ARM64) | `raster_h3-osx_arm64.duckdb_extension.gz` |
+| **`osx_amd64`** | Intel Mac | macOS x86_64 | `raster_h3-osx_amd64.duckdb_extension.gz` |
+| **`linux_amd64`** | Linux x86_64 | Ubuntu, Debian, CentOS, Fedora, Arch (glibc) | `raster_h3-linux_amd64.duckdb_extension.gz` |
+| **`linux_amd64_musl`** | Linux Musl | Alpine Linux, musl-based containers | `raster_h3-linux_amd64_musl.duckdb_extension.gz` |
+| **`linux_arm64`** | Linux ARM64 | AWS Graviton, Raspberry Pi 4/5, Linux AArch64 | `raster_h3-linux_arm64.duckdb_extension.gz` |
+| **`windows_amd64`** | Windows x64 | Windows 10/11, Windows Server (MSVC x86_64) | `raster_h3-windows_amd64.duckdb_extension.gz` |
+
+#### A. Install via Direct Release URL
+Start DuckDB with unsigned extensions enabled (`duckdb -unsigned` or `SET allow_unsigned_extensions = true;`), then install directly:
+
+```sql
+-- Enable loading community extensions
+SET allow_unsigned_extensions = true;
+
+-- Install directly from GitHub Releases (replace <platform> with your platform identifier, e.g. osx_arm64):
+INSTALL 'https://github.com/dmuldrew/raster_h3_hexification/releases/latest/download/raster_h3-<platform>.duckdb_extension.gz';
+
+-- Load the extension
+LOAD 'raster_h3';
+
+-- Verify installation
+SELECT raster_h3_version();
+```
+
+#### B. Install via Custom Extension Repository
+DuckDB extensions can also be resolved automatically using DuckDB's repository layout:
+
+```sql
+SET allow_unsigned_extensions = true;
+SET custom_extension_repository = 'https://github.com/dmuldrew/raster_h3_hexification/releases/latest/download';
+INSTALL raster_h3;
+LOAD raster_h3;
+```
+
+#### C. Manual Download & Local Load
+Alternatively, download the `.duckdb_extension` (or `.duckdb_extension.gz`) file for your platform from [Releases](https://github.com/dmuldrew/raster_h3_hexification/releases) and load it directly:
+```sql
+LOAD '/path/to/raster_h3-<platform>.duckdb_extension';
+```
+
+---
+
+### 2. Quickstart with Docker 🐳
+
+The easiest way to run `raster_h3` in a container is with the bundled Dockerfile, which includes the DuckDB CLI and the pre-compiled native extension:
 
 ### 1. Build the Container
 ```bash
