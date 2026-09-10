@@ -174,30 +174,47 @@ fn main() {
         std::process::exit(1);
     }
 
-    // DuckDB 512-byte extension footer
-    let mut footer = [0u8; 512];
+    // Official DuckDB 534-byte extension footer
+    let mut footer = Vec::with_capacity(534);
 
-    // Offset 480..512: Magic version "4\0"
-    let magic = b"4\0";
-    footer[480..480 + magic.len()].copy_from_slice(magic);
+    // 22-byte WebAssembly custom section header: duckdb_signature
+    footer.push(0);
+    footer.push(147);
+    footer.push(4);
+    footer.push(16);
+    footer.extend_from_slice(b"duckdb_signature");
+    footer.push(128);
+    footer.push(4);
 
-    // Offset 448..480: Platform (e.g. linux_amd64, osx_arm64, windows_amd64)
-    let plat_bytes = target_platform.as_bytes();
-    let plat_len = plat_bytes.len().min(31);
-    footer[448..448 + plat_len].copy_from_slice(&plat_bytes[..plat_len]);
+    let pad_field = |val: &str| -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        let bytes = val.as_bytes();
+        let len = bytes.len().min(32);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        buf
+    };
 
-    // Offset 416..448: DuckDB Version (e.g. v1.2.0)
-    let ver_bytes = duckdb_version.as_bytes();
-    let ver_len = ver_bytes.len().min(31);
-    footer[416..416 + ver_len].copy_from_slice(&ver_bytes[..ver_len]);
+    let abi_str = match abi_type {
+        0 => "CPP",
+        1 => "C_STRUCT",
+        2 => "C_STRUCT_V0",
+        _ => "C_STRUCT",
+    };
 
-    // Offset 384..416: Extension Version (e.g. v0.1.0)
-    let ext_bytes = ext_version.as_bytes();
-    let ext_len = ext_bytes.len().min(31);
-    footer[384..384 + ext_len].copy_from_slice(&ext_bytes[..ext_len]);
+    // 8 fields of 32 bytes each
+    footer.extend_from_slice(&pad_field("")); // FIELD8 (unused)
+    footer.extend_from_slice(&pad_field("")); // FIELD7 (unused)
+    footer.extend_from_slice(&pad_field("")); // FIELD6 (unused)
+    footer.extend_from_slice(&pad_field(abi_str)); // FIELD5 (abi_type)
+    footer.extend_from_slice(&pad_field(&ext_version)); // FIELD4 (extension_version)
+    footer.extend_from_slice(&pad_field(&duckdb_version)); // FIELD3 (duckdb_version)
+    footer.extend_from_slice(&pad_field(&target_platform)); // FIELD2 (duckdb_platform)
+    footer.extend_from_slice(&pad_field("4")); // FIELD1 (header signature: 4)
 
-    // Offset 352..384: ABI Type (0 = CPP, 1 = C_STRUCT, 2 = C_STRUCT_V0)
-    footer[352] = abi_type;
+    // 256 bytes signature space
+    footer.extend_from_slice(&[0u8; 256]);
+
+    let footer_size = footer.len(); // 534 bytes
 
     if gzip {
         let out_file = File::create(&output_path).unwrap_or_else(|e| {
@@ -212,9 +229,9 @@ fn main() {
         println!(
             "Successfully packaged gzipped DuckDB extension: {} ({} -> {} bytes, {:.1}% ratio)",
             output_path,
-            raw_size + 512,
+            raw_size + footer_size,
             compressed_size,
-            (compressed_size as f64 / (raw_size + 512) as f64) * 100.0
+            (compressed_size as f64 / (raw_size + footer_size) as f64) * 100.0
         );
     } else {
         let mut out_file = File::create(&output_path).unwrap_or_else(|e| {
@@ -224,9 +241,9 @@ fn main() {
         out_file.write_all(&so_bytes).unwrap();
         out_file.write_all(&footer).unwrap();
         println!(
-            "Successfully packaged DuckDB extension: {} (total {} bytes with 512-byte footer)",
+            "Successfully packaged DuckDB extension: {} (total {} bytes with 534-byte footer)",
             output_path,
-            raw_size + 512
+            raw_size + footer_size
         );
     }
 }

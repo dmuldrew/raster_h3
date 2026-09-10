@@ -75,6 +75,11 @@ jobs:
         run: |
           echo "RUSTFLAGS=-C link-arg=-undefined -C link-arg=dynamic_lookup" >> $GITHUB_ENV
 
+      - name: Configure Musl Target Flags
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=-crt-static" >> $GITHUB_ENV
+
       - name: Setup DuckDB Import Library (Windows MSVC)
         if: runner.os == 'Windows'
         shell: bash
@@ -98,6 +103,7 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=-crt-static
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package DuckDB Extension (Uncompressed & Gzipped)
