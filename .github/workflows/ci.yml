@@ -70,6 +70,23 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Configure macOS Linker Flags
+        if: runner.os == 'macOS'
+        run: |
+          echo "RUSTFLAGS=-C link-arg=-undefined -C link-arg=dynamic_lookup" >> $GITHUB_ENV
+
+      - name: Setup DuckDB Import Library (Windows MSVC)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p target/duckdb_lib
+          curl -sLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          unzip -o -q libduckdb-windows-amd64.zip -d target/duckdb_lib
+          WIN_LIB_DIR=$(cygpath -w "$(pwd)/target/duckdb_lib")
+          echo "LIB=$WIN_LIB_DIR;$LIB" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-L native=$WIN_LIB_DIR" >> $GITHUB_ENV
+          echo "$(pwd)/target/duckdb_lib" >> $GITHUB_PATH
+
       - name: Run Tests
         run: cargo test --release
 
