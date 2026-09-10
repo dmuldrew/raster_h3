@@ -18,7 +18,7 @@ RUN cargo test --release && \
     cargo run --release --bin package_extension -- \
         --input target/release/libraster_h3.so \
         --output target/release/raster_h3.duckdb_extension \
-        --duckdb-version v1.5.5
+        --duckdb-version v1.2.0
 
 # ==============================================================================
 # Stage 2: Runtime Environment with DuckDB CLI

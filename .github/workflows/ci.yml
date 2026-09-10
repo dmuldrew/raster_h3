@@ -147,7 +147,7 @@ jobs:
           fi
           
           chmod +x $DUCKDB_BIN || true
-          $DUCKDB_BIN -unsigned -c "LOAD 'target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
+          $DUCKDB_BIN -unsigned -c "LOAD '$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
           echo "Smoke test passed successfully on ${{ matrix.platform }}!"
 
       - name: Upload Extension Artifacts
