@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: dmuldrew/raster_h3_hexification
-  ref: cf05bb8a5c9618d778ea95b869f3ea311a2fa492
+  ref: ccb9f828fa0a7984afc970c0164525ced7b5979e
 
 docs:
   hello_world: |
