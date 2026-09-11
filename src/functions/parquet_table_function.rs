@@ -20,7 +20,8 @@ use parquet::basic::Compression;
 use crate::aggregator::multi_horizon::MultiResolutionConfig;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
-use crate::ffi::{from_duckdb_string, to_c_string};
+use crate::ffi::to_c_string;
+use crate::functions::bind_utils::{add_named_parameter, add_positional_parameter, BindHelper};
 use crate::parquet::{H3ParquetWriter, ParquetExportConfig};
 
 /// Bind data parsed during SQL query planning
@@ -57,180 +58,66 @@ unsafe extern "C" fn delete_parquet_global_data(data: *mut c_void) {
 
 /// Bind callback: parses input arguments and defines output table schema
 pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
-    let param_count = duckdb_bind_get_parameter_count(info);
-    if param_count < 2 {
-        let err_msg = to_c_string("h3_raster_to_parquet requires at least 2 arguments: file_path and output_parquet");
-        duckdb_bind_set_error(info, err_msg.as_ptr());
+    let bind = BindHelper::new(info);
+
+    if bind.parameter_count() < 2 {
+        bind.set_error("h3_raster_to_parquet requires at least 2 arguments: file_path and output_parquet");
         return;
     }
 
     // 0: file_path (VARCHAR)
-    let path_val = duckdb_bind_get_parameter(info, 0);
-    let file_path = match from_duckdb_string(duckdb_get_varchar(path_val)) {
+    let file_path = match bind.get_string_param(0) {
         Some(s) => s,
         None => {
-            let err_msg = to_c_string("Invalid file_path parameter");
-            duckdb_bind_set_error(info, err_msg.as_ptr());
+            bind.set_error("Invalid file_path parameter");
             return;
         }
     };
 
     // 1: output_parquet (VARCHAR)
-    let out_val = duckdb_bind_get_parameter(info, 1);
-    let output_parquet = match from_duckdb_string(duckdb_get_varchar(out_val)) {
+    let output_parquet = match bind.get_string_param(1) {
         Some(s) => s,
         None => {
-            let err_msg = to_c_string("Invalid output_parquet parameter");
-            duckdb_bind_set_error(info, err_msg.as_ptr());
+            bind.set_error("Invalid output_parquet parameter");
             return;
         }
     };
 
     let mut resolution = 8u8;
-    let mut band = 1usize;
-    let mut custom_nodata = None;
-    let mut sampling = SamplingPattern::center();
-    let mut is_categorical = false;
-    let mut compact = true;
-    let mut compression = Compression::SNAPPY;
-    let mut row_group_size = 131_072usize;
-
-    // Named parameter: resolution (BIGINT)
-    let name_res = to_c_string("resolution");
-    let val_res = duckdb_bind_get_named_parameter(info, name_res.as_ptr());
-    if !val_res.is_null() {
-        let r = duckdb_get_int64(val_res);
+    if let Some(r) = bind.get_named_int("resolution") {
         if (0..=15).contains(&r) {
             resolution = r as u8;
         }
     }
 
-    // Named parameter: sampling (VARCHAR)
-    let name_sampling = to_c_string("sampling");
-    let val_sampling = duckdb_bind_get_named_parameter(info, name_sampling.as_ptr());
-    if !val_sampling.is_null() {
-        if let Some(s) = from_duckdb_string(duckdb_get_varchar(val_sampling)) {
-            sampling = SamplingPattern::parse(&s);
+    let sampling = bind.parse_sampling();
+    let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
+    let custom_nodata = bind.get_named_double("nodata");
+    let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
+    let compact = bind.get_named_bool("compact").unwrap_or(true);
+
+    let mut compression = Compression::SNAPPY;
+    if let Some(s) = bind.get_named_string("compression") {
+        match s.to_lowercase().as_str() {
+            "snappy" => compression = Compression::SNAPPY,
+            "zstd" => compression = Compression::ZSTD(Default::default()),
+            "gzip" | "flate" => compression = Compression::GZIP(Default::default()),
+            "lz4" => compression = Compression::LZ4,
+            "uncompressed" | "none" => compression = Compression::UNCOMPRESSED,
+            _ => {}
         }
     }
 
-    // Named parameter: band (BIGINT)
-    let name_band = to_c_string("band");
-    let val_band = duckdb_bind_get_named_parameter(info, name_band.as_ptr());
-    if !val_band.is_null() {
-        let b = duckdb_get_int64(val_band);
-        if b > 0 {
-            band = b as usize;
-        }
-    }
-
-    // Named parameter: nodata (DOUBLE)
-    let name_nodata = to_c_string("nodata");
-    let val_nodata = duckdb_bind_get_named_parameter(info, name_nodata.as_ptr());
-    if !val_nodata.is_null() {
-        custom_nodata = Some(duckdb_get_double(val_nodata));
-    }
-
-    // Named parameter: categorical (BOOLEAN)
-    let name_cat = to_c_string("categorical");
-    let val_cat = duckdb_bind_get_named_parameter(info, name_cat.as_ptr());
-    if !val_cat.is_null() {
-        is_categorical = duckdb_get_bool(val_cat);
-    }
-
-    // Named parameter: compact (BOOLEAN)
-    let name_compact = to_c_string("compact");
-    let val_compact = duckdb_bind_get_named_parameter(info, name_compact.as_ptr());
-    if !val_compact.is_null() {
-        compact = duckdb_get_bool(val_compact);
-    }
-
-    // Named parameter: compression (VARCHAR)
-    let name_comp = to_c_string("compression");
-    let val_comp = duckdb_bind_get_named_parameter(info, name_comp.as_ptr());
-    if !val_comp.is_null() {
-        if let Some(s) = from_duckdb_string(duckdb_get_varchar(val_comp)) {
-            match s.to_lowercase().as_str() {
-                "snappy" => compression = Compression::SNAPPY,
-                "zstd" => compression = Compression::ZSTD(Default::default()),
-                "gzip" | "flate" => compression = Compression::GZIP(Default::default()),
-                "lz4" => compression = Compression::LZ4,
-                "uncompressed" | "none" => compression = Compression::UNCOMPRESSED,
-                _ => {}
-            }
-        }
-    }
-
-    // Named parameter: row_group_size (BIGINT)
-    let name_rgs = to_c_string("row_group_size");
-    let val_rgs = duckdb_bind_get_named_parameter(info, name_rgs.as_ptr());
-    if !val_rgs.is_null() {
-        let sz = duckdb_get_int64(val_rgs);
-        if sz > 0 {
-            row_group_size = sz as usize;
-        }
-    }
-
-    // Named parameters for bounding box: min_lon, min_lat, max_lon, max_lat (DOUBLE)
-    let name_min_lon = to_c_string("min_lon");
-    let name_min_lat = to_c_string("min_lat");
-    let name_max_lon = to_c_string("max_lon");
-    let name_max_lat = to_c_string("max_lat");
-    let val_min_lon = duckdb_bind_get_named_parameter(info, name_min_lon.as_ptr());
-    let val_min_lat = duckdb_bind_get_named_parameter(info, name_min_lat.as_ptr());
-    let val_max_lon = duckdb_bind_get_named_parameter(info, name_max_lon.as_ptr());
-    let val_max_lat = duckdb_bind_get_named_parameter(info, name_max_lat.as_ptr());
-
-    let bbox = if !val_min_lon.is_null()
-        && !val_min_lat.is_null()
-        && !val_max_lon.is_null()
-        && !val_max_lat.is_null()
-    {
-        Some([
-            duckdb_get_double(val_min_lon),
-            duckdb_get_double(val_min_lat),
-            duckdb_get_double(val_max_lon),
-            duckdb_get_double(val_max_lat),
-        ])
-    } else {
-        None
-    };
+    let row_group_size = bind.get_named_int("row_group_size").unwrap_or(131_072).max(1) as usize;
+    let bbox = bind.parse_bbox();
 
     // Declare output summary schema:
-    // 0: total_hexagons (BIGINT)
-    let col_hex = to_c_string("total_hexagons");
-    let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
-    duckdb_bind_add_result_column(info, col_hex.as_ptr(), type_bigint);
-
-    // 1: parquet_size_bytes (BIGINT)
-    let col_size = to_c_string("parquet_size_bytes");
-    duckdb_bind_add_result_column(info, col_size.as_ptr(), type_bigint);
-
-    // 2: elapsed_ms (DOUBLE)
-    let col_time = to_c_string("elapsed_ms");
-    let type_double = duckdb_create_logical_type(DuckDBType::Double);
-    duckdb_bind_add_result_column(info, col_time.as_ptr(), type_double);
-
-    // 3: hexagons_per_sec (DOUBLE)
-    let col_rate = to_c_string("hexagons_per_sec");
-    duckdb_bind_add_result_column(info, col_rate.as_ptr(), type_double);
-
-    // 4: output_path (VARCHAR)
-    let col_path = to_c_string("output_path");
-    let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
-    duckdb_bind_add_result_column(info, col_path.as_ptr(), type_varchar);
-
-    // 5: status (VARCHAR)
-    let col_status = to_c_string("status");
-    duckdb_bind_add_result_column(info, col_status.as_ptr(), type_varchar);
-
-    // Cleanup types
-    let mut type_bigint_mut = type_bigint;
-    duckdb_destroy_logical_type(&mut type_bigint_mut);
-    let mut type_double_mut = type_double;
-    duckdb_destroy_logical_type(&mut type_double_mut);
-    let mut type_varchar_mut = type_varchar;
-    duckdb_destroy_logical_type(&mut type_varchar_mut);
+    bind.add_result_column("total_hexagons", DuckDBType::BigInt);
+    bind.add_result_column("parquet_size_bytes", DuckDBType::BigInt);
+    bind.add_result_column("elapsed_ms", DuckDBType::Double);
+    bind.add_result_column("hexagons_per_sec", DuckDBType::Double);
+    bind.add_result_column("output_path", DuckDBType::Varchar);
+    bind.add_result_column("status", DuckDBType::Varchar);
 
     // Cardinality is always 1 summary row
     duckdb_bind_set_cardinality(info, 1, true);
@@ -345,56 +232,25 @@ pub unsafe fn register_parquet_table_function(con: duckdb_connection) -> Result<
     duckdb_table_function_set_name(tf, fn_name.as_ptr());
 
     // Positional parameters:
-    // 0: file_path (VARCHAR)
-    let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
-    duckdb_table_function_add_parameter(tf, type_varchar);
-    // 1: output_parquet (VARCHAR)
-    duckdb_table_function_add_parameter(tf, type_varchar);
+    add_positional_parameter(tf, DuckDBType::Varchar);
+    add_positional_parameter(tf, DuckDBType::Varchar);
 
-    // Named parameter: resolution (BIGINT)
-    let name_res = to_c_string("resolution");
-    let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
-    duckdb_table_function_add_named_parameter(tf, name_res.as_ptr(), type_bigint);
-
-    // Named parameter: sampling (VARCHAR)
-    let name_sampling = to_c_string("sampling");
-    duckdb_table_function_add_named_parameter(tf, name_sampling.as_ptr(), type_varchar);
-
-    // Named parameter: band (BIGINT)
-    let name_band = to_c_string("band");
-    duckdb_table_function_add_named_parameter(tf, name_band.as_ptr(), type_bigint);
-
-    // Named parameter: nodata (DOUBLE)
-    let name_nodata = to_c_string("nodata");
-    let type_double = duckdb_create_logical_type(DuckDBType::Double);
-    duckdb_table_function_add_named_parameter(tf, name_nodata.as_ptr(), type_double);
-
-    // Named parameter: categorical (BOOLEAN)
-    let name_cat = to_c_string("categorical");
-    let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
-    duckdb_table_function_add_named_parameter(tf, name_cat.as_ptr(), type_bool);
-
-    // Named parameter: compact (BOOLEAN)
-    let name_compact = to_c_string("compact");
-    duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
-
-    // Named parameter: compression (VARCHAR)
-    let name_comp = to_c_string("compression");
-    duckdb_table_function_add_named_parameter(tf, name_comp.as_ptr(), type_varchar);
-
-    // Named parameter: row_group_size (BIGINT)
-    let name_rgs = to_c_string("row_group_size");
-    duckdb_table_function_add_named_parameter(tf, name_rgs.as_ptr(), type_bigint);
-
-    // Named parameters for bounding box: min_lon, min_lat, max_lon, max_lat (DOUBLE)
-    let name_min_lon = to_c_string("min_lon");
-    let name_min_lat = to_c_string("min_lat");
-    let name_max_lon = to_c_string("max_lon");
-    let name_max_lat = to_c_string("max_lat");
-    duckdb_table_function_add_named_parameter(tf, name_min_lon.as_ptr(), type_double);
-    duckdb_table_function_add_named_parameter(tf, name_min_lat.as_ptr(), type_double);
-    duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double);
-    duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double);
+    // Named parameters:
+    add_named_parameter(tf, "resolution", DuckDBType::BigInt);
+    add_named_parameter(tf, "sampling", DuckDBType::Varchar);
+    add_named_parameter(tf, "band", DuckDBType::BigInt);
+    add_named_parameter(tf, "nodata", DuckDBType::Double);
+    add_named_parameter(tf, "categorical", DuckDBType::Boolean);
+    add_named_parameter(tf, "compact", DuckDBType::Boolean);
+    add_named_parameter(tf, "compression", DuckDBType::Varchar);
+    add_named_parameter(tf, "row_group_size", DuckDBType::BigInt);
+    add_named_parameter(tf, "min_lon", DuckDBType::Double);
+    add_named_parameter(tf, "min_lat", DuckDBType::Double);
+    add_named_parameter(tf, "max_lon", DuckDBType::Double);
+    add_named_parameter(tf, "max_lat", DuckDBType::Double);
+    add_named_parameter(tf, "bbox", DuckDBType::Varchar);
+    add_named_parameter(tf, "h3_cell", DuckDBType::BigInt);
+    add_named_parameter(tf, "h3_hex", DuckDBType::Varchar);
 
     // Set callbacks
     duckdb_table_function_set_bind(tf, parquet_bind);
@@ -402,15 +258,6 @@ pub unsafe fn register_parquet_table_function(con: duckdb_connection) -> Result<
     duckdb_table_function_set_function(tf, parquet_scan);
 
     let state = duckdb_register_table_function(con, tf);
-
-    let mut type_varchar_mut = type_varchar;
-    duckdb_destroy_logical_type(&mut type_varchar_mut);
-    let mut type_bigint_mut = type_bigint;
-    duckdb_destroy_logical_type(&mut type_bigint_mut);
-    let mut type_double_mut = type_double;
-    duckdb_destroy_logical_type(&mut type_double_mut);
-    let mut type_bool_mut = type_bool;
-    duckdb_destroy_logical_type(&mut type_bool_mut);
 
     let mut tf_mut = tf;
     duckdb_destroy_table_function(&mut tf_mut);

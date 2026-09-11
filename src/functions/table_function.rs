@@ -8,7 +8,11 @@ use crate::aggregator::multi_horizon::{
 };
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
-use crate::ffi::{from_duckdb_string, to_c_string};
+use crate::ffi::to_c_string;
+use crate::functions::bind_utils::{
+    add_named_parameter, add_positional_parameter, register_common_raster_named_parameters,
+    BindHelper,
+};
 use crate::functions::fast_hex::fast_hex_u64;
 use crate::functions::wkb::h3_index_to_wkb;
 use crate::raster::geotiff::GeoTiffStreamReader;
@@ -71,249 +75,35 @@ unsafe extern "C" fn delete_local_data(data: *mut c_void) {
 
 /// Bind callback: parses input arguments, defines output columns, and returns bind data
 pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
-    let param_count = duckdb_bind_get_parameter_count(info);
-    if param_count < 1 {
-        let err_msg = to_c_string("h3_raster_continuous_aggregate requires at least 1 argument: file_path");
-        duckdb_bind_set_error(info, err_msg.as_ptr());
+    let bind = BindHelper::new(info);
+    if bind.parameter_count() < 1 {
+        bind.set_error("h3_raster_continuous_aggregate requires at least 1 argument: file_path");
         return;
     }
 
-    // Param 0: file_path (VARCHAR)
-    let path_val = duckdb_bind_get_parameter(info, 0);
-    let path_str_ptr = duckdb_get_varchar(path_val);
-    let file_path = match from_duckdb_string(path_str_ptr) {
+    let file_path = match bind.get_string_param(0) {
         Some(s) => s,
         None => {
-            let err_msg = to_c_string("Invalid file_path parameter");
-            duckdb_bind_set_error(info, err_msg.as_ptr());
+            bind.set_error("Invalid file_path parameter");
             return;
         }
     };
 
-    let mut parsed_resolutions: Option<Vec<u8>> = None;
-
-    // 1. Named parameter: resolutions (VARCHAR, e.g. '7,8' or '7, 8, 9')
-    let name_ress = to_c_string("resolutions");
-    let named_ress_val = duckdb_bind_get_named_parameter(info, name_ress.as_ptr());
-    if !named_ress_val.is_null() {
-        let ress_str_ptr = duckdb_get_varchar(named_ress_val);
-        if let Some(s) = from_duckdb_string(ress_str_ptr) {
-            let mut list: Vec<u8> = s
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .filter(|item| !item.is_empty())
-                .filter_map(|item| item.parse::<u8>().ok())
-                .filter(|&r| r <= 15)
-                .collect();
-            list.sort_unstable();
-            list.dedup();
-            if !list.is_empty() {
-                parsed_resolutions = Some(list);
-            }
-        }
-    }
-
-    // 2. Named parameters: min_resolution and max_resolution (BIGINT)
-    if parsed_resolutions.is_none() {
-        let name_min_res = to_c_string("min_resolution");
-        let name_max_res = to_c_string("max_resolution");
-        let min_res_val = duckdb_bind_get_named_parameter(info, name_min_res.as_ptr());
-        let max_res_val = duckdb_bind_get_named_parameter(info, name_max_res.as_ptr());
-        if !min_res_val.is_null() && !max_res_val.is_null() {
-            let min_r = duckdb_get_int64(min_res_val);
-            let max_r = duckdb_get_int64(max_res_val);
-            if (0..=15).contains(&min_r) && (0..=15).contains(&max_r) && min_r <= max_r {
-                parsed_resolutions = Some(((min_r as u8)..=(max_r as u8)).collect());
-            }
-        }
-    }
-
-    // 3. Named parameter: resolution (BIGINT)
-    if parsed_resolutions.is_none() {
-        let name_res = to_c_string("resolution");
-        let named_res_val = duckdb_bind_get_named_parameter(info, name_res.as_ptr());
-        if !named_res_val.is_null() {
-            let res_int = duckdb_get_int64(named_res_val);
-            if (0..=15).contains(&res_int) {
-                parsed_resolutions = Some(vec![res_int as u8]);
-            }
-        }
-    }
-
-    // 4. Positional param 1 (optional): resolution (BIGINT)
-    if parsed_resolutions.is_none() && param_count >= 2 {
-        let res_val = duckdb_bind_get_parameter(info, 1);
-        let res_int = duckdb_get_int64(res_val);
-        if (0..=15).contains(&res_int) {
-            parsed_resolutions = Some(vec![res_int as u8]);
-        }
-    }
-
-    let resolutions = parsed_resolutions.unwrap_or_else(|| vec![8]);
-
-    // Named parameter: source_crs
-    let name_crs = to_c_string("source_crs");
-    let named_crs_val = duckdb_bind_get_named_parameter(info, name_crs.as_ptr());
-    let mut source_crs = None;
-    if !named_crs_val.is_null() {
-        let crs_ptr = duckdb_get_varchar(named_crs_val);
-        source_crs = from_duckdb_string(crs_ptr);
-    }
-
-    // Named parameter: nodata
-    let name_nodata = to_c_string("nodata");
-    let named_nodata_val = duckdb_bind_get_named_parameter(info, name_nodata.as_ptr());
-    let mut nodata = None;
-    if !named_nodata_val.is_null() {
-        nodata = Some(duckdb_get_double(named_nodata_val));
-    }
-
-    // Named parameter: chunk_size
-    let mut chunk_size: u32 = 512;
-    let name_chunk = to_c_string("chunk_size");
-    let named_chunk_val = duckdb_bind_get_named_parameter(info, name_chunk.as_ptr());
-    if !named_chunk_val.is_null() {
-        let cs = duckdb_get_int64(named_chunk_val);
-        if cs > 0 {
-            chunk_size = cs as u32;
-        }
-    }
-
-    // Named parameter: band (1-indexed, default 1)
-    let mut band: u32 = 1;
-    let name_band = to_c_string("band");
-    let named_band_val = duckdb_bind_get_named_parameter(info, name_band.as_ptr());
-    if !named_band_val.is_null() {
-        let b = duckdb_get_int64(named_band_val);
-        if b > 0 {
-            band = b as u32;
-        }
-    }
-
-    // Named parameter: sampling
-    let mut sampling = SamplingPattern::default();
-    let name_sampling = to_c_string("sampling");
-    let named_sampling_val = duckdb_bind_get_named_parameter(info, name_sampling.as_ptr());
-    if !named_sampling_val.is_null() {
-        let sampling_ptr = duckdb_get_varchar(named_sampling_val);
-        if let Some(s) = from_duckdb_string(sampling_ptr) {
-            sampling = SamplingPattern::parse(&s);
-        }
-    }
-
-    // Named parameters for bounding box filtering
-    let name_min_lon = to_c_string("min_lon");
-    let named_min_lon_val = duckdb_bind_get_named_parameter(info, name_min_lon.as_ptr());
-
-    let name_min_lat = to_c_string("min_lat");
-    let named_min_lat_val = duckdb_bind_get_named_parameter(info, name_min_lat.as_ptr());
-
-    let name_max_lon = to_c_string("max_lon");
-    let named_max_lon_val = duckdb_bind_get_named_parameter(info, name_max_lon.as_ptr());
-
-    let name_max_lat = to_c_string("max_lat");
-    let named_max_lat_val = duckdb_bind_get_named_parameter(info, name_max_lat.as_ptr());
-
-    let mut bbox = if !named_min_lon_val.is_null()
-        && !named_min_lat_val.is_null()
-        && !named_max_lon_val.is_null()
-        && !named_max_lat_val.is_null()
-    {
-        Some([
-            duckdb_get_double(named_min_lon_val),
-            duckdb_get_double(named_min_lat_val),
-            duckdb_get_double(named_max_lon_val),
-            duckdb_get_double(named_max_lat_val),
-        ])
-    } else {
-        None
-    };
-
-    // Optional spatial filter: h3_cell (BIGINT) or h3_hex (VARCHAR)
-    if bbox.is_none() {
-        let name_cell = to_c_string("h3_cell");
-        let named_cell_val = duckdb_bind_get_named_parameter(info, name_cell.as_ptr());
-        if !named_cell_val.is_null() {
-            let cell_u64 = duckdb_get_uint64(named_cell_val);
-            if let Ok(cell) = h3o::CellIndex::try_from(cell_u64) {
-                let ll: h3o::LatLng = cell.into();
-                let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
-                bbox = Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
-            }
-        } else {
-            let name_h3_hex = to_c_string("h3_hex");
-            let named_h3_hex_val = duckdb_bind_get_named_parameter(info, name_h3_hex.as_ptr());
-            if !named_h3_hex_val.is_null() {
-                let hex_str_ptr = duckdb_get_varchar(named_h3_hex_val);
-                if let Some(s) = from_duckdb_string(hex_str_ptr) {
-                    if let Ok(cell) = s.trim().parse::<h3o::CellIndex>() {
-                        let ll: h3o::LatLng = cell.into();
-                        let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
-                        bbox = Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
-                    }
-                }
-            }
-        }
-    }
+    let resolutions = bind.parse_resolutions(8, Some(1));
+    let source_crs = bind.parse_source_crs();
+    let nodata = bind.get_named_double("nodata");
+    let chunk_size = bind.get_named_int("chunk_size").filter(|&cs| cs > 0).unwrap_or(512) as u32;
+    let band = bind.get_named_int("band").filter(|&b| b > 0).unwrap_or(1) as u32;
+    let sampling = bind.parse_sampling();
+    let bbox = bind.parse_bbox();
 
     // Named parameter: formula (VARCHAR)
-    let name_formula = to_c_string("formula");
-    let named_formula_val = duckdb_bind_get_named_parameter(info, name_formula.as_ptr());
-    let mut formula_str = None;
-    if !named_formula_val.is_null() {
-        let f_ptr = duckdb_get_varchar(named_formula_val);
-        formula_str = from_duckdb_string(f_ptr);
-    }
-
-    // Band parameters for formulas
-    let mut nir_band: usize = 4;
-    let name_nir = to_c_string("nir_band");
-    let named_nir_val = duckdb_bind_get_named_parameter(info, name_nir.as_ptr());
-    if !named_nir_val.is_null() {
-        let b = duckdb_get_int64(named_nir_val);
-        if b > 0 {
-            nir_band = b as usize;
-        }
-    }
-
-    let mut red_band: usize = 3;
-    let name_red = to_c_string("red_band");
-    let named_red_val = duckdb_bind_get_named_parameter(info, name_red.as_ptr());
-    if !named_red_val.is_null() {
-        let b = duckdb_get_int64(named_red_val);
-        if b > 0 {
-            red_band = b as usize;
-        }
-    }
-
-    let mut green_band: usize = 2;
-    let name_green = to_c_string("green_band");
-    let named_green_val = duckdb_bind_get_named_parameter(info, name_green.as_ptr());
-    if !named_green_val.is_null() {
-        let b = duckdb_get_int64(named_green_val);
-        if b > 0 {
-            green_band = b as usize;
-        }
-    }
-
-    let mut blue_band: usize = 1;
-    let name_blue = to_c_string("blue_band");
-    let named_blue_val = duckdb_bind_get_named_parameter(info, name_blue.as_ptr());
-    if !named_blue_val.is_null() {
-        let b = duckdb_get_int64(named_blue_val);
-        if b > 0 {
-            blue_band = b as usize;
-        }
-    }
-
-    let mut swir_band: usize = 6;
-    let name_swir = to_c_string("swir_band");
-    let named_swir_val = duckdb_bind_get_named_parameter(info, name_swir.as_ptr());
-    if !named_swir_val.is_null() {
-        let b = duckdb_get_int64(named_swir_val);
-        if b > 0 {
-            swir_band = b as usize;
-        }
-    }
+    let formula_str = bind.get_named_string("formula");
+    let nir_band = bind.get_named_int("nir_band").filter(|&b| b > 0).unwrap_or(4) as usize;
+    let red_band = bind.get_named_int("red_band").filter(|&b| b > 0).unwrap_or(3) as usize;
+    let green_band = bind.get_named_int("green_band").filter(|&b| b > 0).unwrap_or(2) as usize;
+    let blue_band = bind.get_named_int("blue_band").filter(|&b| b > 0).unwrap_or(1) as usize;
+    let swir_band = bind.get_named_int("swir_band").filter(|&b| b > 0).unwrap_or(6) as usize;
 
     let spectral_formula = formula_str.as_deref().and_then(|f| {
         crate::aggregator::multi_horizon::SpectralFormula::parse(
@@ -321,168 +111,54 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         )
     });
 
-    // Predicates pushdown: min_count, min_mean, max_mean
-    let name_min_count = to_c_string("min_count");
-    let named_min_count_val = duckdb_bind_get_named_parameter(info, name_min_count.as_ptr());
-    let min_count = if !named_min_count_val.is_null() {
-        Some(duckdb_get_double(named_min_count_val))
-    } else {
-        None
-    };
+    let min_count = bind.get_named_double("min_count");
+    let min_mean = bind.get_named_double("min_mean");
+    let max_mean = bind.get_named_double("max_mean");
+    let compact = bind.get_named_bool("compact").unwrap_or(false);
+    let overlap_rule = bind.parse_overlap_rule();
 
-    let name_min_mean = to_c_string("min_mean");
-    let named_min_mean_val = duckdb_bind_get_named_parameter(info, name_min_mean.as_ptr());
-    let min_mean = if !named_min_mean_val.is_null() {
-        Some(duckdb_get_double(named_min_mean_val))
-    } else {
-        None
-    };
-
-    let name_max_mean = to_c_string("max_mean");
-    let named_max_mean_val = duckdb_bind_get_named_parameter(info, name_max_mean.as_ptr());
-    let max_mean = if !named_max_mean_val.is_null() {
-        Some(duckdb_get_double(named_max_mean_val))
-    } else {
-        None
-    };
-
-    // Compaction: compact
-    let name_compact = to_c_string("compact");
-    let named_compact_val = duckdb_bind_get_named_parameter(info, name_compact.as_ptr());
-    let compact = if !named_compact_val.is_null() {
-        duckdb_get_bool(named_compact_val)
-    } else {
-        false
-    };
-
-    // Named parameter: overlap_rule (VARCHAR, default: 'cutline')
-    let mut overlap_rule = crate::raster::mosaic::OverlapRule::default();
-    let name_overlap = to_c_string("overlap_rule");
-    let named_overlap_val = duckdb_bind_get_named_parameter(info, name_overlap.as_ptr());
-    if !named_overlap_val.is_null() {
-        let overlap_ptr = duckdb_get_varchar(named_overlap_val);
-        if let Some(s) = from_duckdb_string(overlap_ptr) {
-            overlap_rule = crate::raster::mosaic::OverlapRule::parse(&s);
-        }
-    }
-
-    // Named parameter: quantiles (VARCHAR) or percentiles (VARCHAR)
     let mut quantiles = Vec::new();
-    let name_quantiles = to_c_string("quantiles");
-    let name_percentiles = to_c_string("percentiles");
-    let named_quantiles_val = duckdb_bind_get_named_parameter(info, name_quantiles.as_ptr());
-    let named_percentiles_val = duckdb_bind_get_named_parameter(info, name_percentiles.as_ptr());
-    let q_param_val = if !named_quantiles_val.is_null() {
-        named_quantiles_val
-    } else {
-        named_percentiles_val
-    };
-    if !q_param_val.is_null() {
-        let q_str_ptr = duckdb_get_varchar(q_param_val);
-        if let Some(s) = from_duckdb_string(q_str_ptr) {
-            match QuantileTarget::parse_list(&s) {
-                Ok(q_targets) => quantiles = q_targets,
-                Err(e) => {
-                    let err_msg = CString::new(format!("Invalid quantiles parameter: {}", e))
-                        .unwrap_or_else(|_| CString::new("Invalid quantiles parameter").unwrap());
-                    duckdb_bind_set_error(info, err_msg.as_ptr());
-                    return;
-                }
+    let q_param_val = bind.get_named_string("quantiles").or_else(|| bind.get_named_string("percentiles"));
+    if let Some(s) = q_param_val {
+        match QuantileTarget::parse_list(&s) {
+            Ok(q_targets) => quantiles = q_targets,
+            Err(e) => {
+                bind.set_error(&format!("Invalid quantiles parameter: {}", e));
+                return;
             }
         }
     }
 
-    // Named parameter: geom (BOOLEAN, default: auto-detected based on DuckDB GEOMETRY availability)
-    let name_geom = to_c_string("geom");
-    let named_geom_val = duckdb_bind_get_named_parameter(info, name_geom.as_ptr());
-    let emit_geom = if !named_geom_val.is_null() {
-        duckdb_get_bool(named_geom_val)
-    } else {
-        crate::ffi::is_geometry_available()
-    };
+    let emit_geom = bind.get_named_bool("geom").unwrap_or_else(crate::ffi::is_geometry_available);
 
     let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
         Ok(paths) => paths,
         Err(e) => {
-            let err_msg = CString::new(format!("Failed to resolve raster source(s): {}", e))
-                .unwrap_or_else(|_| CString::new("Failed to resolve raster source(s)").unwrap());
-            duckdb_bind_set_error(info, err_msg.as_ptr());
+            bind.set_error(&format!("Failed to resolve raster source(s): {}", e));
             return;
         }
     };
 
     // Add Output Columns:
-    // 0: h3_index UBIGINT
-    let col_h3 = to_c_string("h3_index");
-    let type_ubigint = duckdb_create_logical_type(DuckDBType::UBigInt);
-    duckdb_bind_add_result_column(info, col_h3.as_ptr(), type_ubigint);
-    let mut type_ubigint_mut = type_ubigint;
-    duckdb_destroy_logical_type(&mut type_ubigint_mut);
+    bind.add_result_column("h3_index", DuckDBType::UBigInt);
+    bind.add_result_column("h3_hex", DuckDBType::Varchar);
+    bind.add_result_column("mean", DuckDBType::Double);
+    bind.add_result_column("stddev", DuckDBType::Double);
+    bind.add_result_column("count", DuckDBType::Double);
+    bind.add_result_column("min", DuckDBType::Double);
+    bind.add_result_column("max", DuckDBType::Double);
+    bind.add_result_column("sum", DuckDBType::Double);
+    bind.add_result_column("resolution", DuckDBType::UTinyInt);
+    bind.add_result_column("wkb", DuckDBType::Blob);
 
-    // 1: h3_hex VARCHAR
-    let col_hex = to_c_string("h3_hex");
-    let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
-    duckdb_bind_add_result_column(info, col_hex.as_ptr(), type_varchar);
-    let mut type_varchar_mut = type_varchar;
-    duckdb_destroy_logical_type(&mut type_varchar_mut);
-
-    // 2: mean DOUBLE
-    let col_mean = to_c_string("mean");
-    let type_double = duckdb_create_logical_type(DuckDBType::Double);
-    duckdb_bind_add_result_column(info, col_mean.as_ptr(), type_double);
-
-    // 3: stddev DOUBLE (Welford's online sample standard deviation)
-    let col_stddev = to_c_string("stddev");
-    duckdb_bind_add_result_column(info, col_stddev.as_ptr(), type_double);
-
-    // 4: count DOUBLE (Weighted pixel count)
-    let col_cnt = to_c_string("count");
-    duckdb_bind_add_result_column(info, col_cnt.as_ptr(), type_double);
-
-    // 5: min DOUBLE
-    let col_min = to_c_string("min");
-    duckdb_bind_add_result_column(info, col_min.as_ptr(), type_double);
-
-    // 6: max DOUBLE
-    let col_max = to_c_string("max");
-    duckdb_bind_add_result_column(info, col_max.as_ptr(), type_double);
-
-    // 7: sum DOUBLE
-    let col_sum = to_c_string("sum");
-    duckdb_bind_add_result_column(info, col_sum.as_ptr(), type_double);
-    let mut type_double_mut = type_double;
-    duckdb_destroy_logical_type(&mut type_double_mut);
-
-    // 8: resolution UTINYINT
-    let col_res = to_c_string("resolution");
-    let type_utinyint = duckdb_create_logical_type(DuckDBType::UTinyInt);
-    duckdb_bind_add_result_column(info, col_res.as_ptr(), type_utinyint);
-    let mut type_utinyint_mut = type_utinyint;
-    duckdb_destroy_logical_type(&mut type_utinyint_mut);
-
-    // 9: wkb BLOB (OGC 2D Polygon)
-    let col_wkb = to_c_string("wkb");
-    let type_blob = duckdb_create_logical_type(DuckDBType::Blob);
-    duckdb_bind_add_result_column(info, col_wkb.as_ptr(), type_blob);
-    let mut type_blob_mut = type_blob;
-    duckdb_destroy_logical_type(&mut type_blob_mut);
-
-    // 10: geom GEOMETRY (Native DuckDB Geometry)
     if emit_geom {
-        let col_geom = to_c_string("geom");
-        let type_geom = crate::ffi::create_geometry_logical_type();
-        duckdb_bind_add_result_column(info, col_geom.as_ptr(), type_geom);
-        let mut type_geom_mut = type_geom;
-        duckdb_destroy_logical_type(&mut type_geom_mut);
+        let mut type_geom = crate::ffi::create_geometry_logical_type();
+        bind.add_custom_result_column("geom", type_geom);
+        duckdb_destroy_logical_type(&mut type_geom);
     }
 
-    // Quantile columns (10/11, ...): target.column_name() DOUBLE
     for target in &quantiles {
-        let col_q = to_c_string(target.column_name());
-        let type_double_q = duckdb_create_logical_type(DuckDBType::Double);
-        duckdb_bind_add_result_column(info, col_q.as_ptr(), type_double_q);
-        let mut type_double_q_mut = type_double_q;
-        duckdb_destroy_logical_type(&mut type_double_q_mut);
+        bind.add_result_column(target.column_name(), DuckDBType::Double);
     }
 
     // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
@@ -916,108 +592,25 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
 
         // Positional Parameters:
         // 0: file_path (VARCHAR)
-        let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);
-        duckdb_table_function_add_parameter(tf, type_varchar);
+        add_positional_parameter(tf, DuckDBType::Varchar);
 
-        // Named Parameters:
-        // resolution (BIGINT)
-        let name_res = to_c_string("resolution");
-        let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
-        duckdb_table_function_add_named_parameter(tf, name_res.as_ptr(), type_bigint);
+        // Standard Common Raster Named Parameters
+        register_common_raster_named_parameters(tf);
 
-        // resolutions (VARCHAR)
-        let name_ress = to_c_string("resolutions");
-        duckdb_table_function_add_named_parameter(tf, name_ress.as_ptr(), type_varchar);
-
-        // min_resolution (BIGINT)
-        let name_min_res = to_c_string("min_resolution");
-        duckdb_table_function_add_named_parameter(tf, name_min_res.as_ptr(), type_bigint);
-
-        // max_resolution (BIGINT)
-        let name_max_res = to_c_string("max_resolution");
-        duckdb_table_function_add_named_parameter(tf, name_max_res.as_ptr(), type_bigint);
-
-        // source_crs (VARCHAR)
-        let name_crs = to_c_string("source_crs");
-        duckdb_table_function_add_named_parameter(tf, name_crs.as_ptr(), type_varchar);
-
-        // nodata (DOUBLE)
-        let name_nodata = to_c_string("nodata");
-        let type_double = duckdb_create_logical_type(DuckDBType::Double);
-        duckdb_table_function_add_named_parameter(tf, name_nodata.as_ptr(), type_double);
-
-        // chunk_size (BIGINT)
-        let name_chunk = to_c_string("chunk_size");
-        duckdb_table_function_add_named_parameter(tf, name_chunk.as_ptr(), type_bigint);
-
-        // band (BIGINT)
-        let name_band = to_c_string("band");
-        duckdb_table_function_add_named_parameter(tf, name_band.as_ptr(), type_bigint);
-
-        // sampling (VARCHAR)
-        let name_sampling = to_c_string("sampling");
-        duckdb_table_function_add_named_parameter(tf, name_sampling.as_ptr(), type_varchar);
-
-        // Bounding box named parameters: min_lon, min_lat, max_lon, max_lat
-        let name_min_lon = to_c_string("min_lon");
-        let type_double_bbox = duckdb_create_logical_type(DuckDBType::Double);
-        duckdb_table_function_add_named_parameter(tf, name_min_lon.as_ptr(), type_double_bbox);
-
-        let name_min_lat = to_c_string("min_lat");
-        let name_max_lon = to_c_string("max_lon");
-        let name_max_lat = to_c_string("max_lat");
-        duckdb_table_function_add_named_parameter(tf, name_min_lat.as_ptr(), type_double_bbox);
-        duckdb_table_function_add_named_parameter(tf, name_max_lon.as_ptr(), type_double_bbox);
-        duckdb_table_function_add_named_parameter(tf, name_max_lat.as_ptr(), type_double_bbox);
-
-        // Spatial H3 cell filter parameters
-        let name_cell = to_c_string("h3_cell");
-        duckdb_table_function_add_named_parameter(tf, name_cell.as_ptr(), type_bigint);
-        let name_hex = to_c_string("h3_hex");
-        duckdb_table_function_add_named_parameter(tf, name_hex.as_ptr(), type_varchar);
-
-        // formula (VARCHAR)
-        let name_formula = to_c_string("formula");
-        duckdb_table_function_add_named_parameter(tf, name_formula.as_ptr(), type_varchar);
-
-        // Band specification parameters for formulas
-        let name_nir = to_c_string("nir_band");
-        duckdb_table_function_add_named_parameter(tf, name_nir.as_ptr(), type_bigint);
-        let name_red = to_c_string("red_band");
-        duckdb_table_function_add_named_parameter(tf, name_red.as_ptr(), type_bigint);
-        let name_green = to_c_string("green_band");
-        duckdb_table_function_add_named_parameter(tf, name_green.as_ptr(), type_bigint);
-        let name_blue = to_c_string("blue_band");
-        duckdb_table_function_add_named_parameter(tf, name_blue.as_ptr(), type_bigint);
-        let name_swir = to_c_string("swir_band");
-        duckdb_table_function_add_named_parameter(tf, name_swir.as_ptr(), type_bigint);
-
-        // Predicate pushdown parameters
-        let name_min_count = to_c_string("min_count");
-        duckdb_table_function_add_named_parameter(tf, name_min_count.as_ptr(), type_double);
-        let name_min_mean = to_c_string("min_mean");
-        duckdb_table_function_add_named_parameter(tf, name_min_mean.as_ptr(), type_double);
-        let name_max_mean = to_c_string("max_mean");
-        duckdb_table_function_add_named_parameter(tf, name_max_mean.as_ptr(), type_double);
-
-        // Compaction parameter
-        let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
-        let name_compact = to_c_string("compact");
-        duckdb_table_function_add_named_parameter(tf, name_compact.as_ptr(), type_bool);
-
-        // Native GEOMETRY emission parameter
-        let name_geom = to_c_string("geom");
-        duckdb_table_function_add_named_parameter(tf, name_geom.as_ptr(), type_bool);
-
-        // Overlap rule parameter
-        let name_overlap = to_c_string("overlap_rule");
-        duckdb_table_function_add_named_parameter(tf, name_overlap.as_ptr(), type_varchar);
-
-        // Quantile and percentile parameters (VARCHAR)
-        let name_quantiles = to_c_string("quantiles");
-        duckdb_table_function_add_named_parameter(tf, name_quantiles.as_ptr(), type_varchar);
-        let name_percentiles = to_c_string("percentiles");
-        duckdb_table_function_add_named_parameter(tf, name_percentiles.as_ptr(), type_varchar);
+        // Continuous-specific named parameters
+        add_named_parameter(tf, "chunk_size", DuckDBType::BigInt);
+        add_named_parameter(tf, "formula", DuckDBType::Varchar);
+        add_named_parameter(tf, "nir_band", DuckDBType::BigInt);
+        add_named_parameter(tf, "red_band", DuckDBType::BigInt);
+        add_named_parameter(tf, "green_band", DuckDBType::BigInt);
+        add_named_parameter(tf, "blue_band", DuckDBType::BigInt);
+        add_named_parameter(tf, "swir_band", DuckDBType::BigInt);
+        add_named_parameter(tf, "min_count", DuckDBType::Double);
+        add_named_parameter(tf, "min_mean", DuckDBType::Double);
+        add_named_parameter(tf, "max_mean", DuckDBType::Double);
+        add_named_parameter(tf, "geom", DuckDBType::Boolean);
+        add_named_parameter(tf, "quantiles", DuckDBType::Varchar);
+        add_named_parameter(tf, "percentiles", DuckDBType::Varchar);
 
         // Set callbacks including parallel init_local and projection pushdown
         duckdb_table_function_set_bind(tf, raster_h3_bind);
@@ -1027,19 +620,6 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Re
         duckdb_table_function_supports_projection_pushdown(tf, true);
 
         let state = duckdb_register_table_function(con, tf);
-
-        // Cleanup logical types
-        let mut type_varchar_mut = type_varchar;
-        duckdb_destroy_logical_type(&mut type_varchar_mut);
-        let mut type_bigint_mut = type_bigint;
-        duckdb_destroy_logical_type(&mut type_bigint_mut);
-        let mut type_double_mut = type_double;
-        duckdb_destroy_logical_type(&mut type_double_mut);
-        let mut type_double_bbox_mut = type_double_bbox;
-        duckdb_destroy_logical_type(&mut type_double_bbox_mut);
-        let mut type_bool_mut = type_bool;
-        duckdb_destroy_logical_type(&mut type_bool_mut);
-
         let mut tf_mut = tf;
         duckdb_destroy_table_function(&mut tf_mut);
 
