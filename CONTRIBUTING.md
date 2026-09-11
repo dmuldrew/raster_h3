@@ -39,7 +39,6 @@ src/
 ├── aggregator/              # Core aggregation & scanline horizon streaming
 │   ├── accumulator.rs       # Welford online statistics (continuous)
 │   ├── categorical.rs       # Categorical frequency accumulator & streamer
-│   ├── h3_map.rs            # In-memory H3 aggregation map fallback
 │   ├── h3_scanline.rs       # Scanline lookahead & jump-guess traversal
 │   ├── horizon_streamer.rs  # Southernmost scanline horizon eviction engine
 │   ├── multi_horizon/       # Multi-resolution concurrent horizon aggregator submodules

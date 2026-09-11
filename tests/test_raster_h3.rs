@@ -1561,12 +1561,16 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
     }
 
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
-
-    let map = raster_h3::aggregator::h3_map::aggregate_raster_stream(&reader, &config).unwrap();
+    let config = raster_h3::aggregator::multi_horizon::MultiResolutionConfig::new(vec![8]);
+    let mut streamer = raster_h3::aggregator::multi_horizon::MultiScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut map: std::collections::HashMap<u64, raster_h3::aggregator::accumulator::H3Accumulator> = std::collections::HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(2048) {
+            map.entry(record.h3_index)
+                .and_modify(|acc| acc.merge(&record.accumulator))
+                .or_insert(record.accumulator);
+        }
+    }
     assert_eq!(map.len(), 30959);
 
     let mut total_samples = 0.0;

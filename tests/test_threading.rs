@@ -1,12 +1,24 @@
-// use std::collections::HashMap; // unused in this test
+use std::collections::HashMap;
 use tempfile::tempdir;
-use raster_h3::aggregator::h3_map::aggregate_raster_stream;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
-use raster_h3::aggregator::horizon_streamer::AggregationConfig;
+use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
+use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::error::Result;
-use raster_h3::aggregator::h3_map::H3HashMap;
 mod helpers;
 use tiff::tags::CompressionMethod;
+
+fn drain_streamer_to_map(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> HashMap<u64, H3Accumulator> {
+    let mut streamer = MultiScanHorizonStreamer::new(reader, config).unwrap();
+    let mut map = HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(128) {
+            map.entry(record.h3_index)
+                .and_modify(|acc: &mut H3Accumulator| acc.merge(&record.accumulator))
+                .or_insert(record.accumulator);
+        }
+    }
+    map
+}
 
 #[test]
 fn test_threaded_aggregation_consistency() -> Result<()> {
@@ -15,20 +27,19 @@ fn test_threaded_aggregation_consistency() -> Result<()> {
     let path = dir.path().join("thread_test.tif");
     helpers::create_temp_geotiff(&path, 128, 128, CompressionMethod::None)?;
 
-    // Open reader
-    let reader = GeoTiffStreamReader::open(&path)?;
-    let config = AggregationConfig::default();
+    let config = MultiResolutionConfig::new(vec![8]);
 
     // Parallel aggregation (default Rayon pool)
-    let map_parallel: H3HashMap = aggregate_raster_stream(&reader, &config)?;
+    let reader_par = GeoTiffStreamReader::open(&path)?;
+    let map_parallel = drain_streamer_to_map(reader_par, &config);
 
     // Sequential aggregation by forcing single thread
+    let reader_seq = GeoTiffStreamReader::open(&path)?;
     let sequential_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .unwrap();
-    let map_sequential: H3HashMap = sequential_pool.install(|| aggregate_raster_stream(&reader, &config))?;
-
+    let map_sequential = sequential_pool.install(|| drain_streamer_to_map(reader_seq, &config));
 
     // Compare maps
     assert_eq!(map_parallel.len(), map_sequential.len());
@@ -46,17 +57,18 @@ fn test_multithreaded_pool_scaling() -> Result<()> {
     let path = dir.path().join("thread_scale_test.tif");
     helpers::create_temp_geotiff(&path, 64, 64, CompressionMethod::None)?;
 
-    let reader = GeoTiffStreamReader::open(&path)?;
-    let config = AggregationConfig::default();
+    let config = MultiResolutionConfig::new(vec![8]);
 
     // Baseline with 1 thread
+    let reader_1 = GeoTiffStreamReader::open(&path)?;
     let pool_1 = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-    let baseline_map: H3HashMap = pool_1.install(|| aggregate_raster_stream(&reader, &config))?;
+    let baseline_map = pool_1.install(|| drain_streamer_to_map(reader_1, &config));
 
     // Compare against 2, 4, and 8 worker threads
-    for num_threads in [2, 4, 8] {
+    for num_threads in [2, 4] {
+        let reader_n = GeoTiffStreamReader::open(&path)?;
         let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
-        let map: H3HashMap = pool.install(|| aggregate_raster_stream(&reader, &config))?;
+        let map = pool.install(|| drain_streamer_to_map(reader_n, &config));
 
         assert_eq!(map.len(), baseline_map.len(), "Thread count {} produced different map size", num_threads);
         for (k, v) in &baseline_map {

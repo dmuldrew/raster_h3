@@ -489,4 +489,9 @@ impl MultiScanHorizonStreamer {
             .map(|shards| shards.iter().map(|m| m.len()).sum::<usize>())
             .sum()
     }
+
+    /// Check if stream is fully drained and finished
+    pub fn is_finished(&self) -> bool {
+        self.is_finished && self.completed_buffer.is_empty()
+    }
 }
