@@ -15,12 +15,13 @@ use std::sync::Arc;
 use std::thread;
 
 use h3o::{CellIndex, LatLng};
-use parquet::basic::Compression;
+use parquet::basic::{Compression, Encoding};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::ColumnPath;
 
 use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
@@ -637,6 +638,8 @@ where
     let schema = Arc::new(parse_message_type(message_type)?);
     let props = Arc::new(
         WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_column_encoding(ColumnPath::from("h3_index"), Encoding::DELTA_BINARY_PACKED)
             .set_compression(parquet_config.compression)
             .build(),
     );
