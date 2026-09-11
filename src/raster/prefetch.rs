@@ -33,10 +33,10 @@ impl PrefetchedChunkReader {
             1
         } else {
             std::thread::available_parallelism()
-                .map(|p| (p.get() / 3).clamp(2, 4))
-                .unwrap_or(3)
+                .map(|p| (p.get().saturating_sub(2)).clamp(4, 12))
+                .unwrap_or(6)
         };
-        let capacity = buffer_capacity.max(256);
+        let capacity = buffer_capacity.max((default_workers * 128).max(1024));
         Self::spawn_with_workers(reader, chunk_indices, capacity, default_workers)
     }
 
@@ -298,10 +298,10 @@ impl PrefetchedMosaicReader {
             1
         } else {
             std::thread::available_parallelism()
-                .map(|p| (p.get() / 3).clamp(2, 4))
-                .unwrap_or(3)
+                .map(|p| (p.get().saturating_sub(2)).clamp(4, 12))
+                .unwrap_or(6)
         };
-        let capacity = buffer_capacity.max(256);
+        let capacity = buffer_capacity.max((default_workers * 128).max(1024));
         Self::spawn_with_workers(mosaic, capacity, default_workers)
     }
 
