@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -19,21 +19,32 @@ struct MockHttpServer {
     url_base: String,
     bytes_served: Arc<AtomicUsize>,
     request_count: Arc<AtomicUsize>,
+    #[allow(dead_code)]
+    transient_failures: Arc<AtomicUsize>,
+    recorded_headers: Arc<Mutex<Vec<String>>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl MockHttpServer {
     fn start(file_bytes: Vec<u8>) -> Self {
+        Self::start_with_failures(file_bytes, 0)
+    }
+
+    fn start_with_failures(file_bytes: Vec<u8>, failure_count: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let bytes_served = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::new(AtomicUsize::new(0));
+        let transient_failures = Arc::new(AtomicUsize::new(failure_count));
+        let recorded_headers = Arc::new(Mutex::new(Vec::new()));
 
         let shutdown_clone = Arc::clone(&shutdown);
         let bytes_served_clone = Arc::clone(&bytes_served);
         let request_count_clone = Arc::clone(&request_count);
+        let failures_clone = Arc::clone(&transient_failures);
+        let headers_clone = Arc::clone(&recorded_headers);
         let file_bytes_arc = Arc::new(file_bytes);
 
         let handle = thread::spawn(move || {
@@ -54,11 +65,13 @@ impl MockHttpServer {
                 let file_data = Arc::clone(&file_bytes_arc);
                 let served = Arc::clone(&bytes_served_clone);
                 let reqs = Arc::clone(&request_count_clone);
+                let fails = Arc::clone(&failures_clone);
+                let hdrs = Arc::clone(&headers_clone);
 
                 thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                    Self::handle_connection(stream, &file_data, served, reqs);
+                    Self::handle_connection(stream, &file_data, served, reqs, fails, hdrs);
                 });
             }
         });
@@ -68,9 +81,15 @@ impl MockHttpServer {
             url_base: format!("http://127.0.0.1:{}", port),
             bytes_served,
             request_count,
+            transient_failures,
+            recorded_headers,
             shutdown,
             handle: Some(handle),
         }
+    }
+
+    fn recorded_headers(&self) -> Vec<String> {
+        self.recorded_headers.lock().unwrap().clone()
     }
 
     fn handle_connection(
@@ -78,6 +97,8 @@ impl MockHttpServer {
         file_bytes: &[u8],
         bytes_served: Arc<AtomicUsize>,
         request_count: Arc<AtomicUsize>,
+        transient_failures: Arc<AtomicUsize>,
+        recorded_headers: Arc<Mutex<Vec<String>>>,
     ) {
         let mut reader = BufReader::new(&stream);
         let mut request_line = String::new();
@@ -99,6 +120,9 @@ impl MockHttpServer {
             if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
                 break;
             }
+            if let Ok(mut h) = recorded_headers.lock() {
+                h.push(line.clone());
+            }
             if line.to_lowercase().starts_with("range:") {
                 let range_val = line["range:".len()..].trim().to_string();
                 range_header = Some(range_val);
@@ -118,6 +142,21 @@ impl MockHttpServer {
         }
 
         request_count.fetch_add(1, Ordering::SeqCst);
+
+        // Check for simulated transient failure (HTTP 503 Slow Down)
+        let fail_hit = transient_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            if count > 0 {
+                Some(count - 1)
+            } else {
+                None
+            }
+        });
+        if fail_hit.is_ok() {
+            let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+
         let total_size = file_bytes.len();
 
         if let Some(range_str) = range_header {
@@ -650,5 +689,156 @@ fn test_unified_chunk_byte_pathway() {
         assert_decoding_result_eq(&loc_d2, &pay_d);
     }
 }
+
+#[test]
+fn test_s3_url_regional_and_custom_endpoints() {
+    // 1. Default S3 URL
+    let url_default = normalize_url("s3://test-bucket/prefix/cog.tif").unwrap();
+    assert_eq!(url_default, "https://test-bucket.s3.amazonaws.com/prefix/cog.tif");
+
+    // 2. Explicit AWS_REGION
+    std::env::set_var("AWS_REGION", "us-west-2");
+    let url_west = normalize_url("s3://test-bucket/prefix/cog.tif").unwrap();
+    assert_eq!(url_west, "https://test-bucket.s3.us-west-2.amazonaws.com/prefix/cog.tif");
+    std::env::remove_var("AWS_REGION");
+
+    // 3. Fallback AWS_DEFAULT_REGION
+    std::env::set_var("AWS_DEFAULT_REGION", "eu-central-1");
+    let url_eu = normalize_url("s3://test-bucket/prefix/cog.tif").unwrap();
+    assert_eq!(url_eu, "https://test-bucket.s3.eu-central-1.amazonaws.com/prefix/cog.tif");
+    std::env::remove_var("AWS_DEFAULT_REGION");
+
+    // 4. Custom endpoint path-style (MinIO / LocalStack)
+    std::env::set_var("AWS_ENDPOINT_URL", "http://localhost:9000");
+    let url_minio = normalize_url("s3://my-bucket/data/cog.tif").unwrap();
+    assert_eq!(url_minio, "http://localhost:9000/my-bucket/data/cog.tif");
+
+    // 5. Custom endpoint virtual-hosted style
+    std::env::set_var("AWS_S3_ADDRESSING_STYLE", "virtual");
+    let url_minio_virtual = normalize_url("s3://my-bucket/data/cog.tif").unwrap();
+    assert_eq!(url_minio_virtual, "http://my-bucket.localhost:9000/data/cog.tif");
+    std::env::remove_var("AWS_ENDPOINT_URL");
+    std::env::remove_var("AWS_S3_ADDRESSING_STYLE");
+}
+
+#[test]
+fn test_remote_transient_retry_and_recovery() {
+    let local_path = PathBuf::from("data/CFL_HI.tif");
+    if !local_path.exists() {
+        return;
+    }
+
+    let mut file = File::open(&local_path).unwrap();
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes).unwrap();
+
+    // Start mock server configured to return HTTP 503 on the first 2 requests
+    let server = MockHttpServer::start_with_failures(file_bytes, 2);
+    let remote_url = format!("{}/CFL_HI.tif", server.url_base);
+
+    let local_reader = GeoTiffStreamReader::open(&local_path).unwrap();
+
+    // Open should automatically retry through exponential backoff and succeed on 3rd attempt
+    let reader = GeoTiffStreamReader::open(&remote_url)
+        .expect("Reader open should recover from transient 503 errors");
+
+    assert_eq!(reader.metadata.width, local_reader.metadata.width);
+    assert_eq!(reader.metadata.height, local_reader.metadata.height);
+
+    let total_reqs = server.request_count.load(Ordering::SeqCst);
+    assert!(
+        total_reqs >= 3,
+        "Expected at least 3 requests (2 failures + 1 success), got {}",
+        total_reqs
+    );
+}
+
+#[test]
+fn test_remote_request_headers_injection() {
+    let local_path = PathBuf::from("data/CFL_HI.tif");
+    if !local_path.exists() {
+        return;
+    }
+
+    let mut file = File::open(&local_path).unwrap();
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes).unwrap();
+
+    let server = MockHttpServer::start(file_bytes);
+    let remote_url = format!("{}/CFL_HI.tif", server.url_base);
+
+    std::env::set_var("AWS_REQUEST_PAYER", "requester");
+    std::env::set_var("RASTER_H3_AUTH_TOKEN", "test-secret-token-xyz");
+
+    let _reader = GeoTiffStreamReader::open(&remote_url)
+        .expect("Reader open with custom headers");
+
+    std::env::remove_var("AWS_REQUEST_PAYER");
+    std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+
+    let headers = server.recorded_headers();
+    let found_payer = headers
+        .iter()
+        .any(|h| h.to_lowercase().contains("x-amz-request-payer: requester"));
+    let found_auth = headers
+        .iter()
+        .any(|h| h.to_lowercase().contains("authorization: bearer test-secret-token-xyz"));
+
+    assert!(found_payer, "Expected x-amz-request-payer header in HTTP request");
+    assert!(found_auth, "Expected authorization header in HTTP request");
+}
+
+#[test]
+fn test_remote_cog_to_parquet_streaming_pipeline() {
+    use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
+    use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let local_path = PathBuf::from("data/CFL_HI.tif");
+    if !local_path.exists() {
+        return;
+    }
+
+    let mut file = File::open(&local_path).unwrap();
+    let mut file_bytes = Vec::new();
+    file.read_to_end(&mut file_bytes).unwrap();
+
+    let server = MockHttpServer::start(file_bytes);
+    let remote_url = format!("{}/CFL_HI.tif", server.url_base);
+
+    let config = MultiResolutionConfig::new(vec![7]);
+    let parquet_config = ParquetExportConfig {
+        row_group_size: 1000,
+        compression: parquet::basic::Compression::SNAPPY,
+        is_categorical: false,
+        compact: false,
+    };
+
+    let temp_parquet_path = "target/test_remote_streaming_pipeline.parquet";
+    if std::path::Path::new(temp_parquet_path).exists() {
+        let _ = std::fs::remove_file(temp_parquet_path);
+    }
+
+    let total_rows = H3ParquetWriter::process_raster_source_to_parquet(
+        &remote_url,
+        temp_parquet_path,
+        config,
+        parquet_config,
+    )
+    .expect("Remote COG to Parquet streaming pipeline failed");
+
+    assert!(total_rows > 0, "Pipeline should write rows to Parquet");
+
+    // Open and verify Parquet file
+    let pfile = File::open(temp_parquet_path).expect("Failed to open generated parquet file");
+    let reader = SerializedFileReader::new(pfile).expect("Failed to read generated parquet file");
+    let metadata = reader.metadata();
+    assert_eq!(metadata.file_metadata().num_rows() as usize, total_rows);
+    assert!(metadata.num_row_groups() >= 1);
+
+    // Clean up
+    let _ = std::fs::remove_file(temp_parquet_path);
+}
+
 
 
