@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, Resolution};
@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::horizon_streamer::{compute_cell_south_lat, HexEvictionEntry};
+use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::error::{RasterH3Error, Result};
@@ -16,16 +16,9 @@ use crate::raster::prefetch::PrefetchedMosaicReader;
 
 use super::categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
 use super::config::MultiResolutionConfig;
+use super::sharded_map::{get_shard, NUM_SHARDS, ShardedResolutionMap};
 
-/// Number of concurrent shards for parallel active map merging
-pub const NUM_SHARDS: usize = 32;
-
-/// Fast, uniform shard partitioner for 64-bit H3 cell indices
-#[inline(always)]
-pub fn get_shard(cell_u64: u64) -> usize {
-    let h = cell_u64.wrapping_mul(0x517c_c1b7_2722_0a95);
-    (h as usize) & (NUM_SHARDS - 1)
-}
+pub use super::sharded_map::{get_shard as pub_get_shard, NUM_SHARDS as PUB_NUM_SHARDS};
 
 /// Single-pass streaming aggregator across multiple H3 resolutions (Categorical Data)
 pub struct MultiCategoricalHorizonStreamer {
@@ -36,8 +29,7 @@ pub struct MultiCategoricalHorizonStreamer {
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
-    active_shards: Vec<Vec<HashMap<u64, CategoricalAccumulator, FxBuildHasher>>>,
-    eviction_shards: Vec<Vec<BinaryHeap<HexEvictionEntry>>>,
+    resolution_shards: Vec<ShardedResolutionMap<CategoricalAccumulator>>,
     completed_buffer: VecDeque<MultiCategoricalRecord>,
     is_finished: bool,
     current_lat_horizon: f64,
@@ -82,19 +74,7 @@ impl MultiCategoricalHorizonStreamer {
 
         let prefetcher = PrefetchedMosaicReader::spawn(Arc::clone(&mosaic), 1024);
         let num_res = resolutions.len();
-
-        let mut active_shards = Vec::with_capacity(num_res);
-        let mut eviction_shards = Vec::with_capacity(num_res);
-        for _ in 0..num_res {
-            let mut res_active = Vec::with_capacity(NUM_SHARDS);
-            let mut res_evict = Vec::with_capacity(NUM_SHARDS);
-            for _ in 0..NUM_SHARDS {
-                res_active.push(HashMap::with_capacity_and_hasher(128, FxBuildHasher::default()));
-                res_evict.push(BinaryHeap::with_capacity(128));
-            }
-            active_shards.push(res_active);
-            eviction_shards.push(res_evict);
-        }
+        let resolution_shards = (0..num_res).map(|_| ShardedResolutionMap::new()).collect();
 
         let band = config.band;
         let min_count = config.min_count;
@@ -111,8 +91,7 @@ impl MultiCategoricalHorizonStreamer {
             nodata: config.custom_nodata,
             bbox: config.bbox,
             sampling: config.sampling.clone(),
-            active_shards,
-            eviction_shards,
+            resolution_shards,
             completed_buffer: VecDeque::with_capacity(2048),
             is_finished: false,
             current_lat_horizon: f64::INFINITY,
@@ -211,30 +190,9 @@ impl MultiCategoricalHorizonStreamer {
         let num_res = self.resolutions.len();
         for res_idx in 0..num_res {
             let res_u8 = self.resolution_u8s[res_idx];
-            let mut newly_evicted: Vec<(u8, u64, CategoricalAccumulator)> = self.active_shards[res_idx]
-                .par_iter_mut()
-                .zip(self.eviction_shards[res_idx].par_iter_mut())
-                .map(|(shard_map, shard_evict)| {
-                    let mut evicted = Vec::new();
-                    while let Some(top) = shard_evict.peek() {
-                        if top.south_lat > lat_horizon {
-                            let entry = shard_evict.pop().unwrap();
-                            if let Some(acc) = shard_map.remove(&entry.cell_u64) {
-                                evicted.push((res_u8, entry.cell_u64, acc));
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    evicted
-                })
-                .flatten()
-                .collect();
-
-            newly_evicted.par_sort_unstable_by_key(|item| item.1);
-
-            for (r, cell_u64, acc) in newly_evicted {
-                self.push_categorical_record(r, cell_u64, acc);
+            let newly_evicted = self.resolution_shards[res_idx].evict_completed(lat_horizon);
+            for (cell_u64, acc) in newly_evicted {
+                self.push_categorical_record(res_u8, cell_u64, acc);
             }
         }
 
@@ -285,24 +243,9 @@ impl MultiCategoricalHorizonStreamer {
                 let num_res = self.resolutions.len();
                 for res_idx in 0..num_res {
                     let res_u8 = self.resolution_u8s[res_idx];
-                    let mut remaining: Vec<(u8, u64, CategoricalAccumulator)> = self.active_shards[res_idx]
-                        .par_iter_mut()
-                        .zip(self.eviction_shards[res_idx].par_iter_mut())
-                        .map(|(shard_map, shard_evict)| {
-                            let mut drained = Vec::with_capacity(shard_map.len());
-                            shard_evict.clear();
-                            for (cell_u64, acc) in shard_map.drain() {
-                                drained.push((res_u8, cell_u64, acc));
-                            }
-                            drained
-                        })
-                        .flatten()
-                        .collect();
-
-                    remaining.par_sort_unstable_by_key(|item| item.1);
-
-                    for (r, cell_u64, acc) in remaining {
-                        self.push_categorical_record(r, cell_u64, acc);
+                    let remaining = self.resolution_shards[res_idx].drain_all();
+                    for (cell_u64, acc) in remaining {
+                        self.push_categorical_record(res_u8, cell_u64, acc);
                     }
                 }
                 self.flush_pending_compact();
@@ -390,29 +333,7 @@ impl MultiCategoricalHorizonStreamer {
             self.processed_chunk_count += chunk_items.len();
 
             for res_idx in 0..self.resolutions.len() {
-                self.active_shards[res_idx]
-                    .par_iter_mut()
-                    .zip(self.eviction_shards[res_idx].par_iter_mut())
-                    .enumerate()
-                    .for_each(|(s, (shard_map, shard_evict))| {
-                        for (chunk_shards, _) in &parallel_results {
-                            if res_idx < chunk_shards.len() {
-                                for &(cell_u64, ref acc) in &chunk_shards[res_idx][s] {
-                                    shard_map
-                                        .entry(cell_u64)
-                                        .and_modify(|existing| existing.merge(acc))
-                                        .or_insert_with(|| {
-                                            let south_lat = compute_cell_south_lat(cell_u64);
-                                            shard_evict.push(HexEvictionEntry {
-                                                south_lat,
-                                                cell_u64,
-                                            });
-                                            acc.clone()
-                                        });
-                                }
-                            }
-                        }
-                    });
+                self.resolution_shards[res_idx].merge_thread_results(&parallel_results, res_idx);
             }
 
             let recycled_buffers: Vec<DecodingResult> = parallel_results
@@ -468,9 +389,9 @@ impl MultiCategoricalHorizonStreamer {
 
     /// Return total active in-flight cells across all resolutions
     pub fn active_cell_count(&self) -> usize {
-        self.active_shards
+        self.resolution_shards
             .iter()
-            .map(|shards| shards.iter().map(|m| m.len()).sum::<usize>())
+            .map(|s| s.active_cell_count())
             .sum()
     }
 

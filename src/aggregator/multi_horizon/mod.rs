@@ -11,6 +11,7 @@ pub mod categorical_streamer;
 pub mod config;
 pub mod continuous;
 pub mod continuous_streamer;
+pub mod sharded_map;
 
 pub use categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
 pub use categorical_streamer::MultiCategoricalHorizonStreamer;
@@ -20,3 +21,5 @@ pub use continuous::{
     RAD_TO_DEG, WGS84_A,
 };
 pub use continuous_streamer::MultiScanHorizonStreamer;
+pub use sharded_map::{get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS};
+

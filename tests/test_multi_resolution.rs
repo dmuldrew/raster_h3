@@ -13,7 +13,10 @@ use raster_h3::aggregator::multi_horizon::{
 };
 use raster_h3::aggregator::CategoricalHorizonStreamer;
 use raster_h3::aggregator::sampling::SamplingPattern;
+use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
 
 fn create_test_geotiff(width: usize, height: usize) -> NamedTempFile {
     let temp_file = NamedTempFile::new().unwrap();
@@ -430,4 +433,123 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
         }
     }
 }
+
+#[test]
+fn test_parquet_continuous_streaming_export_and_sorting() {
+    let tiff_file = create_test_geotiff(128, 128);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+
+    let parquet_file = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_file.path().to_path_buf();
+
+    let config = MultiResolutionConfig::new(vec![8, 9]);
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+
+    let parquet_config = ParquetExportConfig {
+        compact: false,
+        row_group_size: 50,
+        ..Default::default()
+    };
+
+    let total_written = H3ParquetWriter::write_continuous_streamer_to_parquet(
+        streamer,
+        &parquet_path,
+        parquet_config,
+    )
+    .unwrap();
+
+    assert!(total_written > 0, "Should write hexagons to Parquet");
+
+    let file = File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let metadata = reader.metadata();
+
+    assert!(metadata.num_row_groups() > 1, "Should produce multiple row groups with row_group_size=50");
+
+    let mut row_count = 0;
+    for i in 0..metadata.num_row_groups() {
+        let rg_reader = reader.get_row_group(i).unwrap();
+        let num_rg_rows = rg_reader.metadata().num_rows() as usize;
+        assert!(num_rg_rows <= 50);
+        row_count += num_rg_rows;
+    }
+    assert_eq!(row_count, total_written);
+
+    // Verify sorting within row groups
+    let iter = reader.get_row_iter(None).unwrap();
+    let mut prev_index = i64::MIN;
+    let mut current_rg_rows = 0;
+    for row in iter {
+        let row = row.unwrap();
+        let h3_idx = row.get_long(0).unwrap();
+        if current_rg_rows % 50 == 0 {
+            // New row group started, reset monotonic check
+            prev_index = h3_idx;
+        } else {
+            assert!(h3_idx >= prev_index, "h3_index must be sorted within row group: {} >= {}", h3_idx, prev_index);
+            prev_index = h3_idx;
+        }
+        current_rg_rows += 1;
+    }
+}
+
+#[test]
+fn test_parquet_categorical_streaming_export_and_sorting() {
+    let tiff_file = create_test_geotiff(128, 128);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+
+    let parquet_file = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_file.path().to_path_buf();
+
+    let config = MultiResolutionConfig::new(vec![8, 9]);
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
+
+    let parquet_config = ParquetExportConfig {
+        compact: true,
+        row_group_size: 50,
+        is_categorical: true,
+        ..Default::default()
+    };
+
+    let total_written = H3ParquetWriter::write_categorical_streamer_to_parquet(
+        streamer,
+        &parquet_path,
+        parquet_config,
+    )
+    .unwrap();
+
+    assert!(total_written > 0, "Should write categorical hexagons to Parquet");
+
+    let file = File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let metadata = reader.metadata();
+
+    assert!(metadata.num_row_groups() > 1);
+
+    let mut row_count = 0;
+    for i in 0..metadata.num_row_groups() {
+        let rg_reader = reader.get_row_group(i).unwrap();
+        row_count += rg_reader.metadata().num_rows() as usize;
+    }
+    assert_eq!(row_count, total_written);
+
+    // Verify sorting within row groups
+    let iter = reader.get_row_iter(None).unwrap();
+    let mut prev_index = i64::MIN;
+    let mut current_rg_rows = 0;
+    for row in iter {
+        let row = row.unwrap();
+        let h3_idx = row.get_long(0).unwrap();
+        if current_rg_rows % 50 == 0 {
+            prev_index = h3_idx;
+        } else {
+            assert!(h3_idx >= prev_index, "h3_index must be sorted within row group");
+            prev_index = h3_idx;
+        }
+        current_rg_rows += 1;
+    }
+}
+
 
