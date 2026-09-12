@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +12,7 @@ use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
     add_named_parameter, add_positional_parameter, register_common_raster_named_parameters,
-    BindHelper,
+    BindHelper, ChunkWriter,
 };
 use crate::functions::fast_hex::fast_hex_u64;
 use crate::functions::wkb::h3_index_to_wkb;
@@ -431,11 +431,36 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
             };
 
+            let writer = ChunkWriter::new(output);
+
             // Fast path: if 0 columns are projected (e.g. SELECT count(*))
             if proj_cols.is_empty() {
-                duckdb_data_chunk_set_size(output, batch.len() as idx_t);
+                writer.set_size(batch.len());
                 return;
             }
+
+            let mut fallback_hex_buf = [0u8; 16];
+            let mut fallback_wkb_buf = [0u8; 128];
+            let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
+                (
+                    &mut (*local_data_ptr).hex_buf,
+                    &mut (*local_data_ptr).wkb_buf,
+                )
+            } else {
+                (&mut fallback_hex_buf, &mut fallback_wkb_buf)
+            };
+
+            let batch_len = batch.len();
+
+            let mut out_maj_cls: Option<usize> = None;
+            let mut out_maj_frac: Option<usize> = None;
+            let mut out_maj_cnt: Option<usize> = None;
+            let mut out_uniq: Option<usize> = None;
+            let mut out_distinct: Option<usize> = None;
+            let mut out_shannon: Option<usize> = None;
+            let mut out_entropy: Option<usize> = None;
+            let mut out_idx_wkb: Option<usize> = None;
+            let mut out_idx_geom: Option<usize> = None;
 
             // Schema column mapping (Wide):
             // 0: h3_index UBIGINT
@@ -452,165 +477,123 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 11: distinct_classes BIGINT
             // 12: wkb BLOB
             // 13: geom GEOMETRY (if emit_geom)
-            let mut vec_h3: Option<*mut u64> = None;
-            let mut vec_hex: Option<duckdb_vector> = None;
-            let mut vec_maj_cls: Option<*mut i64> = None;
-            let mut vec_maj_frac: Option<*mut f64> = None;
-            let mut vec_maj_cnt: Option<*mut f64> = None;
-            let mut vec_uniq: Option<*mut i64> = None;
-            let mut vec_tot: Option<*mut f64> = None;
-            let mut vec_hist: Option<duckdb_vector> = None;
-            let mut vec_res: Option<*mut u8> = None;
-            let mut vec_shannon_entropy: Option<*mut f64> = None;
-            let mut vec_entropy: Option<*mut f64> = None;
-            let mut vec_distinct: Option<*mut i64> = None;
-            let mut vec_wkb: Option<duckdb_vector> = None;
-            let mut vec_geom: Option<duckdb_vector> = None;
-
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
-                let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
                 match orig_col {
-                    0 => vec_h3 = Some(duckdb_vector_get_data(v) as *mut u64),
-                    1 => vec_hex = Some(v),
-                    2 => vec_maj_cls = Some(duckdb_vector_get_data(v) as *mut i64),
-                    3 => vec_maj_frac = Some(duckdb_vector_get_data(v) as *mut f64),
-                    4 => vec_maj_cnt = Some(duckdb_vector_get_data(v) as *mut f64),
-                    5 => vec_uniq = Some(duckdb_vector_get_data(v) as *mut i64),
-                    6 => vec_tot = Some(duckdb_vector_get_data(v) as *mut f64),
-                    7 => vec_hist = Some(v),
-                    8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
-                    9 => vec_shannon_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
-                    10 => vec_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
-                    11 => vec_distinct = Some(duckdb_vector_get_data(v) as *mut i64),
-                    12 => vec_wkb = Some(v),
-                    13 if global_data.emit_geom => vec_geom = Some(v),
+                    0 => {
+                        let slice: &mut [u64] = writer.get_data_slice_mut(out_idx, batch_len);
+                        for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                            *dest = rec.h3_index;
+                        }
+                    }
+                    1 => {
+                        for (i, rec) in batch.iter().enumerate() {
+                            let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
+                            writer.set_string_bytes(out_idx, i, hex_slice);
+                        }
+                    }
+                    2 => out_maj_cls = Some(out_idx),
+                    3 => out_maj_frac = Some(out_idx),
+                    4 => out_maj_cnt = Some(out_idx),
+                    5 => out_uniq = Some(out_idx),
+                    6 => {
+                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                        for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                            *dest = rec.accumulator.total_count;
+                        }
+                    }
+                    7 => {
+                        let mut hist_buf = String::with_capacity(256);
+                        for (i, rec) in batch.iter().enumerate() {
+                            rec.accumulator.histogram_json_into(&mut hist_buf);
+                            writer.set_string_bytes(out_idx, i, hist_buf.as_bytes());
+                        }
+                    }
+                    8 => {
+                        let slice: &mut [u8] = writer.get_data_slice_mut(out_idx, batch_len);
+                        for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                            *dest = rec.resolution;
+                        }
+                    }
+                    9 => out_shannon = Some(out_idx),
+                    10 => out_entropy = Some(out_idx),
+                    11 => out_distinct = Some(out_idx),
+                    12 => out_idx_wkb = Some(out_idx),
+                    13 if global_data.emit_geom => out_idx_geom = Some(out_idx),
                     _ => {}
                 }
             }
 
-            let need_majority = vec_maj_cls.is_some() || vec_maj_frac.is_some() || vec_maj_cnt.is_some();
-            let need_entropy = vec_shannon_entropy.is_some() || vec_entropy.is_some();
-            let need_distinct = vec_uniq.is_some() || vec_distinct.is_some();
+            if out_maj_cls.is_some() || out_maj_frac.is_some() || out_maj_cnt.is_some() {
+                let mut slice_cls = out_maj_cls.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
+                let mut slice_frac = out_maj_frac.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+                let mut slice_cnt = out_maj_cnt.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
 
-            let mut fallback_hex_buf = [0u8; 16];
-            let mut fallback_wkb_buf = [0u8; 128];
-            let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
-                (
-                    &mut (*local_data_ptr).hex_buf,
-                    &mut (*local_data_ptr).wkb_buf,
-                )
-            } else {
-                (&mut fallback_hex_buf, &mut fallback_wkb_buf)
-            };
-
-            let batch_len = batch.len();
-            if let Some(p) = vec_h3 {
-                for (i, rec) in batch.iter().enumerate() {
-                    *p.add(i) = rec.h3_index;
-                }
-            }
-            if let Some(p) = vec_res {
-                for (i, rec) in batch.iter().enumerate() {
-                    *p.add(i) = rec.resolution;
-                }
-            }
-            if let Some(p) = vec_tot {
-                for (i, rec) in batch.iter().enumerate() {
-                    *p.add(i) = rec.accumulator.total_count;
-                }
-            }
-            if need_majority {
                 for (i, rec) in batch.iter().enumerate() {
                     let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
-                    if let Some(p) = vec_maj_cls {
-                        *p.add(i) = maj_cls;
+                    if let Some(ref mut s) = slice_cls {
+                        s[i] = maj_cls;
                     }
-                    if let Some(p) = vec_maj_frac {
-                        *p.add(i) = maj_frac;
+                    if let Some(ref mut s) = slice_frac {
+                        s[i] = maj_frac;
                     }
-                    if let Some(p) = vec_maj_cnt {
-                        *p.add(i) = maj_cnt;
+                    if let Some(ref mut s) = slice_cnt {
+                        s[i] = maj_cnt;
                     }
                 }
             }
-            if need_distinct {
+
+            if out_uniq.is_some() || out_distinct.is_some() {
+                let mut slice_uniq = out_uniq.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
+                let mut slice_dist = out_distinct.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
+
                 for (i, rec) in batch.iter().enumerate() {
                     let distinct = rec.accumulator.unique_classes() as i64;
-                    if let Some(p) = vec_uniq {
-                        *p.add(i) = distinct;
+                    if let Some(ref mut s) = slice_uniq {
+                        s[i] = distinct;
                     }
-                    if let Some(p) = vec_distinct {
-                        *p.add(i) = distinct;
+                    if let Some(ref mut s) = slice_dist {
+                        s[i] = distinct;
                     }
                 }
             }
-            if need_entropy {
+
+            if out_shannon.is_some() || out_entropy.is_some() {
+                let mut slice_shannon = out_shannon.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+                let mut slice_ent = out_entropy.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+
                 for (i, rec) in batch.iter().enumerate() {
                     let ent = rec.accumulator.shannon_entropy();
-                    if let Some(p) = vec_shannon_entropy {
-                        *p.add(i) = ent;
+                    if let Some(ref mut s) = slice_shannon {
+                        s[i] = ent;
                     }
-                    if let Some(p) = vec_entropy {
-                        *p.add(i) = ent;
+                    if let Some(ref mut s) = slice_ent {
+                        s[i] = ent;
                     }
                 }
             }
-            if let Some(v) = vec_hex {
+
+            if out_idx_wkb.is_some() || out_idx_geom.is_some() {
                 for (i, rec) in batch.iter().enumerate() {
-                    let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        i as u64,
-                        hex_slice.as_ptr() as *const c_char,
-                        hex_slice.len() as idx_t,
-                    );
-                }
-            }
-            if let Some(v) = vec_hist {
-                let mut hist_buf = String::with_capacity(256);
-                for (i, rec) in batch.iter().enumerate() {
-                    rec.accumulator.histogram_json_into(&mut hist_buf);
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        i as u64,
-                        hist_buf.as_ptr() as *const c_char,
-                        hist_buf.len() as idx_t,
-                    );
-                }
-            }
-            if vec_wkb.is_some() || vec_geom.is_some() {
-                for (i, rec) in batch.iter().enumerate() {
-                    let row_idx = i as u64;
-                    let wkb_len_opt = h3_index_to_wkb(rec.h3_index, wkb_buf);
-                    if let Some(v) = vec_wkb {
-                        if let Some(wkb_len) = wkb_len_opt {
-                            duckdb_vector_assign_string_element_len(
-                                v,
-                                row_idx,
-                                wkb_buf.as_ptr() as *const c_char,
-                                wkb_len as idx_t,
-                            );
-                        } else {
-                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                    if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
+                        let bytes = &wkb_buf[..wkb_len];
+                        if let Some(out_wkb) = out_idx_wkb {
+                            writer.set_string_bytes(out_wkb, i, bytes);
                         }
-                    }
-                    if let Some(v) = vec_geom {
-                        if let Some(wkb_len) = wkb_len_opt {
-                            duckdb_vector_assign_string_element_len(
-                                v,
-                                row_idx,
-                                wkb_buf.as_ptr() as *const c_char,
-                                wkb_len as idx_t,
-                            );
-                        } else {
-                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                        if let Some(out_geom) = out_idx_geom {
+                            writer.set_string_bytes(out_geom, i, bytes);
+                        }
+                    } else {
+                        if let Some(out_wkb) = out_idx_wkb {
+                            writer.set_null(out_wkb, i);
+                        }
+                        if let Some(out_geom) = out_idx_geom {
+                            writer.set_null(out_geom, i);
                         }
                     }
                 }
             }
 
-
-            duckdb_data_chunk_set_size(output, batch_len as idx_t);
+            writer.set_size(batch_len);
         }
         CategoricalOutputFormat::Long => {
             let rows = {
@@ -675,10 +658,26 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 return;
             }
 
+            let writer = ChunkWriter::new(output);
+
             if proj_cols.is_empty() {
-                duckdb_data_chunk_set_size(output, num_taken as idx_t);
+                writer.set_size(num_taken);
                 return;
             }
+
+            let mut fallback_hex_buf = [0u8; 16];
+            let mut fallback_wkb_buf = [0u8; 128];
+            let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
+                (
+                    &mut (*local_data_ptr).hex_buf,
+                    &mut (*local_data_ptr).wkb_buf,
+                )
+            } else {
+                (&mut fallback_hex_buf, &mut fallback_wkb_buf)
+            };
+
+            let mut out_idx_wkb: Option<usize> = None;
+            let mut out_idx_geom: Option<usize> = None;
 
             // Schema column mapping (Long):
             // 0: h3_index UBIGINT
@@ -694,124 +693,90 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 10: unique_classes BIGINT
             // 11: wkb BLOB
             // 12: geom GEOMETRY (if emit_geom)
-            let mut vec_h3: Option<*mut u64> = None;
-            let mut vec_hex: Option<duckdb_vector> = None;
-            let mut vec_cat: Option<*mut i64> = None;
-            let mut vec_cnt: Option<*mut f64> = None;
-            let mut vec_frac: Option<*mut f64> = None;
-            let mut vec_tot: Option<*mut f64> = None;
-            let mut vec_res: Option<*mut u8> = None;
-            let mut vec_shannon_entropy: Option<*mut f64> = None;
-            let mut vec_entropy: Option<*mut f64> = None;
-            let mut vec_distinct: Option<*mut i64> = None;
-            let mut vec_uniq: Option<*mut i64> = None;
-            let mut vec_wkb: Option<duckdb_vector> = None;
-            let mut vec_geom: Option<duckdb_vector> = None;
-
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
-                let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
                 match orig_col {
-                    0 => vec_h3 = Some(duckdb_vector_get_data(v) as *mut u64),
-                    1 => vec_hex = Some(v),
-                    2 => vec_cat = Some(duckdb_vector_get_data(v) as *mut i64),
-                    3 => vec_cnt = Some(duckdb_vector_get_data(v) as *mut f64),
-                    4 => vec_frac = Some(duckdb_vector_get_data(v) as *mut f64),
-                    5 => vec_tot = Some(duckdb_vector_get_data(v) as *mut f64),
-                    6 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
-                    7 => vec_shannon_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
-                    8 => vec_entropy = Some(duckdb_vector_get_data(v) as *mut f64),
-                    9 => vec_distinct = Some(duckdb_vector_get_data(v) as *mut i64),
-                    10 => vec_uniq = Some(duckdb_vector_get_data(v) as *mut i64),
-                    11 => vec_wkb = Some(v),
-                    12 if global_data.emit_geom => vec_geom = Some(v),
+                    0 => {
+                        let slice: &mut [u64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.cell_u64;
+                        }
+                    }
+                    1 => {
+                        for (i, row) in rows.iter().enumerate() {
+                            let hex_slice = fast_hex_u64(row.cell_u64, hex_buf);
+                            writer.set_string_bytes(out_idx, i, hex_slice);
+                        }
+                    }
+                    2 => {
+                        let slice: &mut [i64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.category;
+                        }
+                    }
+                    3 => {
+                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.count;
+                        }
+                    }
+                    4 => {
+                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.fraction;
+                        }
+                    }
+                    5 => {
+                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.total_count;
+                        }
+                    }
+                    6 => {
+                        let slice: &mut [u8] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.resolution;
+                        }
+                    }
+                    7 | 8 => {
+                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.entropy;
+                        }
+                    }
+                    9 | 10 => {
+                        let slice: &mut [i64] = writer.get_data_slice_mut(out_idx, num_taken);
+                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
+                            *dest = row.distinct_classes;
+                        }
+                    }
+                    11 => out_idx_wkb = Some(out_idx),
+                    12 if global_data.emit_geom => out_idx_geom = Some(out_idx),
                     _ => {}
                 }
             }
 
-            let mut fallback_hex_buf = [0u8; 16];
-            let mut fallback_wkb_buf = [0u8; 128];
-            let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
-                (
-                    &mut (*local_data_ptr).hex_buf,
-                    &mut (*local_data_ptr).wkb_buf,
-                )
-            } else {
-                (&mut fallback_hex_buf, &mut fallback_wkb_buf)
-            };
-
-            for (i, row) in rows.into_iter().enumerate() {
-                let row_idx = i as u64;
-
-                if let Some(p) = vec_h3 {
-                    *p.add(i) = row.cell_u64;
-                }
-                if let Some(v) = vec_hex {
-                    let hex_slice = fast_hex_u64(row.cell_u64, hex_buf);
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        row_idx,
-                        hex_slice.as_ptr() as *const c_char,
-                        hex_slice.len() as idx_t,
-                    );
-                }
-                if let Some(p) = vec_cat {
-                    *p.add(i) = row.category;
-                }
-                if let Some(p) = vec_cnt {
-                    *p.add(i) = row.count;
-                }
-                if let Some(p) = vec_frac {
-                    *p.add(i) = row.fraction;
-                }
-                if let Some(p) = vec_tot {
-                    *p.add(i) = row.total_count;
-                }
-                if let Some(p) = vec_res {
-                    *p.add(i) = row.resolution;
-                }
-                if let Some(p) = vec_shannon_entropy {
-                    *p.add(i) = row.entropy;
-                }
-                if let Some(p) = vec_entropy {
-                    *p.add(i) = row.entropy;
-                }
-                if let Some(p) = vec_distinct {
-                    *p.add(i) = row.distinct_classes;
-                }
-                if let Some(p) = vec_uniq {
-                    *p.add(i) = row.distinct_classes;
-                }
-                if vec_wkb.is_some() || vec_geom.is_some() {
-                    let wkb_len_opt = h3_index_to_wkb(row.cell_u64, wkb_buf);
-                    if let Some(v) = vec_wkb {
-                        if let Some(wkb_len) = wkb_len_opt {
-                            duckdb_vector_assign_string_element_len(
-                                v,
-                                row_idx,
-                                wkb_buf.as_ptr() as *const c_char,
-                                wkb_len as idx_t,
-                            );
-                        } else {
-                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+            if out_idx_wkb.is_some() || out_idx_geom.is_some() {
+                for (i, row) in rows.iter().enumerate() {
+                    if let Some(wkb_len) = h3_index_to_wkb(row.cell_u64, wkb_buf) {
+                        let bytes = &wkb_buf[..wkb_len];
+                        if let Some(out_wkb) = out_idx_wkb {
+                            writer.set_string_bytes(out_wkb, i, bytes);
                         }
-                    }
-                    if let Some(v) = vec_geom {
-                        if let Some(wkb_len) = wkb_len_opt {
-                            duckdb_vector_assign_string_element_len(
-                                v,
-                                row_idx,
-                                wkb_buf.as_ptr() as *const c_char,
-                                wkb_len as idx_t,
-                            );
-                        } else {
-                            duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                        if let Some(out_geom) = out_idx_geom {
+                            writer.set_string_bytes(out_geom, i, bytes);
+                        }
+                    } else {
+                        if let Some(out_wkb) = out_idx_wkb {
+                            writer.set_null(out_wkb, i);
+                        }
+                        if let Some(out_geom) = out_idx_geom {
+                            writer.set_null(out_geom, i);
                         }
                     }
                 }
             }
 
-
-            duckdb_data_chunk_set_size(output, num_taken as idx_t);
+            writer.set_size(num_taken);
         }
     }
 }

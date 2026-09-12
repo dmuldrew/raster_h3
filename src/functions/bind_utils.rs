@@ -10,11 +10,13 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::{
     duckdb_bind_add_result_column, duckdb_bind_get_named_parameter, duckdb_bind_get_parameter,
     duckdb_bind_get_parameter_count, duckdb_bind_info, duckdb_bind_set_error,
-    duckdb_create_logical_type, duckdb_destroy_logical_type, duckdb_get_bool, duckdb_get_double,
+    duckdb_create_logical_type, duckdb_data_chunk, duckdb_data_chunk_get_vector,
+    duckdb_data_chunk_set_size, duckdb_destroy_logical_type, duckdb_get_bool, duckdb_get_double,
     duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_logical_type,
     duckdb_table_function, duckdb_table_function_add_named_parameter,
-    duckdb_table_function_add_parameter, duckdb_value, from_duckdb_string, to_c_string,
-    DuckDBType,
+    duckdb_table_function_add_parameter, duckdb_value, duckdb_vector,
+    duckdb_vector_assign_string_element, duckdb_vector_assign_string_element_len,
+    duckdb_vector_get_data, from_duckdb_string, idx_t, to_c_string, DuckDBType,
 };
 use crate::raster::mosaic::OverlapRule;
 
@@ -375,6 +377,105 @@ pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_functio
     add_named_parameter(func, "overlap_rule", DuckDBType::Varchar);
     add_named_parameter(func, "workers", DuckDBType::BigInt);
     add_named_parameter(func, "threads", DuckDBType::BigInt);
+}
+
+// =============================================================================
+// Output Data Chunk Writer
+// =============================================================================
+
+/// Safe, ergonomic wrapper around DuckDB's output `duckdb_data_chunk`
+pub struct ChunkWriter {
+    pub chunk: duckdb_data_chunk,
+}
+
+impl ChunkWriter {
+    #[inline(always)]
+    pub fn new(chunk: duckdb_data_chunk) -> Self {
+        Self { chunk }
+    }
+
+    /// Retrieve the underlying vector for a specific column index
+    #[inline(always)]
+    pub unsafe fn get_vector(&self, col_idx: usize) -> duckdb_vector {
+        duckdb_data_chunk_get_vector(self.chunk, col_idx as idx_t)
+    }
+
+    /// Obtain a typed mutable slice over a vector's raw data buffer.
+    ///
+    /// This allows idiomatic, bounds-check-free, and auto-vectorizable writes:
+    /// ```rust,ignore
+    /// let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+    /// for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+    ///     *dest = rec.accumulator.mean();
+    /// }
+    /// ```
+    #[inline(always)]
+    pub unsafe fn get_data_slice_mut<T>(&self, col_idx: usize, len: usize) -> &mut [T] {
+        let v = self.get_vector(col_idx);
+        let ptr = duckdb_vector_get_data(v) as *mut T;
+        std::slice::from_raw_parts_mut(ptr, len)
+    }
+
+    /// Set an i64 integer sample at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_int64(&self, col_idx: usize, row_idx: usize, val: i64) {
+        let v = self.get_vector(col_idx);
+        *(duckdb_vector_get_data(v) as *mut i64).add(row_idx) = val;
+    }
+
+    /// Set a u64 unsigned integer sample at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_uint64(&self, col_idx: usize, row_idx: usize, val: u64) {
+        let v = self.get_vector(col_idx);
+        *(duckdb_vector_get_data(v) as *mut u64).add(row_idx) = val;
+    }
+
+    /// Set a u8 unsigned integer sample at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_uint8(&self, col_idx: usize, row_idx: usize, val: u8) {
+        let v = self.get_vector(col_idx);
+        *(duckdb_vector_get_data(v) as *mut u8).add(row_idx) = val;
+    }
+
+    /// Set an f64 double sample at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_double(&self, col_idx: usize, row_idx: usize, val: f64) {
+        let v = self.get_vector(col_idx);
+        *(duckdb_vector_get_data(v) as *mut f64).add(row_idx) = val;
+    }
+
+    /// Assign a null-terminated UTF-8 string at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_string(&self, col_idx: usize, row_idx: usize, s: &str) {
+        let v = self.get_vector(col_idx);
+        let c_s = CString::new(s).unwrap_or_default();
+        duckdb_vector_assign_string_element(v, row_idx as idx_t, c_s.as_ptr() as *const std::ffi::c_char);
+    }
+
+    /// Assign a string slice or binary blob bytes of known length at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_string_bytes(&self, col_idx: usize, row_idx: usize, bytes: &[u8]) {
+        let v = self.get_vector(col_idx);
+        duckdb_vector_assign_string_element_len(
+            v,
+            row_idx as idx_t,
+            bytes.as_ptr() as *const std::ffi::c_char,
+            bytes.len() as idx_t,
+        );
+    }
+
+    /// Set a NULL value at (col_idx, row_idx)
+    #[inline(always)]
+    pub unsafe fn set_null(&self, col_idx: usize, row_idx: usize) {
+        let v = self.get_vector(col_idx);
+        duckdb_vector_assign_string_element_len(v, row_idx as idx_t, std::ptr::null(), 0);
+    }
+
+    /// Set the total number of valid rows in this data chunk
+    #[inline(always)]
+    pub unsafe fn set_size(&self, size: usize) {
+        duckdb_data_chunk_set_size(self.chunk, size as idx_t);
+    }
 }
 
 // =============================================================================

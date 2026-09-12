@@ -10,7 +10,7 @@
 //!       compact := true
 //!   );
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::c_void;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -21,7 +21,9 @@ use crate::aggregator::multi_horizon::MultiResolutionConfig;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
-use crate::functions::bind_utils::{add_named_parameter, add_positional_parameter, BindHelper};
+use crate::functions::bind_utils::{
+    add_named_parameter, add_positional_parameter, BindHelper, ChunkWriter,
+};
 use crate::parquet::{H3ParquetWriter, ParquetExportConfig};
 
 /// Bind data parsed during SQL query planning
@@ -195,34 +197,15 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
         Err(e) => (0i64, 0i64, 0.0, format!("ERROR: {}", e)),
     };
 
-    // Populate the 1 output row
-    // 0: total_hexagons (BIGINT)
-    let v_hex = duckdb_data_chunk_get_vector(output, 0);
-    *(duckdb_vector_get_data(v_hex) as *mut i64) = total_hexagons;
-
-    // 1: parquet_size_bytes (BIGINT)
-    let v_size = duckdb_data_chunk_get_vector(output, 1);
-    *(duckdb_vector_get_data(v_size) as *mut i64) = size_bytes;
-
-    // 2: elapsed_ms (DOUBLE)
-    let v_time = duckdb_data_chunk_get_vector(output, 2);
-    *(duckdb_vector_get_data(v_time) as *mut f64) = elapsed_ms;
-
-    // 3: hexagons_per_sec (DOUBLE)
-    let v_rate = duckdb_data_chunk_get_vector(output, 3);
-    *(duckdb_vector_get_data(v_rate) as *mut f64) = rate;
-
-    // 4: output_path (VARCHAR)
-    let v_path = duckdb_data_chunk_get_vector(output, 4);
-    let path_c = CString::new(bind_data.output_parquet.clone()).unwrap_or_default();
-    duckdb_vector_assign_string_element(v_path, 0, path_c.as_ptr() as *const c_char);
-
-    // 5: status (VARCHAR)
-    let v_status = duckdb_data_chunk_get_vector(output, 5);
-    let status_c = CString::new(status).unwrap_or_default();
-    duckdb_vector_assign_string_element(v_status, 0, status_c.as_ptr() as *const c_char);
-
-    duckdb_data_chunk_set_size(output, 1);
+    // Populate the 1 output summary row
+    let writer = ChunkWriter::new(output);
+    writer.set_int64(0, 0, total_hexagons);
+    writer.set_int64(1, 0, size_bytes);
+    writer.set_double(2, 0, elapsed_ms);
+    writer.set_double(3, 0, rate);
+    writer.set_string(4, 0, &bind_data.output_parquet);
+    writer.set_string(5, 0, &status);
+    writer.set_size(1);
 }
 
 /// Register `h3_raster_to_parquet` Table Function in DuckDB connection

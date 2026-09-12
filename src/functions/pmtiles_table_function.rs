@@ -3,7 +3,7 @@
 //! Exposes:
 //!   SELECT * FROM h3_raster_to_pmtiles('california_dem.tif', 'california_elevation.pmtiles', resolution := 8);
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::c_void;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -12,7 +12,9 @@ use crate::aggregator::multi_horizon::MultiResolutionConfig;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
-use crate::functions::bind_utils::{add_named_parameter, add_positional_parameter, BindHelper};
+use crate::functions::bind_utils::{
+    add_named_parameter, add_positional_parameter, BindHelper, ChunkWriter,
+};
 use crate::pmtiles::tiler::{h3_res_to_zoom, H3PmtilesTiler};
 
 /// Bind data parsed during SQL query planning
@@ -164,38 +166,16 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
         if z > max_z { max_z = z; }
     }
 
-    // Populate the 1 output row
-    // 0: total_hexagons (BIGINT)
-    let v_hex = duckdb_data_chunk_get_vector(output, 0);
-    *(duckdb_vector_get_data(v_hex) as *mut i64) = total_hexagons;
-
-    // 1: pmtiles_size_bytes (BIGINT)
-    let v_size = duckdb_data_chunk_get_vector(output, 1);
-    *(duckdb_vector_get_data(v_size) as *mut i64) = size_bytes;
-
-    // 2: min_zoom (BIGINT)
-    let v_min_z = duckdb_data_chunk_get_vector(output, 2);
-    *(duckdb_vector_get_data(v_min_z) as *mut i64) = min_z as i64;
-
-    // 3: max_zoom (BIGINT)
-    let v_max_z = duckdb_data_chunk_get_vector(output, 3);
-    *(duckdb_vector_get_data(v_max_z) as *mut i64) = max_z as i64;
-
-    // 4: elapsed_ms (DOUBLE)
-    let v_time = duckdb_data_chunk_get_vector(output, 4);
-    *(duckdb_vector_get_data(v_time) as *mut f64) = elapsed.as_secs_f64() * 1000.0;
-
-    // 5: output_path (VARCHAR)
-    let v_path = duckdb_data_chunk_get_vector(output, 5);
-    let path_c = CString::new(bind_data.output_pmtiles.clone()).unwrap_or_default();
-    duckdb_vector_assign_string_element(v_path, 0, path_c.as_ptr() as *const c_char);
-
-    // 6: status (VARCHAR)
-    let v_status = duckdb_data_chunk_get_vector(output, 6);
-    let status_c = CString::new(status).unwrap_or_default();
-    duckdb_vector_assign_string_element(v_status, 0, status_c.as_ptr() as *const c_char);
-
-    duckdb_data_chunk_set_size(output, 1);
+    // Populate the 1 output summary row
+    let writer = ChunkWriter::new(output);
+    writer.set_int64(0, 0, total_hexagons);
+    writer.set_int64(1, 0, size_bytes);
+    writer.set_int64(2, 0, min_z as i64);
+    writer.set_int64(3, 0, max_z as i64);
+    writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
+    writer.set_string(5, 0, &bind_data.output_pmtiles);
+    writer.set_string(6, 0, &status);
+    writer.set_size(1);
 }
 
 /// Bind data parsed during SQL query planning for Parquet to PMTiles
@@ -305,38 +285,16 @@ pub unsafe extern "C" fn parquet_pmtiles_scan(info: duckdb_function_info, output
         Err(e) => (0i64, 0i64, 0i64, 0i64, format!("ERROR: {}", e)),
     };
 
-    // Populate the 1 output row
-    // 0: total_hexagons (BIGINT)
-    let v_hex = duckdb_data_chunk_get_vector(output, 0);
-    *(duckdb_vector_get_data(v_hex) as *mut i64) = total_hexagons;
-
-    // 1: pmtiles_size_bytes (BIGINT)
-    let v_size = duckdb_data_chunk_get_vector(output, 1);
-    *(duckdb_vector_get_data(v_size) as *mut i64) = size_bytes;
-
-    // 2: min_zoom (BIGINT)
-    let v_min_z = duckdb_data_chunk_get_vector(output, 2);
-    *(duckdb_vector_get_data(v_min_z) as *mut i64) = min_z;
-
-    // 3: max_zoom (BIGINT)
-    let v_max_z = duckdb_data_chunk_get_vector(output, 3);
-    *(duckdb_vector_get_data(v_max_z) as *mut i64) = max_z;
-
-    // 4: elapsed_ms (DOUBLE)
-    let v_time = duckdb_data_chunk_get_vector(output, 4);
-    *(duckdb_vector_get_data(v_time) as *mut f64) = elapsed.as_secs_f64() * 1000.0;
-
-    // 5: output_path (VARCHAR)
-    let v_path = duckdb_data_chunk_get_vector(output, 5);
-    let path_c = CString::new(bind_data.output_pmtiles.clone()).unwrap_or_default();
-    duckdb_vector_assign_string_element(v_path, 0, path_c.as_ptr() as *const c_char);
-
-    // 6: status (VARCHAR)
-    let v_status = duckdb_data_chunk_get_vector(output, 6);
-    let status_c = CString::new(status).unwrap_or_default();
-    duckdb_vector_assign_string_element(v_status, 0, status_c.as_ptr() as *const c_char);
-
-    duckdb_data_chunk_set_size(output, 1);
+    // Populate the 1 output summary row
+    let writer = ChunkWriter::new(output);
+    writer.set_int64(0, 0, total_hexagons);
+    writer.set_int64(1, 0, size_bytes);
+    writer.set_int64(2, 0, min_z);
+    writer.set_int64(3, 0, max_z);
+    writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
+    writer.set_string(5, 0, &bind_data.output_pmtiles);
+    writer.set_string(6, 0, &status);
+    writer.set_size(1);
 }
 
 /// Register `h3_raster_to_pmtiles` and `h3_parquet_to_pmtiles` Table Functions with DuckDB

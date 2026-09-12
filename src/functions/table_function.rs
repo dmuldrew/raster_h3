@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -11,7 +11,7 @@ use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
     add_named_parameter, add_positional_parameter, register_common_raster_named_parameters,
-    BindHelper,
+    BindHelper, ChunkWriter,
 };
 use crate::functions::fast_hex::fast_hex_u64;
 use crate::functions::wkb::h3_index_to_wkb;
@@ -405,62 +405,12 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 
     let proj_cols = &global_data.projected_columns;
 
+    let writer = ChunkWriter::new(output);
+
     // Fast path: if 0 columns are projected (e.g. SELECT count(*))
     if proj_cols.is_empty() {
-        duckdb_data_chunk_set_size(output, batch.len() as idx_t);
+        writer.set_size(batch.len());
         return;
-    }
-
-    // Map output vector pointers only for projected columns
-    // Schema column mapping:
-    // 0: h3_index UBIGINT
-    // 1: h3_hex VARCHAR
-    // 2: mean DOUBLE
-    // 3: stddev DOUBLE
-    // 4: count DOUBLE
-    // 5: min DOUBLE
-    // 6: max DOUBLE
-    // 7: sum DOUBLE
-    // 8: resolution UTINYINT
-    // 9: wkb BLOB
-    // 10: geom GEOMETRY (if emit_geom)
-    let mut vec_h3: Option<*mut u64> = None;
-    let mut vec_hex: Option<duckdb_vector> = None;
-    let mut vec_mean: Option<*mut f64> = None;
-    let mut vec_stddev: Option<*mut f64> = None;
-    let mut vec_count: Option<*mut f64> = None;
-    let mut vec_min: Option<*mut f64> = None;
-    let mut vec_max: Option<*mut f64> = None;
-    let mut vec_sum: Option<*mut f64> = None;
-    let mut vec_res: Option<*mut u8> = None;
-    let mut vec_wkb: Option<duckdb_vector> = None;
-    let mut vec_geom: Option<duckdb_vector> = None;
-    let mut vec_quantiles: Vec<(usize, *mut f64)> = Vec::new();
-
-    let q_start_col = if global_data.emit_geom { 11 } else { 10 };
-
-    for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
-        let v = duckdb_data_chunk_get_vector(output, out_idx as idx_t);
-        match orig_col {
-            0 => vec_h3 = Some(duckdb_vector_get_data(v) as *mut u64),
-            1 => vec_hex = Some(v),
-            2 => vec_mean = Some(duckdb_vector_get_data(v) as *mut f64),
-            3 => vec_stddev = Some(duckdb_vector_get_data(v) as *mut f64),
-            4 => vec_count = Some(duckdb_vector_get_data(v) as *mut f64),
-            5 => vec_min = Some(duckdb_vector_get_data(v) as *mut f64),
-            6 => vec_max = Some(duckdb_vector_get_data(v) as *mut f64),
-            7 => vec_sum = Some(duckdb_vector_get_data(v) as *mut f64),
-            8 => vec_res = Some(duckdb_vector_get_data(v) as *mut u8),
-            9 => vec_wkb = Some(v),
-            10 if global_data.emit_geom => vec_geom = Some(v),
-            c if c >= q_start_col => {
-                let q_idx = c - q_start_col;
-                if q_idx < global_data.quantiles.len() {
-                    vec_quantiles.push((q_idx, duckdb_vector_get_data(v) as *mut f64));
-                }
-            }
-            _ => {}
-        }
     }
 
     let mut fallback_hex_buf = [0u8; 16];
@@ -475,106 +425,130 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     };
 
     let batch_len = batch.len();
+    let q_start_col = if global_data.emit_geom { 11 } else { 10 };
+    let mut out_idx_wkb: Option<usize> = None;
+    let mut out_idx_geom: Option<usize> = None;
 
-    if let Some(p) = vec_h3 {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.h3_index;
-        }
-    }
-    if let Some(p) = vec_mean {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.accumulator.mean();
-        }
-    }
-    if let Some(p) = vec_stddev {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.accumulator.stddev();
-        }
-    }
-    if let Some(p) = vec_count {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.accumulator.count;
-        }
-    }
-    if let Some(p) = vec_min {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.accumulator.min;
-        }
-    }
-    if let Some(p) = vec_max {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.accumulator.max;
-        }
-    }
-    if let Some(p) = vec_sum {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.accumulator.sum;
-        }
-    }
-    if let Some(p) = vec_res {
-        for (i, rec) in batch.iter().enumerate() {
-            *p.add(i) = rec.resolution;
-        }
-    }
-    for &(q_idx, ptr) in &vec_quantiles {
-        match &global_data.quantiles[q_idx] {
-            QuantileTarget::Percentile(q, _) => {
-                let q_val = *q;
+    // Schema column mapping:
+    // 0: h3_index UBIGINT
+    // 1: h3_hex VARCHAR
+    // 2: mean DOUBLE
+    // 3: stddev DOUBLE
+    // 4: count DOUBLE
+    // 5: min DOUBLE
+    // 6: max DOUBLE
+    // 7: sum DOUBLE
+    // 8: resolution UTINYINT
+    // 9: wkb BLOB
+    // 10: geom GEOMETRY (if emit_geom)
+    // 10/11+: quantiles DOUBLE
+    for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
+        match orig_col {
+            0 => {
+                let slice: &mut [u64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.h3_index;
+                }
+            }
+            1 => {
                 for (i, rec) in batch.iter().enumerate() {
-                    *ptr.add(i) = rec.accumulator.quantile(q_val);
+                    let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
+                    writer.set_string_bytes(out_idx, i, hex_slice);
                 }
             }
-            QuantileTarget::Iqr(_) => {
-                for (i, rec) in batch.iter().enumerate() {
-                    *ptr.add(i) = rec.accumulator.iqr();
+            2 => {
+                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.accumulator.mean();
                 }
             }
+            3 => {
+                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.accumulator.stddev();
+                }
+            }
+            4 => {
+                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.accumulator.count;
+                }
+            }
+            5 => {
+                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.accumulator.min;
+                }
+            }
+            6 => {
+                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.accumulator.max;
+                }
+            }
+            7 => {
+                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.accumulator.sum;
+                }
+            }
+            8 => {
+                let slice: &mut [u8] = writer.get_data_slice_mut(out_idx, batch_len);
+                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                    *dest = rec.resolution;
+                }
+            }
+            9 => {
+                out_idx_wkb = Some(out_idx);
+            }
+            10 if global_data.emit_geom => {
+                out_idx_geom = Some(out_idx);
+            }
+            c if c >= q_start_col => {
+                let q_idx = c - q_start_col;
+                if q_idx < global_data.quantiles.len() {
+                    let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
+                    match &global_data.quantiles[q_idx] {
+                        QuantileTarget::Percentile(q, _) => {
+                            let q_val = *q;
+                            for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                                *dest = rec.accumulator.quantile(q_val);
+                            }
+                        }
+                        QuantileTarget::Iqr(_) => {
+                            for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
+                                *dest = rec.accumulator.iqr();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    if let Some(v) = vec_hex {
+
+    if out_idx_wkb.is_some() || out_idx_geom.is_some() {
         for (i, rec) in batch.iter().enumerate() {
-            let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
-            duckdb_vector_assign_string_element_len(
-                v,
-                i as u64,
-                hex_slice.as_ptr() as *const c_char,
-                hex_slice.len() as idx_t,
-            );
-        }
-    }
-    if vec_wkb.is_some() || vec_geom.is_some() {
-        for (i, rec) in batch.iter().enumerate() {
-            let row_idx = i as u64;
-            let wkb_len_opt = h3_index_to_wkb(rec.h3_index, wkb_buf);
-            if let Some(v) = vec_wkb {
-                if let Some(wkb_len) = wkb_len_opt {
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        row_idx,
-                        wkb_buf.as_ptr() as *const c_char,
-                        wkb_len as idx_t,
-                    );
-                } else {
-                    duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+            if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
+                let bytes = &wkb_buf[..wkb_len];
+                if let Some(out_wkb) = out_idx_wkb {
+                    writer.set_string_bytes(out_wkb, i, bytes);
                 }
-            }
-            if let Some(v) = vec_geom {
-                if let Some(wkb_len) = wkb_len_opt {
-                    duckdb_vector_assign_string_element_len(
-                        v,
-                        row_idx,
-                        wkb_buf.as_ptr() as *const c_char,
-                        wkb_len as idx_t,
-                    );
-                } else {
-                    duckdb_vector_assign_string_element_len(v, row_idx, std::ptr::null(), 0);
+                if let Some(out_geom) = out_idx_geom {
+                    writer.set_string_bytes(out_geom, i, bytes);
+                }
+            } else {
+                if let Some(out_wkb) = out_idx_wkb {
+                    writer.set_null(out_wkb, i);
+                }
+                if let Some(out_geom) = out_idx_geom {
+                    writer.set_null(out_geom, i);
                 }
             }
         }
     }
 
-
-    duckdb_data_chunk_set_size(output, batch_len as idx_t);
+    writer.set_size(batch_len);
 }
 
 /// Register `h3_raster_continuous_aggregate` and `h3_raster_continuous` table functions
