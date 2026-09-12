@@ -1,11 +1,13 @@
 pub mod geotiff;
 pub mod geotransform;
 pub mod http_range;
+pub mod metadata;
 pub mod mosaic;
 pub mod predictor;
 pub mod prefetch;
 pub mod remote_prefetch;
 
+pub use metadata::{extract_crs, extract_geotransform, extract_nodata, parse_wkt_or_ascii_to_proj};
 pub use geotiff::{
     ChunkDecoder, ChunkLayout, ChunkPayload, GeoTiffMetadata, GeoTiffStreamReader, RasterSource,
 };
