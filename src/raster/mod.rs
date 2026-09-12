@@ -2,6 +2,7 @@ pub mod geotiff;
 pub mod geotransform;
 pub mod http_range;
 pub mod mosaic;
+pub mod predictor;
 pub mod prefetch;
 pub mod remote_prefetch;
 
