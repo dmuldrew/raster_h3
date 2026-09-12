@@ -14,9 +14,10 @@ use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
 
 use super::config::SpectralFormula;
-
-pub const WGS84_A: f64 = 6378137.0;
-pub const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
+pub use super::walker::{
+    is_slice_all_native_nodata, RowCoordinates, RowGeometryContext, RAD_TO_DEG, WGS84_A,
+};
+use super::walker::walk_overlap_pixel_cells;
 
 /// Continuous record yielded by the multi-resolution streamer
 #[derive(Debug, Clone, PartialEq)]
@@ -24,27 +25,6 @@ pub struct MultiContinuousRecord {
     pub resolution: u8,
     pub h3_index: u64,
     pub accumulator: H3Accumulator,
-}
-
-/// Fast check if an entire row slice consists purely of NoData values
-#[inline(always)]
-pub fn is_slice_all_native_nodata<T, N>(slice: &[T], native_nodata: Option<N>) -> bool
-where
-    T: Copy + PartialEq,
-    N: Copy + PartialEq<T>,
-{
-    if let Some(nd_nat) = native_nodata {
-        if slice.is_empty() {
-            return true;
-        }
-        let len = slice.len();
-        if nd_nat != slice[0] || nd_nat != slice[len / 2] || nd_nat != slice[len - 1] {
-            return false;
-        }
-        slice.iter().all(|&val| nd_nat == val)
-    } else {
-        false
-    }
 }
 
 /// Direct pixel-by-pixel continuous slice aggregation with strict tile ownership resolution
@@ -65,103 +45,44 @@ fn process_continuous_overlap_slice_into_maps<T>(
 ) where
     T: SimdSpanAccumulate,
 {
-    let stride = if chunk_stride > 0 && slice.len() >= chunk_stride as usize {
-        chunk_stride as usize
-    } else {
-        (chunk.width as usize).max(1)
-    };
-    let actual_rows = (slice.len() / stride).min(chunk.height as usize);
-    let num_res = resolutions.len();
-
-    for r in 0..actual_rows {
-        let row_idx = (chunk.row_offset + r as u32) as usize;
-        let slice_row_start = r * stride;
-        let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-        if row_width == 0 {
-            continue;
-        }
-
-        for c in 0..row_width {
-            let val = slice[slice_row_start + c];
-            if !val.is_valid(native_nodata) {
-                continue;
-            }
+    walk_overlap_pixel_cells(
+        slice,
+        chunk,
+        chunk_stride,
+        resolutions,
+        crs_transformer,
+        gt,
+        sampling,
+        bbox,
+        tile_idx,
+        mosaic,
+        |val| val.is_valid(native_nodata),
+        |res_idx, cell_u64, weight, val| {
             let float_val = val.to_f64_val();
-
-            if sampling.is_single_point() {
-                let (x, y) = gt.pixel_center_to_coord((chunk.col_offset as usize) + c, row_idx);
-                let (lon, lat) = match crs_transformer.transform_point(x, y) {
-                    Ok(coords) => coords,
-                    Err(_) => continue,
-                };
-
-                if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                    if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
-                        continue;
+            chunk_maps[res_idx]
+                .entry(cell_u64)
+                .and_modify(|acc| {
+                    if weight == 1.0 {
+                        acc.update(float_val);
+                    } else {
+                        acc.update_weighted(float_val, weight);
                     }
-                }
-
-                if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
-                    continue;
-                }
-
-                if let Ok(ll) = LatLng::new(lat, lon) {
-                    for res_idx in 0..num_res {
-                        let res = resolutions[res_idx];
-                        let cell_u64: u64 = ll.to_cell(res).into();
-                        chunk_maps[res_idx]
-                            .entry(cell_u64)
-                            .and_modify(|acc| acc.update(float_val))
-                            .or_insert_with(|| {
-                                let mut acc = if track_quantiles {
-                                    H3Accumulator::with_quantiles()
-                                } else {
-                                    H3Accumulator::default()
-                                };
-                                acc.update(float_val);
-                                acc
-                            });
+                })
+                .or_insert_with(|| {
+                    let mut acc = if track_quantiles {
+                        H3Accumulator::with_quantiles()
+                    } else {
+                        H3Accumulator::default()
+                    };
+                    if weight == 1.0 {
+                        acc.update(float_val);
+                    } else {
+                        acc.update_weighted(float_val, weight);
                     }
-                }
-            } else {
-                for sp in &sampling.points {
-                    let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
-                    let py = (chunk.row_offset as f64) + (r as f64) + sp.dy;
-                    let (x, y) = gt.pixel_to_coord(px, py);
-                    if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
-                        if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                            if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
-                                continue;
-                            }
-                        }
-
-                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
-                            continue;
-                        }
-
-                        if let Ok(ll) = LatLng::new(lat, lon) {
-                            for res_idx in 0..num_res {
-                                let res = resolutions[res_idx];
-                                let cell_u64: u64 = ll.to_cell(res).into();
-                                chunk_maps[res_idx]
-                                    .entry(cell_u64)
-                                    .and_modify(|acc| acc.update_weighted(float_val, sp.weight))
-                                    .or_insert_with(|| {
-                                        let mut acc = if track_quantiles {
-                                            H3Accumulator::with_quantiles()
-                                        } else {
-                                            H3Accumulator::default()
-                                        };
-                                        acc.update_weighted(float_val, sp.weight);
-                                        acc
-                                    });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+                    acc
+                });
+        },
+    );
 }
 
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
@@ -204,25 +125,17 @@ fn process_continuous_slice_into_maps<T>(
         return;
     }
 
-    let is_wgs84 = matches!(crs_transformer, CrsTransformer::Wgs84Identity);
-    let is_web_mercator = matches!(crs_transformer, CrsTransformer::WebMercatorFast);
-    let d_lon_step = if is_wgs84 {
-        gt.a
-    } else if is_web_mercator {
-        (gt.a / WGS84_A) * RAD_TO_DEG
-    } else {
-        0.0
-    };
-
-    let stride = if chunk_stride > 0 && slice.len() >= chunk_stride as usize {
-        chunk_stride as usize
-    } else {
-        (chunk.width as usize).max(1)
-    };
-    let actual_rows = (slice.len() / stride).min(chunk.height as usize);
+    let geom_ctx = RowGeometryContext::new(chunk, slice.len(), chunk_stride, crs_transformer, gt);
+    let RowGeometryContext {
+        is_wgs84,
+        is_web_mercator,
+        is_north_up,
+        d_lon_step,
+        dx_step,
+        stride,
+        actual_rows,
+    } = geom_ctx;
     let num_res = resolutions.len();
-    let is_north_up = gt.b == 0.0 && gt.d == 0.0;
-    let dx_step = gt.a;
 
     let mut row_caches: Vec<H3ScanlineLookahead> = resolutions
         .iter()
@@ -265,108 +178,35 @@ fn process_continuous_slice_into_maps<T>(
             continue;
         }
 
-        let (x_start, y_row) = gt.pixel_center_to_coord(chunk.col_offset as usize, row_idx);
-            let (lon_start, lat_row) = if is_wgs84 {
-                (x_start, y_row)
-            } else if is_web_mercator {
-                let lat = (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2)
-                    * RAD_TO_DEG;
-                let lon = (x_start / WGS84_A) * RAD_TO_DEG;
-                (lon, lat)
-            } else {
-                match crs_transformer.transform_point(x_start, y_row) {
-                    Ok(coords) => coords,
-                    Err(_) => (x_start, y_row),
-                }
-            };
+        let coords = match RowCoordinates::compute(
+            r,
+            chunk,
+            row_width,
+            &geom_ctx,
+            gt,
+            crs_transformer,
+            sampling,
+            bbox,
+        ) {
+            Some(c) => c,
+            None => continue,
+        };
 
-            let (d_lon_dx, d_lat_dx, d_lon_dy, d_lat_dy) = if !is_single_point {
-                if is_wgs84 {
-                    (gt.a, gt.d, gt.b, gt.e)
-                } else if is_web_mercator {
-                    let lon_dx = ((x_start + gt.a) / WGS84_A) * RAD_TO_DEG;
-                    let lat_dy = (2.0 * ((y_row + gt.e) / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
-                    (lon_dx - lon_start, 0.0, 0.0, lat_dy - lat_row)
-                } else {
-                    let (lon_x, lat_x) = match crs_transformer.transform_point(x_start + dx_step, y_row) {
-                        Ok(coords) => coords,
-                        Err(_) => (lon_start, lat_row),
-                    };
-                    let (lon_y, lat_y) = match crs_transformer.transform_point(x_start, y_row + gt.e) {
-                        Ok(coords) => coords,
-                        Err(_) => (lon_start, lat_row),
-                    };
-                    (lon_x - lon_start, lat_x - lat_row, lon_y - lon_start, lat_y - lat_row)
-                }
-            } else {
-                (0.0, 0.0, 0.0, 0.0)
-            };
-
-            if is_wgs84 || is_web_mercator {
-                if let Some([_, b_min_lat, _, b_max_lat]) = bbox {
-                    if lat_row < b_min_lat || lat_row > b_max_lat {
-                        continue;
-                    }
-                }
-            }
-
-            let (row_c_start, row_c_end) = if (is_wgs84 || is_web_mercator) && bbox.is_some() {
-                let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
-                if d_lon_step > 0.0 {
-                    let c_s = if lon_start < b_min_lon {
-                        ((b_min_lon - lon_start) / d_lon_step).ceil().max(0.0) as usize
-                    } else {
-                        0
-                    };
-                    let c_e = if lon_start < b_max_lon {
-                        (((b_max_lon - lon_start) / d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
-                    } else {
-                        0
-                    };
-                    (c_s, c_e)
-                } else if d_lon_step < 0.0 {
-                    let c_s = if lon_start > b_max_lon {
-                        ((b_max_lon - lon_start) / d_lon_step).ceil().max(0.0) as usize
-                    } else {
-                        0
-                    };
-                    let c_e = if lon_start > b_min_lon {
-                        (((b_min_lon - lon_start) / d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
-                    } else {
-                        0
-                    };
-                    (c_s, c_e)
-                } else {
-                    (0, row_width)
-                }
-            } else {
-                (0, row_width)
-            };
-
-            if row_c_start >= row_c_end || row_c_start >= row_width {
-                continue;
-            }
-
-            let cos_lat = lat_row.to_radians().cos();
-            let cos_lat_sq = cos_lat * cos_lat;
-
-            let px_diag_m = if !is_single_point {
-                if is_wgs84 {
-                    let dx_m = d_lon_step.abs() * 111_320.0 * cos_lat;
-                    let dy_m = gt.e.abs() * 110_540.0;
-                    dx_m.hypot(dy_m)
-                } else if is_web_mercator {
-                    let dx_m = d_lon_step.abs() * 111_320.0 * cos_lat;
-                    let dy_m = d_lat_dy.abs() * 110_540.0;
-                    dx_m.hypot(dy_m)
-                } else {
-                    let dx_m = (d_lon_dx * cos_lat).hypot(d_lat_dx) * 111_320.0;
-                    let dy_m = (d_lon_dy * cos_lat).hypot(d_lat_dy) * 110_540.0;
-                    dx_m.hypot(dy_m)
-                }
-            } else {
-                0.0
-            };
+        let RowCoordinates {
+            x_start,
+            y_row,
+            lon_start,
+            lat_row,
+            d_lon_dx,
+            d_lat_dx,
+            d_lon_dy,
+            d_lat_dy,
+            row_c_start,
+            row_c_end,
+            cos_lat_sq,
+            px_diag_m,
+            ..
+        } = coords;
 
             if num_res == 1 {
                 for res_idx in 0..num_res {
