@@ -19,7 +19,7 @@ use parquet::basic::{Compression, Encoding};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
 use parquet::file::properties::{WriterProperties, WriterVersion};
-use parquet::file::writer::SerializedFileWriter;
+use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 
@@ -81,6 +81,87 @@ impl ParquetStreamer for MultiCategoricalHorizonStreamer {
     {
         self.drain_completed_into(max_rows, consumer)
     }
+}
+
+#[inline]
+fn compute_sort_permutation(h3_indices: &[i64]) -> Option<Vec<usize>> {
+    let n = h3_indices.len();
+    if n <= 1 {
+        return None;
+    }
+    let mut already_sorted = true;
+    for i in 1..n {
+        if h3_indices[i] < h3_indices[i - 1] {
+            already_sorted = false;
+            break;
+        }
+    }
+    if already_sorted {
+        return None;
+    }
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_unstable_by_key(|&i| h3_indices[i]);
+    Some(perm)
+}
+
+#[inline]
+fn reorder_by_perm<T: Copy>(vec: &mut Vec<T>, perm: &[usize]) {
+    let mut reordered = Vec::with_capacity(perm.len());
+    for &i in perm {
+        reordered.push(vec[i]);
+    }
+    *vec = reordered;
+}
+
+#[inline]
+fn reorder_by_perm_take<T: Default>(vec: &mut Vec<T>, perm: &[usize]) {
+    let mut reordered = Vec::with_capacity(perm.len());
+    for &i in perm {
+        reordered.push(std::mem::take(&mut vec[i]));
+    }
+    *vec = reordered;
+}
+
+#[inline(always)]
+fn write_i64_column(
+    row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
+    values: &[i64],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(ref mut typed) = col_writer.untyped() {
+            typed.write_batch(values, None, None)?;
+        }
+        col_writer.close()?;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn write_f64_column(
+    row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
+    values: &[f64],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
+            typed.write_batch(values, None, None)?;
+        }
+        col_writer.close()?;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn write_byte_array_column(
+    row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
+    values: &[ByteArray],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(ref mut typed) = col_writer.untyped() {
+            typed.write_batch(values, None, None)?;
+        }
+        col_writer.close()?;
+    }
+    Ok(())
 }
 
 /// Common trait for Parquet row group column buffers (continuous and categorical)
@@ -196,59 +277,21 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
     }
 
     fn sort_by_h3_index(&mut self) {
-        let n = self.h3_indices.len();
-        if n <= 1 {
-            return;
-        }
+        let perm = match compute_sort_permutation(&self.h3_indices) {
+            Some(p) => p,
+            None => return,
+        };
 
-        let mut already_sorted = true;
-        for i in 1..n {
-            if self.h3_indices[i] < self.h3_indices[i - 1] {
-                already_sorted = false;
-                break;
-            }
-        }
-        if already_sorted {
-            return;
-        }
-
-        let mut perm: Vec<usize> = (0..n).collect();
-        perm.sort_unstable_by_key(|&i| self.h3_indices[i]);
-
-        let mut sorted_indices = Vec::with_capacity(n);
-        let mut sorted_min = Vec::with_capacity(n);
-        let mut sorted_max = Vec::with_capacity(n);
-        let mut sorted_sum = Vec::with_capacity(n);
-        let mut sorted_avg = Vec::with_capacity(n);
-        let mut sorted_cnt = Vec::with_capacity(n);
-        let mut sorted_hexes = if self.compact { Vec::new() } else { Vec::with_capacity(n) };
-        let mut sorted_lats = if self.compact { Vec::new() } else { Vec::with_capacity(n) };
-        let mut sorted_lngs = if self.compact { Vec::new() } else { Vec::with_capacity(n) };
-
-        for &i in &perm {
-            sorted_indices.push(self.h3_indices[i]);
-            sorted_min.push(self.min_values[i]);
-            sorted_max.push(self.max_values[i]);
-            sorted_sum.push(self.sum_values[i]);
-            sorted_avg.push(self.avg_values[i]);
-            sorted_cnt.push(self.pixel_counts[i]);
-            if !self.compact {
-                sorted_hexes.push(std::mem::replace(&mut self.h3_hexes[i], ByteArray::from("")));
-                sorted_lats.push(self.lats[i]);
-                sorted_lngs.push(self.lngs[i]);
-            }
-        }
-
-        self.h3_indices = sorted_indices;
-        self.min_values = sorted_min;
-        self.max_values = sorted_max;
-        self.sum_values = sorted_sum;
-        self.avg_values = sorted_avg;
-        self.pixel_counts = sorted_cnt;
+        reorder_by_perm(&mut self.h3_indices, &perm);
+        reorder_by_perm(&mut self.min_values, &perm);
+        reorder_by_perm(&mut self.max_values, &perm);
+        reorder_by_perm(&mut self.sum_values, &perm);
+        reorder_by_perm(&mut self.avg_values, &perm);
+        reorder_by_perm(&mut self.pixel_counts, &perm);
         if !self.compact {
-            self.h3_hexes = sorted_hexes;
-            self.lats = sorted_lats;
-            self.lngs = sorted_lngs;
+            reorder_by_perm_take(&mut self.h3_hexes, &perm);
+            reorder_by_perm(&mut self.lats, &perm);
+            reorder_by_perm(&mut self.lngs, &perm);
         }
     }
 
@@ -258,80 +301,18 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut row_group_writer = writer.next_row_group()?;
 
-        // Col 0: h3_index
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.h3_indices, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
+        write_i64_column(&mut row_group_writer, &self.h3_indices)?;
         if !self.compact {
-            // Col 1: h3_hex
-            if let Some(mut col_writer) = row_group_writer.next_column()? {
-                if let ColumnWriter::ByteArrayColumnWriter(ref mut typed) = col_writer.untyped() {
-                    typed.write_batch(&self.h3_hexes, None, None)?;
-                }
-                col_writer.close()?;
-            }
+            write_byte_array_column(&mut row_group_writer, &self.h3_hexes)?;
         }
-
-        // min_value
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.min_values, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // max_value
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.max_values, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // sum_value
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.sum_values, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // avg_value
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.avg_values, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // pixel_count
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.pixel_counts, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
+        write_f64_column(&mut row_group_writer, &self.min_values)?;
+        write_f64_column(&mut row_group_writer, &self.max_values)?;
+        write_f64_column(&mut row_group_writer, &self.sum_values)?;
+        write_f64_column(&mut row_group_writer, &self.avg_values)?;
+        write_f64_column(&mut row_group_writer, &self.pixel_counts)?;
         if !self.compact {
-            // lat
-            if let Some(mut col_writer) = row_group_writer.next_column()? {
-                if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                    typed.write_batch(&self.lats, None, None)?;
-                }
-                col_writer.close()?;
-            }
-
-            // lng
-            if let Some(mut col_writer) = row_group_writer.next_column()? {
-                if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                    typed.write_batch(&self.lngs, None, None)?;
-                }
-                col_writer.close()?;
-            }
+            write_f64_column(&mut row_group_writer, &self.lats)?;
+            write_f64_column(&mut row_group_writer, &self.lngs)?;
         }
 
         row_group_writer.close()?;
@@ -448,59 +429,21 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     }
 
     fn sort_by_h3_index(&mut self) {
-        let n = self.h3_indices.len();
-        if n <= 1 {
-            return;
-        }
+        let perm = match compute_sort_permutation(&self.h3_indices) {
+            Some(p) => p,
+            None => return,
+        };
 
-        let mut already_sorted = true;
-        for i in 1..n {
-            if self.h3_indices[i] < self.h3_indices[i - 1] {
-                already_sorted = false;
-                break;
-            }
-        }
-        if already_sorted {
-            return;
-        }
-
-        let mut perm: Vec<usize> = (0..n).collect();
-        perm.sort_unstable_by_key(|&i| self.h3_indices[i]);
-
-        let mut sorted_indices = Vec::with_capacity(n);
-        let mut sorted_majorities = Vec::with_capacity(n);
-        let mut sorted_fractions = Vec::with_capacity(n);
-        let mut sorted_pixel_counts = Vec::with_capacity(n);
-        let mut sorted_distinct = Vec::with_capacity(n);
-        let mut sorted_entropies = Vec::with_capacity(n);
-        let mut sorted_hexes = if self.compact { Vec::new() } else { Vec::with_capacity(n) };
-        let mut sorted_lats = if self.compact { Vec::new() } else { Vec::with_capacity(n) };
-        let mut sorted_lngs = if self.compact { Vec::new() } else { Vec::with_capacity(n) };
-
-        for &i in &perm {
-            sorted_indices.push(self.h3_indices[i]);
-            sorted_majorities.push(self.majorities[i]);
-            sorted_fractions.push(self.fractions[i]);
-            sorted_pixel_counts.push(self.pixel_counts[i]);
-            sorted_distinct.push(self.distinct_classes[i]);
-            sorted_entropies.push(self.entropies[i]);
-            if !self.compact {
-                sorted_hexes.push(std::mem::replace(&mut self.h3_hexes[i], ByteArray::from("")));
-                sorted_lats.push(self.lats[i]);
-                sorted_lngs.push(self.lngs[i]);
-            }
-        }
-
-        self.h3_indices = sorted_indices;
-        self.majorities = sorted_majorities;
-        self.fractions = sorted_fractions;
-        self.pixel_counts = sorted_pixel_counts;
-        self.distinct_classes = sorted_distinct;
-        self.entropies = sorted_entropies;
+        reorder_by_perm(&mut self.h3_indices, &perm);
+        reorder_by_perm(&mut self.majorities, &perm);
+        reorder_by_perm(&mut self.fractions, &perm);
+        reorder_by_perm(&mut self.pixel_counts, &perm);
+        reorder_by_perm(&mut self.distinct_classes, &perm);
+        reorder_by_perm(&mut self.entropies, &perm);
         if !self.compact {
-            self.h3_hexes = sorted_hexes;
-            self.lats = sorted_lats;
-            self.lngs = sorted_lngs;
+            reorder_by_perm_take(&mut self.h3_hexes, &perm);
+            reorder_by_perm(&mut self.lats, &perm);
+            reorder_by_perm(&mut self.lngs, &perm);
         }
     }
 
@@ -510,80 +453,18 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut row_group_writer = writer.next_row_group()?;
 
-        // Col 0: h3_index
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.h3_indices, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
+        write_i64_column(&mut row_group_writer, &self.h3_indices)?;
         if !self.compact {
-            // Col 1: h3_hex
-            if let Some(mut col_writer) = row_group_writer.next_column()? {
-                if let ColumnWriter::ByteArrayColumnWriter(ref mut typed) = col_writer.untyped() {
-                    typed.write_batch(&self.h3_hexes, None, None)?;
-                }
-                col_writer.close()?;
-            }
+            write_byte_array_column(&mut row_group_writer, &self.h3_hexes)?;
         }
-
-        // majority
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.majorities, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // majority_fraction
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.fractions, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // pixel_count
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.pixel_counts, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // distinct_classes
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.distinct_classes, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // entropy
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                typed.write_batch(&self.entropies, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
+        write_i64_column(&mut row_group_writer, &self.majorities)?;
+        write_f64_column(&mut row_group_writer, &self.fractions)?;
+        write_f64_column(&mut row_group_writer, &self.pixel_counts)?;
+        write_i64_column(&mut row_group_writer, &self.distinct_classes)?;
+        write_f64_column(&mut row_group_writer, &self.entropies)?;
         if !self.compact {
-            // lat
-            if let Some(mut col_writer) = row_group_writer.next_column()? {
-                if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                    typed.write_batch(&self.lats, None, None)?;
-                }
-                col_writer.close()?;
-            }
-
-            // lng
-            if let Some(mut col_writer) = row_group_writer.next_column()? {
-                if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-                    typed.write_batch(&self.lngs, None, None)?;
-                }
-                col_writer.close()?;
-            }
+            write_f64_column(&mut row_group_writer, &self.lats)?;
+            write_f64_column(&mut row_group_writer, &self.lngs)?;
         }
 
         row_group_writer.close()?;
