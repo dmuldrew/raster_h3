@@ -22,7 +22,7 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
-    add_named_parameter, add_positional_parameter, BindHelper, ChunkWriter,
+    add_named_parameter, add_positional_parameter, delete_boxed, BindHelper, ChunkWriter,
 };
 use crate::parquet::{H3ParquetWriter, ParquetExportConfig};
 
@@ -44,18 +44,6 @@ pub struct ParquetBindData {
 /// Global execution state for the single-row generator
 pub struct ParquetGlobalData {
     pub executed: AtomicBool,
-}
-
-unsafe extern "C" fn delete_parquet_bind_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut ParquetBindData));
-    }
-}
-
-unsafe extern "C" fn delete_parquet_global_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut ParquetGlobalData));
-    }
 }
 
 /// Bind callback: parses input arguments and defines output table schema
@@ -137,7 +125,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
         row_group_size,
         bbox,
     });
-    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_parquet_bind_data));
+    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<ParquetBindData>));
 }
 
 /// Init callback
@@ -145,7 +133,7 @@ pub unsafe extern "C" fn parquet_init(info: duckdb_init_info) {
     let global_data = Box::new(ParquetGlobalData {
         executed: AtomicBool::new(false),
     });
-    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_parquet_global_data));
+    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_boxed::<ParquetGlobalData>));
 }
 
 /// Scan callback: runs GeoTIFF-to-Parquet conversion and streams the single summary row

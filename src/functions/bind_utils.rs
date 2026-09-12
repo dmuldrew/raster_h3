@@ -4,7 +4,8 @@
 //! Centralizes parameter extraction, type conversion, bounding box resolution, and column definitions
 //! across continuous, categorical, parquet, and pmtiles table functions.
 
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
+use std::path::PathBuf;
 
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::{
@@ -12,12 +13,14 @@ use crate::ffi::{
     duckdb_bind_get_parameter_count, duckdb_bind_info, duckdb_bind_set_error,
     duckdb_create_logical_type, duckdb_data_chunk, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size, duckdb_destroy_logical_type, duckdb_get_bool, duckdb_get_double,
-    duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_logical_type,
+    duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_init_get_column_count,
+    duckdb_init_get_column_index, duckdb_init_info, duckdb_init_set_init_data, duckdb_logical_type,
     duckdb_table_function, duckdb_table_function_add_named_parameter,
     duckdb_table_function_add_parameter, duckdb_value, duckdb_vector,
     duckdb_vector_assign_string_element, duckdb_vector_assign_string_element_len,
     duckdb_vector_get_data, from_duckdb_string, idx_t, to_c_string, DuckDBType,
 };
+use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::mosaic::OverlapRule;
 
 /// Ergonomic, safe wrapper around DuckDB's `duckdb_bind_info`
@@ -276,6 +279,56 @@ impl BindHelper {
             .or_else(|| self.get_named_int("threads"))
             .and_then(|w| if w > 0 { Some(w as usize) } else { None })
     }
+
+    /// Parse common raster parameters shared across continuous and categorical aggregations
+    pub fn parse_common_raster_params(&self, func_name: &str) -> Option<CommonRasterParams> {
+        if self.parameter_count() < 1 {
+            self.set_error(&format!("{} requires at least 1 argument: file_path", func_name));
+            return None;
+        }
+
+        let file_path = match self.get_string_param(0) {
+            Some(p) => p,
+            None => {
+                self.set_error("Invalid file_path parameter");
+                return None;
+            }
+        };
+
+        let resolutions = self.parse_resolutions(8, Some(1));
+        let source_crs = self.parse_source_crs();
+        let nodata = self.get_named_double("nodata");
+        let chunk_size = self.get_named_int("chunk_size").filter(|&cs| cs > 0).unwrap_or(512) as u32;
+        let band = self.get_named_int("band").filter(|&b| b > 0).unwrap_or(1) as u32;
+        let sampling = self.parse_sampling();
+        let bbox = self.parse_bbox();
+        let compact = self.get_named_bool("compact").unwrap_or(false);
+        let overlap_rule = self.parse_overlap_rule();
+        let emit_geom = self.get_named_bool("geom").unwrap_or_else(crate::ffi::is_geometry_available);
+
+        let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
+            Ok(paths) => paths,
+            Err(e) => {
+                self.set_error(&format!("Failed to resolve raster source(s): {}", e));
+                return None;
+            }
+        };
+
+        Some(CommonRasterParams {
+            file_path,
+            resolved_paths,
+            resolutions,
+            source_crs,
+            nodata,
+            chunk_size,
+            band,
+            sampling,
+            bbox,
+            compact,
+            overlap_rule,
+            emit_geom,
+        })
+    }
 }
 
 // =============================================================================
@@ -283,49 +336,32 @@ impl BindHelper {
 // =============================================================================
 
 /// Standard parameters common to all raster aggregation table functions
-pub struct CommonRasterBindParams {
+#[derive(Debug, Clone)]
+pub struct CommonRasterParams {
     pub file_path: String,
+    pub resolved_paths: Vec<PathBuf>,
     pub resolutions: Vec<u8>,
-    pub band: usize,
-    pub custom_nodata: Option<f64>,
     pub source_crs: Option<String>,
+    pub nodata: Option<f64>,
+    pub chunk_size: u32,
+    pub band: u32,
     pub sampling: SamplingPattern,
     pub bbox: Option<[f64; 4]>,
-    pub overlap_rule: OverlapRule,
     pub compact: bool,
+    pub overlap_rule: OverlapRule,
+    pub emit_geom: bool,
 }
 
-impl CommonRasterBindParams {
+pub type CommonRasterBindParams = CommonRasterParams;
+
+impl CommonRasterParams {
     /// Extract all common raster parameters from bind context
     pub fn extract(bind: &BindHelper, func_name: &str, default_compact: bool) -> Option<Self> {
-        let file_path = match bind.get_string_param(0) {
-            Some(p) => p,
-            None => {
-                bind.set_error(&format!("{} requires at least 1 argument: file_path", func_name));
-                return None;
-            }
-        };
-
-        let resolutions = bind.parse_resolutions(8, Some(1));
-        let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
-        let custom_nodata = bind.get_named_double("nodata");
-        let source_crs = bind.parse_source_crs();
-        let sampling = bind.parse_sampling();
-        let bbox = bind.parse_bbox();
-        let overlap_rule = bind.parse_overlap_rule();
-        let compact = bind.get_named_bool("compact").unwrap_or(default_compact);
-
-        Some(Self {
-            file_path,
-            resolutions,
-            band,
-            custom_nodata,
-            source_crs,
-            sampling,
-            bbox,
-            overlap_rule,
-            compact,
-        })
+        let mut params = bind.parse_common_raster_params(func_name)?;
+        if bind.get_named_bool("compact").is_none() {
+            params.compact = default_compact;
+        }
+        Some(params)
     }
 }
 
@@ -479,6 +515,95 @@ impl ChunkWriter {
 }
 
 // =============================================================================
+// Cardinality Estimation & Table Function Lifecycle Helpers
+// =============================================================================
+
+/// Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
+pub const H3_AREA_M2: [f64; 16] = [
+    4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
+    3.613e7, 5.161e6, 7.373e5, 1.053e5, 1.505e4, 2.150e3,
+    3.071e2, 4.387e1, 6.268e0, 8.954e-1,
+];
+
+/// Estimate query cardinality (number of H3 cells emitted) for a set of raster sources and resolutions
+pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8]) -> u64 {
+    if let Some(first_path) = resolved_paths.first() {
+        if let Ok(reader) = GeoTiffStreamReader::open(first_path) {
+            let w = reader.metadata.width as f64;
+            let h = reader.metadata.height as f64;
+            let total_pixels = (w * h) as u64 * resolved_paths.len() as u64;
+
+            let (x0, y0) = reader.metadata.geotransform.pixel_to_coord(0.0, 0.0);
+            let (x1, y1) = reader.metadata.geotransform.pixel_to_coord(w, h);
+            let dx = (x1 - x0).abs();
+            let dy = (y1 - y0).abs();
+
+            let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
+                dx * 111_320.0 * dy * 110_540.0 * resolved_paths.len() as f64
+            } else {
+                dx * dy * resolved_paths.len() as f64
+            };
+
+            let mut total_hex_est = 0u64;
+            for &res in resolutions {
+                let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
+                let hex_count = (area_m2 / hex_area).ceil() as u64;
+                total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
+            }
+            total_hex_est.max(1)
+        } else {
+            10_000 * resolutions.len() as u64
+        }
+    } else {
+        10_000 * resolutions.len() as u64
+    }
+}
+
+/// Generic C-compatible deallocator for Box<T> allocated data pointers
+pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
+    if !data.is_null() {
+        drop(Box::from_raw(data as *mut T));
+    }
+}
+
+/// Unified thread-local state for table function execution, carrying reusable scratch buffers for hex string and WKB encoding
+pub struct TableFunctionLocalData {
+    pub thread_id: usize,
+    pub hex_buf: [u8; 16],
+    pub wkb_buf: [u8; 128],
+}
+
+impl Default for TableFunctionLocalData {
+    fn default() -> Self {
+        Self {
+            thread_id: 0,
+            hex_buf: [0u8; 16],
+            wkb_buf: [0u8; 128],
+        }
+    }
+}
+
+/// Standard thread-local initialization callback for DuckDB table functions
+pub unsafe extern "C" fn init_table_function_local(info: duckdb_init_info) {
+    let local_data = Box::new(TableFunctionLocalData::default());
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(local_data) as *mut c_void,
+        Some(delete_boxed::<TableFunctionLocalData>),
+    );
+}
+
+/// Extract projected column indices requested by DuckDB projection pushdown
+pub unsafe fn extract_projected_columns(info: duckdb_init_info) -> Vec<usize> {
+    let col_count = duckdb_init_get_column_count(info);
+    let mut projected_columns = Vec::with_capacity(col_count as usize);
+    for i in 0..col_count {
+        projected_columns.push(duckdb_init_get_column_index(info, i) as usize);
+    }
+    projected_columns
+}
+
+// =============================================================================
 // Pure Parsing Helpers & Unit Tests
 // =============================================================================
 
@@ -536,6 +661,40 @@ mod tests {
         assert_eq!(parse_bbox_str("-122.5,37.5,-122.0"), None);
         assert_eq!(parse_bbox_str("not,a,bbox,coords"), None);
         assert_eq!(parse_bbox_str(""), None);
+    }
+
+    #[test]
+    fn test_estimate_raster_cardinality_fallback() {
+        let empty_paths: Vec<PathBuf> = Vec::new();
+        let resolutions = vec![8, 9];
+        assert_eq!(estimate_raster_cardinality(&empty_paths, &resolutions), 20_000);
+
+        let non_existent = vec![PathBuf::from("/non/existent/path.tif")];
+        assert_eq!(estimate_raster_cardinality(&non_existent, &resolutions), 20_000);
+    }
+
+    #[test]
+    fn test_delete_boxed_and_local_data() {
+        struct TestDropCounter(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for TestDropCounter {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let boxed = Box::new(TestDropCounter(dropped.clone()));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe {
+            delete_boxed::<TestDropCounter>(raw);
+            delete_boxed::<TestDropCounter>(std::ptr::null_mut());
+        }
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        let local = TableFunctionLocalData::default();
+        assert_eq!(local.thread_id, 0);
+        assert_eq!(local.hex_buf.len(), 16);
+        assert_eq!(local.wkb_buf.len(), 128);
     }
 }
 

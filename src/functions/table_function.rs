@@ -10,12 +10,12 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
-    add_named_parameter, add_positional_parameter, register_common_raster_named_parameters,
-    BindHelper, ChunkWriter,
+    add_named_parameter, add_positional_parameter, delete_boxed, estimate_raster_cardinality,
+    extract_projected_columns, init_table_function_local, register_common_raster_named_parameters,
+    BindHelper, ChunkWriter, TableFunctionLocalData,
 };
 use crate::functions::fast_hex::fast_hex_u64;
 use crate::functions::wkb::h3_index_to_wkb;
-use crate::raster::geotiff::GeoTiffStreamReader;
 
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
@@ -48,56 +48,18 @@ pub struct RasterH3GlobalData {
     pub emit_geom: bool,
 }
 
-/// Thread-local state for parallel DuckDB execution threads
-pub struct RasterH3LocalData {
-    pub thread_id: usize,
-    pub hex_buf: [u8; 16],
-    pub wkb_buf: [u8; 128],
-}
-
-unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut RasterH3BindData));
-    }
-}
-
-unsafe extern "C" fn delete_global_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut RasterH3GlobalData));
-    }
-}
-
-unsafe extern "C" fn delete_local_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut RasterH3LocalData));
-    }
-}
+/// Thread-local state for parallel DuckDB execution threads (scratch buffers for hex string and WKB encoding)
+pub type RasterH3LocalData = TableFunctionLocalData;
 
 /// Bind callback: parses input arguments, defines output columns, and returns bind data
 pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let bind = BindHelper::new(info);
-    if bind.parameter_count() < 1 {
-        bind.set_error("h3_raster_continuous_aggregate requires at least 1 argument: file_path");
-        return;
-    }
-
-    let file_path = match bind.get_string_param(0) {
-        Some(s) => s,
-        None => {
-            bind.set_error("Invalid file_path parameter");
-            return;
-        }
+    let common = match bind.parse_common_raster_params("h3_raster_continuous_aggregate") {
+        Some(p) => p,
+        None => return,
     };
 
-    let resolutions = bind.parse_resolutions(8, Some(1));
-    let source_crs = bind.parse_source_crs();
-    let nodata = bind.get_named_double("nodata");
-    let chunk_size = bind.get_named_int("chunk_size").filter(|&cs| cs > 0).unwrap_or(512) as u32;
-    let band = bind.get_named_int("band").filter(|&b| b > 0).unwrap_or(1) as u32;
-    let sampling = bind.parse_sampling();
-    let bbox = bind.parse_bbox();
-
-    // Named parameter: formula (VARCHAR)
+    // Continuous-specific named parameter: formula (VARCHAR)
     let formula_str = bind.get_named_string("formula");
     let nir_band = bind.get_named_int("nir_band").filter(|&b| b > 0).unwrap_or(4) as usize;
     let red_band = bind.get_named_int("red_band").filter(|&b| b > 0).unwrap_or(3) as usize;
@@ -114,8 +76,6 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let min_count = bind.get_named_double("min_count");
     let min_mean = bind.get_named_double("min_mean");
     let max_mean = bind.get_named_double("max_mean");
-    let compact = bind.get_named_bool("compact").unwrap_or(false);
-    let overlap_rule = bind.parse_overlap_rule();
 
     let mut quantiles = Vec::new();
     let q_param_val = bind.get_named_string("quantiles").or_else(|| bind.get_named_string("percentiles"));
@@ -129,16 +89,6 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         }
     }
 
-    let emit_geom = bind.get_named_bool("geom").unwrap_or_else(crate::ffi::is_geometry_available);
-
-    let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
-        Ok(paths) => paths,
-        Err(e) => {
-            bind.set_error(&format!("Failed to resolve raster source(s): {}", e));
-            return;
-        }
-    };
-
     // Add Output Columns:
     bind.add_result_column("h3_index", DuckDBType::UBigInt);
     bind.add_result_column("h3_hex", DuckDBType::Varchar);
@@ -151,7 +101,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     bind.add_result_column("resolution", DuckDBType::UTinyInt);
     bind.add_result_column("wkb", DuckDBType::Blob);
 
-    if emit_geom {
+    if common.emit_geom {
         let mut type_geom = crate::ffi::create_geometry_logical_type();
         bind.add_custom_result_column("geom", type_geom);
         duckdb_destroy_logical_type(&mut type_geom);
@@ -161,70 +111,33 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         bind.add_result_column(target.column_name(), DuckDBType::Double);
     }
 
-    // Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
-    const H3_AREA_M2: [f64; 16] = [
-        4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
-        3.613e7, 5.161e6, 7.373e5, 1.053e5, 1.505e4, 2.150e3,
-        3.071e2, 4.387e1, 6.268e0, 8.954e-1,
-    ];
-
-    let estimated_cardinality = if let Some(first_path) = resolved_paths.first() {
-        if let Ok(reader) = GeoTiffStreamReader::open(first_path) {
-            let w = reader.metadata.width as f64;
-            let h = reader.metadata.height as f64;
-            let total_pixels = (w * h) as u64 * resolved_paths.len() as u64;
-
-            let (x0, y0) = reader.metadata.geotransform.pixel_to_coord(0.0, 0.0);
-            let (x1, y1) = reader.metadata.geotransform.pixel_to_coord(w, h);
-            let dx = (x1 - x0).abs();
-            let dy = (y1 - y0).abs();
-
-            let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
-                dx * 111_320.0 * dy * 110_540.0 * resolved_paths.len() as f64
-            } else {
-                dx * dy * resolved_paths.len() as f64
-            };
-
-            let mut total_hex_est = 0u64;
-            for &res in &resolutions {
-                let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
-                let hex_count = (area_m2 / hex_area).ceil() as u64;
-                total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
-            }
-            total_hex_est.max(1)
-        } else {
-            10_000 * resolutions.len() as u64
-        }
-    } else {
-        10_000 * resolutions.len() as u64
-    };
-
+    let estimated_cardinality = estimate_raster_cardinality(&common.resolved_paths, &common.resolutions);
     duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
     let bind_data = Box::new(RasterH3BindData {
-        file_path,
-        resolved_paths,
-        overlap_rule,
-        resolutions,
-        source_crs,
-        nodata,
-        chunk_size,
-        bbox,
-        sampling,
-        band,
+        file_path: common.file_path,
+        resolved_paths: common.resolved_paths,
+        overlap_rule: common.overlap_rule,
+        resolutions: common.resolutions,
+        source_crs: common.source_crs,
+        nodata: common.nodata,
+        chunk_size: common.chunk_size,
+        bbox: common.bbox,
+        sampling: common.sampling,
+        band: common.band,
         spectral_formula,
         min_count,
         min_mean,
         max_mean,
-        compact,
+        compact: common.compact,
         quantiles,
-        emit_geom,
+        emit_geom: common.emit_geom,
     });
 
     duckdb_bind_set_bind_data(
         info,
         Box::into_raw(bind_data) as *mut c_void,
-        Some(delete_bind_data),
+        Some(delete_boxed::<RasterH3BindData>),
     );
 }
 
@@ -253,11 +166,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         }
     };
 
-    let col_count = duckdb_init_get_column_count(info);
-    let mut projected_columns = Vec::with_capacity(col_count as usize);
-    for i in 0..col_count {
-        projected_columns.push(duckdb_init_get_column_index(info, i) as usize);
-    }
+    let projected_columns = extract_projected_columns(info);
 
     let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
     config.overlap_rule = bind_data.overlap_rule;
@@ -295,22 +204,13 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     duckdb_init_set_init_data(
         info,
         Box::into_raw(global_data) as *mut c_void,
-        Some(delete_global_data),
+        Some(delete_boxed::<RasterH3GlobalData>),
     );
 }
 
 /// Thread-local init callback for multi-threaded parallel DuckDB execution
 pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
-    let local_data = Box::new(RasterH3LocalData {
-        thread_id: 0,
-        hex_buf: [0u8; 16],
-        wkb_buf: [0u8; 128],
-    });
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(local_data) as *mut c_void,
-        Some(delete_local_data),
-    );
+    init_table_function_local(info);
 }
 
 /// Scan callback: streaming vector emission directly from scanline horizon eviction with projection pushdown

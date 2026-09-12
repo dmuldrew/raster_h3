@@ -13,7 +13,7 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
-    add_named_parameter, add_positional_parameter, BindHelper, ChunkWriter,
+    add_named_parameter, add_positional_parameter, delete_boxed, BindHelper, ChunkWriter,
 };
 use crate::pmtiles::tiler::{h3_res_to_zoom, H3PmtilesTiler};
 
@@ -32,18 +32,6 @@ pub struct PmtilesBindData {
 /// Global execution state for the single-row generator
 pub struct PmtilesGlobalData {
     pub executed: AtomicBool,
-}
-
-unsafe extern "C" fn delete_bind_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut PmtilesBindData));
-    }
-}
-
-unsafe extern "C" fn delete_global_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut PmtilesGlobalData));
-    }
 }
 
 /// Declare output columns matching the PMTiles summary schema
@@ -104,7 +92,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
         is_categorical,
         properties,
     });
-    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_bind_data));
+    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<PmtilesBindData>));
 }
 
 /// Init callback
@@ -112,7 +100,7 @@ pub unsafe extern "C" fn pmtiles_init(info: duckdb_init_info) {
     let global_data = Box::new(PmtilesGlobalData {
         executed: AtomicBool::new(false),
     });
-    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_global_data));
+    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_boxed::<PmtilesGlobalData>));
 }
 
 /// Scan callback: runs GeoTIFF-to-PMTiles conversion and streams the single summary row
@@ -190,18 +178,6 @@ pub struct ParquetPmtilesGlobalData {
     pub executed: AtomicBool,
 }
 
-unsafe extern "C" fn delete_parquet_bind_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut ParquetPmtilesBindData));
-    }
-}
-
-unsafe extern "C" fn delete_parquet_global_data(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut ParquetPmtilesGlobalData));
-    }
-}
-
 /// Bind callback: parses input arguments for `h3_parquet_to_pmtiles`
 pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
     let bind = BindHelper::new(info);
@@ -239,7 +215,7 @@ pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
         output_pmtiles,
         h3_column,
     });
-    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_parquet_bind_data));
+    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<ParquetPmtilesBindData>));
 }
 
 /// Init callback for `h3_parquet_to_pmtiles`
@@ -247,7 +223,7 @@ pub unsafe extern "C" fn parquet_pmtiles_init(info: duckdb_init_info) {
     let global_data = Box::new(ParquetPmtilesGlobalData {
         executed: AtomicBool::new(false),
     });
-    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_parquet_global_data));
+    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_boxed::<ParquetPmtilesGlobalData>));
 }
 
 /// Scan callback: runs Parquet-to-PMTiles conversion and streams the single summary row

@@ -8,8 +8,9 @@ pub mod table_function;
 pub mod wkb;
 
 pub use bind_utils::{
-    add_named_parameter, add_positional_parameter, register_common_raster_named_parameters,
-    BindHelper, ChunkWriter, CommonRasterBindParams,
+    add_named_parameter, add_positional_parameter, delete_boxed, estimate_raster_cardinality,
+    extract_projected_columns, register_common_raster_named_parameters, BindHelper, ChunkWriter,
+    CommonRasterBindParams, CommonRasterParams, TableFunctionLocalData,
 };
 pub use categorical_table_function::register_categorical_table_function;
 pub use fast_hex::{fast_hex_u64, parse_hex_u64};
