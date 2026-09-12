@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use raster_h3::aggregator::{AggregationConfig, CategoricalHorizonStreamer, ScanHorizonStreamer};
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::GeoTiffStreamReader;

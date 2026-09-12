@@ -77,7 +77,13 @@ where
     }
 }
 
-/// Configuration options for raster-to-H3 aggregation
+/// Configuration options for raster-to-H3 aggregation.
+///
+/// Deprecated: Prefer [`MultiResolutionConfig`] via [`MultiResolutionConfig::single`].
+#[deprecated(
+    since = "0.2.0",
+    note = "AggregationConfig has been superseded by MultiResolutionConfig; use MultiResolutionConfig::single"
+)]
 #[derive(Debug, Clone)]
 pub struct AggregationConfig {
     pub resolution: u8,
@@ -88,6 +94,7 @@ pub struct AggregationConfig {
     pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
+#[allow(deprecated)]
 impl Default for AggregationConfig {
     fn default() -> Self {
         Self {
@@ -139,9 +146,10 @@ pub fn chunk_intersects_bbox(
     c_min_lon <= b_max_lon && c_max_lon >= b_min_lon && c_min_lat <= b_max_lat && c_max_lat >= b_min_lat
 }
 
+#[allow(deprecated)]
 impl From<&AggregationConfig> for MultiResolutionConfig {
     fn from(config: &AggregationConfig) -> Self {
-        let mut multi = MultiResolutionConfig::new(vec![config.resolution]);
+        let mut multi = MultiResolutionConfig::single(config.resolution);
         multi.custom_crs = config.custom_crs.clone();
         multi.custom_nodata = config.custom_nodata;
         multi.bbox = config.bbox;
@@ -153,10 +161,17 @@ impl From<&AggregationConfig> for MultiResolutionConfig {
 
 /// Streaming aggregator using Southernmost Scan-Line Horizon Eviction.
 /// Delegates to the optimized multi-resolution streaming engine.
+///
+/// Deprecated: Prefer [`MultiScanHorizonStreamer`] via [`MultiResolutionConfig::single`].
+#[deprecated(
+    since = "0.2.0",
+    note = "ScanHorizonStreamer has been superseded by MultiScanHorizonStreamer; use MultiScanHorizonStreamer with MultiResolutionConfig::single"
+)]
 pub struct ScanHorizonStreamer {
     inner: MultiScanHorizonStreamer,
 }
 
+#[allow(deprecated)]
 impl ScanHorizonStreamer {
     /// Initialize a new ScanHorizonStreamer with background async prefetching and bbox pruning
     pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {

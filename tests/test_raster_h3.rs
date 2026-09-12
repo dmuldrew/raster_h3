@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -2031,6 +2033,22 @@ fn test_categorical_simd_uniformity_types_and_spans() {
     assert!(f32::is_uniform(&zeros_f32));
     let zeros_f64 = vec![0.0f64, -0.0f64, 0.0f64, -0.0f64];
     assert!(f64::is_uniform(&zeros_f64));
+}
+
+#[test]
+fn test_multi_resolution_config_single_delegation() {
+    let single_cfg = raster_h3::aggregator::MultiResolutionConfig::single(8);
+    assert_eq!(single_cfg.resolutions, vec![8]);
+    assert_eq!(single_cfg.band, 1);
+    assert!(!single_cfg.track_quantiles());
+
+    let legacy_cfg = AggregationConfig {
+        resolution: 8,
+        ..Default::default()
+    };
+    let converted: raster_h3::aggregator::MultiResolutionConfig = (&legacy_cfg).into();
+    assert_eq!(converted.resolutions, vec![8]);
+    assert_eq!(converted.band, 1);
 }
 
 

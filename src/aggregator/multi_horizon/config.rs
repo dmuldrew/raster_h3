@@ -209,6 +209,11 @@ impl MultiResolutionConfig {
         }
     }
 
+    /// Create a single-resolution configuration (convenience constructor)
+    pub fn single(resolution: u8) -> Self {
+        Self::new(vec![resolution])
+    }
+
     /// Check whether streaming quantile calculations are enabled
     #[inline(always)]
     pub fn track_quantiles(&self) -> bool {

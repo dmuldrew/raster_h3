@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::path::Path;
 use std::time::Instant;
 use raster_h3::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use fxhash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 
+#[allow(deprecated)]
 use crate::aggregator::horizon_streamer::AggregationConfig;
 use crate::aggregator::multi_horizon::{MultiCategoricalHorizonStreamer, MultiResolutionConfig};
 use crate::error::Result;
@@ -232,10 +233,17 @@ impl CategoricalAccumulator {
 
 /// Streaming categorical aggregator using Southernmost Scan-Line Horizon Eviction.
 /// Delegates to the optimized multi-resolution categorical streaming engine.
+///
+/// Deprecated: Prefer [`MultiCategoricalHorizonStreamer`] via [`MultiResolutionConfig::single`].
+#[deprecated(
+    since = "0.2.0",
+    note = "CategoricalHorizonStreamer has been superseded by MultiCategoricalHorizonStreamer; use MultiCategoricalHorizonStreamer with MultiResolutionConfig::single"
+)]
 pub struct CategoricalHorizonStreamer {
     inner: MultiCategoricalHorizonStreamer,
 }
 
+#[allow(deprecated)]
 impl CategoricalHorizonStreamer {
     /// Initialize a new CategoricalHorizonStreamer with background async prefetching and bbox pruning
     pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {

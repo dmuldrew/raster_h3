@@ -7,6 +7,7 @@
 //! 4. Spatial ROI Bounding Box Pruning
 //! 5. Multi-Resolution Conservation & Scaling (Res 6 through 10)
 //! 6. Multi-Core Concurrency Scaling (1, 4, 8 Worker Threads)
+#![allow(deprecated)]
 
 use std::fs::File;
 use std::io::BufWriter;
