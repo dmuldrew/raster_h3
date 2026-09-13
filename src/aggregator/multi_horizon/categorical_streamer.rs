@@ -1,402 +1,206 @@
-use std::collections::{HashMap, VecDeque};
+//! Multi-Resolution Scanline Horizon Streamer for Categorical Data
+//!
+//! Provides single-pass streaming aggregation across multiple H3 resolution levels simultaneously
+//! for discrete integer / land cover categories and classification maps.
+
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use fxhash::FxBuildHasher;
-use h3o::{CellIndex, Resolution};
-use rayon::prelude::*;
+use h3o::Resolution;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
-use crate::error::{RasterH3Error, Result};
+use crate::crs::transformer::CrsTransformer;
+use crate::error::Result;
 use crate::raster::geotiff::GeoTiffStreamReader;
+use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
-use crate::raster::prefetch::PrefetchedMosaicReader;
+use crate::raster::RasterChunk;
 
 use super::categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
 use super::config::MultiResolutionConfig;
-use super::sharded_map::{get_shard, NUM_SHARDS, ShardedResolutionMap};
+use super::controller::{HorizonStreamKernel, MultiHorizonStreamer};
 
 pub use super::sharded_map::{get_shard as pub_get_shard, NUM_SHARDS as PUB_NUM_SHARDS};
 
-/// Single-pass streaming aggregator across multiple H3 resolutions (Categorical Data)
-pub struct MultiCategoricalHorizonStreamer {
-    prefetcher: Option<PrefetchedMosaicReader>,
-    pub mosaic: Arc<MosaicReader>,
-    resolutions: Vec<Resolution>,
-    resolution_u8s: Vec<u8>,
-    nodata: Option<f64>,
-    bbox: Option<[f64; 4]>,
-    sampling: SamplingPattern,
-    resolution_shards: Vec<ShardedResolutionMap<CategoricalAccumulator>>,
-    completed_buffer: VecDeque<MultiCategoricalRecord>,
-    is_finished: bool,
-    current_lat_horizon: f64,
-    pub profile_stats: [u64; 4],
-    processed_chunk_count: usize,
-    band: usize,
-    min_count: Option<f64>,
-    min_majority_fraction: Option<f64>,
-    compact: bool,
+/// Kernel implementation for categorical/classified raster aggregation
+#[derive(Clone)]
+pub struct CategoricalKernel {
+    pub band: usize,
+    pub min_count: Option<f64>,
+    pub min_majority_fraction: Option<f64>,
     pub remapper: Option<Arc<CategoryRemapper>>,
-    pending_compact: HashMap<u64, (CategoricalAccumulator, Vec<(u64, CategoricalAccumulator)>), FxBuildHasher>,
 }
 
-impl MultiCategoricalHorizonStreamer {
-    /// Initialize a new MultiCategoricalHorizonStreamer from a single GeoTIFF reader
-    pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
-        let mosaic = Arc::new(MosaicReader::from_single_reader(
-            reader,
-            config.bbox,
-            config.custom_crs.as_deref(),
-        )?);
-        Self::new_mosaic(mosaic, config)
+impl HorizonStreamKernel for CategoricalKernel {
+    type Accumulator = CategoricalAccumulator;
+    type Record = MultiCategoricalRecord;
+
+    #[inline(always)]
+    fn new_parent_accumulator(&self) -> Self::Accumulator {
+        CategoricalAccumulator::default()
     }
 
-    /// Initialize a new MultiCategoricalHorizonStreamer from a multi-file MosaicReader
-    pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
-        if config.resolutions.is_empty() {
-            return Err(RasterH3Error::InvalidParameter(
-                "Resolutions list cannot be empty".to_string(),
-            ));
-        }
-
-        let mut resolutions = Vec::with_capacity(config.resolutions.len());
-        let mut resolution_u8s = Vec::with_capacity(config.resolutions.len());
-        for &res_u8 in &config.resolutions {
-            let res = Resolution::try_from(res_u8).map_err(|_| {
-                RasterH3Error::InvalidParameter(format!("Invalid H3 resolution: {}", res_u8))
-            })?;
-            resolutions.push(res);
-            resolution_u8s.push(res_u8);
-        }
-
-        let prefetcher = PrefetchedMosaicReader::spawn(Arc::clone(&mosaic), 1024);
-        let num_res = resolutions.len();
-        let resolution_shards = (0..num_res).map(|_| ShardedResolutionMap::new()).collect();
-
-        let band = config.band;
-        let min_count = config.min_count;
-        let min_majority_fraction = config.min_majority_fraction;
-        let compact = config.compact;
-        let remapper = config.remapper.clone();
-        let pending_compact = HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default());
-
-        Ok(Self {
-            prefetcher: Some(prefetcher),
-            mosaic,
-            resolutions,
-            resolution_u8s,
-            nodata: config.custom_nodata,
-            bbox: config.bbox,
-            sampling: config.sampling.clone(),
-            resolution_shards,
-            completed_buffer: VecDeque::with_capacity(2048),
-            is_finished: false,
-            current_lat_horizon: f64::INFINITY,
-            profile_stats: [0; 4],
-            processed_chunk_count: 0,
-            band,
-            min_count,
-            min_majority_fraction,
-            compact,
-            remapper,
-            pending_compact,
-        })
-    }
-
-    /// Return current southernmost latitude reached by scanline horizon
-    pub fn current_lat_horizon(&self) -> f64 {
-        self.current_lat_horizon
-    }
-
-    /// Target H3 resolutions
-    pub fn resolutions(&self) -> &[Resolution] {
-        &self.resolutions
-    }
-
-    /// Target H3 resolution integer levels
-    pub fn resolution_u8s(&self) -> &[u8] {
-        &self.resolution_u8s
-    }
-
-    fn push_categorical_record(&mut self, res_u8: u8, cell_u64: u64, acc: CategoricalAccumulator) {
+    #[inline(always)]
+    fn passes_filter(&self, acc: &Self::Accumulator) -> bool {
         if let Some(min_c) = self.min_count {
             if acc.total_count < min_c {
-                return;
+                return false;
             }
         }
         if let Some(min_frac) = self.min_majority_fraction {
             let (_, _, frac) = acc.majority();
             if frac < min_frac {
-                return;
+                return false;
             }
         }
+        true
+    }
 
-        if self.compact {
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                if let Some(parent_res) = cell.resolution().pred() {
-                    if let Some(parent) = cell.parent(parent_res) {
-                        let parent_u64: u64 = parent.into();
-                        let entry = self.pending_compact.entry(parent_u64).or_insert_with(|| {
-                            (CategoricalAccumulator::default(), Vec::with_capacity(7))
-                        });
-                        entry.0.merge(&acc);
-                        entry.1.push((cell_u64, acc));
-
-                        if entry.1.len() == 7 {
-                            let (parent_acc, _) = self.pending_compact.remove(&parent_u64).unwrap();
-                            let p_res_u8: u8 = parent_res.into();
-                            self.completed_buffer.push_back(MultiCategoricalRecord {
-                                resolution: p_res_u8,
-                                h3_index: parent_u64,
-                                accumulator: parent_acc,
-                            });
-                            return;
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        self.completed_buffer.push_back(MultiCategoricalRecord {
-            resolution: res_u8,
+    #[inline(always)]
+    fn make_record(&self, resolution: u8, cell_u64: u64, acc: Self::Accumulator) -> Self::Record {
+        MultiCategoricalRecord {
+            resolution,
             h3_index: cell_u64,
             accumulator: acc,
-        });
-    }
-
-    fn flush_pending_compact(&mut self) {
-        for (_, (_, children)) in self.pending_compact.drain() {
-            for (cell_u64, acc) in children {
-                let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                    cell.resolution().into()
-                } else {
-                    8
-                };
-                self.completed_buffer.push_back(MultiCategoricalRecord {
-                    resolution: res_u8,
-                    h3_index: cell_u64,
-                    accumulator: acc,
-                });
-            }
         }
     }
 
-    /// Evict completed cells across all resolutions that lie north of the given latitude horizon
-    fn evict_completed(&mut self, lat_horizon: f64) {
-        let num_res = self.resolutions.len();
-        for res_idx in 0..num_res {
-            let res_u8 = self.resolution_u8s[res_idx];
-            let newly_evicted = self.resolution_shards[res_idx].evict_completed(lat_horizon);
-            for (cell_u64, acc) in newly_evicted {
-                self.push_categorical_record(res_u8, cell_u64, acc);
-            }
-        }
+    #[inline(always)]
+    fn process_chunk(
+        &self,
+        chunk_bounds: &RasterChunk,
+        decoding_result: &mut DecodingResult,
+        resolutions: &[Resolution],
+        crs_transformer: &CrsTransformer,
+        gt: &GeoTransform,
+        sampling: &SamplingPattern,
+        bbox: Option<[f64; 4]>,
+        chunk_stride: u32,
+        nodata: Option<f64>,
+        samples_per_pixel: u16,
+        overlap_ctx: Option<(usize, &MosaicReader)>,
+        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+    ) -> bool {
+        process_categorical_chunk_payload_into(
+            chunk_bounds,
+            decoding_result,
+            resolutions,
+            crs_transformer,
+            gt,
+            sampling,
+            bbox,
+            chunk_stride,
+            nodata,
+            samples_per_pixel,
+            self.band,
+            overlap_ctx,
+            self.remapper.as_deref(),
+            local_maps,
+        )
+    }
+}
 
-        if self.compact && !self.pending_compact.is_empty() {
-            let mut to_flush = Vec::new();
-            for (&parent_u64, _) in self.pending_compact.iter() {
-                let parent_south = compute_cell_south_lat(parent_u64);
-                if parent_south > lat_horizon {
-                    to_flush.push(parent_u64);
-                }
-            }
-            for p in to_flush {
-                if let Some((_, children)) = self.pending_compact.remove(&p) {
-                    for (cell_u64, acc) in children {
-                        let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                            cell.resolution().into()
-                        } else {
-                            8
-                        };
-                        self.completed_buffer.push_back(MultiCategoricalRecord {
-                            resolution: res_u8,
-                            h3_index: cell_u64,
-                            accumulator: acc,
-                        });
-                    }
-                }
-            }
-        }
+/// Single-pass streaming aggregator across multiple H3 resolutions (Categorical Data)
+pub struct MultiCategoricalHorizonStreamer {
+    inner: MultiHorizonStreamer<CategoricalKernel>,
+    pub remapper: Option<Arc<CategoryRemapper>>,
+}
+
+impl MultiCategoricalHorizonStreamer {
+    /// Initialize a new MultiCategoricalHorizonStreamer from a single GeoTIFF reader
+    pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
+        let kernel = CategoricalKernel {
+            band: config.band,
+            min_count: config.min_count,
+            min_majority_fraction: config.min_majority_fraction,
+            remapper: config.remapper.clone(),
+        };
+        let remapper = kernel.remapper.clone();
+        let inner = MultiHorizonStreamer::new(reader, config, kernel)?;
+        Ok(Self { inner, remapper })
     }
 
-    /// Advance scanline horizon until at least `min_rows` completed records are available or finished
-    pub fn advance_until_completed(&mut self, min_rows: usize) {
-        let batch_size = (rayon::current_num_threads() * 4).max(32);
-        let min_batch = rayon::current_num_threads().clamp(4, 16);
-        let mut chunk_items = Vec::with_capacity(batch_size);
-
-        while self.completed_buffer.len() < min_rows && !self.is_finished {
-            chunk_items.clear();
-            let t0 = std::time::Instant::now();
-            if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.drain_chunk_batch_into(&mut chunk_items, min_batch, batch_size);
-            }
-            self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
-
-            if chunk_items.is_empty() {
-                self.is_finished = true;
-                self.current_lat_horizon = f64::NEG_INFINITY;
-                let num_res = self.resolutions.len();
-                for res_idx in 0..num_res {
-                    let res_u8 = self.resolution_u8s[res_idx];
-                    let remaining = self.resolution_shards[res_idx].drain_all();
-                    for (cell_u64, acc) in remaining {
-                        self.push_categorical_record(res_u8, cell_u64, acc);
-                    }
-                }
-                self.flush_pending_compact();
-                break;
-            }
-
-            let resolutions = &self.resolutions;
-            let sampling = &self.sampling;
-            let bbox = self.bbox;
-            let band = self.band;
-            let mosaic = Arc::clone(&self.mosaic);
-            let user_nodata = self.nodata;
-            let remapper = self.remapper.as_deref();
-
-            // Parallel process all chunks using thread-local reusable HashMaps to eliminate allocation churn
-            let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(Vec<Vec<Vec<(u64, CategoricalAccumulator)>>>, DecodingResult)> = chunk_items
-                .par_iter_mut()
-                .map_init(
-                    || {
-                        let mut maps = Vec::with_capacity(resolutions.len());
-                        for _ in 0..resolutions.len() {
-                            maps.push(HashMap::with_capacity_and_hasher(128, FxBuildHasher::default()));
-                        }
-                        maps
-                    },
-                    |local_maps, item| {
-                        match item {
-                            Ok((tile_idx, _chunk_idx, chunk_bounds, decoding_result, has_overlap)) => {
-                                for m in local_maps.iter_mut() {
-                                    m.clear();
-                                }
-                                let tile = &mosaic.tiles[*tile_idx];
-                                let crs_transformer = &tile.crs_transformer;
-                                let gt = &tile.reader.metadata.geotransform;
-                                let chunk_stride = tile.reader.chunk_layout.chunk_width;
-                                let nodata = user_nodata.or(tile.reader.metadata.nodata);
-                                let samples_per_pixel = tile.reader.metadata.samples_per_pixel;
-
-                                let overlap_ctx = if *has_overlap {
-                                    Some((*tile_idx, &*mosaic))
-                                } else {
-                                    None
-                                };
-
-                                let has_data = process_categorical_chunk_payload_into(
-                                    chunk_bounds,
-                                    decoding_result,
-                                    resolutions,
-                                    crs_transformer,
-                                    gt,
-                                    sampling,
-                                    bbox,
-                                    chunk_stride,
-                                    nodata,
-                                    samples_per_pixel,
-                                    band,
-                                    overlap_ctx,
-                                    remapper,
-                                    local_maps,
-                                );
-                                let mut chunk_shards = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
-                                if has_data {
-                                    for m in local_maps.iter_mut() {
-                                        let mut shards = (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
-                                        for (cell_u64, acc) in m.drain() {
-                                            let s = get_shard(cell_u64);
-                                            shards[s].push((cell_u64, acc));
-                                        }
-                                        chunk_shards.push(shards);
-                                    }
-                                }
-                                let dec = std::mem::replace(decoding_result, DecodingResult::U8(Vec::new()));
-                                Some((chunk_shards, dec))
-                            }
-                            Err(_) => None,
-                        }
-                    },
-                )
-                .filter_map(|x| x)
-                .collect();
-            self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
-
-            let t2 = std::time::Instant::now();
-            self.processed_chunk_count += chunk_items.len();
-
-            for res_idx in 0..self.resolutions.len() {
-                self.resolution_shards[res_idx].merge_thread_results(&parallel_results, res_idx);
-            }
-
-            let recycled_buffers: Vec<DecodingResult> = parallel_results
-                .into_iter()
-                .map(|(_, dec)| dec)
-                .collect();
-
-            if let Some(ref prefetcher) = self.prefetcher {
-                prefetcher.recycle_batch(recycled_buffers);
-            }
-            self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
-
-            if self.processed_chunk_count < self.mosaic.chunk_refs.len() {
-                let next_chunk = &self.mosaic.chunk_refs[self.processed_chunk_count];
-                let safe_lat = next_chunk.north_lat;
-                if safe_lat < self.current_lat_horizon {
-                    let t3 = std::time::Instant::now();
-                    self.current_lat_horizon = safe_lat;
-                    self.evict_completed(safe_lat);
-                    self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
-                }
-            }
-        }
+    /// Initialize a new MultiCategoricalHorizonStreamer from a multi-file MosaicReader
+    pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
+        let kernel = CategoricalKernel {
+            band: config.band,
+            min_count: config.min_count,
+            min_majority_fraction: config.min_majority_fraction,
+            remapper: config.remapper.clone(),
+        };
+        let remapper = kernel.remapper.clone();
+        let inner = MultiHorizonStreamer::new_mosaic(mosaic, config, kernel)?;
+        Ok(Self { inner, remapper })
     }
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
+    #[inline(always)]
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiCategoricalRecord> {
-        self.advance_until_completed(max_rows);
-        let num_to_take = max_rows.min(self.completed_buffer.len());
-        let mut batch = Vec::with_capacity(num_to_take);
-        for _ in 0..num_to_take {
-            if let Some(record) = self.completed_buffer.pop_front() {
-                batch.push(record);
-            }
-        }
-        batch
+        self.inner.fetch_next_batch(max_rows)
     }
 
     /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
-    pub fn drain_completed_into<F>(&mut self, max_rows: usize, mut consumer: F) -> usize
+    #[inline(always)]
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> usize
     where
         F: FnMut(usize, MultiCategoricalRecord),
     {
-        self.advance_until_completed(max_rows);
-        let num_to_take = max_rows.min(self.completed_buffer.len());
-        for i in 0..num_to_take {
-            if let Some(record) = self.completed_buffer.pop_front() {
-                consumer(i, record);
-            }
-        }
-        num_to_take
+        self.inner.drain_completed_into(max_rows, consumer)
+    }
+
+    /// Advance scanline horizon until at least `min_rows` completed records are available or finished
+    #[inline(always)]
+    pub fn advance_until_completed(&mut self, min_rows: usize) {
+        self.inner.advance_until_completed(min_rows);
+    }
+
+    /// Return current southernmost latitude reached by scanline horizon
+    #[inline(always)]
+    pub fn current_lat_horizon(&self) -> f64 {
+        self.inner.current_lat_horizon()
+    }
+
+    /// Target H3 resolutions
+    #[inline(always)]
+    pub fn resolutions(&self) -> &[Resolution] {
+        self.inner.resolutions()
+    }
+
+    /// Target H3 resolution integer levels
+    #[inline(always)]
+    pub fn resolution_u8s(&self) -> &[u8] {
+        self.inner.resolution_u8s()
     }
 
     /// Return total active in-flight cells across all resolutions
+    #[inline(always)]
     pub fn active_cell_count(&self) -> usize {
-        self.resolution_shards
-            .iter()
-            .map(|s| s.active_cell_count())
-            .sum()
+        self.inner.active_cell_count()
     }
 
     /// Check if stream is fully drained and finished
+    #[inline(always)]
     pub fn is_finished(&self) -> bool {
-        self.is_finished && self.completed_buffer.is_empty()
+        self.inner.is_finished()
+    }
+}
+
+impl Deref for MultiCategoricalHorizonStreamer {
+    type Target = MultiHorizonStreamer<CategoricalKernel>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for MultiCategoricalHorizonStreamer {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
