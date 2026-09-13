@@ -5,6 +5,7 @@
 
 use h3o::{LatLng, Resolution};
 
+use crate::aggregator::h3_scanline::{H3NeighborDiskCache, H3ScanlineLookahead};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
@@ -237,6 +238,188 @@ impl RowCoordinates {
             px_diag_m,
         })
     }
+
+    /// Compute the projected longitude and latitude for the pixel center at column `c`
+    #[inline(always)]
+    pub fn pixel_center_lon_lat(
+        &self,
+        c: usize,
+        x_curr: f64,
+        lon_curr: f64,
+        ctx: &RowGeometryContext,
+        gt: &GeoTransform,
+        crs_transformer: &CrsTransformer,
+        col_offset: usize,
+    ) -> Option<(f64, f64)> {
+        if ctx.is_wgs84 || ctx.is_web_mercator {
+            Some((lon_curr, self.lat_row))
+        } else if ctx.is_north_up {
+            crs_transformer.transform_point(x_curr, self.y_row).ok()
+        } else {
+            let (x, y) = gt.pixel_center_to_coord(col_offset + c, self.row_idx);
+            crs_transformer.transform_point(x, y).ok()
+        }
+    }
+
+    /// Delegate span end search to scanline lookahead cache across coordinate reference systems
+    #[inline(always)]
+    pub fn find_span_end(
+        &self,
+        row_cache: &mut H3ScanlineLookahead,
+        c: usize,
+        lon_curr: f64,
+        ctx: &RowGeometryContext,
+        crs_transformer: &CrsTransformer,
+        res: Resolution,
+        run_cell: u64,
+        bbox: Option<[f64; 4]>,
+    ) -> (usize, Option<u64>) {
+        if ctx.is_wgs84 || ctx.is_web_mercator {
+            row_cache.find_span_end(
+                c,
+                self.row_c_end,
+                lon_curr,
+                self.lat_row,
+                ctx.d_lon_step,
+                res,
+                run_cell,
+            )
+        } else if ctx.is_north_up {
+            row_cache.find_span_end_projected(
+                c,
+                self.row_c_end,
+                self.x_start,
+                self.y_row,
+                ctx.dx_step,
+                |x, y| match crs_transformer.transform_point(x, y) {
+                    Ok((p_lon, p_lat)) => {
+                        if is_point_in_bbox(p_lon, p_lat, bbox) {
+                            LatLng::new(p_lat, p_lon).ok().map(|ll| ll.to_cell(res).into())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                },
+                run_cell,
+            )
+        } else {
+            (c + 1, None)
+        }
+    }
+
+    /// Identify the inner core column range `(core_start, core_end)` where all subpixel sample points land inside `run_cell`
+    #[inline(always)]
+    pub fn find_core_span<FCheck>(
+        &self,
+        row_cache: &H3ScanlineLookahead,
+        c: usize,
+        span_end: usize,
+        dx_bounds: (f64, f64),
+        dy_bounds: (f64, f64),
+        ctx: &RowGeometryContext,
+        gt: &GeoTransform,
+        bbox: Option<[f64; 4]>,
+        mut is_in_cell: FCheck,
+    ) -> (usize, usize)
+    where
+        FCheck: FnMut(f64, f64) -> bool,
+    {
+        row_cache.find_core_span(c, span_end, dx_bounds, dy_bounds, |px, py| {
+            let (lon, lat) = if ctx.is_wgs84 {
+                (self.lon_start + (px - 0.5) * ctx.d_lon_step, self.lat_row + (py - 0.5) * gt.e)
+            } else if ctx.is_web_mercator {
+                (self.lon_start + (px - 0.5) * ctx.d_lon_step, self.lat_row + (py - 0.5) * self.d_lat_dy)
+            } else {
+                let d_col = px - 0.5;
+                let d_row = py - 0.5;
+                (
+                    self.lon_start + d_col * self.d_lon_dx + d_row * self.d_lon_dy,
+                    self.lat_row + d_col * self.d_lat_dx + d_row * self.d_lat_dy,
+                )
+            };
+            if !is_point_in_bbox(lon, lat, bbox) {
+                return false;
+            }
+            is_in_cell(lat, lon)
+        })
+    }
+
+    /// Iterate over all subpixel sampling points for pixel at column `k`, invoking `f(lon, lat, d_x, d_y, weight)`
+    #[inline(always)]
+    pub fn for_each_subpixel<F>(
+        &self,
+        k: usize,
+        ctx: &RowGeometryContext,
+        gt: &GeoTransform,
+        crs_transformer: &CrsTransformer,
+        col_offset: usize,
+        sampling: &SamplingPattern,
+        bbox: Option<[f64; 4]>,
+        mut f: F,
+    ) where
+        F: FnMut(f64, f64, f64, f64, f64),
+    {
+        let (k_lon, k_lat) = if ctx.is_wgs84 || ctx.is_web_mercator {
+            (self.lon_start + (k as f64) * ctx.d_lon_step, self.lat_row)
+        } else if ctx.is_north_up {
+            let x_k = self.x_start + (k as f64) * ctx.dx_step;
+            match crs_transformer.transform_point(x_k, self.y_row) {
+                Ok(coords) => coords,
+                Err(_) => (self.lon_start + (k as f64) * self.d_lon_dx, self.lat_row + (k as f64) * self.d_lat_dx),
+            }
+        } else {
+            let (x_k, y_k) = gt.pixel_center_to_coord(col_offset + k, self.row_idx);
+            match crs_transformer.transform_point(x_k, y_k) {
+                Ok(coords) => coords,
+                Err(_) => (self.lon_start + (k as f64) * self.d_lon_dx, self.lat_row + (k as f64) * self.d_lat_dx),
+            }
+        };
+
+        for sp in &sampling.points {
+            let d_x = sp.dx - 0.5;
+            let d_y = sp.dy - 0.5;
+            let lon = k_lon + d_x * self.d_lon_dx + d_y * self.d_lon_dy;
+            let lat = k_lat + d_x * self.d_lat_dx + d_y * self.d_lat_dy;
+
+            if !is_point_in_bbox(lon, lat, bbox) {
+                continue;
+            }
+
+            f(lon, lat, d_x, d_y, sp.weight);
+        }
+    }
+}
+
+/// Check if a WGS84 point `(lon, lat)` falls within an optional bounding box `[min_lon, min_lat, max_lon, max_lat]`
+#[inline(always)]
+pub fn is_point_in_bbox(lon: f64, lat: f64, bbox: Option<[f64; 4]>) -> bool {
+    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
+        lon >= b_min_lon && lon <= b_max_lon && lat >= b_min_lat && lat <= b_max_lat
+    } else {
+        true
+    }
+}
+
+/// Resolve subpixel cell taking fast-paths into account (e.g. center sample or neighbor disk cache)
+#[inline(always)]
+pub fn resolve_subpixel_cell(
+    run_cell: u64,
+    lat: f64,
+    lon: f64,
+    d_x: f64,
+    d_y: f64,
+    res: Resolution,
+    use_neighbor_cache: bool,
+    disk_cache: &mut H3NeighborDiskCache,
+) -> Option<u64> {
+    if d_x.abs() < 1e-9 && d_y.abs() < 1e-9 {
+        Some(run_cell)
+    } else if use_neighbor_cache {
+        Some(disk_cache.resolve_point(lat, lon))
+    } else {
+        LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
+    }
 }
 
 /// Generic pixel-by-pixel walker for mosaic overlap resolution
@@ -331,5 +514,32 @@ pub fn walk_overlap_pixel_cells<T, FVal, FAccum>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_point_in_bbox() {
+        let bbox = Some([-122.5, 37.5, -122.0, 38.0]);
+        assert!(is_point_in_bbox(-122.25, 37.75, bbox));
+        assert!(is_point_in_bbox(-122.5, 37.5, bbox));
+        assert!(is_point_in_bbox(-122.0, 38.0, bbox));
+        assert!(!is_point_in_bbox(-122.6, 37.75, bbox));
+        assert!(!is_point_in_bbox(-122.25, 38.1, bbox));
+        assert!(is_point_in_bbox(0.0, 0.0, None));
+    }
+
+    #[test]
+    fn test_resolve_subpixel_cell_center_fastpath() {
+        let run_cell = 0x8828308281ffffff;
+        let mut disk_cache = H3NeighborDiskCache::default();
+        let res = Resolution::try_from(8).unwrap();
+        let cell = resolve_subpixel_cell(
+            run_cell, 37.75, -122.25, 0.0, 0.0, res, false, &mut disk_cache,
+        );
+        assert_eq!(cell, Some(run_cell));
     }
 }
