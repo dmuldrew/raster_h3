@@ -4,8 +4,11 @@
 //! Centralizes parameter extraction, type conversion, bounding box resolution, and column definitions
 //! across continuous, categorical, parquet, and pmtiles table functions.
 
+use std::collections::VecDeque;
 use std::ffi::{c_void, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::{
@@ -14,12 +17,14 @@ use crate::ffi::{
     duckdb_create_logical_type, duckdb_data_chunk, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size, duckdb_destroy_logical_type, duckdb_get_bool, duckdb_get_double,
     duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_init_get_column_count,
-    duckdb_init_get_column_index, duckdb_init_info, duckdb_init_set_init_data, duckdb_logical_type,
-    duckdb_table_function, duckdb_table_function_add_named_parameter,
+    duckdb_init_get_column_index, duckdb_init_info, duckdb_init_set_error, duckdb_init_set_init_data,
+    duckdb_logical_type, duckdb_table_function, duckdb_table_function_add_named_parameter,
     duckdb_table_function_add_parameter, duckdb_value, duckdb_vector,
     duckdb_vector_assign_string_element, duckdb_vector_assign_string_element_len,
     duckdb_vector_get_data, from_duckdb_string, idx_t, to_c_string, DuckDBType,
 };
+use crate::functions::fast_hex::fast_hex_u64;
+use crate::functions::wkb::h3_index_to_wkb;
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::mosaic::OverlapRule;
 
@@ -507,6 +512,66 @@ impl ChunkWriter {
         duckdb_vector_assign_string_element_len(v, row_idx as idx_t, std::ptr::null(), 0);
     }
 
+    /// Fill a primitive copyable column slice from an iterator
+    #[inline(always)]
+    pub unsafe fn fill_column<T: Copy, I: IntoIterator<Item = T>>(
+        &self,
+        col_idx: usize,
+        count: usize,
+        values: I,
+    ) {
+        let slice: &mut [T] = self.get_data_slice_mut(col_idx, count);
+        for (dest, val) in slice.iter_mut().zip(values) {
+            *dest = val;
+        }
+    }
+
+    /// Write formatted 16-character hexadecimal H3 cell index strings using scratch buffer
+    #[inline(always)]
+    pub unsafe fn write_hex_column<'a, I>(&self, out_idx: usize, cells: I, hex_buf: &mut [u8; 16])
+    where
+        I: IntoIterator<Item = &'a u64>,
+    {
+        for (i, &cell_u64) in cells.into_iter().enumerate() {
+            let hex_slice = fast_hex_u64(cell_u64, hex_buf);
+            self.set_string_bytes(out_idx, i, hex_slice);
+        }
+    }
+
+    /// Write WKB and Native GEOMETRY columns from H3 cell indices with NULL handling
+    #[inline(always)]
+    pub unsafe fn write_wkb_and_geom_columns<'a, I>(
+        &self,
+        out_idx_wkb: Option<usize>,
+        out_idx_geom: Option<usize>,
+        cells: I,
+        wkb_buf: &mut [u8; 128],
+    ) where
+        I: IntoIterator<Item = &'a u64>,
+    {
+        if out_idx_wkb.is_none() && out_idx_geom.is_none() {
+            return;
+        }
+        for (i, &cell_u64) in cells.into_iter().enumerate() {
+            if let Some(wkb_len) = h3_index_to_wkb(cell_u64, wkb_buf) {
+                let bytes = &wkb_buf[..wkb_len];
+                if let Some(out_wkb) = out_idx_wkb {
+                    self.set_string_bytes(out_wkb, i, bytes);
+                }
+                if let Some(out_geom) = out_idx_geom {
+                    self.set_string_bytes(out_geom, i, bytes);
+                }
+            } else {
+                if let Some(out_wkb) = out_idx_wkb {
+                    self.set_null(out_wkb, i);
+                }
+                if let Some(out_geom) = out_idx_geom {
+                    self.set_null(out_geom, i);
+                }
+            }
+        }
+    }
+
     /// Set the total number of valid rows in this data chunk
     #[inline(always)]
     pub unsafe fn set_size(&self, size: usize) {
@@ -566,6 +631,130 @@ pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
     }
 }
 
+/// Attach boxed global init state to DuckDB table function lifecycle with type-safe destructor
+pub unsafe fn set_table_function_init_data<T>(info: duckdb_init_info, data: T) {
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(Box::new(data)) as *mut c_void,
+        Some(delete_boxed::<T>),
+    );
+}
+
+/// Open a raster mosaic reader from resolved paths, setting DuckDB init error on failure
+pub unsafe fn open_mosaic_or_set_error(
+    info: duckdb_init_info,
+    paths: &[PathBuf],
+    bbox: Option<[f64; 4]>,
+    source_crs: Option<&str>,
+    overlap_rule: OverlapRule,
+) -> Option<std::sync::Arc<crate::raster::mosaic::MosaicReader>> {
+    match crate::raster::mosaic::MosaicReader::open(paths, bbox, source_crs, overlap_rule) {
+        Ok(m) => Some(std::sync::Arc::new(m)),
+        Err(e) => {
+            let err_msg = CString::new(format!("Failed to open raster mosaic: {}", e))
+                .unwrap_or_else(|_| CString::new("Failed to open raster mosaic").unwrap());
+            duckdb_init_set_error(info, err_msg.as_ptr());
+            None
+        }
+    }
+}
+
+/// Multi-threaded batch queue for streaming DuckDB table functions
+pub struct ConcurrentRecordQueue<R> {
+    pub ready_batches: Mutex<VecDeque<Vec<R>>>,
+    pub is_finished: AtomicBool,
+}
+
+impl<R> Default for ConcurrentRecordQueue<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<R> ConcurrentRecordQueue<R> {
+    pub fn new() -> Self {
+        Self {
+            ready_batches: Mutex::new(VecDeque::new()),
+            is_finished: AtomicBool::new(false),
+        }
+    }
+
+    /// Retrieve next batch from pre-batched queue (~10ns lock) or refill from streamer under lock
+    pub fn pop_or_refill<S, F>(&self, streamer: &Mutex<S>, mut drain_into: F) -> Option<Vec<R>>
+    where
+        F: FnMut(&mut S, usize, &mut dyn FnMut(usize, R)) -> usize,
+    {
+        // Fast path: check ready_batches
+        let mut ready_q = match self.ready_batches.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(b) = ready_q.pop_front() {
+            return Some(b);
+        }
+        if self.is_finished.load(Ordering::Acquire) {
+            return None;
+        }
+        drop(ready_q);
+
+        // Slow path: acquire streamer lock to refill
+        let mut streamer_guard = match streamer.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let mut ready_q = match self.ready_batches.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(b) = ready_q.pop_front() {
+            return Some(b);
+        }
+        if self.is_finished.load(Ordering::Acquire) {
+            return None;
+        }
+
+        const BATCH_SIZE: usize = 2048;
+        const REFILL_SIZE: usize = BATCH_SIZE * 4;
+
+        let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
+        let mut my_batch = None;
+
+        drain_into(&mut *streamer_guard, REFILL_SIZE, &mut |_i, rec| {
+            current_chunk.push(rec);
+            if current_chunk.len() == BATCH_SIZE {
+                if my_batch.is_none() {
+                    my_batch = Some(std::mem::replace(
+                        &mut current_chunk,
+                        Vec::with_capacity(BATCH_SIZE),
+                    ));
+                } else {
+                    ready_q.push_back(std::mem::replace(
+                        &mut current_chunk,
+                        Vec::with_capacity(BATCH_SIZE),
+                    ));
+                }
+            }
+        });
+
+        if !current_chunk.is_empty() {
+            if my_batch.is_none() {
+                my_batch = Some(current_chunk);
+            } else {
+                ready_q.push_back(current_chunk);
+            }
+        }
+
+        if my_batch.is_none() {
+            self.is_finished.store(true, Ordering::Release);
+        }
+
+        my_batch
+    }
+}
+
 /// Unified thread-local state for table function execution, carrying reusable scratch buffers for hex string and WKB encoding
 pub struct TableFunctionLocalData {
     pub thread_id: usize,
@@ -579,6 +768,22 @@ impl Default for TableFunctionLocalData {
             thread_id: 0,
             hex_buf: [0u8; 16],
             wkb_buf: [0u8; 128],
+        }
+    }
+}
+
+impl TableFunctionLocalData {
+    /// Resolve scratch buffers from thread-local state or fallback buffers
+    #[inline(always)]
+    pub unsafe fn get_scratch_buffers<'a>(
+        ptr: *mut TableFunctionLocalData,
+        fallback_hex: &'a mut [u8; 16],
+        fallback_wkb: &'a mut [u8; 128],
+    ) -> (&'a mut [u8; 16], &'a mut [u8; 128]) {
+        if !ptr.is_null() {
+            (&mut (*ptr).hex_buf, &mut (*ptr).wkb_buf)
+        } else {
+            (fallback_hex, fallback_wkb)
         }
     }
 }
@@ -695,6 +900,35 @@ mod tests {
         assert_eq!(local.thread_id, 0);
         assert_eq!(local.hex_buf.len(), 16);
         assert_eq!(local.wkb_buf.len(), 128);
+    }
+
+    #[test]
+    fn test_concurrent_record_queue_pop_and_refill() {
+        let queue = ConcurrentRecordQueue::<u64>::new();
+        let streamer = Mutex::new(vec![10u64, 20, 30, 40, 50]);
+
+        // First refill
+        let b1 = queue.pop_or_refill(&streamer, |s, max_rows, f| {
+            let num = max_rows.min(s.len());
+            let taken: Vec<u64> = s.drain(..num).collect();
+            for (i, v) in taken.into_iter().enumerate() {
+                f(i, v);
+            }
+            num
+        });
+        assert_eq!(b1, Some(vec![10, 20, 30, 40, 50]));
+
+        // Second refill at EOF
+        let b2 = queue.pop_or_refill(&streamer, |s, max_rows, f| {
+            let num = max_rows.min(s.len());
+            let taken: Vec<u64> = s.drain(..num).collect();
+            for (i, v) in taken.into_iter().enumerate() {
+                f(i, v);
+            }
+            num
+        });
+        assert_eq!(b2, None);
+        assert!(queue.is_finished.load(Ordering::Acquire));
     }
 }
 

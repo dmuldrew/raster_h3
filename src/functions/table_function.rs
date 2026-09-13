@@ -1,6 +1,4 @@
-use std::collections::VecDeque;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::aggregator::multi_horizon::{
@@ -11,11 +9,10 @@ use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
     add_named_parameter, add_positional_parameter, delete_boxed, estimate_raster_cardinality,
-    extract_projected_columns, init_table_function_local, register_common_raster_named_parameters,
-    BindHelper, ChunkWriter, TableFunctionLocalData,
+    extract_projected_columns, init_table_function_local, open_mosaic_or_set_error,
+    register_common_raster_named_parameters, set_table_function_init_data, BindHelper, ChunkWriter,
+    ConcurrentRecordQueue, TableFunctionLocalData,
 };
-use crate::functions::fast_hex::fast_hex_u64;
-use crate::functions::wkb::h3_index_to_wkb;
 
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
@@ -41,8 +38,7 @@ pub struct RasterH3BindData {
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
 pub struct RasterH3GlobalData {
     pub streamer: Mutex<MultiScanHorizonStreamer>,
-    pub ready_batches: Mutex<VecDeque<Vec<MultiContinuousRecord>>>,
-    pub is_finished: AtomicBool,
+    pub record_queue: ConcurrentRecordQueue<MultiContinuousRecord>,
     pub projected_columns: Vec<usize>,
     pub quantiles: Vec<QuantileTarget>,
     pub emit_geom: bool,
@@ -151,19 +147,15 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     }
     let bind_data = &*bind_data_ptr;
 
-    let mosaic = match crate::raster::mosaic::MosaicReader::open(
+    let mosaic = match open_mosaic_or_set_error(
+        info,
         &bind_data.resolved_paths,
         bind_data.bbox,
         bind_data.source_crs.as_deref(),
         bind_data.overlap_rule,
     ) {
-        Ok(m) => std::sync::Arc::new(m),
-        Err(e) => {
-            let err_msg = CString::new(format!("Failed to open raster mosaic: {}", e))
-                .unwrap_or_else(|_| CString::new("Failed to open raster mosaic").unwrap());
-            duckdb_init_set_error(info, err_msg.as_ptr());
-            return;
-        }
+        Some(m) => m,
+        None => return,
     };
 
     let projected_columns = extract_projected_columns(info);
@@ -192,20 +184,15 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         }
     };
 
-    let global_data = Box::new(RasterH3GlobalData {
+    let global_data = RasterH3GlobalData {
         streamer: Mutex::new(streamer),
-        ready_batches: Mutex::new(VecDeque::new()),
-        is_finished: AtomicBool::new(false),
+        record_queue: ConcurrentRecordQueue::new(),
         projected_columns,
         quantiles: bind_data.quantiles.clone(),
         emit_geom: bind_data.emit_geom,
-    });
+    };
 
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(global_data) as *mut c_void,
-        Some(delete_boxed::<RasterH3GlobalData>),
-    );
+    set_table_function_init_data(info, global_data);
 }
 
 /// Thread-local init callback for multi-threaded parallel DuckDB execution
@@ -225,75 +212,11 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     let local_data_ptr = duckdb_function_get_local_init_data(info) as *mut RasterH3LocalData;
 
     // Retrieve next batch of completed records concurrently across DuckDB worker threads
-    let batch_opt = {
-        // Fast path 1: check if ready_batches already has pre-evicted records (~10ns lock)
-        let mut ready_q = match global_data.ready_batches.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        if let Some(b) = ready_q.pop_front() {
-            Some(b)
-        } else if global_data.is_finished.load(Ordering::Acquire) {
-            None
-        } else {
-            drop(ready_q);
-
-            // Path 2: acquire streamer lock to refill ready_batches with multiple chunks
-            let mut streamer = match global_data.streamer.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-
-            let mut ready_q = match global_data.ready_batches.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-
-            if let Some(b) = ready_q.pop_front() {
-                Some(b)
-            } else if global_data.is_finished.load(Ordering::Acquire) {
-                None
-            } else {
-                const BATCH_SIZE: usize = 2048;
-                const REFILL_SIZE: usize = BATCH_SIZE * 4;
-
-                let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
-                let mut my_batch = None;
-
-                streamer.drain_completed_into(REFILL_SIZE, |_i, rec| {
-                    current_chunk.push(rec);
-                    if current_chunk.len() == BATCH_SIZE {
-                        if my_batch.is_none() {
-                            my_batch = Some(std::mem::replace(
-                                &mut current_chunk,
-                                Vec::with_capacity(BATCH_SIZE),
-                            ));
-                        } else {
-                            ready_q.push_back(std::mem::replace(
-                                &mut current_chunk,
-                                Vec::with_capacity(BATCH_SIZE),
-                            ));
-                        }
-                    }
-                });
-
-                if !current_chunk.is_empty() {
-                    if my_batch.is_none() {
-                        my_batch = Some(current_chunk);
-                    } else {
-                        ready_q.push_back(current_chunk);
-                    }
-                }
-
-                if my_batch.is_none() {
-                    global_data.is_finished.store(true, Ordering::Release);
-                }
-
-                my_batch
-            }
-        }
-    };
+    let batch_opt = global_data
+        .record_queue
+        .pop_or_refill(&global_data.streamer, |s, max_rows, f| {
+            s.drain_completed_into(max_rows, f)
+        });
 
     let batch = match batch_opt {
         Some(b) if !b.is_empty() => b,
@@ -304,7 +227,6 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     };
 
     let proj_cols = &global_data.projected_columns;
-
     let writer = ChunkWriter::new(output);
 
     // Fast path: if 0 columns are projected (e.g. SELECT count(*))
@@ -315,14 +237,11 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 
     let mut fallback_hex_buf = [0u8; 16];
     let mut fallback_wkb_buf = [0u8; 128];
-    let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
-        (
-            &mut (*local_data_ptr).hex_buf,
-            &mut (*local_data_ptr).wkb_buf,
-        )
-    } else {
-        (&mut fallback_hex_buf, &mut fallback_wkb_buf)
-    };
+    let (hex_buf, wkb_buf) = TableFunctionLocalData::get_scratch_buffers(
+        local_data_ptr,
+        &mut fallback_hex_buf,
+        &mut fallback_wkb_buf,
+    );
 
     let batch_len = batch.len();
     let q_start_col = if global_data.emit_geom { 11 } else { 10 };
@@ -344,60 +263,15 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     // 10/11+: quantiles DOUBLE
     for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
         match orig_col {
-            0 => {
-                let slice: &mut [u64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.h3_index;
-                }
-            }
-            1 => {
-                for (i, rec) in batch.iter().enumerate() {
-                    let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
-                    writer.set_string_bytes(out_idx, i, hex_slice);
-                }
-            }
-            2 => {
-                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.accumulator.mean();
-                }
-            }
-            3 => {
-                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.accumulator.stddev();
-                }
-            }
-            4 => {
-                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.accumulator.count;
-                }
-            }
-            5 => {
-                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.accumulator.min;
-                }
-            }
-            6 => {
-                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.accumulator.max;
-                }
-            }
-            7 => {
-                let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.accumulator.sum;
-                }
-            }
-            8 => {
-                let slice: &mut [u8] = writer.get_data_slice_mut(out_idx, batch_len);
-                for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                    *dest = rec.resolution;
-                }
-            }
+            0 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index)),
+            1 => writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf),
+            2 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.mean())),
+            3 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.stddev())),
+            4 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.count)),
+            5 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.min)),
+            6 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.max)),
+            7 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.sum)),
+            8 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.resolution)),
             9 => {
                 out_idx_wkb = Some(out_idx);
             }
@@ -407,18 +281,21 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             c if c >= q_start_col => {
                 let q_idx = c - q_start_col;
                 if q_idx < global_data.quantiles.len() {
-                    let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
                     match &global_data.quantiles[q_idx] {
                         QuantileTarget::Percentile(q, _) => {
                             let q_val = *q;
-                            for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                                *dest = rec.accumulator.quantile(q_val);
-                            }
+                            writer.fill_column(
+                                out_idx,
+                                batch_len,
+                                batch.iter().map(|r| r.accumulator.quantile(q_val)),
+                            );
                         }
                         QuantileTarget::Iqr(_) => {
-                            for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                                *dest = rec.accumulator.iqr();
-                            }
+                            writer.fill_column(
+                                out_idx,
+                                batch_len,
+                                batch.iter().map(|r| r.accumulator.iqr()),
+                            );
                         }
                     }
                 }
@@ -427,26 +304,12 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         }
     }
 
-    if out_idx_wkb.is_some() || out_idx_geom.is_some() {
-        for (i, rec) in batch.iter().enumerate() {
-            if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
-                let bytes = &wkb_buf[..wkb_len];
-                if let Some(out_wkb) = out_idx_wkb {
-                    writer.set_string_bytes(out_wkb, i, bytes);
-                }
-                if let Some(out_geom) = out_idx_geom {
-                    writer.set_string_bytes(out_geom, i, bytes);
-                }
-            } else {
-                if let Some(out_wkb) = out_idx_wkb {
-                    writer.set_null(out_wkb, i);
-                }
-                if let Some(out_geom) = out_idx_geom {
-                    writer.set_null(out_geom, i);
-                }
-            }
-        }
-    }
+    writer.write_wkb_and_geom_columns(
+        out_idx_wkb,
+        out_idx_geom,
+        batch.iter().map(|r| &r.h3_index),
+        wkb_buf,
+    );
 
     writer.set_size(batch_len);
 }

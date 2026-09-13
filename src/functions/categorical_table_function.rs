@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::aggregator::multi_horizon::{
@@ -12,11 +11,10 @@ use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
     add_named_parameter, add_positional_parameter, delete_boxed, estimate_raster_cardinality,
-    extract_projected_columns, init_table_function_local, register_common_raster_named_parameters,
-    BindHelper, ChunkWriter, TableFunctionLocalData,
+    extract_projected_columns, init_table_function_local, open_mosaic_or_set_error,
+    register_common_raster_named_parameters, set_table_function_init_data, BindHelper, ChunkWriter,
+    ConcurrentRecordQueue, TableFunctionLocalData,
 };
-use crate::functions::fast_hex::fast_hex_u64;
-use crate::functions::wkb::h3_index_to_wkb;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoricalOutputFormat {
@@ -56,8 +54,7 @@ pub struct LongCategoricalRow {
 
 pub struct RasterH3CategoricalGlobalData {
     pub streamer: Mutex<MultiCategoricalHorizonStreamer>,
-    pub ready_batches: Mutex<VecDeque<Vec<MultiCategoricalRecord>>>,
-    pub is_finished: AtomicBool,
+    pub record_queue: ConcurrentRecordQueue<MultiCategoricalRecord>,
     pub format: CategoricalOutputFormat,
     pub projected_columns: Vec<usize>,
     pub long_queue: Mutex<VecDeque<LongCategoricalRow>>,
@@ -179,19 +176,15 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
     }
     let bind_data = &*bind_data_ptr;
 
-    let mosaic = match crate::raster::mosaic::MosaicReader::open(
+    let mosaic = match open_mosaic_or_set_error(
+        info,
         &bind_data.resolved_paths,
         bind_data.bbox,
         bind_data.source_crs.as_deref(),
         bind_data.overlap_rule,
     ) {
-        Ok(m) => std::sync::Arc::new(m),
-        Err(e) => {
-            let err_msg = CString::new(format!("Failed to open raster mosaic: {}", e))
-                .unwrap_or_else(|_| CString::new("Failed to open raster mosaic").unwrap());
-            duckdb_init_set_error(info, err_msg.as_ptr());
-            return;
-        }
+        Some(m) => m,
+        None => return,
     };
 
     let projected_columns = extract_projected_columns(info);
@@ -218,21 +211,16 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         }
     };
 
-    let global_data = Box::new(RasterH3CategoricalGlobalData {
+    let global_data = RasterH3CategoricalGlobalData {
         streamer: Mutex::new(streamer),
-        ready_batches: Mutex::new(VecDeque::new()),
-        is_finished: AtomicBool::new(false),
+        record_queue: ConcurrentRecordQueue::new(),
         format: bind_data.format,
         projected_columns,
         long_queue: Mutex::new(VecDeque::new()),
         emit_geom: bind_data.emit_geom,
-    });
+    };
 
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(global_data) as *mut c_void,
-        Some(delete_boxed::<RasterH3CategoricalGlobalData>),
-    );
+    set_table_function_init_data(info, global_data);
 }
 
 /// Thread-local init callback for categorical aggregation
@@ -256,73 +244,11 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 
     match global_data.format {
         CategoricalOutputFormat::Wide => {
-            let batch_opt = {
-                let mut ready_q = match global_data.ready_batches.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                if let Some(b) = ready_q.pop_front() {
-                    Some(b)
-                } else if global_data.is_finished.load(Ordering::Acquire) {
-                    None
-                } else {
-                    drop(ready_q);
-
-                    let mut streamer = match global_data.streamer.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-
-                    let mut ready_q = match global_data.ready_batches.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-
-                    if let Some(b) = ready_q.pop_front() {
-                        Some(b)
-                    } else if global_data.is_finished.load(Ordering::Acquire) {
-                        None
-                    } else {
-                        const BATCH_SIZE: usize = 2048;
-                        const REFILL_SIZE: usize = BATCH_SIZE * 4;
-
-                        let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
-                        let mut my_batch = None;
-
-                        streamer.drain_completed_into(REFILL_SIZE, |_i, rec| {
-                            current_chunk.push(rec);
-                            if current_chunk.len() == BATCH_SIZE {
-                                if my_batch.is_none() {
-                                    my_batch = Some(std::mem::replace(
-                                        &mut current_chunk,
-                                        Vec::with_capacity(BATCH_SIZE),
-                                    ));
-                                } else {
-                                    ready_q.push_back(std::mem::replace(
-                                        &mut current_chunk,
-                                        Vec::with_capacity(BATCH_SIZE),
-                                    ));
-                                }
-                            }
-                        });
-
-                        if !current_chunk.is_empty() {
-                            if my_batch.is_none() {
-                                my_batch = Some(current_chunk);
-                            } else {
-                                ready_q.push_back(current_chunk);
-                            }
-                        }
-
-                        if my_batch.is_none() {
-                            global_data.is_finished.store(true, Ordering::Release);
-                        }
-
-                        my_batch
-                    }
-                }
-            };
+            let batch_opt = global_data
+                .record_queue
+                .pop_or_refill(&global_data.streamer, |s, max_rows, f| {
+                    s.drain_completed_into(max_rows, f)
+                });
 
             let batch = match batch_opt {
                 Some(b) if !b.is_empty() => b,
@@ -342,14 +268,11 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 
             let mut fallback_hex_buf = [0u8; 16];
             let mut fallback_wkb_buf = [0u8; 128];
-            let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
-                (
-                    &mut (*local_data_ptr).hex_buf,
-                    &mut (*local_data_ptr).wkb_buf,
-                )
-            } else {
-                (&mut fallback_hex_buf, &mut fallback_wkb_buf)
-            };
+            let (hex_buf, wkb_buf) = TableFunctionLocalData::get_scratch_buffers(
+                local_data_ptr,
+                &mut fallback_hex_buf,
+                &mut fallback_wkb_buf,
+            );
 
             let batch_len = batch.len();
 
@@ -380,28 +303,13 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 13: geom GEOMETRY (if emit_geom)
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 match orig_col {
-                    0 => {
-                        let slice: &mut [u64] = writer.get_data_slice_mut(out_idx, batch_len);
-                        for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                            *dest = rec.h3_index;
-                        }
-                    }
-                    1 => {
-                        for (i, rec) in batch.iter().enumerate() {
-                            let hex_slice = fast_hex_u64(rec.h3_index, hex_buf);
-                            writer.set_string_bytes(out_idx, i, hex_slice);
-                        }
-                    }
+                    0 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index)),
+                    1 => writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf),
                     2 => out_maj_cls = Some(out_idx),
                     3 => out_maj_frac = Some(out_idx),
                     4 => out_maj_cnt = Some(out_idx),
                     5 => out_uniq = Some(out_idx),
-                    6 => {
-                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, batch_len);
-                        for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                            *dest = rec.accumulator.total_count;
-                        }
-                    }
+                    6 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.total_count)),
                     7 => {
                         let mut hist_buf = String::with_capacity(256);
                         for (i, rec) in batch.iter().enumerate() {
@@ -409,12 +317,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                             writer.set_string_bytes(out_idx, i, hist_buf.as_bytes());
                         }
                     }
-                    8 => {
-                        let slice: &mut [u8] = writer.get_data_slice_mut(out_idx, batch_len);
-                        for (dest, rec) in slice.iter_mut().zip(batch.iter()) {
-                            *dest = rec.resolution;
-                        }
-                    }
+                    8 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.resolution)),
                     9 => out_shannon = Some(out_idx),
                     10 => out_entropy = Some(out_idx),
                     11 => out_distinct = Some(out_idx),
@@ -473,26 +376,12 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
             }
 
-            if out_idx_wkb.is_some() || out_idx_geom.is_some() {
-                for (i, rec) in batch.iter().enumerate() {
-                    if let Some(wkb_len) = h3_index_to_wkb(rec.h3_index, wkb_buf) {
-                        let bytes = &wkb_buf[..wkb_len];
-                        if let Some(out_wkb) = out_idx_wkb {
-                            writer.set_string_bytes(out_wkb, i, bytes);
-                        }
-                        if let Some(out_geom) = out_idx_geom {
-                            writer.set_string_bytes(out_geom, i, bytes);
-                        }
-                    } else {
-                        if let Some(out_wkb) = out_idx_wkb {
-                            writer.set_null(out_wkb, i);
-                        }
-                        if let Some(out_geom) = out_idx_geom {
-                            writer.set_null(out_geom, i);
-                        }
-                    }
-                }
-            }
+            writer.write_wkb_and_geom_columns(
+                out_idx_wkb,
+                out_idx_geom,
+                batch.iter().map(|r| &r.h3_index),
+                wkb_buf,
+            );
 
             writer.set_size(batch_len);
         }
@@ -568,14 +457,11 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 
             let mut fallback_hex_buf = [0u8; 16];
             let mut fallback_wkb_buf = [0u8; 128];
-            let (hex_buf, wkb_buf) = if !local_data_ptr.is_null() {
-                (
-                    &mut (*local_data_ptr).hex_buf,
-                    &mut (*local_data_ptr).wkb_buf,
-                )
-            } else {
-                (&mut fallback_hex_buf, &mut fallback_wkb_buf)
-            };
+            let (hex_buf, wkb_buf) = TableFunctionLocalData::get_scratch_buffers(
+                local_data_ptr,
+                &mut fallback_hex_buf,
+                &mut fallback_wkb_buf,
+            );
 
             let mut out_idx_wkb: Option<usize> = None;
             let mut out_idx_geom: Option<usize> = None;
@@ -596,86 +482,27 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             // 12: geom GEOMETRY (if emit_geom)
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 match orig_col {
-                    0 => {
-                        let slice: &mut [u64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.cell_u64;
-                        }
-                    }
-                    1 => {
-                        for (i, row) in rows.iter().enumerate() {
-                            let hex_slice = fast_hex_u64(row.cell_u64, hex_buf);
-                            writer.set_string_bytes(out_idx, i, hex_slice);
-                        }
-                    }
-                    2 => {
-                        let slice: &mut [i64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.category;
-                        }
-                    }
-                    3 => {
-                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.count;
-                        }
-                    }
-                    4 => {
-                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.fraction;
-                        }
-                    }
-                    5 => {
-                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.total_count;
-                        }
-                    }
-                    6 => {
-                        let slice: &mut [u8] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.resolution;
-                        }
-                    }
-                    7 | 8 => {
-                        let slice: &mut [f64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.entropy;
-                        }
-                    }
-                    9 | 10 => {
-                        let slice: &mut [i64] = writer.get_data_slice_mut(out_idx, num_taken);
-                        for (dest, row) in slice.iter_mut().zip(rows.iter()) {
-                            *dest = row.distinct_classes;
-                        }
-                    }
+                    0 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.cell_u64)),
+                    1 => writer.write_hex_column(out_idx, rows.iter().map(|r| &r.cell_u64), hex_buf),
+                    2 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.category)),
+                    3 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.count)),
+                    4 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.fraction)),
+                    5 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.total_count)),
+                    6 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.resolution)),
+                    7 | 8 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.entropy)),
+                    9 | 10 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.distinct_classes)),
                     11 => out_idx_wkb = Some(out_idx),
                     12 if global_data.emit_geom => out_idx_geom = Some(out_idx),
                     _ => {}
                 }
             }
 
-            if out_idx_wkb.is_some() || out_idx_geom.is_some() {
-                for (i, row) in rows.iter().enumerate() {
-                    if let Some(wkb_len) = h3_index_to_wkb(row.cell_u64, wkb_buf) {
-                        let bytes = &wkb_buf[..wkb_len];
-                        if let Some(out_wkb) = out_idx_wkb {
-                            writer.set_string_bytes(out_wkb, i, bytes);
-                        }
-                        if let Some(out_geom) = out_idx_geom {
-                            writer.set_string_bytes(out_geom, i, bytes);
-                        }
-                    } else {
-                        if let Some(out_wkb) = out_idx_wkb {
-                            writer.set_null(out_wkb, i);
-                        }
-                        if let Some(out_geom) = out_idx_geom {
-                            writer.set_null(out_geom, i);
-                        }
-                    }
-                }
-            }
+            writer.write_wkb_and_geom_columns(
+                out_idx_wkb,
+                out_idx_geom,
+                rows.iter().map(|r| &r.cell_u64),
+                wkb_buf,
+            );
 
             writer.set_size(num_taken);
         }
