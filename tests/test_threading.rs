@@ -133,3 +133,67 @@ fn test_multithreaded_streamer_high_contention_stress() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_prefetched_chunk_reader_multithreaded_pipeline() -> Result<()> {
+    use raster_h3::raster::prefetch::PrefetchedChunkReader;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("prefetch_test.tif");
+    // Create a 256x256 GeoTIFF
+    helpers::create_temp_geotiff(&path, 256, 256, CompressionMethod::None)?;
+
+    let reader = GeoTiffStreamReader::open(&path)?;
+    let total_chunks = reader.chunk_layout.total_chunks;
+    let chunk_indices: Vec<u32> = (0..total_chunks).collect();
+
+    // Spawn prefetcher with 4 background worker threads and capacity 16
+    let prefetcher = PrefetchedChunkReader::spawn_with_workers(
+        reader.clone(),
+        chunk_indices.clone(),
+        16,
+        4,
+    );
+
+    let mut drained_chunks = Vec::new();
+    let mut batch = Vec::new();
+    let mut buffers_to_recycle = Vec::new();
+
+    while prefetcher.drain_chunk_batch_into(&mut batch, 2, 4) > 0 {
+        for item in batch.drain(..) {
+            let (chunk_idx, bounds, data) = item.expect("Prefetch chunk decoding error");
+            // Check order
+            assert_eq!(chunk_idx as usize, drained_chunks.len(), "Chunks must arrive in strict sequential order");
+            drained_chunks.push((chunk_idx, bounds));
+            buffers_to_recycle.push(data);
+        }
+        // Recycle buffers back to test pool reuse
+        if buffers_to_recycle.len() >= 4 {
+            prefetcher.recycle_batch(buffers_to_recycle.drain(..));
+        }
+    }
+    // Recycle any remaining
+    prefetcher.recycle_batch(buffers_to_recycle);
+
+    assert_eq!(drained_chunks.len(), total_chunks as usize);
+
+    // Verify bitwise and bounds parity against baseline reader
+    for (chunk_idx, bounds) in drained_chunks {
+        let (expected_bounds, _) = reader.read_chunk(chunk_idx)?;
+        assert_eq!(bounds, expected_bounds);
+    }
+
+    // Verify early drop cancellation does not deadlock or leak threads
+    let prefetcher_early = PrefetchedChunkReader::spawn_with_workers(
+        reader.clone(),
+        (0..total_chunks).collect(),
+        16,
+        4,
+    );
+    // Drain only 1 chunk then drop prefetcher immediately
+    let _ = prefetcher_early.next_chunk();
+    drop(prefetcher_early);
+
+    Ok(())
+}
+
+

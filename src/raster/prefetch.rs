@@ -453,3 +453,268 @@ impl PrefetchedMosaicReader {
         batch
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_ordered_prefetch_queue_sequential() {
+        let queue = Arc::new(OrderedPrefetchQueue::new(16, 50));
+        let q = Arc::clone(&queue);
+        let producer = thread::spawn(move || {
+            for i in 0..50 {
+                assert!(q.push(i, format!("item_{}", i)));
+            }
+        });
+        for i in 0..50 {
+            let item = queue.next().expect("Expected item");
+            assert_eq!(item, format!("item_{}", i));
+        }
+        assert!(queue.next().is_none());
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn test_ordered_prefetch_queue_batch_draining() {
+        let queue = Arc::new(OrderedPrefetchQueue::new(16, 100));
+        let q = Arc::clone(&queue);
+        let producer = thread::spawn(move || {
+            for i in 0..100 {
+                assert!(q.push(i, i * 10));
+            }
+        });
+        let mut collected = Vec::new();
+        let mut batch = Vec::new();
+        while queue.drain_into(&mut batch, 5, 10) > 0 {
+            collected.append(&mut batch);
+        }
+        producer.join().unwrap();
+        assert_eq!(collected.len(), 100);
+        for (idx, &val) in collected.iter().enumerate() {
+            assert_eq!(val, idx * 10);
+        }
+    }
+
+    #[test]
+    fn test_ordered_prefetch_queue_reverse_insertion() {
+        let queue = Arc::new(OrderedPrefetchQueue::new(16, 16));
+        let q_clone = Arc::clone(&queue);
+
+        // Push in reverse order in a background thread
+        let handle = thread::spawn(move || {
+            for i in (0..16).rev() {
+                assert!(q_clone.push(i, i));
+            }
+        });
+
+        // Drain from main thread - must come out in strictly ascending order 0..16
+        let mut collected = Vec::new();
+        for _ in 0..16 {
+            collected.push(queue.next().unwrap());
+        }
+        handle.join().unwrap();
+
+        assert_eq!(collected, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_ordered_prefetch_queue_chaotic_multithreaded() {
+        // 16 producer threads pushing 10,000 items in chaotic non-sequential order
+        let num_items = 10_000;
+        let num_producers = 16;
+        let queue = Arc::new(OrderedPrefetchQueue::new(64, num_items));
+        let next_job = Arc::new(AtomicUsize::new(0));
+
+        let mut producer_handles = Vec::new();
+        for worker_id in 0..num_producers {
+            let q = Arc::clone(&queue);
+            let job_counter = Arc::clone(&next_job);
+            producer_handles.push(thread::spawn(move || {
+                loop {
+                    let job_id = job_counter.fetch_add(1, Ordering::Relaxed);
+                    if job_id >= num_items {
+                        break;
+                    }
+                    // Introduce chaotic jitter / preemption
+                    let jitter = (job_id * 17 + worker_id * 31) % 10;
+                    if jitter == 0 {
+                        thread::yield_now();
+                    } else if jitter == 1 {
+                        thread::sleep(Duration::from_micros(10));
+                    }
+                    assert!(q.push(job_id, job_id as u64));
+                }
+            }));
+        }
+
+        // Consumer drains using a variety of batch sizes
+        let mut received = Vec::with_capacity(num_items);
+        let mut batch = Vec::new();
+        let mut batch_size_cycle = 1;
+        while received.len() < num_items {
+            let min_b = batch_size_cycle;
+            let max_b = batch_size_cycle * 2;
+            let drained = queue.drain_into(&mut batch, min_b, max_b);
+            if drained > 0 {
+                received.append(&mut batch);
+            }
+            batch_size_cycle = (batch_size_cycle % 15) + 1;
+        }
+
+        for h in producer_handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(received.len(), num_items);
+        for (expected, actual) in received.iter().enumerate() {
+            assert_eq!(*actual, expected as u64, "Queue must maintain strict sequence order");
+        }
+    }
+
+    #[test]
+    fn test_ordered_prefetch_queue_backpressure_saturation() {
+        let capacity = 16;
+        let total_jobs = 100;
+        let queue = Arc::new(OrderedPrefetchQueue::new(capacity, total_jobs));
+        let q_clone = Arc::clone(&queue);
+
+        let pushed_count = Arc::new(AtomicUsize::new(0));
+        let p_count = Arc::clone(&pushed_count);
+
+        let producer_handle = thread::spawn(move || {
+            for i in 0..total_jobs {
+                assert!(q_clone.push(i, i));
+                p_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // Sleep briefly to give producer time to saturate capacity
+        thread::sleep(Duration::from_millis(50));
+
+        // Capacity is 16. The producer cannot advance beyond capacity (16 items) ahead of consumer (next_read = 0).
+        let count_before_drain = pushed_count.load(Ordering::SeqCst);
+        assert!(
+            count_before_drain <= capacity,
+            "Backpressure failed: pushed {} items but capacity is {}",
+            count_before_drain,
+            capacity
+        );
+
+        // Consumer drains 8 items
+        let mut batch = Vec::new();
+        queue.drain_into(&mut batch, 8, 8);
+        assert_eq!(batch.len(), 8);
+
+        // Allow producer to unblock and push 8 more items
+        thread::sleep(Duration::from_millis(50));
+        let count_after_drain = pushed_count.load(Ordering::SeqCst);
+        assert!(
+            count_after_drain >= count_before_drain,
+            "Producer should resume after draining"
+        );
+        assert!(
+            count_after_drain <= 8 + capacity,
+            "Producer cannot exceed next_read + capacity"
+        );
+
+        // Drain the rest
+        while queue.drain_into(&mut batch, 1, 32) > 0 {
+            batch.clear();
+        }
+
+        producer_handle.join().unwrap();
+        assert_eq!(pushed_count.load(Ordering::SeqCst), total_jobs);
+    }
+
+    #[test]
+    fn test_ordered_prefetch_queue_early_close() {
+        let capacity = 16;
+        let total_jobs = 1000;
+        let queue = Arc::new(OrderedPrefetchQueue::new(capacity, total_jobs));
+
+        let num_workers = 4;
+        let mut handles = Vec::new();
+        let unblocked = Arc::new(AtomicUsize::new(0));
+
+        for w in 0..num_workers {
+            let q = Arc::clone(&queue);
+            let unb = Arc::clone(&unblocked);
+            handles.push(thread::spawn(move || {
+                for i in (w..total_jobs).step_by(num_workers) {
+                    if !q.push(i, i) {
+                        unb.fetch_add(1, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }));
+        }
+
+        // Read a few items
+        let _ = queue.next();
+        let _ = queue.next();
+
+        // Close early
+        queue.close();
+
+        // All producer threads should terminate cleanly without deadlock
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Subsequent drain returns 0 once remaining buffer slots are empty
+        let mut batch = Vec::new();
+        while queue.drain_into(&mut batch, 1, 10) > 0 {
+            batch.clear();
+        }
+        assert_eq!(queue.drain_into(&mut batch, 1, 10), 0);
+    }
+
+    #[test]
+    fn test_lock_free_buffer_pool_concurrency() {
+        let pool = Arc::new(crossbeam_deque::Injector::new());
+        let num_threads = 8;
+        let iters_per_thread = 2000;
+
+        // Pre-populate pool with 16 buffers
+        for _ in 0..16 {
+            pool.push(DecodingResult::U8(vec![0u8; 1024]));
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..num_threads {
+            let p = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                for _ in 0..iters_per_thread {
+                    let buf = match p.steal() {
+                        crossbeam_deque::Steal::Success(b) => b,
+                        _ => DecodingResult::U8(vec![1u8; 1024]),
+                    };
+                    // Modify buffer to verify no data race or corruption
+                    match buf {
+                        DecodingResult::U8(mut v) => {
+                            v[0] = v[0].wrapping_add(1);
+                            p.push(DecodingResult::U8(v));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify pool can be completely drained without crashing
+        let mut count = 0;
+        while let crossbeam_deque::Steal::Success(_) = pool.steal() {
+            count += 1;
+        }
+        assert!(count >= 16);
+    }
+}
