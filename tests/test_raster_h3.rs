@@ -1541,6 +1541,75 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
 }
 
 #[test]
+fn test_parallel_categorical_aggregation_hawaii_dataset() {
+    use raster_h3::aggregator::multi_horizon::{
+        MultiCategoricalHorizonStreamer, MultiResolutionConfig,
+    };
+    use std::collections::HashMap;
+
+    let tiff_path = Path::new("data/LF2024_FBFM40_HI.tif");
+    if !tiff_path.exists() {
+        return;
+    }
+
+    // 1. Dual-pyramid multi-resolution scan (Res 7 + Res 8) in a single pass
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let config = MultiResolutionConfig::new(vec![7, 8]);
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
+
+    let mut r7_count = 0usize;
+    let mut r8_count = 0usize;
+    let mut total_pixels = 0.0f64;
+    let mut r8_class_distribution: HashMap<i64, usize> = HashMap::new();
+
+    loop {
+        let n = streamer.drain_completed_into(2048, |_i, rec| {
+            if rec.resolution == 7 {
+                r7_count += 1;
+            } else if rec.resolution == 8 {
+                r8_count += 1;
+                total_pixels += rec.accumulator.total_count;
+                let (maj_cls, _, _) = rec.accumulator.majority();
+                *r8_class_distribution.entry(maj_cls).or_insert(0usize) += 1;
+            }
+        });
+        if n == 0 {
+            break;
+        }
+    }
+
+    // Ground truth asserts for LF2024_FBFM40_HI.tif
+    assert_eq!(r7_count, 39_412, "Res 7 pyramid cell count mismatch");
+    assert_eq!(r8_count, 273_615, "Res 8 pyramid cell count mismatch");
+    assert_eq!(r7_count + r8_count, 313_027, "Total dual pyramid cell count mismatch");
+    assert_eq!(total_pixels as u64, 256_542_384, "Total pixel count mismatch on Hawaii categorical scan");
+
+    // Verify top 3 landcover classes
+    assert_eq!(*r8_class_distribution.get(&-9999).unwrap_or(&0), 243_696, "Class -9999 (NoData) hex count mismatch");
+    assert_eq!(*r8_class_distribution.get(&98).unwrap_or(&0), 10_779, "Class 98 hex count mismatch");
+    assert_eq!(*r8_class_distribution.get(&163).unwrap_or(&0), 7_287, "Class 163 hex count mismatch");
+
+    // 2. Spatial bounding box pushdown (Maui Island ROI)
+    let maui_bbox = [-156.70, 20.55, -155.95, 21.05];
+    let mut config_maui = MultiResolutionConfig::new(vec![8]);
+    config_maui.bbox = Some(maui_bbox);
+
+    let reader_maui = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let mut streamer_maui = MultiCategoricalHorizonStreamer::new(reader_maui, &config_maui).unwrap();
+    let mut maui_hexes = 0usize;
+
+    loop {
+        let n = streamer_maui.drain_completed_into(2048, |_i, _rec| {
+            maui_hexes += 1;
+        });
+        if n == 0 {
+            break;
+        }
+    }
+    assert_eq!(maui_hexes, 5_230, "Maui ROI spatial filter pushdown hexagon count mismatch");
+}
+
+#[test]
 fn test_spatial_filter_pushdown_chunk_skipping() {
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
