@@ -145,6 +145,7 @@ fn print_help() {
     println!("  --format <fmt>        Output format: parquet, pmtiles, or both (default: parquet)");
     println!("  --compression <type>  Parquet compression: snappy, zstd, gzip, or none (default: snappy)");
     println!("  --compact <bool>      Compact Parquet format without lat/lng/hex strings (default: true)");
+    println!("  --geoparquet          Emit OGC GeoParquet 1.1 geometry and metadata (default: false)");
     println!("  --row-group-size <n>  Parquet row group row count (default: 131072)");
     println!("  --overlap-rule <rule> Mosaic overlap resolution: cutline, first, last, min, max, mean (default: cutline)");
     println!("  --sampling <pattern>  Subpixel sampling: center, 5point, 7point, 9point (default: center)");
@@ -413,6 +414,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut format = OutputFormat::Parquet;
     let mut compression = Compression::SNAPPY;
     let mut compact = true;
+    let mut geoparquet = false;
     let mut row_group_size = 131_072usize;
     let mut overlap_rule = OverlapRule::Cutline;
     let mut sampling = SamplingPattern::center();
@@ -518,6 +520,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "--keep-raw" => {
                 evict_raw = false;
             }
+            "--geoparquet" => {
+                geoparquet = true;
+            }
             "--dry-run" => {
                 dry_run = true;
             }
@@ -552,6 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         compression,
         row_group_size,
         is_categorical: false,
+        geoparquet,
     };
 
     println!("=========================================================================================");
@@ -559,7 +565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("=========================================================================================");
     println!("  Target Resolutions : {:?}", resolutions);
     println!("  Output Format      : {:?}", format);
-    println!("  Parquet Config     : compression={:?}, compact={}, row_group_size={}", compression, compact, row_group_size);
+    println!("  Parquet Config     : compression={:?}, compact={}, geoparquet={}, row_group_size={}", compression, compact, geoparquet, row_group_size);
     println!("  Sampling Pattern   : {:?}", sampling);
     println!("  Overlap Rule       : {:?}", overlap_rule);
     println!("  Active Bands       : Band {} to Band {}", start_band, end_band);

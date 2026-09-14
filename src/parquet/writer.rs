@@ -23,11 +23,15 @@ use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 
+use parquet::file::metadata::KeyValue;
+use serde_json::json;
+
 use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use crate::functions::fast_hex::fast_hex_u64;
+use crate::functions::wkb::cell_to_wkb;
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 #[derive(Debug, Clone)]
@@ -36,6 +40,7 @@ pub struct ParquetExportConfig {
     pub compression: Compression,
     pub row_group_size: usize,
     pub is_categorical: bool,
+    pub geoparquet: bool,
 }
 
 impl Default for ParquetExportConfig {
@@ -45,8 +50,70 @@ impl Default for ParquetExportConfig {
             compression: Compression::SNAPPY,
             row_group_size: 131_072,
             is_categorical: false,
+            geoparquet: false,
         }
     }
+}
+
+/// Build an OGC GeoParquet 1.1 compliant JSON metadata object for Parquet FileMetaData key-value store
+pub fn build_geoparquet_metadata(primary_column: &str, bbox: [f64; 4]) -> String {
+    let geo = json!({
+        "version": "1.1.0",
+        "primary_column": primary_column,
+        "columns": {
+            primary_column: {
+                "encoding": "WKB",
+                "geometry_types": ["Polygon"],
+                "crs": {
+                    "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
+                    "type": "GeographicCRS",
+                    "name": "WGS 84 (CRS84)",
+                    "datum_ensemble": {
+                        "name": "World Geodetic System 1984 ensemble",
+                        "members": [
+                            { "name": "World Geodetic System 1984 (Transit)" },
+                            { "name": "World Geodetic System 1984 (G730)" },
+                            { "name": "World Geodetic System 1984 (G873)" },
+                            { "name": "World Geodetic System 1984 (G1150)" },
+                            { "name": "World Geodetic System 1984 (G1674)" },
+                            { "name": "World Geodetic System 1984 (G1762)" },
+                            { "name": "World Geodetic System 1984 (G2139)" }
+                        ],
+                        "ellipsoid": {
+                            "name": "WGS 84",
+                            "semi_major_axis": 6378137.0,
+                            "inverse_flattening": 298.257223563
+                        },
+                        "accuracy": "2.0"
+                    },
+                    "coordinate_system": {
+                        "subtype": "ellipsoidal",
+                        "axis": [
+                            {
+                                "name": "Geodetic longitude",
+                                "abbreviation": "Lon",
+                                "direction": "east",
+                                "unit": "degree"
+                            },
+                            {
+                                "name": "Geodetic latitude",
+                                "abbreviation": "Lat",
+                                "direction": "north",
+                                "unit": "degree"
+                            }
+                        ]
+                    },
+                    "id": {
+                        "authority": "OGC",
+                        "code": "CRS84"
+                    }
+                },
+                "bbox": [bbox[0], bbox[1], bbox[2], bbox[3]],
+                "edges": "planar"
+            }
+        }
+    });
+    geo.to_string()
 }
 
 /// Common interface for horizon streamers supplying records to the Parquet pipeline
@@ -57,6 +124,11 @@ pub trait ParquetStreamer {
     fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> usize
     where
         F: FnMut(usize, Self::Record);
+
+    /// Optional spatial bounding box in WGS84 [min_lon, min_lat, max_lon, max_lat]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        None
+    }
 }
 
 impl ParquetStreamer for MultiScanHorizonStreamer {
@@ -69,6 +141,11 @@ impl ParquetStreamer for MultiScanHorizonStreamer {
     {
         self.drain_completed_into(max_rows, consumer)
     }
+
+    #[inline]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        Some(self.mosaic.mosaic_bounds_wgs84)
+    }
 }
 
 impl ParquetStreamer for MultiCategoricalHorizonStreamer {
@@ -80,6 +157,11 @@ impl ParquetStreamer for MultiCategoricalHorizonStreamer {
         F: FnMut(usize, Self::Record),
     {
         self.drain_completed_into(max_rows, consumer)
+    }
+
+    #[inline]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        Some(self.mosaic.mosaic_bounds_wgs84)
     }
 }
 
@@ -164,12 +246,17 @@ fn write_byte_array_column(
     Ok(())
 }
 
-/// Common trait for Parquet row group column buffers (continuous and categorical)
-pub trait ParquetRowGroupBuffer: Send + 'static {
+///// Common trait for Parquet row group column buffers (continuous and categorical)
+pub trait ParquetRowGroupBuffer: Sized + Send + 'static {
     type Record;
 
-    /// Allocate a new buffer with target row group capacity
-    fn with_capacity(capacity: usize, compact: bool) -> Self;
+    /// Allocate a new buffer with target row group capacity and options
+    fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self;
+
+    /// Allocate a new buffer with target row group capacity (default geoparquet: false)
+    fn with_capacity(capacity: usize, compact: bool) -> Self {
+        Self::with_capacity_and_options(capacity, compact, false)
+    }
 
     /// Push a single stream record into column vectors
     fn push_record(&mut self, record: Self::Record);
@@ -195,13 +282,15 @@ pub trait ParquetRowGroupBuffer: Send + 'static {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Return schema definition string for this buffer type
-    fn schema_message(compact: bool) -> &'static str;
+    fn schema_message(compact: bool, geoparquet: bool) -> &'static str;
 }
 
 /// Columnar buffer for continuous raster aggregation row groups
 pub struct ContinuousRowGroupBuffer {
     compact: bool,
+    geoparquet: bool,
     h3_indices: Vec<i64>,
+    geometries: Vec<ByteArray>,
     min_values: Vec<f64>,
     max_values: Vec<f64>,
     sum_values: Vec<f64>,
@@ -215,10 +304,12 @@ pub struct ContinuousRowGroupBuffer {
 impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
     type Record = MultiContinuousRecord;
 
-    fn with_capacity(capacity: usize, compact: bool) -> Self {
+    fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self {
         Self {
             compact,
+            geoparquet,
             h3_indices: Vec::with_capacity(capacity),
+            geometries: if geoparquet { Vec::with_capacity(capacity) } else { Vec::new() },
             min_values: Vec::with_capacity(capacity),
             max_values: Vec::with_capacity(capacity),
             sum_values: Vec::with_capacity(capacity),
@@ -235,6 +326,17 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
         let cell_u64 = record.h3_index;
         let acc = record.accumulator;
         self.h3_indices.push(cell_u64 as i64);
+
+        if self.geoparquet {
+            if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                let mut wkb_buf = [0u8; 128];
+                let len = cell_to_wkb(cell, &mut wkb_buf);
+                self.geometries.push(ByteArray::from(&wkb_buf[..len]));
+            } else {
+                self.geometries.push(ByteArray::from(Vec::new()));
+            }
+        }
+
         self.min_values.push(acc.min);
         self.max_values.push(acc.max);
         self.sum_values.push(acc.sum);
@@ -264,6 +366,9 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
 
     fn clear(&mut self) {
         self.h3_indices.clear();
+        if self.geoparquet {
+            self.geometries.clear();
+        }
         self.min_values.clear();
         self.max_values.clear();
         self.sum_values.clear();
@@ -283,13 +388,18 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
         };
 
         reorder_by_perm(&mut self.h3_indices, &perm);
+        if self.geoparquet {
+            reorder_by_perm_take(&mut self.geometries, &perm);
+        }
+        if !self.compact {
+            reorder_by_perm_take(&mut self.h3_hexes, &perm);
+        }
         reorder_by_perm(&mut self.min_values, &perm);
         reorder_by_perm(&mut self.max_values, &perm);
         reorder_by_perm(&mut self.sum_values, &perm);
         reorder_by_perm(&mut self.avg_values, &perm);
         reorder_by_perm(&mut self.pixel_counts, &perm);
         if !self.compact {
-            reorder_by_perm_take(&mut self.h3_hexes, &perm);
             reorder_by_perm(&mut self.lats, &perm);
             reorder_by_perm(&mut self.lngs, &perm);
         }
@@ -305,6 +415,9 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
         if !self.compact {
             write_byte_array_column(&mut row_group_writer, &self.h3_hexes)?;
         }
+        if self.geoparquet {
+            write_byte_array_column(&mut row_group_writer, &self.geometries)?;
+        }
         write_f64_column(&mut row_group_writer, &self.min_values)?;
         write_f64_column(&mut row_group_writer, &self.max_values)?;
         write_f64_column(&mut row_group_writer, &self.sum_values)?;
@@ -319,9 +432,9 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
         Ok(())
     }
 
-    fn schema_message(compact: bool) -> &'static str {
-        if compact {
-            "
+    fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
+        match (compact, geoparquet) {
+            (true, false) => "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED DOUBLE min_value;
@@ -330,9 +443,19 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                     REQUIRED DOUBLE avg_value;
                     REQUIRED DOUBLE pixel_count;
                 }
-            "
-        } else {
-            "
+            ",
+            (true, true) => "
+                message schema {
+                    REQUIRED INT64 h3_index;
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED DOUBLE min_value;
+                    REQUIRED DOUBLE max_value;
+                    REQUIRED DOUBLE sum_value;
+                    REQUIRED DOUBLE avg_value;
+                    REQUIRED DOUBLE pixel_count;
+                }
+            ",
+            (false, false) => "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
@@ -344,7 +467,21 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                     REQUIRED DOUBLE lat;
                     REQUIRED DOUBLE lng;
                 }
-            "
+            ",
+            (false, true) => "
+                message schema {
+                    REQUIRED INT64 h3_index;
+                    REQUIRED BYTE_ARRAY h3_hex (UTF8);
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED DOUBLE min_value;
+                    REQUIRED DOUBLE max_value;
+                    REQUIRED DOUBLE sum_value;
+                    REQUIRED DOUBLE avg_value;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED DOUBLE lat;
+                    REQUIRED DOUBLE lng;
+                }
+            ",
         }
     }
 }
@@ -352,7 +489,9 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
 /// Columnar buffer for categorical raster aggregation row groups
 pub struct CategoricalRowGroupBuffer {
     compact: bool,
+    geoparquet: bool,
     h3_indices: Vec<i64>,
+    geometries: Vec<ByteArray>,
     majorities: Vec<i64>,
     fractions: Vec<f64>,
     pixel_counts: Vec<f64>,
@@ -366,10 +505,12 @@ pub struct CategoricalRowGroupBuffer {
 impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     type Record = MultiCategoricalRecord;
 
-    fn with_capacity(capacity: usize, compact: bool) -> Self {
+    fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self {
         Self {
             compact,
+            geoparquet,
             h3_indices: Vec::with_capacity(capacity),
+            geometries: if geoparquet { Vec::with_capacity(capacity) } else { Vec::new() },
             majorities: Vec::with_capacity(capacity),
             fractions: Vec::with_capacity(capacity),
             pixel_counts: Vec::with_capacity(capacity),
@@ -387,6 +528,17 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
         let acc = record.accumulator;
         let (maj_cat, _maj_cnt, maj_frac) = acc.majority();
         self.h3_indices.push(cell_u64 as i64);
+
+        if self.geoparquet {
+            if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                let mut wkb_buf = [0u8; 128];
+                let len = cell_to_wkb(cell, &mut wkb_buf);
+                self.geometries.push(ByteArray::from(&wkb_buf[..len]));
+            } else {
+                self.geometries.push(ByteArray::from(Vec::new()));
+            }
+        }
+
         self.majorities.push(maj_cat);
         self.fractions.push(maj_frac);
         self.pixel_counts.push(acc.total_count);
@@ -416,6 +568,9 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
 
     fn clear(&mut self) {
         self.h3_indices.clear();
+        if self.geoparquet {
+            self.geometries.clear();
+        }
         self.majorities.clear();
         self.fractions.clear();
         self.pixel_counts.clear();
@@ -435,13 +590,18 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
         };
 
         reorder_by_perm(&mut self.h3_indices, &perm);
+        if self.geoparquet {
+            reorder_by_perm_take(&mut self.geometries, &perm);
+        }
+        if !self.compact {
+            reorder_by_perm_take(&mut self.h3_hexes, &perm);
+        }
         reorder_by_perm(&mut self.majorities, &perm);
         reorder_by_perm(&mut self.fractions, &perm);
         reorder_by_perm(&mut self.pixel_counts, &perm);
         reorder_by_perm(&mut self.distinct_classes, &perm);
         reorder_by_perm(&mut self.entropies, &perm);
         if !self.compact {
-            reorder_by_perm_take(&mut self.h3_hexes, &perm);
             reorder_by_perm(&mut self.lats, &perm);
             reorder_by_perm(&mut self.lngs, &perm);
         }
@@ -457,6 +617,9 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
         if !self.compact {
             write_byte_array_column(&mut row_group_writer, &self.h3_hexes)?;
         }
+        if self.geoparquet {
+            write_byte_array_column(&mut row_group_writer, &self.geometries)?;
+        }
         write_i64_column(&mut row_group_writer, &self.majorities)?;
         write_f64_column(&mut row_group_writer, &self.fractions)?;
         write_f64_column(&mut row_group_writer, &self.pixel_counts)?;
@@ -471,9 +634,9 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
         Ok(())
     }
 
-    fn schema_message(compact: bool) -> &'static str {
-        if compact {
-            "
+    fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
+        match (compact, geoparquet) {
+            (true, false) => "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED INT64 majority;
@@ -482,9 +645,19 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                     REQUIRED INT64 distinct_classes;
                     REQUIRED DOUBLE entropy;
                 }
-            "
-        } else {
-            "
+            ",
+            (true, true) => "
+                message schema {
+                    REQUIRED INT64 h3_index;
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED INT64 majority;
+                    REQUIRED DOUBLE majority_fraction;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED INT64 distinct_classes;
+                    REQUIRED DOUBLE entropy;
+                }
+            ",
+            (false, false) => "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
@@ -496,7 +669,21 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                     REQUIRED DOUBLE lat;
                     REQUIRED DOUBLE lng;
                 }
-            "
+            ",
+            (false, true) => "
+                message schema {
+                    REQUIRED INT64 h3_index;
+                    REQUIRED BYTE_ARRAY h3_hex (UTF8);
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED INT64 majority;
+                    REQUIRED DOUBLE majority_fraction;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED INT64 distinct_classes;
+                    REQUIRED DOUBLE entropy;
+                    REQUIRED DOUBLE lat;
+                    REQUIRED DOUBLE lng;
+                }
+            ",
         }
     }
 }
@@ -515,17 +702,26 @@ where
     F: FnMut(usize),
 {
     let compact = parquet_config.compact;
+    let geoparquet = parquet_config.geoparquet;
     let row_group_size = parquet_config.row_group_size.max(1);
 
-    let message_type = B::schema_message(compact);
+    let message_type = B::schema_message(compact, geoparquet);
     let schema = Arc::new(parse_message_type(message_type)?);
-    let props = Arc::new(
-        WriterProperties::builder()
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_column_encoding(ColumnPath::from("h3_index"), Encoding::DELTA_BINARY_PACKED)
-            .set_compression(parquet_config.compression)
-            .build(),
-    );
+
+    let mut props_builder = WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_2_0)
+        .set_column_encoding(ColumnPath::from("h3_index"), Encoding::DELTA_BINARY_PACKED)
+        .set_compression(parquet_config.compression);
+
+    if geoparquet {
+        let bbox = streamer.bounds_wgs84().unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+        let geo_json = build_geoparquet_metadata("geometry", bbox);
+        props_builder = props_builder.set_key_value_metadata(Some(vec![
+            KeyValue::new("geo".to_string(), geo_json),
+        ]));
+    }
+
+    let props = Arc::new(props_builder.build());
 
     if let Some(parent) = parquet_path.as_ref().parent() {
         if !parent.as_os_str().is_empty() {
@@ -539,8 +735,8 @@ where
     let (writer_tx, writer_rx) = sync_channel::<B>(2);
     let (recycle_tx, recycle_rx) = sync_channel::<B>(2);
 
-    let buf1 = B::with_capacity(row_group_size, compact);
-    let buf2 = B::with_capacity(row_group_size, compact);
+    let buf1 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
+    let buf2 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
     let _ = recycle_tx.send(buf2);
 
     let writer_handle = thread::spawn(move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -578,7 +774,7 @@ where
             }
             current_buf = match recycle_rx.recv() {
                 Ok(b) => b,
-                Err(_) => B::with_capacity(row_group_size, compact),
+                Err(_) => B::with_capacity_and_options(row_group_size, compact, geoparquet),
             };
         }
 

@@ -812,6 +812,7 @@ fn test_remote_cog_to_parquet_streaming_pipeline() {
         compression: parquet::basic::Compression::SNAPPY,
         is_categorical: false,
         compact: false,
+        geoparquet: false,
     };
 
     let temp_parquet_path = "target/test_remote_streaming_pipeline.parquet";

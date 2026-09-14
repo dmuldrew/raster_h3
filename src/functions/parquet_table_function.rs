@@ -39,6 +39,7 @@ pub struct ParquetBindData {
     pub compression: Compression,
     pub row_group_size: usize,
     pub bbox: Option<[f64; 4]>,
+    pub geoparquet: bool,
 }
 
 /// Global execution state for the single-row generator
@@ -85,6 +86,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
     let custom_nodata = bind.get_named_double("nodata");
     let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
     let compact = bind.get_named_bool("compact").unwrap_or(true);
+    let geoparquet = bind.get_named_bool("geoparquet").or_else(|| bind.get_named_bool("geom")).unwrap_or(false);
 
     let mut compression = Compression::SNAPPY;
     if let Some(s) = bind.get_named_string("compression") {
@@ -124,6 +126,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
         compression,
         row_group_size,
         bbox,
+        geoparquet,
     });
     duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<ParquetBindData>));
 }
@@ -157,6 +160,7 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
         compression: bind_data.compression,
         row_group_size: bind_data.row_group_size,
         is_categorical: bind_data.is_categorical,
+        geoparquet: bind_data.geoparquet,
     };
 
     let start = Instant::now();
@@ -222,6 +226,8 @@ pub unsafe fn register_parquet_table_function(con: duckdb_connection) -> Result<
     add_named_parameter(tf, "bbox", DuckDBType::Varchar);
     add_named_parameter(tf, "h3_cell", DuckDBType::BigInt);
     add_named_parameter(tf, "h3_hex", DuckDBType::Varchar);
+    add_named_parameter(tf, "geoparquet", DuckDBType::Boolean);
+    add_named_parameter(tf, "geom", DuckDBType::Boolean);
 
     // Set callbacks
     duckdb_table_function_set_bind(tf, parquet_bind);

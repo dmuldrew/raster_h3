@@ -113,6 +113,7 @@ fn test_conus_batch_and_evict_pipeline_simulation() {
         compression: parquet::basic::Compression::SNAPPY,
         row_group_size: 64,
         is_categorical: false,
+        geoparquet: false,
     };
 
     let total_written = H3ParquetWriter::write_continuous_streamer_to_parquet_with_progress(
