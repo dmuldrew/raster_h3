@@ -5,22 +5,20 @@
 //! horizon eviction to maintain a bounded memory footprint.
 
 use std::borrow::Cow;
-use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::path::Path;
-use fxhash::FxBuildHasher;
 use h3o::{CellIndex, LatLng};
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use serde_json::json;
 
 use crate::functions::fast_hex::parse_hex_u64;
-use crate::pmtiles::features::PmtilesExportSummary;
-use crate::pmtiles::mvt::{MercatorPoint, MvtLayer, MvtValue};
-use crate::pmtiles::pyramid::{
-    cell_boundary_mercator, cell_tile_range_mercator, h3_res_to_zoom, max_hex_radius_deg,
-    tile_xy_to_bbox,
+use crate::pmtiles::features::{
+    build_pmtiles_metadata, PmtilesExportSummary, TilePyramidAccumulator,
 };
-use crate::pmtiles::tiler::{evict_and_write_tiles, flush_all_tiles, TileEvictionEntry};
+use crate::pmtiles::mvt::{MercatorPoint, MvtValue};
+use crate::pmtiles::pyramid::{
+    cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg,
+};
 use crate::pmtiles::writer::PmtilesWriter;
 
 /// Extent and statistics for a Parquet row group discovered during pre-scan
@@ -193,22 +191,16 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
 
     // If no extents found or empty file, fallback to empty summary
     if rg_extents.is_empty() {
-        let metadata = json!({
-            "name": "h3_pmtiles_export",
-            "description": "H3 vector hexagon tile pyramid exported by raster_h3",
-            "version": "3",
-            "minzoom": 0,
-            "maxzoom": 0,
-            "vector_layers": [
-                {
-                    "id": "h3_hexagons",
-                    "description": "H3 hexagonal vector polygons with attributes",
-                    "minzoom": 0,
-                    "maxzoom": 0,
-                    "fields": {}
-                }
-            ]
-        });
+        let metadata = build_pmtiles_metadata(
+            "h3_pmtiles_export",
+            "H3 vector hexagon tile pyramid exported by raster_h3",
+            0,
+            0,
+            "h3_hexagons",
+            "H3 hexagonal vector polygons with attributes",
+            json!({}),
+            None,
+        );
         let writer = PmtilesWriter::new(
             0,
             0,
@@ -265,22 +257,16 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         fields_map.insert(col.name().to_string(), json!(type_str));
     }
 
-    let metadata = json!({
-        "name": "h3_pmtiles_export",
-        "description": "H3 vector hexagon tile pyramid exported by raster_h3",
-        "version": "3",
-        "minzoom": min_zoom,
-        "maxzoom": max_zoom,
-        "vector_layers": [
-            {
-                "id": "h3_hexagons",
-                "description": "H3 hexagonal vector polygons with attributes",
-                "minzoom": min_zoom,
-                "maxzoom": max_zoom,
-                "fields": fields_map
-            }
-        ]
-    });
+    let metadata = build_pmtiles_metadata(
+        "h3_pmtiles_export",
+        "H3 vector hexagon tile pyramid exported by raster_h3",
+        min_zoom,
+        max_zoom,
+        "h3_hexagons",
+        "H3 hexagonal vector polygons with attributes",
+        serde_json::Value::Object(fields_map),
+        None,
+    );
 
     let mut writer = PmtilesWriter::new(
         min_zoom,
@@ -289,9 +275,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         metadata.to_string(),
     )?;
 
-    let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
-        HashMap::with_hasher(FxBuildHasher::default());
-    let mut tile_eviction_queue: BinaryHeap<TileEvictionEntry> = BinaryHeap::new();
+    let mut accumulator = TilePyramidAccumulator::new(safety_margin);
 
     let mut total_features = 0usize;
     let mut valid_features = 0usize;
@@ -398,75 +382,22 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
                 properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));
             }
 
-            let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, vertices_merc, zoom);
-            if min_tx == max_tx && min_ty == max_ty {
-                let tile_key = (zoom, min_tx, min_ty);
-                let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
-                    l
-                } else {
-                    let bbox = tile_xy_to_bbox(tile_key.0, tile_key.1, tile_key.2);
-                    let safe_evict_lat = bbox[1] - safety_margin;
-                    tile_eviction_queue.push(TileEvictionEntry {
-                        safe_evict_lat,
-                        tile_key,
-                    });
-                    tile_buckets.entry(tile_key).or_insert_with(|| {
-                        MvtLayer::new("h3_hexagons")
-                    })
-                };
-                layer.add_hexagon_mercator(
-                    h3_u64,
-                    vertices_merc,
-                    zoom,
-                    min_tx,
-                    min_ty,
-                    properties,
-                );
-            } else {
-                for tx in min_tx..=max_tx {
-                    for ty in min_ty..=max_ty {
-                        let is_last = tx == max_tx && ty == max_ty;
-                        let tile_key = (zoom, tx, ty);
-                        let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
-                            l
-                        } else {
-                            let bbox = tile_xy_to_bbox(tile_key.0, tile_key.1, tile_key.2);
-                            let safe_evict_lat = bbox[1] - safety_margin;
-                            tile_eviction_queue.push(TileEvictionEntry {
-                                safe_evict_lat,
-                                tile_key,
-                            });
-                            tile_buckets.entry(tile_key).or_insert_with(|| {
-                                MvtLayer::new("h3_hexagons")
-                            })
-                        };
-
-                        let props = if is_last {
-                            std::mem::take(&mut properties)
-                        } else {
-                            properties.clone()
-                        };
-
-                        layer.add_hexagon_mercator(
-                            h3_u64,
-                            vertices_merc,
-                            zoom,
-                            tx,
-                            ty,
-                            props,
-                        );
-                    }
-                }
-            }
+            accumulator.add_hexagon_mercator(
+                h3_u64,
+                center_merc,
+                vertices_merc,
+                zoom,
+                properties,
+            );
         }
 
         // Streaming Horizon Eviction: Evict and compress all tiles completed prior to the remaining horizon
         let lat_horizon = future_horizons[k];
-        evict_and_write_tiles(&mut tile_buckets, &mut tile_eviction_queue, lat_horizon, &mut writer)?;
+        accumulator.evict_and_write_tiles(lat_horizon, &mut writer)?;
     }
 
-    let total_tiles = writer.tile_count() + tile_buckets.len();
-    flush_all_tiles(tile_buckets, &mut writer)?;
+    let total_tiles = writer.tile_count() + accumulator.active_tile_count();
+    accumulator.flush_all(&mut writer)?;
     writer.finish(pmtiles_path)?;
 
     Ok(PmtilesExportSummary {

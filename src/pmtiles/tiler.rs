@@ -35,28 +35,11 @@ pub use crate::pmtiles::pyramid::{
     tile_xy_to_bbox, zoom_to_h3_res, zooms_for_h3_res,
 };
 
-/// Priority queue entry for tile eviction ordered by southernmost latitude
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) struct TileEvictionEntry {
-    pub(crate) safe_evict_lat: f64,
-    pub(crate) tile_key: (u8, u32, u32),
-}
-
-impl Eq for TileEvictionEntry {}
-
-impl Ord for TileEvictionEntry {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.safe_evict_lat.total_cmp(&other.safe_evict_lat)
-    }
-}
-
-impl PartialOrd for TileEvictionEntry {
-    #[inline(always)]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
+// Re-export feature definitions, metadata, accumulator, and export summaries from features module
+pub use crate::pmtiles::features::{
+    build_default_pmtiles_fields, build_pmtiles_metadata, H3Feature, PmtilesExportSummary,
+    ResolutionAccumulatorStats, TileEvictionEntry, TilePyramidAccumulator,
+};
 
 /// Intermediate prepared tile operation generated across Rayon worker threads
 struct PreparedTileOp {
@@ -101,73 +84,41 @@ struct CategoricalStreamBatch {
 
 /// Evict all tiles whose southernmost reach is strictly north of lat_horizon,
 /// encode to MVT protobuf and Gzip compress across Rayon workers, and stream to PMTiles
-pub(crate) fn evict_and_write_tiles(
+#[allow(dead_code)]
+pub fn evict_and_write_tiles(
     tile_buckets: &mut HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher>,
     tile_eviction_queue: &mut BinaryHeap<TileEvictionEntry>,
     lat_horizon: f64,
     writer: &mut PmtilesWriter,
 ) -> io::Result<usize> {
-    let mut ready_tiles = Vec::new();
-    while let Some(top) = tile_eviction_queue.peek() {
-        if top.safe_evict_lat > lat_horizon {
-            let entry = tile_eviction_queue.pop().unwrap();
-            if let Some(layer) = tile_buckets.remove(&entry.tile_key) {
-                ready_tiles.push((entry.tile_key, layer));
-            }
-        } else {
-            break;
-        }
-    }
-
-    if ready_tiles.is_empty() {
-        return Ok(0);
-    }
-
-    let count = ready_tiles.len();
-    let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = ready_tiles
-        .into_par_iter()
-        .map(|(key, layer)| {
-            let pbf_bytes = layer.encode();
-            let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-            Ok((key, compressed))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-
-    for ((z, x, y), compressed_bytes) in compressed_batch {
-        writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
-    }
-
+    let mut acc = TilePyramidAccumulator {
+        tile_buckets: std::mem::take(tile_buckets),
+        tile_eviction_queue: std::mem::take(tile_eviction_queue),
+        safety_margin: 0.0,
+        layer_name: std::borrow::Cow::Borrowed("h3_hexagons"),
+        property_filter: None,
+    };
+    let count = acc.evict_and_write_tiles(lat_horizon, writer)?;
+    *tile_buckets = acc.tile_buckets;
+    *tile_eviction_queue = acc.tile_eviction_queue;
     Ok(count)
 }
 
 /// Flush all remaining active tiles at raster/stream completion in parallel
-pub(crate) fn flush_all_tiles(
+#[allow(dead_code)]
+pub fn flush_all_tiles(
     tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher>,
     writer: &mut PmtilesWriter,
 ) -> io::Result<usize> {
-    let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = tile_buckets.into_iter().collect();
-    if remaining_tiles.is_empty() {
-        return Ok(0);
-    }
-    let count = remaining_tiles.len();
-    let compressed_batch: Vec<((u8, u32, u32), Vec<u8>)> = remaining_tiles
-        .into_par_iter()
-        .map(|(key, layer)| {
-            let pbf_bytes = layer.encode();
-            let compressed = crate::pmtiles::writer::gzip_compress(&pbf_bytes)?;
-            Ok((key, compressed))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-
-    for ((z, x, y), compressed_bytes) in compressed_batch {
-        writer.add_compressed_tile(z, x, y, &compressed_bytes)?;
-    }
-
-    Ok(count)
+    let acc = TilePyramidAccumulator {
+        tile_buckets,
+        tile_eviction_queue: BinaryHeap::new(),
+        safety_margin: 0.0,
+        layer_name: std::borrow::Cow::Borrowed("h3_hexagons"),
+        property_filter: None,
+    };
+    acc.flush_all(writer)
 }
-
-// Re-export feature definitions, metadata, and export summaries from features module
-pub use crate::pmtiles::features::{H3Feature, PmtilesExportSummary, ResolutionAccumulatorStats};
 
 /// High-level builder to convert H3 data and GeoTIFF raster aggregations directly to PMTiles v3
 pub struct H3PmtilesTiler;
@@ -178,8 +129,7 @@ impl H3PmtilesTiler {
         features: I,
         output_path: P,
     ) -> Result<PmtilesExportSummary, Box<dyn std::error::Error + Send + Sync>> {
-        let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+        let mut accumulator = TilePyramidAccumulator::new(0.0);
 
         let mut total_features = 0usize;
         let mut valid_features = 0usize;
@@ -235,46 +185,13 @@ impl H3PmtilesTiler {
                 properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));
             }
 
-            let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, vertices_merc, zoom);
-            if min_tx == max_tx && min_ty == max_ty {
-                let tile_key = (zoom, min_tx, min_ty);
-                let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                    MvtLayer::new("h3_hexagons")
-                });
-                layer.add_hexagon_mercator(
-                    feat.h3_index,
-                    vertices_merc,
-                    zoom,
-                    min_tx,
-                    min_ty,
-                    properties,
-                );
-            } else {
-                for tx in min_tx..=max_tx {
-                    for ty in min_ty..=max_ty {
-                        let is_last = tx == max_tx && ty == max_ty;
-                        let tile_key = (zoom, tx, ty);
-                        let layer = tile_buckets.entry(tile_key).or_insert_with(|| {
-                            MvtLayer::new("h3_hexagons")
-                        });
-
-                        let props = if is_last {
-                            std::mem::take(&mut properties)
-                        } else {
-                            properties.clone()
-                        };
-
-                        layer.add_hexagon_mercator(
-                            feat.h3_index,
-                            vertices_merc,
-                            zoom,
-                            tx,
-                            ty,
-                            props,
-                        );
-                    }
-                }
-            }
+            accumulator.add_hexagon_mercator(
+                feat.h3_index,
+                center_merc,
+                vertices_merc,
+                zoom,
+                properties,
+            );
         }
 
         if valid_features == 0 {
@@ -286,26 +203,16 @@ impl H3PmtilesTiler {
             max_zoom = 0;
         }
 
-        let metadata = json!({
-            "name": "h3_pmtiles_export",
-            "description": "H3 vector hexagon tile pyramid exported by raster_h3",
-            "version": "3",
-            "minzoom": min_zoom,
-            "maxzoom": max_zoom,
-            "vector_layers": [
-                {
-                    "id": "h3_hexagons",
-                    "description": "H3 hexagonal vector polygons with attributes",
-                    "minzoom": min_zoom,
-                    "maxzoom": max_zoom,
-                    "fields": {
-                        "h3_index": "Number",
-                        "h3_hex": "String",
-                        "resolution": "Number"
-                    }
-                }
-            ]
-        });
+        let metadata = build_pmtiles_metadata(
+            "h3_pmtiles_export",
+            "H3 vector hexagon tile pyramid exported by raster_h3",
+            min_zoom,
+            max_zoom,
+            "h3_hexagons",
+            "H3 hexagonal vector polygons with attributes",
+            build_default_pmtiles_fields(),
+            None,
+        );
 
         let mut writer = PmtilesWriter::new(
             min_zoom,
@@ -314,8 +221,8 @@ impl H3PmtilesTiler {
             metadata.to_string(),
         )?;
 
-        let total_tiles = tile_buckets.len();
-        flush_all_tiles(tile_buckets, &mut writer)?;
+        let total_tiles = accumulator.active_tile_count();
+        accumulator.flush_all(&mut writer)?;
 
         writer.finish(output_path)?;
 
@@ -361,9 +268,8 @@ impl H3PmtilesTiler {
         let max_cell_radius = resolutions.iter().map(|&r| max_hex_radius_deg(r)).fold(0.0f64, f64::max);
         let safety_margin = 2.5 * max_cell_radius;
 
-        let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
-        let mut tile_eviction_queue: BinaryHeap<TileEvictionEntry> = BinaryHeap::new();
+        let mut accumulator = TilePyramidAccumulator::new(safety_margin)
+            .with_filter(property_filter.clone());
 
         let mut total_hexagons = 0usize;
         let mut global_min_lon = 180.0f64;
@@ -557,39 +463,20 @@ impl H3PmtilesTiler {
                 if hex.c_lat > global_max_lat { global_max_lat = hex.c_lat; }
 
                 for op in hex.ops {
-                    let tile_key = op.tile_key;
-                    let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
-                        l
-                    } else {
-                        let bbox = tile_xy_to_bbox(tile_key.0, tile_key.1, tile_key.2);
-                        let safe_evict_lat = bbox[1] - safety_margin;
-                        tile_eviction_queue.push(TileEvictionEntry {
-                            safe_evict_lat,
-                            tile_key,
-                        });
-                        tile_buckets.entry(tile_key).or_insert_with(|| {
-                            MvtLayer::with_filter("h3_hexagons", property_filter.clone())
-                        })
-                    };
-
-                    if op.is_parent {
-                        layer.add_or_merge_feature(op.feature);
-                    } else {
-                        layer.add_feature(op.feature);
-                    }
+                    accumulator.add_op(op.tile_key, op.feature, op.is_parent);
                 }
 
                 total_hexagons += 1;
             }
 
-            evict_and_write_tiles(&mut tile_buckets, &mut tile_eviction_queue, batch.lat_horizon, &mut writer)?;
+            accumulator.evict_and_write_tiles(batch.lat_horizon, &mut writer)?;
         }
 
         if let Err(e) = producer_handle.join() {
             return Err(format!("Producer thread panicked: {:?}", e).into());
         }
 
-        flush_all_tiles(tile_buckets, &mut writer)?;
+        accumulator.flush_all(&mut writer)?;
 
         if total_hexagons == 0 {
             global_min_lon = -180.0;
@@ -638,23 +525,20 @@ impl H3PmtilesTiler {
             })
         };
 
-        let metadata = json!({
-            "name": "raster_h3_pmtiles",
-            "description": "Multi-resolution H3 hexagonal vector tile pyramid generated by raster_h3",
-            "version": "3",
-            "minzoom": min_zoom,
-            "maxzoom": max_zoom,
-            "h3_resolution_stats": res_stats_json,
-            "vector_layers": [
-                {
-                    "id": "h3_hexagons",
-                    "description": "Aggregated H3 hexagonal grid cells",
-                    "minzoom": min_zoom,
-                    "maxzoom": max_zoom,
-                    "fields": fields_json
-                }
-            ]
-        });
+        let metadata = build_pmtiles_metadata(
+            "raster_h3_pmtiles",
+            "Multi-resolution H3 hexagonal vector tile pyramid generated by raster_h3",
+            min_zoom,
+            max_zoom,
+            "h3_hexagons",
+            "Aggregated H3 hexagonal grid cells",
+            fields_json,
+            Some({
+                let mut extras = serde_json::Map::new();
+                extras.insert("h3_resolution_stats".to_string(), json!(res_stats_json));
+                extras
+            }),
+        );
 
         writer.set_metadata(
             [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
@@ -699,9 +583,8 @@ impl H3PmtilesTiler {
         let max_cell_radius = resolutions.iter().map(|&r| max_hex_radius_deg(r)).fold(0.0f64, f64::max);
         let safety_margin = 2.5 * max_cell_radius;
 
-        let mut tile_buckets: HashMap<(u8, u32, u32), MvtLayer, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
-        let mut tile_eviction_queue: BinaryHeap<TileEvictionEntry> = BinaryHeap::new();
+        let mut accumulator = TilePyramidAccumulator::new(safety_margin)
+            .with_filter(property_filter.clone());
 
         let mut total_hexagons = 0usize;
         let mut global_min_lon = 180.0f64;
@@ -909,39 +792,20 @@ impl H3PmtilesTiler {
                 if hex.c_lat > global_max_lat { global_max_lat = hex.c_lat; }
 
                 for op in hex.ops {
-                    let tile_key = op.tile_key;
-                    let layer = if let Some(l) = tile_buckets.get_mut(&tile_key) {
-                        l
-                    } else {
-                        let bbox = tile_xy_to_bbox(tile_key.0, tile_key.1, tile_key.2);
-                        let safe_evict_lat = bbox[1] - safety_margin;
-                        tile_eviction_queue.push(TileEvictionEntry {
-                            safe_evict_lat,
-                            tile_key,
-                        });
-                        tile_buckets.entry(tile_key).or_insert_with(|| {
-                            MvtLayer::with_filter("h3_hexagons", property_filter.clone())
-                        })
-                    };
-
-                    if op.is_parent {
-                        layer.add_or_merge_feature(op.feature);
-                    } else {
-                        layer.add_feature(op.feature);
-                    }
+                    accumulator.add_op(op.tile_key, op.feature, op.is_parent);
                 }
 
                 total_hexagons += 1;
             }
 
-            evict_and_write_tiles(&mut tile_buckets, &mut tile_eviction_queue, batch.lat_horizon, &mut writer)?;
+            accumulator.evict_and_write_tiles(batch.lat_horizon, &mut writer)?;
         }
 
         if let Err(e) = producer_handle.join() {
             return Err(format!("Producer thread panicked: {:?}", e).into());
         }
 
-        flush_all_tiles(tile_buckets, &mut writer)?;
+        accumulator.flush_all(&mut writer)?;
 
         if total_hexagons == 0 {
             global_min_lon = -180.0;
@@ -1016,26 +880,23 @@ impl H3PmtilesTiler {
         };
 
         // Build vector layer JSON metadata for MapLibre / Web Vector Clients
-        let metadata = json!({
-            "name": "raster_h3_categorical_pmtiles",
-            "format": "pbf",
-            "type": "overlay",
-            "description": "Multi-resolution H3 categorical vector tile pyramid generated by raster_h3",
-            "version": "3",
-            "dataset_type": "categorical",
-            "minzoom": min_zoom,
-            "maxzoom": max_zoom,
-            "h3_resolution_stats": res_stats_json,
-            "vector_layers": [
-                {
-                    "id": "h3_hexagons",
-                    "description": "Aggregated H3 hexagonal grid cells",
-                    "minzoom": min_zoom,
-                    "maxzoom": max_zoom,
-                    "fields": fields_json
-                }
-            ]
-        });
+        let metadata = build_pmtiles_metadata(
+            "raster_h3_categorical_pmtiles",
+            "Multi-resolution H3 categorical vector tile pyramid generated by raster_h3",
+            min_zoom,
+            max_zoom,
+            "h3_hexagons",
+            "Aggregated H3 hexagonal grid cells",
+            fields_json,
+            Some({
+                let mut extras = serde_json::Map::new();
+                extras.insert("format".to_string(), json!("pbf"));
+                extras.insert("type".to_string(), json!("overlay"));
+                extras.insert("dataset_type".to_string(), json!("categorical"));
+                extras.insert("h3_resolution_stats".to_string(), json!(res_stats_json));
+                extras
+            }),
+        );
 
         writer.set_metadata(
             [global_min_lon, global_min_lat, global_max_lon, global_max_lat],

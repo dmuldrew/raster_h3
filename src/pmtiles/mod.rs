@@ -10,7 +10,10 @@ pub mod pyramid;
 pub mod tiler;
 pub mod writer;
 
-pub use features::{H3Feature, PmtilesExportSummary, ResolutionAccumulatorStats};
+pub use features::{
+    build_default_pmtiles_fields, build_pmtiles_metadata, H3Feature, PmtilesExportSummary,
+    ResolutionAccumulatorStats, TileEvictionEntry, TilePyramidAccumulator,
+};
 pub use mvt::{FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue};
 pub use parquet_tiler::{process_parquet_to_pmtiles, RowGroupExtent};
 pub use pyramid::{
