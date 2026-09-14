@@ -4,7 +4,6 @@ use std::sync::Mutex;
 use crate::aggregator::multi_horizon::{
     MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
 };
-use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
@@ -16,23 +15,12 @@ use crate::functions::bind_utils::{
 
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
-    pub file_path: String,
-    pub resolved_paths: Vec<std::path::PathBuf>,
-    pub overlap_rule: crate::raster::mosaic::OverlapRule,
-    pub resolutions: Vec<u8>,
-    pub source_crs: Option<String>,
-    pub nodata: Option<f64>,
-    pub chunk_size: u32,
-    pub bbox: Option<[f64; 4]>,
-    pub sampling: SamplingPattern,
-    pub band: u32,
+    pub common: crate::functions::bind_utils::CommonRasterParams,
     pub spectral_formula: Option<crate::aggregator::multi_horizon::SpectralFormula>,
     pub min_count: Option<f64>,
     pub min_mean: Option<f64>,
     pub max_mean: Option<f64>,
-    pub compact: bool,
     pub quantiles: Vec<QuantileTarget>,
-    pub emit_geom: bool,
 }
 
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
@@ -111,23 +99,12 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
     let bind_data = Box::new(RasterH3BindData {
-        file_path: common.file_path,
-        resolved_paths: common.resolved_paths,
-        overlap_rule: common.overlap_rule,
-        resolutions: common.resolutions,
-        source_crs: common.source_crs,
-        nodata: common.nodata,
-        chunk_size: common.chunk_size,
-        bbox: common.bbox,
-        sampling: common.sampling,
-        band: common.band,
+        common,
         spectral_formula,
         min_count,
         min_mean,
         max_mean,
-        compact: common.compact,
         quantiles,
-        emit_geom: common.emit_geom,
     });
 
     duckdb_bind_set_bind_data(
@@ -149,10 +126,10 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
 
     let mosaic = match open_mosaic_or_set_error(
         info,
-        &bind_data.resolved_paths,
-        bind_data.bbox,
-        bind_data.source_crs.as_deref(),
-        bind_data.overlap_rule,
+        &bind_data.common.resolved_paths,
+        bind_data.common.bbox,
+        bind_data.common.source_crs.as_deref(),
+        bind_data.common.overlap_rule,
     ) {
         Some(m) => m,
         None => return,
@@ -160,18 +137,18 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
 
     let projected_columns = extract_projected_columns(info);
 
-    let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
-    config.overlap_rule = bind_data.overlap_rule;
-    config.custom_crs = bind_data.source_crs.clone();
-    config.custom_nodata = bind_data.nodata;
-    config.bbox = bind_data.bbox;
-    config.sampling = bind_data.sampling.clone();
-    config.band = bind_data.band as usize;
+    let mut config = MultiResolutionConfig::new(bind_data.common.resolutions.clone());
+    config.overlap_rule = bind_data.common.overlap_rule;
+    config.custom_crs = bind_data.common.source_crs.clone();
+    config.custom_nodata = bind_data.common.nodata;
+    config.bbox = bind_data.common.bbox;
+    config.sampling = bind_data.common.sampling.clone();
+    config.band = bind_data.common.band as usize;
     config.spectral_formula = bind_data.spectral_formula;
     config.min_count = bind_data.min_count;
     config.min_mean = bind_data.min_mean;
     config.max_mean = bind_data.max_mean;
-    config.compact = bind_data.compact;
+    config.compact = bind_data.common.compact;
     config.quantiles = bind_data.quantiles.clone();
 
     let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
@@ -189,7 +166,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         record_queue: ConcurrentRecordQueue::new(),
         projected_columns,
         quantiles: bind_data.quantiles.clone(),
-        emit_geom: bind_data.emit_geom,
+        emit_geom: bind_data.common.emit_geom,
     };
 
     set_table_function_init_data(info, global_data);

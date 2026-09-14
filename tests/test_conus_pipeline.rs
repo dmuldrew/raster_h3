@@ -9,49 +9,9 @@ use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3::pmtiles::H3PmtilesTiler;
 use raster_h3::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 use tempfile::TempDir;
-use tiff::encoder::{colortype, TiffEncoder};
-use tiff::tags::Tag;
+mod helpers;
 
-fn create_test_geotiff(
-    path: &Path,
-    width: u32,
-    height: u32,
-    origin_lon: f64,
-    origin_lat: f64,
-    pixel_size: f64,
-    fill_val: f32,
-) {
-    let file = File::create(path).expect("failed to create tiff file");
-    let mut encoder = TiffEncoder::new(file).expect("failed to create encoder");
-    let mut image = encoder
-        .new_image::<colortype::Gray32Float>(width, height)
-        .expect("failed to create image");
-
-    image
-        .encoder()
-        .write_tag(
-            Tag::ModelTiepointTag,
-            &[0.0_f64, 0.0, 0.0, origin_lon, origin_lat, 0.0][..],
-        )
-        .expect("write tiepoint tag");
-    image
-        .encoder()
-        .write_tag(
-            Tag::ModelPixelScaleTag,
-            &[pixel_size, pixel_size, 0.0][..],
-        )
-        .expect("write pixel scale tag");
-
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-
-    let data = vec![fill_val; (width * height) as usize];
-    image.write_data(&data).expect("write data");
-}
+use helpers::create_constant_f32_geotiff as create_test_geotiff;
 
 fn is_valid_tiff(path: &Path) -> bool {
     if let Ok(mut f) = File::open(path) {

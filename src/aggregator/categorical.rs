@@ -232,9 +232,17 @@ impl CategoricalAccumulator {
 pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {
     /// Return true if all values in the slice are identical to slice[0], or if slice is empty.
     fn is_uniform(slice: &[Self]) -> bool;
+
+    /// Convert native pixel value to an i64 category ID if in valid range
+    fn to_category(self) -> Option<i64>;
 }
 
 impl CategoricalUniformity for u8 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -264,6 +272,11 @@ impl CategoricalUniformity for u8 {
 
 impl CategoricalUniformity for i8 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         let u8_slice: &[u8] = unsafe {
             std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len())
@@ -273,6 +286,11 @@ impl CategoricalUniformity for i8 {
 }
 
 impl CategoricalUniformity for u16 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -302,6 +320,11 @@ impl CategoricalUniformity for u16 {
 
 impl CategoricalUniformity for i16 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         let u16_slice: &[u16] = unsafe {
             std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len())
@@ -311,6 +334,11 @@ impl CategoricalUniformity for i16 {
 }
 
 impl CategoricalUniformity for u32 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -340,6 +368,11 @@ impl CategoricalUniformity for u32 {
 
 impl CategoricalUniformity for i32 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         let u32_slice: &[u32] = unsafe {
             std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len())
@@ -349,6 +382,15 @@ impl CategoricalUniformity for i32 {
 }
 
 impl CategoricalUniformity for u64 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        if self <= i64::MAX as u64 {
+            Some(self as i64)
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -378,6 +420,11 @@ impl CategoricalUniformity for u64 {
 
 impl CategoricalUniformity for i64 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         let u64_slice: &[u64] = unsafe {
             std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len())
@@ -387,6 +434,15 @@ impl CategoricalUniformity for i64 {
 }
 
 impl CategoricalUniformity for f32 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        if self.is_finite() {
+            Some(self.round() as i64)
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -420,6 +476,15 @@ impl CategoricalUniformity for f32 {
 }
 
 impl CategoricalUniformity for f64 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        if self.is_finite() {
+            Some(self.round() as i64)
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {

@@ -1,11 +1,10 @@
+mod helpers;
+
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufWriter;
 use tempfile::NamedTempFile;
-use tiff::encoder::colortype::Gray32Float;
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
 
+use helpers::create_wave_test_geotiff as create_test_geotiff;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiContinuousRecord, MultiResolutionConfig,
     MultiScanHorizonStreamer,
@@ -15,48 +14,6 @@ use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
-
-fn create_test_geotiff(width: usize, height: usize) -> NamedTempFile {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity(width * height);
-    for row in 0..height {
-        let r_f = row as f32;
-        for col in 0..width {
-            let c_f = col as f32;
-            let val = (r_f * 0.1).sin() * 20.0 + (c_f * 0.1).cos() * 15.0 + 100.0;
-            data.push(val);
-        }
-    }
-
-    let file = File::create(&path).unwrap();
-    let writer = BufWriter::new(file);
-    let mut encoder = TiffEncoder::new(writer).unwrap();
-    let mut image = encoder
-        .new_image::<Gray32Float>(width as u32, height as u32)
-        .unwrap();
-
-    // Top-left: SF Bay (-122.45, 37.80)
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..])
-        .unwrap();
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33550), &[0.0005f64, 0.0005, 0.0][..])
-        .unwrap();
-
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-    image.write_data(&data).unwrap();
-
-    temp_file
-}
 
 #[test]
 fn test_multi_resolution_direct_ground_truth_exact_match() {

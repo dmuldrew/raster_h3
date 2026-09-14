@@ -12,7 +12,8 @@ pub use accumulator::H3Accumulator;
 pub use categorical::{CategoricalAccumulator, CategoricalUniformity};
 pub use h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
 pub use horizon_streamer::{
-    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, HexEvictionEntry,
+    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata,
+    is_decoding_result_all_nodata, HexEvictionEntry, NodataCast,
 };
 pub use multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,

@@ -1,8 +1,10 @@
+mod helpers;
+
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
 
+use helpers::create_constant_gray8_geotiff as create_test_geotiff;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
@@ -11,42 +13,6 @@ use raster_h3::raster::mosaic::{
 };
 use raster_h3::raster::prefetch::PrefetchedMosaicReader;
 use tiff::decoder::DecodingResult;
-use tiff::encoder::{colortype, TiffEncoder};
-use tiff::tags::Tag;
-
-fn create_test_geotiff(
-    path: &Path,
-    width: u32,
-    height: u32,
-    origin_lon: f64,
-    origin_lat: f64,
-    pixel_size: f64,
-    fill_val: u8,
-) {
-    let file = File::create(path).expect("failed to create tiff file");
-    let mut encoder = TiffEncoder::new(file).expect("failed to create encoder");
-    let mut image = encoder
-        .new_image::<colortype::Gray8>(width, height)
-        .expect("failed to create image");
-
-    image
-        .encoder()
-        .write_tag(
-            Tag::ModelTiepointTag,
-            &[0.0_f64, 0.0, 0.0, origin_lon, origin_lat, 0.0][..],
-        )
-        .expect("write tiepoint tag");
-    image
-        .encoder()
-        .write_tag(
-            Tag::ModelPixelScaleTag,
-            &[pixel_size, pixel_size, 0.0][..],
-        )
-        .expect("write pixel scale tag");
-
-    let data = vec![fill_val; (width * height) as usize];
-    image.write_data(&data).expect("write data");
-}
 
 #[test]
 fn test_glob_match_patterns() {

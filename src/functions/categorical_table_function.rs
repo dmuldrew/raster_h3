@@ -6,7 +6,6 @@ use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiResolutionConfig,
 };
 use crate::aggregator::remap::CategoryRemapper;
-use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
 use crate::functions::bind_utils::{
@@ -23,21 +22,10 @@ pub enum CategoricalOutputFormat {
 }
 
 pub struct RasterH3CategoricalBindData {
-    pub file_path: String,
-    pub resolved_paths: Vec<std::path::PathBuf>,
-    pub overlap_rule: crate::raster::mosaic::OverlapRule,
-    pub resolutions: Vec<u8>,
-    pub source_crs: Option<String>,
-    pub nodata: Option<f64>,
-    pub chunk_size: u32,
-    pub bbox: Option<[f64; 4]>,
-    pub sampling: SamplingPattern,
-    pub band: u32,
+    pub common: crate::functions::bind_utils::CommonRasterParams,
     pub format: CategoricalOutputFormat,
     pub min_count: Option<f64>,
     pub min_majority_fraction: Option<f64>,
-    pub compact: bool,
-    pub emit_geom: bool,
     pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
@@ -141,21 +129,10 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
     duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
     let bind_data = Box::new(RasterH3CategoricalBindData {
-        file_path: common.file_path,
-        resolved_paths: common.resolved_paths,
-        overlap_rule: common.overlap_rule,
-        resolutions: common.resolutions,
-        source_crs: common.source_crs,
-        nodata: common.nodata,
-        chunk_size: common.chunk_size,
-        bbox: common.bbox,
-        sampling: common.sampling,
-        band: common.band,
+        common,
         format,
         min_count,
         min_majority_fraction,
-        compact: common.compact,
-        emit_geom: common.emit_geom,
         remapper,
     });
 
@@ -178,10 +155,10 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
 
     let mosaic = match open_mosaic_or_set_error(
         info,
-        &bind_data.resolved_paths,
-        bind_data.bbox,
-        bind_data.source_crs.as_deref(),
-        bind_data.overlap_rule,
+        &bind_data.common.resolved_paths,
+        bind_data.common.bbox,
+        bind_data.common.source_crs.as_deref(),
+        bind_data.common.overlap_rule,
     ) {
         Some(m) => m,
         None => return,
@@ -189,16 +166,16 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
 
     let projected_columns = extract_projected_columns(info);
 
-    let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
-    config.overlap_rule = bind_data.overlap_rule;
-    config.custom_crs = bind_data.source_crs.clone();
-    config.custom_nodata = bind_data.nodata;
-    config.bbox = bind_data.bbox;
-    config.sampling = bind_data.sampling.clone();
-    config.band = bind_data.band as usize;
+    let mut config = MultiResolutionConfig::new(bind_data.common.resolutions.clone());
+    config.overlap_rule = bind_data.common.overlap_rule;
+    config.custom_crs = bind_data.common.source_crs.clone();
+    config.custom_nodata = bind_data.common.nodata;
+    config.bbox = bind_data.common.bbox;
+    config.sampling = bind_data.common.sampling.clone();
+    config.band = bind_data.common.band as usize;
     config.min_count = bind_data.min_count;
     config.min_majority_fraction = bind_data.min_majority_fraction;
-    config.compact = bind_data.compact;
+    config.compact = bind_data.common.compact;
     config.remapper = bind_data.remapper.clone();
 
     let streamer = match MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config) {
@@ -217,7 +194,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         format: bind_data.format,
         projected_columns,
         long_queue: Mutex::new(VecDeque::new()),
-        emit_geom: bind_data.emit_geom,
+        emit_geom: bind_data.common.emit_geom,
     };
 
     set_table_function_init_data(info, global_data);

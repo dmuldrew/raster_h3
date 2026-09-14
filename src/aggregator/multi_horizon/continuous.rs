@@ -5,7 +5,7 @@ use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
-use crate::aggregator::horizon_streamer::is_chunk_all_nodata;
+use crate::aggregator::horizon_streamer::{is_decoding_result_all_nodata, NodataCast};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::aggregator::simd::SimdSpanAccumulate;
 use crate::crs::transformer::CrsTransformer;
@@ -14,9 +14,9 @@ use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
 
 use super::config::SpectralFormula;
-pub use super::walker::{
+use super::walker::{
     is_point_in_bbox, is_slice_all_native_nodata, resolve_subpixel_cell, RowCoordinates,
-    RowGeometryContext, RAD_TO_DEG, WGS84_A,
+    RowGeometryContext,
 };
 use super::walker::walk_overlap_pixel_cells;
 
@@ -923,109 +923,42 @@ pub fn process_continuous_chunk_payload_into(
     let is_multisample = samples_per_pixel > 1 || spectral_formula.is_some() || band > 1;
     let spp = samples_per_pixel.max(1) as usize;
 
-    if !is_multisample {
-        let is_all_nodata = match decoding_result {
-            DecodingResult::U8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::U16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::U32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::U64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::F32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::F64(slice) => is_chunk_all_nodata(slice, nodata, |x| x),
+    macro_rules! dispatch_continuous {
+        ($dr:expr, $nodata:expr, |$slice:ident, $nd:ident| $body:expr) => {
+            match $dr {
+                DecodingResult::U8($slice) => { let $nd = <u8 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U16($slice) => { let $nd = <u16 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U32($slice) => { let $nd = <u32 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U64($slice) => { let $nd = <u64 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I8($slice) => { let $nd = <i8 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I16($slice) => { let $nd = <i16 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I32($slice) => { let $nd = <i32 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I64($slice) => { let $nd = <i64 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::F32($slice) => { let $nd = <f32 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::F64($slice) => { let $nd = <f64 as NodataCast>::from_nodata_f64($nodata); $body }
+            }
         };
+    }
 
-        if is_all_nodata {
+    if !is_multisample {
+        if is_decoding_result_all_nodata(decoding_result, nodata) {
             return false;
         }
 
-        match decoding_result {
-            DecodingResult::U8(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::U16(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::U32(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::U64(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I8(slice) => {
-                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I16(slice) => {
-                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I32(slice) => {
-                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I64(slice) => {
-                let nd = nodata.map(|v| v as i64);
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::F32(slice) => {
-                let nd = nodata.map(|v| v as f32);
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::F64(slice) => {
-                let nd = nodata;
-                process_continuous_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps);
-            }
-        }
+        dispatch_continuous!(decoding_result, nodata, |slice, nd| {
+            process_continuous_slice_into_maps(
+                slice, chunk_bounds, nd, resolutions, crs_transformer, gt,
+                sampling, bbox, chunk_stride, overlap_ctx, track_quantiles, chunk_maps,
+            );
+        });
     } else {
-        match decoding_result {
-            DecodingResult::U8(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::U16(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::U32(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::U64(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I8(slice) => {
-                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I16(slice) => {
-                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I32(slice) => {
-                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::I64(slice) => {
-                let nd = nodata.map(|v| v as i64);
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::F32(slice) => {
-                let nd = nodata.map(|v| v as f32);
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-            DecodingResult::F64(slice) => {
-                let nd = nodata;
-                process_continuous_multisample_slice_into_maps(slice, chunk_bounds, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, spectral_formula, overlap_ctx, track_quantiles, chunk_maps);
-            }
-        }
+        dispatch_continuous!(decoding_result, nodata, |slice, nd| {
+            process_continuous_multisample_slice_into_maps(
+                slice, chunk_bounds, nd, resolutions, crs_transformer, gt,
+                sampling, bbox, chunk_stride, spp, band, spectral_formula,
+                overlap_ctx, track_quantiles, chunk_maps,
+            );
+        });
     }
     true
 }

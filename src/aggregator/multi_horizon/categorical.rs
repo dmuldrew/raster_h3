@@ -5,7 +5,7 @@ use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::{CategoricalAccumulator, CategoricalUniformity};
 use crate::aggregator::h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
-use crate::aggregator::horizon_streamer::is_chunk_all_nodata;
+use crate::aggregator::horizon_streamer::{is_decoding_result_all_nodata, NodataCast};
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
@@ -27,10 +27,9 @@ pub struct MultiCategoricalRecord {
 }
 
 /// Direct pixel-by-pixel categorical slice aggregation with strict tile ownership resolution
-fn process_categorical_overlap_slice_into_maps<T, F, N>(
+fn process_categorical_overlap_slice_into_maps<T, N>(
     slice: &[T],
     chunk: &RasterChunk,
-    to_i64: F,
     native_nodata: Option<N>,
     resolutions: &[Resolution],
     crs_transformer: &CrsTransformer,
@@ -44,8 +43,7 @@ fn process_categorical_overlap_slice_into_maps<T, F, N>(
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) where
-    T: Copy + PartialEq,
-    F: Fn(T) -> Option<i64>,
+    T: CategoricalUniformity,
     N: Copy + PartialEq<T>,
 {
     let resolve_cat = |val: T| -> Option<i64> {
@@ -54,7 +52,7 @@ fn process_categorical_overlap_slice_into_maps<T, F, N>(
                 return None;
             }
         }
-        let raw_cat = to_i64(val)?;
+        let raw_cat = val.to_category()?;
         if let Some(nd_f64) = nodata {
             if (raw_cat as f64 - nd_f64).abs() < 1e-6 {
                 return None;
@@ -95,10 +93,9 @@ fn process_categorical_overlap_slice_into_maps<T, F, N>(
 }
 
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
-fn process_categorical_slice_into_maps<T, F, N>(
+fn process_categorical_slice_into_maps<T, N>(
     slice: &[T],
     chunk: &RasterChunk,
-    to_i64: F,
     native_nodata: Option<N>,
     resolutions: &[Resolution],
     crs_transformer: &CrsTransformer,
@@ -112,7 +109,6 @@ fn process_categorical_slice_into_maps<T, F, N>(
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) where
     T: CategoricalUniformity,
-    F: Fn(T) -> Option<i64>,
     N: Copy + PartialEq<T>,
 {
     if slice.is_empty() {
@@ -123,7 +119,6 @@ fn process_categorical_slice_into_maps<T, F, N>(
         process_categorical_overlap_slice_into_maps(
             slice,
             chunk,
-            to_i64,
             native_nodata,
             resolutions,
             crs_transformer,
@@ -299,7 +294,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                         }
                                     }
                                     if !is_nd {
-                                        if let Some(raw_cat) = to_i64(first_val) {
+                                        if let Some(raw_cat) = first_val.to_category() {
                                             let mut is_nd_float = false;
                                             if native_nodata.is_none() {
                                                 if let Some(nd) = nodata {
@@ -331,7 +326,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                             }
                                         }
 
-                                        if let Some(raw_cat) = to_i64(val_raw) {
+                                        if let Some(raw_cat) = val_raw.to_category() {
                                             if native_nodata.is_none() {
                                                 if let Some(nd) = nodata {
                                                     if (raw_cat as f64 - nd).abs() < 1e-6 {
@@ -395,7 +390,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                         }
                                     }
 
-                                    if let Some(raw_cat) = to_i64(val_raw) {
+                                    if let Some(raw_cat) = val_raw.to_category() {
                                         if native_nodata.is_none() {
                                             if let Some(nd) = nodata {
                                                 if (raw_cat as f64 - nd).abs() < 1e-6 {
@@ -661,7 +656,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                 }
                             }
                             if !is_nd {
-                                if let Some(raw_cat) = to_i64(first_val) {
+                                if let Some(raw_cat) = first_val.to_category() {
                                     let mut is_nd_float = false;
                                     if native_nodata.is_none() {
                                         if let Some(nd) = nodata {
@@ -698,7 +693,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                     }
                                 }
 
-                                if let Some(raw_cat) = to_i64(val_raw) {
+                                if let Some(raw_cat) = val_raw.to_category() {
                                     if native_nodata.is_none() {
                                         if let Some(nd) = nodata {
                                             if (raw_cat as f64 - nd).abs() < 1e-6 {
@@ -763,7 +758,7 @@ fn process_categorical_slice_into_maps<T, F, N>(
                                 }
                             }
 
-                            if let Some(raw_cat) = to_i64(val_raw) {
+                            if let Some(raw_cat) = val_raw.to_category() {
                                 if native_nodata.is_none() {
                                     if let Some(nd) = nodata {
                                         if (raw_cat as f64 - nd).abs() < 1e-6 {
@@ -877,10 +872,9 @@ fn process_categorical_slice_into_maps<T, F, N>(
     }
 
 /// Process a multi-sample categorical slice into thread-local hash maps for a specific band
-fn process_categorical_multisample_slice_into_maps<T, F>(
+fn process_categorical_multisample_slice_into_maps<T>(
     slice: &[T],
     chunk: &RasterChunk,
-    to_class_fn: F,
     native_nodata: Option<T>,
     resolutions: &[Resolution],
     crs_transformer: &CrsTransformer,
@@ -895,8 +889,7 @@ fn process_categorical_multisample_slice_into_maps<T, F>(
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 )
 where
-    T: Copy + PartialEq,
-    F: Fn(T) -> Option<i64>,
+    T: CategoricalUniformity,
 {
     let row_width = chunk.width as usize;
     let spp = samples_per_pixel.max(1);
@@ -914,7 +907,7 @@ where
                 }
             }
 
-            let raw_cat = match to_class_fn(raw) {
+            let raw_cat = match raw.to_category() {
                 Some(cls) => cls,
                 None => continue,
             };
@@ -985,109 +978,41 @@ pub fn process_categorical_chunk_payload_into(
     let is_multisample = samples_per_pixel > 1 && band > 1;
     let spp = samples_per_pixel.max(1) as usize;
 
-    if !is_multisample {
-        let is_all_nodata = match decoding_result {
-            DecodingResult::U8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::U16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::U32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::U64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I8(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I16(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::I64(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::F32(slice) => is_chunk_all_nodata(slice, nodata, |x| x as f64),
-            DecodingResult::F64(slice) => is_chunk_all_nodata(slice, nodata, |x| x),
+    macro_rules! dispatch_categorical {
+        ($dr:expr, $nodata:expr, |$slice:ident, $nd:ident| $body:expr) => {
+            match $dr {
+                DecodingResult::U8($slice) => { let $nd = <u8 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U16($slice) => { let $nd = <u16 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U32($slice) => { let $nd = <u32 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U64($slice) => { let $nd = <u64 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I8($slice) => { let $nd = <i8 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I16($slice) => { let $nd = <i16 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I32($slice) => { let $nd = <i32 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::I64($slice) => { let $nd = <i64 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::F32($slice) => { let $nd = <f32 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::F64($slice) => { let $nd = <f64 as NodataCast>::from_nodata_f64($nodata); $body }
+            }
         };
+    }
 
-        if is_all_nodata {
+    if !is_multisample {
+        if is_decoding_result_all_nodata(decoding_result, nodata) {
             return false;
         }
 
-        match decoding_result {
-            DecodingResult::U8(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::U16(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::U32(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::U64(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I8(slice) => {
-                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I16(slice) => {
-                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I32(slice) => {
-                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I64(slice) => {
-                let nd = nodata.map(|v| v as i64);
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::F32(slice) => {
-                let nd = nodata.map(|v| v as f32);
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::F64(slice) => {
-                let nd = nodata;
-                process_categorical_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps);
-            }
-        }
+        dispatch_categorical!(decoding_result, nodata, |slice, nd| {
+            process_categorical_slice_into_maps(
+                slice, chunk_bounds, nd, resolutions, crs_transformer, gt,
+                sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps,
+            );
+        });
     } else {
-        match decoding_result {
-            DecodingResult::U8(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=255.0).contains(&v) { Some(v as u8) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::U16(slice) => {
-                let nd = nodata.and_then(|v| if (0.0..=65535.0).contains(&v) { Some(v as u16) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::U32(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 && v <= u32::MAX as f64 { Some(v as u32) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::U64(slice) => {
-                let nd = nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x <= i64::MAX as u64 { Some(x as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I8(slice) => {
-                let nd = nodata.and_then(|v| if (-128.0..=127.0).contains(&v) { Some(v as i8) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I16(slice) => {
-                let nd = nodata.and_then(|v| if (-32768.0..=32767.0).contains(&v) { Some(v as i16) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I32(slice) => {
-                let nd = nodata.and_then(|v| if v >= i32::MIN as f64 && v <= i32::MAX as f64 { Some(v as i32) } else { None });
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x as i64), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::I64(slice) => {
-                let nd = nodata.map(|v| v as i64);
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| Some(x), nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::F32(slice) => {
-                let nd = nodata.map(|v| v as f32);
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-            DecodingResult::F64(slice) => {
-                let nd = nodata;
-                process_categorical_multisample_slice_into_maps(slice, chunk_bounds, |x| if x.is_finite() { Some(x.round() as i64) } else { None }, nd, resolutions, crs_transformer, gt, sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps);
-            }
-        }
+        dispatch_categorical!(decoding_result, nodata, |slice, nd| {
+            process_categorical_multisample_slice_into_maps(
+                slice, chunk_bounds, nd, resolutions, crs_transformer, gt,
+                sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps,
+            );
+        });
     }
     true
 }

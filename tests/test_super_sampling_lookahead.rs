@@ -1,58 +1,11 @@
+mod helpers;
+
+use helpers::{create_fn_f32_geotiff as create_test_geotiff, TestGeoTiffBuilder};
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::GeoTiffStreamReader;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::PathBuf;
-use tempfile::NamedTempFile;
-use tiff::encoder::colortype::Gray32Float;
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
-
-fn create_test_geotiff(
-    width: u32,
-    height: u32,
-    val_fn: impl Fn(u32, u32) -> f32,
-) -> (NamedTempFile, PathBuf) {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for r in 0..height {
-        for c in 0..width {
-            data.push(val_fn(c, r));
-        }
-    }
-
-    let file = File::create(&path).unwrap();
-    let writer = BufWriter::new(file);
-    let mut encoder = TiffEncoder::new(writer).unwrap();
-    let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-
-    // ModelTiepointTag: (0, 0, 0, -122.4, 37.8, 0.0) - SF Bay area in WGS84
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.4, 37.8, 0.0][..])
-        .unwrap();
-    // ModelPixelScaleTag: 0.001 deg (~100m)
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-        .unwrap();
-
-    // EPSG:4326 GeoKeys
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-    image.write_data(&data).unwrap();
-
-    (temp_file, path)
-}
 
 #[test]
 fn test_continuous_supersampling_all_patterns_conservation() {
@@ -267,40 +220,11 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
     let expected_pixels = (width * height) as f64;
     let constant_val = 17.25f32;
 
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for _ in 0..(width * height) {
-        data.push(constant_val);
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-
-        // ModelTiepointTag: (0, 0, 0, 500000.0, 4180000.0, 0.0) - SF Bay area in UTM Zone 10N
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, 500000.0, 4180000.0, 0.0][..])
-            .unwrap();
-        // ModelPixelScaleTag: 30m resolution (ScaleX = 30.0, ScaleY = 30.0)
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[30.0f64, 30.0, 0.0][..])
-            .unwrap();
-
-        // EPSG:32610 GeoKeys (UTM Zone 10N)
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 1, // ModelTypeProjected
-            3072, 0, 1, 32610, // EPSG:32610
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(width, height)
+        .origin(500000.0, 4180000.0)
+        .pixel_size(30.0)
+        .epsg(32610)
+        .create_f32_tempfile(|_, _| constant_val);
 
     let patterns = [
         ("center", SamplingPattern::center()),
