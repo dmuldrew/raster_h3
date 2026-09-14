@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
@@ -10,11 +8,9 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use raster_h3::aggregator::remap::CategoryRemapper;
-use raster_h3::aggregator::horizon_streamer::AggregationConfig;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig,
 };
-use raster_h3::aggregator::CategoricalHorizonStreamer;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 #[test]
@@ -150,16 +146,10 @@ fn test_categorical_streamer_with_remapping() {
         CategoryRemapper::parse("{101..103: 1, 121..122: 2, 99: null}").unwrap(),
     );
 
-    let config = AggregationConfig {
-        resolution: 8,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: None,
-        remapper: Some(remapper),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(8);
+    config.remapper = Some(remapper);
 
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     let mut class_counts: HashMap<i64, f64> = HashMap::new();
 
@@ -168,7 +158,8 @@ fn test_categorical_streamer_with_remapping() {
         if batch.is_empty() {
             break;
         }
-        for (_cell, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_pixels += acc.total_count;
             acc.for_each_class(|cat, cnt| {
                 *class_counts.entry(cat).or_insert(0.0) += cnt;

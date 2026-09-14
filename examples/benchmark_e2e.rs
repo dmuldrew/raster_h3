@@ -7,8 +7,6 @@
 //! 4. Spatial ROI Bounding Box Pruning
 //! 5. Multi-Resolution Conservation & Scaling (Res 6 through 10)
 //! 6. Multi-Core Concurrency Scaling (1, 4, 8 Worker Threads)
-#![allow(deprecated)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::time::Instant;
@@ -18,9 +16,10 @@ use tiff::encoder::colortype::Gray32Float;
 use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
-use raster_h3::aggregator::categorical::CategoricalHorizonStreamer;
-use raster_h3::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
 use raster_h3::aggregator::sampling::SamplingPattern;
+use raster_h3::aggregator::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 fn generate_e2e_geotiff(width: usize, height: usize) -> NamedTempFile {
@@ -84,11 +83,8 @@ fn main() {
     // ---------------------------------------------------------------------------------------------
     println!("\n▶ [Stage 1] Continuous Elevation Aggregation (Single-Pass Welford Variance)");
     let reader = GeoTiffStreamReader::open(raster_path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let config = MultiResolutionConfig::single(8);
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let start = Instant::now();
     let mut total_cells = 0;
     let mut total_pixel_mass = 0.0;
@@ -100,11 +96,11 @@ fn main() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
             total_cells += 1;
-            total_pixel_mass += acc.count;
-            assert!(acc.mean().is_finite());
-            assert!(acc.variance() >= 0.0);
+            total_pixel_mass += rec.accumulator.count;
+            assert!(rec.accumulator.mean().is_finite());
+            assert!(rec.accumulator.variance() >= 0.0);
         }
     }
     let dur = start.elapsed();
@@ -120,7 +116,7 @@ fn main() {
     // ---------------------------------------------------------------------------------------------
     println!("\n▶ [Stage 2] Categorical Landcover Streaming (RLE Compression & Histograms)");
     let reader_cat = GeoTiffStreamReader::open(raster_path).unwrap();
-    let mut cat_streamer = CategoricalHorizonStreamer::new(reader_cat, &config).unwrap();
+    let mut cat_streamer = MultiCategoricalHorizonStreamer::new(reader_cat, &config).unwrap();
     let start_cat = Instant::now();
     let mut cat_cells = 0;
     let mut cat_mass = 0.0;
@@ -130,10 +126,10 @@ fn main() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
             cat_cells += 1;
-            cat_mass += acc.total_count;
-            let (maj_class, maj_count, maj_frac) = acc.majority();
+            cat_mass += rec.accumulator.total_count;
+            let (maj_class, maj_count, maj_frac) = rec.accumulator.majority();
             assert!(maj_class >= 0);
             assert!(maj_count > 0.0);
             assert!(maj_frac > 0.0 && maj_frac <= 1.0);
@@ -151,12 +147,9 @@ fn main() {
     // ---------------------------------------------------------------------------------------------
     println!("\n▶ [Stage 3] Sub-Pixel Anti-Aliased Super-Sampling (RGSS 4-Point)");
     let reader_rgss = GeoTiffStreamReader::open(raster_path).unwrap();
-    let config_rgss = AggregationConfig {
-        resolution: 8,
-        sampling: SamplingPattern::parse("rgss"),
-        ..Default::default()
-    };
-    let mut rgss_streamer = ScanHorizonStreamer::new(reader_rgss, &config_rgss).unwrap();
+    let mut config_rgss = MultiResolutionConfig::single(8);
+    config_rgss.sampling = SamplingPattern::parse("rgss");
+    let mut rgss_streamer = MultiScanHorizonStreamer::new(reader_rgss, &config_rgss).unwrap();
     let start_rgss = Instant::now();
     let mut rgss_mass = 0.0;
 
@@ -165,8 +158,8 @@ fn main() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            rgss_mass += acc.count;
+        for rec in batch {
+            rgss_mass += rec.accumulator.count;
         }
     }
     let dur_rgss = start_rgss.elapsed();
@@ -179,12 +172,9 @@ fn main() {
     // ---------------------------------------------------------------------------------------------
     println!("\n▶ [Stage 4] Spatial ROI Bounding Box Pruning");
     let reader_roi = GeoTiffStreamReader::open(raster_path).unwrap();
-    let config_roi = AggregationConfig {
-        resolution: 9,
-        bbox: Some([-122.45, 37.75, -122.35, 37.82]),
-        ..Default::default()
-    };
-    let mut roi_streamer = ScanHorizonStreamer::new(reader_roi, &config_roi).unwrap();
+    let mut config_roi = MultiResolutionConfig::single(9);
+    config_roi.bbox = Some([-122.45, 37.75, -122.35, 37.82]);
+    let mut roi_streamer = MultiScanHorizonStreamer::new(reader_roi, &config_roi).unwrap();
     let start_roi = Instant::now();
     let mut roi_cells = 0;
     let mut roi_mass = 0.0;
@@ -194,9 +184,9 @@ fn main() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
             roi_cells += 1;
-            roi_mass += acc.count;
+            roi_mass += rec.accumulator.count;
         }
     }
     let dur_roi = start_roi.elapsed();

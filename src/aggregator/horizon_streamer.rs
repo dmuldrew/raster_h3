@@ -1,13 +1,6 @@
-use std::sync::Arc;
 use h3o::CellIndex;
 
-use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
-use crate::aggregator::remap::CategoryRemapper;
-use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
-use crate::error::Result;
-use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
 
@@ -77,37 +70,6 @@ where
     }
 }
 
-/// Configuration options for raster-to-H3 aggregation.
-///
-/// Deprecated: Prefer [`MultiResolutionConfig`] via [`MultiResolutionConfig::single`].
-#[deprecated(
-    since = "0.2.0",
-    note = "AggregationConfig has been superseded by MultiResolutionConfig; use MultiResolutionConfig::single"
-)]
-#[derive(Debug, Clone)]
-pub struct AggregationConfig {
-    pub resolution: u8,
-    pub custom_crs: Option<String>,
-    pub custom_nodata: Option<f64>,
-    pub bbox: Option<[f64; 4]>, // [min_lon, min_lat, max_lon, max_lat]
-    pub sampling: SamplingPattern,
-    pub remapper: Option<Arc<CategoryRemapper>>,
-}
-
-#[allow(deprecated)]
-impl Default for AggregationConfig {
-    fn default() -> Self {
-        Self {
-            resolution: 8,
-            custom_crs: None,
-            custom_nodata: None,
-            bbox: None,
-            sampling: SamplingPattern::default(),
-            remapper: None,
-        }
-    }
-}
-
 /// Check if a 2D chunk intersects the given [min_lon, min_lat, max_lon, max_lat] bounding box
 pub fn chunk_intersects_bbox(
     chunk: &RasterChunk,
@@ -144,53 +106,4 @@ pub fn chunk_intersects_bbox(
     }
 
     c_min_lon <= b_max_lon && c_max_lon >= b_min_lon && c_min_lat <= b_max_lat && c_max_lat >= b_min_lat
-}
-
-#[allow(deprecated)]
-impl From<&AggregationConfig> for MultiResolutionConfig {
-    fn from(config: &AggregationConfig) -> Self {
-        let mut multi = MultiResolutionConfig::single(config.resolution);
-        multi.custom_crs = config.custom_crs.clone();
-        multi.custom_nodata = config.custom_nodata;
-        multi.bbox = config.bbox;
-        multi.sampling = config.sampling.clone();
-        multi.remapper = config.remapper.clone();
-        multi
-    }
-}
-
-/// Streaming aggregator using Southernmost Scan-Line Horizon Eviction.
-/// Delegates to the optimized multi-resolution streaming engine.
-///
-/// Deprecated: Prefer [`MultiScanHorizonStreamer`] via [`MultiResolutionConfig::single`].
-#[deprecated(
-    since = "0.2.0",
-    note = "ScanHorizonStreamer has been superseded by MultiScanHorizonStreamer; use MultiScanHorizonStreamer with MultiResolutionConfig::single"
-)]
-pub struct ScanHorizonStreamer {
-    inner: MultiScanHorizonStreamer,
-}
-
-#[allow(deprecated)]
-impl ScanHorizonStreamer {
-    /// Initialize a new ScanHorizonStreamer with background async prefetching and bbox pruning
-    pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {
-        let multi_config = MultiResolutionConfig::from(config);
-        let inner = MultiScanHorizonStreamer::new(reader, &multi_config)?;
-        Ok(Self { inner })
-    }
-
-    /// Pull up to `max_rows` completed records from the stream
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<(u64, H3Accumulator)> {
-        self.inner
-            .fetch_next_batch(max_rows)
-            .into_iter()
-            .map(|record| (record.h3_index, record.accumulator))
-            .collect()
-    }
-
-    /// Return current number of active cells in memory
-    pub fn active_cell_count(&self) -> usize {
-        self.inner.active_cell_count()
-    }
 }

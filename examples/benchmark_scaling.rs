@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -10,7 +8,7 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use raster_h3::aggregator::{
-    AggregationConfig, CategoricalHorizonStreamer, H3Accumulator, ScanHorizonStreamer,
+    H3Accumulator, MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
@@ -94,14 +92,11 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
     let file_size_mb = std::fs::metadata(&path).unwrap().len() as f64 / (1024.0 * 1024.0);
     println!("done in {:.2?} ({:.1} MB)", gen_start.elapsed(), file_size_mb);
 
-    let config = AggregationConfig {
-        resolution,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(resolution);
 
     // 1. Single-Threaded Continuous Streaming Benchmark
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
 
     let st_start = Instant::now();
     let mut total_cells = 0;
@@ -114,8 +109,8 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
             break;
         }
         total_cells += batch.len();
-        for (_, acc) in batch {
-            total_pixels_accumulated += acc.count;
+        for rec in batch {
+            total_pixels_accumulated += rec.accumulator.count;
         }
         // Approximate in-flight horizon buffer: width / pixels_per_cell * ~4 rows
         let est_in_flight = ((width as f64 / 15.0) * 4.0) as usize;
@@ -213,7 +208,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
 
     // 4. Categorical Horizon Streaming Benchmark
     let cat_reader = GeoTiffStreamReader::open(&path).unwrap();
-    let mut cat_streamer = CategoricalHorizonStreamer::new(cat_reader, &config).unwrap();
+    let mut cat_streamer = MultiCategoricalHorizonStreamer::new(cat_reader, &config).unwrap();
     let cat_start = Instant::now();
     let mut cat_cells = 0;
     loop {

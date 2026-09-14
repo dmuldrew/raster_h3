@@ -2,11 +2,7 @@ use std::collections::HashMap;
 use fxhash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 
-#[allow(deprecated)]
-use crate::aggregator::horizon_streamer::AggregationConfig;
-use crate::aggregator::multi_horizon::{MultiCategoricalHorizonStreamer, MultiResolutionConfig};
-use crate::error::Result;
-use crate::raster::geotiff::GeoTiffStreamReader;
+
 
 /// Maximum number of distinct categories tracked inline without heap allocation.
 pub const INLINE_CAPACITY: usize = 16;
@@ -231,41 +227,6 @@ impl CategoricalAccumulator {
     }
 }
 
-/// Streaming categorical aggregator using Southernmost Scan-Line Horizon Eviction.
-/// Delegates to the optimized multi-resolution categorical streaming engine.
-///
-/// Deprecated: Prefer [`MultiCategoricalHorizonStreamer`] via [`MultiResolutionConfig::single`].
-#[deprecated(
-    since = "0.2.0",
-    note = "CategoricalHorizonStreamer has been superseded by MultiCategoricalHorizonStreamer; use MultiCategoricalHorizonStreamer with MultiResolutionConfig::single"
-)]
-pub struct CategoricalHorizonStreamer {
-    inner: MultiCategoricalHorizonStreamer,
-}
-
-#[allow(deprecated)]
-impl CategoricalHorizonStreamer {
-    /// Initialize a new CategoricalHorizonStreamer with background async prefetching and bbox pruning
-    pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {
-        let multi_config = MultiResolutionConfig::from(config);
-        let inner = MultiCategoricalHorizonStreamer::new(reader, &multi_config)?;
-        Ok(Self { inner })
-    }
-
-    /// Pull up to `max_rows` completed categorical records from the stream
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<(u64, CategoricalAccumulator)> {
-        self.inner
-            .fetch_next_batch(max_rows)
-            .into_iter()
-            .map(|record| (record.h3_index, record.accumulator))
-            .collect()
-    }
-
-    /// Return current number of active cells in memory
-    pub fn active_cell_count(&self) -> usize {
-        self.inner.active_cell_count()
-    }
-}
 
 /// Trait for numeric raster pixel types that support high-throughput SIMD / branchless span uniformity detection.
 pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {

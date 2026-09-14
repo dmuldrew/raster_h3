@@ -1,8 +1,6 @@
-#![allow(deprecated)]
-
 use std::path::Path;
 use std::time::Instant;
-use raster_h3::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
+use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 fn main() {
@@ -20,17 +18,10 @@ fn main() {
     println!("\n▶ [Test 1] Full GeoTIFF Scan (No Pushdown Filter)");
     let reader_full = GeoTiffStreamReader::open(tif_path).unwrap();
     let total_chunks = reader_full.chunk_layout.total_chunks;
-    let config_full = AggregationConfig {
-        resolution: 8,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: None,
-        sampling: Default::default(),
-        ..Default::default()
-    };
+    let config_full = MultiResolutionConfig::single(8);
 
     let start_full = Instant::now();
-    let mut streamer_full = ScanHorizonStreamer::new(reader_full, &config_full).unwrap();
+    let mut streamer_full = MultiScanHorizonStreamer::new(reader_full, &config_full).unwrap();
     let mut full_hex_count = 0usize;
     let mut full_pixel_count = 0.0f64;
 
@@ -39,9 +30,9 @@ fn main() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
             full_hex_count += 1;
-            full_pixel_count += acc.count;
+            full_pixel_count += rec.accumulator.count;
         }
     }
     let duration_full = start_full.elapsed();
@@ -58,17 +49,11 @@ fn main() {
     println!("  • Requested BBox       : [{:.2}, {:.2}, {:.2}, {:.2}]", oahu_bbox[0], oahu_bbox[1], oahu_bbox[2], oahu_bbox[3]);
 
     let reader_filtered = GeoTiffStreamReader::open(tif_path).unwrap();
-    let config_filtered = AggregationConfig {
-        resolution: 8,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: Some(oahu_bbox),
-        sampling: Default::default(),
-        ..Default::default()
-    };
+    let mut config_filtered = MultiResolutionConfig::single(8);
+    config_filtered.bbox = Some(oahu_bbox);
 
     let start_filtered = Instant::now();
-    let mut streamer_filtered = ScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
+    let mut streamer_filtered = MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
     let mut filtered_hex_count = 0usize;
     let mut filtered_pixel_count = 0.0f64;
 
@@ -77,9 +62,9 @@ fn main() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
             filtered_hex_count += 1;
-            filtered_pixel_count += acc.count;
+            filtered_pixel_count += rec.accumulator.count;
         }
     }
     let duration_filtered = start_filtered.elapsed();

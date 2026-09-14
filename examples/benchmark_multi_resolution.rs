@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -9,8 +7,8 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use raster_h3::aggregator::{
-    AggregationConfig, CategoricalHorizonStreamer, MultiCategoricalHorizonStreamer,
-    MultiResolutionConfig, MultiScanHorizonStreamer, SamplingPattern, ScanHorizonStreamer,
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+    SamplingPattern,
 };
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
@@ -86,8 +84,8 @@ fn benchmark_dataset(path: &Path, label: &str) {
     println!("\n--- [Continuous: Center Point] ---");
     let t_res8 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 8, ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
+        let cfg = MultiResolutionConfig::single(8);
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
@@ -102,8 +100,8 @@ fn benchmark_dataset(path: &Path, label: &str) {
 
     let t_res9 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 9, ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
+        let cfg = MultiResolutionConfig::single(9);
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
@@ -139,8 +137,9 @@ fn benchmark_dataset(path: &Path, label: &str) {
     println!("\n--- [Continuous: 5-Point Super-Sampling] ---");
     let t_res8_5p = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 8, sampling: SamplingPattern::five_point(), ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
+        let mut cfg = MultiResolutionConfig::single(8);
+        cfg.sampling = SamplingPattern::five_point();
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
@@ -154,8 +153,9 @@ fn benchmark_dataset(path: &Path, label: &str) {
     };
     let t_res9_5p = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 9, sampling: SamplingPattern::five_point(), ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
+        let mut cfg = MultiResolutionConfig::single(9);
+        cfg.sampling = SamplingPattern::five_point();
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
@@ -191,8 +191,8 @@ fn benchmark_dataset(path: &Path, label: &str) {
     println!("\n--- [Categorical: Center Point] ---");
     let t_cat_res8 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 8, ..Default::default() };
-        let mut streamer = CategoricalHorizonStreamer::new(r, &cfg).unwrap();
+        let cfg = MultiResolutionConfig::single(8);
+        let mut streamer = MultiCategoricalHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
@@ -206,8 +206,8 @@ fn benchmark_dataset(path: &Path, label: &str) {
     };
     let t_cat_res9 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 9, ..Default::default() };
-        let mut streamer = CategoricalHorizonStreamer::new(r, &cfg).unwrap();
+        let cfg = MultiResolutionConfig::single(9);
+        let mut streamer = MultiCategoricalHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {

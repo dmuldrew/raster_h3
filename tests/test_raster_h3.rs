@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -10,9 +8,12 @@ use tiff::tags::Tag;
 
 use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::{
-    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, AggregationConfig,
-    CategoricalAccumulator, CategoricalHorizonStreamer, H3Accumulator,
-    SamplingPattern, ScanHorizonStreamer,
+    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata,
+    CategoricalAccumulator, H3Accumulator,
+    SamplingPattern,
+};
+use raster_h3::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3::crs::CrsTransformer;
 use raster_h3::error::RasterH3Error;
@@ -186,15 +187,9 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: None,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
 
     let mut all_yielded = Vec::new();
     loop {
@@ -202,7 +197,9 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
         if batch.is_empty() {
             break;
         }
-        all_yielded.extend(batch);
+        for rec in batch {
+            all_yielded.push((rec.h3_index, rec.accumulator));
+        }
     }
 
     assert!(!all_yielded.is_empty());
@@ -254,23 +251,18 @@ fn test_bounding_box_pruning() {
     let reader = GeoTiffStreamReader::open(&path).unwrap();
 
     // Query only a small sub-rectangle: lon [-122.48, -122.46], lat [37.72, 37.74]
-    let config = AggregationConfig {
-        resolution: 9,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: Some([-122.48, 37.72, -122.46, 37.74]),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(9);
+    config.bbox = Some([-122.48, 37.72, -122.46, 37.74]);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut filtered_pixels: f64 = 0.0;
     loop {
         let batch = streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            filtered_pixels += acc.count;
+        for rec in batch {
+            filtered_pixels += rec.accumulator.count;
         }
     }
 
@@ -315,24 +307,19 @@ fn test_web_mercator_hoisted_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        custom_crs: Some("EPSG:3857".to_string()),
-        custom_nodata: None,
-        bbox: None,
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(8);
+    config.custom_crs = Some("EPSG:3857".to_string());
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_count: f64 = 0.0;
     loop {
         let batch = streamer.fetch_next_batch(64);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in &batch {
-            total_count += acc.count;
-            assert_eq!(acc.mean(), 120.0);
+        for rec in &batch {
+            total_count += rec.accumulator.count;
+            assert_eq!(rec.accumulator.mean(), 120.0);
         }
     }
     assert_eq!(total_count, 2500.0);
@@ -512,22 +499,18 @@ fn test_categorical_horizon_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: None,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut all_yielded = Vec::new();
     loop {
         let batch = streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        all_yielded.extend(batch);
+        for rec in batch {
+            all_yielded.push((rec.h3_index, rec.accumulator));
+        }
     }
 
     assert!(!all_yielded.is_empty());
@@ -572,19 +555,17 @@ fn test_u16_raster_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     loop {
         let batch = streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_pixels += acc.count;
             assert_eq!(acc.mean(), 1250.0);
             assert_eq!(acc.min, 1250.0);
@@ -625,21 +606,18 @@ fn test_f64_raster_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     loop {
         let batch = streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            total_pixels += acc.count;
-            assert!((acc.mean() - 273.15).abs() < 1e-6);
+        for rec in batch {
+            total_pixels += rec.accumulator.count;
+            assert!((rec.accumulator.mean() - 273.15).abs() < 1e-6);
         }
     }
     assert_eq!(total_pixels, 900.0);
@@ -676,13 +654,10 @@ fn test_subpixel_rgss_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        sampling: SamplingPattern::rgss(),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(9);
+    config.sampling = SamplingPattern::rgss();
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     let mut has_fractional_cell = false;
 
@@ -691,7 +666,8 @@ fn test_subpixel_rgss_streaming() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_pixels += acc.count;
             assert!((acc.mean() - 25.0).abs() < 1e-6);
             if (acc.count.fract() - 0.0).abs() > 1e-4 {
@@ -737,13 +713,10 @@ fn test_subpixel_hex_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        sampling: SamplingPattern::hex_seven_point(),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(9);
+    config.sampling = SamplingPattern::hex_seven_point();
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
 
     loop {
@@ -751,9 +724,9 @@ fn test_subpixel_hex_streaming() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            total_pixels += acc.count;
-            assert!((acc.mean() - 42.0).abs() < 1e-6);
+        for rec in batch {
+            total_pixels += rec.accumulator.count;
+            assert!((rec.accumulator.mean() - 42.0).abs() < 1e-6);
         }
     }
 
@@ -798,12 +771,9 @@ fn test_nodata_filtering_preserves_statistics() {
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     assert_eq!(reader.metadata.nodata, Some(-9999.0));
 
-    let config = AggregationConfig {
-        resolution: 9,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
 
     loop {
@@ -811,7 +781,8 @@ fn test_nodata_filtering_preserves_statistics() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_pixels += acc.count;
             // All statistics must strictly reflect the valid 100.0 values, never polluted by -9999.0
             assert_eq!(acc.mean(), 100.0);
@@ -861,12 +832,9 @@ fn test_nan_filtering_in_streaming() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
 
     loop {
@@ -874,7 +842,8 @@ fn test_nan_filtering_in_streaming() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_pixels += acc.count;
             assert_eq!(acc.mean(), 50.0);
             assert_eq!(acc.min, 50.0);
@@ -920,13 +889,10 @@ fn test_custom_nodata_override() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        custom_nodata: Some(0.0),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(9);
+    config.custom_nodata = Some(0.0);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
 
     loop {
@@ -934,9 +900,9 @@ fn test_custom_nodata_override() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            total_pixels += acc.count;
-            assert_eq!(acc.mean(), 100.0);
+        for rec in batch {
+            total_pixels += rec.accumulator.count;
+            assert_eq!(rec.accumulator.mean(), 100.0);
         }
     }
 
@@ -1032,12 +998,9 @@ fn test_categorical_homogeneous_raster() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 9,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(9);
 
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut all_yielded = Vec::new();
 
     loop {
@@ -1045,7 +1008,9 @@ fn test_categorical_homogeneous_raster() {
         if batch.is_empty() {
             break;
         }
-        all_yielded.extend(batch);
+        for rec in batch {
+            all_yielded.push((rec.h3_index, rec.accumulator));
+        }
     }
 
     assert!(!all_yielded.is_empty());
@@ -1109,12 +1074,9 @@ fn test_invalid_resolution_parameter_error() {
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     // Resolution 16 is invalid in H3 (valid range: 0..=15)
-    let invalid_config = AggregationConfig {
-        resolution: 16,
-        ..Default::default()
-    };
+    let invalid_config = MultiResolutionConfig::single(16);
 
-    let res_cont = ScanHorizonStreamer::new(reader.clone(), &invalid_config);
+    let res_cont = MultiScanHorizonStreamer::new(reader.clone(), &invalid_config);
     assert!(res_cont.is_err());
     match res_cont {
         Err(RasterH3Error::InvalidParameter(msg)) => {
@@ -1123,7 +1085,7 @@ fn test_invalid_resolution_parameter_error() {
         _ => panic!("Expected RasterH3Error::InvalidParameter"),
     }
 
-    let res_cat = CategoricalHorizonStreamer::new(reader, &invalid_config);
+    let res_cat = MultiCategoricalHorizonStreamer::new(reader, &invalid_config);
     assert!(res_cat.is_err());
     match res_cat {
         Err(RasterH3Error::InvalidParameter(msg)) => {
@@ -1162,21 +1124,18 @@ fn test_plain_tiff_without_geokeys() {
     assert_eq!(reader.metadata.epsg, None);
     assert_eq!(reader.metadata.geotransform, GeoTransform::default());
 
-    let config = AggregationConfig {
-        resolution: 4,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(4);
 
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     loop {
         let batch = streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            total_pixels += acc.count;
-            assert_eq!(acc.mean(), 42.0);
+        for rec in batch {
+            total_pixels += rec.accumulator.count;
+            assert_eq!(rec.accumulator.mean(), 42.0);
         }
     }
     assert_eq!(total_pixels, 100.0);
@@ -1380,37 +1339,34 @@ fn test_all_nodata_full_stream_scan_and_categorical() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 7,
-        custom_nodata: Some(-9999.0),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(7);
+    config.custom_nodata = Some(-9999.0);
 
-    // Test ScanHorizonStreamer on 100% nodata raster
-    let mut scan_streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    // Test MultiScanHorizonStreamer on 100% nodata raster
+    let mut scan_streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_accumulated_pixels = 0.0;
     loop {
         let batch = scan_streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            total_accumulated_pixels += acc.count;
+        for rec in batch {
+            total_accumulated_pixels += rec.accumulator.count;
         }
     }
     assert_eq!(total_accumulated_pixels, 0.0);
 
-    // Test CategoricalHorizonStreamer on 100% nodata raster
+    // Test MultiCategoricalHorizonStreamer on 100% nodata raster
     let reader_cat = GeoTiffStreamReader::open(&path).unwrap();
-    let mut cat_streamer = CategoricalHorizonStreamer::new(reader_cat, &config).unwrap();
+    let mut cat_streamer = MultiCategoricalHorizonStreamer::new(reader_cat, &config).unwrap();
     let mut total_categorical_pixels = 0.0;
     loop {
         let batch = cat_streamer.fetch_next_batch(16);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            total_categorical_pixels += acc.total_count;
+        for rec in batch {
+            total_categorical_pixels += rec.accumulator.total_count;
         }
     }
     assert_eq!(total_categorical_pixels, 0.0);
@@ -1522,13 +1478,10 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        custom_nodata: Some(255.0),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(8);
+    config.custom_nodata = Some(255.0);
 
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut total_accumulated = 0.0;
     let mut class_1_total = 0.0;
     let mut class_2_total = 0.0;
@@ -1539,7 +1492,8 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_accumulated += acc.total_count;
             class_1_total += acc.get_class_count(1);
             class_2_total += acc.get_class_count(2);
@@ -1623,20 +1577,16 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
 
     // 1. Full Scan (No Pushdown)
     let reader_full = GeoTiffStreamReader::open(&path).unwrap();
-    let config_full = AggregationConfig {
-        resolution: 8,
-        bbox: None,
-        ..Default::default()
-    };
-    let mut streamer_full = ScanHorizonStreamer::new(reader_full, &config_full).unwrap();
+    let config_full = MultiResolutionConfig::single(8);
+    let mut streamer_full = MultiScanHorizonStreamer::new(reader_full, &config_full).unwrap();
     let mut full_pixels = 0.0f64;
     loop {
         let batch = streamer_full.fetch_next_batch(100);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            full_pixels += acc.count;
+        for rec in batch {
+            full_pixels += rec.accumulator.count;
         }
     }
     assert_eq!(full_pixels, 40000.0);
@@ -1645,21 +1595,18 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
     // Query quarter of the raster: lon [-122.45, -122.35], lat [37.65, 37.75]
     let reader_filtered = GeoTiffStreamReader::open(&path).unwrap();
     let target_bbox = [-122.45, 37.65, -122.35, 37.75];
-    let config_filtered = AggregationConfig {
-        resolution: 8,
-        bbox: Some(target_bbox),
-        ..Default::default()
-    };
+    let mut config_filtered = MultiResolutionConfig::single(8);
+    config_filtered.bbox = Some(target_bbox);
 
-    let mut streamer_filtered = ScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
+    let mut streamer_filtered = MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
     let mut filtered_pixels = 0.0f64;
     loop {
         let batch = streamer_filtered.fetch_next_batch(100);
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
-            filtered_pixels += acc.count;
+        for rec in batch {
+            filtered_pixels += rec.accumulator.count;
         }
     }
 
@@ -2042,11 +1989,7 @@ fn test_multi_resolution_config_single_delegation() {
     assert_eq!(single_cfg.band, 1);
     assert!(!single_cfg.track_quantiles());
 
-    let legacy_cfg = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
-    let converted: raster_h3::aggregator::MultiResolutionConfig = (&legacy_cfg).into();
+    let converted = raster_h3::aggregator::MultiResolutionConfig::new(vec![8]);
     assert_eq!(converted.resolutions, vec![8]);
     assert_eq!(converted.band, 1);
 }

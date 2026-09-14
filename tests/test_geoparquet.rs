@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use tempfile::NamedTempFile;

@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
@@ -8,12 +6,10 @@ use tiff::encoder::colortype::Gray32Float;
 use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
-use raster_h3::aggregator::horizon_streamer::{AggregationConfig, ScanHorizonStreamer};
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiContinuousRecord, MultiResolutionConfig,
     MultiScanHorizonStreamer,
 };
-use raster_h3::aggregator::CategoricalHorizonStreamer;
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
@@ -96,12 +92,9 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
 
     // 2. Run standalone single-resolution streaming for 7, 8, and 9
     for &target_res in &[7, 8, 9] {
-        let single_config = AggregationConfig {
-            resolution: target_res,
-            ..Default::default()
-        };
+        let single_config = MultiResolutionConfig::single(target_res);
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = ScanHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer = MultiScanHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -111,9 +104,9 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
             if batch.is_empty() {
                 break;
             }
-            for (cell, acc) in batch {
-                total_single_mass += acc.count;
-                single_cells.insert(cell, acc);
+            for rec in batch {
+                total_single_mass += rec.accumulator.count;
+                single_cells.insert(rec.h3_index, rec.accumulator);
             }
         }
 
@@ -188,12 +181,9 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
     }
 
     for &target_res in &[7, 8] {
-        let single_config = AggregationConfig {
-            resolution: target_res,
-            ..Default::default()
-        };
+        let single_config = MultiResolutionConfig::single(target_res);
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = CategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer = MultiCategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -203,9 +193,9 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
             if batch.is_empty() {
                 break;
             }
-            for (cell, acc) in batch {
-                total_single_mass += acc.total_count;
-                single_cells.insert(cell, acc);
+            for rec in batch {
+                total_single_mass += rec.accumulator.total_count;
+                single_cells.insert(rec.h3_index, rec.accumulator);
             }
         }
 
@@ -300,13 +290,10 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
 
     // 2. Run standalone single-resolution streaming for 8 and 9 with 5-point super-sampling
     for &target_res in &[8, 9] {
-        let single_config = AggregationConfig {
-            resolution: target_res,
-            sampling: SamplingPattern::five_point(),
-            ..Default::default()
-        };
+        let mut single_config = MultiResolutionConfig::single(target_res);
+        single_config.sampling = SamplingPattern::five_point();
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = ScanHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer = MultiScanHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -316,9 +303,9 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
             if batch.is_empty() {
                 break;
             }
-            for (cell, acc) in batch {
-                total_single_mass += acc.count;
-                single_cells.insert(cell, acc);
+            for rec in batch {
+                total_single_mass += rec.accumulator.count;
+                single_cells.insert(rec.h3_index, rec.accumulator);
             }
         }
 
@@ -393,13 +380,10 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
     }
 
     for &target_res in &[8, 9] {
-        let single_config = AggregationConfig {
-            resolution: target_res,
-            sampling: SamplingPattern::five_point(),
-            ..Default::default()
-        };
+        let mut single_config = MultiResolutionConfig::single(target_res);
+        single_config.sampling = SamplingPattern::five_point();
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = CategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer = MultiCategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -409,9 +393,9 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
             if batch.is_empty() {
                 break;
             }
-            for (cell, acc) in batch {
-                total_single_mass += acc.total_count;
-                single_cells.insert(cell, acc);
+            for rec in batch {
+                total_single_mass += rec.accumulator.total_count;
+                single_cells.insert(rec.h3_index, rec.accumulator);
             }
         }
 

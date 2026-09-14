@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::time::Instant;
@@ -8,9 +6,10 @@ use tiff::encoder::colortype::Gray32Float;
 use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
-use raster_h3::aggregator::{
-    AggregationConfig, CategoricalHorizonStreamer, SamplingPattern, ScanHorizonStreamer,
+use raster_h3::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
+use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::GeoTiffStreamReader;
 
 /// Helper to generate synthetic floating point test GeoTIFF
@@ -65,13 +64,10 @@ fn test_streaming_throughput_and_memory_bounding() {
     let (_tmp, path) = create_benchmark_geotiff(width, height, 100.0);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(8);
 
     let start = Instant::now();
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
 
     let mut accumulated_pixels = 0.0;
     let mut total_batches = 0;
@@ -83,7 +79,8 @@ fn test_streaming_throughput_and_memory_bounding() {
             break;
         }
         total_batches += 1;
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_cells += 1;
             accumulated_pixels += acc.count;
             assert!(acc.mean() >= 100.0);
@@ -120,13 +117,10 @@ fn test_multi_resolution_conservation_and_scaling() {
 
     for &res in &resolutions {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: res,
-            ..Default::default()
-        };
+        let config = MultiResolutionConfig::single(res);
 
         let start = Instant::now();
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut res_pixels = 0.0;
         let mut res_cells = 0;
 
@@ -135,7 +129,8 @@ fn test_multi_resolution_conservation_and_scaling() {
             if batch.is_empty() {
                 break;
             }
-            for (_, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 res_cells += 1;
                 res_pixels += acc.count;
             }
@@ -209,13 +204,10 @@ fn test_categorical_streaming_performance_scaling() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(8);
 
     let start = Instant::now();
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
 
     let mut accumulated_pixels = 0.0;
     let mut total_cells = 0;
@@ -225,7 +217,8 @@ fn test_categorical_streaming_performance_scaling() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_cells += 1;
             accumulated_pixels += acc.total_count;
             assert!(acc.unique_classes() >= 1);
@@ -263,14 +256,11 @@ fn test_subpixel_sampling_scaling_and_conservation() {
 
     for (name, pattern) in patterns {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: 8,
-            sampling: pattern,
-            ..Default::default()
-        };
+        let mut config = MultiResolutionConfig::single(8);
+        config.sampling = pattern;
 
         let start = Instant::now();
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut total_weighted_count = 0.0;
         let mut cells = 0;
 
@@ -279,7 +269,8 @@ fn test_subpixel_sampling_scaling_and_conservation() {
             if batch.is_empty() {
                 break;
             }
-            for (_, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 cells += 1;
                 total_weighted_count += acc.count;
             }
