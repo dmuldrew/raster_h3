@@ -61,7 +61,7 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
     /// Each Rayon worker thread merges into a distinct shard concurrently.
     pub fn merge_thread_results<T: Sync>(
         &mut self,
-        parallel_results: &[(Vec<Vec<Vec<(u64, A)>>>, T)],
+        parallel_results: &[(Vec<[Vec<(u64, A)>; NUM_SHARDS]>, T)],
         res_idx: usize,
     ) {
         self.shards

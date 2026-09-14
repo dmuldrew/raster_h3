@@ -252,8 +252,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     /// Advance scanline horizon until at least `min_rows` completed records are available or finished
     pub fn advance_until_completed(&mut self, min_rows: usize) {
-        let batch_size = (rayon::current_num_threads() * 4).max(32);
-        let min_batch = rayon::current_num_threads().clamp(4, 16);
+        let batch_size = (rayon::current_num_threads() * 8).clamp(64, 256);
+        let min_batch = (rayon::current_num_threads() * 2).clamp(16, 64);
         let mut chunk_items = Vec::with_capacity(batch_size);
 
         while self.completed_buffer.len() < min_rows && !self.is_finished {
@@ -287,7 +287,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             let kernel = &self.kernel;
 
             let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(Vec<Vec<Vec<(u64, K::Accumulator)>>>, DecodingResult)> = chunk_items
+            let parallel_results: Vec<(Vec<[Vec<(u64, K::Accumulator)>; NUM_SHARDS]>, DecodingResult)> = chunk_items
                 .par_iter_mut()
                 .map_init(
                     || {
@@ -334,7 +334,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                                 let mut chunk_shards = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
                                 if has_data {
                                     for m in local_maps.iter_mut() {
-                                        let mut shards = (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
+                                        let mut shards: [Vec<(u64, K::Accumulator)>; NUM_SHARDS] =
+                                            std::array::from_fn(|_| Vec::new());
                                         for (cell_u64, acc) in m.drain() {
                                             let s = get_shard(cell_u64);
                                             shards[s].push((cell_u64, acc));

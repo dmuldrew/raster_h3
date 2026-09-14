@@ -23,11 +23,12 @@ fn main() {
     // =========================================================================
     println!("\n▶ [TEST SUITE 1] Continuous Raster: data/CFL_HI.tif");
     let cfl_reader = GeoTiffStreamReader::open(cfl_path).expect("Failed to open CFL_HI.tif");
-    println!("  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?})",
+    println!("  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?}, Proj: {:?})",
         cfl_reader.metadata.width,
         cfl_reader.metadata.height,
         cfl_reader.chunk_layout.total_chunks,
-        cfl_reader.metadata.epsg
+        cfl_reader.metadata.epsg,
+        cfl_reader.metadata.proj_string
     );
 
     // 1A. Full Archipelago Continuous Scan (Multi-Core Rayon Horizon Streaming)
@@ -55,6 +56,10 @@ fn main() {
     println!("      - Scan Time       : {:.2?} ({:.2} Mpx/sec)",
         dur_cfl_full,
         (total_cfl_pixels / 1_000_000.0) / dur_cfl_full.as_secs_f64()
+    );
+    let s = streamer_cfl.profile_stats;
+    println!("      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms, evict={:.2}ms",
+        s[0] as f64 / 1_000_000.0, s[1] as f64 / 1_000_000.0, s[2] as f64 / 1_000_000.0, s[3] as f64 / 1_000_000.0
     );
 
     // 1B. Spatial Filter Pushdown: Bounding Box (Oahu South Shore ROI)
@@ -123,11 +128,13 @@ fn main() {
     // =========================================================================
     println!("\n▶ [TEST SUITE 2] Categorical Raster: data/LF2024_FBFM40_HI.tif");
     let lf_reader = GeoTiffStreamReader::open(lf_path).expect("Failed to open LF2024_FBFM40_HI.tif");
-    println!("  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?})",
+    println!("  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?}, Proj: {:?}, NoData: {:?})",
         lf_reader.metadata.width,
         lf_reader.metadata.height,
         lf_reader.chunk_layout.total_chunks,
-        lf_reader.metadata.epsg
+        lf_reader.metadata.epsg,
+        lf_reader.metadata.proj_string,
+        lf_reader.metadata.nodata
     );
 
     // 2A. Full Archipelago Categorical Scan (Multi-Core Rayon Engine, H3 Res 8)
@@ -155,6 +162,10 @@ fn main() {
     println!("      - Scan Time       : {:.2?} ({:.2} Mpx/sec)",
         dur_lf_full,
         (total_lf_pixels / 1_000_000.0) / dur_lf_full.as_secs_f64()
+    );
+    let s_lf = streamer_lf.profile_stats;
+    println!("      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms, evict={:.2}ms",
+        s_lf[0] as f64 / 1_000_000.0, s_lf[1] as f64 / 1_000_000.0, s_lf[2] as f64 / 1_000_000.0, s_lf[3] as f64 / 1_000_000.0
     );
 
     let mut top_classes: Vec<_> = class_distribution.into_iter().collect();

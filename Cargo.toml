@@ -40,6 +40,7 @@ ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] 
 url = "2.5"
 weezl = "0.1"
 libc = "0.2"
+crossbeam-deque = "0.8"
 
 [profile.release]
 opt-level = 3
