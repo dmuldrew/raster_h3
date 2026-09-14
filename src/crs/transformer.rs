@@ -243,10 +243,10 @@ impl CrsTransformer {
                     if let Ok(transformer) = Self::from_proj_string(&p_str) {
                         return Ok(transformer);
                     }
-                    return Err(RasterH3Error::CrsError(format!(
-                        "Unsupported or unrecognized EPSG code: {}",
-                        code
-                    )));
+                    return Err(RasterH3Error::UnsupportedEpsg {
+                        code,
+                        detail: format!("Unsupported or unrecognized EPSG code: {}", code),
+                    });
                 }
             }
         }
@@ -582,5 +582,18 @@ mod tests {
         let mut empty_lat = [];
         tf.transform_batch(&[], &[], &mut empty_lon, &mut empty_lat)
             .unwrap();
+    }
+
+    #[test]
+    fn test_unsupported_epsg_error() {
+        let res = CrsTransformer::from_crs_or_epsg(Some(999999), None);
+        assert!(res.is_err(), "Expected error for unsupported EPSG code");
+        match res.err().unwrap() {
+            RasterH3Error::UnsupportedEpsg { code, detail } => {
+                assert_eq!(code, 999999);
+                assert!(detail.contains("999999"));
+            }
+            other => panic!("Expected RasterH3Error::UnsupportedEpsg, got {:?}", other),
+        }
     }
 }

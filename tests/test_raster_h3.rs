@@ -1,10 +1,8 @@
-use std::fs::File;
-use std::io::BufWriter;
+mod helpers;
+
+use helpers::{create_constant_f32_geotiff, TestGeoTiffBuilder};
 use std::path::Path;
 use tempfile::NamedTempFile;
-use tiff::encoder::colortype::{Gray16, Gray32Float, Gray64Float, Gray8};
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
 
 use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::multi_horizon::{
@@ -168,40 +166,7 @@ fn test_compute_cell_south_lat() {
 fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
-
-    let width = 100;
-    let height = 100;
-    let data = vec![75.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-
-        image.write_data(&data).unwrap();
-    }
+    create_constant_f32_geotiff(&path, 100, 100, -122.45, 37.85, 0.001, 75.0);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let config = MultiResolutionConfig::single(9);
@@ -234,40 +199,7 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
 fn test_bounding_box_pruning() {
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
-
-    // 100x100 raster from lon [-122.5, -122.4], lat [37.7, 37.8]
-    let width = 100;
-    let height = 100;
-    let data = vec![50.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    create_constant_f32_geotiff(&path, 100, 100, -122.50, 37.80, 0.001, 50.0);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
 
@@ -297,42 +229,12 @@ fn test_web_mercator_hoisted_streaming() {
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
-    let width = 50;
-    let height = 50;
-    let data = vec![120.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        // Web Mercator coords around San Francisco
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -13630000.0, 4550000.0, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[100.0f64, 100.0, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2, 1024, 0, 1, 1, // Projected
-            3072, 0, 1, 3857, // EPSG:3857
-        ];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    TestGeoTiffBuilder::new(50, 50)
+        .origin(-13630000.0, 4550000.0)
+        .pixel_size(100.0)
+        .epsg(3857)
+        .write_constant(&path, 120.0f32)
+        .unwrap();
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let mut config = MultiResolutionConfig::single(8);
@@ -355,22 +257,7 @@ fn test_web_mercator_hoisted_streaming() {
 
 #[test]
 fn test_prefetched_chunk_reader() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 20;
-    let height = 20;
-    let data = vec![1.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(20, 20).create_constant_tempfile(1.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let total_chunks = reader.chunk_layout.total_chunks;
@@ -389,19 +276,9 @@ fn test_prefetched_chunk_reader() {
 fn test_prefetched_chunk_reader_multi_worker_ordering() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("multi_worker_test.tif");
-    let width = 64usize;
-    let height = 64usize;
-    let data: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    TestGeoTiffBuilder::new(64, 64)
+        .write_fn(&path, |col, row| (row * 64 + col) as f32)
+        .unwrap();
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let total_chunks = reader.chunk_layout.total_chunks;
@@ -441,19 +318,9 @@ fn test_prefetched_chunk_reader_multi_worker_ordering() {
 fn test_prefetched_chunk_reader_early_drop() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("early_drop_test.tif");
-    let width = 64usize;
-    let height = 64usize;
-    let data: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    TestGeoTiffBuilder::new(64, 64)
+        .write_fn(&path, |col, row| (row * 64 + col) as f32)
+        .unwrap();
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let total_chunks = reader.chunk_layout.total_chunks;
@@ -500,45 +367,10 @@ fn test_categorical_accumulator_operations() {
 
 #[test]
 fn test_categorical_horizon_streaming() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 50;
-    let height = 50;
-    // Upper half is class 10 (Forest), lower half is class 50 (Urban)
-    let mut data = vec![10u8; width * height];
-    for i in (width * height / 2)..(width * height) {
-        data[i] = 50;
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray8>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(50, 50)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_tempfile(|_c, r| if r < 25 { 10u8 } else { 50u8 });
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let config = MultiResolutionConfig::single(9);
@@ -568,41 +400,10 @@ fn test_categorical_horizon_streaming() {
 
 #[test]
 fn test_u16_raster_streaming() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 40;
-    let height = 40;
-    let data = vec![1250u16; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray16>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(40, 40)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_constant_tempfile(1250u16);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let config = MultiResolutionConfig::single(9);
@@ -627,41 +428,10 @@ fn test_u16_raster_streaming() {
 
 #[test]
 fn test_f64_raster_streaming() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 30;
-    let height = 30;
-    let data = vec![273.15f64; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray64Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(30, 30)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_constant_tempfile(273.15f64);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let config = MultiResolutionConfig::single(9);
@@ -683,41 +453,10 @@ fn test_f64_raster_streaming() {
 
 #[test]
 fn test_subpixel_rgss_streaming() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 40;
-    let height = 40;
-    let data = vec![25.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(40, 40)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_constant_tempfile(25.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let mut config = MultiResolutionConfig::single(9);
@@ -757,41 +496,10 @@ fn test_subpixel_rgss_streaming() {
 
 #[test]
 fn test_subpixel_hex_streaming() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 30;
-    let height = 30;
-    let data = vec![42.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(30, 30)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_constant_tempfile(42.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let mut config = MultiResolutionConfig::single(9);
@@ -820,46 +528,11 @@ fn test_subpixel_hex_streaming() {
 
 #[test]
 fn test_nodata_filtering_preserves_statistics() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 40;
-    let height = 40;
-    // Upper half is valid 100.0, lower half is -9999.0 (NoData)
-    let mut data = vec![100.0f32; width * height];
-    for i in (width * height / 2)..(width * height) {
-        data[i] = -9999.0;
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.encoder().write_tag(Tag::GdalNodata, "-9999").unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(40, 40)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .gdal_nodata("-9999")
+        .create_tempfile(|_c, r| if r < 20 { 100.0f32 } else { -9999.0f32 });
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     assert_eq!(reader.metadata.nodata, Some(-9999.0));
@@ -892,45 +565,10 @@ fn test_nodata_filtering_preserves_statistics() {
 
 #[test]
 fn test_nan_filtering_in_streaming() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 20;
-    let height = 20;
-    let mut data = vec![50.0f32; width * height];
-    // Set half the pixels to NaN
-    for i in (width * height / 2)..(width * height) {
-        data[i] = f32::NAN;
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(20, 20)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_tempfile(|_c, r| if r < 10 { 50.0f32 } else { f32::NAN });
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let config = MultiResolutionConfig::single(9);
@@ -957,45 +595,10 @@ fn test_nan_filtering_in_streaming() {
 
 #[test]
 fn test_custom_nodata_override() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 30;
-    let height = 30;
-    // 0.0 is background/nodata, 100.0 is signal
-    let mut data = vec![0.0f32; width * height];
-    for i in 0..100 {
-        data[i] = 100.0;
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(30, 30)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_tempfile(|c, r| if r * 30 + c < 100 { 100.0f32 } else { 0.0f32 });
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let mut config = MultiResolutionConfig::single(9);
@@ -1097,42 +700,10 @@ fn test_categorical_tied_majority() {
 
 #[test]
 fn test_categorical_homogeneous_raster() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let width = 30;
-    let height = 30;
-    // 100% class 40 (Cropland)
-    let data = vec![40u8; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray8>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::ModelTiepointTag,
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::ModelPixelScaleTag, &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(30, 30)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_constant_tempfile(40u8);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let config = MultiResolutionConfig::single(9);
@@ -1197,17 +768,7 @@ fn test_scalar_resolution_and_parent_calculations() {
 
 #[test]
 fn test_invalid_resolution_parameter_error() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-    let data = vec![1.0f32; 100];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder.new_image::<Gray32Float>(10, 10).unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(10, 10).create_constant_tempfile(1.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     // Resolution 16 is invalid in H3 (valid range: 0..=15)
@@ -1254,17 +815,9 @@ fn test_nonexistent_file_path_error() {
 
 #[test]
 fn test_plain_tiff_without_geokeys() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-    let data = vec![42.0f32; 100];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder.new_image::<Gray32Float>(10, 10).unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(10, 10)
+        .georeferenced(false)
+        .create_constant_tempfile(42.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     // Non-georeferenced images have no detected CRS
@@ -1498,38 +1051,10 @@ fn test_tiled_uneven_chunk_layout_and_bounds() {
 
 #[test]
 fn test_all_nodata_full_stream_scan_and_categorical() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    // Create a 16x16 GeoTIFF where all values are -9999.0 (NoData)
-    let width = 16u32;
-    let height = 16u32;
-    let nodata_val = -9999.0f32;
-    let data = vec![nodata_val; (width * height) as usize];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -122.4194, 37.7749, 0.0][..],
-            )
-            .unwrap();
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(16, 16)
+        .origin(-122.4194, 37.7749)
+        .pixel_size(0.001)
+        .create_constant_tempfile(-9999.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let mut config = MultiResolutionConfig::single(7);
@@ -1629,61 +1154,35 @@ fn test_sampling_pattern_fallback_to_center() {
 
 #[test]
 fn test_categorical_rle_alternating_and_interspersed_nodata() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
     let width = 64;
     let height = 64;
-    let mut data = Vec::with_capacity(width * height);
-
-    // Row pattern:
-    // Half alternating [1, 2, 1, 2...]
-    // Half contiguous [10, 10, 10, NoData(255), 10, 10...]
     let mut expected_valid_pixels = 0.0;
     for row in 0..height {
         for col in 0..width {
             if row < 32 {
-                let cat = if col % 2 == 0 { 1u8 } else { 2u8 };
-                data.push(cat);
                 expected_valid_pixels += 1.0;
-            } else {
-                if col % 10 == 5 {
-                    data.push(255u8); // NoData
-                } else {
-                    data.push(10u8);
-                    expected_valid_pixels += 1.0;
-                }
+            } else if col % 10 != 5 {
+                expected_valid_pixels += 1.0;
             }
         }
     }
 
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray8>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
-            )
-            .unwrap();
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(width as u32, height as u32)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_tempfile(|col, row| {
+            if row < 32 {
+                if col % 2 == 0 {
+                    1u8
+                } else {
+                    2u8
+                }
+            } else if col % 10 == 5 {
+                255u8 // NoData
+            } else {
+                10u8
+            }
+        });
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     let mut config = MultiResolutionConfig::single(8);
@@ -1848,42 +1347,10 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
 
 #[test]
 fn test_spatial_filter_pushdown_chunk_skipping() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    // Create a 200x200 GeoTIFF spanning [-122.5, -122.3] lon, [37.6, 37.8] lat
-    let width = 200;
-    let height = 200;
-    let data = vec![100.0f32; width * height];
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder
-            .new_image::<Gray32Float>(width as u32, height as u32)
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(
-                Tag::Unknown(33922),
-                &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..],
-            )
-            .unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34735), &geokeys[..])
-            .unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(200, 200)
+        .origin(-122.50, 37.80)
+        .pixel_size(0.001)
+        .create_constant_tempfile(100.0f32);
 
     // 1. Full Scan (No Pushdown)
     let reader_full = GeoTiffStreamReader::open(&path).unwrap();

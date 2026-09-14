@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::horizon_streamer::{is_decoding_result_all_nodata, NodataCast};
+use crate::aggregator::nodata::is_decoding_result_all_nodata;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::aggregator::simd::SimdSpanAccumulate;
 use crate::crs::transformer::CrsTransformer;
+use crate::dispatch_decoding;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
@@ -442,59 +443,12 @@ pub fn process_continuous_chunk_payload_into(
     let is_multisample = samples_per_pixel > 1 || spectral_formula.is_some() || band > 1;
     let spp = samples_per_pixel.max(1) as usize;
 
-    macro_rules! dispatch_continuous {
-        ($dr:expr, $nodata:expr, |$slice:ident, $nd:ident| $body:expr) => {
-            match $dr {
-                DecodingResult::U8($slice) => {
-                    let $nd = <u8 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::U16($slice) => {
-                    let $nd = <u16 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::U32($slice) => {
-                    let $nd = <u32 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::U64($slice) => {
-                    let $nd = <u64 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::I8($slice) => {
-                    let $nd = <i8 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::I16($slice) => {
-                    let $nd = <i16 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::I32($slice) => {
-                    let $nd = <i32 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::I64($slice) => {
-                    let $nd = <i64 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::F32($slice) => {
-                    let $nd = <f32 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-                DecodingResult::F64($slice) => {
-                    let $nd = <f64 as NodataCast>::from_nodata_f64($nodata);
-                    $body
-                }
-            }
-        };
-    }
-
     if !is_multisample {
         if is_decoding_result_all_nodata(decoding_result, nodata) {
             return false;
         }
 
-        dispatch_continuous!(decoding_result, nodata, |slice, nd| {
+        dispatch_decoding!(decoding_result, nodata, |slice, nd| {
             process_continuous_slice_into_maps(
                 slice,
                 chunk_bounds,
@@ -511,7 +465,7 @@ pub fn process_continuous_chunk_payload_into(
             );
         });
     } else {
-        dispatch_continuous!(decoding_result, nodata, |slice, nd| {
+        dispatch_decoding!(decoding_result, nodata, |slice, nd| {
             process_continuous_multisample_slice_into_maps(
                 slice,
                 chunk_bounds,

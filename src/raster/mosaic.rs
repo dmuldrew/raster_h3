@@ -246,6 +246,10 @@ impl TileDescriptor {
                     "Tile {} ({:?}): {}",
                     tile_idx, reader.file_path, msg
                 )),
+                RasterH3Error::UnsupportedEpsg { code, detail } => RasterH3Error::UnsupportedEpsg {
+                    code,
+                    detail: format!("Tile {} ({:?}): {}", tile_idx, reader.file_path, detail),
+                },
                 other => other,
             })?;
 

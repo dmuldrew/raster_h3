@@ -20,6 +20,9 @@ pub enum RasterH3Error {
     #[error("CRS transformation error: {0}")]
     CrsError(String),
 
+    #[error("Unsupported EPSG code {code}: {detail}")]
+    UnsupportedEpsg { code: u32, detail: String },
+
     #[error("PROJ error: {0}")]
     Proj(#[from] proj4rs::errors::Error),
 
