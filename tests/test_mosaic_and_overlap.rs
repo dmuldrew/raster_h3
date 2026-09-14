@@ -9,6 +9,8 @@ use raster_h3::aggregator::multi_horizon::{
 use raster_h3::raster::mosaic::{
     glob_match, resolve_raster_sources, MosaicReader, OverlapRule,
 };
+use raster_h3::raster::prefetch::PrefetchedMosaicReader;
+use tiff::decoder::DecodingResult;
 use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;
 
@@ -269,3 +271,94 @@ fn test_categorical_mosaic_with_overlap() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
+    let temp_dir = std::env::temp_dir().join("raster_h3_test_mosaic_prefetch");
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // Create 3 tiles with different fill values
+    let f1 = temp_dir.join("tile_0.tif");
+    let f2 = temp_dir.join("tile_1.tif");
+    let f3 = temp_dir.join("tile_2.tif");
+    create_test_geotiff(&f1, 40, 40, -122.50, 37.85, 0.001, 10);
+    create_test_geotiff(&f2, 40, 40, -122.45, 37.85, 0.001, 20);
+    create_test_geotiff(&f3, 40, 40, -122.40, 37.85, 0.001, 30);
+
+    let paths = vec![f1, f2, f3];
+    let mosaic = Arc::new(
+        MosaicReader::open(&paths, None, None, OverlapRule::Cutline).expect("open mosaic"),
+    );
+
+    let total_jobs = mosaic.chunk_refs.len();
+    assert!(total_jobs >= 3, "Mosaic should have at least 3 chunks");
+
+    // Spawn PrefetchedMosaicReader with 4 worker threads
+    let prefetcher = PrefetchedMosaicReader::spawn_with_workers(Arc::clone(&mosaic), 16, 4);
+
+    let mut received_chunks = 0;
+    for job_id in 0..total_jobs {
+        let item = prefetcher.next_chunk().expect("Expected chunk from prefetcher");
+        let (tile_idx, chunk_idx, bounds, data, has_overlap) = item.expect("Chunk decoding failed");
+
+        // Verify sequential job ordering invariants
+        let expected_ref = mosaic.chunk_refs[job_id];
+        assert_eq!(tile_idx, expected_ref.tile_idx, "tile_idx mismatch at job {}", job_id);
+        assert_eq!(chunk_idx, expected_ref.chunk_idx, "chunk_idx mismatch at job {}", job_id);
+        assert_eq!(has_overlap, expected_ref.has_overlap, "has_overlap mismatch at job {}", job_id);
+        assert!(bounds.width > 0 && bounds.height > 0);
+
+        // Verify pixel data content matches tile fill value
+        let expected_fill = match tile_idx {
+            0 => 10u8,
+            1 => 20u8,
+            2 => 30u8,
+            _ => unreachable!(),
+        };
+
+        match data {
+            DecodingResult::U8(ref pixels) => {
+                assert_eq!(pixels.len(), (bounds.width * bounds.height) as usize);
+                assert!(pixels.iter().all(|&p| p == expected_fill), "Pixel value corrupted");
+            }
+            _ => panic!("Expected U8 decoding result"),
+        }
+
+        // Test buffer recycling back to worker pool
+        prefetcher.recycle_batch(std::iter::once(data));
+        received_chunks += 1;
+    }
+
+    assert_eq!(received_chunks, total_jobs);
+    assert!(prefetcher.next_chunk().is_none(), "Queue should be empty after all chunks pulled");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_prefetched_mosaic_reader_early_drop() {
+    let temp_dir = std::env::temp_dir().join("raster_h3_test_mosaic_early_drop");
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let f1 = temp_dir.join("ed_0.tif");
+    let f2 = temp_dir.join("ed_1.tif");
+    create_test_geotiff(&f1, 50, 50, -122.50, 37.85, 0.001, 10);
+    create_test_geotiff(&f2, 50, 50, -122.45, 37.85, 0.001, 20);
+
+    let paths = vec![f1, f2];
+    let mosaic = Arc::new(
+        MosaicReader::open(&paths, None, None, OverlapRule::Cutline).expect("open mosaic"),
+    );
+
+    let prefetcher = PrefetchedMosaicReader::spawn_with_workers(Arc::clone(&mosaic), 16, 4);
+
+    // Pull only 1 chunk then immediately drop prefetcher
+    let first = prefetcher.next_chunk();
+    assert!(first.is_some(), "Should receive first chunk");
+
+    // Dropping prefetcher must close queue and terminate worker threads promptly without deadlock
+    drop(prefetcher);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+

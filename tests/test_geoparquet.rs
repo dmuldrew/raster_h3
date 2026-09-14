@@ -334,3 +334,195 @@ fn test_geoparquet_raster_source_end_to_end() {
     assert_eq!(geo_json["version"], "1.1.0");
     assert_eq!(geo_json["columns"]["geometry"]["encoding"], "WKB");
 }
+
+#[test]
+fn test_geoparquet_ogc_1_1_specification_deep_validation() {
+    let tiff_file = create_test_geotiff(50, 50);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+
+    let parquet_file = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_file.path().to_path_buf();
+
+    let config = MultiResolutionConfig::new(vec![8]);
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+
+    let parquet_config = ParquetExportConfig {
+        geoparquet: true,
+        compact: true,
+        ..Default::default()
+    };
+
+    let total = H3ParquetWriter::write_continuous_streamer_to_parquet(
+        streamer,
+        &parquet_path,
+        parquet_config,
+    ).unwrap();
+    assert!(total > 0);
+
+    let file = File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let meta = reader.metadata();
+
+    // 1. Inspect GeoParquet 1.1 JSON Metadata in Parquet KeyValue Store
+    let kv_meta = meta.file_metadata().key_value_metadata().expect("Missing kv_metadata");
+    let geo_kv = kv_meta.iter().find(|kv| kv.key == "geo").expect("Missing 'geo' key");
+    let geo_str = geo_kv.value.as_ref().expect("Missing 'geo' value string");
+    let geo: serde_json::Value = serde_json::from_str(geo_str).expect("Valid JSON");
+
+    // Spec check 1: Root attributes
+    assert_eq!(geo["version"], "1.1.0", "OGC GeoParquet version must be 1.1.0");
+    assert_eq!(geo["primary_column"], "geometry", "Primary column must be 'geometry'");
+
+    // Spec check 2: Columns object
+    let col = &geo["columns"]["geometry"];
+    assert!(col.is_object(), "columns.geometry must be an object");
+    assert_eq!(col["encoding"], "WKB", "Encoding must be WKB");
+    assert_eq!(col["edges"], "planar", "Edges must be planar");
+
+    let geom_types = col["geometry_types"].as_array().expect("geometry_types array");
+    assert_eq!(geom_types.len(), 1);
+    assert_eq!(geom_types[0], "Polygon");
+
+    // Spec check 3: Bounding box
+    let bbox = col["bbox"].as_array().expect("bbox array");
+    assert_eq!(bbox.len(), 4);
+    let min_lon = bbox[0].as_f64().unwrap();
+    let min_lat = bbox[1].as_f64().unwrap();
+    let max_lon = bbox[2].as_f64().unwrap();
+    let max_lat = bbox[3].as_f64().unwrap();
+    assert!(min_lon <= max_lon, "min_lon <= max_lon");
+    assert!(min_lat <= max_lat, "min_lat <= max_lat");
+    assert!(min_lon >= -180.0 && max_lon <= 180.0);
+    assert!(min_lat >= -90.0 && max_lat <= 90.0);
+
+    // Spec check 4: PROJJSON CRS
+    let crs = &col["crs"];
+    assert_eq!(crs["$schema"], "https://proj.org/schemas/v0.7/projjson.schema.json");
+    assert_eq!(crs["type"], "GeographicCRS");
+    assert_eq!(crs["name"], "WGS 84 (CRS84)");
+    assert_eq!(crs["id"]["authority"], "OGC");
+    assert_eq!(crs["id"]["code"], "CRS84");
+
+    let ensemble = &crs["datum_ensemble"];
+    assert_eq!(ensemble["name"], "World Geodetic System 1984 ensemble");
+    assert_eq!(ensemble["members"].as_array().unwrap().len(), 7);
+    assert_eq!(ensemble["ellipsoid"]["name"], "WGS 84");
+    assert!((ensemble["ellipsoid"]["semi_major_axis"].as_f64().unwrap() - 6378137.0).abs() < 1e-6);
+
+    let coord_sys = &crs["coordinate_system"];
+    assert_eq!(coord_sys["subtype"], "ellipsoidal");
+    let axes = coord_sys["axis"].as_array().unwrap();
+    assert_eq!(axes.len(), 2);
+    assert_eq!(axes[0]["direction"], "east");
+    assert_eq!(axes[1]["direction"], "north");
+}
+
+#[test]
+fn test_geoparquet_non_compact_categorical_metadata_and_columns() {
+    let tiff_file = create_test_geotiff(30, 30);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+
+    let parquet_file = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_file.path().to_path_buf();
+
+    let config = MultiResolutionConfig::new(vec![8]);
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
+
+    let parquet_config = ParquetExportConfig {
+        compact: false,
+        is_categorical: true,
+        geoparquet: true,
+        ..Default::default()
+    };
+
+    let total = H3ParquetWriter::write_categorical_streamer_to_parquet(
+        streamer,
+        &parquet_path,
+        parquet_config,
+    ).unwrap();
+    assert!(total > 0);
+
+    let file = File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let meta = reader.metadata();
+
+    // Standard non-compact categorical GeoParquet schema must have 10 columns:
+    // [h3_index, h3_hex, geometry, majority, majority_fraction, pixel_count, distinct_classes, entropy, lat, lng]
+    let schema = meta.file_metadata().schema_descr();
+    assert_eq!(schema.num_columns(), 10, "Non-compact categorical GeoParquet must have 10 columns");
+
+    assert_eq!(schema.column(0).name(), "h3_index");
+    assert_eq!(schema.column(1).name(), "h3_hex");
+    assert_eq!(schema.column(2).name(), "geometry");
+    assert_eq!(schema.column(3).name(), "majority");
+    assert_eq!(schema.column(4).name(), "majority_fraction");
+    assert_eq!(schema.column(5).name(), "pixel_count");
+    assert_eq!(schema.column(6).name(), "distinct_classes");
+    assert_eq!(schema.column(7).name(), "entropy");
+    assert_eq!(schema.column(8).name(), "lat");
+    assert_eq!(schema.column(9).name(), "lng");
+
+    for row in reader.get_row_iter(None).unwrap() {
+        let row = row.unwrap();
+        let geom_bytes = row.get_bytes(2).unwrap();
+        validate_wkb_hexagon(geom_bytes.data());
+
+        let lat = row.get_double(8).unwrap();
+        let lng = row.get_double(9).unwrap();
+        assert!(lat >= 37.0 && lat <= 38.5);
+        assert!(lng >= -123.0 && lng <= -122.0);
+    }
+}
+
+#[test]
+fn test_geoparquet_column_projection_and_filtering() {
+    let tiff_file = create_test_geotiff(40, 40);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+
+    let parquet_file = NamedTempFile::new().unwrap();
+    let parquet_path = parquet_file.path().to_path_buf();
+
+    let config = MultiResolutionConfig::new(vec![9]);
+    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+    let streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+
+    let parquet_config = ParquetExportConfig {
+        compact: true,
+        geoparquet: true,
+        ..Default::default()
+    };
+
+    let total_written = H3ParquetWriter::write_continuous_streamer_to_parquet(
+        streamer,
+        &parquet_path,
+        parquet_config,
+    ).unwrap();
+
+    let file = File::open(&parquet_path).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let meta = reader.metadata();
+
+    let schema = meta.file_metadata().schema_descr();
+    let h3_idx = schema.columns().iter().position(|c| c.name() == "h3_index").unwrap();
+    let geom_idx = schema.columns().iter().position(|c| c.name() == "geometry").unwrap();
+    let avg_idx = schema.columns().iter().position(|c| c.name() == "avg_value").unwrap();
+
+    // Verify per-column projection across rows
+    let mut rows_checked = 0;
+    for row in reader.get_row_iter(None).unwrap() {
+        let row = row.unwrap();
+        let h3 = row.get_long(h3_idx).unwrap();
+        assert!(h3 > 0, "Valid H3 index");
+
+        let geom = row.get_bytes(geom_idx).unwrap();
+        assert_eq!(geom.len(), 125, "Valid 125-byte WKB");
+
+        let avg = row.get_double(avg_idx).unwrap();
+        assert!(avg > 0.0, "Valid avg value");
+        rows_checked += 1;
+    }
+    assert_eq!(rows_checked, total_written);
+}
+

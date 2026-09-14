@@ -388,4 +388,103 @@ mod tests {
         assert!((lon - -157.0).abs() < 1e-6);
         assert!((lat - 13.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_antimeridian_utm_zone_1_and_60_continuity() {
+        // UTM Zone 1N (EPSG:32601): central meridian = -177°, spans -180° to -174°
+        let tf_z1 = CrsTransformer::from_crs_or_epsg(Some(32601), None).unwrap();
+        let (lon_cm, lat_cm) = tf_z1.transform_point(500000.0, 0.0).unwrap();
+        assert!((lon_cm - -177.0).abs() < 1e-3, "Zone 1 central meridian should be -177°");
+        assert!(lat_cm.abs() < 1e-3, "Equator latitude should be 0°");
+
+        // West edge of Zone 1 near the antimeridian: spans -180° to -174°
+        // Note: PROJ4 normalizes -180° and +180° to the antimeridian meridian
+        let (lon_west, lat_w) = tf_z1.transform_point(166021.0, 0.0).unwrap();
+        assert!((lon_west.abs() - 180.0).abs() < 0.05, "West edge should be at antimeridian (±180°), got {}", lon_west);
+        assert!(lat_w.abs() < 1e-3);
+
+        // Point inside Zone 1: x = 250000m (approx -179.24°)
+        let (lon_in1, _) = tf_z1.transform_point(250000.0, 0.0).unwrap();
+        assert!(lon_in1 > -180.0 && lon_in1 < -177.0, "Inside Zone 1 should be between -180° and -177°: got {}", lon_in1);
+
+        // UTM Zone 60N (EPSG:32660): central meridian = +177°, spans +174° to +180°
+        let tf_z60 = CrsTransformer::from_crs_or_epsg(Some(32660), None).unwrap();
+        let (lon_cm60, lat_cm60) = tf_z60.transform_point(500000.0, 0.0).unwrap();
+        assert!((lon_cm60 - 177.0).abs() < 1e-3, "Zone 60 central meridian should be +177°");
+        assert!(lat_cm60.abs() < 1e-3, "Equator latitude should be 0°");
+
+        // East edge of Zone 60 near +180° antimeridian
+        let (lon_east, _) = tf_z60.transform_point(833978.0, 0.0).unwrap();
+        assert!((lon_east.abs() - 180.0).abs() < 0.05, "East edge should be at antimeridian (±180°), got {}", lon_east);
+
+        // Point inside Zone 60: x = 750000m (approx +179.24°)
+        let (lon_in60, _) = tf_z60.transform_point(750000.0, 0.0).unwrap();
+        assert!(lon_in60 > 177.0 && lon_in60 < 180.0, "Inside Zone 60 should be between +177° and +180°: got {}", lon_in60);
+    }
+
+    #[test]
+    fn test_polar_stereographic_and_latitude_bounds() {
+        // South Pole Stereographic (+proj=stere +lat_0=-90)
+        let sp_proj = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+        let tf_sp = CrsTransformer::from_proj_string(sp_proj).unwrap();
+        let (_sp_lon, sp_lat) = tf_sp.transform_point(0.0, 0.0).unwrap();
+        assert!((sp_lat - -90.0).abs() < 1e-5, "South pole latitude should be -90°: got {}", sp_lat);
+
+        // North Pole Stereographic (+proj=stere +lat_0=90)
+        let np_proj = "+proj=stere +lat_0=90 +lat_ts=71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+        let tf_np = CrsTransformer::from_proj_string(np_proj).unwrap();
+        let (_np_lon, np_lat) = tf_np.transform_point(0.0, 0.0).unwrap();
+        assert!((np_lat - 90.0).abs() < 1e-5, "North pole latitude should be +90°: got {}", np_lat);
+
+        // Web Mercator extreme Y points approach ±85.051129° without NaN
+        let tf_wm = CrsTransformer::from_crs_or_epsg(Some(3857), None).unwrap();
+        let (_lon_n, lat_n) = tf_wm.transform_point(0.0, 20000000.0).unwrap();
+        assert!(!lat_n.is_nan());
+        assert!(lat_n > 85.0 && lat_n <= 90.0, "Latitude must remain bounded: {}", lat_n);
+
+        let (_lon_s, lat_s) = tf_wm.transform_point(0.0, -20000000.0).unwrap();
+        assert!(!lat_s.is_nan());
+        assert!(lat_s < -85.0 && lat_s >= -90.0, "Latitude must remain bounded: {}", lat_s);
+    }
+
+    #[test]
+    fn test_malformed_proj_strings_and_error_handling() {
+        let invalid_strings = [
+            "+proj=nonexistent_projection_abc_123",
+            "completely invalid syntax without plus",
+            "+proj=utm +zone=999 +datum=WGS84",
+        ];
+
+        for s in &invalid_strings {
+            let res = CrsTransformer::from_proj_string(s);
+            assert!(res.is_err(), "Expected error for invalid PROJ string: {}", s);
+            match res.err().unwrap() {
+                RasterH3Error::CrsError(msg) => {
+                    assert!(!msg.is_empty(), "CrsError must contain diagnostic message");
+                }
+                other => panic!("Expected RasterH3Error::CrsError, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_transform_batch_bounds_safety() {
+        let tf = CrsTransformer::from_crs_or_epsg(Some(4326), None).unwrap();
+        let xs = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let ys = [1.0, 2.0, 3.0, 4.0, 5.0];
+
+        // Mismatched destination buffer: smaller than inputs
+        let mut out_lon = [0.0; 3];
+        let mut out_lat = [0.0; 3];
+        tf.transform_batch(&xs, &ys, &mut out_lon, &mut out_lat).unwrap();
+
+        assert_eq!(out_lon, [10.0, 20.0, 30.0]);
+        assert_eq!(out_lat, [1.0, 2.0, 3.0]);
+
+        // Empty slices
+        let mut empty_lon = [];
+        let mut empty_lat = [];
+        tf.transform_batch(&[], &[], &mut empty_lon, &mut empty_lat).unwrap();
+    }
 }
+
