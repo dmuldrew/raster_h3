@@ -574,8 +574,9 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets (dx_i, dy_i) are eval
 ### How CRS Detection Works
 1. **GeoTIFF metadata**: The extension reads the `ModelTiepointTag`, `ModelPixelScaleTag`, and `GeoKeyDirectoryTag` from the TIFF header to extract the embedded projection definition.
 2. **EPSG matching**: If an EPSG code is found, the transformer selects the optimal tier (Identity → Analytical → PROJ4).
-3. **PROJ string fallback**: If only a PROJ.4 definition string is present (e.g. Lambert Conformal Conic, Albers Equal-Area), it is passed directly to `proj4rs`.
-4. **Manual override**: The `source_crs` parameter accepts `'EPSG:XXXX'` codes or full PROJ.4 definition strings, overriding any embedded metadata.
+3. **PROJ string fallback**: If only a PROJ.4 definition string or WKT is present (e.g. Lambert Conformal Conic, Albers Equal-Area), it is parsed and transformed via `proj4rs`.
+4. **Mandatory Explicit CRS if Undetected**: If a GeoTIFF lacks embedded CRS metadata or uses an unrecognized projection code, `raster_h3` **strictly halts with an error** (`RasterH3Error::CrsError`) instead of guessing. You must supply the CRS explicitly.
+5. **Manual specification & override**: The `crs` (or `source_crs`) parameter accepts `'EPSG:XXXX'` codes or full PROJ.4 definition strings, taking strict precedence over any embedded metadata.
 
 ### Supported Projection Families
 
@@ -594,14 +595,14 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets (dx_i, dy_i) are eval
 -- Auto-detect from GeoTIFF metadata (most common)
 SELECT * FROM h3_raster_continuous_aggregate('sentinel2_utm32n.tif', resolution := 8);
 
--- Override CRS with EPSG code
-SELECT * FROM h3_raster_continuous_aggregate('legacy_raster.tif', resolution := 8, source_crs := 'EPSG:32632');
+-- Explicitly supply CRS for unreferenced GeoTIFFs (or override existing CRS)
+SELECT * FROM h3_raster_continuous_aggregate('legacy_raster.tif', resolution := 8, crs := 'EPSG:32632');
 
--- Override with full PROJ string (Lambert Conformal Conic)
+-- Supply full PROJ string (Lambert Conformal Conic)
 SELECT * FROM h3_raster_continuous_aggregate(
     'conus_climate.tif',
     resolution := 7,
-    source_crs := '+proj=lcc +lat_1=25 +lat_2=60 +lat_0=42.5 +lon_0=-100 +datum=NAD83 +units=m'
+    crs := '+proj=lcc +lat_1=25 +lat_2=60 +lat_0=42.5 +lon_0=-100 +datum=NAD83 +units=m'
 );
 ```
 
@@ -952,7 +953,7 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `min_resolution` | `BIGINT` | `None` | Minimum H3 resolution for multi-resolution pyramid range. |
 | `max_resolution` | `BIGINT` | `None` | Maximum H3 resolution for multi-resolution pyramid range. |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
-| `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). |
+| `source_crs` | `VARCHAR` | `None` (auto) | Raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). Required if raster lacks embedded CRS metadata; otherwise acts as override. Alias: `crs`. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, `'5point'`, `'8rooks'`, `'9point'`, `'16point'`). |
@@ -998,7 +999,7 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `max_resolution` | `BIGINT` | `None` | Maximum H3 resolution for multi-resolution pyramid range. |
 | `format` | `VARCHAR` | `'wide'` | Output layout: `'wide'` (majority + histogram) or `'long'` (normalized rows). |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
-| `source_crs` | `VARCHAR` | `None` (auto) | Override raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). |
+| `source_crs` | `VARCHAR` | `None` (auto) | Raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). Required if raster lacks embedded CRS metadata; otherwise acts as override. Alias: `crs`. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, etc.). |
@@ -1204,15 +1205,21 @@ When loading `raster_h3` in DuckDB, you may encounter:
   ```
 
 ### 2. Missing or Non-Standard CRS GeoKeys
-If a GeoTIFF lacks embedded projection tags or uses an unrecognized local coordinate system, `raster_h3` will fail to identify the CRS automatically.
+If a GeoTIFF lacks embedded projection tags or uses an unrecognized coordinate system, `raster_h3` will intentionally reject the file with a clear error:
+```
+CRS transformation error: No CRS detected in raster metadata. A CRS must be specified explicitly (e.g. crs := 'EPSG:4326', crs := 'EPSG:5070').
+```
 
-**Resolution**:
-Explicitly specify the coordinate reference system using the `source_crs` parameter (accepts standard EPSG codes or full PROJ.4 parameter strings):
+**Why this is enforced:**
+To prevent silent spatial corruption. If an unreferenced raster is actually in projected meter coordinates (e.g. UTM, State Plane, Albers), treating meter values as $(lon, lat)$ would cause coordinates to fall outside valid latitude bounds ($[-90^\circ, +90^\circ]$), silently emitting 0 rows (an empty table) or placing hexagons in the wrong location on Earth.
+
+**Resolution:**
+Explicitly specify the coordinate reference system using the `crs` or `source_crs` parameter (accepts standard EPSG codes or full PROJ.4 parameter strings):
 ```sql
 SELECT * FROM h3_raster_continuous_aggregate(
     'unprojected_grid.tif', 
     resolution := 8, 
-    source_crs := 'EPSG:32610'
+    crs := 'EPSG:32610'  -- or source_crs := 'EPSG:32610'
 );
 ```
 

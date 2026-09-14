@@ -1074,7 +1074,8 @@ fn test_invalid_resolution_parameter_error() {
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     // Resolution 16 is invalid in H3 (valid range: 0..=15)
-    let invalid_config = MultiResolutionConfig::single(16);
+    let mut invalid_config = MultiResolutionConfig::single(16);
+    invalid_config.custom_crs = Some("EPSG:4326".to_string());
 
     let res_cont = MultiScanHorizonStreamer::new(reader.clone(), &invalid_config);
     assert!(res_cont.is_err());
@@ -1120,11 +1121,25 @@ fn test_plain_tiff_without_geokeys() {
     }
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    // Non-georeferenced images should gracefully fallback to default GeoTransform & identity CRS
+    // Non-georeferenced images have no detected CRS
     assert_eq!(reader.metadata.epsg, None);
+    assert_eq!(reader.metadata.proj_string, None);
     assert_eq!(reader.metadata.geotransform, GeoTransform::default());
 
-    let config = MultiResolutionConfig::single(4);
+    // 1. Without specifying custom_crs, streamer initialization MUST fail with a CRS error
+    let unspec_config = MultiResolutionConfig::single(4);
+    let err_res = MultiScanHorizonStreamer::new(reader.clone(), &unspec_config);
+    assert!(err_res.is_err());
+    match err_res {
+        Err(RasterH3Error::CrsError(msg)) => {
+            assert!(msg.contains("No CRS detected in raster metadata"), "Unexpected message: {}", msg);
+        }
+        _ => panic!("Expected RasterH3Error::CrsError when CRS is not detected"),
+    }
+
+    // 2. When the user explicitly specifies a CRS, hexification succeeds
+    let mut config = MultiResolutionConfig::single(4);
+    config.custom_crs = Some("EPSG:4326".to_string());
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
@@ -1335,6 +1350,12 @@ fn test_all_nodata_full_stream_scan_and_categorical() {
             .encoder()
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
+        let geokeys: [u16; 12] = [
+            1, 1, 0, 2,
+            1024, 0, 1, 2,
+            2048, 0, 1, 4326,
+        ];
+        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -1396,11 +1417,15 @@ fn test_corrupted_and_empty_tiff_error_handling() {
 
 #[test]
 fn test_crs_unspecified_fallback_and_invalid_proj_error() {
-    // 1. Unspecified CRS (None, None) gracefully defaults to identity WGS84
-    let default_transformer = CrsTransformer::from_crs_or_epsg(None, None).unwrap();
-    let (lon, lat) = default_transformer.transform_point(-122.4, 37.8).unwrap();
-    assert!((lon - (-122.4)).abs() < 1e-9);
-    assert!((lat - 37.8).abs() < 1e-9);
+    // 1. Unspecified CRS (None, None) now returns a typed CrsError requiring explicit CRS
+    let default_transformer = CrsTransformer::from_crs_or_epsg(None, None);
+    assert!(default_transformer.is_err());
+    match default_transformer {
+        Err(RasterH3Error::CrsError(msg)) => {
+            assert!(msg.contains("No CRS detected in raster metadata"), "Unexpected message: {}", msg);
+        }
+        _ => panic!("Expected RasterH3Error::CrsError for unspecified CRS"),
+    }
 
     // 2. Explicit invalid PROJ definition returns a typed CrsError
     let invalid_result = CrsTransformer::from_crs_or_epsg(None, Some("+proj=nonexistent_invalid_crs +units=m"));

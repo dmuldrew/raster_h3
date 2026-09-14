@@ -221,10 +221,20 @@ impl TileDescriptor {
         reader: GeoTiffStreamReader,
         custom_crs: Option<&str>,
     ) -> Result<Self> {
-        let crs_transformer = CrsTransformer::from_crs_or_epsg(
-            reader.metadata.epsg,
-            custom_crs.or(reader.metadata.proj_string.as_deref()),
-        )?;
+        let (epsg_to_use, proj_to_use) = if let Some(custom) = custom_crs {
+            (None, Some(custom))
+        } else {
+            (reader.metadata.epsg, reader.metadata.proj_string.as_deref())
+        };
+
+        let crs_transformer = CrsTransformer::from_crs_or_epsg(epsg_to_use, proj_to_use)
+            .map_err(|e| match e {
+                RasterH3Error::CrsError(msg) => RasterH3Error::CrsError(format!(
+                    "Tile {} ({:?}): {}",
+                    tile_idx, reader.file_path, msg
+                )),
+                other => other,
+            })?;
 
         let w = reader.metadata.width as f64;
         let h = reader.metadata.height as f64;

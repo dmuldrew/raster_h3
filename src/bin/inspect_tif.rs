@@ -246,6 +246,9 @@ fn main() {
         if let Some(ref proj) = meta.proj_string {
             println!("  Projection:  {}", proj);
         }
+        if let Err(ref e) = transformer_res {
+            println!("  Warning:     {}", e);
+        }
         println!("  Origin:      ({:.6}, {:.6})", gt.c0, gt.f0);
         println!("  Pixel Size:  {:.6} x {:.6}", gt.a.abs(), gt.e.abs());
         println!("--------------------------------------------------------------------------------");

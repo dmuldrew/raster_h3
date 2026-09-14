@@ -238,6 +238,10 @@ impl CrsTransformer {
                     if let Ok(transformer) = Self::from_proj_string(&p_str) {
                         return Ok(transformer);
                     }
+                    return Err(RasterH3Error::CrsError(format!(
+                        "Unsupported or unrecognized EPSG code: {}",
+                        code
+                    )));
                 }
             }
         }
@@ -260,8 +264,9 @@ impl CrsTransformer {
             return Self::from_proj_string(trimmed);
         }
 
-        // Default to Wgs84Identity if unspec
-        Ok(Self::Wgs84Identity)
+        Err(RasterH3Error::CrsError(
+            "No CRS detected in raster metadata. A CRS must be specified explicitly (e.g. crs := 'EPSG:4326', crs := 'EPSG:5070').".into(),
+        ))
     }
 
     /// Construct from arbitrary PROJ string to WGS84

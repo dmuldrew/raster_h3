@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - *Category 4*: Categorical histogram 16-slot inline array vs heap `HashMap` spillover and Shannon entropy theoretical bounds ($\ln K$, $0.0$).
   - *Category 5*: SIMD Deflate and fast LZW corrupted byte stream fuzzing, truncated payload detection, and buffer auto-resizing.
 
+### Changed
+- **Strict CRS Validation on GeoTIFF Ingestion**:
+  - Eliminated silent fallback to `Wgs84Identity` when GeoTIFF metadata lacks embedded CRS definitions or uses unrecognized projection codes.
+  - Ingestion now fails immediately with `RasterH3Error::CrsError` instructing the user to supply `crs` or `source_crs` explicitly (e.g. `crs := 'EPSG:4326'`, `crs := 'EPSG:5070'`).
+  - Prevents silent data corruption, invalid hexagon emission, or empty result sets when ingesting rasters in projected meter coordinates.
+  - User-specified `custom_crs` / `crs` now takes strict priority over any embedded raster metadata.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added
