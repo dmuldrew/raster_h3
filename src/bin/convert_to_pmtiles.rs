@@ -1,7 +1,7 @@
-use std::path::Path;
-use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3::aggregator::SamplingPattern;
+use raster_h3::pmtiles::tiler::H3PmtilesTiler;
+use std::path::Path;
 
 fn print_help() {
     println!("raster_h3 PMTiles v3 Converter (GeoTIFF & Parquet)");
@@ -16,8 +16,12 @@ fn print_help() {
     println!("  -s, --sampling <PATTERN>   Sampling pattern: center, rgss, hex, 16point (default: center)");
     println!("      --nodata <FLOAT>       Custom nodata override value");
     println!("  -p, --properties <LIST>    Comma-separated list of properties to include in vector tiles");
-    println!("      --h3-column <NAME>     H3 cell column name for Parquet input (default: auto-detect)");
-    println!("      --bbox <BBOX>          Bounding box crop in WGS84: min_lon,min_lat,max_lon,max_lat");
+    println!(
+        "      --h3-column <NAME>     H3 cell column name for Parquet input (default: auto-detect)"
+    );
+    println!(
+        "      --bbox <BBOX>          Bounding box crop in WGS84: min_lon,min_lat,max_lon,max_lat"
+    );
     println!("      --parquet              Force Parquet ingestion mode");
     println!("  -h, --help                 Display this help menu");
 }
@@ -50,14 +54,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         while i < args.len() {
             match args[i].as_str() {
                 "--input" | "-i" => {
-                    if i + 1 < args.len() { input_path = args[i + 1].clone(); i += 1; }
+                    if i + 1 < args.len() {
+                        input_path = args[i + 1].clone();
+                        i += 1;
+                    }
                 }
                 "--output" | "-o" => {
-                    if i + 1 < args.len() { output_path = args[i + 1].clone(); i += 1; }
+                    if i + 1 < args.len() {
+                        output_path = args[i + 1].clone();
+                        i += 1;
+                    }
                 }
                 "--resolutions" | "-r" => {
                     if i + 1 < args.len() {
-                        resolutions = args[i + 1].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                        resolutions = args[i + 1]
+                            .split(',')
+                            .filter_map(|s| s.trim().parse().ok())
+                            .collect();
                         i += 1;
                     }
                 }
@@ -76,17 +89,29 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
                 "--nodata" => {
-                    if i + 1 < args.len() { custom_nodata = args[i + 1].parse().ok(); i += 1; }
+                    if i + 1 < args.len() {
+                        custom_nodata = args[i + 1].parse().ok();
+                        i += 1;
+                    }
                 }
                 "--properties" | "-p" => {
-                    if i + 1 < args.len() { properties = Some(args[i + 1].clone()); i += 1; }
+                    if i + 1 < args.len() {
+                        properties = Some(args[i + 1].clone());
+                        i += 1;
+                    }
                 }
                 "--h3-column" => {
-                    if i + 1 < args.len() { h3_column = Some(args[i + 1].clone()); i += 1; }
+                    if i + 1 < args.len() {
+                        h3_column = Some(args[i + 1].clone());
+                        i += 1;
+                    }
                 }
                 "--bbox" => {
                     if i + 1 < args.len() {
-                        let parts: Vec<f64> = args[i + 1].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                        let parts: Vec<f64> = args[i + 1]
+                            .split(',')
+                            .filter_map(|s| s.trim().parse().ok())
+                            .collect();
                         if parts.len() == 4 {
                             bbox = Some([parts[0], parts[1], parts[2], parts[3]]);
                         } else {
@@ -108,7 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         input_path = args[1].clone();
         output_path = args[2].clone();
         if args.len() > 3 {
-            resolutions = args[3].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            resolutions = args[3]
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
         }
         if args.len() > 4 {
             is_categorical = args[4].parse().unwrap_or(true);
@@ -126,9 +154,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_parquet = force_parquet || input_path.ends_with(".parquet");
 
     if is_parquet {
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("raster_h3 PMTiles v3 Converter: Parquet Mode");
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("  Input:     {}", input_path);
         println!("  Output:    {}", output_path);
         if let Some(ref col) = h3_column {
@@ -136,7 +168,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             println!("  H3 Column: Auto-detect (h3_index, h3_hex, h3, cell, hex)");
         }
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
 
         let start = std::time::Instant::now();
         let summary = H3PmtilesTiler::process_parquet_to_pmtiles(
@@ -153,11 +187,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Invalid Dropped:    {}", summary.invalid_features_dropped);
         }
         println!("  Total Tiles:        {}", summary.total_tiles);
-        println!("  Zoom Range:         {} to {}", summary.min_zoom, summary.max_zoom);
+        println!(
+            "  Zoom Range:         {} to {}",
+            summary.min_zoom, summary.max_zoom
+        );
     } else {
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("raster_h3 PMTiles v3 Converter: GeoTIFF Raster Mode");
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("  Input:        {}", input_path);
         println!("  Output:       {}", output_path);
         println!("  Resolutions:  {:?}", resolutions);
@@ -166,12 +207,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Custom NoData: {}", nd);
         }
         if let Some(ref b) = bbox {
-            println!("  BBox Crop:    [{:.4}, {:.4}, {:.4}, {:.4}]", b[0], b[1], b[2], b[3]);
+            println!(
+                "  BBox Crop:    [{:.4}, {:.4}, {:.4}, {:.4}]",
+                b[0], b[1], b[2], b[3]
+            );
         }
         if let Some(ref p) = properties {
             println!("  Properties:   {}", p);
         }
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
 
         let mut config = MultiResolutionConfig::new(resolutions);
         config.custom_nodata = custom_nodata;
@@ -181,17 +227,28 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let start = std::time::Instant::now();
         let total_hexagons = if is_categorical {
-            H3PmtilesTiler::process_categorical_source_to_pmtiles(&input_path, &output_path, config)?
+            H3PmtilesTiler::process_categorical_source_to_pmtiles(
+                &input_path,
+                &output_path,
+                config,
+            )?
         } else {
             H3PmtilesTiler::process_raster_source_to_pmtiles(&input_path, &output_path, config)?
         };
         let elapsed = start.elapsed();
 
-        println!("Success! Generated {} hexagons in {:.2?}", total_hexagons, elapsed);
+        println!(
+            "Success! Generated {} hexagons in {:.2?}",
+            total_hexagons, elapsed
+        );
     }
 
     if let Ok(meta) = Path::new(&output_path).metadata() {
-        println!("  Output Size:  {} bytes ({:.2} MB)", meta.len(), meta.len() as f64 / (1024.0 * 1024.0));
+        println!(
+            "  Output Size:  {} bytes ({:.2} MB)",
+            meta.len(),
+            meta.len() as f64 / (1024.0 * 1024.0)
+        );
     }
     println!("================================================================================");
 

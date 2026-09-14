@@ -157,14 +157,17 @@ fn accumulate_span_f32_no_nodata(slice: &[f32]) -> H3Accumulator {
         }
     }
 
-    let total_count = ((count0 + count1) + (count2 + count3) + (count4 + count5) + (count6 + count7)) as f64;
+    let total_count =
+        ((count0 + count1) + (count2 + count3) + (count4 + count5) + (count6 + count7)) as f64;
     if total_count == 0.0 {
         return H3Accumulator::default();
     }
 
     let total_sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-    let total_min = ((min0.min(min1)).min(min2.min(min3))).min((min4.min(min5)).min(min6.min(min7))) as f64;
-    let total_max = ((max0.max(max1)).max(max2.max(max3))).max((max4.max(max5)).max(max6.max(max7))) as f64;
+    let total_min =
+        ((min0.min(min1)).min(min2.min(min3))).min((min4.min(min5)).min(min6.min(min7))) as f64;
+    let total_max =
+        ((max0.max(max1)).max(max2.max(max3))).max((max4.max(max5)).max(max6.max(max7))) as f64;
 
     // Fast-path: uniform span (e.g. flat water or uniform elevation) has zero variance
     if total_min == total_max {
@@ -376,14 +379,17 @@ fn accumulate_span_f32_with_nodata(slice: &[f32], nd: f32) -> H3Accumulator {
         }
     }
 
-    let total_count = ((count0 + count1) + (count2 + count3) + (count4 + count5) + (count6 + count7)) as f64;
+    let total_count =
+        ((count0 + count1) + (count2 + count3) + (count4 + count5) + (count6 + count7)) as f64;
     if total_count == 0.0 {
         return H3Accumulator::default();
     }
 
     let total_sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-    let total_min = ((min0.min(min1)).min(min2.min(min3))).min((min4.min(min5)).min(min6.min(min7))) as f64;
-    let total_max = ((max0.max(max1)).max(max2.max(max3))).max((max4.max(max5)).max(max6.max(max7))) as f64;
+    let total_min =
+        ((min0.min(min1)).min(min2.min(min3))).min((min4.min(min5)).min(min6.min(min7))) as f64;
+    let total_max =
+        ((max0.max(max1)).max(max2.max(max3))).max((max4.max(max5)).max(max6.max(max7))) as f64;
 
     if total_min == total_max {
         return H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, 0.0);
@@ -748,7 +754,13 @@ macro_rules! impl_simd_span_integer {
                 let total_max = (max0.max(max1)).max(max2.max(max3)) as f64;
 
                 if total_min == total_max {
-                    return H3Accumulator::from_stats(total_sum, total_count, total_min, total_max, 0.0);
+                    return H3Accumulator::from_stats(
+                        total_sum,
+                        total_count,
+                        total_min,
+                        total_max,
+                        0.0,
+                    );
                 }
 
                 let mean = total_sum / total_count;

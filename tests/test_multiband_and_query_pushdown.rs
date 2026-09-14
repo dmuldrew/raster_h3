@@ -43,19 +43,21 @@ fn create_test_rgba_geotiff(
     // Tie point: SF Bay (-122.45, 37.80)
     image
         .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..])
+        .write_tag(
+            Tag::Unknown(33922),
+            &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..],
+        )
         .unwrap();
     image
         .encoder()
         .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
         .unwrap();
 
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(34735), &geokeys[..])
+        .unwrap();
     image.write_data(&data).unwrap();
 
     temp_file
@@ -86,19 +88,21 @@ fn create_test_gray8_geotiff(
 
     image
         .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..])
+        .write_tag(
+            Tag::Unknown(33922),
+            &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..],
+        )
         .unwrap();
     image
         .encoder()
         .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
         .unwrap();
 
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(34735), &geokeys[..])
+        .unwrap();
     image.write_data(&data).unwrap();
 
     temp_file
@@ -280,13 +284,18 @@ fn test_continuous_predicate_pushdown_min_count_and_mean() {
 #[test]
 fn test_categorical_predicate_pushdown_majority_fraction() {
     // Raster where left half is class 1 (uniform), right half alternates 2 and 3 at pixel level
-    let temp_raster = create_test_gray8_geotiff(64, 64, |c, r| {
-        if c < 32 {
-            1
-        } else {
-            ((c + r) % 2 + 2) as u8
-        }
-    });
+    let temp_raster =
+        create_test_gray8_geotiff(
+            64,
+            64,
+            |c, r| {
+                if c < 32 {
+                    1
+                } else {
+                    ((c + r) % 2 + 2) as u8
+                }
+            },
+        );
     let raster_path = temp_raster.path();
 
     // 1. Baseline unfiltered
@@ -360,7 +369,10 @@ fn test_hierarchical_compaction_continuous_conservation() {
         uncompacted_records.extend(b);
     }
 
-    let uncompacted_count: f64 = uncompacted_records.iter().map(|r| r.accumulator.count).sum();
+    let uncompacted_count: f64 = uncompacted_records
+        .iter()
+        .map(|r| r.accumulator.count)
+        .sum();
     let uncompacted_sum: f64 = uncompacted_records.iter().map(|r| r.accumulator.sum).sum();
 
     // 2. Run with compaction enabled (compact := true)
@@ -384,15 +396,27 @@ fn test_hierarchical_compaction_continuous_conservation() {
     assert!(compacted_records.len() < uncompacted_records.len());
 
     // Check that some records were compacted to resolution 7!
-    let compacted_to_res_7 = compacted_records.iter().filter(|r| r.resolution == 7).count();
-    assert!(compacted_to_res_7 > 0, "Expected at least some complete parent cells at res 7");
+    let compacted_to_res_7 = compacted_records
+        .iter()
+        .filter(|r| r.resolution == 7)
+        .count();
+    assert!(
+        compacted_to_res_7 > 0,
+        "Expected at least some complete parent cells at res 7"
+    );
 
     // Total pixel count and pixel sum MUST BE 100% CONSERVED!
     let compacted_count: f64 = compacted_records.iter().map(|r| r.accumulator.count).sum();
     let compacted_sum: f64 = compacted_records.iter().map(|r| r.accumulator.sum).sum();
 
-    assert!((compacted_count - uncompacted_count).abs() < 1e-5, "Count conservation failed");
-    assert!((compacted_sum - uncompacted_sum).abs() < 1e-5, "Sum conservation failed");
+    assert!(
+        (compacted_count - uncompacted_count).abs() < 1e-5,
+        "Count conservation failed"
+    );
+    assert!(
+        (compacted_sum - uncompacted_sum).abs() < 1e-5,
+        "Sum conservation failed"
+    );
 }
 
 #[test]
@@ -426,7 +450,8 @@ fn test_hierarchical_compaction_categorical_conservation() {
         compact: true,
         ..Default::default()
     };
-    let mut streamer_comp = MultiCategoricalHorizonStreamer::new(reader_comp, &config_comp).unwrap();
+    let mut streamer_comp =
+        MultiCategoricalHorizonStreamer::new(reader_comp, &config_comp).unwrap();
     let mut compacted = Vec::new();
     loop {
         let b = streamer_comp.fetch_next_batch(500);
@@ -561,4 +586,3 @@ fn test_spectral_formula_out_of_bounds_band_clamping() {
         assert!((rec.accumulator.mean() - 0.60).abs() < 1e-6);
     }
 }
-

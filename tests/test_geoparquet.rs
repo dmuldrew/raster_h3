@@ -3,13 +3,13 @@ mod helpers;
 use std::fs::File;
 use tempfile::NamedTempFile;
 
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
 
 fn create_test_geotiff(width: usize, height: usize) -> NamedTempFile {
     helpers::create_wave_test_geotiff_with_scale(width, height, 0.001)
@@ -17,7 +17,11 @@ fn create_test_geotiff(width: usize, height: usize) -> NamedTempFile {
 
 /// Helper to validate a 125-byte WKB 2D Polygon
 fn validate_wkb_hexagon(bytes: &[u8]) {
-    assert_eq!(bytes.len(), 125, "WKB hexagon polygon must be exactly 125 bytes");
+    assert_eq!(
+        bytes.len(),
+        125,
+        "WKB hexagon polygon must be exactly 125 bytes"
+    );
 
     // Byte order: 1 = Little Endian
     assert_eq!(bytes[0], 0x01, "Byte order must be Little Endian (1)");
@@ -46,13 +50,27 @@ fn validate_wkb_hexagon(bytes: &[u8]) {
     // Check closed ring: first vertex equals last vertex
     let (first_lon, first_lat) = coords[0];
     let (last_lon, last_lat) = coords[6];
-    assert!((first_lon - last_lon).abs() < 1e-9, "First and last lon must match");
-    assert!((first_lat - last_lat).abs() < 1e-9, "First and last lat must match");
+    assert!(
+        (first_lon - last_lon).abs() < 1e-9,
+        "First and last lon must match"
+    );
+    assert!(
+        (first_lat - last_lat).abs() < 1e-9,
+        "First and last lat must match"
+    );
 
     // Check bounds roughly around SF Bay
     for (lon, lat) in coords {
-        assert!(lon >= -123.0 && lon <= -122.0, "Longitude {} out of expected range", lon);
-        assert!(lat >= 37.5 && lat <= 38.0, "Latitude {} out of expected range", lat);
+        assert!(
+            lon >= -123.0 && lon <= -122.0,
+            "Longitude {} out of expected range",
+            lon
+        );
+        assert!(
+            lat >= 37.5 && lat <= 38.0,
+            "Latitude {} out of expected range",
+            lat
+        );
     }
 }
 
@@ -79,7 +97,8 @@ fn test_geoparquet_continuous_metadata_and_wkb() {
         streamer,
         &parquet_path,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(total_written > 0, "Should have written rows");
 
     // Inspect Parquet file
@@ -88,13 +107,26 @@ fn test_geoparquet_continuous_metadata_and_wkb() {
     let meta = reader.metadata();
 
     // 1. Verify FileMetaData contains "geo" key
-    let kv_meta = meta.file_metadata().key_value_metadata().expect("Should have key-value metadata");
-    let geo_kv = kv_meta.iter().find(|kv| kv.key == "geo").expect("Should have 'geo' metadata key");
-    let geo_val = geo_kv.value.as_ref().expect("geo metadata must have a value");
+    let kv_meta = meta
+        .file_metadata()
+        .key_value_metadata()
+        .expect("Should have key-value metadata");
+    let geo_kv = kv_meta
+        .iter()
+        .find(|kv| kv.key == "geo")
+        .expect("Should have 'geo' metadata key");
+    let geo_val = geo_kv
+        .value
+        .as_ref()
+        .expect("geo metadata must have a value");
 
     // Parse JSON
-    let geo_json: serde_json::Value = serde_json::from_str(geo_val).expect("geo metadata must be valid JSON");
-    assert_eq!(geo_json["version"], "1.1.0", "GeoParquet specification version must be 1.1.0");
+    let geo_json: serde_json::Value =
+        serde_json::from_str(geo_val).expect("geo metadata must be valid JSON");
+    assert_eq!(
+        geo_json["version"], "1.1.0",
+        "GeoParquet specification version must be 1.1.0"
+    );
     assert_eq!(geo_json["primary_column"], "geometry");
 
     let col = &geo_json["columns"]["geometry"];
@@ -113,7 +145,10 @@ fn test_geoparquet_continuous_metadata_and_wkb() {
 
     // 2. Verify Schema contains geometry column
     let schema = meta.file_metadata().schema_descr();
-    let geom_idx = schema.columns().iter().position(|c| c.name() == "geometry")
+    let geom_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == "geometry")
         .expect("Schema must contain 'geometry' column");
 
     // 3. Verify WKB contents
@@ -150,7 +185,8 @@ fn test_geoparquet_compact_continuous() {
         streamer,
         &parquet_path,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(total_written > 0);
 
     let file = File::open(&parquet_path).unwrap();
@@ -159,8 +195,15 @@ fn test_geoparquet_compact_continuous() {
 
     // Compact columns: [h3_index, geometry, min_value, max_value, sum_value, avg_value, pixel_count]
     let schema = meta.file_metadata().schema_descr();
-    assert_eq!(schema.num_columns(), 7, "Compact GeoParquet should have 7 columns");
-    let geom_idx = schema.columns().iter().position(|c| c.name() == "geometry")
+    assert_eq!(
+        schema.num_columns(),
+        7,
+        "Compact GeoParquet should have 7 columns"
+    );
+    let geom_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == "geometry")
         .expect("Compact GeoParquet must have 'geometry' column");
     assert_eq!(geom_idx, 1);
 
@@ -194,7 +237,8 @@ fn test_geoparquet_categorical() {
         streamer,
         &parquet_path,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(total_written > 0);
 
     let file = File::open(&parquet_path).unwrap();
@@ -202,14 +246,27 @@ fn test_geoparquet_categorical() {
     let meta = reader.metadata();
 
     // Verify "geo" key in file metadata
-    let kv_meta = meta.file_metadata().key_value_metadata().expect("Should have key-value metadata");
+    let kv_meta = meta
+        .file_metadata()
+        .key_value_metadata()
+        .expect("Should have key-value metadata");
     let has_geo = kv_meta.iter().any(|kv| kv.key == "geo");
-    assert!(has_geo, "Categorical GeoParquet must have 'geo' metadata key");
+    assert!(
+        has_geo,
+        "Categorical GeoParquet must have 'geo' metadata key"
+    );
 
     // Compact categorical columns: [h3_index, geometry, majority, majority_fraction, pixel_count, distinct_classes, entropy]
     let schema = meta.file_metadata().schema_descr();
-    assert_eq!(schema.num_columns(), 7, "Compact categorical GeoParquet should have 7 columns");
-    let geom_idx = schema.columns().iter().position(|c| c.name() == "geometry")
+    assert_eq!(
+        schema.num_columns(),
+        7,
+        "Compact categorical GeoParquet should have 7 columns"
+    );
+    let geom_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == "geometry")
         .expect("Categorical GeoParquet must have 'geometry' column");
     assert_eq!(geom_idx, 1);
 
@@ -239,11 +296,8 @@ fn test_geoparquet_disabled_by_default() {
     };
     assert!(!parquet_config.geoparquet);
 
-    H3ParquetWriter::write_continuous_streamer_to_parquet(
-        streamer,
-        &parquet_path,
-        parquet_config,
-    ).unwrap();
+    H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, &parquet_path, parquet_config)
+        .unwrap();
 
     let file = File::open(&parquet_path).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
@@ -251,13 +305,23 @@ fn test_geoparquet_disabled_by_default() {
 
     // Ensure NO "geo" key in file metadata
     if let Some(kv_meta) = meta.file_metadata().key_value_metadata() {
-        assert!(!kv_meta.iter().any(|kv| kv.key == "geo"), "Non-geoparquet must NOT have 'geo' metadata");
+        assert!(
+            !kv_meta.iter().any(|kv| kv.key == "geo"),
+            "Non-geoparquet must NOT have 'geo' metadata"
+        );
     }
 
     // Ensure NO geometry column in schema
     let schema = meta.file_metadata().schema_descr();
-    assert_eq!(schema.num_columns(), 6, "Standard compact should have 6 columns");
-    assert!(!schema.columns().iter().any(|c| c.name() == "geometry"), "Should not contain 'geometry' column");
+    assert_eq!(
+        schema.num_columns(),
+        6,
+        "Standard compact should have 6 columns"
+    );
+    assert!(
+        !schema.columns().iter().any(|c| c.name() == "geometry"),
+        "Should not contain 'geometry' column"
+    );
 }
 
 #[test]
@@ -280,7 +344,8 @@ fn test_geoparquet_raster_source_end_to_end() {
         parquet_path,
         config,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(written > 0);
 
     let file = File::open(parquet_path).unwrap();
@@ -288,7 +353,10 @@ fn test_geoparquet_raster_source_end_to_end() {
     let meta = reader.metadata();
 
     let kv_meta = meta.file_metadata().key_value_metadata().unwrap();
-    let geo_kv = kv_meta.iter().find(|kv| kv.key == "geo").expect("Must have geo metadata");
+    let geo_kv = kv_meta
+        .iter()
+        .find(|kv| kv.key == "geo")
+        .expect("Must have geo metadata");
     let geo_json: serde_json::Value = serde_json::from_str(geo_kv.value.as_ref().unwrap()).unwrap();
 
     assert_eq!(geo_json["version"], "1.1.0");
@@ -317,7 +385,8 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
         streamer,
         &parquet_path,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(total > 0);
 
     let file = File::open(&parquet_path).unwrap();
@@ -325,14 +394,26 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
     let meta = reader.metadata();
 
     // 1. Inspect GeoParquet 1.1 JSON Metadata in Parquet KeyValue Store
-    let kv_meta = meta.file_metadata().key_value_metadata().expect("Missing kv_metadata");
-    let geo_kv = kv_meta.iter().find(|kv| kv.key == "geo").expect("Missing 'geo' key");
+    let kv_meta = meta
+        .file_metadata()
+        .key_value_metadata()
+        .expect("Missing kv_metadata");
+    let geo_kv = kv_meta
+        .iter()
+        .find(|kv| kv.key == "geo")
+        .expect("Missing 'geo' key");
     let geo_str = geo_kv.value.as_ref().expect("Missing 'geo' value string");
     let geo: serde_json::Value = serde_json::from_str(geo_str).expect("Valid JSON");
 
     // Spec check 1: Root attributes
-    assert_eq!(geo["version"], "1.1.0", "OGC GeoParquet version must be 1.1.0");
-    assert_eq!(geo["primary_column"], "geometry", "Primary column must be 'geometry'");
+    assert_eq!(
+        geo["version"], "1.1.0",
+        "OGC GeoParquet version must be 1.1.0"
+    );
+    assert_eq!(
+        geo["primary_column"], "geometry",
+        "Primary column must be 'geometry'"
+    );
 
     // Spec check 2: Columns object
     let col = &geo["columns"]["geometry"];
@@ -340,7 +421,9 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
     assert_eq!(col["encoding"], "WKB", "Encoding must be WKB");
     assert_eq!(col["edges"], "planar", "Edges must be planar");
 
-    let geom_types = col["geometry_types"].as_array().expect("geometry_types array");
+    let geom_types = col["geometry_types"]
+        .as_array()
+        .expect("geometry_types array");
     assert_eq!(geom_types.len(), 1);
     assert_eq!(geom_types[0], "Polygon");
 
@@ -358,7 +441,10 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
 
     // Spec check 4: PROJJSON CRS
     let crs = &col["crs"];
-    assert_eq!(crs["$schema"], "https://proj.org/schemas/v0.7/projjson.schema.json");
+    assert_eq!(
+        crs["$schema"],
+        "https://proj.org/schemas/v0.7/projjson.schema.json"
+    );
     assert_eq!(crs["type"], "GeographicCRS");
     assert_eq!(crs["name"], "WGS 84 (CRS84)");
     assert_eq!(crs["id"]["authority"], "OGC");
@@ -401,7 +487,8 @@ fn test_geoparquet_non_compact_categorical_metadata_and_columns() {
         streamer,
         &parquet_path,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(total > 0);
 
     let file = File::open(&parquet_path).unwrap();
@@ -411,7 +498,11 @@ fn test_geoparquet_non_compact_categorical_metadata_and_columns() {
     // Standard non-compact categorical GeoParquet schema must have 10 columns:
     // [h3_index, h3_hex, geometry, majority, majority_fraction, pixel_count, distinct_classes, entropy, lat, lng]
     let schema = meta.file_metadata().schema_descr();
-    assert_eq!(schema.num_columns(), 10, "Non-compact categorical GeoParquet must have 10 columns");
+    assert_eq!(
+        schema.num_columns(),
+        10,
+        "Non-compact categorical GeoParquet must have 10 columns"
+    );
 
     assert_eq!(schema.column(0).name(), "h3_index");
     assert_eq!(schema.column(1).name(), "h3_hex");
@@ -458,16 +549,29 @@ fn test_geoparquet_column_projection_and_filtering() {
         streamer,
         &parquet_path,
         parquet_config,
-    ).unwrap();
+    )
+    .unwrap();
 
     let file = File::open(&parquet_path).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
     let meta = reader.metadata();
 
     let schema = meta.file_metadata().schema_descr();
-    let h3_idx = schema.columns().iter().position(|c| c.name() == "h3_index").unwrap();
-    let geom_idx = schema.columns().iter().position(|c| c.name() == "geometry").unwrap();
-    let avg_idx = schema.columns().iter().position(|c| c.name() == "avg_value").unwrap();
+    let h3_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == "h3_index")
+        .unwrap();
+    let geom_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == "geometry")
+        .unwrap();
+    let avg_idx = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == "avg_value")
+        .unwrap();
 
     // Verify per-column projection across rows
     let mut rows_checked = 0;
@@ -485,4 +589,3 @@ fn test_geoparquet_column_projection_and_filtering() {
     }
     assert_eq!(rows_checked, total_written);
 }
-

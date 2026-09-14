@@ -7,10 +7,10 @@
 //! Usage:
 //!   cargo run --bin inspect_tif -- <path_or_url> [options]
 
-use std::fs;
-use std::path::Path;
 use h3o::{LatLng, Resolution};
 use serde_json::json;
+use std::fs;
+use std::path::Path;
 
 use raster_h3::crs::transformer::CrsTransformer;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
@@ -55,7 +55,9 @@ fn main() {
                     if parts.len() == 2 {
                         point_query = Some((parts[0], parts[1]));
                     } else {
-                        eprintln!("Error: --point requires lat,lon (e.g. --point 21.3069,-157.8583)");
+                        eprintln!(
+                            "Error: --point requires lat,lon (e.g. --point 21.3069,-157.8583)"
+                        );
                         std::process::exit(1);
                     }
                     i += 1;
@@ -165,7 +167,9 @@ fn main() {
     };
 
     let file_size_mb = if Path::new(&target).exists() {
-        fs::metadata(&target).ok().map(|m| m.len() as f64 / (1024.0 * 1024.0))
+        fs::metadata(&target)
+            .ok()
+            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
     } else {
         None
     };
@@ -221,26 +225,44 @@ fn main() {
         });
         println!("{}", serde_json::to_string_pretty(&json_data).unwrap());
     } else {
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("raster_h3 GeoTIFF / COG Inspector");
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         if let Some(mb) = file_size_mb {
-            println!("Source:        {} ({}, {:.2} MB)", target, source_type_str, mb);
+            println!(
+                "Source:        {} ({}, {:.2} MB)",
+                target, source_type_str, mb
+            );
         } else {
             println!("Source:        {} ({})", target, source_type_str);
         }
-        println!("Dimensions:    {} x {} pixels ({} band{})",
-            meta.width, meta.height, meta.samples_per_pixel,
-            if meta.samples_per_pixel > 1 { "s" } else { "" });
-        println!("Chunk Layout:  {} x {} px ({} x {} = {} total chunks)",
-            chunk.chunk_width, chunk.chunk_height,
-            chunk.chunks_across, chunk.chunks_down, chunk.total_chunks);
+        println!(
+            "Dimensions:    {} x {} pixels ({} band{})",
+            meta.width,
+            meta.height,
+            meta.samples_per_pixel,
+            if meta.samples_per_pixel > 1 { "s" } else { "" }
+        );
+        println!(
+            "Chunk Layout:  {} x {} px ({} x {} = {} total chunks)",
+            chunk.chunk_width,
+            chunk.chunk_height,
+            chunk.chunks_across,
+            chunk.chunks_down,
+            chunk.total_chunks
+        );
         if let Some(nd) = meta.nodata {
             println!("NoData Value:  {}", nd);
         } else {
             println!("NoData Value:  None");
         }
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!("Spatial Reference:");
         println!("  EPSG:        {:?}", meta.epsg);
         if let Some(ref proj) = meta.proj_string {
@@ -251,30 +273,43 @@ fn main() {
         }
         println!("  Origin:      ({:.6}, {:.6})", gt.c0, gt.f0);
         println!("  Pixel Size:  {:.6} x {:.6}", gt.a.abs(), gt.e.abs());
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!("Extents:");
-        println!("  Projected:   X: [{:.3}, {:.3}], Y: [{:.3}, {:.3}]",
-            proj_min_x, proj_max_x, proj_min_y, proj_max_y);
+        println!(
+            "  Projected:   X: [{:.3}, {:.3}], Y: [{:.3}, {:.3}]",
+            proj_min_x, proj_max_x, proj_min_y, proj_max_y
+        );
         if let Some([min_lon, min_lat, max_lon, max_lat]) = wgs84_bounds {
-            println!("  WGS84 Bounds: [{:.6}, {:.6}, {:.6}, {:.6}]", min_lon, min_lat, max_lon, max_lat);
+            println!(
+                "  WGS84 Bounds: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                min_lon, min_lat, max_lon, max_lat
+            );
         }
         if let Some((c_lat, c_lon)) = center_wgs84 {
             println!("  Center:      (lat: {:.6}°, lon: {:.6}°)", c_lat, c_lon);
         }
         if let Some((hex, u, c_lat, c_lon)) = center_h3 {
-            println!("--------------------------------------------------------------------------------");
+            println!(
+                "--------------------------------------------------------------------------------"
+            );
             println!("H3 Cell at Center (Resolution {}):", h3_res_u8);
             println!("  Cell Hex:    {}", hex);
             println!("  Cell Index:  {}", u);
             println!("  Cell Center: (lat: {:.6}°, lon: {:.6}°)", c_lat, c_lon);
         }
         if let Some((q_lat, q_lon)) = point_query {
-            println!("--------------------------------------------------------------------------------");
+            println!(
+                "--------------------------------------------------------------------------------"
+            );
             println!("Point Query (lat: {:.6}°, lon: {:.6}°):", q_lat, q_lon);
             if let Some(Some((hex, u))) = point_result {
                 println!("  H3 Res {}:    {} ({})", h3_res_u8, hex, u);
             }
         }
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
     }
 }

@@ -13,8 +13,12 @@ use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("=========================================================================================");
-    println!("          USFS BURN PROBABILITY: MULTI-TILE MOSAIC VERIFICATION & BENCHMARK              ");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "          USFS BURN PROBABILITY: MULTI-TILE MOSAIC VERIFICATION & BENCHMARK              "
+    );
     println!("=========================================================================================\n");
 
     let source_pattern = "data/burn_probability_mosaic/*.tif";
@@ -31,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Found {} GeoTIFF tile(s) in mosaic:", paths.len());
     for (i, p) in paths.iter().enumerate() {
         if let Ok(reader) = raster_h3::raster::geotiff::GeoTiffStreamReader::open(p) {
-            let (c0, f0) = (reader.metadata.geotransform.c0, reader.metadata.geotransform.f0);
+            let (c0, f0) = (
+                reader.metadata.geotransform.c0,
+                reader.metadata.geotransform.f0,
+            );
             println!(
                 "  [{}] {:?} | {}x{} px | Chunks: {} ({}x{}) | Origin: ({:.4}, {:.4})",
                 i,
@@ -50,18 +57,29 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Open MosaicReader with Voronoi Cutline rule
     println!("\n[Step 1] Initializing MosaicReader with Voronoi Cutline rule...");
     let t0 = Instant::now();
-    let mosaic = Arc::new(MosaicReader::open(&paths, None, None, OverlapRule::Cutline)?);
+    let mosaic = Arc::new(MosaicReader::open(
+        &paths,
+        None,
+        None,
+        OverlapRule::Cutline,
+    )?);
     let dur_mosaic_open = t0.elapsed();
 
     println!("  - Mosaic Tiles Count  : {}", mosaic.tiles.len());
-    println!("  - Combined BBox WGS84 : [{:.4}, {:.4}, {:.4}, {:.4}]",
-        mosaic.mosaic_bounds_wgs84[0], mosaic.mosaic_bounds_wgs84[1],
-        mosaic.mosaic_bounds_wgs84[2], mosaic.mosaic_bounds_wgs84[3]);
+    println!(
+        "  - Combined BBox WGS84 : [{:.4}, {:.4}, {:.4}, {:.4}]",
+        mosaic.mosaic_bounds_wgs84[0],
+        mosaic.mosaic_bounds_wgs84[1],
+        mosaic.mosaic_bounds_wgs84[2],
+        mosaic.mosaic_bounds_wgs84[3]
+    );
     println!("  - Total Interleaved Chunks : {}", mosaic.chunk_refs.len());
     println!("  - Open Duration       : {:.2?}", dur_mosaic_open);
 
     // Step 2: Streaming Multi-Resolution Aggregation (Res 7, 8, 9)
-    println!("\n[Step 2] Streaming Mosaic Aggregation via MultiScanHorizonStreamer (Res 7, 8, 9)...");
+    println!(
+        "\n[Step 2] Streaming Mosaic Aggregation via MultiScanHorizonStreamer (Res 7, 8, 9)..."
+    );
     let mut config = MultiResolutionConfig::new(vec![7, 8, 9]);
     config.overlap_rule = OverlapRule::Cutline;
 
@@ -95,8 +113,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dur_stream = t_stream.elapsed();
 
     println!("  - Mosaic Stream Time  : {:.2?}", dur_stream);
-    println!("  - Throughput          : {:.2} Mpix/s",
-        (pixel_count_by_res[8] / 1_000_000.0) / dur_stream.as_secs_f64());
+    println!(
+        "  - Throughput          : {:.2} Mpix/s",
+        (pixel_count_by_res[8] / 1_000_000.0) / dur_stream.as_secs_f64()
+    );
 
     println!("\n  Aggregated Multi-Resolution Hexagon Results:");
     for res in [7, 8, 9] {
@@ -111,18 +131,36 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Conservation check: all resolutions must cover the exact same total pixel volume
-    assert!(hex_count_by_res[7] > 0, "Resolution 7 should yield hexagons");
-    assert!(hex_count_by_res[8] > hex_count_by_res[7], "Res 8 count must exceed Res 7");
-    assert!(hex_count_by_res[9] > hex_count_by_res[8], "Res 9 count must exceed Res 8");
+    assert!(
+        hex_count_by_res[7] > 0,
+        "Resolution 7 should yield hexagons"
+    );
+    assert!(
+        hex_count_by_res[8] > hex_count_by_res[7],
+        "Res 8 count must exceed Res 7"
+    );
+    assert!(
+        hex_count_by_res[9] > hex_count_by_res[8],
+        "Res 9 count must exceed Res 8"
+    );
 
     let diff_7_8 = (pixel_count_by_res[7] - pixel_count_by_res[8]).abs();
     let diff_8_9 = (pixel_count_by_res[8] - pixel_count_by_res[9]).abs();
     println!("\n  Seam Conservation Check:");
-    println!("    - Res 7 vs Res 8 Pixel Delta: {:.1} pixels ({:.4}%)",
-        diff_7_8, (diff_7_8 / pixel_count_by_res[8]) * 100.0);
-    println!("    - Res 8 vs Res 9 Pixel Delta: {:.1} pixels ({:.4}%)",
-        diff_8_9, (diff_8_9 / pixel_count_by_res[8]) * 100.0);
-    assert!(diff_8_9 < 100.0, "Multi-resolution pixel conservation failed across tile seams!");
+    println!(
+        "    - Res 7 vs Res 8 Pixel Delta: {:.1} pixels ({:.4}%)",
+        diff_7_8,
+        (diff_7_8 / pixel_count_by_res[8]) * 100.0
+    );
+    println!(
+        "    - Res 8 vs Res 9 Pixel Delta: {:.1} pixels ({:.4}%)",
+        diff_8_9,
+        (diff_8_9 / pixel_count_by_res[8]) * 100.0
+    );
+    assert!(
+        diff_8_9 < 100.0,
+        "Multi-resolution pixel conservation failed across tile seams!"
+    );
 
     // Step 3: End-to-End PMTiles Generation directly from Mosaic Source
     println!("\n[Step 3] Exporting Multi-Resolution PMTiles v3 Archive directly from Mosaic...");
@@ -130,11 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pmtiles_config = MultiResolutionConfig::new(vec![7, 8, 9]);
 
     let t_pmtiles = Instant::now();
-    let total_pmtiles_hexes = H3PmtilesTiler::process_geotiff_to_pmtiles(
-        source_pattern,
-        pmtiles_output,
-        pmtiles_config,
-    )?;
+    let total_pmtiles_hexes =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(source_pattern, pmtiles_output, pmtiles_config)?;
     let dur_pmtiles = t_pmtiles.elapsed();
 
     let pmtiles_file = File::open(pmtiles_output)?;
@@ -145,7 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("  - PMTiles Generation Time  : {:.2?}", dur_pmtiles);
 
     println!("\n=========================================================================================");
-    println!("                ALL MOSAIC VERIFICATION TESTS PASSED SUCCESSFULLY!                       ");
+    println!(
+        "                ALL MOSAIC VERIFICATION TESTS PASSED SUCCESSFULLY!                       "
+    );
     println!("=========================================================================================\n");
 
     Ok(())

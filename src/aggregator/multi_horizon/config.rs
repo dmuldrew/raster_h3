@@ -8,19 +8,52 @@ use crate::raster::mosaic::OverlapRule;
 /// Supported on-the-fly spectral index formulas
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpectralFormula {
-    Ndvi { nir_band: usize, red_band: usize },
-    Ndwi { green_band: usize, nir_band: usize },
-    Nbr { nir_band: usize, swir_band: usize },
-    Evi { nir_band: usize, red_band: usize, blue_band: usize },
+    Ndvi {
+        nir_band: usize,
+        red_band: usize,
+    },
+    Ndwi {
+        green_band: usize,
+        nir_band: usize,
+    },
+    Nbr {
+        nir_band: usize,
+        swir_band: usize,
+    },
+    Evi {
+        nir_band: usize,
+        red_band: usize,
+        blue_band: usize,
+    },
 }
 
 impl SpectralFormula {
-    pub fn parse(name: &str, nir: usize, red: usize, green: usize, blue: usize, swir: usize) -> Option<Self> {
+    pub fn parse(
+        name: &str,
+        nir: usize,
+        red: usize,
+        green: usize,
+        blue: usize,
+        swir: usize,
+    ) -> Option<Self> {
         match name.to_lowercase().trim() {
-            "ndvi" => Some(Self::Ndvi { nir_band: nir, red_band: red }),
-            "ndwi" => Some(Self::Ndwi { green_band: green, nir_band: nir }),
-            "nbr" => Some(Self::Nbr { nir_band: nir, swir_band: swir }),
-            "evi" => Some(Self::Evi { nir_band: nir, red_band: red, blue_band: blue }),
+            "ndvi" => Some(Self::Ndvi {
+                nir_band: nir,
+                red_band: red,
+            }),
+            "ndwi" => Some(Self::Ndwi {
+                green_band: green,
+                nir_band: nir,
+            }),
+            "nbr" => Some(Self::Nbr {
+                nir_band: nir,
+                swir_band: swir,
+            }),
+            "evi" => Some(Self::Evi {
+                nir_band: nir,
+                red_band: red,
+                blue_band: blue,
+            }),
             _ => None,
         }
     }
@@ -274,30 +307,49 @@ mod tests {
     fn test_spectral_formula_parsing() {
         assert_eq!(
             SpectralFormula::parse("ndvi", 4, 3, 2, 1, 5),
-            Some(SpectralFormula::Ndvi { nir_band: 4, red_band: 3 })
+            Some(SpectralFormula::Ndvi {
+                nir_band: 4,
+                red_band: 3
+            })
         );
         assert_eq!(
             SpectralFormula::parse("  NDVI  ", 4, 3, 2, 1, 5),
-            Some(SpectralFormula::Ndvi { nir_band: 4, red_band: 3 })
+            Some(SpectralFormula::Ndvi {
+                nir_band: 4,
+                red_band: 3
+            })
         );
         assert_eq!(
             SpectralFormula::parse("ndwi", 4, 3, 2, 1, 5),
-            Some(SpectralFormula::Ndwi { green_band: 2, nir_band: 4 })
+            Some(SpectralFormula::Ndwi {
+                green_band: 2,
+                nir_band: 4
+            })
         );
         assert_eq!(
             SpectralFormula::parse("nbr", 4, 3, 2, 1, 5),
-            Some(SpectralFormula::Nbr { nir_band: 4, swir_band: 5 })
+            Some(SpectralFormula::Nbr {
+                nir_band: 4,
+                swir_band: 5
+            })
         );
         assert_eq!(
             SpectralFormula::parse("evi", 4, 3, 2, 1, 5),
-            Some(SpectralFormula::Evi { nir_band: 4, red_band: 3, blue_band: 1 })
+            Some(SpectralFormula::Evi {
+                nir_band: 4,
+                red_band: 3,
+                blue_band: 1
+            })
         );
         assert_eq!(SpectralFormula::parse("invalid", 4, 3, 2, 1, 5), None);
     }
 
     #[test]
     fn test_spectral_formula_ndvi_computation_and_edge_cases() {
-        let formula = SpectralFormula::Ndvi { nir_band: 4, red_band: 3 };
+        let formula = SpectralFormula::Ndvi {
+            nir_band: 4,
+            red_band: 3,
+        };
 
         // 1. Standard positive vegetation
         let ndvi = formula.compute(0.8, 0.2, 0.0, 0.0, 0.0).unwrap();
@@ -316,7 +368,10 @@ mod tests {
 
     #[test]
     fn test_spectral_formula_ndwi_computation_and_edge_cases() {
-        let formula = SpectralFormula::Ndwi { green_band: 2, nir_band: 4 };
+        let formula = SpectralFormula::Ndwi {
+            green_band: 2,
+            nir_band: 4,
+        };
 
         // 1. Standard water body
         let ndwi = formula.compute(0.1, 0.0, 0.4, 0.0, 0.0).unwrap();
@@ -332,7 +387,10 @@ mod tests {
 
     #[test]
     fn test_spectral_formula_nbr_computation_and_edge_cases() {
-        let formula = SpectralFormula::Nbr { nir_band: 4, swir_band: 5 };
+        let formula = SpectralFormula::Nbr {
+            nir_band: 4,
+            swir_band: 5,
+        };
 
         // 1. Healthy forest (high NIR, low SWIR)
         let nbr_healthy = formula.compute(0.7, 0.0, 0.0, 0.0, 0.2).unwrap();
@@ -348,7 +406,11 @@ mod tests {
 
     #[test]
     fn test_spectral_formula_evi_computation_and_edge_cases() {
-        let formula = SpectralFormula::Evi { nir_band: 4, red_band: 3, blue_band: 1 };
+        let formula = SpectralFormula::Evi {
+            nir_band: 4,
+            red_band: 3,
+            blue_band: 1,
+        };
 
         // 1. Standard EVI calculation: 2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1)
         // NIR = 0.5, Red = 0.1, Blue = 0.05

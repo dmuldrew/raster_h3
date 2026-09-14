@@ -1,7 +1,7 @@
+use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{Read, Write};
 use tempfile::tempdir;
-use flate2::read::GzDecoder;
 
 #[test]
 fn test_duckdb_extension_footer_layout() {
@@ -38,7 +38,10 @@ fn test_duckdb_extension_footer_layout() {
     assert!(dummy_ext_path.exists());
 
     let mut ext_bytes = Vec::new();
-    File::open(&dummy_ext_path).unwrap().read_to_end(&mut ext_bytes).unwrap();
+    File::open(&dummy_ext_path)
+        .unwrap()
+        .read_to_end(&mut ext_bytes)
+        .unwrap();
     assert_eq!(ext_bytes.len(), 1024 + 534);
 
     // Verify original payload is intact

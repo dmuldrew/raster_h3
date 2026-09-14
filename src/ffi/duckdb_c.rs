@@ -88,8 +88,11 @@ impl Default for duckdb_result {
 
 #[repr(C)]
 pub struct duckdb_extension_access {
-    pub get_api: Option<unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *mut c_void>,
-    pub get_database: Option<unsafe extern "C" fn(info: duckdb_extension_info) -> *mut duckdb_database>,
+    pub get_api: Option<
+        unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *mut c_void,
+    >,
+    pub get_database:
+        Option<unsafe extern "C" fn(info: duckdb_extension_info) -> *mut duckdb_database>,
     pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
 }
 
@@ -138,17 +141,23 @@ impl duckdb_string_t {
     }
 }
 
-
 pub type duckdb_table_function_bind_t = unsafe extern "C" fn(info: duckdb_bind_info);
 pub type duckdb_table_function_init_t = unsafe extern "C" fn(info: duckdb_init_info);
-pub type duckdb_table_function_t = unsafe extern "C" fn(info: duckdb_function_info, output: duckdb_data_chunk);
-pub type duckdb_scalar_function_t =
-    unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector);
+pub type duckdb_table_function_t =
+    unsafe extern "C" fn(info: duckdb_function_info, output: duckdb_data_chunk);
+pub type duckdb_scalar_function_t = unsafe extern "C" fn(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+);
 pub type duckdb_delete_callback_t = unsafe extern "C" fn(data: *mut c_void);
 
 #[cfg_attr(windows, link(name = "duckdb"))]
 extern "C" {
-    pub fn duckdb_connect(database: duckdb_database, out_connection: *mut duckdb_connection) -> DuckDBState;
+    pub fn duckdb_connect(
+        database: duckdb_database,
+        out_connection: *mut duckdb_connection,
+    ) -> DuckDBState;
     pub fn duckdb_disconnect(connection: *mut duckdb_connection);
 
     // Logical types
@@ -160,15 +169,27 @@ extern "C" {
     // Table functions
     pub fn duckdb_create_table_function() -> duckdb_table_function;
     pub fn duckdb_destroy_table_function(table_function: *mut duckdb_table_function);
-    pub fn duckdb_table_function_set_name(table_function: duckdb_table_function, name: *const c_char);
-    pub fn duckdb_table_function_add_parameter(table_function: duckdb_table_function, type_: duckdb_logical_type);
+    pub fn duckdb_table_function_set_name(
+        table_function: duckdb_table_function,
+        name: *const c_char,
+    );
+    pub fn duckdb_table_function_add_parameter(
+        table_function: duckdb_table_function,
+        type_: duckdb_logical_type,
+    );
     pub fn duckdb_table_function_add_named_parameter(
         table_function: duckdb_table_function,
         name: *const c_char,
         type_: duckdb_logical_type,
     );
-    pub fn duckdb_table_function_set_bind(table_function: duckdb_table_function, bind: duckdb_table_function_bind_t);
-    pub fn duckdb_table_function_set_init(table_function: duckdb_table_function, init: duckdb_table_function_init_t);
+    pub fn duckdb_table_function_set_bind(
+        table_function: duckdb_table_function,
+        bind: duckdb_table_function_bind_t,
+    );
+    pub fn duckdb_table_function_set_init(
+        table_function: duckdb_table_function,
+        init: duckdb_table_function_init_t,
+    );
     pub fn duckdb_table_function_set_local_init(
         table_function: duckdb_table_function,
         init_local: duckdb_table_function_init_t,
@@ -189,7 +210,10 @@ extern "C" {
     // Bind info
     pub fn duckdb_bind_get_parameter_count(info: duckdb_bind_info) -> idx_t;
     pub fn duckdb_bind_get_parameter(info: duckdb_bind_info, index: idx_t) -> duckdb_value;
-    pub fn duckdb_bind_get_named_parameter(info: duckdb_bind_info, name: *const c_char) -> duckdb_value;
+    pub fn duckdb_bind_get_named_parameter(
+        info: duckdb_bind_info,
+        name: *const c_char,
+    ) -> duckdb_value;
     pub fn duckdb_bind_add_result_column(
         info: duckdb_bind_info,
         name: *const c_char,
@@ -228,7 +252,11 @@ extern "C" {
     pub fn duckdb_data_chunk_get_size(chunk: duckdb_data_chunk) -> idx_t;
     pub fn duckdb_data_chunk_set_size(chunk: duckdb_data_chunk, size: idx_t);
     pub fn duckdb_vector_get_data(vector: duckdb_vector) -> *mut c_void;
-    pub fn duckdb_vector_assign_string_element(vector: duckdb_vector, index: idx_t, str: *const c_char);
+    pub fn duckdb_vector_assign_string_element(
+        vector: duckdb_vector,
+        index: idx_t,
+        str: *const c_char,
+    );
     pub fn duckdb_vector_assign_string_element_len(
         vector: duckdb_vector,
         index: idx_t,
@@ -248,7 +276,10 @@ extern "C" {
     // Scalar functions
     pub fn duckdb_create_scalar_function() -> duckdb_scalar_function;
     pub fn duckdb_destroy_scalar_function(scalar_function: *mut duckdb_scalar_function);
-    pub fn duckdb_scalar_function_set_name(scalar_function: duckdb_scalar_function, name: *const c_char);
+    pub fn duckdb_scalar_function_set_name(
+        scalar_function: duckdb_scalar_function,
+        name: *const c_char,
+    );
     pub fn duckdb_scalar_function_add_parameter(
         scalar_function: duckdb_scalar_function,
         type_: duckdb_logical_type,
@@ -318,7 +349,10 @@ mod tests {
                 },
             };
             assert_eq!(unsafe { s.length() }, len as u32);
-            assert_eq!(unsafe { s.as_str() }, std::str::from_utf8(&raw[..len]).unwrap());
+            assert_eq!(
+                unsafe { s.as_str() },
+                std::str::from_utf8(&raw[..len]).unwrap()
+            );
         }
 
         // 3. Length 13 (first pointer length, just above 12-byte inlined boundary)
@@ -380,7 +414,9 @@ mod tests {
         assert_eq!(unsafe { s_invalid_inline.as_str() }, "");
 
         // 3. Pointer string with invalid UTF-8 bytes
-        let invalid_bytes = [0xFFu8, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8, 0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0];
+        let invalid_bytes = [
+            0xFFu8, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8, 0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0,
+        ];
         let s_invalid_ptr = duckdb_string_t {
             pointer: DuckDbStringPointer {
                 length: 13,
@@ -414,7 +450,10 @@ mod tests {
         unsafe {
             crate::functions::bind_utils::delete_boxed::<DropTracker>(raw_ptr);
         }
-        assert!(flag.load(Ordering::SeqCst), "delete_boxed must invoke Drop and reclaim memory");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "delete_boxed must invoke Drop and reclaim memory"
+        );
 
         // 2. Verify delete_boxed handles null pointer safely without panic
         unsafe {

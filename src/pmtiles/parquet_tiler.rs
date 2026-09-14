@@ -4,21 +4,19 @@
 //! multi-zoom PMTiles v3 vector hexagon archive with streaming latitude
 //! horizon eviction to maintain a bounded memory footprint.
 
-use std::borrow::Cow;
-use std::fs::File;
-use std::path::Path;
 use h3o::{CellIndex, LatLng};
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use serde_json::json;
+use std::borrow::Cow;
+use std::fs::File;
+use std::path::Path;
 
 use crate::functions::fast_hex::parse_hex_u64;
 use crate::pmtiles::features::{
     build_pmtiles_metadata, PmtilesExportSummary, TilePyramidAccumulator,
 };
 use crate::pmtiles::mvt::{MercatorPoint, MvtValue};
-use crate::pmtiles::pyramid::{
-    cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg,
-};
+use crate::pmtiles::pyramid::{cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg};
 use crate::pmtiles::writer::PmtilesWriter;
 
 /// Extent and statistics for a Parquet row group discovered during pre-scan
@@ -59,15 +57,29 @@ pub fn scan_row_group_h3_extent(
             let center: LatLng = cell.into();
             let lat = center.lat();
             let lon = center.lng();
-            if lat < min_lat { min_lat = lat; }
-            if lat > max_lat { max_lat = lat; }
-            if lon < min_lon { min_lon = lon; }
-            if lon > max_lon { max_lon = lon; }
+            if lat < min_lat {
+                min_lat = lat;
+            }
+            if lat > max_lat {
+                max_lat = lat;
+            }
+            if lon < min_lon {
+                min_lon = lon;
+            }
+            if lon > max_lon {
+                max_lon = lon;
+            }
             let res: u8 = cell.resolution().into();
-            if res < min_res { min_res = res; }
+            if res < min_res {
+                min_res = res;
+            }
             let zoom = h3_res_to_zoom(res);
-            if zoom < min_zoom { min_zoom = zoom; }
-            if zoom > max_zoom { max_zoom = zoom; }
+            if zoom < min_zoom {
+                min_zoom = zoom;
+            }
+            if zoom > max_zoom {
+                max_zoom = zoom;
+            }
             count += 1;
         }
     };
@@ -78,7 +90,9 @@ pub fn scan_row_group_h3_extent(
             loop {
                 vals.clear();
                 let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
-                if read == 0 { break; }
+                if read == 0 {
+                    break;
+                }
                 for &v in &vals {
                     process_h3(v as u64);
                 }
@@ -89,7 +103,9 @@ pub fn scan_row_group_h3_extent(
             loop {
                 vals.clear();
                 let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
-                if read == 0 { break; }
+                if read == 0 {
+                    break;
+                }
                 for &v in &vals {
                     process_h3(v as u64);
                 }
@@ -100,7 +116,9 @@ pub fn scan_row_group_h3_extent(
             loop {
                 vals.clear();
                 let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
-                if read == 0 { break; }
+                if read == 0 {
+                    break;
+                }
                 for v in &vals {
                     if let Ok(s) = std::str::from_utf8(v.data()) {
                         if let Some(h3) = parse_hex_u64(s) {
@@ -115,7 +133,9 @@ pub fn scan_row_group_h3_extent(
             loop {
                 vals.clear();
                 let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
-                if read == 0 { break; }
+                if read == 0 {
+                    break;
+                }
                 for v in &vals {
                     if let Ok(s) = std::str::from_utf8(v.data()) {
                         if let Some(h3) = parse_hex_u64(s) {
@@ -170,7 +190,12 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         // Auto-detect common H3 column names: h3_index, h3_hex, h3, cell, hex, or column 0
         for (idx, field) in schema.columns().iter().enumerate() {
             let name = field.name().to_ascii_lowercase();
-            if name == "h3_index" || name == "h3_hex" || name == "h3" || name == "cell" || name == "hex" {
+            if name == "h3_index"
+                || name == "h3_hex"
+                || name == "h3"
+                || name == "cell"
+                || name == "hex"
+            {
                 h3_col_idx = Some(idx);
                 break;
             }
@@ -201,12 +226,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
             json!({}),
             None,
         );
-        let writer = PmtilesWriter::new(
-            0,
-            0,
-            [-180.0, -85.0, 180.0, 85.0],
-            metadata.to_string(),
-        )?;
+        let writer = PmtilesWriter::new(0, 0, [-180.0, -85.0, 180.0, 85.0], metadata.to_string())?;
         writer.finish(pmtiles_path)?;
         return Ok(PmtilesExportSummary {
             total_features: 0,
@@ -218,10 +238,19 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         });
     }
 
-    let global_min_lon = rg_extents.iter().map(|e| e.min_lon).fold(180.0f64, f64::min);
+    let global_min_lon = rg_extents
+        .iter()
+        .map(|e| e.min_lon)
+        .fold(180.0f64, f64::min);
     let global_min_lat = rg_extents.iter().map(|e| e.min_lat).fold(90.0f64, f64::min);
-    let global_max_lon = rg_extents.iter().map(|e| e.max_lon).fold(-180.0f64, f64::max);
-    let global_max_lat = rg_extents.iter().map(|e| e.max_lat).fold(-90.0f64, f64::max);
+    let global_max_lon = rg_extents
+        .iter()
+        .map(|e| e.max_lon)
+        .fold(-180.0f64, f64::max);
+    let global_max_lat = rg_extents
+        .iter()
+        .map(|e| e.max_lat)
+        .fold(-90.0f64, f64::max);
     let min_zoom = rg_extents.iter().map(|e| e.min_zoom).min().unwrap_or(0);
     let max_zoom = rg_extents.iter().map(|e| e.max_zoom).max().unwrap_or(0);
     let min_res = rg_extents.iter().map(|e| e.min_res).min().unwrap_or(0);
@@ -247,11 +276,17 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
     fields_map.insert("h3_hex".to_string(), json!("String"));
     fields_map.insert("resolution".to_string(), json!("Number"));
     for (idx, col) in schema.columns().iter().enumerate() {
-        if idx == h3_idx { continue; }
+        if idx == h3_idx {
+            continue;
+        }
         let type_str = match col.physical_type() {
-            parquet::basic::Type::INT32 | parquet::basic::Type::INT64 | parquet::basic::Type::INT96 => "Number",
+            parquet::basic::Type::INT32
+            | parquet::basic::Type::INT64
+            | parquet::basic::Type::INT96 => "Number",
             parquet::basic::Type::FLOAT | parquet::basic::Type::DOUBLE => "Number",
-            parquet::basic::Type::BYTE_ARRAY | parquet::basic::Type::FIXED_LEN_BYTE_ARRAY => "String",
+            parquet::basic::Type::BYTE_ARRAY | parquet::basic::Type::FIXED_LEN_BYTE_ARRAY => {
+                "String"
+            }
             parquet::basic::Type::BOOLEAN => "Boolean",
         };
         fields_map.insert(col.name().to_string(), json!(type_str));
@@ -271,7 +306,12 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
     let mut writer = PmtilesWriter::new(
         min_zoom,
         max_zoom,
-        [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
+        [
+            global_min_lon,
+            global_min_lat,
+            global_max_lon,
+            global_max_lat,
+        ],
         metadata.to_string(),
     )?;
 
@@ -382,13 +422,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
                 properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));
             }
 
-            accumulator.add_hexagon_mercator(
-                h3_u64,
-                center_merc,
-                vertices_merc,
-                zoom,
-                properties,
-            );
+            accumulator.add_hexagon_mercator(h3_u64, center_merc, vertices_merc, zoom, properties);
         }
 
         // Streaming Horizon Eviction: Evict and compress all tiles completed prior to the remaining horizon

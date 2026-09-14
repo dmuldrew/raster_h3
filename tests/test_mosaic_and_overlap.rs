@@ -8,9 +8,7 @@ use helpers::create_constant_gray8_geotiff as create_test_geotiff;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
-use raster_h3::raster::mosaic::{
-    glob_match, resolve_raster_sources, MosaicReader, OverlapRule,
-};
+use raster_h3::raster::mosaic::{glob_match, resolve_raster_sources, MosaicReader, OverlapRule};
 use raster_h3::raster::prefetch::PrefetchedMosaicReader;
 use tiff::decoder::DecodingResult;
 
@@ -62,7 +60,9 @@ fn test_resolve_sources_glob() {
     let glob_pat = format!("{}/alpha_*.tif", temp_dir.display());
     let resolved = resolve_raster_sources(&glob_pat).expect("resolve glob");
     assert_eq!(resolved.len(), 2);
-    assert!(resolved.iter().all(|p| p.to_string_lossy().contains("alpha_")));
+    assert!(resolved
+        .iter()
+        .all(|p| p.to_string_lossy().contains("alpha_")));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -91,7 +91,9 @@ fn test_resolve_sources_vrt_xml() {
 </VRTDataset>"#
     );
     let mut vrt_file = File::create(&vrt_path).expect("create vrt");
-    vrt_file.write_all(vrt_content.as_bytes()).expect("write vrt");
+    vrt_file
+        .write_all(vrt_content.as_bytes())
+        .expect("write vrt");
 
     let resolved = resolve_raster_sources(&vrt_path.to_string_lossy()).expect("resolve vrt");
     assert_eq!(resolved.len(), 2);
@@ -171,7 +173,10 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         // Combined span: [-122.45, -122.39] = 60 pixels wide by 40 tall = 2400 unique ground pixels
-        assert_eq!(total_pixels as u64, 2400, "Cutline must not double-count pixels");
+        assert_eq!(
+            total_pixels as u64, 2400,
+            "Cutline must not double-count pixels"
+        );
     }
 
     // 2. First (Painter's algorithm: Tile 1 takes precedence in overlap)
@@ -186,7 +191,10 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         let records = streamer.fetch_next_batch(100_000);
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
-        assert_eq!(total_pixels as u64, 2400, "First must not double-count pixels");
+        assert_eq!(
+            total_pixels as u64, 2400,
+            "First must not double-count pixels"
+        );
     }
 
     // 3. Average (Accumulate all overlapping observations)
@@ -196,13 +204,15 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         );
         let mut config = MultiResolutionConfig::new(vec![9]);
         config.overlap_rule = OverlapRule::Average;
-        let mut streamer =
-            MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init avg");
+        let mut streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init avg");
         let records = streamer.fetch_next_batch(100_000);
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         // 40*40 + 40*40 = 3200 accumulated observations
-        assert_eq!(total_pixels as u64, 3200, "Average must accumulate both observations in overlap");
+        assert_eq!(
+            total_pixels as u64, 3200,
+            "Average must accumulate both observations in overlap"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -229,7 +239,10 @@ fn test_categorical_mosaic_with_overlap() {
         MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config).expect("init cat streamer");
 
     let records = streamer.fetch_next_batch(10_000);
-    assert!(!records.is_empty(), "Categorical mosaic should yield records");
+    assert!(
+        !records.is_empty(),
+        "Categorical mosaic should yield records"
+    );
 
     let total_count: f64 = records.iter().map(|r| r.accumulator.total_count).sum();
     // 50 x 30 = 1500 unique pixels
@@ -264,14 +277,28 @@ fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
 
     let mut received_chunks = 0;
     for job_id in 0..total_jobs {
-        let item = prefetcher.next_chunk().expect("Expected chunk from prefetcher");
+        let item = prefetcher
+            .next_chunk()
+            .expect("Expected chunk from prefetcher");
         let (tile_idx, chunk_idx, bounds, data, has_overlap) = item.expect("Chunk decoding failed");
 
         // Verify sequential job ordering invariants
         let expected_ref = mosaic.chunk_refs[job_id];
-        assert_eq!(tile_idx, expected_ref.tile_idx, "tile_idx mismatch at job {}", job_id);
-        assert_eq!(chunk_idx, expected_ref.chunk_idx, "chunk_idx mismatch at job {}", job_id);
-        assert_eq!(has_overlap, expected_ref.has_overlap, "has_overlap mismatch at job {}", job_id);
+        assert_eq!(
+            tile_idx, expected_ref.tile_idx,
+            "tile_idx mismatch at job {}",
+            job_id
+        );
+        assert_eq!(
+            chunk_idx, expected_ref.chunk_idx,
+            "chunk_idx mismatch at job {}",
+            job_id
+        );
+        assert_eq!(
+            has_overlap, expected_ref.has_overlap,
+            "has_overlap mismatch at job {}",
+            job_id
+        );
         assert!(bounds.width > 0 && bounds.height > 0);
 
         // Verify pixel data content matches tile fill value
@@ -285,7 +312,10 @@ fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
         match data {
             DecodingResult::U8(ref pixels) => {
                 assert_eq!(pixels.len(), (bounds.width * bounds.height) as usize);
-                assert!(pixels.iter().all(|&p| p == expected_fill), "Pixel value corrupted");
+                assert!(
+                    pixels.iter().all(|&p| p == expected_fill),
+                    "Pixel value corrupted"
+                );
             }
             _ => panic!("Expected U8 decoding result"),
         }
@@ -296,7 +326,10 @@ fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
     }
 
     assert_eq!(received_chunks, total_jobs);
-    assert!(prefetcher.next_chunk().is_none(), "Queue should be empty after all chunks pulled");
+    assert!(
+        prefetcher.next_chunk().is_none(),
+        "Queue should be empty after all chunks pulled"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -327,4 +360,3 @@ fn test_prefetched_mosaic_reader_early_drop() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
-

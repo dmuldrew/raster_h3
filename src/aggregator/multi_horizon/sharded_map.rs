@@ -1,6 +1,6 @@
-use std::collections::{BinaryHeap, HashMap};
 use fxhash::FxBuildHasher;
 use rayon::prelude::*;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
@@ -50,7 +50,10 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         let mut eviction = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
-            shards.push(HashMap::with_capacity_and_hasher(128, FxBuildHasher::default()));
+            shards.push(HashMap::with_capacity_and_hasher(
+                128,
+                FxBuildHasher::default(),
+            ));
             eviction.push(BinaryHeap::with_capacity(128));
         }
         Self { shards, eviction }

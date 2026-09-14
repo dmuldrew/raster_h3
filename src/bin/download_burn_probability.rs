@@ -3,6 +3,7 @@
 //! Example usage:
 //!   cargo run --release --bin download_burn_probability -- --grid 2,2 --output-dir data/burn_probability_mosaic/
 
+use rayon::prelude::*;
 use std::env;
 use std::fs::{self, File};
 use std::io::{copy, BufWriter};
@@ -10,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use rayon::prelude::*;
 
 const BASE_URL: &str = "https://imagery.geoplatform.gov/iipp/rest/services/Fire_Aviation/USFS_EDW_RMRS_WRC_BurnProbability/ImageServer/exportImage";
 
@@ -34,7 +34,9 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --bbox <min_lon,min_lat,max_lon,max_lat>");
-    println!("                        Bounding box in WGS84 degrees (default: -121.5,39.0,-120.5,40.0)");
+    println!(
+        "                        Bounding box in WGS84 degrees (default: -121.5,39.0,-120.5,40.0)"
+    );
     println!("  --grid <cols,rows>    Tiling grid divisions (default: 2,2 -> 4 tiles)");
     println!("  --output-dir <path>   Directory to save GeoTIFF tiles (default: data/burn_probability_mosaic/)");
     println!("  --resolution <meters> Target pixel size in meters (default: 30.0)");
@@ -130,8 +132,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("===========================================================");
     println!("  USFS Burn Probability Tiled Mosaic Downloader");
     println!("===========================================================");
-    println!("  Bounding Box       : [{:.4}, {:.4}, {:.4}, {:.4}]", bbox[0], bbox[1], bbox[2], bbox[3]);
-    println!("  Tiling Grid        : {} columns x {} rows ({} tiles total)", cols, rows, cols * rows);
+    println!(
+        "  Bounding Box       : [{:.4}, {:.4}, {:.4}, {:.4}]",
+        bbox[0], bbox[1], bbox[2], bbox[3]
+    );
+    println!(
+        "  Tiling Grid        : {} columns x {} rows ({} tiles total)",
+        cols,
+        rows,
+        cols * rows
+    );
     println!("  Resolution (approx): {:.1} meters/pixel", resolution);
     println!("  Compression        : {}", compression);
     println!("  Output Directory   : {:?}", output_dir);

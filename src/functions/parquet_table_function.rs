@@ -52,7 +52,9 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
     let bind = BindHelper::new(info);
 
     if bind.parameter_count() < 2 {
-        bind.set_error("h3_raster_to_parquet requires at least 2 arguments: file_path and output_parquet");
+        bind.set_error(
+            "h3_raster_to_parquet requires at least 2 arguments: file_path and output_parquet",
+        );
         return;
     }
 
@@ -86,7 +88,10 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
     let custom_nodata = bind.get_named_double("nodata");
     let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
     let compact = bind.get_named_bool("compact").unwrap_or(true);
-    let geoparquet = bind.get_named_bool("geoparquet").or_else(|| bind.get_named_bool("geom")).unwrap_or(false);
+    let geoparquet = bind
+        .get_named_bool("geoparquet")
+        .or_else(|| bind.get_named_bool("geom"))
+        .unwrap_or(false);
 
     let mut compression = Compression::SNAPPY;
     if let Some(s) = bind.get_named_string("compression") {
@@ -100,7 +105,10 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
         }
     }
 
-    let row_group_size = bind.get_named_int("row_group_size").unwrap_or(131_072).max(1) as usize;
+    let row_group_size = bind
+        .get_named_int("row_group_size")
+        .unwrap_or(131_072)
+        .max(1) as usize;
     let bbox = bind.parse_bbox();
 
     // Declare output summary schema:
@@ -128,7 +136,11 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
         bbox,
         geoparquet,
     });
-    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<ParquetBindData>));
+    duckdb_bind_set_bind_data(
+        info,
+        Box::into_raw(bind_data) as *mut c_void,
+        Some(delete_boxed::<ParquetBindData>),
+    );
 }
 
 /// Init callback
@@ -136,7 +148,11 @@ pub unsafe extern "C" fn parquet_init(info: duckdb_init_info) {
     let global_data = Box::new(ParquetGlobalData {
         executed: AtomicBool::new(false),
     });
-    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_boxed::<ParquetGlobalData>));
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(global_data) as *mut c_void,
+        Some(delete_boxed::<ParquetGlobalData>),
+    );
 }
 
 /// Scan callback: runs GeoTIFF-to-Parquet conversion and streams the single summary row

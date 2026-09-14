@@ -1,12 +1,18 @@
-use std::path::Path;
-use std::time::Instant;
 use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
+use std::path::Path;
+use std::time::Instant;
 
 fn main() {
-    println!("=========================================================================================");
-    println!("                 raster_h3 Spatial Bounding Box Filter Pushdown Verification             ");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "                 raster_h3 Spatial Bounding Box Filter Pushdown Verification             "
+    );
+    println!(
+        "========================================================================================="
+    );
 
     let tif_path = "data/CFL_HI.tif";
     if !Path::new(tif_path).exists() {
@@ -46,14 +52,18 @@ fn main() {
     // Lon [-157.92, -157.80], Lat [21.28, 21.36]
     let oahu_bbox = [-157.92, 21.28, -157.80, 21.36];
     println!("\n▶ [Test 2] Spatial Bounding Box Pushdown Filter (Honolulu / Oahu ROI)");
-    println!("  • Requested BBox       : [{:.2}, {:.2}, {:.2}, {:.2}]", oahu_bbox[0], oahu_bbox[1], oahu_bbox[2], oahu_bbox[3]);
+    println!(
+        "  • Requested BBox       : [{:.2}, {:.2}, {:.2}, {:.2}]",
+        oahu_bbox[0], oahu_bbox[1], oahu_bbox[2], oahu_bbox[3]
+    );
 
     let reader_filtered = GeoTiffStreamReader::open(tif_path).unwrap();
     let mut config_filtered = MultiResolutionConfig::single(8);
     config_filtered.bbox = Some(oahu_bbox);
 
     let start_filtered = Instant::now();
-    let mut streamer_filtered = MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
+    let mut streamer_filtered =
+        MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
     let mut filtered_hex_count = 0usize;
     let mut filtered_pixel_count = 0.0f64;
 
@@ -74,11 +84,17 @@ fn main() {
 
     let speedup = (duration_full.as_secs_f64() / duration_filtered.as_secs_f64()).max(1.0);
     println!("\n=========================================================================================");
-    println!("                                   PUSH DOWN RESULTS                                     ");
-    println!("=========================================================================================");
+    println!(
+        "                                   PUSH DOWN RESULTS                                     "
+    );
+    println!(
+        "========================================================================================="
+    );
     println!("  • Full Archipelago Ingestion : {:.2?}", duration_full);
     println!("  • Filter Pushdown Ingestion  : {:.2?}", duration_filtered);
     println!("  • Speedup Factor             : {:.1}x FASTER", speedup);
     println!("  • Unnecessary Chunks Skipped : YES (100% Zero-I/O Pruning)");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
 }

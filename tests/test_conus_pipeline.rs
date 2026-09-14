@@ -54,7 +54,8 @@ fn test_conus_batch_and_evict_pipeline_simulation() {
     assert_eq!(tile_paths.len(), 4);
 
     // 2. Open MosaicReader across the tiles
-    let mosaic = Arc::new(MosaicReader::open(&tile_paths, None, None, OverlapRule::Cutline).unwrap());
+    let mosaic =
+        Arc::new(MosaicReader::open(&tile_paths, None, None, OverlapRule::Cutline).unwrap());
     assert_eq!(mosaic.chunk_refs.len(), 4);
 
     // 3. Configure multi-resolution streaming for H3 resolutions 8 and 9
@@ -64,7 +65,8 @@ fn test_conus_batch_and_evict_pipeline_simulation() {
 
     // 4. Test Parquet output with progress callback
     let out_parquet = output_dir.join("conus_bp_band_0.parquet");
-    let streamer_parquet = MultiScanHorizonStreamer::new_mosaic(Arc::clone(&mosaic), &config).unwrap();
+    let streamer_parquet =
+        MultiScanHorizonStreamer::new_mosaic(Arc::clone(&mosaic), &config).unwrap();
 
     let mut progress_invocations = 0usize;
     let mut last_progress_count = 0usize;
@@ -84,10 +86,14 @@ fn test_conus_batch_and_evict_pipeline_simulation() {
             progress_invocations += 1;
             last_progress_count = count;
         },
-    ).expect("write parquet");
+    )
+    .expect("write parquet");
 
     assert!(total_written > 0, "Should write hexagons to Parquet");
-    assert!(progress_invocations > 0, "Progress callback should be invoked");
+    assert!(
+        progress_invocations > 0,
+        "Progress callback should be invoked"
+    );
     assert_eq!(last_progress_count, total_written);
 
     // Verify Parquet file contents
@@ -98,27 +104,39 @@ fn test_conus_batch_and_evict_pipeline_simulation() {
 
     // 5. Test PMTiles output
     let out_pmtiles = output_dir.join("conus_bp_band_0.pmtiles");
-    let streamer_pmtiles = MultiScanHorizonStreamer::new_mosaic(Arc::clone(&mosaic), &config).unwrap();
-    let total_pmtiles_hex = H3PmtilesTiler::generate_from_continuous_streamer(
-        streamer_pmtiles,
-        &out_pmtiles,
-    ).expect("generate pmtiles");
+    let streamer_pmtiles =
+        MultiScanHorizonStreamer::new_mosaic(Arc::clone(&mosaic), &config).unwrap();
+    let total_pmtiles_hex =
+        H3PmtilesTiler::generate_from_continuous_streamer(streamer_pmtiles, &out_pmtiles)
+            .expect("generate pmtiles");
 
     assert_eq!(total_pmtiles_hex, total_written);
     assert!(out_pmtiles.exists());
     let mut pmtiles_bytes = [0u8; 7];
     let mut f = File::open(&out_pmtiles).unwrap();
     f.read_exact(&mut pmtiles_bytes).unwrap();
-    assert_eq!(&pmtiles_bytes, b"PMTiles", "PMTiles archive must start with PMTiles magic bytes");
+    assert_eq!(
+        &pmtiles_bytes, b"PMTiles",
+        "PMTiles archive must start with PMTiles magic bytes"
+    );
 
     // 6. Test Eviction of raw GeoTIFF files
     assert!(raw_staging_dir.exists());
     fs::remove_dir_all(&raw_staging_dir).expect("purge raw staging dir");
-    assert!(!raw_staging_dir.exists(), "Raw staging directory must be purged");
+    assert!(
+        !raw_staging_dir.exists(),
+        "Raw staging directory must be purged"
+    );
 
     // Outputs must still exist intact after raw eviction
-    assert!(out_parquet.exists(), "Parquet output must persist after eviction");
-    assert!(out_pmtiles.exists(), "PMTiles output must persist after eviction");
+    assert!(
+        out_parquet.exists(),
+        "Parquet output must persist after eviction"
+    );
+    assert!(
+        out_pmtiles.exists(),
+        "PMTiles output must persist after eviction"
+    );
 }
 
 #[test]
@@ -137,12 +155,20 @@ fn test_tiff_magic_validation_edge_cases() {
 
     // 3. ArcGIS Server JSON error payload disguised as TIFF
     let json_err = temp_dir.path().join("error.json");
-    fs::write(&json_err, b"{\"error\":{\"code\":500,\"message\":\"Internal server error\"}}").unwrap();
+    fs::write(
+        &json_err,
+        b"{\"error\":{\"code\":500,\"message\":\"Internal server error\"}}",
+    )
+    .unwrap();
     assert!(!is_valid_tiff(&json_err));
 
     // 4. HTML error page
     let html_err = temp_dir.path().join("error.html");
-    fs::write(&html_err, b"<html><head><title>504 Gateway Timeout</title></head></html>").unwrap();
+    fs::write(
+        &html_err,
+        b"<html><head><title>504 Gateway Timeout</title></head></html>",
+    )
+    .unwrap();
     assert!(!is_valid_tiff(&html_err));
 
     // 5. Truncated 2-byte file

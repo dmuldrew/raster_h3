@@ -1,7 +1,7 @@
+use crossbeam_deque::Injector;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use crossbeam_deque::Injector;
 use tiff::decoder::DecodingResult;
 
 use crate::error::Result;
@@ -170,7 +170,11 @@ impl Drop for PrefetchedChunkReader {
 impl PrefetchedChunkReader {
     /// Spawn a background prefetch thread pool with hardware-scaled worker count.
     /// Uses persistent decoders per worker thread to avoid IFD header re-parsing.
-    pub fn spawn(reader: GeoTiffStreamReader, chunk_indices: Vec<u32>, buffer_capacity: usize) -> Self {
+    pub fn spawn(
+        reader: GeoTiffStreamReader,
+        chunk_indices: Vec<u32>,
+        buffer_capacity: usize,
+    ) -> Self {
         let default_workers = if reader.is_remote() {
             4
         } else if chunk_indices.len() <= 4 {
@@ -198,7 +202,10 @@ impl PrefetchedChunkReader {
         };
 
         let total_jobs = chunk_indices.len();
-        let queue = Arc::new(OrderedPrefetchQueue::new(buffer_capacity.max(16), total_jobs));
+        let queue = Arc::new(OrderedPrefetchQueue::new(
+            buffer_capacity.max(16),
+            total_jobs,
+        ));
         let buffer_pool = Arc::new(Injector::new());
 
         if total_jobs == 0 {
@@ -343,7 +350,10 @@ impl PrefetchedMosaicReader {
     ) -> Self {
         let remote_queue = RemoteChunkPrefetchQueue::spawn_mosaic(&mosaic, None).map(Arc::new);
         let total_jobs = mosaic.chunk_refs.len();
-        let queue = Arc::new(OrderedPrefetchQueue::new(buffer_capacity.max(16), total_jobs));
+        let queue = Arc::new(OrderedPrefetchQueue::new(
+            buffer_capacity.max(16),
+            total_jobs,
+        ));
         let buffer_pool = Arc::new(Injector::new());
 
         if total_jobs == 0 {
@@ -572,7 +582,10 @@ mod tests {
 
         assert_eq!(received.len(), num_items);
         for (expected, actual) in received.iter().enumerate() {
-            assert_eq!(*actual, expected as u64, "Queue must maintain strict sequence order");
+            assert_eq!(
+                *actual, expected as u64,
+                "Queue must maintain strict sequence order"
+            );
         }
     }
 

@@ -45,11 +45,26 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
 
     // Continuous-specific named parameter: formula (VARCHAR)
     let formula_str = bind.get_named_string("formula");
-    let nir_band = bind.get_named_int("nir_band").filter(|&b| b > 0).unwrap_or(4) as usize;
-    let red_band = bind.get_named_int("red_band").filter(|&b| b > 0).unwrap_or(3) as usize;
-    let green_band = bind.get_named_int("green_band").filter(|&b| b > 0).unwrap_or(2) as usize;
-    let blue_band = bind.get_named_int("blue_band").filter(|&b| b > 0).unwrap_or(1) as usize;
-    let swir_band = bind.get_named_int("swir_band").filter(|&b| b > 0).unwrap_or(6) as usize;
+    let nir_band = bind
+        .get_named_int("nir_band")
+        .filter(|&b| b > 0)
+        .unwrap_or(4) as usize;
+    let red_band = bind
+        .get_named_int("red_band")
+        .filter(|&b| b > 0)
+        .unwrap_or(3) as usize;
+    let green_band = bind
+        .get_named_int("green_band")
+        .filter(|&b| b > 0)
+        .unwrap_or(2) as usize;
+    let blue_band = bind
+        .get_named_int("blue_band")
+        .filter(|&b| b > 0)
+        .unwrap_or(1) as usize;
+    let swir_band = bind
+        .get_named_int("swir_band")
+        .filter(|&b| b > 0)
+        .unwrap_or(6) as usize;
 
     let spectral_formula = formula_str.as_deref().and_then(|f| {
         crate::aggregator::multi_horizon::SpectralFormula::parse(
@@ -62,7 +77,9 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     let max_mean = bind.get_named_double("max_mean");
 
     let mut quantiles = Vec::new();
-    let q_param_val = bind.get_named_string("quantiles").or_else(|| bind.get_named_string("percentiles"));
+    let q_param_val = bind
+        .get_named_string("quantiles")
+        .or_else(|| bind.get_named_string("percentiles"));
     if let Some(s) = q_param_val {
         match QuantileTarget::parse_list(&s) {
             Ok(q_targets) => quantiles = q_targets,
@@ -95,7 +112,8 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
         bind.add_result_column(target.column_name(), DuckDBType::Double);
     }
 
-    let estimated_cardinality = estimate_raster_cardinality(&common.resolved_paths, &common.resolutions);
+    let estimated_cardinality =
+        estimate_raster_cardinality(&common.resolved_paths, &common.resolutions);
     duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
     let bind_data = Box::new(RasterH3BindData {
@@ -242,9 +260,21 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         match orig_col {
             0 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index)),
             1 => writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf),
-            2 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.mean())),
-            3 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.stddev())),
-            4 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.count)),
+            2 => writer.fill_column(
+                out_idx,
+                batch_len,
+                batch.iter().map(|r| r.accumulator.mean()),
+            ),
+            3 => writer.fill_column(
+                out_idx,
+                batch_len,
+                batch.iter().map(|r| r.accumulator.stddev()),
+            ),
+            4 => writer.fill_column(
+                out_idx,
+                batch_len,
+                batch.iter().map(|r| r.accumulator.count),
+            ),
             5 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.min)),
             6 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.max)),
             7 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.sum)),

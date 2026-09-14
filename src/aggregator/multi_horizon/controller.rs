@@ -4,11 +4,11 @@
 //! partitioning, lock-free thread result merging, decompression buffer recycling,
 //! southernmost latitude horizon progression, and 7-cell hierarchical compaction.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::horizon_streamer::compute_cell_south_lat;
@@ -174,11 +174,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         if entry.1.len() == 7 {
                             let (parent_acc, _) = self.pending_compact.remove(&parent_u64).unwrap();
                             let p_res_u8: u8 = parent_res.into();
-                            self.completed_buffer.push_back(self.kernel.make_record(
-                                p_res_u8,
-                                parent_u64,
-                                parent_acc,
-                            ));
+                            self.completed_buffer.push_back(
+                                self.kernel.make_record(p_res_u8, parent_u64, parent_acc),
+                            );
                             return;
                         }
                         return;
@@ -187,11 +185,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
         }
 
-        self.completed_buffer.push_back(self.kernel.make_record(
-            res_u8,
-            cell_u64,
-            acc,
-        ));
+        self.completed_buffer
+            .push_back(self.kernel.make_record(res_u8, cell_u64, acc));
     }
 
     /// Flush remaining pending compaction cells at stream termination
@@ -203,11 +198,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 } else {
                     8
                 };
-                self.completed_buffer.push_back(self.kernel.make_record(
-                    res_u8,
-                    cell_u64,
-                    acc,
-                ));
+                self.completed_buffer
+                    .push_back(self.kernel.make_record(res_u8, cell_u64, acc));
             }
         }
     }
@@ -239,11 +231,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         } else {
                             8
                         };
-                        self.completed_buffer.push_back(self.kernel.make_record(
-                            res_u8,
-                            cell_u64,
-                            acc,
-                        ));
+                        self.completed_buffer
+                            .push_back(self.kernel.make_record(res_u8, cell_u64, acc));
                     }
                 }
             }
@@ -287,66 +276,74 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             let kernel = &self.kernel;
 
             let t1 = std::time::Instant::now();
-            let parallel_results: Vec<(Vec<[Vec<(u64, K::Accumulator)>; NUM_SHARDS]>, DecodingResult)> = chunk_items
+            let parallel_results: Vec<(
+                Vec<[Vec<(u64, K::Accumulator)>; NUM_SHARDS]>,
+                DecodingResult,
+            )> = chunk_items
                 .par_iter_mut()
                 .map_init(
                     || {
                         let mut maps = Vec::with_capacity(resolutions.len());
                         for _ in 0..resolutions.len() {
-                            maps.push(HashMap::with_capacity_and_hasher(128, FxBuildHasher::default()));
+                            maps.push(HashMap::with_capacity_and_hasher(
+                                128,
+                                FxBuildHasher::default(),
+                            ));
                         }
                         maps
                     },
-                    |local_maps, item| {
-                        match item {
-                            Ok((tile_idx, _chunk_idx, chunk_bounds, decoding_result, has_overlap)) => {
-                                for m in local_maps.iter_mut() {
-                                    m.clear();
-                                }
-                                let tile = &mosaic.tiles[*tile_idx];
-                                let crs_transformer = &tile.crs_transformer;
-                                let gt = &tile.reader.metadata.geotransform;
-                                let chunk_stride = tile.reader.chunk_layout.chunk_width;
-                                let nodata = user_nodata.or(tile.reader.metadata.nodata);
-                                let samples_per_pixel = tile.reader.metadata.samples_per_pixel;
-
-                                let overlap_ctx = if *has_overlap {
-                                    Some((*tile_idx, &*mosaic))
-                                } else {
-                                    None
-                                };
-
-                                let has_data = kernel.process_chunk(
-                                    chunk_bounds,
-                                    decoding_result,
-                                    resolutions,
-                                    crs_transformer,
-                                    gt,
-                                    sampling,
-                                    bbox,
-                                    chunk_stride,
-                                    nodata,
-                                    samples_per_pixel,
-                                    overlap_ctx,
-                                    local_maps,
-                                );
-
-                                let mut chunk_shards = Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
-                                if has_data {
-                                    for m in local_maps.iter_mut() {
-                                        let mut shards: [Vec<(u64, K::Accumulator)>; NUM_SHARDS] =
-                                            std::array::from_fn(|_| Vec::new());
-                                        for (cell_u64, acc) in m.drain() {
-                                            let s = get_shard(cell_u64);
-                                            shards[s].push((cell_u64, acc));
-                                        }
-                                        chunk_shards.push(shards);
-                                    }
-                                }
-                                (chunk_shards, std::mem::replace(decoding_result, DecodingResult::U8(Vec::new())))
+                    |local_maps, item| match item {
+                        Ok((tile_idx, _chunk_idx, chunk_bounds, decoding_result, has_overlap)) => {
+                            for m in local_maps.iter_mut() {
+                                m.clear();
                             }
-                            Err(_) => (Vec::new(), DecodingResult::U8(Vec::new())),
+                            let tile = &mosaic.tiles[*tile_idx];
+                            let crs_transformer = &tile.crs_transformer;
+                            let gt = &tile.reader.metadata.geotransform;
+                            let chunk_stride = tile.reader.chunk_layout.chunk_width;
+                            let nodata = user_nodata.or(tile.reader.metadata.nodata);
+                            let samples_per_pixel = tile.reader.metadata.samples_per_pixel;
+
+                            let overlap_ctx = if *has_overlap {
+                                Some((*tile_idx, &*mosaic))
+                            } else {
+                                None
+                            };
+
+                            let has_data = kernel.process_chunk(
+                                chunk_bounds,
+                                decoding_result,
+                                resolutions,
+                                crs_transformer,
+                                gt,
+                                sampling,
+                                bbox,
+                                chunk_stride,
+                                nodata,
+                                samples_per_pixel,
+                                overlap_ctx,
+                                local_maps,
+                            );
+
+                            let mut chunk_shards =
+                                Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
+                            if has_data {
+                                for m in local_maps.iter_mut() {
+                                    let mut shards: [Vec<(u64, K::Accumulator)>; NUM_SHARDS] =
+                                        std::array::from_fn(|_| Vec::new());
+                                    for (cell_u64, acc) in m.drain() {
+                                        let s = get_shard(cell_u64);
+                                        shards[s].push((cell_u64, acc));
+                                    }
+                                    chunk_shards.push(shards);
+                                }
+                            }
+                            (
+                                chunk_shards,
+                                std::mem::replace(decoding_result, DecodingResult::U8(Vec::new())),
+                            )
                         }
+                        Err(_) => (Vec::new(), DecodingResult::U8(Vec::new())),
                     },
                 )
                 .collect();
@@ -360,10 +357,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 self.resolution_shards[res_idx].merge_thread_results(&parallel_results, res_idx);
             }
 
-            let recycled_buffers: Vec<DecodingResult> = parallel_results
-                .into_iter()
-                .map(|(_, dec)| dec)
-                .collect();
+            let recycled_buffers: Vec<DecodingResult> =
+                parallel_results.into_iter().map(|(_, dec)| dec).collect();
 
             if let Some(ref prefetcher) = self.prefetcher {
                 prefetcher.recycle_batch(recycled_buffers);

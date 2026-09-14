@@ -120,7 +120,9 @@ pub fn extract_crs<R: Read + Seek>(decoder: &mut Decoder<R>) -> (Option<u32>, Op
 
         if let Ok(doubles) = doubles_res {
             let get_double = |key: u16| -> Option<f64> {
-                double_param_keys.get(&key).and_then(|&idx| doubles.get(idx).copied())
+                double_param_keys
+                    .get(&key)
+                    .and_then(|&idx| doubles.get(idx).copied())
             };
 
             let datum_str = if geo_epsg == Some(4269) {
@@ -186,9 +188,15 @@ pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
     let upper = s.to_uppercase();
 
     // Determine datum
-    let datum = if upper.contains("D_NORTH_AMERICAN_1983") || upper.contains("NAD83") || upper.contains("GRS_1980") {
+    let datum = if upper.contains("D_NORTH_AMERICAN_1983")
+        || upper.contains("NAD83")
+        || upper.contains("GRS_1980")
+    {
         "+datum=NAD83"
-    } else if upper.contains("D_NORTH_AMERICAN_1927") || upper.contains("NAD27") || upper.contains("CLARKE_1866") {
+    } else if upper.contains("D_NORTH_AMERICAN_1927")
+        || upper.contains("NAD27")
+        || upper.contains("CLARKE_1866")
+    {
         "+datum=NAD27"
     } else {
         "+datum=WGS84"
@@ -209,8 +217,12 @@ pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
     if upper.contains("PROJECTION[\"ALBERS\"]") || upper.contains("ALBERS_EQUAL_AREA_CONIC") {
         let lat_1 = extract_param("STANDARD_PARALLEL_1").unwrap_or(0.0);
         let lat_2 = extract_param("STANDARD_PARALLEL_2").unwrap_or(0.0);
-        let lat_0 = extract_param("LATITUDE_OF_ORIGIN").or_else(|| extract_param("LATITUDE_OF_CENTER")).unwrap_or(0.0);
-        let lon_0 = extract_param("CENTRAL_MERIDIAN").or_else(|| extract_param("LONGITUDE_OF_CENTER")).unwrap_or(0.0);
+        let lat_0 = extract_param("LATITUDE_OF_ORIGIN")
+            .or_else(|| extract_param("LATITUDE_OF_CENTER"))
+            .unwrap_or(0.0);
+        let lon_0 = extract_param("CENTRAL_MERIDIAN")
+            .or_else(|| extract_param("LONGITUDE_OF_CENTER"))
+            .unwrap_or(0.0);
         let x_0 = extract_param("FALSE_EASTING").unwrap_or(0.0);
         let y_0 = extract_param("FALSE_NORTHING").unwrap_or(0.0);
 
@@ -220,11 +232,17 @@ pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
         ));
     }
 
-    if upper.contains("PROJECTION[\"LAMBERT_CONFORMAL_CONIC\"]") || upper.contains("LAMBERT_CONFORMAL_CONIC") {
+    if upper.contains("PROJECTION[\"LAMBERT_CONFORMAL_CONIC\"]")
+        || upper.contains("LAMBERT_CONFORMAL_CONIC")
+    {
         let lat_1 = extract_param("STANDARD_PARALLEL_1").unwrap_or(0.0);
         let lat_2 = extract_param("STANDARD_PARALLEL_2").unwrap_or(0.0);
-        let lat_0 = extract_param("LATITUDE_OF_ORIGIN").or_else(|| extract_param("LATITUDE_OF_CENTER")).unwrap_or(0.0);
-        let lon_0 = extract_param("CENTRAL_MERIDIAN").or_else(|| extract_param("LONGITUDE_OF_CENTER")).unwrap_or(0.0);
+        let lat_0 = extract_param("LATITUDE_OF_ORIGIN")
+            .or_else(|| extract_param("LATITUDE_OF_CENTER"))
+            .unwrap_or(0.0);
+        let lon_0 = extract_param("CENTRAL_MERIDIAN")
+            .or_else(|| extract_param("LONGITUDE_OF_CENTER"))
+            .unwrap_or(0.0);
         let x_0 = extract_param("FALSE_EASTING").unwrap_or(0.0);
         let y_0 = extract_param("FALSE_NORTHING").unwrap_or(0.0);
 
@@ -234,7 +252,9 @@ pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
         ));
     }
 
-    if upper.contains("PROJECTION[\"TRANSVERSE_MERCATOR\"]") || upper.contains("TRANSVERSE_MERCATOR") {
+    if upper.contains("PROJECTION[\"TRANSVERSE_MERCATOR\"]")
+        || upper.contains("TRANSVERSE_MERCATOR")
+    {
         let scale = extract_param("SCALE_FACTOR").unwrap_or(0.9996);
         let lat_0 = extract_param("LATITUDE_OF_ORIGIN").unwrap_or(0.0);
         let lon_0 = extract_param("CENTRAL_MERIDIAN").unwrap_or(0.0);

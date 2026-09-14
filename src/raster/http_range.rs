@@ -4,9 +4,9 @@
 //! Uses HTTP Range requests (`bytes=start-end`) to read only the initial IFD header
 //! and the specific tile chunks intersecting the scanline horizon or spatial bounding box.
 
+use fxhash::FxHashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
-use fxhash::FxHashMap;
 use ureq::Agent;
 use url::Url;
 
@@ -67,7 +67,10 @@ pub fn normalize_url(raw_url: &str) -> Result<String> {
             if let Some(reg) = region {
                 let reg_trimmed = reg.trim();
                 if !reg_trimmed.is_empty() && reg_trimmed != "us-east-1" {
-                    Ok(format!("https://{}.s3.{}.amazonaws.com/{}", bucket, reg_trimmed, key))
+                    Ok(format!(
+                        "https://{}.s3.{}.amazonaws.com/{}",
+                        bucket, reg_trimmed, key
+                    ))
                 } else {
                     Ok(format!("https://{}.s3.amazonaws.com/{}", bucket, key))
                 }
@@ -102,11 +105,17 @@ fn get_default_headers() -> Vec<(String, String)> {
     // Bearer token or AWS session token
     if let Ok(token) = std::env::var("RASTER_H3_AUTH_TOKEN") {
         if !token.trim().is_empty() {
-            headers.push(("Authorization".to_string(), format!("Bearer {}", token.trim())));
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", token.trim()),
+            ));
         }
     } else if let Ok(session_token) = std::env::var("AWS_SESSION_TOKEN") {
         if !session_token.trim().is_empty() {
-            headers.push(("x-amz-security-token".to_string(), session_token.trim().to_string()));
+            headers.push((
+                "x-amz-security-token".to_string(),
+                session_token.trim().to_string(),
+            ));
         }
     }
 
@@ -146,16 +155,17 @@ where
             Err(e) => {
                 if attempt >= max_retries || !is_transient_error(&e) {
                     return match e {
-                        ureq::Error::Status(404, _) => Err(RasterH3Error::InvalidParameter(format!(
-                            "Remote raster not found (HTTP 404): {}",
-                            url
-                        ))),
-                        ureq::Error::Status(status, r) => Err(RasterH3Error::InvalidParameter(format!(
-                            "HTTP request failed for '{}': HTTP {} - {}",
-                            url,
-                            status,
-                            r.status_text()
-                        ))),
+                        ureq::Error::Status(404, _) => Err(RasterH3Error::InvalidParameter(
+                            format!("Remote raster not found (HTTP 404): {}", url),
+                        )),
+                        ureq::Error::Status(status, r) => {
+                            Err(RasterH3Error::InvalidParameter(format!(
+                                "HTTP request failed for '{}': HTTP {} - {}",
+                                url,
+                                status,
+                                r.status_text()
+                            )))
+                        }
                         ureq::Error::Transport(t) => Err(RasterH3Error::InvalidParameter(format!(
                             "Network transport error connecting to '{}': {}",
                             url, t
@@ -321,7 +331,8 @@ impl RemoteHttpSource {
             if let Some(block) = cache.get(&block_idx) {
                 if offset_in_block < block.len() {
                     let available = (block.len() - offset_in_block).min(actual_len);
-                    out[..available].copy_from_slice(&block[offset_in_block..offset_in_block + available]);
+                    out[..available]
+                        .copy_from_slice(&block[offset_in_block..offset_in_block + available]);
                     return Ok(available);
                 }
             }
@@ -344,7 +355,8 @@ impl RemoteHttpSource {
         };
 
         let available = (final_block.len().saturating_sub(offset_in_block)).min(actual_len);
-        out[..available].copy_from_slice(&final_block[offset_in_block..offset_in_block + available]);
+        out[..available]
+            .copy_from_slice(&final_block[offset_in_block..offset_in_block + available]);
         Ok(available)
     }
 

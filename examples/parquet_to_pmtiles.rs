@@ -6,9 +6,9 @@
 //!     --output data/census.pmtiles \
 //!     --h3-col h3_index
 
+use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use std::env;
 use std::time::Instant;
-use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -84,12 +84,21 @@ fn main() {
             println!("SUCCESS!");
             println!("  Total Rows:             {}", summary.total_features);
             println!("  Valid H3 Hexagons:      {}", summary.valid_features);
-            println!("  Invalid Rows Dropped:   {}", summary.invalid_features_dropped);
+            println!(
+                "  Invalid Rows Dropped:   {}",
+                summary.invalid_features_dropped
+            );
             println!("  Vector Tiles Generated: {}", summary.total_tiles);
-            println!("  Zoom Range:             Z{} .. Z{}", summary.min_zoom, summary.max_zoom);
+            println!(
+                "  Zoom Range:             Z{} .. Z{}",
+                summary.min_zoom, summary.max_zoom
+            );
             println!("  Elapsed Time:           {:.2?}", elapsed);
             if let Ok(m) = std::fs::metadata(&output) {
-                println!("  Output File Size:       {:.2} MB", m.len() as f64 / 1_048_576.0);
+                println!(
+                    "  Output File Size:       {:.2} MB",
+                    m.len() as f64 / 1_048_576.0
+                );
             }
             println!("=================================================================");
         }
@@ -106,6 +115,8 @@ fn print_help() {
     println!("Options:");
     println!("  -i, --input <path>     Input Parquet file containing H3 index column");
     println!("  -o, --output <path>    Output .pmtiles archive path");
-    println!("  -c, --h3-col <name>    Explicit name of the H3 index column (default: auto-detect)");
+    println!(
+        "  -c, --h3-col <name>    Explicit name of the H3 index column (default: auto-detect)"
+    );
     println!("  -h, --help             Print help information");
 }

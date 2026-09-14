@@ -3,12 +3,12 @@
 //! Example usage:
 //!   cargo run --release --example raster_to_pmtiles -- --input data/sample.tif --output data/sample.pmtiles --resolutions 7,8,9
 
-use std::env;
-use std::fs::File;
-use std::time::Instant;
 use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::pmtiles::tiler::H3PmtilesTiler;
+use std::env;
+use std::fs::File;
+use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
@@ -73,8 +73,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut file = File::create(&temp_tiff)?;
         let mut encoder = TiffEncoder::new(&mut file)?;
         let mut image = encoder.new_image::<colortype::Gray32Float>(1024, 1024)?;
-        image.encoder().write_tag(Tag::ModelTiepointTag, &[0.0_f64, 0.0, 0.0, -122.5, 37.8, 0.0][..])?;
-        image.encoder().write_tag(Tag::ModelPixelScaleTag, &[0.0005_f64, 0.0005, 0.0][..])?;
+        image.encoder().write_tag(
+            Tag::ModelTiepointTag,
+            &[0.0_f64, 0.0, 0.0, -122.5, 37.8, 0.0][..],
+        )?;
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.0005_f64, 0.0005, 0.0][..])?;
 
         let pixels: Vec<f32> = (0..(1024 * 1024))
             .map(|i| (i % 1000) as f32 + 50.0)
@@ -106,7 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.sampling = sampling;
 
     let start = Instant::now();
-    let total_hexagons = H3PmtilesTiler::process_geotiff_to_pmtiles(&input_path, &output_path, config)?;
+    let total_hexagons =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(&input_path, &output_path, config)?;
     let elapsed = start.elapsed();
 
     let pmtiles_file = File::open(&output_path)?;
@@ -114,8 +120,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("  Conversion Complete!");
     println!("  Total Hexagons Written : {}", total_hexagons);
-    println!("  PMTiles Archive Size   : {:.2} KB ({:.2} MB)", file_size_kb, file_size_kb / 1024.0);
-    println!("  Total Elapsed Time     : {:.3} s ({:.1} ms)", elapsed.as_secs_f64(), elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  PMTiles Archive Size   : {:.2} KB ({:.2} MB)",
+        file_size_kb,
+        file_size_kb / 1024.0
+    );
+    println!(
+        "  Total Elapsed Time     : {:.3} s ({:.1} ms)",
+        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() * 1000.0
+    );
     println!("===========================================================");
 
     Ok(())

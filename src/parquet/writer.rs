@@ -309,15 +309,31 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             compact,
             geoparquet,
             h3_indices: Vec::with_capacity(capacity),
-            geometries: if geoparquet { Vec::with_capacity(capacity) } else { Vec::new() },
+            geometries: if geoparquet {
+                Vec::with_capacity(capacity)
+            } else {
+                Vec::new()
+            },
             min_values: Vec::with_capacity(capacity),
             max_values: Vec::with_capacity(capacity),
             sum_values: Vec::with_capacity(capacity),
             avg_values: Vec::with_capacity(capacity),
             pixel_counts: Vec::with_capacity(capacity),
-            h3_hexes: if compact { Vec::new() } else { Vec::with_capacity(capacity) },
-            lats: if compact { Vec::new() } else { Vec::with_capacity(capacity) },
-            lngs: if compact { Vec::new() } else { Vec::with_capacity(capacity) },
+            h3_hexes: if compact {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
+            lats: if compact {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
+            lngs: if compact {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
         }
     }
 
@@ -434,7 +450,8 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
 
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
         match (compact, geoparquet) {
-            (true, false) => "
+            (true, false) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED DOUBLE min_value;
@@ -443,8 +460,10 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                     REQUIRED DOUBLE avg_value;
                     REQUIRED DOUBLE pixel_count;
                 }
-            ",
-            (true, true) => "
+            "
+            }
+            (true, true) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY geometry;
@@ -454,8 +473,10 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                     REQUIRED DOUBLE avg_value;
                     REQUIRED DOUBLE pixel_count;
                 }
-            ",
-            (false, false) => "
+            "
+            }
+            (false, false) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
@@ -467,8 +488,10 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                     REQUIRED DOUBLE lat;
                     REQUIRED DOUBLE lng;
                 }
-            ",
-            (false, true) => "
+            "
+            }
+            (false, true) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
@@ -481,7 +504,8 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                     REQUIRED DOUBLE lat;
                     REQUIRED DOUBLE lng;
                 }
-            ",
+            "
+            }
         }
     }
 }
@@ -510,15 +534,31 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             compact,
             geoparquet,
             h3_indices: Vec::with_capacity(capacity),
-            geometries: if geoparquet { Vec::with_capacity(capacity) } else { Vec::new() },
+            geometries: if geoparquet {
+                Vec::with_capacity(capacity)
+            } else {
+                Vec::new()
+            },
             majorities: Vec::with_capacity(capacity),
             fractions: Vec::with_capacity(capacity),
             pixel_counts: Vec::with_capacity(capacity),
             distinct_classes: Vec::with_capacity(capacity),
             entropies: Vec::with_capacity(capacity),
-            h3_hexes: if compact { Vec::new() } else { Vec::with_capacity(capacity) },
-            lats: if compact { Vec::new() } else { Vec::with_capacity(capacity) },
-            lngs: if compact { Vec::new() } else { Vec::with_capacity(capacity) },
+            h3_hexes: if compact {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
+            lats: if compact {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
+            lngs: if compact {
+                Vec::new()
+            } else {
+                Vec::with_capacity(capacity)
+            },
         }
     }
 
@@ -636,7 +676,8 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
 
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
         match (compact, geoparquet) {
-            (true, false) => "
+            (true, false) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED INT64 majority;
@@ -645,8 +686,10 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                     REQUIRED INT64 distinct_classes;
                     REQUIRED DOUBLE entropy;
                 }
-            ",
-            (true, true) => "
+            "
+            }
+            (true, true) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY geometry;
@@ -656,8 +699,10 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                     REQUIRED INT64 distinct_classes;
                     REQUIRED DOUBLE entropy;
                 }
-            ",
-            (false, false) => "
+            "
+            }
+            (false, false) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
@@ -669,8 +714,10 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                     REQUIRED DOUBLE lat;
                     REQUIRED DOUBLE lng;
                 }
-            ",
-            (false, true) => "
+            "
+            }
+            (false, true) => {
+                "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
@@ -683,7 +730,8 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                     REQUIRED DOUBLE lat;
                     REQUIRED DOUBLE lng;
                 }
-            ",
+            "
+            }
         }
     }
 }
@@ -714,11 +762,12 @@ where
         .set_compression(parquet_config.compression);
 
     if geoparquet {
-        let bbox = streamer.bounds_wgs84().unwrap_or([-180.0, -90.0, 180.0, 90.0]);
+        let bbox = streamer
+            .bounds_wgs84()
+            .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
         let geo_json = build_geoparquet_metadata("geometry", bbox);
-        props_builder = props_builder.set_key_value_metadata(Some(vec![
-            KeyValue::new("geo".to_string(), geo_json),
-        ]));
+        props_builder = props_builder
+            .set_key_value_metadata(Some(vec![KeyValue::new("geo".to_string(), geo_json)]));
     }
 
     let props = Arc::new(props_builder.build());
@@ -739,21 +788,23 @@ where
     let buf2 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
     let _ = recycle_tx.send(buf2);
 
-    let writer_handle = thread::spawn(move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let mut total_rows = 0usize;
-        while let Ok(mut buf) = writer_rx.recv() {
-            if !buf.is_empty() {
-                buf.sort_by_h3_index();
-                let count = buf.len();
-                buf.flush_to_row_group(&mut writer)?;
-                total_rows += count;
-                buf.clear();
-                let _ = recycle_tx.send(buf);
+    let writer_handle = thread::spawn(
+        move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+            let mut total_rows = 0usize;
+            while let Ok(mut buf) = writer_rx.recv() {
+                if !buf.is_empty() {
+                    buf.sort_by_h3_index();
+                    let count = buf.len();
+                    buf.flush_to_row_group(&mut writer)?;
+                    total_rows += count;
+                    buf.clear();
+                    let _ = recycle_tx.send(buf);
+                }
             }
-        }
-        writer.close()?;
-        Ok(total_rows)
-    });
+            writer.close()?;
+            Ok(total_rows)
+        },
+    );
 
     let mut current_buf = buf1;
     let mut total_drained = 0usize;
@@ -805,7 +856,12 @@ where
     B: ParquetRowGroupBuffer<Record = S::Record>,
     P: AsRef<Path>,
 {
-    run_parquet_streaming_pipeline_with_progress::<S, B, P, _>(streamer, parquet_path, parquet_config, |_| {})
+    run_parquet_streaming_pipeline_with_progress::<S, B, P, _>(
+        streamer,
+        parquet_path,
+        parquet_config,
+        |_| {},
+    )
 }
 
 pub struct H3ParquetWriter;
@@ -823,7 +879,9 @@ impl H3ParquetWriter {
 
         if parquet_config.is_categorical {
             if resolved_paths.len() == 1
-                && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or(""))
+                && !crate::raster::http_range::is_remote_url(
+                    resolved_paths[0].to_str().unwrap_or(""),
+                )
             {
                 let reader = GeoTiffStreamReader::open(&resolved_paths[0])?;
                 let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
@@ -840,7 +898,9 @@ impl H3ParquetWriter {
             }
         } else {
             if resolved_paths.len() == 1
-                && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or(""))
+                && !crate::raster::http_range::is_remote_url(
+                    resolved_paths[0].to_str().unwrap_or(""),
+                )
             {
                 let reader = GeoTiffStreamReader::open(&resolved_paths[0])?;
                 let streamer = MultiScanHorizonStreamer::new(reader, &config)?;

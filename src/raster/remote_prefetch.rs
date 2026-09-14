@@ -98,7 +98,8 @@ pub fn coalesce_chunk_ranges(
                     let slice_start = (chunk.offset - curr.start_offset) as usize;
                     let slice_len = chunk.length as usize;
                     curr.end_offset = chunk_end;
-                    curr.chunk_slices.push((chunk.chunk_idx, slice_start, slice_len));
+                    curr.chunk_slices
+                        .push((chunk.chunk_idx, slice_start, slice_len));
                     continue;
                 }
             }
@@ -147,7 +148,9 @@ impl RemoteChunkPrefetchQueue {
         let mut locations = Vec::with_capacity(chunk_indices.len());
         for &chunk_idx in chunk_indices {
             let idx = chunk_idx as usize;
-            if let (Some(&offset), Some(&length)) = (info.chunk_offsets.get(idx), info.chunk_bytes.get(idx)) {
+            if let (Some(&offset), Some(&length)) =
+                (info.chunk_offsets.get(idx), info.chunk_bytes.get(idx))
+            {
                 locations.push(ChunkLocation {
                     tile_idx: 0,
                     chunk_idx,
@@ -199,7 +202,9 @@ impl RemoteChunkPrefetchQueue {
             let reader = &mosaic.tiles[tile_idx].reader;
             if let Some(ref info) = reader.chunk_info {
                 let idx = chunk_ref.chunk_idx as usize;
-                if let (Some(&offset), Some(&length)) = (info.chunk_offsets.get(idx), info.chunk_bytes.get(idx)) {
+                if let (Some(&offset), Some(&length)) =
+                    (info.chunk_offsets.get(idx), info.chunk_bytes.get(idx))
+                {
                     locations.push(ChunkLocation {
                         tile_idx,
                         chunk_idx: chunk_ref.chunk_idx,
@@ -323,7 +328,11 @@ impl RemoteChunkPrefetchQueue {
 
     /// Retrieve a downloaded chunk payload, blocking until available or error occurs.
     /// Removes the chunk from the ready map to maintain bounded memory footprint.
-    pub fn get_chunk_payload(&self, tile_idx: usize, chunk_idx: u32) -> Result<Option<Arc<Vec<u8>>>> {
+    pub fn get_chunk_payload(
+        &self,
+        tile_idx: usize,
+        chunk_idx: u32,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
         let key = (tile_idx, chunk_idx);
         let mut map = self.ready_chunks.lock().map_err(|_| {
             RasterH3Error::InvalidParameter("Prefetch queue mutex poisoned".to_string())
@@ -382,9 +391,24 @@ mod tests {
     #[test]
     fn test_coalesce_adjacent_chunks() {
         let chunks = vec![
-            ChunkLocation { tile_idx: 0, chunk_idx: 0, offset: 1000, length: 4000 },
-            ChunkLocation { tile_idx: 0, chunk_idx: 1, offset: 5000, length: 4000 },
-            ChunkLocation { tile_idx: 0, chunk_idx: 2, offset: 9000, length: 2000 },
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 0,
+                offset: 1000,
+                length: 4000,
+            },
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 1,
+                offset: 5000,
+                length: 4000,
+            },
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 2,
+                offset: 9000,
+                length: 2000,
+            },
         ];
 
         let ranges = coalesce_chunk_ranges(&chunks, 32768, 2 * 1024 * 1024);
@@ -400,9 +424,24 @@ mod tests {
     #[test]
     fn test_coalesce_with_gap() {
         let chunks = vec![
-            ChunkLocation { tile_idx: 0, chunk_idx: 0, offset: 1000, length: 4000 },  // 1000..4999
-            ChunkLocation { tile_idx: 0, chunk_idx: 1, offset: 6000, length: 4000 },  // gap = 1000 (<= 32KB)
-            ChunkLocation { tile_idx: 0, chunk_idx: 2, offset: 50000, length: 4000 }, // gap = 40000 (> 32KB) -> split
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 0,
+                offset: 1000,
+                length: 4000,
+            }, // 1000..4999
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 1,
+                offset: 6000,
+                length: 4000,
+            }, // gap = 1000 (<= 32KB)
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 2,
+                offset: 50000,
+                length: 4000,
+            }, // gap = 40000 (> 32KB) -> split
         ];
 
         let ranges = coalesce_chunk_ranges(&chunks, 32768, 2 * 1024 * 1024);
@@ -425,8 +464,18 @@ mod tests {
     #[test]
     fn test_coalesce_max_range_limit() {
         let chunks = vec![
-            ChunkLocation { tile_idx: 0, chunk_idx: 0, offset: 0, length: 600 },
-            ChunkLocation { tile_idx: 0, chunk_idx: 1, offset: 600, length: 600 }, // cumulative 1200 > max_range 1000 -> split
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 0,
+                offset: 0,
+                length: 600,
+            },
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 1,
+                offset: 600,
+                length: 600,
+            }, // cumulative 1200 > max_range 1000 -> split
         ];
 
         let ranges = coalesce_chunk_ranges(&chunks, 1024, 1000);
@@ -440,8 +489,18 @@ mod tests {
     #[test]
     fn test_coalesce_multi_tile_split() {
         let chunks = vec![
-            ChunkLocation { tile_idx: 0, chunk_idx: 0, offset: 1000, length: 4000 },
-            ChunkLocation { tile_idx: 1, chunk_idx: 0, offset: 5000, length: 4000 }, // different tile -> split
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 0,
+                offset: 1000,
+                length: 4000,
+            },
+            ChunkLocation {
+                tile_idx: 1,
+                chunk_idx: 0,
+                offset: 5000,
+                length: 4000,
+            }, // different tile -> split
         ];
 
         let ranges = coalesce_chunk_ranges(&chunks, 32768, 2 * 1024 * 1024);

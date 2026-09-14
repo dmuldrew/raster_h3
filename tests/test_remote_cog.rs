@@ -146,7 +146,8 @@ impl MockHttpServer {
         }
 
         if method != "GET" && method != "HEAD" {
-            let resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let resp =
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes());
             return;
         }
@@ -160,13 +161,14 @@ impl MockHttpServer {
         request_count.fetch_add(1, Ordering::SeqCst);
 
         // Check for simulated transient failure (HTTP 503 Slow Down)
-        let fail_hit = transient_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            if count > 0 {
-                Some(count - 1)
-            } else {
-                None
-            }
-        });
+        let fail_hit =
+            transient_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count > 0 {
+                    Some(count - 1)
+                } else {
+                    None
+                }
+            });
         if fail_hit.is_ok() {
             let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes());
@@ -306,10 +308,10 @@ fn test_remote_header_read_budget_efficiency() {
     let remote_url = format!("{}/CFL_HI.tif", server.url_base);
 
     // Open remote GeoTIFF reader
-    let remote_reader = GeoTiffStreamReader::open(&remote_url)
-        .expect("Failed to open remote GeoTIFF reader");
-    let local_reader = GeoTiffStreamReader::open(&local_path)
-        .expect("Failed to open local GeoTIFF reader");
+    let remote_reader =
+        GeoTiffStreamReader::open(&remote_url).expect("Failed to open remote GeoTIFF reader");
+    let local_reader =
+        GeoTiffStreamReader::open(&local_path).expect("Failed to open local GeoTIFF reader");
 
     // 1. Verify byte budget: metadata parse must consume < 512 KB (small fraction of 60 MB file)
     let bytes_served = server.bytes_served.load(Ordering::SeqCst);
@@ -332,7 +334,10 @@ fn test_remote_header_read_budget_efficiency() {
     // 2. Verify metadata parity
     assert_eq!(remote_reader.metadata.width, local_reader.metadata.width);
     assert_eq!(remote_reader.metadata.height, local_reader.metadata.height);
-    assert_eq!(remote_reader.metadata.geotransform, local_reader.metadata.geotransform);
+    assert_eq!(
+        remote_reader.metadata.geotransform,
+        local_reader.metadata.geotransform
+    );
     assert_eq!(remote_reader.metadata.nodata, local_reader.metadata.nodata);
     assert_eq!(remote_reader.metadata.epsg, local_reader.metadata.epsg);
     assert_eq!(
@@ -519,7 +524,13 @@ fn test_remote_mosaic_reader_integration() {
     let remote_url = format!("{}/CFL_HI.tif", server.url_base);
 
     let paths = resolve_raster_sources(&remote_url).unwrap();
-    let mosaic = MosaicReader::open(&paths, None, None, raster_h3::raster::mosaic::OverlapRule::Cutline).unwrap();
+    let mosaic = MosaicReader::open(
+        &paths,
+        None,
+        None,
+        raster_h3::raster::mosaic::OverlapRule::Cutline,
+    )
+    .unwrap();
     assert_eq!(mosaic.tiles.len(), 1);
     assert_eq!(mosaic.tiles[0].file_path.to_str().unwrap(), remote_url);
     assert!(mosaic.tiles[0].reader.metadata.width > 0);
@@ -559,7 +570,10 @@ fn test_remote_end_to_end_multi_resolution_streamer() {
         records.extend(batch);
     }
 
-    assert!(!records.is_empty(), "Streamer should yield records from remote COG");
+    assert!(
+        !records.is_empty(),
+        "Streamer should yield records from remote COG"
+    );
     println!(
         "Successfully aggregated {} continuous records from remote COG stream",
         records.len()
@@ -594,7 +608,8 @@ fn test_remote_prefetch_queue_and_request_coalescing() {
 
     // Request 16 consecutive chunks across scanlines
     let chunk_indices: Vec<u32> = (0..16).collect();
-    let prefetcher = PrefetchedChunkReader::spawn_with_workers(remote_reader, chunk_indices.clone(), 32, 4);
+    let prefetcher =
+        PrefetchedChunkReader::spawn_with_workers(remote_reader, chunk_indices.clone(), 32, 4);
 
     let mut drained = Vec::new();
     while let Some(item) = prefetcher.next_chunk() {
@@ -640,12 +655,37 @@ fn test_remote_coalesce_chunk_ranges_algorithm() {
     use raster_h3::raster::remote_prefetch::{coalesce_chunk_ranges, ChunkLocation};
 
     let chunks = vec![
-        ChunkLocation { tile_idx: 0, chunk_idx: 0, offset: 1000, length: 2000 },
-        ChunkLocation { tile_idx: 0, chunk_idx: 1, offset: 3000, length: 2000 },
-        ChunkLocation { tile_idx: 0, chunk_idx: 2, offset: 5000, length: 2000 },
+        ChunkLocation {
+            tile_idx: 0,
+            chunk_idx: 0,
+            offset: 1000,
+            length: 2000,
+        },
+        ChunkLocation {
+            tile_idx: 0,
+            chunk_idx: 1,
+            offset: 3000,
+            length: 2000,
+        },
+        ChunkLocation {
+            tile_idx: 0,
+            chunk_idx: 2,
+            offset: 5000,
+            length: 2000,
+        },
         // Large gap (50,000 bytes > 32KB max gap)
-        ChunkLocation { tile_idx: 0, chunk_idx: 3, offset: 57000, length: 3000 },
-        ChunkLocation { tile_idx: 0, chunk_idx: 4, offset: 60000, length: 3000 },
+        ChunkLocation {
+            tile_idx: 0,
+            chunk_idx: 3,
+            offset: 57000,
+            length: 3000,
+        },
+        ChunkLocation {
+            tile_idx: 0,
+            chunk_idx: 4,
+            offset: 60000,
+            length: 3000,
+        },
     ];
 
     let coalesced = coalesce_chunk_ranges(&chunks, 32768, 1024 * 1024);
@@ -755,18 +795,27 @@ fn test_s3_url_regional_and_custom_endpoints() {
     let _env_lock = ENV_MUTEX.lock().unwrap();
     // 1. Default S3 URL
     let url_default = normalize_url("s3://test-bucket/prefix/cog.tif").unwrap();
-    assert_eq!(url_default, "https://test-bucket.s3.amazonaws.com/prefix/cog.tif");
+    assert_eq!(
+        url_default,
+        "https://test-bucket.s3.amazonaws.com/prefix/cog.tif"
+    );
 
     // 2. Explicit AWS_REGION
     std::env::set_var("AWS_REGION", "us-west-2");
     let url_west = normalize_url("s3://test-bucket/prefix/cog.tif").unwrap();
-    assert_eq!(url_west, "https://test-bucket.s3.us-west-2.amazonaws.com/prefix/cog.tif");
+    assert_eq!(
+        url_west,
+        "https://test-bucket.s3.us-west-2.amazonaws.com/prefix/cog.tif"
+    );
     std::env::remove_var("AWS_REGION");
 
     // 3. Fallback AWS_DEFAULT_REGION
     std::env::set_var("AWS_DEFAULT_REGION", "eu-central-1");
     let url_eu = normalize_url("s3://test-bucket/prefix/cog.tif").unwrap();
-    assert_eq!(url_eu, "https://test-bucket.s3.eu-central-1.amazonaws.com/prefix/cog.tif");
+    assert_eq!(
+        url_eu,
+        "https://test-bucket.s3.eu-central-1.amazonaws.com/prefix/cog.tif"
+    );
     std::env::remove_var("AWS_DEFAULT_REGION");
 
     // 4. Custom endpoint path-style (MinIO / LocalStack)
@@ -777,7 +826,10 @@ fn test_s3_url_regional_and_custom_endpoints() {
     // 5. Custom endpoint virtual-hosted style
     std::env::set_var("AWS_S3_ADDRESSING_STYLE", "virtual");
     let url_minio_virtual = normalize_url("s3://my-bucket/data/cog.tif").unwrap();
-    assert_eq!(url_minio_virtual, "http://my-bucket.localhost:9000/data/cog.tif");
+    assert_eq!(
+        url_minio_virtual,
+        "http://my-bucket.localhost:9000/data/cog.tif"
+    );
     std::env::remove_var("AWS_ENDPOINT_URL");
     std::env::remove_var("AWS_S3_ADDRESSING_STYLE");
 }
@@ -842,8 +894,7 @@ fn test_remote_request_headers_injection() {
     std::env::set_var("AWS_REQUEST_PAYER", "requester");
     std::env::set_var("RASTER_H3_AUTH_TOKEN", "test-secret-token-xyz");
 
-    let _reader = GeoTiffStreamReader::open(&remote_url)
-        .expect("Reader open with custom headers");
+    let _reader = GeoTiffStreamReader::open(&remote_url).expect("Reader open with custom headers");
 
     std::env::remove_var("AWS_REQUEST_PAYER");
     std::env::remove_var("RASTER_H3_AUTH_TOKEN");
@@ -852,11 +903,15 @@ fn test_remote_request_headers_injection() {
     let found_payer = headers
         .iter()
         .any(|h| h.to_lowercase().contains("x-amz-request-payer: requester"));
-    let found_auth = headers
-        .iter()
-        .any(|h| h.to_lowercase().contains("authorization: bearer test-secret-token-xyz"));
+    let found_auth = headers.iter().any(|h| {
+        h.to_lowercase()
+            .contains("authorization: bearer test-secret-token-xyz")
+    });
 
-    assert!(found_payer, "Expected x-amz-request-payer header in HTTP request");
+    assert!(
+        found_payer,
+        "Expected x-amz-request-payer header in HTTP request"
+    );
     assert!(found_auth, "Expected authorization header in HTTP request");
 }
 
@@ -867,9 +922,9 @@ fn test_remote_cog_to_parquet_streaming_pipeline() {
         return;
     }
 
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
     use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
-    use parquet::file::reader::{FileReader, SerializedFileReader};
 
     let local_path = PathBuf::from("data/CFL_HI.tif");
     if !local_path.exists() {
@@ -917,6 +972,3 @@ fn test_remote_cog_to_parquet_streaming_pipeline() {
     // Clean up
     let _ = std::fs::remove_file(temp_parquet_path);
 }
-
-
-

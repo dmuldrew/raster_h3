@@ -232,7 +232,9 @@ pub unsafe extern "C" fn scalar_h3_is_valid_str(
     output: duckdb_vector,
 ) {
     unary_str_to_scalar_kernel(input, output, |s| {
-        parse_hex_u64(s).map(|u| CellIndex::try_from(u).is_ok()).unwrap_or(false)
+        parse_hex_u64(s)
+            .map(|u| CellIndex::try_from(u).is_ok())
+            .unwrap_or(false)
     });
 }
 
@@ -304,22 +306,25 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    binary_str_scalar_to_str_kernel(input, output, |s, parent_res_i64: i64, buf: &mut [u8; 16]| {
-        let cell_opt = parse_hex_u64(s).and_then(|u| CellIndex::try_from(u).ok());
-        let res_opt = if (0..=15).contains(&parent_res_i64) {
-            Resolution::try_from(parent_res_i64 as u8).ok()
-        } else {
-            None
-        };
-        if let (Some(cell), Some(target_res)) = (cell_opt, res_opt) {
-            if let Some(parent) = cell.parent(target_res) {
-                return Some(fast_hex_u64(parent.into(), buf));
+    binary_str_scalar_to_str_kernel(
+        input,
+        output,
+        |s, parent_res_i64: i64, buf: &mut [u8; 16]| {
+            let cell_opt = parse_hex_u64(s).and_then(|u| CellIndex::try_from(u).ok());
+            let res_opt = if (0..=15).contains(&parent_res_i64) {
+                Resolution::try_from(parent_res_i64 as u8).ok()
+            } else {
+                None
+            };
+            if let (Some(cell), Some(target_res)) = (cell_opt, res_opt) {
+                if let Some(parent) = cell.parent(target_res) {
+                    return Some(fast_hex_u64(parent.into(), buf));
+                }
             }
-        }
-        None
-    });
+            None
+        },
+    );
 }
-
 
 #[inline]
 unsafe fn register_unary_scalar_fn(
@@ -372,49 +377,141 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     let type_geom = crate::ffi::create_geometry_logical_type();
 
     // 1. h3_to_string(UBIGINT) -> VARCHAR
-    register_unary_scalar_fn(con, "h3_to_string", type_ubigint, type_varchar, scalar_h3_to_string);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_string",
+        type_ubigint,
+        type_varchar,
+        scalar_h3_to_string,
+    );
 
     // 2. string_to_h3(VARCHAR) -> UBIGINT
-    register_unary_scalar_fn(con, "string_to_h3", type_varchar, type_ubigint, scalar_string_to_h3);
+    register_unary_scalar_fn(
+        con,
+        "string_to_h3",
+        type_varchar,
+        type_ubigint,
+        scalar_string_to_h3,
+    );
 
     // 3. h3_to_lat(UBIGINT) -> DOUBLE
-    register_unary_scalar_fn(con, "h3_to_lat", type_ubigint, type_double, scalar_h3_to_lat);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_lat",
+        type_ubigint,
+        type_double,
+        scalar_h3_to_lat,
+    );
 
     // 4. h3_to_lng(UBIGINT) -> DOUBLE
-    register_unary_scalar_fn(con, "h3_to_lng", type_ubigint, type_double, scalar_h3_to_lng);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_lng",
+        type_ubigint,
+        type_double,
+        scalar_h3_to_lng,
+    );
 
     // 5. h3_get_resolution(UBIGINT) -> BIGINT
-    register_unary_scalar_fn(con, "h3_get_resolution", type_ubigint, type_bigint, scalar_h3_get_resolution);
+    register_unary_scalar_fn(
+        con,
+        "h3_get_resolution",
+        type_ubigint,
+        type_bigint,
+        scalar_h3_get_resolution,
+    );
 
     // 6. h3_is_valid(UBIGINT) -> BOOLEAN
-    register_unary_scalar_fn(con, "h3_is_valid", type_ubigint, type_bool, scalar_h3_is_valid_u64);
+    register_unary_scalar_fn(
+        con,
+        "h3_is_valid",
+        type_ubigint,
+        type_bool,
+        scalar_h3_is_valid_u64,
+    );
 
     // 7. h3_is_valid(VARCHAR) -> BOOLEAN
-    register_unary_scalar_fn(con, "h3_is_valid", type_varchar, type_bool, scalar_h3_is_valid_str);
+    register_unary_scalar_fn(
+        con,
+        "h3_is_valid",
+        type_varchar,
+        type_bool,
+        scalar_h3_is_valid_str,
+    );
 
     // 8. h3_to_wkb(UBIGINT) -> BLOB
-    register_unary_scalar_fn(con, "h3_to_wkb", type_ubigint, type_blob, scalar_h3_to_wkb_u64);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_wkb",
+        type_ubigint,
+        type_blob,
+        scalar_h3_to_wkb_u64,
+    );
 
     // 9. h3_to_wkb(VARCHAR) -> BLOB
-    register_unary_scalar_fn(con, "h3_to_wkb", type_varchar, type_blob, scalar_h3_to_wkb_str);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_wkb",
+        type_varchar,
+        type_blob,
+        scalar_h3_to_wkb_str,
+    );
 
     // 10. h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
-    register_binary_scalar_fn(con, "h3_cell_to_parent", type_ubigint, type_bigint, type_ubigint, scalar_h3_cell_to_parent_u64);
+    register_binary_scalar_fn(
+        con,
+        "h3_cell_to_parent",
+        type_ubigint,
+        type_bigint,
+        type_ubigint,
+        scalar_h3_cell_to_parent_u64,
+    );
 
     // 11. h3_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR
-    register_binary_scalar_fn(con, "h3_cell_to_parent", type_varchar, type_bigint, type_varchar, scalar_h3_cell_to_parent_str);
+    register_binary_scalar_fn(
+        con,
+        "h3_cell_to_parent",
+        type_varchar,
+        type_bigint,
+        type_varchar,
+        scalar_h3_cell_to_parent_str,
+    );
 
     // 12. h3_to_geometry(UBIGINT) -> GEOMETRY
-    register_unary_scalar_fn(con, "h3_to_geometry", type_ubigint, type_geom, scalar_h3_to_geometry_u64);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_geometry",
+        type_ubigint,
+        type_geom,
+        scalar_h3_to_geometry_u64,
+    );
 
     // 13. h3_to_geometry(VARCHAR) -> GEOMETRY
-    register_unary_scalar_fn(con, "h3_to_geometry", type_varchar, type_geom, scalar_h3_to_geometry_str);
+    register_unary_scalar_fn(
+        con,
+        "h3_to_geometry",
+        type_varchar,
+        type_geom,
+        scalar_h3_to_geometry_str,
+    );
 
     // 14. h3_cell_to_geometry(UBIGINT) -> GEOMETRY (standard alias)
-    register_unary_scalar_fn(con, "h3_cell_to_geometry", type_ubigint, type_geom, scalar_h3_to_geometry_u64);
+    register_unary_scalar_fn(
+        con,
+        "h3_cell_to_geometry",
+        type_ubigint,
+        type_geom,
+        scalar_h3_to_geometry_u64,
+    );
 
     // 15. h3_cell_to_geometry(VARCHAR) -> GEOMETRY (standard alias)
-    register_unary_scalar_fn(con, "h3_cell_to_geometry", type_varchar, type_geom, scalar_h3_to_geometry_str);
+    register_unary_scalar_fn(
+        con,
+        "h3_cell_to_geometry",
+        type_varchar,
+        type_geom,
+        scalar_h3_to_geometry_str,
+    );
 
     // Cleanup types
     let mut type_ubigint_mut = type_ubigint;
@@ -550,4 +647,3 @@ mod tests {
         assert_eq!(unsafe { s15.as_str() }, "8828308281fffff");
     }
 }
-

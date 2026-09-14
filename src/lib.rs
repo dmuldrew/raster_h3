@@ -3,8 +3,8 @@ pub mod crs;
 pub mod error;
 pub mod ffi;
 pub mod functions;
-pub mod pmtiles;
 pub mod parquet;
+pub mod pmtiles;
 pub mod raster;
 
 use std::ffi::c_char;

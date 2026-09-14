@@ -196,24 +196,47 @@ fn test_parse_quantile_specs_presets() {
 fn test_parse_quantile_specs_custom_and_aliases() {
     let custom = QuantileTarget::parse_list("p01, p05, median, q3, p99_5, iqr").unwrap();
     assert_eq!(custom.len(), 6);
-    assert_eq!(custom[0], QuantileTarget::Percentile(0.01, "p01".to_string()));
-    assert_eq!(custom[1], QuantileTarget::Percentile(0.05, "p05".to_string()));
-    assert_eq!(custom[2], QuantileTarget::Percentile(0.50, "median".to_string()));
-    assert_eq!(custom[3], QuantileTarget::Percentile(0.75, "q3".to_string()));
-    assert_eq!(custom[4], QuantileTarget::Percentile(0.995, "p99_5".to_string()));
+    assert_eq!(
+        custom[0],
+        QuantileTarget::Percentile(0.01, "p01".to_string())
+    );
+    assert_eq!(
+        custom[1],
+        QuantileTarget::Percentile(0.05, "p05".to_string())
+    );
+    assert_eq!(
+        custom[2],
+        QuantileTarget::Percentile(0.50, "median".to_string())
+    );
+    assert_eq!(
+        custom[3],
+        QuantileTarget::Percentile(0.75, "q3".to_string())
+    );
+    assert_eq!(
+        custom[4],
+        QuantileTarget::Percentile(0.995, "p99_5".to_string())
+    );
     assert_eq!(custom[5], QuantileTarget::Iqr("iqr".to_string()));
 
     let decimals = QuantileTarget::parse_list("0.05, 0.50, 0.95").unwrap();
     assert_eq!(decimals.len(), 3);
-    assert_eq!(decimals[0], QuantileTarget::Percentile(0.05, "p05".to_string()));
-    assert_eq!(decimals[1], QuantileTarget::Percentile(0.50, "p50".to_string()));
-    assert_eq!(decimals[2], QuantileTarget::Percentile(0.95, "p95".to_string()));
+    assert_eq!(
+        decimals[0],
+        QuantileTarget::Percentile(0.05, "p05".to_string())
+    );
+    assert_eq!(
+        decimals[1],
+        QuantileTarget::Percentile(0.50, "p50".to_string())
+    );
+    assert_eq!(
+        decimals[2],
+        QuantileTarget::Percentile(0.95, "p95".to_string())
+    );
 
     // Deduplication test
     let dup = QuantileTarget::parse_list("p50, p50, median, 0.50").unwrap();
     assert_eq!(dup.len(), 2); // "p50" and "median" (distinct column names)
 }
-
 
 #[test]
 fn test_multi_scan_streamer_with_quantiles_enabled() {
@@ -235,14 +258,27 @@ fn test_multi_scan_streamer_with_quantiles_enabled() {
         }
         for rec in &batch {
             total_records += 1;
-            assert!(rec.accumulator.quantiles.is_some(), "Quantiles should be tracked");
+            assert!(
+                rec.accumulator.quantiles.is_some(),
+                "Quantiles should be tracked"
+            );
             let p25 = rec.accumulator.quantile(0.25);
             let p50 = rec.accumulator.quantile(0.50);
             let p75 = rec.accumulator.quantile(0.75);
             let iqr = rec.accumulator.iqr();
 
-            assert!(p25 <= p50 + 1e-6, "Monotonicity: p25 {} <= p50 {}", p25, p50);
-            assert!(p50 <= p75 + 1e-6, "Monotonicity: p50 {} <= p75 {}", p50, p75);
+            assert!(
+                p25 <= p50 + 1e-6,
+                "Monotonicity: p25 {} <= p50 {}",
+                p25,
+                p50
+            );
+            assert!(
+                p50 <= p75 + 1e-6,
+                "Monotonicity: p50 {} <= p75 {}",
+                p50,
+                p75
+            );
             assert!(iqr >= 0.0, "IQR should be non-negative: {}", iqr);
             assert!(p50 >= rec.accumulator.min - 1e-6);
             assert!(p50 <= rec.accumulator.max + 1e-6);
@@ -270,7 +306,10 @@ fn test_multi_scan_streamer_with_quantiles_disabled_zero_cost() {
         }
         for rec in &batch {
             total_records += 1;
-            assert!(rec.accumulator.quantiles.is_none(), "Quantiles should be None when disabled");
+            assert!(
+                rec.accumulator.quantiles.is_none(),
+                "Quantiles should be None when disabled"
+            );
             assert!(rec.accumulator.quantile(0.5).is_nan());
             assert!(rec.accumulator.iqr().is_nan());
         }

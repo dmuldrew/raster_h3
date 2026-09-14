@@ -125,7 +125,8 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
         }
     }
 
-    let estimated_cardinality = estimate_raster_cardinality(&common.resolved_paths, &common.resolutions);
+    let estimated_cardinality =
+        estimate_raster_cardinality(&common.resolved_paths, &common.resolutions);
     duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
     let bind_data = Box::new(RasterH3CategoricalBindData {
@@ -210,14 +211,16 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
     info: duckdb_function_info,
     output: duckdb_data_chunk,
 ) {
-    let global_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3CategoricalGlobalData;
+    let global_data_ptr =
+        duckdb_function_get_init_data(info) as *const RasterH3CategoricalGlobalData;
     if global_data_ptr.is_null() {
         duckdb_data_chunk_set_size(output, 0);
         return;
     }
     let global_data = &*global_data_ptr;
     let proj_cols = &global_data.projected_columns;
-    let local_data_ptr = duckdb_function_get_local_init_data(info) as *mut RasterH3CategoricalLocalData;
+    let local_data_ptr =
+        duckdb_function_get_local_init_data(info) as *mut RasterH3CategoricalLocalData;
 
     match global_data.format {
         CategoricalOutputFormat::Wide => {
@@ -281,12 +284,18 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 match orig_col {
                     0 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index)),
-                    1 => writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf),
+                    1 => {
+                        writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf)
+                    }
                     2 => out_maj_cls = Some(out_idx),
                     3 => out_maj_frac = Some(out_idx),
                     4 => out_maj_cnt = Some(out_idx),
                     5 => out_uniq = Some(out_idx),
-                    6 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.total_count)),
+                    6 => writer.fill_column(
+                        out_idx,
+                        batch_len,
+                        batch.iter().map(|r| r.accumulator.total_count),
+                    ),
                     7 => {
                         let mut hist_buf = String::with_capacity(256);
                         for (i, rec) in batch.iter().enumerate() {
@@ -305,9 +314,12 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             }
 
             if out_maj_cls.is_some() || out_maj_frac.is_some() || out_maj_cnt.is_some() {
-                let mut slice_cls = out_maj_cls.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
-                let mut slice_frac = out_maj_frac.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
-                let mut slice_cnt = out_maj_cnt.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+                let mut slice_cls =
+                    out_maj_cls.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
+                let mut slice_frac =
+                    out_maj_frac.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+                let mut slice_cnt =
+                    out_maj_cnt.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
 
                 for (i, rec) in batch.iter().enumerate() {
                     let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
@@ -324,8 +336,10 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             }
 
             if out_uniq.is_some() || out_distinct.is_some() {
-                let mut slice_uniq = out_uniq.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
-                let mut slice_dist = out_distinct.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
+                let mut slice_uniq =
+                    out_uniq.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
+                let mut slice_dist =
+                    out_distinct.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
 
                 for (i, rec) in batch.iter().enumerate() {
                     let distinct = rec.accumulator.unique_classes() as i64;
@@ -339,8 +353,10 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             }
 
             if out_shannon.is_some() || out_entropy.is_some() {
-                let mut slice_shannon = out_shannon.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
-                let mut slice_ent = out_entropy.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+                let mut slice_shannon =
+                    out_shannon.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
+                let mut slice_ent =
+                    out_entropy.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
 
                 for (i, rec) in batch.iter().enumerate() {
                     let ent = rec.accumulator.shannon_entropy();
@@ -378,8 +394,10 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     let mut added_any = false;
                     streamer.drain_completed_into(512, |_i, rec| {
                         added_any = true;
-                        let mut entries: Vec<(i64, f64)> = Vec::with_capacity(rec.accumulator.unique_classes());
-                        rec.accumulator.for_each_class(|cat, cnt| entries.push((cat, cnt)));
+                        let mut entries: Vec<(i64, f64)> =
+                            Vec::with_capacity(rec.accumulator.unique_classes());
+                        rec.accumulator
+                            .for_each_class(|cat, cnt| entries.push((cat, cnt)));
                         entries.sort_unstable_by_key(|&(cat, _)| cat);
 
                         let entropy = rec.accumulator.shannon_entropy();
@@ -460,14 +478,20 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 match orig_col {
                     0 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.cell_u64)),
-                    1 => writer.write_hex_column(out_idx, rows.iter().map(|r| &r.cell_u64), hex_buf),
+                    1 => {
+                        writer.write_hex_column(out_idx, rows.iter().map(|r| &r.cell_u64), hex_buf)
+                    }
                     2 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.category)),
                     3 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.count)),
                     4 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.fraction)),
                     5 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.total_count)),
                     6 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.resolution)),
                     7 | 8 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.entropy)),
-                    9 | 10 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.distinct_classes)),
+                    9 | 10 => writer.fill_column(
+                        out_idx,
+                        num_taken,
+                        rows.iter().map(|r| r.distinct_classes),
+                    ),
                     11 => out_idx_wkb = Some(out_idx),
                     12 if global_data.emit_geom => out_idx_geom = Some(out_idx),
                     _ => {}

@@ -7,10 +7,10 @@
 //! 4. Spatial ROI Bounding Box Pruning
 //! 5. Multi-Resolution Conservation & Scaling (Res 6 through 10)
 //! 6. Multi-Core Concurrency Scaling (1, 4, 8 Worker Threads)
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufWriter;
 use std::time::Instant;
-use rayon::prelude::*;
 use tempfile::NamedTempFile;
 use tiff::encoder::colortype::Gray32Float;
 use tiff::encoder::TiffEncoder;
@@ -46,7 +46,10 @@ fn generate_e2e_geotiff(width: usize, height: usize) -> NamedTempFile {
     // Top-left: SF Bay (-122.50, 37.85)
     image
         .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..])
+        .write_tag(
+            Tag::Unknown(33922),
+            &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..],
+        )
         .unwrap();
     // Pixel resolution: 0.00025 deg (~27 meters)
     image
@@ -54,27 +57,35 @@ fn generate_e2e_geotiff(width: usize, height: usize) -> NamedTempFile {
         .write_tag(Tag::Unknown(33550), &[0.00025f64, 0.00025, 0.0][..])
         .unwrap();
 
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(34735), &geokeys[..])
+        .unwrap();
     image.write_data(&data).unwrap();
 
     temp_file
 }
 
 fn main() {
-    println!("=========================================================================================");
-    println!("                       raster_h3 Complete End-to-End Benchmark Suite                     ");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "                       raster_h3 Complete End-to-End Benchmark Suite                     "
+    );
+    println!(
+        "========================================================================================="
+    );
     println!("Generating benchmark raster (2000x2000 = 4,000,000 pixels, ~16 MB)...");
 
     let t0 = Instant::now();
     let temp_raster = generate_e2e_geotiff(2000, 2000);
     let raster_path = temp_raster.path();
-    println!("GeoTIFF generated in {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "GeoTIFF generated in {:.2}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     let total_pixels = 2000 * 2000;
 
@@ -105,10 +116,22 @@ fn main() {
     }
     let dur = start.elapsed();
     let mpps = (total_pixels as f64 / dur.as_secs_f64()) / 1_000_000.0;
-    println!("  • Time:           {:.2} ms ({:.2} Mpx/sec)", dur.as_secs_f64() * 1000.0, mpps);
+    println!(
+        "  • Time:           {:.2} ms ({:.2} Mpx/sec)",
+        dur.as_secs_f64() * 1000.0,
+        mpps
+    );
     println!("  • Hexagons:       {} cells", total_cells);
-    println!("  • Mass Check:     {:.0} / {} pixels ({:.2}%)", total_pixel_mass, total_pixels, (total_pixel_mass / total_pixels as f64) * 100.0);
-    println!("  • Peak Horizon:   {} in-flight cells (< 0.5 MB)", max_in_flight);
+    println!(
+        "  • Mass Check:     {:.0} / {} pixels ({:.2}%)",
+        total_pixel_mass,
+        total_pixels,
+        (total_pixel_mass / total_pixels as f64) * 100.0
+    );
+    println!(
+        "  • Peak Horizon:   {} in-flight cells (< 0.5 MB)",
+        max_in_flight
+    );
     assert_eq!(total_pixel_mass, total_pixels as f64);
 
     // ---------------------------------------------------------------------------------------------
@@ -137,9 +160,16 @@ fn main() {
     }
     let dur_cat = start_cat.elapsed();
     let cat_mpps = (total_pixels as f64 / dur_cat.as_secs_f64()) / 1_000_000.0;
-    println!("  • Time:           {:.2} ms ({:.2} Mpx/sec)", dur_cat.as_secs_f64() * 1000.0, cat_mpps);
+    println!(
+        "  • Time:           {:.2} ms ({:.2} Mpx/sec)",
+        dur_cat.as_secs_f64() * 1000.0,
+        cat_mpps
+    );
     println!("  • Unique Cells:   {}", cat_cells);
-    println!("  • Mass Check:     {:.0} / {} pixels", cat_mass, total_pixels);
+    println!(
+        "  • Mass Check:     {:.0} / {} pixels",
+        cat_mass, total_pixels
+    );
     assert_eq!(cat_mass, total_pixels as f64);
 
     // ---------------------------------------------------------------------------------------------
@@ -163,8 +193,14 @@ fn main() {
         }
     }
     let dur_rgss = start_rgss.elapsed();
-    println!("  • Time:           {:.2} ms", dur_rgss.as_secs_f64() * 1000.0);
-    println!("  • Mass Check:     {:.0} / {} pixels (Exact Conservation)", rgss_mass, total_pixels);
+    println!(
+        "  • Time:           {:.2} ms",
+        dur_rgss.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  • Mass Check:     {:.0} / {} pixels (Exact Conservation)",
+        rgss_mass, total_pixels
+    );
     assert!((rgss_mass - total_pixels as f64).abs() < 1e-4);
 
     // ---------------------------------------------------------------------------------------------
@@ -190,7 +226,10 @@ fn main() {
         }
     }
     let dur_roi = start_roi.elapsed();
-    println!("  • Time:           {:.2} ms", dur_roi.as_secs_f64() * 1000.0);
+    println!(
+        "  • Time:           {:.2} ms",
+        dur_roi.as_secs_f64() * 1000.0
+    );
     println!("  • Pruned Cells:   {}", roi_cells);
     println!("  • Pruned Mass:    {:.0} pixels", roi_mass);
 
@@ -199,7 +238,10 @@ fn main() {
     // ---------------------------------------------------------------------------------------------
     println!("\n▶ [Stage 5] Multi-Threaded Concurrency Scaling (Rayon Worker Pools)");
     for num_threads in [1, 2, 4, 8] {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
         let mt_start = Instant::now();
 
         let _ = pool.install(|| {
@@ -216,10 +258,19 @@ fn main() {
 
         let dur_mt = mt_start.elapsed();
         let mt_mpps = (total_pixels as f64 / dur_mt.as_secs_f64()) / 1_000_000.0;
-        println!("  • {:>2} Thread(s):   {:>6.2} ms ({:>6.2} Mpx/sec)", num_threads, dur_mt.as_secs_f64() * 1000.0, mt_mpps);
+        println!(
+            "  • {:>2} Thread(s):   {:>6.2} ms ({:>6.2} Mpx/sec)",
+            num_threads,
+            dur_mt.as_secs_f64() * 1000.0,
+            mt_mpps
+        );
     }
 
     println!("\n=========================================================================================");
-    println!("                        ALL END-TO-END BENCHMARKS PASSED SUCCESSFULLY!                   ");
-    println!("=========================================================================================");
+    println!(
+        "                        ALL END-TO-END BENCHMARKS PASSED SUCCESSFULLY!                   "
+    );
+    println!(
+        "========================================================================================="
+    );
 }

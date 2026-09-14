@@ -20,7 +20,10 @@ fn test_continuous_supersampling_all_patterns_conservation() {
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
@@ -91,13 +94,18 @@ fn test_continuous_gradient_supersampling_consistency() {
     let expected_pixels = (width * height) as f64;
 
     // Linear diagonal gradient: f(x, y) = 10.0 + x * 0.5 + y * 0.5
-    let (_tmp, path) = create_test_geotiff(width, height, |c, r| 10.0 + (c as f32) * 0.5 + (r as f32) * 0.5);
+    let (_tmp, path) = create_test_geotiff(width, height, |c, r| {
+        10.0 + (c as f32) * 0.5 + (r as f32) * 0.5
+    });
 
     let patterns = [
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
@@ -172,7 +180,10 @@ fn test_categorical_supersampling_all_patterns_conservation() {
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
@@ -230,7 +241,10 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];

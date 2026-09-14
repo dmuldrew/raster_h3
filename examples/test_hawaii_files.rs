@@ -1,14 +1,20 @@
-use std::path::Path;
-use std::time::Instant;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
+use std::path::Path;
+use std::time::Instant;
 
 fn main() {
-    println!("=========================================================================================");
-    println!("                 raster_h3 Comprehensive Real-World Test: Hawaii Datasets                ");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "                 raster_h3 Comprehensive Real-World Test: Hawaii Datasets                "
+    );
+    println!(
+        "========================================================================================="
+    );
 
     let cfl_path = "data/CFL_HI.tif";
     let lf_path = "data/LF2024_FBFM40_HI.tif";
@@ -23,7 +29,8 @@ fn main() {
     // =========================================================================
     println!("\n▶ [TEST SUITE 1] Continuous Raster: data/CFL_HI.tif");
     let cfl_reader = GeoTiffStreamReader::open(cfl_path).expect("Failed to open CFL_HI.tif");
-    println!("  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?}, Proj: {:?})",
+    println!(
+        "  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?}, Proj: {:?})",
         cfl_reader.metadata.width,
         cfl_reader.metadata.height,
         cfl_reader.chunk_layout.total_chunks,
@@ -47,13 +54,19 @@ fn main() {
             total_cfl_pixels += rec.accumulator.count;
             cfl_sum_val += rec.accumulator.sum;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_cfl_full = t0.elapsed();
     println!("      - Hexagons Output : {} hexagons", total_cfl_hexes);
     println!("      - Pixels Ingested : {:.0} pixels", total_cfl_pixels);
-    println!("      - Global Mean Val : {:.4}", cfl_sum_val / total_cfl_pixels.max(1.0));
-    println!("      - Scan Time       : {:.2?} ({:.2} Mpx/sec)",
+    println!(
+        "      - Global Mean Val : {:.4}",
+        cfl_sum_val / total_cfl_pixels.max(1.0)
+    );
+    println!(
+        "      - Scan Time       : {:.2?} ({:.2} Mpx/sec)",
         dur_cfl_full,
         (total_cfl_pixels / 1_000_000.0) / dur_cfl_full.as_secs_f64()
     );
@@ -71,7 +84,8 @@ fn main() {
 
     let t_bbox = Instant::now();
     let cfl_reader_bbox = GeoTiffStreamReader::open(cfl_path).unwrap();
-    let mut streamer_cfl_bbox = MultiScanHorizonStreamer::new(cfl_reader_bbox, &config_cfl_bbox).unwrap();
+    let mut streamer_cfl_bbox =
+        MultiScanHorizonStreamer::new(cfl_reader_bbox, &config_cfl_bbox).unwrap();
     let mut bbox_cfl_hexes = 0usize;
     let mut bbox_cfl_pixels = 0.0f64;
 
@@ -80,19 +94,24 @@ fn main() {
             bbox_cfl_hexes += 1;
             bbox_cfl_pixels += rec.accumulator.count;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_cfl_bbox = t_bbox.elapsed();
     println!("      - ROI Hexagons    : {} hexagons", bbox_cfl_hexes);
     println!("      - ROI Pixels      : {:.0} pixels", bbox_cfl_pixels);
     println!("      - Ingestion Time  : {:.2?}", dur_cfl_bbox);
-    println!("      - Speedup vs Full : {:.1}x faster",
+    println!(
+        "      - Speedup vs Full : {:.1}x faster",
         dur_cfl_full.as_secs_f64() / dur_cfl_bbox.as_secs_f64()
     );
 
     // 1C. Spatial Filter Pushdown: Single H3 Cell Point Lookup
     println!("\n  1C. Single H3 Cell Spatial Filter Pushdown (Diamond Head Cell)");
-    let target_cell = h3o::LatLng::new(21.26, -157.81).unwrap().to_cell(h3o::Resolution::Eight);
+    let target_cell = h3o::LatLng::new(21.26, -157.81)
+        .unwrap()
+        .to_cell(h3o::Resolution::Eight);
     let ll: h3o::LatLng = target_cell.into();
     let r = raster_h3::pmtiles::tiler::max_hex_radius_deg(target_cell.resolution().into());
     let mut config_cfl_cell = MultiResolutionConfig::new(vec![8]);
@@ -100,7 +119,8 @@ fn main() {
 
     let t_cell = Instant::now();
     let cfl_reader_cell = GeoTiffStreamReader::open(cfl_path).unwrap();
-    let mut streamer_cfl_cell = MultiScanHorizonStreamer::new(cfl_reader_cell, &config_cfl_cell).unwrap();
+    let mut streamer_cfl_cell =
+        MultiScanHorizonStreamer::new(cfl_reader_cell, &config_cfl_cell).unwrap();
     let mut point_hexes = 0usize;
     let mut point_cell_found = false;
 
@@ -109,17 +129,36 @@ fn main() {
             point_hexes += 1;
             if rec.h3_index == u64::from(target_cell) {
                 point_cell_found = true;
-                println!("      - Cell {:x}: Mean={:.2}, Count={:.0}, Min={:.2}, Max={:.2}",
-                    rec.h3_index, rec.accumulator.mean(), rec.accumulator.count, rec.accumulator.min, rec.accumulator.max);
+                println!(
+                    "      - Cell {:x}: Mean={:.2}, Count={:.0}, Min={:.2}, Max={:.2}",
+                    rec.h3_index,
+                    rec.accumulator.mean(),
+                    rec.accumulator.count,
+                    rec.accumulator.min,
+                    rec.accumulator.max
+                );
             }
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_cfl_cell = t_cell.elapsed();
-    println!("      - Chunks & Cells  : {} target neighborhood cells yielded", point_hexes);
-    println!("      - Target Found?   : {}", if point_cell_found { "YES (Exact match)" } else { "NO" });
+    println!(
+        "      - Chunks & Cells  : {} target neighborhood cells yielded",
+        point_hexes
+    );
+    println!(
+        "      - Target Found?   : {}",
+        if point_cell_found {
+            "YES (Exact match)"
+        } else {
+            "NO"
+        }
+    );
     println!("      - Query Latency   : {:.2?}", dur_cfl_cell);
-    println!("      - Speedup vs Full : {:.1}x faster",
+    println!(
+        "      - Speedup vs Full : {:.1}x faster",
         dur_cfl_full.as_secs_f64() / dur_cfl_cell.as_secs_f64()
     );
 
@@ -127,8 +166,10 @@ fn main() {
     // TEST SUITE 2: Categorical Raster (data/LF2024_FBFM40_HI.tif - Landfire Fuel Models)
     // =========================================================================
     println!("\n▶ [TEST SUITE 2] Categorical Raster: data/LF2024_FBFM40_HI.tif");
-    let lf_reader = GeoTiffStreamReader::open(lf_path).expect("Failed to open LF2024_FBFM40_HI.tif");
-    println!("  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?}, Proj: {:?}, NoData: {:?})",
+    let lf_reader =
+        GeoTiffStreamReader::open(lf_path).expect("Failed to open LF2024_FBFM40_HI.tif");
+    println!(
+        "  • Raster Dimensions : {} x {} ({} chunks, EPSG: {:?}, Proj: {:?}, NoData: {:?})",
         lf_reader.metadata.width,
         lf_reader.metadata.height,
         lf_reader.chunk_layout.total_chunks,
@@ -154,12 +195,15 @@ fn main() {
             let (maj_cls, _, _) = rec.accumulator.majority();
             *class_distribution.entry(maj_cls).or_insert(0usize) += 1;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_lf_full = t_lf.elapsed();
     println!("      - Hexagons Output : {} hexagons", total_lf_hexes);
     println!("      - Pixels Ingested : {:.0} pixels", total_lf_pixels);
-    println!("      - Scan Time       : {:.2?} ({:.2} Mpx/sec)",
+    println!(
+        "      - Scan Time       : {:.2?} ({:.2} Mpx/sec)",
         dur_lf_full,
         (total_lf_pixels / 1_000_000.0) / dur_lf_full.as_secs_f64()
     );
@@ -172,15 +216,22 @@ fn main() {
     top_classes.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
     println!("      - Top 3 Landcover Classes (by hex count):");
     for (cls, count) in top_classes.iter().take(3) {
-        println!("        * Class {:>4}: {:>6} hexagons ({:.1}%)",
-            cls, count, (*count as f64 / total_lf_hexes as f64) * 100.0);
+        println!(
+            "        * Class {:>4}: {:>6} hexagons ({:.1}%)",
+            cls,
+            count,
+            (*count as f64 / total_lf_hexes as f64) * 100.0
+        );
     }
 
     // 2B. Projection Pushdown Comparison on Categorical
-    println!("\n  2B. Projection Pushdown: Full Projection (with JSON) vs Projected (JSON Bypassed)");
+    println!(
+        "\n  2B. Projection Pushdown: Full Projection (with JSON) vs Projected (JSON Bypassed)"
+    );
     let lf_reader_proj = GeoTiffStreamReader::open(lf_path).unwrap();
     let t_proj = Instant::now();
-    let mut streamer_lf_proj = MultiCategoricalHorizonStreamer::new(lf_reader_proj, &config_lf).unwrap();
+    let mut streamer_lf_proj =
+        MultiCategoricalHorizonStreamer::new(lf_reader_proj, &config_lf).unwrap();
     let mut projected_hexes = 0usize;
 
     loop {
@@ -189,12 +240,20 @@ fn main() {
             let _ = rec.accumulator.majority();
             projected_hexes += 1;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_lf_proj = t_proj.elapsed();
     println!("      - Projected Scan Time : {:.2?}", dur_lf_proj);
-    println!("      - Hexagons Verified   : {} (100% Deterministic match)", projected_hexes);
-    assert_eq!(total_lf_hexes, projected_hexes, "Hexagon count mismatch between projections!");
+    println!(
+        "      - Hexagons Verified   : {} (100% Deterministic match)",
+        projected_hexes
+    );
+    assert_eq!(
+        total_lf_hexes, projected_hexes,
+        "Hexagon count mismatch between projections!"
+    );
 
     // 2C. Spatial Filter Pushdown on Categorical (Maui Island ROI)
     println!("\n  2C. Spatial Bounding Box Filter Pushdown (Maui Island ROI)");
@@ -205,7 +264,8 @@ fn main() {
 
     let t_maui = Instant::now();
     let lf_reader_maui = GeoTiffStreamReader::open(lf_path).unwrap();
-    let mut streamer_lf_maui = MultiCategoricalHorizonStreamer::new(lf_reader_maui, &config_lf_maui).unwrap();
+    let mut streamer_lf_maui =
+        MultiCategoricalHorizonStreamer::new(lf_reader_maui, &config_lf_maui).unwrap();
     let mut maui_hexes = 0usize;
     let mut maui_pixels = 0.0f64;
 
@@ -214,13 +274,16 @@ fn main() {
             maui_hexes += 1;
             maui_pixels += rec.accumulator.total_count;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_lf_maui = t_maui.elapsed();
     println!("      - Maui Hexagons   : {} hexagons", maui_hexes);
     println!("      - Maui Pixels     : {:.0} pixels", maui_pixels);
     println!("      - Ingestion Time  : {:.2?}", dur_lf_maui);
-    println!("      - Speedup vs Full : {:.1}x faster",
+    println!(
+        "      - Speedup vs Full : {:.1}x faster",
         dur_lf_full.as_secs_f64() / dur_lf_maui.as_secs_f64()
     );
 
@@ -231,7 +294,8 @@ fn main() {
     let config_multi = MultiResolutionConfig::new(vec![7, 8]);
     let t_multi = Instant::now();
     let lf_reader_multi = GeoTiffStreamReader::open(lf_path).unwrap();
-    let mut streamer_multi = MultiCategoricalHorizonStreamer::new(lf_reader_multi, &config_multi).unwrap();
+    let mut streamer_multi =
+        MultiCategoricalHorizonStreamer::new(lf_reader_multi, &config_multi).unwrap();
     let mut r7_count = 0usize;
     let mut r8_count = 0usize;
 
@@ -243,7 +307,9 @@ fn main() {
                 r8_count += 1;
             }
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_multi = t_multi.elapsed();
     println!("      - Res 7 Hexagons  : {} cells", r7_count);
@@ -260,7 +326,8 @@ fn main() {
     config_lf_ent.bbox = Some(maui_bbox);
 
     let t_ent = Instant::now();
-    let mut streamer_ent = MultiCategoricalHorizonStreamer::new(lf_reader_entropy, &config_lf_ent).unwrap();
+    let mut streamer_ent =
+        MultiCategoricalHorizonStreamer::new(lf_reader_entropy, &config_lf_ent).unwrap();
     let mut total_ent_hexes = 0usize;
     let mut pure_hexes = 0usize; // entropy == 0.0 (single class)
     let mut diverse_hexes = 0usize; // entropy > 1.0 (multi-class ecotones)
@@ -285,18 +352,33 @@ fn main() {
                 max_distinct = distinct;
             }
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_ent = t_ent.elapsed();
     println!("      - Maui Hexagons    : {} cells", total_ent_hexes);
-    println!("      - Pure Cells (H=0) : {} cells ({:.1}%)",
-        pure_hexes, (pure_hexes as f64 / total_ent_hexes as f64) * 100.0);
-    println!("      - Diverse Ecotones : {} cells ({:.1}% with H > 1.0)",
-        diverse_hexes, (diverse_hexes as f64 / total_ent_hexes as f64) * 100.0);
-    println!("      - Max Diversity    : H={:.3}, Max Distinct Classes={}", max_entropy, max_distinct);
+    println!(
+        "      - Pure Cells (H=0) : {} cells ({:.1}%)",
+        pure_hexes,
+        (pure_hexes as f64 / total_ent_hexes as f64) * 100.0
+    );
+    println!(
+        "      - Diverse Ecotones : {} cells ({:.1}% with H > 1.0)",
+        diverse_hexes,
+        (diverse_hexes as f64 / total_ent_hexes as f64) * 100.0
+    );
+    println!(
+        "      - Max Diversity    : H={:.3}, Max Distinct Classes={}",
+        max_entropy, max_distinct
+    );
     println!("      - Entropy Calc Time: {:.2?}", dur_ent);
 
     println!("\n=========================================================================================");
-    println!("                              ALL HAWAII TESTS PASSED SUCCESSFULLY                       ");
-    println!("=========================================================================================");
+    println!(
+        "                              ALL HAWAII TESTS PASSED SUCCESSFULLY                       "
+    );
+    println!(
+        "========================================================================================="
+    );
 }

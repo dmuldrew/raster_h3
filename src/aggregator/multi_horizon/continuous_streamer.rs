@@ -3,11 +3,11 @@
 //! Provides single-pass streaming aggregation across multiple H3 resolution levels simultaneously
 //! for continuous/floating-point raster bands and spectral indices.
 
+use fxhash::FxBuildHasher;
+use h3o::Resolution;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use fxhash::FxBuildHasher;
-use h3o::Resolution;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;

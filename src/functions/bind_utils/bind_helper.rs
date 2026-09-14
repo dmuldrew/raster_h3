@@ -125,7 +125,8 @@ impl BindHelper {
 
     /// Set an error message on the bind context and halt execution
     pub fn set_error(&self, msg: &str) {
-        let c_err = CString::new(msg).unwrap_or_else(|_| CString::new("Error in table function bind").unwrap());
+        let c_err = CString::new(msg)
+            .unwrap_or_else(|_| CString::new("Error in table function bind").unwrap());
         unsafe {
             duckdb_bind_set_error(self.info, c_err.as_ptr());
         }
@@ -207,7 +208,9 @@ impl BindHelper {
         let max_lon = self.get_named_double("max_lon");
         let max_lat = self.get_named_double("max_lat");
 
-        if let (Some(min_x), Some(min_y), Some(max_x), Some(max_y)) = (min_lon, min_lat, max_lon, max_lat) {
+        if let (Some(min_x), Some(min_y), Some(max_x), Some(max_y)) =
+            (min_lon, min_lat, max_lon, max_lat)
+        {
             return Some([min_x, min_y, max_x, max_y]);
         }
 
@@ -219,7 +222,10 @@ impl BindHelper {
         }
 
         // 3. H3 cell index (u64 / i64)
-        if let Some(cell_u64) = self.get_named_uint("h3_cell").or_else(|| self.get_named_int("h3_cell").map(|v| v as u64)) {
+        if let Some(cell_u64) = self
+            .get_named_uint("h3_cell")
+            .or_else(|| self.get_named_int("h3_cell").map(|v| v as u64))
+        {
             if let Ok(cell) = h3o::CellIndex::try_from(cell_u64) {
                 let ll: h3o::LatLng = cell.into();
                 let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
@@ -273,7 +279,10 @@ impl BindHelper {
     /// Parse common raster parameters shared across continuous and categorical aggregations
     pub fn parse_common_raster_params(&self, func_name: &str) -> Option<CommonRasterParams> {
         if self.parameter_count() < 1 {
-            self.set_error(&format!("{} requires at least 1 argument: file_path", func_name));
+            self.set_error(&format!(
+                "{} requires at least 1 argument: file_path",
+                func_name
+            ));
             return None;
         }
 
@@ -288,13 +297,18 @@ impl BindHelper {
         let resolutions = self.parse_resolutions(8, Some(1));
         let source_crs = self.parse_source_crs();
         let nodata = self.get_named_double("nodata");
-        let chunk_size = self.get_named_int("chunk_size").filter(|&cs| cs > 0).unwrap_or(512) as u32;
+        let chunk_size = self
+            .get_named_int("chunk_size")
+            .filter(|&cs| cs > 0)
+            .unwrap_or(512) as u32;
         let band = self.get_named_int("band").filter(|&b| b > 0).unwrap_or(1) as u32;
         let sampling = self.parse_sampling();
         let bbox = self.parse_bbox();
         let compact = self.get_named_bool("compact").unwrap_or(false);
         let overlap_rule = self.parse_overlap_rule();
-        let emit_geom = self.get_named_bool("geom").unwrap_or_else(crate::ffi::is_geometry_available);
+        let emit_geom = self
+            .get_named_bool("geom")
+            .unwrap_or_else(crate::ffi::is_geometry_available);
 
         let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
             Ok(paths) => paths,

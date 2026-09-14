@@ -184,7 +184,14 @@ impl H3Accumulator {
                 m2 += d * d;
             }
         }
-        let chunk_acc = Self { sum, count, min, max, m2, quantiles: None };
+        let chunk_acc = Self {
+            sum,
+            count,
+            min,
+            max,
+            m2,
+            quantiles: None,
+        };
         self.merge(&chunk_acc);
     }
 

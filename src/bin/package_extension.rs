@@ -1,9 +1,9 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 
 fn detect_platform() -> String {
     let os = match env::consts::OS {
@@ -137,7 +137,10 @@ fn main() {
         Some(p) => p,
         None => {
             let in_p = Path::new(&input_path);
-            let stem = in_p.file_stem().and_then(|s| s.to_str()).unwrap_or("extension");
+            let stem = in_p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("extension");
             let clean_stem = stem.strip_prefix("lib").unwrap_or(stem);
             let mut out = in_p.with_file_name(format!("{}.duckdb_extension", clean_stem));
             if gzip {
@@ -218,7 +221,10 @@ fn main() {
 
     if gzip {
         let out_file = File::create(&output_path).unwrap_or_else(|e| {
-            eprintln!("Error: Failed to create output file '{}': {}", output_path, e);
+            eprintln!(
+                "Error: Failed to create output file '{}': {}",
+                output_path, e
+            );
             std::process::exit(1);
         });
         let mut encoder = GzEncoder::new(out_file, Compression::default());
@@ -235,7 +241,10 @@ fn main() {
         );
     } else {
         let mut out_file = File::create(&output_path).unwrap_or_else(|e| {
-            eprintln!("Error: Failed to create output file '{}': {}", output_path, e);
+            eprintln!(
+                "Error: Failed to create output file '{}': {}",
+                output_path, e
+            );
             std::process::exit(1);
         });
         out_file.write_all(&so_bytes).unwrap();

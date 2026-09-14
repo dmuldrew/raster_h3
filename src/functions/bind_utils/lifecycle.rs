@@ -11,9 +11,8 @@ use crate::raster::mosaic::{MosaicReader, OverlapRule};
 
 /// Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation
 pub const H3_AREA_M2: [f64; 16] = [
-    4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8,
-    3.613e7, 5.161e6, 7.373e5, 1.053e5, 1.505e4, 2.150e3,
-    3.071e2, 4.387e1, 6.268e0, 8.954e-1,
+    4.357e12, 6.097e11, 8.680e10, 1.239e10, 1.770e9, 2.529e8, 3.613e7, 5.161e6, 7.373e5, 1.053e5,
+    1.505e4, 2.150e3, 3.071e2, 4.387e1, 6.268e0, 8.954e-1,
 ];
 
 /// Estimate query cardinality (number of H3 cells emitted) for a set of raster sources and resolutions
@@ -29,11 +28,12 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
             let dx = (x1 - x0).abs();
             let dy = (y1 - y0).abs();
 
-            let area_m2 = if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
-                dx * 111_320.0 * dy * 110_540.0 * resolved_paths.len() as f64
-            } else {
-                dx * dy * resolved_paths.len() as f64
-            };
+            let area_m2 =
+                if matches!(reader.metadata.epsg, Some(4326)) || reader.metadata.epsg.is_none() {
+                    dx * 111_320.0 * dy * 110_540.0 * resolved_paths.len() as f64
+                } else {
+                    dx * dy * resolved_paths.len() as f64
+                };
 
             let mut total_hex_est = 0u64;
             for &res in resolutions {

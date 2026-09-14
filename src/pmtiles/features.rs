@@ -1,10 +1,10 @@
 //! PMTiles Feature Definitions, Layer Metadata, and Export Summaries.
 
-use std::borrow::Cow;
-use std::collections::{BinaryHeap, HashMap};
 use fxhash::FxBuildHasher;
 use rayon::prelude::*;
 use serde_json::json;
+use std::borrow::Cow;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::pmtiles::mvt::{MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter};
@@ -72,36 +72,60 @@ impl ResolutionAccumulatorStats {
         let stddev = acc.stddev();
 
         if !mean.is_nan() {
-            if mean < self.min_mean { self.min_mean = mean; }
-            if mean > self.max_mean { self.max_mean = mean; }
+            if mean < self.min_mean {
+                self.min_mean = mean;
+            }
+            if mean > self.max_mean {
+                self.max_mean = mean;
+            }
             self.total_mean += mean;
         }
 
         if !sum.is_nan() {
-            if sum < self.min_sum { self.min_sum = sum; }
-            if sum > self.max_sum { self.max_sum = sum; }
+            if sum < self.min_sum {
+                self.min_sum = sum;
+            }
+            if sum > self.max_sum {
+                self.max_sum = sum;
+            }
             self.total_sum += sum;
         }
 
         if !max.is_nan() {
-            if max < self.min_max { self.min_max = max; }
-            if max > self.max_max { self.max_max = max; }
+            if max < self.min_max {
+                self.min_max = max;
+            }
+            if max > self.max_max {
+                self.max_max = max;
+            }
         }
 
         if !min.is_nan() {
-            if min < self.min_min { self.min_min = min; }
-            if min > self.max_min { self.max_min = min; }
+            if min < self.min_min {
+                self.min_min = min;
+            }
+            if min > self.max_min {
+                self.max_min = min;
+            }
         }
 
         if !count.is_nan() {
-            if count < self.min_count { self.min_count = count; }
-            if count > self.max_count { self.max_count = count; }
+            if count < self.min_count {
+                self.min_count = count;
+            }
+            if count > self.max_count {
+                self.max_count = count;
+            }
             self.total_pixel_count += count;
         }
 
         if !stddev.is_nan() {
-            if stddev < self.min_stddev { self.min_stddev = stddev; }
-            if stddev > self.max_stddev { self.max_stddev = stddev; }
+            if stddev < self.min_stddev {
+                self.min_stddev = stddev;
+            }
+            if stddev > self.max_stddev {
+                self.max_stddev = stddev;
+            }
             self.total_stddev += stddev;
         }
     }
@@ -268,17 +292,11 @@ impl TilePyramidAccumulator {
         zoom: u8,
         mut properties: Vec<(Cow<'static, str>, MvtValue)>,
     ) {
-        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, vertices_merc, zoom);
+        let (min_tx, max_tx, min_ty, max_ty) =
+            cell_tile_range_mercator(center_merc, vertices_merc, zoom);
         if min_tx == max_tx && min_ty == max_ty {
             let layer = self.get_or_create_layer((zoom, min_tx, min_ty));
-            layer.add_hexagon_mercator(
-                h3_u64,
-                vertices_merc,
-                zoom,
-                min_tx,
-                min_ty,
-                properties,
-            );
+            layer.add_hexagon_mercator(h3_u64, vertices_merc, zoom, min_tx, min_ty, properties);
         } else {
             for tx in min_tx..=max_tx {
                 for ty in min_ty..=max_ty {
@@ -289,14 +307,7 @@ impl TilePyramidAccumulator {
                         properties.clone()
                     };
                     let layer = self.get_or_create_layer((zoom, tx, ty));
-                    layer.add_hexagon_mercator(
-                        h3_u64,
-                        vertices_merc,
-                        zoom,
-                        tx,
-                        ty,
-                        props,
-                    );
+                    layer.add_hexagon_mercator(h3_u64, vertices_merc, zoom, tx, ty, props);
                 }
             }
         }
@@ -351,7 +362,8 @@ impl TilePyramidAccumulator {
 
     /// Flush all remaining active tiles at completion in parallel across Rayon workers
     pub fn flush_all(self, writer: &mut PmtilesWriter) -> std::io::Result<usize> {
-        let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> = self.tile_buckets.into_iter().collect();
+        let remaining_tiles: Vec<((u8, u32, u32), MvtLayer)> =
+            self.tile_buckets.into_iter().collect();
         if remaining_tiles.is_empty() {
             return Ok(0);
         }

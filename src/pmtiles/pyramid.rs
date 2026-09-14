@@ -1,7 +1,7 @@
 //! Web Mercator tile pyramid coordinate math and bounding boxes for PMTiles v3.
 
-use h3o::{CellIndex, LatLng};
 use crate::pmtiles::mvt::MercatorPoint;
+use h3o::{CellIndex, LatLng};
 
 /// Convert WGS84 (lon, lat) to Web Mercator tile coordinates (x, y) at zoom z
 pub fn lon_lat_to_tile_xy(lon: f64, lat: f64, z: u8) -> (u32, u32) {
@@ -63,7 +63,11 @@ pub fn cell_tile_range(center: LatLng, vertices: &[LatLng], z: u8) -> (u32, u32,
 
 /// Determine the tile coordinate range for an H3 cell with precalculated normalized Mercator points
 #[inline(always)]
-pub fn cell_tile_range_mercator(center: MercatorPoint, vertices: &[MercatorPoint], z: u8) -> (u32, u32, u32, u32) {
+pub fn cell_tile_range_mercator(
+    center: MercatorPoint,
+    vertices: &[MercatorPoint],
+    z: u8,
+) -> (u32, u32, u32, u32) {
     let (mut min_tx, mut min_ty) = mercator_to_tile_xy(center, z);
     let mut max_tx = min_tx;
     let mut max_ty = min_ty;

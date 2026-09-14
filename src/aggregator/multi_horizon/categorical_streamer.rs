@@ -3,11 +3,11 @@
 //! Provides single-pass streaming aggregation across multiple H3 resolution levels simultaneously
 //! for discrete integer / land cover categories and classification maps.
 
+use fxhash::FxBuildHasher;
+use h3o::Resolution;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use fxhash::FxBuildHasher;
-use h3o::Resolution;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::CategoricalAccumulator;

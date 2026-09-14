@@ -51,12 +51,7 @@ pub fn apply_horizontal_predictor<T: WrappingAdd>(
 
 /// Apply TIFF Horizontal Predictor on u8 samples with ARM NEON SIMD acceleration when spp == 1.
 #[inline]
-pub fn apply_horizontal_predictor_u8(
-    data: &mut [u8],
-    data_w: usize,
-    data_h: usize,
-    spp: usize,
-) {
+pub fn apply_horizontal_predictor_u8(data: &mut [u8], data_w: usize, data_h: usize, spp: usize) {
     if spp != 1 {
         apply_horizontal_predictor(data, data_w, data_h, spp);
         return;
@@ -79,12 +74,7 @@ pub fn apply_horizontal_predictor_u8(
 
 /// Apply TIFF Horizontal Predictor on u16 samples with ARM NEON SIMD acceleration when spp == 1.
 #[inline]
-pub fn apply_horizontal_predictor_u16(
-    data: &mut [u16],
-    data_w: usize,
-    data_h: usize,
-    spp: usize,
-) {
+pub fn apply_horizontal_predictor_u16(data: &mut [u16], data_w: usize, data_h: usize, spp: usize) {
     if spp != 1 {
         apply_horizontal_predictor(data, data_w, data_h, spp);
         return;
@@ -248,14 +238,22 @@ pub fn unpack_integer_samples<T: TiffSample + WrappingAdd>(
         if src_stride_bytes == dst_stride_bytes {
             let total_bytes = data_w * data_h * spp * sample_bytes;
             unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, total_bytes);
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    dst.as_mut_ptr() as *mut u8,
+                    total_bytes,
+                );
             }
         } else {
             for r in 0..data_h {
                 let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
                 let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
                 unsafe {
-                    std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, dst_stride_bytes);
+                    std::ptr::copy_nonoverlapping(
+                        s.as_ptr(),
+                        d.as_mut_ptr() as *mut u8,
+                        dst_stride_bytes,
+                    );
                 }
             }
         }
@@ -521,14 +519,22 @@ pub fn unpack_f32(
                 if src_stride_bytes == dst_stride_bytes {
                     let total_bytes = data_w * data_h * spp * 4;
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, total_bytes);
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            dst.as_mut_ptr() as *mut u8,
+                            total_bytes,
+                        );
                     }
                 } else {
                     for r in 0..data_h {
                         let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
                         let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
                         unsafe {
-                            std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, dst_stride_bytes);
+                            std::ptr::copy_nonoverlapping(
+                                s.as_ptr(),
+                                d.as_mut_ptr() as *mut u8,
+                                dst_stride_bytes,
+                            );
                         }
                     }
                 }
@@ -540,14 +546,20 @@ pub fn unpack_f32(
                         TiffByteOrder::LittleEndian => {
                             for (i, item) in d.iter_mut().enumerate() {
                                 *item = f32::from_bits(u32::from_le_bytes([
-                                    s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
+                                    s[i * 4],
+                                    s[i * 4 + 1],
+                                    s[i * 4 + 2],
+                                    s[i * 4 + 3],
                                 ]));
                             }
                         }
                         TiffByteOrder::BigEndian => {
                             for (i, item) in d.iter_mut().enumerate() {
                                 *item = f32::from_bits(u32::from_be_bytes([
-                                    s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3],
+                                    s[i * 4],
+                                    s[i * 4 + 1],
+                                    s[i * 4 + 2],
+                                    s[i * 4 + 3],
                                 ]));
                             }
                         }
@@ -613,14 +625,22 @@ pub fn unpack_f64(
                 if src_stride_bytes == dst_stride_bytes {
                     let total_bytes = data_w * data_h * spp * 8;
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, total_bytes);
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            dst.as_mut_ptr() as *mut u8,
+                            total_bytes,
+                        );
                     }
                 } else {
                     for r in 0..data_h {
                         let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
                         let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
                         unsafe {
-                            std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, dst_stride_bytes);
+                            std::ptr::copy_nonoverlapping(
+                                s.as_ptr(),
+                                d.as_mut_ptr() as *mut u8,
+                                dst_stride_bytes,
+                            );
                         }
                     }
                 }
@@ -632,16 +652,28 @@ pub fn unpack_f64(
                         TiffByteOrder::LittleEndian => {
                             for (i, item) in d.iter_mut().enumerate() {
                                 *item = f64::from_bits(u64::from_le_bytes([
-                                    s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
-                                    s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                                    s[i * 8],
+                                    s[i * 8 + 1],
+                                    s[i * 8 + 2],
+                                    s[i * 8 + 3],
+                                    s[i * 8 + 4],
+                                    s[i * 8 + 5],
+                                    s[i * 8 + 6],
+                                    s[i * 8 + 7],
                                 ]));
                             }
                         }
                         TiffByteOrder::BigEndian => {
                             for (i, item) in d.iter_mut().enumerate() {
                                 *item = f64::from_bits(u64::from_be_bytes([
-                                    s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
-                                    s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+                                    s[i * 8],
+                                    s[i * 8 + 1],
+                                    s[i * 8 + 2],
+                                    s[i * 8 + 3],
+                                    s[i * 8 + 4],
+                                    s[i * 8 + 5],
+                                    s[i * 8 + 6],
+                                    s[i * 8 + 7],
                                 ]));
                             }
                         }
@@ -697,7 +729,7 @@ mod tests {
         // tile_w = 4, data_w = 2, data_h = 2, spp = 1 (tile has padding)
         let tile = vec![
             10u8, 20, 99, 99, // row 0: keep [10, 20]
-            30, 40, 99, 99,   // row 1: keep [30, 40]
+            30, 40, 99, 99, // row 1: keep [30, 40]
         ];
         let mut dst = vec![0u8; 4];
         unpack_integer_samples(

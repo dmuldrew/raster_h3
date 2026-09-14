@@ -74,7 +74,11 @@ impl ChunkWriter {
     pub unsafe fn set_string(&self, col_idx: usize, row_idx: usize, s: &str) {
         let v = self.get_vector(col_idx);
         let c_s = CString::new(s).unwrap_or_default();
-        duckdb_vector_assign_string_element(v, row_idx as idx_t, c_s.as_ptr() as *const std::ffi::c_char);
+        duckdb_vector_assign_string_element(
+            v,
+            row_idx as idx_t,
+            c_s.as_ptr() as *const std::ffi::c_char,
+        );
     }
 
     /// Assign a string slice or binary blob bytes of known length at (col_idx, row_idx)

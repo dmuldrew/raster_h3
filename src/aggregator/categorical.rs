@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use fxhash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
-
-
+use std::collections::HashMap;
 
 /// Maximum number of distinct categories tracked inline without heap allocation.
 pub const INLINE_CAPACITY: usize = 16;
@@ -97,7 +95,8 @@ impl CategoricalAccumulator {
             self.inline_len += 1;
         } else {
             // Spill to heap
-            let mut map: HashMap<i64, f64, FxBuildHasher> = HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
+            let mut map: HashMap<i64, f64, FxBuildHasher> =
+                HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
             for i in 0..INLINE_CAPACITY {
                 map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
             }
@@ -227,7 +226,6 @@ impl CategoricalAccumulator {
     }
 }
 
-
 /// Trait for numeric raster pixel types that support high-throughput SIMD / branchless span uniformity detection.
 pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {
     /// Return true if all values in the slice are identical to slice[0], or if slice is empty.
@@ -278,9 +276,8 @@ impl CategoricalUniformity for i8 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u8_slice: &[u8] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len())
-        };
+        let u8_slice: &[u8] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
         u8::is_uniform(u8_slice)
     }
 }
@@ -326,9 +323,8 @@ impl CategoricalUniformity for i16 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u16_slice: &[u16] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len())
-        };
+        let u16_slice: &[u16] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len()) };
         u16::is_uniform(u16_slice)
     }
 }
@@ -374,9 +370,8 @@ impl CategoricalUniformity for i32 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u32_slice: &[u32] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len())
-        };
+        let u32_slice: &[u32] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len()) };
         u32::is_uniform(u32_slice)
     }
 }
@@ -426,9 +421,8 @@ impl CategoricalUniformity for i64 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u64_slice: &[u64] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len())
-        };
+        let u64_slice: &[u64] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len()) };
         u64::is_uniform(u64_slice)
     }
 }
@@ -531,28 +525,42 @@ mod tests {
         for c in 0..16 {
             acc.update_weighted(c, 1.0);
             assert_eq!(acc.unique_classes(), (c + 1) as usize);
-            assert!(acc.heap_counts.is_none(), "Must remain in inline storage for <= 16 classes");
+            assert!(
+                acc.heap_counts.is_none(),
+                "Must remain in inline storage for <= 16 classes"
+            );
         }
         assert_eq!(acc.inline_len, 16);
         assert_eq!(acc.total_count, 16.0);
 
         // Update existing class 5: must NOT trigger heap spillover
         acc.update_weighted(5, 4.0);
-        assert!(acc.heap_counts.is_none(), "Updating existing class must not allocate heap");
+        assert!(
+            acc.heap_counts.is_none(),
+            "Updating existing class must not allocate heap"
+        );
         assert_eq!(acc.unique_classes(), 16);
         assert_eq!(acc.get_class_count(5), 5.0);
         assert_eq!(acc.total_count, 20.0);
 
         // Add 17th class: triggers spillover to heap
         acc.update_weighted(100, 10.0);
-        assert!(acc.heap_counts.is_some(), "Adding 17th class must spill to heap HashMap");
+        assert!(
+            acc.heap_counts.is_some(),
+            "Adding 17th class must spill to heap HashMap"
+        );
         assert_eq!(acc.unique_classes(), 17);
         assert_eq!(acc.total_count, 30.0);
 
         // Verify all 16 previous classes are preserved in heap map
         for c in 0..16 {
             let expected = if c == 5 { 5.0 } else { 1.0 };
-            assert_eq!(acc.get_class_count(c), expected, "Preserved class count mismatch for class {}", c);
+            assert_eq!(
+                acc.get_class_count(c),
+                expected,
+                "Preserved class count mismatch for class {}",
+                c
+            );
         }
         assert_eq!(acc.get_class_count(100), 10.0);
 
@@ -611,7 +619,11 @@ mod tests {
         let s_entropy = skewed.shannon_entropy();
         assert!(s_entropy > 0.0);
         assert!(s_entropy < 2.0f64.ln());
-        assert!(s_entropy < 1e-4, "Skewed distribution must have near-zero entropy: got {}", s_entropy);
+        assert!(
+            s_entropy < 1e-4,
+            "Skewed distribution must have near-zero entropy: got {}",
+            s_entropy
+        );
     }
 
     #[test]
@@ -654,4 +666,3 @@ mod tests {
         assert!(json_heap.ends_with('}'));
     }
 }
-

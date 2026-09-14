@@ -5,6 +5,8 @@ use std::fs::File;
 use tempfile::NamedTempFile;
 
 use helpers::create_wave_test_geotiff as create_test_geotiff;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiContinuousRecord, MultiResolutionConfig,
     MultiScanHorizonStreamer,
@@ -12,8 +14,6 @@ use raster_h3::aggregator::multi_horizon::{
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
 
 #[test]
 fn test_multi_resolution_direct_ground_truth_exact_match() {
@@ -43,7 +43,10 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
         }
         for rec in batch {
             let res = rec.resolution;
-            multi_res_map.get_mut(&res).unwrap().insert(rec.h3_index, rec);
+            multi_res_map
+                .get_mut(&res)
+                .unwrap()
+                .insert(rec.h3_index, rec);
         }
     }
 
@@ -51,7 +54,8 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
     for &target_res in &[7, 8, 9] {
         let single_config = MultiResolutionConfig::single(target_res);
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = MultiScanHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer =
+            MultiScanHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -92,12 +96,14 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
             assert!(
                 (multi_rec.accumulator.mean() - single_acc.mean()).abs() < 1e-9,
                 "Mean mismatch at cell {:x} (res {})",
-                cell_u64, target_res
+                cell_u64,
+                target_res
             );
             assert!(
                 (multi_rec.accumulator.variance() - single_acc.variance()).abs() < 1e-7,
                 "Variance mismatch at cell {:x} (res {})",
-                cell_u64, target_res
+                cell_u64,
+                target_res
             );
             assert_eq!(multi_rec.accumulator.min, single_acc.min);
             assert_eq!(multi_rec.accumulator.max, single_acc.max);
@@ -120,7 +126,8 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
         ..Default::default()
     };
     let reader = GeoTiffStreamReader::open(raster_path).unwrap();
-    let mut multi_cat_streamer = MultiCategoricalHorizonStreamer::new(reader, &multi_config).unwrap();
+    let mut multi_cat_streamer =
+        MultiCategoricalHorizonStreamer::new(reader, &multi_config).unwrap();
 
     let mut multi_cat_map: HashMap<u8, HashMap<u64, _>> = HashMap::new();
     multi_cat_map.insert(7, HashMap::new());
@@ -133,14 +140,18 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
         }
         for rec in batch {
             let res = rec.resolution;
-            multi_cat_map.get_mut(&res).unwrap().insert(rec.h3_index, rec);
+            multi_cat_map
+                .get_mut(&res)
+                .unwrap()
+                .insert(rec.h3_index, rec);
         }
     }
 
     for &target_res in &[7, 8] {
         let single_config = MultiResolutionConfig::single(target_res);
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = MultiCategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer =
+            MultiCategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -164,7 +175,10 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
             let multi_rec = multi_cells.get(cell_u64).unwrap();
             assert_eq!(multi_rec.accumulator.total_count, single_acc.total_count);
             assert_eq!(multi_rec.accumulator.majority(), single_acc.majority());
-            assert_eq!(multi_rec.accumulator.unique_classes(), single_acc.unique_classes());
+            assert_eq!(
+                multi_rec.accumulator.unique_classes(),
+                single_acc.unique_classes()
+            );
             single_acc.for_each_class(|cat, cnt| {
                 assert_eq!(multi_rec.accumulator.get_class_count(cat), cnt);
             });
@@ -193,7 +207,8 @@ fn test_prefetch_drain_chunk_batch_into() {
     let num_chunks = reader.chunk_layout.total_chunks as u32;
 
     let indices: Vec<u32> = (0..num_chunks).collect();
-    let prefetcher = PrefetchedChunkReader::spawn_with_workers(reader, indices, num_chunks as usize, 2);
+    let prefetcher =
+        PrefetchedChunkReader::spawn_with_workers(reader, indices, num_chunks as usize, 2);
 
     let mut batch = Vec::new();
     let min_b = (num_chunks as usize / 2).max(1);
@@ -241,7 +256,10 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
         }
         for rec in batch {
             let res = rec.resolution;
-            multi_res_map.get_mut(&res).unwrap().insert(rec.h3_index, rec);
+            multi_res_map
+                .get_mut(&res)
+                .unwrap()
+                .insert(rec.h3_index, rec);
         }
     }
 
@@ -250,7 +268,8 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
         let mut single_config = MultiResolutionConfig::single(target_res);
         single_config.sampling = SamplingPattern::five_point();
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = MultiScanHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer =
+            MultiScanHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -286,17 +305,24 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
             assert!(
                 (multi_rec.accumulator.count - single_acc.count).abs() < 1e-6,
                 "Count mismatch at cell {:x} (res {}): multi = {}, single = {}",
-                cell_u64, target_res, multi_rec.accumulator.count, single_acc.count
+                cell_u64,
+                target_res,
+                multi_rec.accumulator.count,
+                single_acc.count
             );
             assert!(
                 (multi_rec.accumulator.sum - single_acc.sum).abs() < 1e-5,
                 "Sum mismatch at cell {:x} (res {}): multi = {}, single = {}",
-                cell_u64, target_res, multi_rec.accumulator.sum, single_acc.sum
+                cell_u64,
+                target_res,
+                multi_rec.accumulator.sum,
+                single_acc.sum
             );
             assert!(
                 (multi_rec.accumulator.mean() - single_acc.mean()).abs() < 1e-5,
                 "Mean mismatch at cell {:x} (res {})",
-                cell_u64, target_res
+                cell_u64,
+                target_res
             );
         }
 
@@ -319,7 +345,8 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
         ..Default::default()
     };
     let reader = GeoTiffStreamReader::open(raster_path).unwrap();
-    let mut multi_cat_streamer = MultiCategoricalHorizonStreamer::new(reader, &multi_config).unwrap();
+    let mut multi_cat_streamer =
+        MultiCategoricalHorizonStreamer::new(reader, &multi_config).unwrap();
 
     let mut multi_cat_map: HashMap<u8, HashMap<u64, _>> = HashMap::new();
     multi_cat_map.insert(8, HashMap::new());
@@ -332,7 +359,10 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
         }
         for rec in batch {
             let res = rec.resolution;
-            multi_cat_map.get_mut(&res).unwrap().insert(rec.h3_index, rec);
+            multi_cat_map
+                .get_mut(&res)
+                .unwrap()
+                .insert(rec.h3_index, rec);
         }
     }
 
@@ -340,7 +370,8 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
         let mut single_config = MultiResolutionConfig::single(target_res);
         single_config.sampling = SamplingPattern::five_point();
         let single_reader = GeoTiffStreamReader::open(raster_path).unwrap();
-        let mut single_streamer = MultiCategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
+        let mut single_streamer =
+            MultiCategoricalHorizonStreamer::new(single_reader, &single_config).unwrap();
 
         let mut single_cells = HashMap::new();
         let mut total_single_mass = 0.0;
@@ -364,13 +395,16 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
             let multi_rec = multi_cells.get(cell_u64).unwrap();
             assert!(
                 (multi_rec.accumulator.total_count - single_acc.total_count).abs() < 1e-6,
-                "Total count mismatch at cell {:x}", cell_u64
+                "Total count mismatch at cell {:x}",
+                cell_u64
             );
             assert_eq!(multi_rec.accumulator.majority(), single_acc.majority());
             single_acc.for_each_class(|cat, cnt| {
                 assert!(
                     (multi_rec.accumulator.get_class_count(cat) - cnt).abs() < 1e-6,
-                    "Class count mismatch for cat {} at cell {:x}", cat, cell_u64
+                    "Class count mismatch for cat {} at cell {:x}",
+                    cat,
+                    cell_u64
                 );
             });
         }
@@ -408,7 +442,10 @@ fn test_parquet_continuous_streaming_export_and_sorting() {
     let reader = SerializedFileReader::new(file).unwrap();
     let metadata = reader.metadata();
 
-    assert!(metadata.num_row_groups() > 1, "Should produce multiple row groups with row_group_size=50");
+    assert!(
+        metadata.num_row_groups() > 1,
+        "Should produce multiple row groups with row_group_size=50"
+    );
 
     let mut row_count = 0;
     for i in 0..metadata.num_row_groups() {
@@ -430,7 +467,12 @@ fn test_parquet_continuous_streaming_export_and_sorting() {
             // New row group started, reset monotonic check
             prev_index = h3_idx;
         } else {
-            assert!(h3_idx >= prev_index, "h3_index must be sorted within row group: {} >= {}", h3_idx, prev_index);
+            assert!(
+                h3_idx >= prev_index,
+                "h3_index must be sorted within row group: {} >= {}",
+                h3_idx,
+                prev_index
+            );
             prev_index = h3_idx;
         }
         current_rg_rows += 1;
@@ -463,7 +505,10 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
     )
     .unwrap();
 
-    assert!(total_written > 0, "Should write categorical hexagons to Parquet");
+    assert!(
+        total_written > 0,
+        "Should write categorical hexagons to Parquet"
+    );
 
     let file = File::open(&parquet_path).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
@@ -488,11 +533,12 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
         if current_rg_rows % 50 == 0 {
             prev_index = h3_idx;
         } else {
-            assert!(h3_idx >= prev_index, "h3_index must be sorted within row group");
+            assert!(
+                h3_idx >= prev_index,
+                "h3_index must be sorted within row group"
+            );
             prev_index = h3_idx;
         }
         current_rg_rows += 1;
     }
 }
-
-

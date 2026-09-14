@@ -2,8 +2,22 @@ use h3o::{CellIndex, LatLng, Resolution};
 
 /// H3 average edge length in meters for resolutions 0..=15
 pub const H3_EDGE_LENGTH_M: [f64; 16] = [
-    1_107_712.0, 418_676.0, 158_244.0, 59_810.0, 22_606.0, 8_544.0, 3_229.0, 1_220.0,
-    461.3, 174.4, 65.9, 24.9, 9.41, 3.56, 1.35, 0.509,
+    1_107_712.0,
+    418_676.0,
+    158_244.0,
+    59_810.0,
+    22_606.0,
+    8_544.0,
+    3_229.0,
+    1_220.0,
+    461.3,
+    174.4,
+    65.9,
+    24.9,
+    9.41,
+    3.56,
+    1.35,
+    0.509,
 ];
 
 /// Helper to determine if a pixel size in meters is safe for 1-ring Voronoi neighbor caching
@@ -153,18 +167,23 @@ impl H3ScanlineLookahead {
         res: Resolution,
         run_cell: u64,
     ) -> (usize, Option<u64>) {
-        let remaining_guess = self.prev_hex_width.saturating_sub(self.current_hex_span).max(1);
+        let remaining_guess = self
+            .prev_hex_width
+            .saturating_sub(self.current_hex_span)
+            .max(1);
         let mut guess_c = (c + remaining_guess).min(row_width);
         let mut guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
         let mut last_cell_at_right: Option<u64> = None;
-        
+
         while guess_c < row_width {
             if let Ok(ll) = LatLng::new(lat_row, guess_lon) {
                 let guess_cell: u64 = ll.to_cell(res).into();
                 if guess_cell == run_cell {
                     let step = (guess_c - c).max(1);
                     let new_guess_c = (guess_c + step).min(row_width);
-                    if new_guess_c == guess_c { break; }
+                    if new_guess_c == guess_c {
+                        break;
+                    }
                     guess_c = new_guess_c;
                     guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
                 } else {
@@ -194,7 +213,14 @@ impl H3ScanlineLookahead {
                 last_cell_at_right = None;
             }
         }
-        (left, if left < row_width { last_cell_at_right } else { None })
+        (
+            left,
+            if left < row_width {
+                last_cell_at_right
+            } else {
+                None
+            },
+        )
     }
 
     /// Determine the end of the current H3 cell span for projected coordinates using exponential probe + binary search
@@ -212,7 +238,10 @@ impl H3ScanlineLookahead {
     where
         F: FnMut(f64, f64) -> Option<u64>,
     {
-        let remaining_guess = self.prev_hex_width.saturating_sub(self.current_hex_span).max(1);
+        let remaining_guess = self
+            .prev_hex_width
+            .saturating_sub(self.current_hex_span)
+            .max(1);
         let mut guess_c = (c + remaining_guess).min(row_width);
         let mut guess_x = x_start + (guess_c as f64) * dx_step;
         let mut last_cell_at_right: Option<u64> = None;
@@ -253,7 +282,14 @@ impl H3ScanlineLookahead {
                 last_cell_at_right = None;
             }
         }
-        (left, if left < row_width { last_cell_at_right } else { None })
+        (
+            left,
+            if left < row_width {
+                last_cell_at_right
+            } else {
+                None
+            },
+        )
     }
 
     /// Find the sub-pixel core interval `[core_start, core_end)` within `[c, span_end)`
@@ -314,4 +350,3 @@ impl H3ScanlineLookahead {
         }
     }
 }
-

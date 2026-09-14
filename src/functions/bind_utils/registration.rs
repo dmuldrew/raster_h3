@@ -5,10 +5,7 @@ use crate::ffi::{
 };
 
 /// Add a positional parameter with automated logical type lifecycle management
-pub unsafe fn add_positional_parameter(
-    func: duckdb_table_function,
-    duckdb_type: DuckDBType,
-) {
+pub unsafe fn add_positional_parameter(func: duckdb_table_function, duckdb_type: DuckDBType) {
     let mut logical_type = duckdb_create_logical_type(duckdb_type);
     duckdb_table_function_add_parameter(func, logical_type);
     duckdb_destroy_logical_type(&mut logical_type);

@@ -3,14 +3,14 @@
 //! Orchestrates the streaming aggregation of GeoTIFF rasters across multiple H3 resolutions
 //! and packages the resulting vector hexagons directly into a single PMTiles v3 archive.
 
-use std::borrow::Cow;
-use std::collections::{BinaryHeap, HashMap};
-use std::io;
-use std::path::Path;
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, LatLng, Resolution};
 use rayon::prelude::*;
 use serde_json::json;
+use std::borrow::Cow;
+use std::collections::{BinaryHeap, HashMap};
+use std::io;
+use std::path::Path;
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
@@ -31,8 +31,8 @@ use crate::raster::geotiff::GeoTiffStreamReader;
 // Re-export tile pyramid coordinate math and zoom calculations from pyramid module
 pub use crate::pmtiles::pyramid::{
     cell_boundary_mercator, cell_tile_range, cell_tile_range_mercator, h3_res_for_zoom,
-    h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy,
-    tile_xy_to_bbox, zoom_to_h3_res, zooms_for_h3_res,
+    h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy, tile_xy_to_bbox,
+    zoom_to_h3_res, zooms_for_h3_res,
 };
 
 // Re-export feature definitions, metadata, accumulator, and export summaries from features module
@@ -160,10 +160,18 @@ impl H3PmtilesTiler {
             let c_lat = center.lat();
             let c_lon = center.lng();
 
-            if c_lon < global_min_lon { global_min_lon = c_lon; }
-            if c_lon > global_max_lon { global_max_lon = c_lon; }
-            if c_lat < global_min_lat { global_min_lat = c_lat; }
-            if c_lat > global_max_lat { global_max_lat = c_lat; }
+            if c_lon < global_min_lon {
+                global_min_lon = c_lon;
+            }
+            if c_lon > global_max_lon {
+                global_max_lon = c_lon;
+            }
+            if c_lat < global_min_lat {
+                global_min_lat = c_lat;
+            }
+            if c_lat > global_max_lat {
+                global_max_lat = c_lat;
+            }
 
             let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
             let (v_merc, v_count) = cell_boundary_mercator(cell);
@@ -171,15 +179,22 @@ impl H3PmtilesTiler {
 
             let res_u8: u8 = cell.resolution().into();
             let zoom = h3_res_to_zoom(res_u8);
-            if zoom < min_zoom { min_zoom = zoom; }
-            if zoom > max_zoom { max_zoom = zoom; }
+            if zoom < min_zoom {
+                min_zoom = zoom;
+            }
+            if zoom > max_zoom {
+                max_zoom = zoom;
+            }
 
             let mut properties = feat.properties;
             if !properties.iter().any(|(k, _)| k == "h3_index") {
                 properties.push((Cow::Borrowed("h3_index"), MvtValue::UInt(feat.h3_index)));
             }
             if !properties.iter().any(|(k, _)| k == "h3_hex") {
-                properties.push((Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(feat.h3_index)));
+                properties.push((
+                    Cow::Borrowed("h3_hex"),
+                    MvtValue::from_hex_u64(feat.h3_index),
+                ));
             }
             if !properties.iter().any(|(k, _)| k == "resolution") {
                 properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));
@@ -217,7 +232,12 @@ impl H3PmtilesTiler {
         let mut writer = PmtilesWriter::new(
             min_zoom,
             max_zoom,
-            [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
+            [
+                global_min_lon,
+                global_min_lat,
+                global_max_lon,
+                global_max_lat,
+            ],
             metadata.to_string(),
         )?;
 
@@ -249,7 +269,9 @@ impl H3PmtilesTiler {
         output_path: P,
         properties: Option<&str>,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let property_filter = properties.map(PropertyFilter::parse).unwrap_or_else(PropertyFilter::all);
+        let property_filter = properties
+            .map(PropertyFilter::parse)
+            .unwrap_or_else(PropertyFilter::all);
         let needs_stddev = property_filter.needs_stddev();
 
         let resolutions = streamer.resolution_u8s().to_vec();
@@ -260,16 +282,23 @@ impl H3PmtilesTiler {
         for &res in &resolutions {
             let zooms = zooms_for_h3_res(res, min_res);
             for &z in &zooms {
-                if z < min_zoom { min_zoom = z; }
-                if z > max_zoom { max_zoom = z; }
+                if z < min_zoom {
+                    min_zoom = z;
+                }
+                if z > max_zoom {
+                    max_zoom = z;
+                }
             }
         }
 
-        let max_cell_radius = resolutions.iter().map(|&r| max_hex_radius_deg(r)).fold(0.0f64, f64::max);
+        let max_cell_radius = resolutions
+            .iter()
+            .map(|&r| max_hex_radius_deg(r))
+            .fold(0.0f64, f64::max);
         let safety_margin = 2.5 * max_cell_radius;
 
-        let mut accumulator = TilePyramidAccumulator::new(safety_margin)
-            .with_filter(property_filter.clone());
+        let mut accumulator =
+            TilePyramidAccumulator::new(safety_margin).with_filter(property_filter.clone());
 
         let mut total_hexagons = 0usize;
         let mut global_min_lon = 180.0f64;
@@ -288,19 +317,23 @@ impl H3PmtilesTiler {
         )?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<ContinuousStreamBatch>(4);
-        let producer_handle = std::thread::spawn(move || {
-            loop {
-                let mut records = Vec::with_capacity(8192);
-                streamer.drain_completed_into(8192, |_i, record| {
-                    records.push(record);
-                });
-                if records.is_empty() {
-                    break;
-                }
-                let lat_horizon = streamer.current_lat_horizon();
-                if tx.send(ContinuousStreamBatch { records, lat_horizon }).is_err() {
-                    break;
-                }
+        let producer_handle = std::thread::spawn(move || loop {
+            let mut records = Vec::with_capacity(8192);
+            streamer.drain_completed_into(8192, |_i, record| {
+                records.push(record);
+            });
+            if records.is_empty() {
+                break;
+            }
+            let lat_horizon = streamer.current_lat_horizon();
+            if tx
+                .send(ContinuousStreamBatch {
+                    records,
+                    lat_horizon,
+                })
+                .is_err()
+            {
+                break;
             }
         });
 
@@ -322,7 +355,11 @@ impl H3PmtilesTiler {
                     let (v_merc, v_count) = cell_boundary_mercator(cell);
                     let vertices_merc = &v_merc[..v_count];
 
-                    let stddev = if needs_stddev { accumulator.stddev() } else { 0.0 };
+                    let stddev = if needs_stddev {
+                        accumulator.stddev()
+                    } else {
+                        0.0
+                    };
 
                     let properties = FeatureProperties::Continuous {
                         h3_index,
@@ -346,11 +383,16 @@ impl H3PmtilesTiler {
                                 if let Some(parent_cell) = cell.parent(res_enum) {
                                     let parent_h3: u64 = parent_cell.into();
                                     let p_center: LatLng = parent_cell.into();
-                                    let p_center_merc = MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
+                                    let p_center_merc =
+                                        MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
                                     let (p_v_merc, p_v_count) = cell_boundary_mercator(parent_cell);
                                     let p_vertices_merc = &p_v_merc[..p_v_count];
 
-                                    let parent_stddev = if needs_stddev { accumulator.stddev() } else { 0.0 };
+                                    let parent_stddev = if needs_stddev {
+                                        accumulator.stddev()
+                                    } else {
+                                        0.0
+                                    };
                                     let parent_properties = FeatureProperties::Continuous {
                                         h3_index: parent_h3,
                                         resolution: optimal_res,
@@ -362,7 +404,11 @@ impl H3PmtilesTiler {
                                         max: accumulator.max,
                                     };
 
-                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(p_center_merc, p_vertices_merc, zoom);
+                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(
+                                        p_center_merc,
+                                        p_vertices_merc,
+                                        zoom,
+                                    );
                                     if min_tx == max_tx && min_ty == max_ty {
                                         let feature = MvtFeature::from_mercator(
                                             parent_h3,
@@ -403,7 +449,8 @@ impl H3PmtilesTiler {
                             }
                         }
 
-                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, vertices_merc, zoom);
+                        let (min_tx, max_tx, min_ty, max_ty) =
+                            cell_tile_range_mercator(center_merc, vertices_merc, zoom);
                         if min_tx == max_tx && min_ty == max_ty {
                             let feature = MvtFeature::from_mercator(
                                 h3_index,
@@ -457,10 +504,18 @@ impl H3PmtilesTiler {
                     .or_insert_with(ResolutionAccumulatorStats::new)
                     .record(&hex.accumulator);
 
-                if hex.c_lon < global_min_lon { global_min_lon = hex.c_lon; }
-                if hex.c_lon > global_max_lon { global_max_lon = hex.c_lon; }
-                if hex.c_lat < global_min_lat { global_min_lat = hex.c_lat; }
-                if hex.c_lat > global_max_lat { global_max_lat = hex.c_lat; }
+                if hex.c_lon < global_min_lon {
+                    global_min_lon = hex.c_lon;
+                }
+                if hex.c_lon > global_max_lon {
+                    global_max_lon = hex.c_lon;
+                }
+                if hex.c_lat < global_min_lat {
+                    global_min_lat = hex.c_lat;
+                }
+                if hex.c_lat > global_max_lat {
+                    global_max_lat = hex.c_lat;
+                }
 
                 for op in hex.ops {
                     accumulator.add_op(op.tile_key, op.feature, op.is_parent);
@@ -501,15 +556,33 @@ impl H3PmtilesTiler {
 
         let fields_json = if property_filter.is_custom {
             let mut m = serde_json::Map::new();
-            if property_filter.has_continuous(PROP_H3_INDEX) { m.insert("h3_index".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_H3_HEX) { m.insert("h3_hex".to_string(), json!("String")); }
-            if property_filter.has_continuous(PROP_RESOLUTION) { m.insert("resolution".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_MEAN) { m.insert("mean".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_SUM) { m.insert("sum".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_STDDEV) { m.insert("stddev".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_COUNT) { m.insert("count".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_MIN) { m.insert("min".to_string(), json!("Number")); }
-            if property_filter.has_continuous(PROP_MAX) { m.insert("max".to_string(), json!("Number")); }
+            if property_filter.has_continuous(PROP_H3_INDEX) {
+                m.insert("h3_index".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_H3_HEX) {
+                m.insert("h3_hex".to_string(), json!("String"));
+            }
+            if property_filter.has_continuous(PROP_RESOLUTION) {
+                m.insert("resolution".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_MEAN) {
+                m.insert("mean".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_SUM) {
+                m.insert("sum".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_STDDEV) {
+                m.insert("stddev".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_COUNT) {
+                m.insert("count".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_MIN) {
+                m.insert("min".to_string(), json!("Number"));
+            }
+            if property_filter.has_continuous(PROP_MAX) {
+                m.insert("max".to_string(), json!("Number"));
+            }
             serde_json::Value::Object(m)
         } else {
             json!({
@@ -541,7 +614,12 @@ impl H3PmtilesTiler {
         );
 
         writer.set_metadata(
-            [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
+            [
+                global_min_lon,
+                global_min_lat,
+                global_max_lon,
+                global_max_lat,
+            ],
             metadata.to_string(),
         );
 
@@ -563,7 +641,9 @@ impl H3PmtilesTiler {
         output_path: P,
         properties: Option<&str>,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let property_filter = properties.map(PropertyFilter::parse).unwrap_or_else(PropertyFilter::all);
+        let property_filter = properties
+            .map(PropertyFilter::parse)
+            .unwrap_or_else(PropertyFilter::all);
         let needs_entropy = property_filter.needs_entropy();
 
         let resolutions = streamer.resolution_u8s().to_vec();
@@ -575,16 +655,23 @@ impl H3PmtilesTiler {
         for &res in &resolutions {
             let zooms = zooms_for_h3_res(res, min_res);
             for &z in &zooms {
-                if z < min_zoom { min_zoom = z; }
-                if z > max_zoom { max_zoom = z; }
+                if z < min_zoom {
+                    min_zoom = z;
+                }
+                if z > max_zoom {
+                    max_zoom = z;
+                }
             }
         }
 
-        let max_cell_radius = resolutions.iter().map(|&r| max_hex_radius_deg(r)).fold(0.0f64, f64::max);
+        let max_cell_radius = resolutions
+            .iter()
+            .map(|&r| max_hex_radius_deg(r))
+            .fold(0.0f64, f64::max);
         let safety_margin = 2.5 * max_cell_radius;
 
-        let mut accumulator = TilePyramidAccumulator::new(safety_margin)
-            .with_filter(property_filter.clone());
+        let mut accumulator =
+            TilePyramidAccumulator::new(safety_margin).with_filter(property_filter.clone());
 
         let mut total_hexagons = 0usize;
         let mut global_min_lon = 180.0f64;
@@ -592,12 +679,18 @@ impl H3PmtilesTiler {
         let mut global_max_lon = -180.0f64;
         let mut global_max_lat = -90.0f64;
 
-        let mut res_cell_counts: HashMap<u8, usize, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-        let mut res_purity_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-        let mut res_class_counts: HashMap<u8, HashMap<i64, u64, FxBuildHasher>, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-        let mut res_entropy_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-        let mut res_distinct_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
-        let mut res_pixel_sums: HashMap<u8, f64, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_cell_counts: HashMap<u8, usize, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_purity_sums: HashMap<u8, f64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_class_counts: HashMap<u8, HashMap<i64, u64, FxBuildHasher>, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_entropy_sums: HashMap<u8, f64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_distinct_sums: HashMap<u8, f64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
+        let mut res_pixel_sums: HashMap<u8, f64, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher::default());
 
         let mut writer = PmtilesWriter::new(
             min_zoom,
@@ -607,19 +700,23 @@ impl H3PmtilesTiler {
         )?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<CategoricalStreamBatch>(4);
-        let producer_handle = std::thread::spawn(move || {
-            loop {
-                let mut records = Vec::with_capacity(8192);
-                streamer.drain_completed_into(8192, |_i, record| {
-                    records.push(record);
-                });
-                if records.is_empty() {
-                    break;
-                }
-                let lat_horizon = streamer.current_lat_horizon();
-                if tx.send(CategoricalStreamBatch { records, lat_horizon }).is_err() {
-                    break;
-                }
+        let producer_handle = std::thread::spawn(move || loop {
+            let mut records = Vec::with_capacity(8192);
+            streamer.drain_completed_into(8192, |_i, record| {
+                records.push(record);
+            });
+            if records.is_empty() {
+                break;
+            }
+            let lat_horizon = streamer.current_lat_horizon();
+            if tx
+                .send(CategoricalStreamBatch {
+                    records,
+                    lat_horizon,
+                })
+                .is_err()
+            {
+                break;
             }
         });
 
@@ -633,7 +730,11 @@ impl H3PmtilesTiler {
                     let accumulator = record.accumulator;
 
                     let (majority_class, _maj_count, majority_fraction) = accumulator.majority();
-                    let entropy = if needs_entropy { accumulator.shannon_entropy() } else { 0.0 };
+                    let entropy = if needs_entropy {
+                        accumulator.shannon_entropy()
+                    } else {
+                        0.0
+                    };
                     let distinct_classes = accumulator.unique_classes();
                     let pixel_count = accumulator.total_count;
 
@@ -667,7 +768,8 @@ impl H3PmtilesTiler {
                                 if let Some(parent_cell) = cell.parent(res_enum) {
                                     let parent_h3: u64 = parent_cell.into();
                                     let p_center: LatLng = parent_cell.into();
-                                    let p_center_merc = MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
+                                    let p_center_merc =
+                                        MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
                                     let (p_v_merc, p_v_count) = cell_boundary_mercator(parent_cell);
                                     let p_vertices_merc = &p_v_merc[..p_v_count];
 
@@ -681,7 +783,11 @@ impl H3PmtilesTiler {
                                         count: pixel_count,
                                     };
 
-                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(p_center_merc, p_vertices_merc, zoom);
+                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(
+                                        p_center_merc,
+                                        p_vertices_merc,
+                                        zoom,
+                                    );
                                     if min_tx == max_tx && min_ty == max_ty {
                                         let feature = MvtFeature::from_mercator(
                                             parent_h3,
@@ -722,7 +828,8 @@ impl H3PmtilesTiler {
                             }
                         }
 
-                        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, vertices_merc, zoom);
+                        let (min_tx, max_tx, min_ty, max_ty) =
+                            cell_tile_range_mercator(center_merc, vertices_merc, zoom);
                         if min_tx == max_tx && min_ty == max_ty {
                             let feature = MvtFeature::from_mercator(
                                 h3_index,
@@ -778,18 +885,29 @@ impl H3PmtilesTiler {
                 *res_cell_counts.entry(hex.resolution).or_insert(0) += 1;
                 *res_purity_sums.entry(hex.resolution).or_insert(0.0) += hex.majority_fraction;
                 *res_entropy_sums.entry(hex.resolution).or_insert(0.0) += hex.entropy;
-                *res_distinct_sums.entry(hex.resolution).or_insert(0.0) += hex.distinct_classes as f64;
+                *res_distinct_sums.entry(hex.resolution).or_insert(0.0) +=
+                    hex.distinct_classes as f64;
                 *res_pixel_sums.entry(hex.resolution).or_insert(0.0) += hex.pixel_count;
 
-                let class_map = res_class_counts.entry(hex.resolution).or_insert_with(|| HashMap::with_hasher(FxBuildHasher::default()));
+                let class_map = res_class_counts
+                    .entry(hex.resolution)
+                    .or_insert_with(|| HashMap::with_hasher(FxBuildHasher::default()));
                 hex.accumulator.for_each_class(|cls, cnt| {
                     *class_map.entry(cls).or_insert(0) += cnt as u64;
                 });
 
-                if hex.c_lon < global_min_lon { global_min_lon = hex.c_lon; }
-                if hex.c_lon > global_max_lon { global_max_lon = hex.c_lon; }
-                if hex.c_lat < global_min_lat { global_min_lat = hex.c_lat; }
-                if hex.c_lat > global_max_lat { global_max_lat = hex.c_lat; }
+                if hex.c_lon < global_min_lon {
+                    global_min_lon = hex.c_lon;
+                }
+                if hex.c_lon > global_max_lon {
+                    global_max_lon = hex.c_lon;
+                }
+                if hex.c_lat < global_min_lat {
+                    global_min_lat = hex.c_lat;
+                }
+                if hex.c_lat > global_max_lat {
+                    global_max_lat = hex.c_lat;
+                }
 
                 for op in hex.ops {
                     accumulator.add_op(op.tile_key, op.feature, op.is_parent);
@@ -829,10 +947,26 @@ impl H3PmtilesTiler {
             let distinct_sum = res_distinct_sums.get(&res).copied().unwrap_or(0.0);
             let pixel_sum = res_pixel_sums.get(&res).copied().unwrap_or(0.0);
 
-            let avg_purity = if cell_count > 0 { purity_sum / cell_count as f64 } else { 0.0 };
-            let avg_entropy = if cell_count > 0 { entropy_sum / cell_count as f64 } else { 0.0 };
-            let avg_distinct = if cell_count > 0 { distinct_sum / cell_count as f64 } else { 0.0 };
-            let avg_pixels = if cell_count > 0 { pixel_sum / cell_count as f64 } else { 0.0 };
+            let avg_purity = if cell_count > 0 {
+                purity_sum / cell_count as f64
+            } else {
+                0.0
+            };
+            let avg_entropy = if cell_count > 0 {
+                entropy_sum / cell_count as f64
+            } else {
+                0.0
+            };
+            let avg_distinct = if cell_count > 0 {
+                distinct_sum / cell_count as f64
+            } else {
+                0.0
+            };
+            let avg_pixels = if cell_count > 0 {
+                pixel_sum / cell_count as f64
+            } else {
+                0.0
+            };
 
             let mut class_freq_json = serde_json::Map::new();
             if let Some(cmap) = res_class_counts.get(&res) {
@@ -857,14 +991,30 @@ impl H3PmtilesTiler {
 
         let fields_json = if property_filter.is_custom {
             let mut m = serde_json::Map::new();
-            if property_filter.has_categorical(PROP_CAT_H3_INDEX) { m.insert("h3_index".to_string(), json!("Number")); }
-            if property_filter.has_categorical(PROP_CAT_H3_HEX) { m.insert("h3_hex".to_string(), json!("String")); }
-            if property_filter.has_categorical(PROP_CAT_RESOLUTION) { m.insert("resolution".to_string(), json!("Number")); }
-            if property_filter.has_categorical(PROP_CAT_MAJORITY) { m.insert("majority".to_string(), json!("Number")); }
-            if property_filter.has_categorical(PROP_CAT_MAJORITY_FRACTION) { m.insert("majority_fraction".to_string(), json!("Number")); }
-            if property_filter.has_categorical(PROP_CAT_DISTINCT_CLASSES) { m.insert("distinct_classes".to_string(), json!("Number")); }
-            if property_filter.has_categorical(PROP_CAT_ENTROPY) { m.insert("entropy".to_string(), json!("Number")); }
-            if property_filter.has_categorical(PROP_CAT_COUNT) { m.insert("count".to_string(), json!("Number")); }
+            if property_filter.has_categorical(PROP_CAT_H3_INDEX) {
+                m.insert("h3_index".to_string(), json!("Number"));
+            }
+            if property_filter.has_categorical(PROP_CAT_H3_HEX) {
+                m.insert("h3_hex".to_string(), json!("String"));
+            }
+            if property_filter.has_categorical(PROP_CAT_RESOLUTION) {
+                m.insert("resolution".to_string(), json!("Number"));
+            }
+            if property_filter.has_categorical(PROP_CAT_MAJORITY) {
+                m.insert("majority".to_string(), json!("Number"));
+            }
+            if property_filter.has_categorical(PROP_CAT_MAJORITY_FRACTION) {
+                m.insert("majority_fraction".to_string(), json!("Number"));
+            }
+            if property_filter.has_categorical(PROP_CAT_DISTINCT_CLASSES) {
+                m.insert("distinct_classes".to_string(), json!("Number"));
+            }
+            if property_filter.has_categorical(PROP_CAT_ENTROPY) {
+                m.insert("entropy".to_string(), json!("Number"));
+            }
+            if property_filter.has_categorical(PROP_CAT_COUNT) {
+                m.insert("count".to_string(), json!("Number"));
+            }
             serde_json::Value::Object(m)
         } else {
             json!({
@@ -899,7 +1049,12 @@ impl H3PmtilesTiler {
         );
 
         writer.set_metadata(
-            [global_min_lon, global_min_lat, global_max_lon, global_max_lat],
+            [
+                global_min_lon,
+                global_min_lat,
+                global_max_lon,
+                global_max_lat,
+            ],
             metadata.to_string(),
         );
 
@@ -917,10 +1072,16 @@ impl H3PmtilesTiler {
         let resolved_paths = crate::raster::mosaic::resolve_raster_sources(&source_str)?;
         let props = config.properties.clone();
 
-        if resolved_paths.len() == 1 && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or("")) {
+        if resolved_paths.len() == 1
+            && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or(""))
+        {
             let reader = GeoTiffStreamReader::open(&resolved_paths[0])?;
             let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
-            Self::generate_from_categorical_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+            Self::generate_from_categorical_streamer_with_properties(
+                streamer,
+                pmtiles_path,
+                props.as_deref(),
+            )
         } else {
             let mosaic = std::sync::Arc::new(crate::raster::mosaic::MosaicReader::open(
                 &resolved_paths,
@@ -929,7 +1090,11 @@ impl H3PmtilesTiler {
                 config.overlap_rule,
             )?);
             let streamer = MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config)?;
-            Self::generate_from_categorical_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+            Self::generate_from_categorical_streamer_with_properties(
+                streamer,
+                pmtiles_path,
+                props.as_deref(),
+            )
         }
     }
 
@@ -952,10 +1117,16 @@ impl H3PmtilesTiler {
         let resolved_paths = crate::raster::mosaic::resolve_raster_sources(&source_str)?;
         let props = config.properties.clone();
 
-        if resolved_paths.len() == 1 && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or("")) {
+        if resolved_paths.len() == 1
+            && !crate::raster::http_range::is_remote_url(resolved_paths[0].to_str().unwrap_or(""))
+        {
             let reader = GeoTiffStreamReader::open(&resolved_paths[0])?;
             let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
-            Self::generate_from_continuous_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+            Self::generate_from_continuous_streamer_with_properties(
+                streamer,
+                pmtiles_path,
+                props.as_deref(),
+            )
         } else {
             let mosaic = std::sync::Arc::new(crate::raster::mosaic::MosaicReader::open(
                 &resolved_paths,
@@ -964,7 +1135,11 @@ impl H3PmtilesTiler {
                 config.overlap_rule,
             )?);
             let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;
-            Self::generate_from_continuous_streamer_with_properties(streamer, pmtiles_path, props.as_deref())
+            Self::generate_from_continuous_streamer_with_properties(
+                streamer,
+                pmtiles_path,
+                props.as_deref(),
+            )
         }
     }
 
@@ -990,4 +1165,3 @@ impl H3PmtilesTiler {
         )
     }
 }
-

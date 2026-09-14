@@ -3,11 +3,11 @@
 //! Implements the open PMTiles v3 specification for cloud-native single-file
 //! vector tile archives with Gzip compression and Hilbert-indexed directory structure.
 
+use libdeflater::{CompressionLvl, Compressor};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
-use libdeflater::{CompressionLvl, Compressor};
 
 thread_local! {
     static THREAD_COMPRESSOR: RefCell<Compressor> = RefCell::new(
@@ -121,7 +121,12 @@ pub fn gzip_compress(data: &[u8]) -> io::Result<Vec<u8>> {
         let mut compressed = vec![0u8; max_len];
         let actual_size = compressor
             .gzip_compress(data, &mut compressed)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("gzip compression error: {:?}", e)))?;
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("gzip compression error: {:?}", e),
+                )
+            })?;
         compressed.truncate(actual_size);
         Ok(compressed)
     })
@@ -161,10 +166,7 @@ fn encode_directory(entries: &[Entry]) -> io::Result<Vec<u8>> {
     // 4. Offsets: 0 = contiguous with previous, else (offset + 1) to avoid
     //    conflicting with the 0 sentinel. Matches go-pmtiles SerializeEntries.
     for (i, e) in entries.iter().enumerate() {
-        if i > 0
-            && e.offset
-                == entries[i - 1].offset + (entries[i - 1].length as u64)
-        {
+        if i > 0 && e.offset == entries[i - 1].offset + (entries[i - 1].length as u64) {
             write_varint(&mut uncompressed, 0);
         } else {
             write_varint(&mut uncompressed, e.offset + 1);
@@ -175,7 +177,10 @@ fn encode_directory(entries: &[Entry]) -> io::Result<Vec<u8>> {
 }
 
 /// Partition directory entries into PMTiles v3 Leaf Directories and construct root pointers
-pub fn build_leaf_directories(entries: &[Entry], leaf_size: usize) -> io::Result<(Vec<u8>, Vec<u8>)> {
+pub fn build_leaf_directories(
+    entries: &[Entry],
+    leaf_size: usize,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut root_pointers = Vec::new();
     let mut all_leaf_bytes = Vec::new();
     let mut current_leaf_offset = 0u64;
@@ -223,7 +228,12 @@ pub struct PmtilesWriter {
 
 impl PmtilesWriter {
     /// Create a new PMTiles v3 streaming archive builder with disk spill storage
-    pub fn new(min_zoom: u8, max_zoom: u8, bbox: [f64; 4], metadata_json: String) -> io::Result<Self> {
+    pub fn new(
+        min_zoom: u8,
+        max_zoom: u8,
+        bbox: [f64; 4],
+        metadata_json: String,
+    ) -> io::Result<Self> {
         let spill_file = tempfile::tempfile()?;
         Ok(Self {
             spill_file,
@@ -249,7 +259,13 @@ impl PmtilesWriter {
     }
 
     /// Add a pre-compressed tile payload directly into the spill file
-    pub fn add_compressed_tile(&mut self, z: u8, x: u32, y: u32, compressed_data: &[u8]) -> io::Result<()> {
+    pub fn add_compressed_tile(
+        &mut self,
+        z: u8,
+        x: u32,
+        y: u32,
+        compressed_data: &[u8],
+    ) -> io::Result<()> {
         let len = compressed_data.len() as u32;
         let tile_id = zxy_to_tile_id(z, x, y);
         self.spill_file.write_all(compressed_data)?;
@@ -387,7 +403,9 @@ impl PmtilesWriter {
                         io::ErrorKind::UnexpectedEof,
                         format!(
                             "Spill file truncated: tile offset {}+{} exceeds spill file size {}",
-                            start, e.length, mmap.len()
+                            start,
+                            e.length,
+                            mmap.len()
                         ),
                     ));
                 }

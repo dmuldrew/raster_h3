@@ -145,14 +145,18 @@ fn print_help() {
     println!("  --format <fmt>        Output format: parquet, pmtiles, or both (default: parquet)");
     println!("  --compression <type>  Parquet compression: snappy, zstd, gzip, or none (default: snappy)");
     println!("  --compact <bool>      Compact Parquet format without lat/lng/hex strings (default: true)");
-    println!("  --geoparquet          Emit OGC GeoParquet 1.1 geometry and metadata (default: false)");
+    println!(
+        "  --geoparquet          Emit OGC GeoParquet 1.1 geometry and metadata (default: false)"
+    );
     println!("  --row-group-size <n>  Parquet row group row count (default: 131072)");
     println!("  --overlap-rule <rule> Mosaic overlap resolution: cutline, first, last, min, max, mean (default: cutline)");
     println!("  --sampling <pattern>  Subpixel sampling: center, 5point, 7point, 9point (default: center)");
     println!("  --workers <n>         Concurrent download threads (default: 8)");
     println!("  --output-dir <path>   Directory for final Parquet/PMTiles files (default: data/conus_bands)");
     println!("  --raw-dir <path>      Directory for temporary GeoTIFF tiles (default: data/conus_bands_raw)");
-    println!("  --keep-raw            Do not delete raw GeoTIFF tiles after processing (default: false)");
+    println!(
+        "  --keep-raw            Do not delete raw GeoTIFF tiles after processing (default: false)"
+    );
     println!("  --dry-run             Display plan and tile coordinates without downloading");
     println!("  --help, -h            Show this help menu");
 }
@@ -205,9 +209,15 @@ fn download_band_tiles(
         }
     }
 
-    println!("  Band {}: Identified {} active land tiles to fetch", band.band_index, jobs.len());
+    println!(
+        "  Band {}: Identified {} active land tiles to fetch",
+        band.band_index,
+        jobs.len()
+    );
 
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(num_workers).build()?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_workers)
+        .build()?;
     let downloaded_count = Arc::new(AtomicUsize::new(0));
     let skipped_count = Arc::new(AtomicUsize::new(0));
     let total_bytes = Arc::new(AtomicUsize::new(0));
@@ -294,7 +304,11 @@ fn download_band_tiles(
     let mb = total_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
     println!(
         "  Band {}: Download complete in {:.1?} ({} downloaded, {} cached, {:.1} MB staged)",
-        band.band_index, t0.elapsed(), dl, sk, mb
+        band.band_index,
+        t0.elapsed(),
+        dl,
+        sk,
+        mb
     );
 
     let pattern = format!("{}/tile_*.tif", raw_band_dir.to_str().unwrap());
@@ -314,12 +328,20 @@ fn process_band_streaming(
     parquet_config: &ParquetExportConfig,
     output_dir: &Path,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    println!("  Band {}: Opening MosaicReader across {} tiles (rule: {:?})...",
-        band_index, paths.len(), overlap_rule);
+    println!(
+        "  Band {}: Opening MosaicReader across {} tiles (rule: {:?})...",
+        band_index,
+        paths.len(),
+        overlap_rule
+    );
     let t_init = Instant::now();
     let mosaic = Arc::new(MosaicReader::open(paths, None, None, overlap_rule)?);
-    println!("  Band {}: Mosaic opened in {:.2?} ({} total chunks across mosaic)",
-        band_index, t_init.elapsed(), mosaic.chunk_refs.len());
+    println!(
+        "  Band {}: Mosaic opened in {:.2?} ({} total chunks across mosaic)",
+        band_index,
+        t_init.elapsed(),
+        mosaic.chunk_refs.len()
+    );
 
     let mut config = MultiResolutionConfig::new(resolutions.to_vec());
     config.overlap_rule = overlap_rule;
@@ -331,24 +353,27 @@ fn process_band_streaming(
     if format == OutputFormat::Parquet || format == OutputFormat::Both {
         let out_parquet = output_dir.join(format!("conus_bp_band_{}.parquet", band_index));
         if out_parquet.exists() {
-            println!("  [RESUME] Band {} Parquet already exists ({:?}), skipping.",
-                band_index, out_parquet);
+            println!(
+                "  [RESUME] Band {} Parquet already exists ({:?}), skipping.",
+                band_index, out_parquet
+            );
         } else {
             let t_stream = Instant::now();
             let streamer = MultiScanHorizonStreamer::new_mosaic(Arc::clone(&mosaic), &config)?;
 
             let mut next_log = 2_000_000usize;
-            let total_written = H3ParquetWriter::write_continuous_streamer_to_parquet_with_progress(
-                streamer,
-                &out_parquet,
-                parquet_config.clone(),
-                |count| {
-                    if count >= next_log {
-                        let elapsed = t_stream.elapsed().as_secs_f64();
-                        let rss_str = get_process_rss_mb()
-                            .map(|r| format!(", RSS: {:.1} MB", r))
-                            .unwrap_or_default();
-                        println!(
+            let total_written =
+                H3ParquetWriter::write_continuous_streamer_to_parquet_with_progress(
+                    streamer,
+                    &out_parquet,
+                    parquet_config.clone(),
+                    |count| {
+                        if count >= next_log {
+                            let elapsed = t_stream.elapsed().as_secs_f64();
+                            let rss_str = get_process_rss_mb()
+                                .map(|r| format!(", RSS: {:.1} MB", r))
+                                .unwrap_or_default();
+                            println!(
                             "    Band {}: Streamed {:>5.1}M hexagons in {:>5.1}s ({:.1} khex/s{})...",
                             band_index,
                             count as f64 / 1_000_000.0,
@@ -356,10 +381,10 @@ fn process_band_streaming(
                             (count as f64 / 1000.0) / elapsed.max(0.001),
                             rss_str
                         );
-                        next_log += 2_000_000;
-                    }
-                },
-            )?;
+                            next_log += 2_000_000;
+                        }
+                    },
+                )?;
 
             let p_size_mb = fs::metadata(&out_parquet)
                 .map(|m| m.len() as f64 / (1024.0 * 1024.0))
@@ -367,7 +392,10 @@ fn process_band_streaming(
 
             println!(
                 "  Band {}: Hexified to Parquet in {:.1?} | Total: {} hexes | Output: {:.1} MB",
-                band_index, t_stream.elapsed(), total_written, p_size_mb
+                band_index,
+                t_stream.elapsed(),
+                total_written,
+                p_size_mb
             );
             total_hexagons_emitted = total_written;
         }
@@ -377,16 +405,16 @@ fn process_band_streaming(
     if format == OutputFormat::Pmtiles || format == OutputFormat::Both {
         let out_pmtiles = output_dir.join(format!("conus_bp_band_{}.pmtiles", band_index));
         if out_pmtiles.exists() {
-            println!("  [RESUME] Band {} PMTiles already exists ({:?}), skipping.",
-                band_index, out_pmtiles);
+            println!(
+                "  [RESUME] Band {} PMTiles already exists ({:?}), skipping.",
+                band_index, out_pmtiles
+            );
         } else {
             let t_pmtiles = Instant::now();
             let streamer = MultiScanHorizonStreamer::new_mosaic(Arc::clone(&mosaic), &config)?;
 
-            let total_pmtiles_hex = H3PmtilesTiler::generate_from_continuous_streamer(
-                streamer,
-                &out_pmtiles,
-            )?;
+            let total_pmtiles_hex =
+                H3PmtilesTiler::generate_from_continuous_streamer(streamer, &out_pmtiles)?;
 
             let p_size_mb = fs::metadata(&out_pmtiles)
                 .map(|m| m.len() as f64 / (1024.0 * 1024.0))
@@ -394,7 +422,10 @@ fn process_band_streaming(
 
             println!(
                 "  Band {}: Tiled to PMTiles in {:.1?} | Total: {} hexes | Output: {:.1} MB",
-                band_index, t_pmtiles.elapsed(), total_pmtiles_hex, p_size_mb
+                band_index,
+                t_pmtiles.elapsed(),
+                total_pmtiles_hex,
+                p_size_mb
             );
             if total_hexagons_emitted == 0 {
                 total_hexagons_emitted = total_pmtiles_hex;
@@ -492,7 +523,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "center" => sampling = SamplingPattern::center(),
                         "rgss" => sampling = SamplingPattern::rgss(),
                         "5point" => sampling = SamplingPattern::five_point(),
-                        "7point" | "hex_seven_point" => sampling = SamplingPattern::hex_seven_point(),
+                        "7point" | "hex_seven_point" => {
+                            sampling = SamplingPattern::hex_seven_point()
+                        }
                         "9point" => sampling = SamplingPattern::nine_point(),
                         _ => {}
                     }
@@ -541,15 +574,55 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 0.05° seam overlap ensures boundary H3 cells are completely covered
     let bands = vec![
         // Band 0: Northern Tier (WA, ID, MT, ND, MN, Upper Great Lakes)
-        BandConfig { band_index: 0, min_lon: -125.0, max_lon: -66.5, min_lat: 44.50, max_lat: 49.50, cols: 39, rows: 5 },
+        BandConfig {
+            band_index: 0,
+            min_lon: -125.0,
+            max_lon: -66.5,
+            min_lat: 44.50,
+            max_lat: 49.50,
+            cols: 39,
+            rows: 5,
+        },
         // Band 1: Upper Central (OR, WY, SD, NE, IA, IL, MI, NY, New England)
-        BandConfig { band_index: 1, min_lon: -125.0, max_lon: -66.5, min_lat: 39.50, max_lat: 44.55, cols: 39, rows: 5 },
+        BandConfig {
+            band_index: 1,
+            min_lon: -125.0,
+            max_lon: -66.5,
+            min_lat: 39.50,
+            max_lat: 44.55,
+            cols: 39,
+            rows: 5,
+        },
         // Band 2: Mid Tier (CA, NV, UT, CO, KS, MO, IN, OH, PA, Mid-Atlantic)
-        BandConfig { band_index: 2, min_lon: -125.0, max_lon: -66.5, min_lat: 34.50, max_lat: 39.55, cols: 39, rows: 5 },
+        BandConfig {
+            band_index: 2,
+            min_lon: -125.0,
+            max_lon: -66.5,
+            min_lat: 34.50,
+            max_lat: 39.55,
+            cols: 39,
+            rows: 5,
+        },
         // Band 3: Southern Tier (AZ, NM, TX, OK, AR, TN, NC, SC, GA, AL, MS)
-        BandConfig { band_index: 3, min_lon: -125.0, max_lon: -66.5, min_lat: 29.50, max_lat: 34.55, cols: 39, rows: 5 },
+        BandConfig {
+            band_index: 3,
+            min_lon: -125.0,
+            max_lon: -66.5,
+            min_lat: 29.50,
+            max_lat: 34.55,
+            cols: 39,
+            rows: 5,
+        },
         // Band 4: Deep South & Florida (South TX, LA Coast, FL Peninsula)
-        BandConfig { band_index: 4, min_lon: -125.0, max_lon: -66.5, min_lat: 24.50, max_lat: 29.55, cols: 39, rows: 5 },
+        BandConfig {
+            band_index: 4,
+            min_lon: -125.0,
+            max_lon: -66.5,
+            min_lat: 24.50,
+            max_lat: 29.55,
+            cols: 39,
+            rows: 5,
+        },
     ];
 
     let parquet_config = ParquetExportConfig {
@@ -560,15 +633,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         geoparquet,
     };
 
-    println!("=========================================================================================");
-    println!("     CONUS WILDFIRE BURN PROBABILITY: BATCH & EVICT HEXIFICATION PIPELINE                ");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "     CONUS WILDFIRE BURN PROBABILITY: BATCH & EVICT HEXIFICATION PIPELINE                "
+    );
+    println!(
+        "========================================================================================="
+    );
     println!("  Target Resolutions : {:?}", resolutions);
     println!("  Output Format      : {:?}", format);
-    println!("  Parquet Config     : compression={:?}, compact={}, geoparquet={}, row_group_size={}", compression, compact, geoparquet, row_group_size);
+    println!(
+        "  Parquet Config     : compression={:?}, compact={}, geoparquet={}, row_group_size={}",
+        compression, compact, geoparquet, row_group_size
+    );
     println!("  Sampling Pattern   : {:?}", sampling);
     println!("  Overlap Rule       : {:?}", overlap_rule);
-    println!("  Active Bands       : Band {} to Band {}", start_band, end_band);
+    println!(
+        "  Active Bands       : Band {} to Band {}",
+        start_band, end_band
+    );
     println!("  Download Workers   : {}", num_workers);
     println!("  Evict Raw GeoTIFFs : {}", evict_raw);
     println!("  Output Directory   : {:?}", output_dir);
@@ -599,8 +684,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             continue;
         }
 
-        println!("\n>>> STARTING BAND {} [Lat: {:.2}°N to {:.2}°N] <<<",
-            band.band_index, band.min_lat, band.max_lat);
+        println!(
+            "\n>>> STARTING BAND {} [Lat: {:.2}°N to {:.2}°N] <<<",
+            band.band_index, band.min_lat, band.max_lat
+        );
 
         let raw_band_dir = raw_dir.join(format!("band_{}", band.band_index));
 
@@ -608,7 +695,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tile_paths = download_band_tiles(band, &raw_band_dir, num_workers)?;
 
         if tile_paths.is_empty() {
-            println!("  [WARN] No valid GeoTIFF tiles available for Band {}. Skipping processing.", band.band_index);
+            println!(
+                "  [WARN] No valid GeoTIFF tiles available for Band {}. Skipping processing.",
+                band.band_index
+            );
             continue;
         }
 
@@ -628,22 +718,34 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         // Step 3: Evict raw GeoTIFF files immediately to free disk space
         if evict_raw {
-            println!("  Band {}: Evicting raw GeoTIFF tiles from {:?}...", band.band_index, raw_band_dir);
+            println!(
+                "  Band {}: Evicting raw GeoTIFF tiles from {:?}...",
+                band.band_index, raw_band_dir
+            );
             if let Err(e) = fs::remove_dir_all(&raw_band_dir) {
-                eprintln!("    [WARN] Failed to purge raw directory {:?}: {}", raw_band_dir, e);
+                eprintln!(
+                    "    [WARN] Failed to purge raw directory {:?}: {}",
+                    raw_band_dir, e
+                );
             } else {
                 let rss_str = get_process_rss_mb()
                     .map(|r| format!(" (Current RSS: {:.1} MB)", r))
                     .unwrap_or_default();
-                println!("  Band {}: Eviction complete. Disk space reclaimed successfully{}.",
-                    band.band_index, rss_str);
+                println!(
+                    "  Band {}: Eviction complete. Disk space reclaimed successfully{}.",
+                    band.band_index, rss_str
+                );
             }
         }
     }
 
     println!("\n=========================================================================================");
-    println!("                     FULL CONUS BATCH & EVICT PIPELINE COMPLETE!                         ");
-    println!("=========================================================================================");
+    println!(
+        "                     FULL CONUS BATCH & EVICT PIPELINE COMPLETE!                         "
+    );
+    println!(
+        "========================================================================================="
+    );
     println!("  Total Time Elapsed  : {:.1?}", global_start.elapsed());
     println!("  Total Hexagons      : {}", total_conus_hexagons);
     println!("  Artifacts Stored In : {:?}", output_dir);

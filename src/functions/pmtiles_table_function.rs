@@ -51,7 +51,9 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
     let bind = BindHelper::new(info);
 
     if bind.parameter_count() < 2 {
-        bind.set_error("h3_raster_to_pmtiles requires at least 2 arguments: file_path and output_pmtiles");
+        bind.set_error(
+            "h3_raster_to_pmtiles requires at least 2 arguments: file_path and output_pmtiles",
+        );
         return;
     }
 
@@ -92,7 +94,11 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
         is_categorical,
         properties,
     });
-    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<PmtilesBindData>));
+    duckdb_bind_set_bind_data(
+        info,
+        Box::into_raw(bind_data) as *mut c_void,
+        Some(delete_boxed::<PmtilesBindData>),
+    );
 }
 
 /// Init callback
@@ -100,7 +106,11 @@ pub unsafe extern "C" fn pmtiles_init(info: duckdb_init_info) {
     let global_data = Box::new(PmtilesGlobalData {
         executed: AtomicBool::new(false),
     });
-    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_boxed::<PmtilesGlobalData>));
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(global_data) as *mut c_void,
+        Some(delete_boxed::<PmtilesGlobalData>),
+    );
 }
 
 /// Scan callback: runs GeoTIFF-to-PMTiles conversion and streams the single summary row
@@ -150,8 +160,12 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
     let mut max_z = 0u8;
     for &r in &bind_data.resolutions {
         let z = h3_res_to_zoom(r);
-        if z < min_z { min_z = z; }
-        if z > max_z { max_z = z; }
+        if z < min_z {
+            min_z = z;
+        }
+        if z > max_z {
+            max_z = z;
+        }
     }
 
     // Populate the 1 output summary row
@@ -183,7 +197,9 @@ pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
     let bind = BindHelper::new(info);
 
     if bind.parameter_count() < 2 {
-        bind.set_error("h3_parquet_to_pmtiles requires at least 2 arguments: parquet_path and output_pmtiles");
+        bind.set_error(
+            "h3_parquet_to_pmtiles requires at least 2 arguments: parquet_path and output_pmtiles",
+        );
         return;
     }
 
@@ -205,7 +221,8 @@ pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
         }
     };
 
-    let h3_column = bind.get_named_string("h3_column")
+    let h3_column = bind
+        .get_named_string("h3_column")
         .or_else(|| bind.get_named_string("h3_col"));
 
     add_pmtiles_summary_columns(&bind);
@@ -215,7 +232,11 @@ pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
         output_pmtiles,
         h3_column,
     });
-    duckdb_bind_set_bind_data(info, Box::into_raw(bind_data) as *mut c_void, Some(delete_boxed::<ParquetPmtilesBindData>));
+    duckdb_bind_set_bind_data(
+        info,
+        Box::into_raw(bind_data) as *mut c_void,
+        Some(delete_boxed::<ParquetPmtilesBindData>),
+    );
 }
 
 /// Init callback for `h3_parquet_to_pmtiles`
@@ -223,11 +244,18 @@ pub unsafe extern "C" fn parquet_pmtiles_init(info: duckdb_init_info) {
     let global_data = Box::new(ParquetPmtilesGlobalData {
         executed: AtomicBool::new(false),
     });
-    duckdb_init_set_init_data(info, Box::into_raw(global_data) as *mut c_void, Some(delete_boxed::<ParquetPmtilesGlobalData>));
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(global_data) as *mut c_void,
+        Some(delete_boxed::<ParquetPmtilesGlobalData>),
+    );
 }
 
 /// Scan callback: runs Parquet-to-PMTiles conversion and streams the single summary row
-pub unsafe extern "C" fn parquet_pmtiles_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+pub unsafe extern "C" fn parquet_pmtiles_scan(
+    info: duckdb_function_info,
+    output: duckdb_data_chunk,
+) {
     let bind_data = &*(duckdb_function_get_bind_data(info) as *const ParquetPmtilesBindData);
     let global_data = &*(duckdb_function_get_init_data(info) as *const ParquetPmtilesGlobalData);
 
@@ -339,4 +367,3 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
 
     Ok(())
 }
-

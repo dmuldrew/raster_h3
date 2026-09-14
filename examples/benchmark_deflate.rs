@@ -8,13 +8,7 @@ use tiff::decoder::{Decoder, DecodingResult};
 use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
-fn write_benchmark_deflate_geotiff(
-    path: &Path,
-    width: u32,
-    height: u32,
-    tile_w: u32,
-    tile_h: u32,
-) {
+fn write_benchmark_deflate_geotiff(path: &Path, width: u32, height: u32, tile_w: u32, tile_h: u32) {
     let mut file = BufWriter::new(File::create(path).unwrap());
     file.write_all(b"II\x2a\x00\x08\x00\x00\x00").unwrap();
 
@@ -116,9 +110,15 @@ fn write_benchmark_deflate_geotiff(
 }
 
 fn main() {
-    println!("=========================================================================================");
-    println!("       raster_h3 Benchmark: SIMD-Accelerated Chunk Decompression (libdeflater)           ");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "       raster_h3 Benchmark: SIMD-Accelerated Chunk Decompression (libdeflater)           "
+    );
+    println!(
+        "========================================================================================="
+    );
 
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path();
@@ -130,8 +130,18 @@ fn main() {
     let total_pixels = (width * height) as f64;
 
     println!("\n▶ Generating synthetic tiled Deflate GeoTIFF...");
-    println!("  • Raster Size     : {} x {} ({:.2} million pixels)", width, height, total_pixels / 1_000_000.0);
-    println!("  • Tile Dimensions : {} x {} ({} tiles)", tile_w, tile_h, (width / tile_w) * (height / tile_h));
+    println!(
+        "  • Raster Size     : {} x {} ({:.2} million pixels)",
+        width,
+        height,
+        total_pixels / 1_000_000.0
+    );
+    println!(
+        "  • Tile Dimensions : {} x {} ({} tiles)",
+        tile_w,
+        tile_h,
+        (width / tile_w) * (height / tile_h)
+    );
     println!("  • Compression     : Deflate / zlib");
     println!("  • Data Type       : Float32 (4 bytes/sample)");
 
@@ -144,7 +154,8 @@ fn main() {
     let mmap = reader.mmap().expect("Failed to get mmap");
 
     let uncompressed_tile_bytes = (tile_w * tile_h * 4) as usize;
-    let total_uncompressed_mb = (total_chunks as usize * uncompressed_tile_bytes) as f64 / (1024.0 * 1024.0);
+    let total_uncompressed_mb =
+        (total_chunks as usize * uncompressed_tile_bytes) as f64 / (1024.0 * 1024.0);
 
     // =========================================================================
     // BENCHMARK 1: Standard tiff crate decoding (flate2 / miniz_oxide)
@@ -166,7 +177,10 @@ fn main() {
 
     println!("  • Total Time      : {:.2?}", dur_std);
     println!("  • Decomp Bandwidth: {:.2} MB/sec", std_bandwidth);
-    println!("  • Average Latency : {:.2} µs / tile", std_latency_per_tile);
+    println!(
+        "  • Average Latency : {:.2} µs / tile",
+        std_latency_per_tile
+    );
 
     // =========================================================================
     // BENCHMARK 2: SIMD libdeflater Chunk Decompression
@@ -188,11 +202,17 @@ fn main() {
 
     println!("  • Total Time      : {:.2?}", dur_simd);
     println!("  • Decomp Bandwidth: {:.2} MB/sec", simd_bandwidth);
-    println!("  • Average Latency : {:.2} µs / tile", simd_latency_per_tile);
+    println!(
+        "  • Average Latency : {:.2} µs / tile",
+        simd_latency_per_tile
+    );
 
     assert_eq!(std_samples_read, simd_samples_read);
     let speedup = dur_std.as_secs_f64() / dur_simd.as_secs_f64();
-    println!("\n  ⚡ Pure Decompression Speedup: {:.2}x faster with libdeflater!", speedup);
+    println!(
+        "\n  ⚡ Pure Decompression Speedup: {:.2}x faster with libdeflater!",
+        speedup
+    );
 
     // =========================================================================
     // BENCHMARK 3: End-to-End Multi-Core Rayon Streaming Aggregation
@@ -218,11 +238,18 @@ fn main() {
     let mpx_sec = (total_pixels_streamed / 1_000_000.0) / dur_stream.as_secs_f64();
 
     println!("  • Hexagons Produced : {} cells", total_hexes);
-    println!("  • Pixels Ingested   : {:.0} pixels", total_pixels_streamed);
+    println!(
+        "  • Pixels Ingested   : {:.0} pixels",
+        total_pixels_streamed
+    );
     println!("  • Streaming Time    : {:.2?}", dur_stream);
     println!("  • Sustained Stream  : {:.2} Mpx/sec", mpx_sec);
 
     println!("\n=========================================================================================");
-    println!("                          DEFLATE BENCHMARK COMPLETED SUCCESSFULLY                       ");
-    println!("=========================================================================================");
+    println!(
+        "                          DEFLATE BENCHMARK COMPLETED SUCCESSFULLY                       "
+    );
+    println!(
+        "========================================================================================="
+    );
 }

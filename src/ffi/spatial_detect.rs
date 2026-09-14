@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::ffi::duckdb_c::*;
 use crate::ffi::to_c_string;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static SPATIAL_LOADED: AtomicBool = AtomicBool::new(false);
 
