@@ -501,16 +501,18 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     }
 }
 
-/// Generic double-buffered streaming pipeline from any horizon streamer to Parquet
-pub fn run_parquet_streaming_pipeline<S, B, P>(
+/// Generic double-buffered streaming pipeline from any horizon streamer to Parquet with progress reporting
+pub fn run_parquet_streaming_pipeline_with_progress<S, B, P, F>(
     mut streamer: S,
     parquet_path: P,
     parquet_config: ParquetExportConfig,
+    mut progress_callback: F,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
 where
     S: ParquetStreamer,
     B: ParquetRowGroupBuffer<Record = S::Record>,
     P: AsRef<Path>,
+    F: FnMut(usize),
 {
     let compact = parquet_config.compact;
     let row_group_size = parquet_config.row_group_size.max(1);
@@ -558,12 +560,17 @@ where
     });
 
     let mut current_buf = buf1;
+    let mut total_drained = 0usize;
 
     loop {
         let space_left = row_group_size.saturating_sub(current_buf.len()).max(1);
         let drained = streamer.drain_completed_into(space_left, |_, record| {
             current_buf.push_record(record);
         });
+        total_drained += drained;
+        if drained > 0 {
+            progress_callback(total_drained);
+        }
 
         if current_buf.len() >= row_group_size {
             if writer_tx.send(current_buf).is_err() {
@@ -589,6 +596,20 @@ where
         Err(_) => return Err("Background Parquet writer thread panicked".into()),
     };
     Ok(total_hexagons)
+}
+
+/// Generic double-buffered streaming pipeline from any horizon streamer to Parquet
+pub fn run_parquet_streaming_pipeline<S, B, P>(
+    streamer: S,
+    parquet_path: P,
+    parquet_config: ParquetExportConfig,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: ParquetStreamer,
+    B: ParquetRowGroupBuffer<Record = S::Record>,
+    P: AsRef<Path>,
+{
+    run_parquet_streaming_pipeline_with_progress::<S, B, P, _>(streamer, parquet_path, parquet_config, |_| {})
 }
 
 pub struct H3ParquetWriter;
@@ -639,6 +660,21 @@ impl H3ParquetWriter {
                 Self::write_continuous_streamer_to_parquet(streamer, parquet_path, parquet_config)
             }
         }
+    }
+
+    /// Stream continuous raster aggregation directly into Parquet with progress reporting
+    pub fn write_continuous_streamer_to_parquet_with_progress<P: AsRef<Path>, F: FnMut(usize)>(
+        streamer: MultiScanHorizonStreamer,
+        parquet_path: P,
+        parquet_config: ParquetExportConfig,
+        progress: F,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        run_parquet_streaming_pipeline_with_progress::<_, ContinuousRowGroupBuffer, _, F>(
+            streamer,
+            parquet_path,
+            parquet_config,
+            progress,
+        )
     }
 
     /// Stream continuous raster aggregation directly into Parquet
