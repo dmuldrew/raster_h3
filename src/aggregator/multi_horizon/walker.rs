@@ -3,9 +3,13 @@
 //! Centralizes raster coordinate projection, scanline derivatives, bounding box pruning,
 //! and mosaic overlap resolution across both continuous (Welford) and categorical engines.
 
+use fxhash::FxBuildHasher;
 use h3o::{LatLng, Resolution};
+use std::collections::HashMap;
 
-use crate::aggregator::h3_scanline::{H3NeighborDiskCache, H3ScanlineLookahead};
+use crate::aggregator::h3_scanline::{
+    can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead,
+};
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
@@ -122,7 +126,8 @@ impl RowCoordinates {
         let (lon_start, lat_row) = if ctx.is_wgs84 {
             (x_start, y_row)
         } else if ctx.is_web_mercator {
-            let lat = (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
+            let lat =
+                (2.0 * (y_row / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
             let lon = (x_start / WGS84_A) * RAD_TO_DEG;
             (lon, lat)
         } else {
@@ -146,18 +151,26 @@ impl RowCoordinates {
                 (gt.a, gt.d, gt.b, gt.e)
             } else if ctx.is_web_mercator {
                 let lon_dx = ((x_start + gt.a) / WGS84_A) * RAD_TO_DEG;
-                let lat_dy = (2.0 * ((y_row + gt.e) / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
+                let lat_dy = (2.0 * ((y_row + gt.e) / WGS84_A).exp().atan()
+                    - std::f64::consts::FRAC_PI_2)
+                    * RAD_TO_DEG;
                 (lon_dx - lon_start, 0.0, 0.0, lat_dy - lat_row)
             } else {
-                let (lon_x, lat_x) = match crs_transformer.transform_point(x_start + ctx.dx_step, y_row) {
-                    Ok(coords) => coords,
-                    Err(_) => (lon_start, lat_row),
-                };
+                let (lon_x, lat_x) =
+                    match crs_transformer.transform_point(x_start + ctx.dx_step, y_row) {
+                        Ok(coords) => coords,
+                        Err(_) => (lon_start, lat_row),
+                    };
                 let (lon_y, lat_y) = match crs_transformer.transform_point(x_start, y_row + gt.e) {
                     Ok(coords) => coords,
                     Err(_) => (lon_start, lat_row),
                 };
-                (lon_x - lon_start, lat_x - lat_row, lon_y - lon_start, lat_y - lat_row)
+                (
+                    lon_x - lon_start,
+                    lat_x - lat_row,
+                    lon_y - lon_start,
+                    lat_y - lat_row,
+                )
             }
         } else {
             (0.0, 0.0, 0.0, 0.0)
@@ -172,7 +185,8 @@ impl RowCoordinates {
                     0
                 };
                 let c_e = if lon_start < b_max_lon {
-                    (((b_max_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
+                    (((b_max_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
+                        .min(row_width)
                 } else {
                     0
                 };
@@ -184,7 +198,8 @@ impl RowCoordinates {
                     0
                 };
                 let c_e = if lon_start > b_min_lon {
-                    (((b_min_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1).min(row_width)
+                    (((b_min_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
+                        .min(row_width)
                 } else {
                     0
                 };
@@ -294,7 +309,9 @@ impl RowCoordinates {
                 |x, y| match crs_transformer.transform_point(x, y) {
                     Ok((p_lon, p_lat)) => {
                         if is_point_in_bbox(p_lon, p_lat, bbox) {
-                            LatLng::new(p_lat, p_lon).ok().map(|ll| ll.to_cell(res).into())
+                            LatLng::new(p_lat, p_lon)
+                                .ok()
+                                .map(|ll| ll.to_cell(res).into())
                         } else {
                             None
                         }
@@ -327,9 +344,15 @@ impl RowCoordinates {
     {
         row_cache.find_core_span(c, span_end, dx_bounds, dy_bounds, |px, py| {
             let (lon, lat) = if ctx.is_wgs84 {
-                (self.lon_start + (px - 0.5) * ctx.d_lon_step, self.lat_row + (py - 0.5) * gt.e)
+                (
+                    self.lon_start + (px - 0.5) * ctx.d_lon_step,
+                    self.lat_row + (py - 0.5) * gt.e,
+                )
             } else if ctx.is_web_mercator {
-                (self.lon_start + (px - 0.5) * ctx.d_lon_step, self.lat_row + (py - 0.5) * self.d_lat_dy)
+                (
+                    self.lon_start + (px - 0.5) * ctx.d_lon_step,
+                    self.lat_row + (py - 0.5) * self.d_lat_dy,
+                )
             } else {
                 let d_col = px - 0.5;
                 let d_row = py - 0.5;
@@ -366,13 +389,19 @@ impl RowCoordinates {
             let x_k = self.x_start + (k as f64) * ctx.dx_step;
             match crs_transformer.transform_point(x_k, self.y_row) {
                 Ok(coords) => coords,
-                Err(_) => (self.lon_start + (k as f64) * self.d_lon_dx, self.lat_row + (k as f64) * self.d_lat_dx),
+                Err(_) => (
+                    self.lon_start + (k as f64) * self.d_lon_dx,
+                    self.lat_row + (k as f64) * self.d_lat_dx,
+                ),
             }
         } else {
             let (x_k, y_k) = gt.pixel_center_to_coord(col_offset + k, self.row_idx);
             match crs_transformer.transform_point(x_k, y_k) {
                 Ok(coords) => coords,
-                Err(_) => (self.lon_start + (k as f64) * self.d_lon_dx, self.lat_row + (k as f64) * self.d_lat_dx),
+                Err(_) => (
+                    self.lon_start + (k as f64) * self.d_lon_dx,
+                    self.lat_row + (k as f64) * self.d_lat_dx,
+                ),
             }
         };
 
@@ -494,7 +523,11 @@ pub fn walk_overlap_pixel_cells<T, FVal, FAccum>(
                     let (x, y) = gt.pixel_to_coord(px, py);
                     if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
                         if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                            if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                            if lon < b_min_lon
+                                || lon > b_max_lon
+                                || lat < b_min_lat
+                                || lat > b_max_lat
+                            {
                                 continue;
                             }
                         }
@@ -511,6 +544,630 @@ pub fn walk_overlap_pixel_cells<T, FVal, FAccum>(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Trait implemented by accumulator engines (continuous and categorical) to drive the generic scanline walker
+pub trait ScanlineEngine<T, Acc> {
+    type Sample: Copy;
+
+    /// Allocate a fresh empty accumulator (or with quantiles if configured)
+    fn new_acc(&self) -> Acc;
+
+    /// Reset an accumulator to its zero/empty state
+    fn clear_acc(&self, acc: &mut Acc);
+
+    /// Check if accumulator contains valid observations
+    fn has_samples(&self, acc: &Acc) -> bool;
+
+    /// Merge the source accumulator into the destination
+    fn merge_acc(&self, dest: &mut Acc, src: &Acc);
+
+    /// Accumulate a span of pixels into a single accumulator
+    fn accumulate_span(&self, acc: &mut Acc, slice: &[T]);
+
+    /// Accumulate a span of pixels across multiple active resolution accumulators
+    fn accumulate_span_multi(&self, run_accs: &mut [Acc], run_cells: &[u64], slice: &[T]);
+
+    /// Extract a valid sample from a raw pixel, or None if nodata
+    fn get_sample(&self, pixel: T) -> Option<Self::Sample>;
+
+    /// Update an accumulator with a sample and weight
+    fn update_sample(&self, acc: &mut Acc, sample: Self::Sample, weight: f64);
+}
+
+/// Unified generic scanline walker across all resolutions and sampling patterns
+pub fn scanline_walk<T, Acc, E, FNoData>(
+    slice: &[T],
+    chunk: &RasterChunk,
+    resolutions: &[Resolution],
+    crs_transformer: &CrsTransformer,
+    gt: &GeoTransform,
+    sampling: &SamplingPattern,
+    bbox: Option<[f64; 4]>,
+    chunk_stride: u32,
+    is_row_all_nodata: FNoData,
+    engine: &E,
+    chunk_maps: &mut [HashMap<u64, Acc, FxBuildHasher>],
+) where
+    T: Copy,
+    Acc: Clone,
+    E: ScanlineEngine<T, Acc>,
+    FNoData: Fn(&[T]) -> bool,
+{
+    let geom_ctx = RowGeometryContext::new(chunk, slice.len(), chunk_stride, crs_transformer, gt);
+    let RowGeometryContext {
+        is_wgs84,
+        is_web_mercator,
+        is_north_up,
+        d_lon_step,
+        dx_step,
+        stride,
+        actual_rows,
+    } = geom_ctx;
+    let num_res = resolutions.len();
+
+    let mut row_caches: Vec<H3ScanlineLookahead> = resolutions
+        .iter()
+        .map(|&res| H3ScanlineLookahead::for_resolution(res))
+        .collect();
+
+    let is_single_point = sampling.is_single_point();
+    let dx_bounds = sampling.dx_bounds();
+    let dy_bounds = sampling.dy_bounds();
+
+    let mut span_ends = if num_res > 1 {
+        vec![0usize; num_res]
+    } else {
+        Vec::new()
+    };
+    let mut run_cells = if num_res > 1 {
+        vec![0u64; num_res]
+    } else {
+        Vec::new()
+    };
+    let mut run_accs: Vec<Acc> = if num_res > 1 {
+        (0..num_res).map(|_| engine.new_acc()).collect()
+    } else {
+        Vec::new()
+    };
+    let mut known_next_cells: Vec<Option<u64>> = if num_res > 1 {
+        vec![None; num_res]
+    } else {
+        Vec::new()
+    };
+    let mut core_starts = if num_res > 1 {
+        vec![0usize; num_res]
+    } else {
+        Vec::new()
+    };
+    let mut core_ends = if num_res > 1 {
+        vec![0usize; num_res]
+    } else {
+        Vec::new()
+    };
+
+    for r in 0..actual_rows {
+        let slice_row_start = r * stride;
+        let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
+        if row_width == 0 {
+            continue;
+        }
+
+        let slice_row = &slice[slice_row_start..slice_row_start + row_width];
+        if is_row_all_nodata(slice_row) {
+            continue;
+        }
+
+        let coords = match RowCoordinates::compute(
+            r,
+            chunk,
+            row_width,
+            &geom_ctx,
+            gt,
+            crs_transformer,
+            sampling,
+            bbox,
+        ) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let RowCoordinates {
+            x_start,
+            lon_start,
+            row_c_start,
+            row_c_end,
+            cos_lat_sq,
+            px_diag_m,
+            ..
+        } = coords;
+
+        if num_res == 1 {
+            let res_idx = 0;
+            let res = resolutions[res_idx];
+            let active_map = &mut chunk_maps[res_idx];
+            let row_cache = &mut row_caches[res_idx];
+            row_cache.reset_row();
+            let mut run_cell: u64 = 0;
+            let mut run_acc = engine.new_acc();
+
+            let use_neighbor_cache = !is_single_point && can_use_neighbor_cache(px_diag_m, res);
+            let mut disk_cache = H3NeighborDiskCache::default();
+
+            let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
+            let mut x_curr = x_start + (row_c_start as f64) * dx_step;
+            let mut c = row_c_start;
+            let mut known_next_cell: Option<u64> = None;
+
+            while c < row_c_end {
+                let (lon, lat) = match coords.pixel_center_lon_lat(
+                    c,
+                    x_curr,
+                    lon_curr,
+                    &geom_ctx,
+                    gt,
+                    crs_transformer,
+                    chunk.col_offset as usize,
+                ) {
+                    Some(ll) => ll,
+                    None => {
+                        known_next_cell = None;
+                        c += 1;
+                        if is_north_up {
+                            x_curr += dx_step;
+                        }
+                        continue;
+                    }
+                };
+
+                if !is_wgs84 && !is_web_mercator {
+                    if !is_point_in_bbox(lon, lat, bbox) {
+                        known_next_cell = None;
+                        c += 1;
+                        if is_north_up {
+                            x_curr += dx_step;
+                        }
+                        continue;
+                    }
+                }
+
+                let cell_opt = known_next_cell
+                    .take()
+                    .or_else(|| row_cache.get_or_compute_cell(lat, lon, res));
+
+                if let Some(cell_u64) = cell_opt {
+                    if cell_u64 != run_cell {
+                        if run_cell != 0 && engine.has_samples(&run_acc) {
+                            active_map
+                                .entry(run_cell)
+                                .and_modify(|acc| engine.merge_acc(acc, &run_acc))
+                                .or_insert_with(|| run_acc.clone());
+                        }
+                        run_cell = cell_u64;
+                        engine.clear_acc(&mut run_acc);
+                        row_cache.on_cell_changed();
+                        if use_neighbor_cache {
+                            disk_cache.update(run_cell, cos_lat_sq);
+                        }
+                    }
+
+                    let (span_end, next_cell) = coords.find_span_end(
+                        row_cache,
+                        c,
+                        lon_curr,
+                        &geom_ctx,
+                        crs_transformer,
+                        res,
+                        run_cell,
+                        bbox,
+                    );
+
+                    if is_single_point {
+                        let span_slice = &slice[slice_row_start + c..slice_row_start + span_end];
+                        engine.accumulate_span(&mut run_acc, span_slice);
+                    } else {
+                        let (core_start, core_end) = coords.find_core_span(
+                            row_cache,
+                            c,
+                            span_end,
+                            dx_bounds,
+                            dy_bounds,
+                            &geom_ctx,
+                            gt,
+                            bbox,
+                            |lat, lon| {
+                                if use_neighbor_cache {
+                                    disk_cache.is_in_run_cell(lat, lon)
+                                } else {
+                                    LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
+                                        == Some(run_cell)
+                                }
+                            },
+                        );
+
+                        let mut evaluate_boundary = |k: usize,
+                                                     run_acc: &mut Acc,
+                                                     active_map: &mut HashMap<
+                            u64,
+                            Acc,
+                            FxBuildHasher,
+                        >| {
+                            let val_raw = slice[slice_row_start + k];
+                            if let Some(sample) = engine.get_sample(val_raw) {
+                                coords.for_each_subpixel(
+                                    k,
+                                    &geom_ctx,
+                                    gt,
+                                    crs_transformer,
+                                    chunk.col_offset as usize,
+                                    sampling,
+                                    bbox,
+                                    |lon, lat, d_x, d_y, weight| {
+                                        let cell = match resolve_subpixel_cell(
+                                            run_cell,
+                                            lat,
+                                            lon,
+                                            d_x,
+                                            d_y,
+                                            res,
+                                            use_neighbor_cache,
+                                            &mut disk_cache,
+                                        ) {
+                                            Some(c) => c,
+                                            None => return,
+                                        };
+
+                                        if cell == run_cell {
+                                            engine.update_sample(run_acc, sample, weight);
+                                        } else {
+                                            active_map
+                                                .entry(cell)
+                                                .and_modify(|acc| {
+                                                    engine.update_sample(acc, sample, weight)
+                                                })
+                                                .or_insert_with(|| {
+                                                    let mut acc = engine.new_acc();
+                                                    engine.update_sample(&mut acc, sample, weight);
+                                                    acc
+                                                });
+                                        }
+                                    },
+                                );
+                            }
+                        };
+
+                        for k in c..core_start {
+                            evaluate_boundary(k, &mut run_acc, active_map);
+                        }
+
+                        if core_end > core_start {
+                            let core_slice =
+                                &slice[slice_row_start + core_start..slice_row_start + core_end];
+                            engine.accumulate_span(&mut run_acc, core_slice);
+                        }
+
+                        for k in core_end..span_end {
+                            evaluate_boundary(k, &mut run_acc, active_map);
+                        }
+                    }
+
+                    let num_stepped = span_end - c;
+                    row_cache.advance_span(num_stepped);
+                    if is_wgs84 || is_web_mercator {
+                        lon_curr += (num_stepped as f64) * d_lon_step;
+                    } else if is_north_up {
+                        x_curr += (num_stepped as f64) * dx_step;
+                    }
+                    c = span_end;
+                    known_next_cell = next_cell;
+                } else {
+                    c += 1;
+                    if is_wgs84 || is_web_mercator {
+                        lon_curr += d_lon_step;
+                    } else if is_north_up {
+                        x_curr += dx_step;
+                    }
+                }
+            }
+
+            if run_cell != 0 && engine.has_samples(&run_acc) {
+                active_map
+                    .entry(run_cell)
+                    .and_modify(|acc| engine.merge_acc(acc, &run_acc))
+                    .or_insert_with(|| run_acc.clone());
+            }
+        } else {
+            let use_neighbor_caches: Vec<bool> = resolutions
+                .iter()
+                .map(|&r| !is_single_point && can_use_neighbor_cache(px_diag_m, r))
+                .collect();
+            let mut disk_caches = vec![H3NeighborDiskCache::default(); num_res];
+
+            for i in 0..num_res {
+                row_caches[i].reset_row();
+                run_cells[i] = 0;
+                engine.clear_acc(&mut run_accs[i]);
+                known_next_cells[i] = None;
+                span_ends[i] = row_c_start;
+                core_starts[i] = row_c_start;
+                core_ends[i] = row_c_start;
+            }
+
+            let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
+            let mut x_curr = x_start + (row_c_start as f64) * dx_step;
+            let mut c = row_c_start;
+
+            while c < row_c_end {
+                let (lon, lat) = match coords.pixel_center_lon_lat(
+                    c,
+                    x_curr,
+                    lon_curr,
+                    &geom_ctx,
+                    gt,
+                    crs_transformer,
+                    chunk.col_offset as usize,
+                ) {
+                    Some(ll) => ll,
+                    None => {
+                        for i in 0..num_res {
+                            if run_cells[i] != 0 && engine.has_samples(&run_accs[i]) {
+                                chunk_maps[i]
+                                    .entry(run_cells[i])
+                                    .and_modify(|acc| engine.merge_acc(acc, &run_accs[i]))
+                                    .or_insert_with(|| run_accs[i].clone());
+                                engine.clear_acc(&mut run_accs[i]);
+                            }
+                            run_cells[i] = 0;
+                            known_next_cells[i] = None;
+                            span_ends[i] = c + 1;
+                        }
+                        c += 1;
+                        if is_north_up {
+                            x_curr += dx_step;
+                        }
+                        continue;
+                    }
+                };
+
+                if !is_wgs84 && !is_web_mercator {
+                    if !is_point_in_bbox(lon, lat, bbox) {
+                        for i in 0..num_res {
+                            if run_cells[i] != 0 && engine.has_samples(&run_accs[i]) {
+                                chunk_maps[i]
+                                    .entry(run_cells[i])
+                                    .and_modify(|acc| engine.merge_acc(acc, &run_accs[i]))
+                                    .or_insert_with(|| run_accs[i].clone());
+                                engine.clear_acc(&mut run_accs[i]);
+                            }
+                            run_cells[i] = 0;
+                            known_next_cells[i] = None;
+                            span_ends[i] = c + 1;
+                        }
+                        c += 1;
+                        if is_north_up {
+                            x_curr += dx_step;
+                        }
+                        continue;
+                    }
+                }
+
+                for i in 0..num_res {
+                    if c >= span_ends[i] {
+                        let res = resolutions[i];
+                        let cell_opt = known_next_cells[i]
+                            .take()
+                            .or_else(|| row_caches[i].get_or_compute_cell(lat, lon, res));
+
+                        if let Some(cell_u64) = cell_opt {
+                            if cell_u64 != run_cells[i] {
+                                if run_cells[i] != 0 && engine.has_samples(&run_accs[i]) {
+                                    chunk_maps[i]
+                                        .entry(run_cells[i])
+                                        .and_modify(|acc| engine.merge_acc(acc, &run_accs[i]))
+                                        .or_insert_with(|| run_accs[i].clone());
+                                    engine.clear_acc(&mut run_accs[i]);
+                                }
+                                run_cells[i] = cell_u64;
+                                row_caches[i].on_cell_changed();
+                                if use_neighbor_caches[i] {
+                                    disk_caches[i].update(run_cells[i], cos_lat_sq);
+                                }
+                            }
+
+                            let (span_end, next_cell) = coords.find_span_end(
+                                &mut row_caches[i],
+                                c,
+                                lon_curr,
+                                &geom_ctx,
+                                crs_transformer,
+                                res,
+                                run_cells[i],
+                                bbox,
+                            );
+
+                            span_ends[i] = span_end;
+                            known_next_cells[i] = next_cell;
+
+                            if !is_single_point {
+                                let (c_start, c_end) = coords.find_core_span(
+                                    &row_caches[i],
+                                    c,
+                                    span_end,
+                                    dx_bounds,
+                                    dy_bounds,
+                                    &geom_ctx,
+                                    gt,
+                                    bbox,
+                                    |test_lat, test_lon| {
+                                        if use_neighbor_caches[i] {
+                                            disk_caches[i].is_in_run_cell(test_lat, test_lon)
+                                        } else {
+                                            LatLng::new(test_lat, test_lon)
+                                                .ok()
+                                                .map(|ll| ll.to_cell(res).into())
+                                                == Some(run_cells[i])
+                                        }
+                                    },
+                                );
+                                core_starts[i] = c_start;
+                                core_ends[i] = c_end;
+                            }
+                        } else {
+                            if run_cells[i] != 0 && engine.has_samples(&run_accs[i]) {
+                                chunk_maps[i]
+                                    .entry(run_cells[i])
+                                    .and_modify(|acc| engine.merge_acc(acc, &run_accs[i]))
+                                    .or_insert_with(|| run_accs[i].clone());
+                                engine.clear_acc(&mut run_accs[i]);
+                            }
+                            run_cells[i] = 0;
+                            span_ends[i] = c + 1;
+                            known_next_cells[i] = None;
+                            core_starts[i] = c + 1;
+                            core_ends[i] = c + 1;
+                        }
+                    }
+                }
+
+                let mut step_end = row_c_end;
+                for i in 0..num_res {
+                    step_end = step_end.min(span_ends[i]);
+                }
+                let step_end = step_end.max(c + 1).min(row_c_end);
+
+                if is_single_point {
+                    let span_slice = &slice[slice_row_start + c..slice_row_start + step_end];
+                    engine.accumulate_span_multi(&mut run_accs, &run_cells, span_slice);
+                } else {
+                    let mut sub_core_start = c;
+                    let mut sub_core_end = step_end;
+                    for i in 0..num_res {
+                        if run_cells[i] != 0 {
+                            sub_core_start = sub_core_start.max(core_starts[i]);
+                            sub_core_end = sub_core_end.min(core_ends[i]);
+                        }
+                    }
+
+                    let mut evaluate_boundary_multi = |k: usize,
+                                                       run_accs: &mut [Acc],
+                                                       chunk_maps: &mut [HashMap<
+                        u64,
+                        Acc,
+                        FxBuildHasher,
+                    >]| {
+                        let val_raw = slice[slice_row_start + k];
+                        if let Some(sample) = engine.get_sample(val_raw) {
+                            for i in 0..num_res {
+                                if run_cells[i] == 0 {
+                                    continue;
+                                }
+                                if k >= core_starts[i] && k < core_ends[i] {
+                                    engine.update_sample(&mut run_accs[i], sample, 1.0);
+                                }
+                            }
+
+                            let any_subpixel = (0..num_res).any(|i| {
+                                run_cells[i] != 0 && (k < core_starts[i] || k >= core_ends[i])
+                            });
+                            if any_subpixel {
+                                coords.for_each_subpixel(
+                                    k,
+                                    &geom_ctx,
+                                    gt,
+                                    crs_transformer,
+                                    chunk.col_offset as usize,
+                                    sampling,
+                                    bbox,
+                                    |lon, lat, d_x, d_y, weight| {
+                                        for i in 0..num_res {
+                                            if run_cells[i] == 0
+                                                || (k >= core_starts[i] && k < core_ends[i])
+                                            {
+                                                continue;
+                                            }
+                                            let res = resolutions[i];
+                                            let cell = match resolve_subpixel_cell(
+                                                run_cells[i],
+                                                lat,
+                                                lon,
+                                                d_x,
+                                                d_y,
+                                                res,
+                                                use_neighbor_caches[i],
+                                                &mut disk_caches[i],
+                                            ) {
+                                                Some(c) => c,
+                                                None => continue,
+                                            };
+
+                                            if cell == run_cells[i] {
+                                                engine.update_sample(
+                                                    &mut run_accs[i],
+                                                    sample,
+                                                    weight,
+                                                );
+                                            } else {
+                                                chunk_maps[i]
+                                                    .entry(cell)
+                                                    .and_modify(|acc| {
+                                                        engine.update_sample(acc, sample, weight)
+                                                    })
+                                                    .or_insert_with(|| {
+                                                        let mut a = engine.new_acc();
+                                                        engine
+                                                            .update_sample(&mut a, sample, weight);
+                                                        a
+                                                    });
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                        }
+                    };
+
+                    if sub_core_start < sub_core_end {
+                        for k in c..sub_core_start {
+                            evaluate_boundary_multi(k, &mut run_accs, chunk_maps);
+                        }
+
+                        let core_slice = &slice
+                            [slice_row_start + sub_core_start..slice_row_start + sub_core_end];
+                        engine.accumulate_span_multi(&mut run_accs, &run_cells, core_slice);
+
+                        for k in sub_core_end..step_end {
+                            evaluate_boundary_multi(k, &mut run_accs, chunk_maps);
+                        }
+                    } else {
+                        for k in c..step_end {
+                            evaluate_boundary_multi(k, &mut run_accs, chunk_maps);
+                        }
+                    }
+                }
+
+                let num_stepped = step_end - c;
+                for i in 0..num_res {
+                    row_caches[i].advance_span(num_stepped);
+                }
+
+                if is_wgs84 || is_web_mercator {
+                    lon_curr += (num_stepped as f64) * d_lon_step;
+                } else if is_north_up {
+                    x_curr += (num_stepped as f64) * dx_step;
+                }
+                c = step_end;
+            }
+
+            for i in 0..num_res {
+                if run_cells[i] != 0 && engine.has_samples(&run_accs[i]) {
+                    chunk_maps[i]
+                        .entry(run_cells[i])
+                        .and_modify(|acc| engine.merge_acc(acc, &run_accs[i]))
+                        .or_insert_with(|| run_accs[i].clone());
                 }
             }
         }
@@ -538,7 +1195,14 @@ mod tests {
         let mut disk_cache = H3NeighborDiskCache::default();
         let res = Resolution::try_from(8).unwrap();
         let cell = resolve_subpixel_cell(
-            run_cell, 37.75, -122.25, 0.0, 0.0, res, false, &mut disk_cache,
+            run_cell,
+            37.75,
+            -122.25,
+            0.0,
+            0.0,
+            res,
+            false,
+            &mut disk_cache,
         );
         assert_eq!(cell, Some(run_cell));
     }

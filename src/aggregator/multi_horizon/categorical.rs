@@ -1,10 +1,9 @@
-use std::collections::HashMap;
 use fxhash::FxBuildHasher;
 use h3o::{LatLng, Resolution};
+use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::{CategoricalAccumulator, CategoricalUniformity};
-use crate::aggregator::h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
 use crate::aggregator::horizon_streamer::{is_decoding_result_all_nodata, NodataCast};
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
@@ -14,10 +13,8 @@ use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
 
 use super::walker::{
-    is_point_in_bbox, is_slice_all_native_nodata, resolve_subpixel_cell, walk_overlap_pixel_cells,
-    RowCoordinates, RowGeometryContext,
+    is_slice_all_native_nodata, scanline_walk, walk_overlap_pixel_cells, ScanlineEngine,
 };
-
 /// Categorical record yielded by the multi-resolution categorical streamer
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiCategoricalRecord {
@@ -135,741 +132,204 @@ fn process_categorical_slice_into_maps<T, N>(
         return;
     }
 
-    let geom_ctx = RowGeometryContext::new(chunk, slice.len(), chunk_stride, crs_transformer, gt);
-    let RowGeometryContext {
-        is_wgs84,
-        is_web_mercator,
-        is_north_up,
-        d_lon_step,
-        dx_step,
-        stride,
-        actual_rows,
-    } = geom_ctx;
-    let num_res = resolutions.len();
+    let engine = CategoricalEngine::new(native_nodata, nodata, remapper);
+    scanline_walk(
+        slice,
+        chunk,
+        resolutions,
+        crs_transformer,
+        gt,
+        sampling,
+        bbox,
+        chunk_stride,
+        |s| is_slice_all_native_nodata(s, native_nodata),
+        &engine,
+        chunk_maps,
+    );
+}
 
-    let mut row_caches: Vec<H3ScanlineLookahead> = resolutions
-        .iter()
-        .map(|&res| H3ScanlineLookahead::for_resolution(res))
-        .collect();
+struct CategoricalEngine<'a, T, N> {
+    native_nodata: Option<N>,
+    nodata: Option<f64>,
+    remapper: Option<&'a CategoryRemapper>,
+    _marker: std::marker::PhantomData<T>,
+}
 
-    let is_single_point = sampling.is_single_point();
-    let dx_bounds = sampling.dx_bounds();
-    let dy_bounds = sampling.dy_bounds();
-
-    let mut span_ends = if num_res > 1 { vec![0usize; num_res] } else { Vec::new() };
-    let mut run_cells = if num_res > 1 { vec![0u64; num_res] } else { Vec::new() };
-    let mut run_accs: Vec<CategoricalAccumulator> = if num_res > 1 {
-        vec![CategoricalAccumulator::default(); num_res]
-    } else {
-        Vec::new()
-    };
-    let mut known_next_cells: Vec<Option<u64>> = if num_res > 1 { vec![None; num_res] } else { Vec::new() };
-    let mut core_starts = if num_res > 1 { vec![0usize; num_res] } else { Vec::new() };
-    let mut core_ends = if num_res > 1 { vec![0usize; num_res] } else { Vec::new() };
-
-    for r in 0..actual_rows {
-        let slice_row_start = r * stride;
-        let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
-        if row_width == 0 {
-            continue;
+impl<'a, T, N> CategoricalEngine<'a, T, N>
+where
+    T: CategoricalUniformity,
+    N: Copy + PartialEq<T>,
+{
+    fn new(
+        native_nodata: Option<N>,
+        nodata: Option<f64>,
+        remapper: Option<&'a CategoryRemapper>,
+    ) -> Self {
+        Self {
+            native_nodata,
+            nodata,
+            remapper,
+            _marker: std::marker::PhantomData,
         }
+    }
 
-        let slice_row = &slice[slice_row_start..slice_row_start + row_width];
-        if is_slice_all_native_nodata(slice_row, native_nodata) {
-            continue;
+    #[inline(always)]
+    fn resolve_category(&self, val: T) -> Option<i64> {
+        if let Some(nd_nat) = self.native_nodata {
+            if nd_nat == val {
+                return None;
+            }
         }
+        let raw_cat = val.to_category()?;
+        if self.native_nodata.is_none() {
+            if let Some(nd) = self.nodata {
+                if (raw_cat as f64 - nd).abs() < 1e-6 {
+                    return None;
+                }
+            }
+        }
+        if let Some(rem) = self.remapper {
+            rem.remap(raw_cat)
+        } else {
+            Some(raw_cat)
+        }
+    }
+}
 
-        let coords = match RowCoordinates::compute(
-            r,
-            chunk,
-            row_width,
-            &geom_ctx,
-            gt,
-            crs_transformer,
-            sampling,
-            bbox,
-        ) {
-            Some(c) => c,
-            None => continue,
-        };
+impl<'a, T, N> ScanlineEngine<T, CategoricalAccumulator> for CategoricalEngine<'a, T, N>
+where
+    T: CategoricalUniformity,
+    N: Copy + PartialEq<T>,
+{
+    type Sample = i64;
 
-        let RowCoordinates {
-            x_start,
-            lon_start,
-            row_c_start,
-            row_c_end,
-            cos_lat_sq,
-            px_diag_m,
-            ..
-        } = coords;
+    #[inline(always)]
+    fn new_acc(&self) -> CategoricalAccumulator {
+        CategoricalAccumulator::default()
+    }
 
-            if num_res == 1 {
-                for res_idx in 0..num_res {
-                    let res = resolutions[res_idx];
-                    let active_map = &mut chunk_maps[res_idx];
-                    let row_cache = &mut row_caches[res_idx];
-                    row_cache.reset_row();
-                    let mut run_cell: u64 = 0;
-                    let mut run_acc = CategoricalAccumulator::default();
+    #[inline(always)]
+    fn clear_acc(&self, acc: &mut CategoricalAccumulator) {
+        *acc = CategoricalAccumulator::default();
+    }
 
-                    let use_neighbor_cache = !is_single_point && can_use_neighbor_cache(px_diag_m, res);
-                    let mut disk_cache = H3NeighborDiskCache::default();
+    #[inline(always)]
+    fn has_samples(&self, acc: &CategoricalAccumulator) -> bool {
+        acc.total_count > 0.0
+    }
 
-                    let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
-                    let mut x_curr = x_start + (row_c_start as f64) * dx_step;
-                    let mut c = row_c_start;
-                    let mut known_next_cell: Option<u64> = None;
+    #[inline(always)]
+    fn merge_acc(&self, dest: &mut CategoricalAccumulator, src: &CategoricalAccumulator) {
+        dest.merge(src);
+    }
 
-                    while c < row_c_end {
-                        let (lon, lat) = match coords.pixel_center_lon_lat(
-                            c,
-                            x_curr,
-                            lon_curr,
-                            &geom_ctx,
-                            gt,
-                            crs_transformer,
-                            chunk.col_offset as usize,
-                        ) {
-                            Some(ll) => ll,
-                            None => {
-                                known_next_cell = None;
-                                c += 1;
-                                if is_north_up {
-                                    x_curr += dx_step;
-                                }
-                                continue;
-                            }
-                        };
+    #[inline(always)]
+    fn accumulate_span(&self, acc: &mut CategoricalAccumulator, sub_slice: &[T]) {
+        if sub_slice.is_empty() {
+            return;
+        }
+        let first_val = sub_slice[0];
+        let is_uniform = T::is_uniform(sub_slice);
 
-                        if !is_wgs84 && !is_web_mercator {
-                            if !is_point_in_bbox(lon, lat, bbox) {
-                                known_next_cell = None;
-                                c += 1;
-                                if is_north_up {
-                                    x_curr += dx_step;
-                                }
-                                continue;
-                            }
-                        }
+        if is_uniform {
+            if let Some(cat) = self.resolve_category(first_val) {
+                acc.update_weighted(cat, sub_slice.len() as f64);
+            }
+        } else {
+            let mut curr_cat: Option<i64> = None;
+            let mut curr_cat_count: f64 = 0.0;
 
-                        let cell_opt = known_next_cell.take().or_else(|| row_cache.get_or_compute_cell(lat, lon, res));
-
-                        if let Some(cell_u64) = cell_opt {
-                            if cell_u64 != run_cell {
-                                if run_cell != 0 && run_acc.total_count > 0.0 {
-                                    active_map
-                                        .entry(run_cell)
-                                        .and_modify(|acc| acc.merge(&run_acc))
-                                        .or_insert_with(|| run_acc);
-                                }
-                                run_cell = cell_u64;
-                                run_acc = CategoricalAccumulator::default();
-                                row_cache.on_cell_changed();
-                                if use_neighbor_cache {
-                                    disk_cache.update(run_cell, cos_lat_sq);
-                                }
-                            }
-
-                            let (span_end, next_cell) = coords.find_span_end(
-                                row_cache,
-                                c,
-                                lon_curr,
-                                &geom_ctx,
-                                crs_transformer,
-                                res,
-                                run_cell,
-                                bbox,
-                            );
-
-                            let aggregate_cat_span = |sub_slice: &[T], acc: &mut CategoricalAccumulator| {
-                                if sub_slice.is_empty() { return; }
-                                let first_val = sub_slice[0];
-                                let is_uniform = T::is_uniform(sub_slice);
-
-                                if is_uniform {
-                                    let mut is_nd = false;
-                                    if let Some(nd_nat) = native_nodata {
-                                        if nd_nat == first_val {
-                                            is_nd = true;
-                                        }
-                                    }
-                                    if !is_nd {
-                                        if let Some(raw_cat) = first_val.to_category() {
-                                            let mut is_nd_float = false;
-                                            if native_nodata.is_none() {
-                                                if let Some(nd) = nodata {
-                                                    if (raw_cat as f64 - nd).abs() < 1e-6 {
-                                                        is_nd_float = true;
-                                                    }
-                                                }
-                                            }
-                                            if !is_nd_float {
-                                                let cat_opt = if let Some(rem) = remapper {
-                                                    rem.remap(raw_cat)
-                                                } else {
-                                                    Some(raw_cat)
-                                                };
-                                                if let Some(cat) = cat_opt {
-                                                    acc.update_weighted(cat, sub_slice.len() as f64);
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    let mut curr_cat: Option<i64> = None;
-                                    let mut curr_cat_count: f64 = 0.0;
-
-                                    for &val_raw in sub_slice {
-                                        if let Some(nd_nat) = native_nodata {
-                                            if nd_nat == val_raw {
-                                                continue;
-                                            }
-                                        }
-
-                                        if let Some(raw_cat) = val_raw.to_category() {
-                                            if native_nodata.is_none() {
-                                                if let Some(nd) = nodata {
-                                                    if (raw_cat as f64 - nd).abs() < 1e-6 {
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                            let cat = if let Some(rem) = remapper {
-                                                match rem.remap(raw_cat) {
-                                                    Some(c) => c,
-                                                    None => continue,
-                                                }
-                                            } else {
-                                                raw_cat
-                                            };
-                                            if Some(cat) == curr_cat {
-                                                curr_cat_count += 1.0;
-                                            } else {
-                                                if let Some(prev) = curr_cat {
-                                                    acc.update_weighted(prev, curr_cat_count);
-                                                }
-                                                curr_cat = Some(cat);
-                                                curr_cat_count = 1.0;
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(prev) = curr_cat {
-                                        acc.update_weighted(prev, curr_cat_count);
-                                    }
-                                }
-                            };
-
-                            if is_single_point {
-                                let span_slice = &slice[slice_row_start + c..slice_row_start + span_end];
-                                aggregate_cat_span(span_slice, &mut run_acc);
-                            } else {
-                                let (core_start, core_end) = coords.find_core_span(
-                                    row_cache,
-                                    c,
-                                    span_end,
-                                    dx_bounds,
-                                    dy_bounds,
-                                    &geom_ctx,
-                                    gt,
-                                    bbox,
-                                    |lat, lon| {
-                                        if use_neighbor_cache {
-                                            disk_cache.is_in_run_cell(lat, lon)
-                                        } else {
-                                            LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into()) == Some(run_cell)
-                                        }
-                                    },
-                                );
-
-                                let mut evaluate_boundary = |k: usize| {
-                                    let val_raw = slice[slice_row_start + k];
-                                    if let Some(nd_nat) = native_nodata {
-                                        if nd_nat == val_raw {
-                                            return;
-                                        }
-                                    }
-
-                                    if let Some(raw_cat) = val_raw.to_category() {
-                                        if native_nodata.is_none() {
-                                            if let Some(nd) = nodata {
-                                                if (raw_cat as f64 - nd).abs() < 1e-6 {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        let cat = if let Some(rem) = remapper {
-                                            match rem.remap(raw_cat) {
-                                                Some(c) => c,
-                                                None => return,
-                                            }
-                                        } else {
-                                            raw_cat
-                                        };
-
-                                        coords.for_each_subpixel(
-                                            k,
-                                            &geom_ctx,
-                                            gt,
-                                            crs_transformer,
-                                            chunk.col_offset as usize,
-                                            sampling,
-                                            bbox,
-                                            |lon, lat, d_x, d_y, weight| {
-                                                let cell = match resolve_subpixel_cell(
-                                                    run_cell,
-                                                    lat,
-                                                    lon,
-                                                    d_x,
-                                                    d_y,
-                                                    res,
-                                                    use_neighbor_cache,
-                                                    &mut disk_cache,
-                                                ) {
-                                                    Some(c) => c,
-                                                    None => return,
-                                                };
-
-                                                active_map
-                                                    .entry(cell)
-                                                    .and_modify(|acc| acc.update_weighted(cat, weight))
-                                                    .or_insert_with(|| {
-                                                        let mut a = CategoricalAccumulator::default();
-                                                        a.update_weighted(cat, weight);
-                                                        a
-                                                    });
-                                            },
-                                        );
-                                    }
-                                };
-
-                                for k in c..core_start {
-                                    evaluate_boundary(k);
-                                }
-
-                                if core_start < core_end {
-                                    let core_slice = &slice[slice_row_start + core_start..slice_row_start + core_end];
-                                    aggregate_cat_span(core_slice, &mut run_acc);
-                                }
-
-                                for k in core_end..span_end {
-                                    evaluate_boundary(k);
-                                }
-                            }
-
-                            let num_stepped = span_end - c;
-                            row_cache.advance_span(num_stepped);
-                            if is_wgs84 || is_web_mercator {
-                                lon_curr += (num_stepped as f64) * d_lon_step;
-                            } else if is_north_up {
-                                x_curr += (num_stepped as f64) * dx_step;
-                            }
-                            c = span_end;
-                            known_next_cell = next_cell;
-                        } else {
-                            c += 1;
-                            if is_wgs84 || is_web_mercator {
-                                lon_curr += d_lon_step;
-                            } else if is_north_up {
-                                x_curr += dx_step;
-                            }
-                        }
+            for &val_raw in sub_slice {
+                let cat = match self.resolve_category(val_raw) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if Some(cat) == curr_cat {
+                    curr_cat_count += 1.0;
+                } else {
+                    if let Some(prev) = curr_cat {
+                        acc.update_weighted(prev, curr_cat_count);
                     }
+                    curr_cat = Some(cat);
+                    curr_cat_count = 1.0;
+                }
+            }
+            if let Some(last_cat) = curr_cat {
+                if curr_cat_count > 0.0 {
+                    acc.update_weighted(last_cat, curr_cat_count);
+                }
+            }
+        }
+    }
 
-                    if run_cell != 0 && run_acc.total_count > 0.0 {
-                        active_map
-                            .entry(run_cell)
-                            .and_modify(|acc| acc.merge(&run_acc))
-                            .or_insert_with(|| run_acc);
+    #[inline(always)]
+    fn accumulate_span_multi(
+        &self,
+        run_accs: &mut [CategoricalAccumulator],
+        run_cells: &[u64],
+        sub_slice: &[T],
+    ) {
+        if sub_slice.is_empty() {
+            return;
+        }
+        let first_val = sub_slice[0];
+        let is_uniform = T::is_uniform(sub_slice);
+
+        if is_uniform {
+            if let Some(cat) = self.resolve_category(first_val) {
+                let weight = sub_slice.len() as f64;
+                for i in 0..run_accs.len() {
+                    if run_cells[i] != 0 {
+                        run_accs[i].update_weighted(cat, weight);
                     }
                 }
-            } else {
-                let use_neighbor_caches: Vec<bool> = resolutions
-                    .iter()
-                    .map(|&r| !is_single_point && can_use_neighbor_cache(px_diag_m, r))
-                    .collect();
-                let mut disk_caches = vec![H3NeighborDiskCache::default(); num_res];
+            }
+        } else {
+            let mut curr_cat: Option<i64> = None;
+            let mut curr_cat_count: f64 = 0.0;
 
-                for i in 0..num_res {
-                    row_caches[i].reset_row();
-                    run_cells[i] = 0;
-                    run_accs[i] = CategoricalAccumulator::default();
-                    known_next_cells[i] = None;
-                    span_ends[i] = row_c_start;
-                    core_starts[i] = row_c_start;
-                    core_ends[i] = row_c_start;
-                }
-
-                let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
-                let mut x_curr = x_start + (row_c_start as f64) * dx_step;
-                let mut c = row_c_start;
-
-                while c < row_c_end {
-                    let (lon, lat) = match coords.pixel_center_lon_lat(
-                        c,
-                        x_curr,
-                        lon_curr,
-                        &geom_ctx,
-                        gt,
-                        crs_transformer,
-                        chunk.col_offset as usize,
-                    ) {
-                        Some(ll) => ll,
-                        None => {
-                            for i in 0..num_res {
-                                if run_cells[i] != 0 && run_accs[i].total_count > 0.0 {
-                                    chunk_maps[i]
-                                        .entry(run_cells[i])
-                                        .and_modify(|acc| acc.merge(&run_accs[i]))
-                                        .or_insert_with(|| run_accs[i].clone());
-                                    run_accs[i] = CategoricalAccumulator::default();
-                                }
-                                run_cells[i] = 0;
-                                known_next_cells[i] = None;
-                                span_ends[i] = c + 1;
-                            }
-                            c += 1;
-                            if is_north_up {
-                                x_curr += dx_step;
-                            }
-                            continue;
-                        }
-                    };
-
-                    if !is_wgs84 && !is_web_mercator {
-                        if !is_point_in_bbox(lon, lat, bbox) {
-                            for i in 0..num_res {
-                                if run_cells[i] != 0 && run_accs[i].total_count > 0.0 {
-                                    chunk_maps[i]
-                                        .entry(run_cells[i])
-                                        .and_modify(|acc| acc.merge(&run_accs[i]))
-                                        .or_insert_with(|| run_accs[i].clone());
-                                    run_accs[i] = CategoricalAccumulator::default();
-                                }
-                                run_cells[i] = 0;
-                                known_next_cells[i] = None;
-                                span_ends[i] = c + 1;
-                            }
-                            c += 1;
-                            if is_north_up {
-                                x_curr += dx_step;
-                            }
-                            continue;
-                        }
-                    }
-
-                    for i in 0..num_res {
-                        if c >= span_ends[i] {
-                            let res = resolutions[i];
-                            let cell_opt = known_next_cells[i]
-                                .take()
-                                .or_else(|| row_caches[i].get_or_compute_cell(lat, lon, res));
-
-                            if let Some(cell_u64) = cell_opt {
-                                if cell_u64 != run_cells[i] {
-                                    if run_cells[i] != 0 && run_accs[i].total_count > 0.0 {
-                                        chunk_maps[i]
-                                            .entry(run_cells[i])
-                                            .and_modify(|acc| acc.merge(&run_accs[i]))
-                                            .or_insert_with(|| run_accs[i].clone());
-                                        run_accs[i] = CategoricalAccumulator::default();
-                                    }
-                                    run_cells[i] = cell_u64;
-                                    row_caches[i].on_cell_changed();
-                                    if use_neighbor_caches[i] {
-                                        disk_caches[i].update(run_cells[i], cos_lat_sq);
-                                    }
-                                }
-
-                                let (span_end, next_cell) = coords.find_span_end(
-                                    &mut row_caches[i],
-                                    c,
-                                    lon_curr,
-                                    &geom_ctx,
-                                    crs_transformer,
-                                    res,
-                                    run_cells[i],
-                                    bbox,
-                                );
-
-                                span_ends[i] = span_end;
-                                known_next_cells[i] = next_cell;
-
-                                if !is_single_point {
-                                    let (c_start, c_end) = coords.find_core_span(
-                                        &row_caches[i],
-                                        c,
-                                        span_end,
-                                        dx_bounds,
-                                        dy_bounds,
-                                        &geom_ctx,
-                                        gt,
-                                        bbox,
-                                        |test_lat, test_lon| {
-                                            if use_neighbor_caches[i] {
-                                                disk_caches[i].is_in_run_cell(test_lat, test_lon)
-                                            } else {
-                                                LatLng::new(test_lat, test_lon).ok().map(|ll| ll.to_cell(res).into())
-                                                    == Some(run_cells[i])
-                                            }
-                                        },
-                                    );
-                                    core_starts[i] = c_start;
-                                    core_ends[i] = c_end;
-                                }
-                            } else {
-                                if run_cells[i] != 0 && run_accs[i].total_count > 0.0 {
-                                    chunk_maps[i]
-                                        .entry(run_cells[i])
-                                        .and_modify(|acc| acc.merge(&run_accs[i]))
-                                        .or_insert_with(|| run_accs[i].clone());
-                                    run_accs[i] = CategoricalAccumulator::default();
-                                }
-                                run_cells[i] = 0;
-                                span_ends[i] = c + 1;
-                                known_next_cells[i] = None;
-                                core_starts[i] = c + 1;
-                                core_ends[i] = c + 1;
-                            }
-                        }
-                    }
-
-                    let mut step_end = row_c_end;
-                    for i in 0..num_res {
-                        step_end = step_end.min(span_ends[i]);
-                    }
-                    let step_end = step_end.max(c + 1).min(row_c_end);
-
-                    let aggregate_cat_span_multi = |sub_slice: &[T],
-                                                    run_accs: &mut [CategoricalAccumulator]| {
-                        if sub_slice.is_empty() {
-                            return;
-                        }
-                        let first_val = sub_slice[0];
-                        let is_uniform = T::is_uniform(sub_slice);
-
-                        if is_uniform {
-                            let mut is_nd = false;
-                            if let Some(nd_nat) = native_nodata {
-                                if nd_nat == first_val {
-                                    is_nd = true;
-                                }
-                            }
-                            if !is_nd {
-                                if let Some(raw_cat) = first_val.to_category() {
-                                    let mut is_nd_float = false;
-                                    if native_nodata.is_none() {
-                                        if let Some(nd) = nodata {
-                                            if (raw_cat as f64 - nd).abs() < 1e-6 {
-                                                is_nd_float = true;
-                                            }
-                                        }
-                                    }
-                                    if !is_nd_float {
-                                        let cat_opt = if let Some(rem) = remapper {
-                                            rem.remap(raw_cat)
-                                        } else {
-                                            Some(raw_cat)
-                                        };
-                                        if let Some(cat) = cat_opt {
-                                            let count = sub_slice.len() as f64;
-                                            for i in 0..num_res {
-                                                if run_cells[i] != 0 {
-                                                    run_accs[i].update_weighted(cat, count);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            let mut curr_cat: Option<i64> = None;
-                            let mut curr_cat_count: f64 = 0.0;
-
-                            for &val_raw in sub_slice {
-                                if let Some(nd_nat) = native_nodata {
-                                    if nd_nat == val_raw {
-                                        continue;
-                                    }
-                                }
-
-                                if let Some(raw_cat) = val_raw.to_category() {
-                                    if native_nodata.is_none() {
-                                        if let Some(nd) = nodata {
-                                            if (raw_cat as f64 - nd).abs() < 1e-6 {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    let cat = if let Some(rem) = remapper {
-                                        match rem.remap(raw_cat) {
-                                            Some(c) => c,
-                                            None => continue,
-                                        }
-                                    } else {
-                                        raw_cat
-                                    };
-                                    if Some(cat) == curr_cat {
-                                        curr_cat_count += 1.0;
-                                    } else {
-                                        if let Some(prev) = curr_cat {
-                                            for i in 0..num_res {
-                                                if run_cells[i] != 0 {
-                                                    run_accs[i].update_weighted(prev, curr_cat_count);
-                                                }
-                                            }
-                                        }
-                                        curr_cat = Some(cat);
-                                        curr_cat_count = 1.0;
-                                    }
-                                }
-                            }
-
-                            if let Some(prev) = curr_cat {
-                                for i in 0..num_res {
-                                    if run_cells[i] != 0 {
-                                        run_accs[i].update_weighted(prev, curr_cat_count);
-                                    }
-                                }
-                            }
-                        }
-                    };
-
-                    if is_single_point {
-                        let span_slice = &slice[slice_row_start + c..slice_row_start + step_end];
-                        aggregate_cat_span_multi(span_slice, &mut run_accs);
-                    } else {
-                        let mut sub_core_start = c;
-                        let mut sub_core_end = step_end;
-                        for i in 0..num_res {
+            for &val_raw in sub_slice {
+                let cat = match self.resolve_category(val_raw) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if Some(cat) == curr_cat {
+                    curr_cat_count += 1.0;
+                } else {
+                    if let Some(prev) = curr_cat {
+                        for i in 0..run_accs.len() {
                             if run_cells[i] != 0 {
-                                sub_core_start = sub_core_start.max(core_starts[i]);
-                                sub_core_end = sub_core_end.min(core_ends[i]);
-                            }
-                        }
-
-                        let mut evaluate_boundary_multi = |k: usize,
-                                                           run_accs: &mut [CategoricalAccumulator],
-                                                           chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>]| {
-                            let val_raw = slice[slice_row_start + k];
-                            if let Some(nd_nat) = native_nodata {
-                                if nd_nat == val_raw {
-                                    return;
-                                }
-                            }
-
-                            if let Some(raw_cat) = val_raw.to_category() {
-                                if native_nodata.is_none() {
-                                    if let Some(nd) = nodata {
-                                        if (raw_cat as f64 - nd).abs() < 1e-6 {
-                                            return;
-                                        }
-                                    }
-                                }
-                                let cat = if let Some(rem) = remapper {
-                                    match rem.remap(raw_cat) {
-                                        Some(c) => c,
-                                        None => return,
-                                    }
-                                } else {
-                                    raw_cat
-                                };
-
-                                for i in 0..num_res {
-                                    if run_cells[i] == 0 {
-                                        continue;
-                                    }
-                                    if k >= core_starts[i] && k < core_ends[i] {
-                                        run_accs[i].update_weighted(cat, 1.0);
-                                    }
-                                }
-
-                                let any_subpixel = (0..num_res).any(|i| run_cells[i] != 0 && (k < core_starts[i] || k >= core_ends[i]));
-                                if any_subpixel {
-                                    coords.for_each_subpixel(
-                                        k,
-                                        &geom_ctx,
-                                        gt,
-                                        crs_transformer,
-                                        chunk.col_offset as usize,
-                                        sampling,
-                                        bbox,
-                                        |lon, lat, d_x, d_y, weight| {
-                                            for i in 0..num_res {
-                                                if run_cells[i] == 0 || (k >= core_starts[i] && k < core_ends[i]) {
-                                                    continue;
-                                                }
-                                                let res = resolutions[i];
-                                                let cell = match resolve_subpixel_cell(
-                                                    run_cells[i],
-                                                    lat,
-                                                    lon,
-                                                    d_x,
-                                                    d_y,
-                                                    res,
-                                                    use_neighbor_caches[i],
-                                                    &mut disk_caches[i],
-                                                ) {
-                                                    Some(c) => c,
-                                                    None => continue,
-                                                };
-
-                                                chunk_maps[i]
-                                                    .entry(cell)
-                                                    .and_modify(|acc| acc.update_weighted(cat, weight))
-                                                    .or_insert_with(|| {
-                                                        let mut a = CategoricalAccumulator::default();
-                                                        a.update_weighted(cat, weight);
-                                                        a
-                                                    });
-                                            }
-                                        },
-                                    );
-                                }
-                            }
-                        };
-
-                        if sub_core_start < sub_core_end {
-                            for k in c..sub_core_start {
-                                evaluate_boundary_multi(k, &mut run_accs, chunk_maps);
-                            }
-
-                            let core_slice = &slice[slice_row_start + sub_core_start..slice_row_start + sub_core_end];
-                            aggregate_cat_span_multi(core_slice, &mut run_accs);
-
-                            for k in sub_core_end..step_end {
-                                evaluate_boundary_multi(k, &mut run_accs, chunk_maps);
-                            }
-                        } else {
-                            for k in c..step_end {
-                                evaluate_boundary_multi(k, &mut run_accs, chunk_maps);
+                                run_accs[i].update_weighted(prev, curr_cat_count);
                             }
                         }
                     }
-
-                    let num_stepped = step_end - c;
-                    for i in 0..num_res {
-                        row_caches[i].advance_span(num_stepped);
-                    }
-                    if is_wgs84 || is_web_mercator {
-                        lon_curr += (num_stepped as f64) * d_lon_step;
-                    } else if is_north_up {
-                        x_curr += (num_stepped as f64) * dx_step;
-                    }
-                    c = step_end;
+                    curr_cat = Some(cat);
+                    curr_cat_count = 1.0;
                 }
+            }
 
-                for i in 0..num_res {
-                    if run_cells[i] != 0 && run_accs[i].total_count > 0.0 {
-                        chunk_maps[i]
-                            .entry(run_cells[i])
-                            .and_modify(|acc| acc.merge(&run_accs[i]))
-                            .or_insert_with(|| run_accs[i].clone());
+            if let Some(last_cat) = curr_cat {
+                if curr_cat_count > 0.0 {
+                    for i in 0..run_accs.len() {
+                        if run_cells[i] != 0 {
+                            run_accs[i].update_weighted(last_cat, curr_cat_count);
+                        }
                     }
                 }
             }
         }
     }
+
+    #[inline(always)]
+    fn get_sample(&self, pixel: T) -> Option<i64> {
+        self.resolve_category(pixel)
+    }
+
+    #[inline(always)]
+    fn update_sample(&self, acc: &mut CategoricalAccumulator, sample: i64, weight: f64) {
+        acc.update_weighted(sample, weight);
+    }
+}
 
 /// Process a multi-sample categorical slice into thread-local hash maps for a specific band
 fn process_categorical_multisample_slice_into_maps<T>(
@@ -887,8 +347,7 @@ fn process_categorical_multisample_slice_into_maps<T>(
     overlap_ctx: Option<(usize, &MosaicReader)>,
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
-)
-where
+) where
     T: CategoricalUniformity,
 {
     let row_width = chunk.width as usize;
@@ -927,7 +386,8 @@ where
                 let (x, y) = gt.pixel_to_coord(px, py);
                 if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
                     if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat {
+                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat
+                        {
                             continue;
                         }
                     }
@@ -981,16 +441,46 @@ pub fn process_categorical_chunk_payload_into(
     macro_rules! dispatch_categorical {
         ($dr:expr, $nodata:expr, |$slice:ident, $nd:ident| $body:expr) => {
             match $dr {
-                DecodingResult::U8($slice) => { let $nd = <u8 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::U16($slice) => { let $nd = <u16 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::U32($slice) => { let $nd = <u32 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::U64($slice) => { let $nd = <u64 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::I8($slice) => { let $nd = <i8 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::I16($slice) => { let $nd = <i16 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::I32($slice) => { let $nd = <i32 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::I64($slice) => { let $nd = <i64 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::F32($slice) => { let $nd = <f32 as NodataCast>::from_nodata_f64($nodata); $body }
-                DecodingResult::F64($slice) => { let $nd = <f64 as NodataCast>::from_nodata_f64($nodata); $body }
+                DecodingResult::U8($slice) => {
+                    let $nd = <u8 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::U16($slice) => {
+                    let $nd = <u16 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::U32($slice) => {
+                    let $nd = <u32 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::U64($slice) => {
+                    let $nd = <u64 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::I8($slice) => {
+                    let $nd = <i8 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::I16($slice) => {
+                    let $nd = <i16 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::I32($slice) => {
+                    let $nd = <i32 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::I64($slice) => {
+                    let $nd = <i64 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::F32($slice) => {
+                    let $nd = <f32 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
+                DecodingResult::F64($slice) => {
+                    let $nd = <f64 as NodataCast>::from_nodata_f64($nodata);
+                    $body
+                }
             }
         };
     }
@@ -1002,15 +492,38 @@ pub fn process_categorical_chunk_payload_into(
 
         dispatch_categorical!(decoding_result, nodata, |slice, nd| {
             process_categorical_slice_into_maps(
-                slice, chunk_bounds, nd, resolutions, crs_transformer, gt,
-                sampling, bbox, chunk_stride, nodata, overlap_ctx, remapper, chunk_maps,
+                slice,
+                chunk_bounds,
+                nd,
+                resolutions,
+                crs_transformer,
+                gt,
+                sampling,
+                bbox,
+                chunk_stride,
+                nodata,
+                overlap_ctx,
+                remapper,
+                chunk_maps,
             );
         });
     } else {
         dispatch_categorical!(decoding_result, nodata, |slice, nd| {
             process_categorical_multisample_slice_into_maps(
-                slice, chunk_bounds, nd, resolutions, crs_transformer, gt,
-                sampling, bbox, chunk_stride, spp, band, overlap_ctx, remapper, chunk_maps,
+                slice,
+                chunk_bounds,
+                nd,
+                resolutions,
+                crs_transformer,
+                gt,
+                sampling,
+                bbox,
+                chunk_stride,
+                spp,
+                band,
+                overlap_ctx,
+                remapper,
+                chunk_maps,
             );
         });
     }

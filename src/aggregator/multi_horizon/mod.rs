@@ -23,7 +23,6 @@ pub use continuous_streamer::MultiScanHorizonStreamer;
 pub use controller::{HorizonStreamKernel, MultiHorizonStreamer};
 pub use sharded_map::{get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS};
 pub use walker::{
-    is_slice_all_native_nodata, walk_overlap_pixel_cells, RowCoordinates, RowGeometryContext,
-    RAD_TO_DEG, WGS84_A,
+    is_slice_all_native_nodata, scanline_walk, walk_overlap_pixel_cells, RowCoordinates,
+    RowGeometryContext, ScanlineEngine, RAD_TO_DEG, WGS84_A,
 };
-

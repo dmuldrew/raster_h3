@@ -7,13 +7,12 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use h3o::{LatLng, Resolution};
-use raster_h3::aggregator::{
-    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata,
-    CategoricalAccumulator, H3Accumulator,
-    SamplingPattern,
-};
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+};
+use raster_h3::aggregator::{
+    chunk_intersects_bbox, compute_cell_south_lat, is_chunk_all_nodata, CategoricalAccumulator,
+    H3Accumulator, SamplingPattern,
 };
 use raster_h3::crs::CrsTransformer;
 use raster_h3::error::RasterH3Error;
@@ -96,12 +95,18 @@ fn test_subpixel_sampling_patterns() {
     let center = SamplingPattern::parse("center");
     assert!(center.is_single_point());
 
-    let presets = ["rgss", "5point", "gaussian", "hex", "8rooks", "9point", "16point"];
+    let presets = [
+        "rgss", "5point", "gaussian", "hex", "8rooks", "9point", "16point",
+    ];
     for name in presets {
         let pattern = SamplingPattern::parse(name);
         assert!(!pattern.is_single_point());
         let sum_w: f64 = pattern.points.iter().map(|p| p.weight).sum();
-        assert!((sum_w - 1.0).abs() < 1e-9, "Weights did not sum to 1.0 for {}", name);
+        assert!(
+            (sum_w - 1.0).abs() < 1e-9,
+            "Weights did not sum to 1.0 for {}",
+            name
+        );
     }
 }
 
@@ -147,8 +152,16 @@ fn test_compute_cell_south_lat() {
 
     // Now returns center lat as a fast proxy (always >= true south vertex lat)
     let south_lat = compute_cell_south_lat(cell_u64);
-    assert!(south_lat > 37.76, "Center lat should be near input: {}", south_lat);
-    assert!(south_lat < 37.79, "Center lat should be near input: {}", south_lat);
+    assert!(
+        south_lat > 37.76,
+        "Center lat should be near input: {}",
+        south_lat
+    );
+    assert!(
+        south_lat < 37.79,
+        "Center lat should be near input: {}",
+        south_lat
+    );
 }
 
 #[test]
@@ -164,11 +177,16 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -176,12 +194,11 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
 
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
 
         image.write_data(&data).unwrap();
     }
@@ -227,11 +244,16 @@ fn test_bounding_box_pruning() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -239,12 +261,11 @@ fn test_bounding_box_pruning() {
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
 
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -284,12 +305,17 @@ fn test_web_mercator_hoisted_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         // Web Mercator coords around San Francisco
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -13630000.0, 4550000.0, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -13630000.0, 4550000.0, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -298,11 +324,13 @@ fn test_web_mercator_hoisted_streaming() {
             .unwrap();
 
         let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 1, // Projected
+            1, 1, 0, 2, 1024, 0, 1, 1, // Projected
             3072, 0, 1, 3857, // EPSG:3857
         ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -338,7 +366,9 @@ fn test_prefetched_chunk_reader() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -367,7 +397,9 @@ fn test_prefetched_chunk_reader_multi_worker_ordering() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -387,7 +419,11 @@ fn test_prefetched_chunk_reader_multi_worker_ordering() {
         let mut expected_chunk_idx = 0;
         while let Some(res) = prefetcher.next_chunk() {
             let (idx, bounds, _data) = res.expect("chunk decoding should succeed");
-            assert_eq!(idx, expected_chunk_idx, "Chunk out of order for num_workers={}", num_workers);
+            assert_eq!(
+                idx, expected_chunk_idx,
+                "Chunk out of order for num_workers={}",
+                num_workers
+            );
             let expected_bounds = reader.chunk_layout.get_chunk_bounds(
                 idx,
                 reader.metadata.width,
@@ -413,7 +449,9 @@ fn test_prefetched_chunk_reader_early_drop() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -477,11 +515,16 @@ fn test_categorical_horizon_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray8>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -489,12 +532,11 @@ fn test_categorical_horizon_streaming() {
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
 
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -537,11 +579,16 @@ fn test_u16_raster_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray16>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray16>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -550,7 +597,10 @@ fn test_u16_raster_streaming() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -588,11 +638,16 @@ fn test_f64_raster_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray64Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray64Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -601,7 +656,10 @@ fn test_f64_raster_streaming() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -636,11 +694,16 @@ fn test_subpixel_rgss_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -649,7 +712,10 @@ fn test_subpixel_rgss_streaming() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -677,9 +743,16 @@ fn test_subpixel_rgss_streaming() {
     }
 
     // RGSS 4-point weights (0.25 each) must sum to the exact total pixels (1600.0)
-    assert!((total_pixels - 1600.0).abs() < 1e-3, "Total RGSS area weight mismatch: {}", total_pixels);
+    assert!(
+        (total_pixels - 1600.0).abs() < 1e-3,
+        "Total RGSS area weight mismatch: {}",
+        total_pixels
+    );
     // Boundary hexagons should have fractional pixel area contributions
-    assert!(has_fractional_cell, "Expected boundary hexagons to have fractional counts under RGSS super-sampling");
+    assert!(
+        has_fractional_cell,
+        "Expected boundary hexagons to have fractional counts under RGSS super-sampling"
+    );
 }
 
 #[test]
@@ -695,11 +768,16 @@ fn test_subpixel_hex_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -708,7 +786,10 @@ fn test_subpixel_hex_streaming() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -730,7 +811,11 @@ fn test_subpixel_hex_streaming() {
         }
     }
 
-    assert!((total_pixels - 900.0).abs() < 1e-3, "Total Hex 7-point area weight mismatch: {}", total_pixels);
+    assert!(
+        (total_pixels - 900.0).abs() < 1e-3,
+        "Total Hex 7-point area weight mismatch: {}",
+        total_pixels
+    );
 }
 
 #[test]
@@ -750,11 +835,16 @@ fn test_nodata_filtering_preserves_statistics() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -763,7 +853,10 @@ fn test_nodata_filtering_preserves_statistics() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.encoder().write_tag(Tag::GdalNodata, "-9999").unwrap();
         image.write_data(&data).unwrap();
     }
@@ -814,11 +907,16 @@ fn test_nan_filtering_in_streaming() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -827,7 +925,10 @@ fn test_nan_filtering_in_streaming() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -871,11 +972,16 @@ fn test_custom_nodata_override() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -884,7 +990,10 @@ fn test_custom_nodata_override() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -916,9 +1025,17 @@ fn test_crs_southern_hemisphere_utm() {
     let transformer = CrsTransformer::from_crs_or_epsg(Some(32733), None).unwrap();
     let (lon, lat) = transformer.transform_point(500000.0, 6200000.0).unwrap();
     // Central meridian for Zone 33 is 15°E
-    assert!((lon - 15.0).abs() < 0.1, "Expected lon near 15°E, got: {}", lon);
+    assert!(
+        (lon - 15.0).abs() < 0.1,
+        "Expected lon near 15°E, got: {}",
+        lon
+    );
     // Northing 6,200,000 in Southern hemisphere maps to ~ -34.3° S
-    assert!(lat < -30.0 && lat > -40.0, "Expected negative latitude in S hemisphere, got: {}", lat);
+    assert!(
+        lat < -30.0 && lat > -40.0,
+        "Expected negative latitude in S hemisphere, got: {}",
+        lat
+    );
 }
 
 #[test]
@@ -929,8 +1046,16 @@ fn test_crs_custom_albers_proj_string() {
 
     // Origin (0.0, 0.0) in projection meters maps to (-96.0, 37.5) in WGS84
     let (lon, lat) = transformer.transform_point(0.0, 0.0).unwrap();
-    assert!((lon - -96.0).abs() < 0.01, "Expected lon near -96.0, got: {}", lon);
-    assert!((lat - 37.5).abs() < 0.01, "Expected lat near 37.5, got: {}", lat);
+    assert!(
+        (lon - -96.0).abs() < 0.01,
+        "Expected lon near -96.0, got: {}",
+        lon
+    );
+    assert!(
+        (lat - 37.5).abs() < 0.01,
+        "Expected lat near 37.5, got: {}",
+        lat
+    );
 }
 
 #[test]
@@ -939,7 +1064,11 @@ fn test_crs_invalid_proj_string_error_handling() {
     assert!(result.is_err(), "Expected error on invalid PROJ string");
     match result {
         Err(RasterH3Error::CrsError(msg)) => {
-            assert!(msg.contains("Failed to parse source PROJ string"), "Unexpected message: {}", msg);
+            assert!(
+                msg.contains("Failed to parse source PROJ string"),
+                "Unexpected message: {}",
+                msg
+            );
         }
         _ => panic!("Expected RasterH3Error::CrsError"),
     }
@@ -980,11 +1109,16 @@ fn test_categorical_homogeneous_raster() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray8>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::ModelTiepointTag, &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -993,7 +1127,10 @@ fn test_categorical_homogeneous_raster() {
             .unwrap();
 
         let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
-        image.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..]).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::GeoKeyDirectoryTag, &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -1081,7 +1218,11 @@ fn test_invalid_resolution_parameter_error() {
     assert!(res_cont.is_err());
     match res_cont {
         Err(RasterH3Error::InvalidParameter(msg)) => {
-            assert!(msg.contains("Invalid H3 resolution: 16"), "Unexpected message: {}", msg);
+            assert!(
+                msg.contains("Invalid H3 resolution: 16"),
+                "Unexpected message: {}",
+                msg
+            );
         }
         _ => panic!("Expected RasterH3Error::InvalidParameter"),
     }
@@ -1090,7 +1231,11 @@ fn test_invalid_resolution_parameter_error() {
     assert!(res_cat.is_err());
     match res_cat {
         Err(RasterH3Error::InvalidParameter(msg)) => {
-            assert!(msg.contains("Invalid H3 resolution: 16"), "Unexpected message: {}", msg);
+            assert!(
+                msg.contains("Invalid H3 resolution: 16"),
+                "Unexpected message: {}",
+                msg
+            );
         }
         _ => panic!("Expected RasterH3Error::InvalidParameter"),
     }
@@ -1098,7 +1243,8 @@ fn test_invalid_resolution_parameter_error() {
 
 #[test]
 fn test_nonexistent_file_path_error() {
-    let result = GeoTiffStreamReader::open(Path::new("/nonexistent_directory/nonexistent_file.tif"));
+    let result =
+        GeoTiffStreamReader::open(Path::new("/nonexistent_directory/nonexistent_file.tif"));
     assert!(result.is_err());
     match result {
         Err(RasterH3Error::Io(_)) => {}
@@ -1131,10 +1277,14 @@ fn test_plain_tiff_without_geokeys() {
     let err_res = MultiScanHorizonStreamer::new(reader.clone(), &unspec_config);
     assert!(err_res.is_err());
     match err_res {
-        Err(RasterH3Error::CrsError(msg)) => {
-            assert!(msg.contains("No CRS detected in raster metadata"), "Unexpected message: {}", msg);
+        Err(RasterH3Error::CrsNotDetected(msg)) => {
+            assert!(
+                msg.contains("No CRS detected in raster metadata"),
+                "Unexpected message: {}",
+                msg
+            );
         }
-        _ => panic!("Expected RasterH3Error::CrsError when CRS is not detected"),
+        _ => panic!("Expected RasterH3Error::CrsNotDetected when CRS is not detected"),
     }
 
     // 2. When the user explicitly specifies a CRS, hexification succeeds
@@ -1213,13 +1363,33 @@ fn test_chunk_intersects_bbox_tile_filtering() {
 
     // Query bbox in upper-left: [10, 150, 50, 180]
     let bbox_upper_left = [10.0, 150.0, 50.0, 180.0];
-    assert!(chunk_intersects_bbox(&chunk0, &gt, &transformer, &bbox_upper_left));
-    assert!(!chunk_intersects_bbox(&chunk3, &gt, &transformer, &bbox_upper_left));
+    assert!(chunk_intersects_bbox(
+        &chunk0,
+        &gt,
+        &transformer,
+        &bbox_upper_left
+    ));
+    assert!(!chunk_intersects_bbox(
+        &chunk3,
+        &gt,
+        &transformer,
+        &bbox_upper_left
+    ));
 
     // Query bbox in lower-right: [120, 10, 180, 50]
     let bbox_lower_right = [120.0, 10.0, 180.0, 50.0];
-    assert!(!chunk_intersects_bbox(&chunk0, &gt, &transformer, &bbox_lower_right));
-    assert!(chunk_intersects_bbox(&chunk3, &gt, &transformer, &bbox_lower_right));
+    assert!(!chunk_intersects_bbox(
+        &chunk0,
+        &gt,
+        &transformer,
+        &bbox_lower_right
+    ));
+    assert!(chunk_intersects_bbox(
+        &chunk3,
+        &gt,
+        &transformer,
+        &bbox_lower_right
+    ));
 }
 
 #[test]
@@ -1344,18 +1514,20 @@ fn test_all_nodata_full_stream_scan_and_categorical() {
         let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.4194, 37.7749, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.4194, 37.7749, 0.0][..],
+            )
             .unwrap();
         image
             .encoder()
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -1404,7 +1576,9 @@ fn test_corrupted_and_empty_tiff_error_handling() {
 
     // 2. Corrupted invalid header magic bytes
     let mut invalid_magic_file = NamedTempFile::new().unwrap();
-    invalid_magic_file.write_all(b"NOT_A_VALID_TIFF_STREAM").unwrap();
+    invalid_magic_file
+        .write_all(b"NOT_A_VALID_TIFF_STREAM")
+        .unwrap();
     invalid_magic_file.flush().unwrap();
     assert!(GeoTiffStreamReader::open(invalid_magic_file.path()).is_err());
 
@@ -1421,14 +1595,19 @@ fn test_crs_unspecified_fallback_and_invalid_proj_error() {
     let default_transformer = CrsTransformer::from_crs_or_epsg(None, None);
     assert!(default_transformer.is_err());
     match default_transformer {
-        Err(RasterH3Error::CrsError(msg)) => {
-            assert!(msg.contains("No CRS detected in raster metadata"), "Unexpected message: {}", msg);
+        Err(RasterH3Error::CrsNotDetected(msg)) => {
+            assert!(
+                msg.contains("No CRS detected in raster metadata"),
+                "Unexpected message: {}",
+                msg
+            );
         }
-        _ => panic!("Expected RasterH3Error::CrsError for unspecified CRS"),
+        _ => panic!("Expected RasterH3Error::CrsNotDetected for unspecified CRS"),
     }
 
     // 2. Explicit invalid PROJ definition returns a typed CrsError
-    let invalid_result = CrsTransformer::from_crs_or_epsg(None, Some("+proj=nonexistent_invalid_crs +units=m"));
+    let invalid_result =
+        CrsTransformer::from_crs_or_epsg(None, Some("+proj=nonexistent_invalid_crs +units=m"));
     assert!(invalid_result.is_err());
     match invalid_result {
         Err(RasterH3Error::CrsError(msg)) => {
@@ -1482,23 +1661,27 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray8>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
             .unwrap();
         image
             .encoder()
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
 
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -1531,7 +1714,10 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
     assert!(class_1_total > 0.0);
     assert!(class_2_total > 0.0);
     assert!(class_10_total > 0.0);
-    assert_eq!(class_1_total + class_2_total + class_10_total, expected_valid_pixels);
+    assert_eq!(
+        class_1_total + class_2_total + class_10_total,
+        expected_valid_pixels
+    );
 }
 
 #[test]
@@ -1543,8 +1729,11 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
 
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
     let config = raster_h3::aggregator::multi_horizon::MultiResolutionConfig::new(vec![8]);
-    let mut streamer = raster_h3::aggregator::multi_horizon::MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let mut map: std::collections::HashMap<u64, raster_h3::aggregator::accumulator::H3Accumulator> = std::collections::HashMap::new();
+    let mut streamer =
+        raster_h3::aggregator::multi_horizon::MultiScanHorizonStreamer::new(reader, &config)
+            .unwrap();
+    let mut map: std::collections::HashMap<u64, raster_h3::aggregator::accumulator::H3Accumulator> =
+        std::collections::HashMap::new();
     while !streamer.is_finished() {
         for record in streamer.fetch_next_batch(2048) {
             map.entry(record.h3_index)
@@ -1606,13 +1795,32 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
     // Ground truth asserts for LF2024_FBFM40_HI.tif
     assert_eq!(r7_count, 39_412, "Res 7 pyramid cell count mismatch");
     assert_eq!(r8_count, 273_615, "Res 8 pyramid cell count mismatch");
-    assert_eq!(r7_count + r8_count, 313_027, "Total dual pyramid cell count mismatch");
-    assert_eq!(total_pixels as u64, 256_542_384, "Total pixel count mismatch on Hawaii categorical scan");
+    assert_eq!(
+        r7_count + r8_count,
+        313_027,
+        "Total dual pyramid cell count mismatch"
+    );
+    assert_eq!(
+        total_pixels as u64, 256_542_384,
+        "Total pixel count mismatch on Hawaii categorical scan"
+    );
 
     // Verify top 3 landcover classes
-    assert_eq!(*r8_class_distribution.get(&-9999).unwrap_or(&0), 243_696, "Class -9999 (NoData) hex count mismatch");
-    assert_eq!(*r8_class_distribution.get(&98).unwrap_or(&0), 10_779, "Class 98 hex count mismatch");
-    assert_eq!(*r8_class_distribution.get(&163).unwrap_or(&0), 7_287, "Class 163 hex count mismatch");
+    assert_eq!(
+        *r8_class_distribution.get(&-9999).unwrap_or(&0),
+        243_696,
+        "Class -9999 (NoData) hex count mismatch"
+    );
+    assert_eq!(
+        *r8_class_distribution.get(&98).unwrap_or(&0),
+        10_779,
+        "Class 98 hex count mismatch"
+    );
+    assert_eq!(
+        *r8_class_distribution.get(&163).unwrap_or(&0),
+        7_287,
+        "Class 163 hex count mismatch"
+    );
 
     // 2. Spatial bounding box pushdown (Maui Island ROI)
     let maui_bbox = [-156.70, 20.55, -155.95, 21.05];
@@ -1620,7 +1828,8 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
     config_maui.bbox = Some(maui_bbox);
 
     let reader_maui = GeoTiffStreamReader::open(tiff_path).unwrap();
-    let mut streamer_maui = MultiCategoricalHorizonStreamer::new(reader_maui, &config_maui).unwrap();
+    let mut streamer_maui =
+        MultiCategoricalHorizonStreamer::new(reader_maui, &config_maui).unwrap();
     let mut maui_hexes = 0usize;
 
     loop {
@@ -1631,7 +1840,10 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
             break;
         }
     }
-    assert_eq!(maui_hexes, 5_230, "Maui ROI spatial filter pushdown hexagon count mismatch");
+    assert_eq!(
+        maui_hexes, 5_230,
+        "Maui ROI spatial filter pushdown hexagon count mismatch"
+    );
 }
 
 #[test]
@@ -1648,11 +1860,16 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
         let file = File::create(&path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..],
+            )
             .unwrap();
 
         image
@@ -1660,12 +1877,11 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
             .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
             .unwrap();
 
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -1692,7 +1908,8 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
     let mut config_filtered = MultiResolutionConfig::single(8);
     config_filtered.bbox = Some(target_bbox);
 
-    let mut streamer_filtered = MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
+    let mut streamer_filtered =
+        MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
     let mut filtered_pixels = 0.0f64;
     loop {
         let batch = streamer_filtered.fetch_next_batch(100);
@@ -1712,16 +1929,22 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
 
 #[test]
 fn test_antimeridian_crossing_and_wrap() {
-    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
     use raster_h3::pmtiles::mvt::MercatorPoint;
+    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
 
     // 1. Longitude wrapping and clamping on Date Line
     let (tx_west, ty_west) = lon_lat_to_tile_xy(-179.999, 51.5, 8);
     let (tx_east, ty_east) = lon_lat_to_tile_xy(179.999, 51.5, 8);
 
     assert_eq!(tx_west, 0, "Westmost longitude should map to tile column 0");
-    assert_eq!(tx_east, 255, "Eastmost longitude should map to tile column 255 (2^8 - 1)");
-    assert_eq!(ty_west, ty_east, "Identical latitudes must share tile row Y");
+    assert_eq!(
+        tx_east, 255,
+        "Eastmost longitude should map to tile column 255 (2^8 - 1)"
+    );
+    assert_eq!(
+        ty_west, ty_east,
+        "Identical latitudes must share tile row Y"
+    );
 
     // 2. Normalized Mercator coordinates
     let merc_west = MercatorPoint::from_lat_lng(51.5, -180.0);
@@ -1730,8 +1953,12 @@ fn test_antimeridian_crossing_and_wrap() {
     assert!((merc_east.x - 1.0).abs() < 1e-6);
 
     // 3. H3 cell indexing across Date Line
-    let cell_west = LatLng::new(51.5, -179.99).unwrap().to_cell(Resolution::Eight);
-    let cell_east = LatLng::new(51.5, 179.99).unwrap().to_cell(Resolution::Eight);
+    let cell_west = LatLng::new(51.5, -179.99)
+        .unwrap()
+        .to_cell(Resolution::Eight);
+    let cell_east = LatLng::new(51.5, 179.99)
+        .unwrap()
+        .to_cell(Resolution::Eight);
     let south_west = compute_cell_south_lat(cell_west.into());
     let south_east = compute_cell_south_lat(cell_east.into());
     assert!(south_west.is_finite());
@@ -1740,8 +1967,8 @@ fn test_antimeridian_crossing_and_wrap() {
 
 #[test]
 fn test_extreme_polar_latitudes_clamping() {
-    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
     use raster_h3::pmtiles::mvt::MercatorPoint;
+    use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
 
     // 1. Extreme North Pole (+89.99°)
     let (tx_north, ty_north) = lon_lat_to_tile_xy(0.0, 89.99, 10);
@@ -1750,7 +1977,10 @@ fn test_extreme_polar_latitudes_clamping() {
 
     // 2. Extreme South Pole (-89.99°)
     let (tx_south, ty_south) = lon_lat_to_tile_xy(0.0, -89.99, 10);
-    assert_eq!(ty_south, 1023, "South pole must clamp safely to tile Y=1023 (2^10 - 1)");
+    assert_eq!(
+        ty_south, 1023,
+        "South pole must clamp safely to tile Y=1023 (2^10 - 1)"
+    );
     assert!(tx_south < 1024);
 
     // 3. Mercator coordinate finite clamping
@@ -1767,7 +1997,16 @@ fn test_welford_accumulator_extreme_mixed_bathymetry_numerical_stability() {
     let mut acc = H3Accumulator::default();
 
     // 1,000,000 samples spanning from Mariana Trench (-10,928m) to Mt Everest (+8,848.86m)
-    let samples = [-10928.0f64, -5000.0, -100.0, 0.0, 500.0, 2500.0, 5895.0, 8848.86];
+    let samples = [
+        -10928.0f64,
+        -5000.0,
+        -100.0,
+        0.0,
+        500.0,
+        2500.0,
+        5895.0,
+        8848.86,
+    ];
     let num_repeats = 125_000; // 8 * 125,000 = 1,000,000 samples
     let total_count = (samples.len() * num_repeats) as f64;
 
@@ -1776,7 +2015,9 @@ fn test_welford_accumulator_extreme_mixed_bathymetry_numerical_stability() {
     let true_var: f64 = samples
         .iter()
         .map(|&x| (x - true_mean) * (x - true_mean))
-        .sum::<f64>() * (num_repeats as f64) / (total_count - 1.0);
+        .sum::<f64>()
+        * (num_repeats as f64)
+        / (total_count - 1.0);
 
     for _ in 0..num_repeats {
         for &val in &samples {
@@ -1789,8 +2030,14 @@ fn test_welford_accumulator_extreme_mixed_bathymetry_numerical_stability() {
     assert_eq!(acc.max, 8848.86);
 
     // Welford online mean and sample variance must match 2-pass exact reference
-    assert!((acc.mean() - true_mean).abs() < 1e-8, "Mean error must be < 1e-8");
-    assert!((acc.variance() - true_var).abs() < 1e-4, "Variance error must be < 1e-4");
+    assert!(
+        (acc.mean() - true_mean).abs() < 1e-8,
+        "Mean error must be < 1e-8"
+    );
+    assert!(
+        (acc.variance() - true_var).abs() < 1e-4,
+        "Variance error must be < 1e-4"
+    );
     assert!(acc.variance() >= 0.0, "Variance must never be negative");
     assert!((acc.stddev() - true_var.sqrt()).abs() < 1e-6);
 }
@@ -1815,7 +2062,11 @@ fn test_categorical_accumulator_high_cardinality_shannon_entropy() {
     // Analytical Shannon entropy for uniform distribution over N=256 is ln(256) nats
     let entropy = acc.shannon_entropy();
     let expected_entropy = (256.0f64).ln();
-    assert!((entropy - expected_entropy).abs() < 1e-10, "Entropy of uniform 256 classes must equal ln(256), got {}", entropy);
+    assert!(
+        (entropy - expected_entropy).abs() < 1e-10,
+        "Entropy of uniform 256 classes must equal ln(256), got {}",
+        entropy
+    );
 
     // Test extreme single-class concentration (100% pure class) -> Shannon entropy must be exactly 0.0
     let mut pure_acc = CategoricalAccumulator::default();
@@ -1849,7 +2100,10 @@ fn test_wkb_ogc_compliance() {
     assert_eq!(num_rings, 1, "Ring count must be 1");
 
     let num_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
-    assert_eq!(num_points, 7, "Hexagon ring must have 7 points (6 vertices + 1 closing)");
+    assert_eq!(
+        num_points, 7,
+        "Hexagon ring must have 7 points (6 vertices + 1 closing)"
+    );
 
     // Check ring closure (point 0 == point 6)
     let p0_x = f64::from_le_bytes(buf[13..21].try_into().unwrap());
@@ -1907,14 +2161,21 @@ fn test_simd_span_f32_accuracy_and_welford_equivalence() {
 
     let nd_acc = f32::accumulate_span(&nodata_vals, Some(-9999.0));
     assert_eq!(nd_acc.count, 124.0);
-    assert!((nd_acc.sum - (welford.sum - raw_vals[5] as f64 - raw_vals[15] as f64 - raw_vals[50] as f64)).abs() < 1e-4);
+    assert!(
+        (nd_acc.sum
+            - (welford.sum - raw_vals[5] as f64 - raw_vals[15] as f64 - raw_vals[50] as f64))
+            .abs()
+            < 1e-4
+    );
 }
 
 #[test]
 fn test_simd_span_f64_accuracy_and_welford_equivalence() {
     use raster_h3::aggregator::simd::SimdSpanAccumulate;
 
-    let raw_vals: Vec<f64> = (0..127).map(|i| ((i * 11 + 7) % 89) as f64 * 2.25).collect();
+    let raw_vals: Vec<f64> = (0..127)
+        .map(|i| ((i * 11 + 7) % 89) as f64 * 2.25)
+        .collect();
     let mut welford = H3Accumulator::default();
     for &v in &raw_vals {
         welford.update(v);
@@ -1951,8 +2212,16 @@ fn test_simd_span_variable_lengths() {
         let acc = f32::accumulate_span(&vals, None);
         assert_eq!(acc.count, expected.count, "Count mismatch for len {}", len);
         if len > 0 {
-            assert!((acc.sum - expected.sum).abs() < 1e-4, "Sum mismatch for len {}", len);
-            assert!((acc.mean() - expected.mean()).abs() < 1e-6, "Mean mismatch for len {}", len);
+            assert!(
+                (acc.sum - expected.sum).abs() < 1e-4,
+                "Sum mismatch for len {}",
+                len
+            );
+            assert!(
+                (acc.mean() - expected.mean()).abs() < 1e-6,
+                "Mean mismatch for len {}",
+                len
+            );
         }
     }
 }
@@ -1992,7 +2261,10 @@ fn test_categorical_16_slot_inline_and_heap_spillover() {
     }
 
     assert_eq!(cat.inline_len, 16);
-    assert!(cat.heap_counts.is_none(), "Must stay inline up to 16 classes");
+    assert!(
+        cat.heap_counts.is_none(),
+        "Must stay inline up to 16 classes"
+    );
     assert_eq!(cat.unique_classes(), 16);
     let expected_sum: f64 = (1..=16).map(|c| (c * 10) as f64).sum();
     assert_eq!(cat.total_count, expected_sum);
@@ -2006,7 +2278,10 @@ fn test_categorical_16_slot_inline_and_heap_spillover() {
 
     // 2. Add 17th class: should spill to heap
     cat.update_weighted(17, 200.0);
-    assert!(cat.heap_counts.is_some(), "Must spill to heap on 17th class");
+    assert!(
+        cat.heap_counts.is_some(),
+        "Must spill to heap on 17th class"
+    );
     assert_eq!(cat.unique_classes(), 17);
     assert_eq!(cat.total_count, expected_sum + 200.0);
     assert_eq!(cat.get_class_count(17), 200.0);
@@ -2037,23 +2312,39 @@ fn test_categorical_simd_uniformity_types_and_spans() {
         // Various span sizes: 2, 7, 8, 15, 16, 31, 32, 63, 64, 100
         for len in [2, 7, 8, 15, 16, 31, 32, 63, 64, 100] {
             let uniform_vec = vec![val; len];
-            assert!(T::is_uniform(&uniform_vec), "Expected uniform for len {}", len);
+            assert!(
+                T::is_uniform(&uniform_vec),
+                "Expected uniform for len {}",
+                len
+            );
 
             // Mismatch at start
             let mut diff_start = uniform_vec.clone();
             diff_start[0] = diff_val;
-            assert!(!T::is_uniform(&diff_start), "Expected non-uniform at start for len {}", len);
+            assert!(
+                !T::is_uniform(&diff_start),
+                "Expected non-uniform at start for len {}",
+                len
+            );
 
             // Mismatch at end
             let mut diff_end = uniform_vec.clone();
             diff_end[len - 1] = diff_val;
-            assert!(!T::is_uniform(&diff_end), "Expected non-uniform at end for len {}", len);
+            assert!(
+                !T::is_uniform(&diff_end),
+                "Expected non-uniform at end for len {}",
+                len
+            );
 
             // Mismatch at middle
             if len > 2 {
                 let mut diff_mid = uniform_vec.clone();
                 diff_mid[len / 2] = diff_val;
-                assert!(!T::is_uniform(&diff_mid), "Expected non-uniform at mid for len {}", len);
+                assert!(
+                    !T::is_uniform(&diff_mid),
+                    "Expected non-uniform at mid for len {}",
+                    len
+                );
             }
         }
     }
@@ -2087,8 +2378,3 @@ fn test_multi_resolution_config_single_delegation() {
     assert_eq!(converted.resolutions, vec![8]);
     assert_eq!(converted.band, 1);
 }
-
-
-
-
-
