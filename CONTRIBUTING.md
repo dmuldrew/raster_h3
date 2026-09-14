@@ -61,19 +61,28 @@ src/
 ├── functions/               # DuckDB table & scalar function registrations
 │   ├── categorical_table_function.rs  # h3_raster_categorical_aggregate registration
 │   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter
+│   ├── parquet_table_function.rs      # Native Parquet export registration
 │   ├── pmtiles_table_function.rs      # h3_raster_to_pmtiles registration
 │   ├── scalar.rs            # Scalar helper functions (h3_to_string, string_to_h3, etc.)
 │   ├── table_function.rs    # h3_raster_continuous_aggregate registration
+│   └── mod.rs
+├── parquet/                 # Native OGC GeoParquet 1.1 streaming exporter
+│   ├── writer.rs            # Double-buffered row-group writer & WKB polygon geometry emitter
 │   └── mod.rs
 ├── pmtiles/                 # Native PMTiles v3 & Mapbox Vector Tile (MVT) generation
 │   ├── mvt.rs               # Pure-Rust Protobuf MVT vector tile encoder
 │   ├── tiler.rs             # Multi-resolution pyramid tiling & Hilbert indexer
 │   ├── writer.rs            # PMTiles v3 container writer & header serializer
 │   └── mod.rs
-├── raster/                  # GeoTIFF I/O & geotransform
-│   ├── geotiff.rs           # Baseline/tiled/BigTIFF reader & decompression
+├── raster/                  # GeoTIFF, COG, and Mosaic streaming
+│   ├── geotiff.rs           # Baseline/tiled/BigTIFF reader with SIMD Deflate & fast LZW
 │   ├── geotransform.rs      # Affine geotransform & coordinate mapping
-│   ├── prefetch.rs         # Lock-free background memory prefetcher
+│   ├── http_range.rs        # HTTP/S3 byte-range client & chunk coalescing
+│   ├── metadata.rs          # GeoTIFF tag & IFD parser
+│   ├── mosaic.rs            # Multi-file mosaic reader & overlap rules (Cutline, First, Average)
+│   ├── predictor.rs         # Horizontal & floating-point TIFF predictor decoders
+│   ├── prefetch.rs          # Lock-free buffer pool (Injector) & OrderedPrefetchQueue
+│   ├── remote_prefetch.rs   # Asynchronous range request prefetch queue for COGs
 │   └── mod.rs
 ├── error.rs                 # Error types & conversions
 └── lib.rs                   # Extension entry point & registration

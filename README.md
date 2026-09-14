@@ -53,6 +53,8 @@ By converting continuous raster pixels into discrete H3 cell indices (`UBIGINT` 
 - **Bounded Constant Memory (O(Scan Front) < 15 MB RAM)**: Processes multi-gigabyte and multi-terabyte rasters on standard laptops without out-of-memory (OOM) crashes.
 - **Hardware-Saturating Multi-Core Throughput**: Maximizes CPU throughput by saturating disk and decompression pipelines across all available cores with linear Rayon and DuckDB thread distribution.
 - **Native PMTiles v3 Vector Pyramid Generation**: Converts raster aggregations directly into single-file Mapbox Vector Tile (`.pmtiles`) archives with zero intermediate GIS files, zero external `tippecanoe` builds, and strict mathematical H3 validity enforcement.
+- **Native OGC GeoParquet 1.1 Export**: Converts continuous or categorical aggregations directly to GeoParquet with 125-byte closed WKB polygon geometries and embedded PROJJSON metadata.
+- **Cloud-Native Remote COG & S3 Streaming**: Directly streams Cloud-Optimized GeoTIFFs over HTTP, HTTPS, or AWS S3 with asynchronous chunk range prefetching and request coalescing.
 - **Native H3 Parquet to PMTiles Conversion**: Converts any H3-indexed Parquet file directly to PMTiles v3 archives with auto-detected property schema and strict cell validation.
 - **Arbitrary SQL Execution in Docker**: Runs continuous, categorical, or PMTiles export queries directly as 1-liners or piped scripts in Docker with zero manual extension loading.
 - **Sub-Pixel Area-Weighted Anti-Aliasing**: Supports multi-point super-sampling (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact area-proportional boundary aggregation.
@@ -312,9 +314,62 @@ COPY (
 ) TO 'elevation_h3.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
 ```
 
-### 7. Categorical Raster Aggregation (Land Cover, Zoning, Soil Types)
+### 7. Remote Cloud-Optimized GeoTIFF (COG) & S3 Streaming
+Stream remote rasters directly over HTTP, HTTPS, or AWS S3 without downloading the full raster to local disk:
+```sql
+-- Direct HTTPS COG ingestion with asynchronous byte-range prefetching
+SELECT * FROM h3_raster_continuous_aggregate(
+    'https://example.com/rasters/cog_elevation.tif',
+    resolution := 8,
+    sampling := 'rgss'
+);
 
-#### 7a. Majority Class & Dominance Percentage (Wide Format)
+-- AWS S3 bucket streaming (respects standard AWS environment variables or S3 URLs)
+SELECT * FROM h3_raster_continuous_aggregate(
+    's3://my-geospatial-bucket/landsat/scene_01.tif',
+    resolution := 9
+);
+```
+
+### 8. Multi-File Raster Mosaics & Cutline Overlap Resolution
+Ingest multi-tile collections via glob patterns, comma-delimited lists, or GDAL VRT files with zero double-counting:
+```sql
+-- Voronoi cutline bisector partitioning: zero double-counting across overlapping tiles
+SELECT * FROM h3_raster_continuous_aggregate(
+    'tiles/tile_*.tif',
+    resolution := 8,
+    overlap_rule := 'cutline'
+);
+
+-- Comma-separated list with Painter's Algorithm ('first' tile takes precedence)
+SELECT * FROM h3_raster_categorical_aggregate(
+    'tile_west.tif,tile_east.tif',
+    resolution := 8,
+    overlap_rule := 'first'
+);
+```
+
+### 9. On-the-Fly Multi-Band Spectral Index Calculation (NDVI, NDWI, NBR, EVI)
+Compute spectral indices directly during streaming ingestion with automatic division-by-zero protection:
+```sql
+-- Compute Normalized Difference Vegetation Index (NDVI) on-the-fly from multi-band imagery
+SELECT * FROM h3_raster_continuous_aggregate(
+    'sentinel2_l2a.tif',
+    resolution := 9,
+    formula := 'ndvi'
+);
+
+-- Compute Normalized Burn Ratio (NBR) for wildfire burn severity mapping
+SELECT * FROM h3_raster_continuous_aggregate(
+    'landsat_wildfire.tif',
+    resolution := 9,
+    formula := 'nbr'
+);
+```
+
+### 10. Categorical Raster Aggregation (Land Cover, Zoning, Soil Types)
+
+#### 10a. Majority Class & Dominance Percentage (Wide Format)
 ```sql
 SELECT
     h3_hex,
@@ -326,7 +381,7 @@ SELECT
 FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8);
 ```
 
-#### 7b. Querying the JSON Class Histogram
+#### 10b. Querying the JSON Class Histogram
 ```sql
 -- Use DuckDB's built-in JSON functions to extract specific class fractions
 SELECT
@@ -338,7 +393,7 @@ FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8)
 WHERE json_extract(histogram, '$."50"') IS NOT NULL;
 ```
 
-#### 7c. Normalized Long-Form Filtering
+#### 10c. Normalized Long-Form Filtering
 ```sql
 -- Find all hexagons with >= 25% Urban (class 50) coverage
 SELECT
@@ -351,7 +406,7 @@ WHERE category = 50 AND fraction >= 0.25
 ORDER BY fraction DESC;
 ```
 
-### 8. Native PMTiles v3 Vector Pyramid Export from DuckDB
+### 11. Native PMTiles v3 Vector Pyramid Export from DuckDB
 ```sql
 -- Convert any GeoTIFF directly to a multi-resolution PMTiles v3 archive in a single query
 SELECT * FROM h3_raster_to_pmtiles(
@@ -363,7 +418,7 @@ SELECT * FROM h3_raster_to_pmtiles(
 );
 ```
 
-### 9. Python, Node.js, and R Integration Recipes
+### 12. Python, Node.js, and R Integration Recipes
 
 `raster_h3` can be loaded dynamically in any DuckDB client library:
 
@@ -445,6 +500,10 @@ print(res)
 | 8 | **Zero-Allocation Fast Hex Formatting** | Formats 64-bit integer H3 indices into lowercase hexadecimal ASCII bytes using a 16-byte stack LUT. |
 | 9 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data from disk. |
 | 10 | **Native DuckDB Parallelism (`init_local`)** | Dynamically distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
+| 11 | **Lock-Free Work-Stealing Buffer Pool** | Work-stealing buffer injector (`crossbeam_deque::Injector`) eliminates buffer allocation churn across 15,840+ chunks. |
+| 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate OS thread context switches with zero-allocation batch drains. |
+| 13 | **Cloud-Native COG & Mosaic Ingestion** | Asynchronous HTTP/S3 range prefetching and multi-file Voronoi cutline mosaic blending with zero double-counting. |
+| 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of 125-byte WKB polygon geometries with embedded PROJJSON `OGC:CRS84` metadata. |
 
 ### 1. Southernmost Scan-Line Horizon Eviction
 Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
@@ -1114,6 +1173,10 @@ flowchart TD
 | :--- | :--- | :--- |
 | [`h3o`](https://crates.io/crates/h3o) `v0.6` | Pure-Rust H3 Engine | Provides 100% pure-Rust implementation of Uber's H3 Discrete Global Grid System, eliminating C/C++ toolchain dependencies or FFI boundary overhead. |
 | [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Directly maps GeoTIFF files from disk into userspace virtual memory, bypassing `read()` syscalls and intermediate buffer copies with sequential kernel readahead hints. |
+| [`crossbeam-deque`](https://crates.io/crates/crossbeam-deque) `v0.8` | Lock-Free Buffer Pool | Provides concurrent work-stealing buffer injector (`crossbeam_deque::Injector`) for zero-allocation chunk memory reuse across worker threads. |
+| [`libdeflater`](https://crates.io/crates/libdeflater) `v1.23` | SIMD Deflate Acceleration | Provides hardware-accelerated SIMD Deflate/Zlib decompression (AVX-512, AVX2, NEON) for ultra-fast chunk decoding. |
+| [`weezl`](https://crates.io/crates/weezl) `v0.1` | Accelerated LZW Decoder | Fast streaming LZW decompression for legacy and Landfire GeoTIFFs directly from memory-mapped slices. |
+| [`parquet`](https://crates.io/crates/parquet) `v53` | Native GeoParquet Engine | High-throughput streaming row-group writer supporting standard and compact schemas with OGC GeoParquet 1.1 WKB geometry emission. |
 | [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Chunk Decoder | Pure-Rust decoder for baseline TIFF, tiled TIFFs, and BigTIFF formats with Deflate, LZW, and PackBits decompression directly from memory slices. |
 | [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Geodetic Reprojection | Standalone pure-Rust port of PROJ.4 transformations (UTM, Transverse Mercator, Lambert Conformal Conic → WGS84) without massive C++ `libproj` dependencies. |
 | [`fxhash`](https://crates.io/crates/fxhash) `v0.2` | Fast Non-Cryptographic Hasher | Provides near-identity-hash throughput for 64-bit integer H3 cell keys in active horizon maps. |
