@@ -93,6 +93,12 @@ fn test_duckdb_extension_footer_layout() {
         .arg(&dummy_gz_path)
         .arg("-p")
         .arg("linux_amd64")
+        .arg("-d")
+        .arg("v1.2.0")
+        .arg("-v")
+        .arg("v0.1.0")
+        .arg("-a")
+        .arg("1")
         .arg("-z")
         .status()
         .expect("Failed to execute package_extension with -z");
