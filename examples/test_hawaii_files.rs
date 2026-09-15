@@ -1,3 +1,9 @@
+//! Real-world benchmark on Hawaii CFL (continuous) and LANDFIRE FBFM40 (categorical) datasets.
+//!
+//! Evaluates full archipelago streaming, bounding box filtering, and multi-resolution aggregation.
+//!
+//! Run with: `cargo run --example test_hawaii_files`
+
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };

@@ -1,3 +1,8 @@
+//! Tests the DuckDB extension packaging binary and metadata footer structure.
+//!
+//! Verifies binary execution, WebAssembly custom section headers, ABI metadata fields,
+//! version strings, platform tags, zeroed signature space, and gzip compression output.
+
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{Read, Write};

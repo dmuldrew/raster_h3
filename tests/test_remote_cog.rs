@@ -1,3 +1,8 @@
+//! Tests remote Cloud Optimized GeoTIFF (COG) streaming over HTTP/S3.
+//!
+//! Validates HTTP byte-range requests via a mock server, prefetch range coalescing, retry and recovery,
+//! spatial ROI chunk filtering, header budget optimization, and streaming Parquet pipeline integration.
+
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

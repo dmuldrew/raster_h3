@@ -1,3 +1,8 @@
+//! Smoke tests for the CONUS-scale mosaic aggregation and export pipeline.
+//!
+//! Validates multi-tile mosaic ingestion, multi-resolution batch eviction streaming,
+//! Parquet export progress tracking, and PMTiles generation from partitioned raster inputs.
+
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;

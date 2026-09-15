@@ -1,3 +1,8 @@
+//! Tests SIMD-accelerated Deflate decompression using `libdeflater`.
+//!
+//! Verifies exact bitwise parity with standard `flate2`/`tiff` decoders across tiled and striped
+//! layouts, horizontal and floating-point predictors, corrupted stream handling, and buffer auto-resizing.
+
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;

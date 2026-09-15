@@ -1,10 +1,44 @@
+//! # `raster_h3`
+//!
+//! A high-performance DuckDB loadable extension written in pure Rust for aggregating
+//! geospatial raster data (GeoTIFF) into Uber H3 hexagonal grid cells.
+//!
+//! The crate operates as both a `cdylib` (DuckDB loadable extension loaded at runtime
+//! via `LOAD 'raster_h3'`) and an `rlib` (Rust library crate).
+//!
+//! ## Pipeline Overview
+//!
+//! The processing pipeline follows a multi-stage flow:
+//!
+//! `raster` (GeoTIFF I/O) &rarr; `crs` (coordinate projection) &rarr; `aggregator` (scanline H3 accumulation) &rarr; `functions` (DuckDB C-FFI table functions) &rarr; SQL output.
+//!
+//! - [`raster`]: GeoTIFF reading, metadata decoding, chunked raster processing, and memory-mapped file I/O.
+//! - [`crs`]: Coordinate reference system detection and reprojection from raster space to WGS 84 coordinates.
+//! - [`aggregator`]: Parallel scanline traversal accumulating raster pixel values into H3 hexagonal cells.
+//! - [`functions`]: DuckDB C-FFI scalar and table functions exposing the aggregated data to SQL queries.
+//!
+//! ## Direct Export Modules
+//!
+//! In addition to returning query results directly in DuckDB:
+//!
+//! - The [`pmtiles`] module provides direct PMTiles v3 vector tile export with MVT encoding.
+//! - The [`parquet`] module provides native Parquet/GeoParquet streaming export.
+
+/// Scanline accumulation and statistical aggregation of raster pixels into H3 hexagonal cells.
 pub mod aggregator;
+/// Coordinate reference system (CRS) detection, parsing, and reprojection.
 pub mod crs;
+/// Crate-wide error handling types and result alias.
 pub mod error;
+/// DuckDB C-API foreign function interface (FFI) bindings and wrappers.
 pub mod ffi;
+/// DuckDB scalar and table function implementations exposed to SQL.
 pub mod functions;
+/// Native Parquet and GeoParquet streaming export.
 pub mod parquet;
+/// Direct PMTiles v3 vector tile export with MVT encoding.
 pub mod pmtiles;
+/// GeoTIFF file decoding, metadata extraction, and chunked raster I/O.
 pub mod raster;
 
 use std::ffi::c_char;

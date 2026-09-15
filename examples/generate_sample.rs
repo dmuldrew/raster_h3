@@ -1,3 +1,9 @@
+//! Generates a synthetic sample GeoTIFF with a radial elevation gradient for testing.
+//!
+//! Encodes WGS84 geographic metadata (EPSG:4326) and writes an elevation surface around San Francisco.
+//!
+//! Run with: `cargo run --example generate_sample`
+
 use std::fs::File;
 use std::io::BufWriter;
 use tiff::encoder::colortype::Gray32Float;

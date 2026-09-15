@@ -1,3 +1,9 @@
+//! Benchmarks single-pass multi-resolution fusion versus sequential multi-pass raster scans.
+//!
+//! Compares streaming execution time, throughput, and speedup across multiple simultaneous H3 resolutions.
+//!
+//! Run with: `cargo run --example benchmark_multi_resolution`
+
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;

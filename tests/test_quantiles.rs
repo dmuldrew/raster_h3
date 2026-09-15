@@ -1,3 +1,8 @@
+//! Tests streaming quantile sketches and DDSketch accuracy within H3 accumulators.
+//!
+//! Validates quantile estimation precision, merge associativity and commutativity, preset and custom
+//! spec parsing, zero-overhead disabling, and edge cases including empty and single-value inputs.
+
 use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::aggregator::multi_horizon::{
     MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,

@@ -1,3 +1,8 @@
+//! Tests sub-pixel super-sampling pattern conservation and scanline lookahead.
+//!
+//! Validates total pixel mass conservation across center, RGSS, quincunx, Gaussian, hexagonal,
+//! and grid patterns under geographic (EPSG:4326) and projected (UTM) coordinate reference systems.
+
 mod helpers;
 
 use helpers::{create_fn_f32_geotiff as create_test_geotiff, TestGeoTiffBuilder};

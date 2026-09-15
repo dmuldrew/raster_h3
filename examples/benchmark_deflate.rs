@@ -1,3 +1,9 @@
+//! Benchmarks SIMD-accelerated `libdeflater` versus standard `flate2` decompression on synthetic tiled GeoTIFFs.
+//!
+//! Evaluates chunk decompression throughput and latency between scalar and SIMD paths alongside H3 aggregation.
+//!
+//! Run with: `cargo run --example benchmark_deflate`
+
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;

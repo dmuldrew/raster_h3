@@ -1,3 +1,9 @@
+//! Benchmarks multi-band spectral indices, H3 hierarchical compaction, and predicate pushdown filtering.
+//!
+//! Evaluates continuous and categorical raster pipelines, measuring row reduction, throughput, and pruned cells.
+//!
+//! Run with: `cargo run --example benchmark_features`
+
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };

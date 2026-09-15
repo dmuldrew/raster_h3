@@ -1,3 +1,8 @@
+//! Comprehensive test suite for core raster-to-H3 aggregation functionality.
+//!
+//! Validates CRS reprojectors, GeoTIFF chunk decoding, NoData filtering, accumulator statistics,
+//! sub-pixel super-sampling patterns, spatial bounding box pushdown, and edge cases across raster types.
+
 mod helpers;
 
 use helpers::{create_constant_f32_geotiff, TestGeoTiffBuilder};

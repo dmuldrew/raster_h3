@@ -1,3 +1,9 @@
+//! Streaming GeoTIFF reader with on-demand chunk decoding and buffer recycling.
+//!
+//! This module provides a streaming GeoTIFF reader that decodes chunks (strips/tiles) on-demand
+//! with buffer recycling, supporting DEFLATE, LZW, and uncompressed formats.
+//! It supports both local files (via memory mapping) and remote cloud storage (via HTTP range requests).
+
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{Cursor, Seek};
@@ -16,29 +22,43 @@ use crate::raster::RasterChunk;
 /// TIFF byte order (Intel Little-Endian vs Motorola Big-Endian)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TiffByteOrder {
+    /// Little-endian byte order (`"II"`, Intel format), least significant byte first.
     LittleEndian,
+    /// Big-endian byte order (`"MM"`, Motorola format), most significant byte first.
     BigEndian,
 }
 
 /// Parsed GeoTIFF metadata
 #[derive(Debug, Clone)]
 pub struct GeoTiffMetadata {
+    /// Raster width in pixels.
     pub width: u32,
+    /// Raster height in pixels.
     pub height: u32,
+    /// Affine pixel-to-coordinate transform.
     pub geotransform: GeoTransform,
+    /// NoData sentinel value if present in raster metadata.
     pub nodata: Option<f64>,
+    /// Detected EPSG spatial reference code, if present.
     pub epsg: Option<u32>,
+    /// Detected PROJ4 projection definition string, if present.
     pub proj_string: Option<String>,
+    /// Number of bands or samples per pixel.
     pub samples_per_pixel: u16,
 }
 
 /// Chunk layout information (tiled vs striped)
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkLayout {
+    /// Dimension (width) of each strip or tile in pixels.
     pub chunk_width: u32,
+    /// Dimension (height) of each strip or tile in pixels.
     pub chunk_height: u32,
+    /// Grid layout column count (number of chunks across).
     pub chunks_across: u32,
+    /// Grid layout row count (number of chunks down).
     pub chunks_down: u32,
+    /// Total number of chunks in the raster grid.
     pub total_chunks: u32,
 }
 
@@ -101,15 +121,20 @@ impl ChunkLayout {
 /// Backing storage for a GeoTIFF: local memory-mapped file or remote HTTP/S3 stream
 #[derive(Clone)]
 pub enum RasterSource {
+    /// Local file backing accessed via memory mapping.
     Local(Arc<Mmap>),
+    /// Remote file backing accessed via HTTP range requests.
     Remote(Arc<RemoteHttpSource>),
 }
 
 /// Chunk byte payload: zero-copy borrowed slice (local mmap) or owned byte vector (remote HTTP / cache)
 #[derive(Debug, Clone)]
 pub enum ChunkPayload<'a> {
+    /// Zero-copy byte slice borrowed directly from memory-mapped storage (strips or tiles).
     Borrowed(&'a [u8]),
+    /// Shared reference-counted byte buffer from cache or asynchronous prefetch queue.
     ArcOwned(Arc<Vec<u8>>),
+    /// Owned byte buffer allocated for remote HTTP responses or decompressed payloads.
     Owned(Vec<u8>),
 }
 
@@ -185,25 +210,40 @@ impl RasterSource {
 /// TIFF chunk layout and compression metadata for SIMD-accelerated direct decoding
 #[derive(Debug, Clone)]
 pub struct TiffChunkInfo {
+    /// Compression scheme used for chunk payloads (e.g., None, LZW, Deflate).
     pub compression: CompressionMethod,
+    /// Differencing predictor applied prior to compression (e.g., None, Horizontal, FloatingPoint).
     pub predictor: Predictor,
+    /// Organization of raster chunks within the TIFF file (strip vs tile).
     pub chunk_type: ChunkType,
+    /// Byte offsets of each chunk within the TIFF file or stream.
     pub chunk_offsets: Arc<[u64]>,
+    /// Compressed byte sizes for each chunk.
     pub chunk_bytes: Arc<[u64]>,
+    /// Nominal (width, height) pixel dimensions of chunks.
     pub chunk_dimensions: (u32, u32),
+    /// Number of bits per sample per band (e.g., 8, 16, 32, 64).
     pub bits_per_sample: u8,
+    /// Data interpretation of samples (e.g., unsigned integer, signed integer, IEEE float).
     pub sample_format: SampleFormat,
+    /// Endianness of numerical data within the TIFF file.
     pub byte_order: TiffByteOrder,
+    /// Color space interpretation of sample values (e.g., BlackIsZero, RGB).
     pub photometric: PhotometricInterpretation,
 }
 
 /// Zero-copy memory-mapped or remote streaming GeoTIFF reader that decodes chunks on-demand
 #[derive(Clone)]
 pub struct GeoTiffStreamReader {
+    /// Path or URI identifying the source GeoTIFF file.
     pub file_path: PathBuf,
+    /// Backing data source providing raw byte access (local memory map or remote HTTP stream).
     pub source: RasterSource,
+    /// Parsed GeoTIFF metadata including spatial reference, extent, and NoData value.
     pub metadata: GeoTiffMetadata,
+    /// Grid layout partitioning the raster into discrete strips or tiles.
     pub chunk_layout: ChunkLayout,
+    /// Pre-parsed chunk compression parameters and byte offsets for direct decoding.
     pub chunk_info: Option<Arc<TiffChunkInfo>>,
 }
 

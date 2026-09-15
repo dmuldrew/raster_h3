@@ -1,3 +1,8 @@
+//! Tests accelerated zero-allocation LZW decompression powered by `weezl`.
+//!
+//! Validates bitwise equivalence against the standard TIFF decoder on real-world and synthetic datasets,
+//! horizontal differencing predictors, edge padding, buffer recycling, and corrupted or truncated payloads.
+
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;

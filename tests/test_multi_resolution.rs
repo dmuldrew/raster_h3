@@ -1,3 +1,8 @@
+//! Tests single-pass multi-resolution fusion across continuous and categorical rasters.
+//!
+//! Validates exact ground-truth parity against single-resolution runs, pixel mass conservation,
+//! super-sampling consistency, prefetch batch draining, and streaming Parquet export.
+
 mod helpers;
 
 use std::collections::HashMap;

@@ -1,3 +1,9 @@
+//! Tests Rayon multi-core worker thread scaling on synthetic rasters of varying dimensions.
+//!
+//! Evaluates single-threaded versus multi-threaded throughput, in-flight memory bounds, and scaling.
+//!
+//! Run with: `cargo run --example benchmark_scaling`
+
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufWriter;

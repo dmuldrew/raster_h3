@@ -1,3 +1,8 @@
+//! Tests PMTiles v3 archive generation and Mapbox Vector Tile (MVT) encoding.
+//!
+//! Validates Hilbert curve tile ID addressing, directory structures, MVT protobuf serialization,
+//! selective property filtering, parent zoom aggregation, and GeoTIFF/Parquet-to-PMTiles pipelines.
+
 use flate2::read::GzDecoder;
 use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3::pmtiles::mvt::{

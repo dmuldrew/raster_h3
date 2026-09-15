@@ -1,3 +1,8 @@
+//! Performance regression guards and throughput baseline tests.
+//!
+//! Evaluates streaming throughput baselines, memory bounds, multi-resolution scaling,
+//! categorical aggregation efficiency, and sub-pixel super-sampling conservation.
+
 mod helpers;
 
 use std::time::Instant;

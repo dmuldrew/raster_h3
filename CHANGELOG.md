@@ -43,6 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - *Category 3*: Antimeridian crossing ($\pm 180^\circ$) UTM zone continuity, Arctic/Antarctic polar stereographic projections, and malformed PROJ handling.
   - *Category 4*: Categorical histogram 16-slot inline array vs heap `HashMap` spillover and Shannon entropy theoretical bounds ($\ln K$, $0.0$).
   - *Category 5*: SIMD Deflate and fast LZW corrupted byte stream fuzzing, truncated payload detection, and buffer auto-resizing.
+- **Streaming Quantile Sketches**:
+  - DDSketch-inspired log-key histogram (`QuantileSketch`) for streaming P50, P90, P95, P99, IQR, deciles, and custom percentile targets with sub-1% relative error.
+  - Configurable via `quantiles` parameter (e.g. `quantiles := 'p50,p90,p99'`, `quantiles := 'iqr'`, `quantiles := 'deciles'`).
+  - Zero-cost disabled path when quantiles are not requested.
+- **Category Remapping**:
+  - `CategoryRemapper` supporting exact (`10=Forest`), range (`20-29=Urban`), and wildcard (`*=Other`) mapping syntax for reclassifying categorical rasters during ingestion.
+  - Configurable via `remap` / `remapping` / `classes` parameter.
+- **Predicate Pushdown & Query Filters**:
+  - Server-side filtering via `h3_cell`, `h3_hex`, `min_mean`, `max_mean`, `min_count`, and `min_majority_fraction` parameters.
+  - `bbox` string parameter for bounding box specification (alternative to individual coordinate parameters).
+- **Native WKB Geometry Emission**:
+  - 125-byte OGC-compliant closed WKB 2D Polygon hexagon geometries via `geom := true` parameter.
+  - Enables direct DuckDB Spatial extension interop and GeoParquet output.
+- **Direct Native Parquet Export**:
+  - `h3_raster_to_parquet` table function for single-command GeoTIFF → Parquet streaming export.
+  - Supports OGC GeoParquet 1.1 metadata, compact format, and configurable compression (`snappy`, `zstd`, `gzip`, `lz4`, `brotli`).
 
 ### Changed
 - **Strict CRS Validation on GeoTIFF Ingestion**:
@@ -50,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Ingestion now fails immediately with `RasterH3Error::CrsError` instructing the user to supply `crs` or `source_crs` explicitly (e.g. `crs := 'EPSG:4326'`, `crs := 'EPSG:5070'`).
   - Prevents silent data corruption, invalid hexagon emission, or empty result sets when ingesting rasters in projected meter coordinates.
   - User-specified `custom_crs` / `crs` now takes strict priority over any embedded raster metadata.
+- **`bind_utils` Modularization**:
+  - Split monolithic bind state management into focused submodules: `bind_helper`, `chunk_writer`, `lifecycle`, `parsing`, `record_queue`, and `registration`.
+- **Codebase Refactoring**:
+  - Centralized NoData casting and dispatch into `src/aggregator/nodata.rs` with unified `dispatch_decoding!` macro.
+  - Macro-collapsed 10-arm buffer decoding and 6-arm direct-decoding branches in `src/raster/geotiff.rs`.
+  - Added structured `RasterH3Error::UnsupportedEpsg { code, detail }` error variant.
+  - Unified continuous and categorical scanline loops into generic `ScanlineEngine` trait with `scanline_walk` in `src/aggregator/multi_horizon/walker.rs`.
+  - Consolidated test GeoTIFF generation across all integration test suites into generic `TestGeoTiffBuilder`.
 
 ## [0.2.0] - 2026-08-30
 
@@ -95,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Replaced `SpatialCoherenceCache` with `H3ScanlineLookahead` algorithm, resolving a massive spherical trigonometry bottleneck by using exponential jump-guessing and binary search, resulting in a ~2.6x overall throughput speedup.
 
-### Fixed
+### Added
 - **Sub-pixel super-sampling** with 8 presets: center, RGSS, hexagonal, Gaussian PSF, 5-point quincunx, 8-rooks, 9-point grid, 16-point grid
 - **Scalar helper functions**: `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`
 - **Spatial ROI bounding box pruning** via `min_lon`, `min_lat`, `max_lon`, `max_lat` parameters
@@ -103,3 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Zero-copy I/O** via `memmap2` with async double-buffered prefetching
 - **Docker container** with multi-stage build, bundled DuckDB CLI, and demo script
 - **Query planner integration**: cardinality estimation and parallel `init_local` distribution
+
+[Unreleased]: https://github.com/dmuldrew/raster_h3_hexification/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dmuldrew/raster_h3_hexification/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dmuldrew/raster_h3_hexification/releases/tag/v0.1.0

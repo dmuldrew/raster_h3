@@ -1,3 +1,8 @@
+//! Tests multi-file raster mosaic ingestion and overlap resolution rules.
+//!
+//! Evaluates glob pattern expansion, GDAL VRT XML source resolution, cutline, first,
+//! and average overlap handling, and multi-worker concurrent prefetched mosaic reading.
+
 mod helpers;
 
 use std::fs::File;

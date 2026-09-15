@@ -1,3 +1,8 @@
+//! Tests multi-band extraction, spectral index calculation, and predicate pushdown filtering.
+//!
+//! Evaluates on-the-fly NDVI, NDWI, NBR, and EVI spectral formulas, NoData and division-by-zero resilience,
+//! predicate pushdown row pruning, and hierarchical H3 compaction conservation.
+
 use std::fs::File;
 use std::io::BufWriter;
 use tempfile::NamedTempFile;

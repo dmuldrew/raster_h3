@@ -1,3 +1,11 @@
+//! Coordinate Reference System (CRS) transformations to WGS84.
+//!
+//! This module implements a 3-tier CRS transformation hierarchy:
+//!
+//! - **Tier 1: `Wgs84Identity`** — Zero-cost passthrough for EPSG:4326/4269 data.
+//! - **Tier 2: `WebMercatorFast` and `AlbersConic`** — Fast analytical transformations with direct formulas (no PROJ4 overhead).
+//! - **Tier 3: `Proj4`** — General-purpose fallback using `proj4rs` for arbitrary CRS.
+
 use crate::error::{RasterH3Error, Result};
 use proj4rs::proj::Proj;
 
@@ -7,16 +15,27 @@ const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 /// Precomputed constants for analytical, closed-form inverse Albers Equal Area Conic projection
 #[derive(Debug, Clone, Copy)]
 pub struct AlbersConicFast {
+    /// Latitude of origin in radians.
     pub lat_origin_rad: f64,
+    /// Longitude of central meridian in radians.
     pub lon_origin_rad: f64,
+    /// False easting in meters.
     pub x_0: f64,
+    /// False northing in meters.
     pub y_0: f64,
+    /// Cone constant.
     pub n: f64,
+    /// Albers constant C.
     pub c: f64,
+    /// Polar distance at origin.
     pub rho0: f64,
+    /// First eccentricity of the ellipsoid.
     pub e: f64,
+    /// Eccentricity squared.
     pub e2: f64,
+    /// Semi-major axis in meters.
     pub a: f64,
+    /// Authalic latitude parameter at poles.
     pub qp: f64,
 }
 

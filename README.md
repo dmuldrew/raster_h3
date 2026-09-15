@@ -13,7 +13,7 @@ Supports both **continuous** raster surfaces (elevation, temperature, NDVI, prec
 ## 📖 Table of Contents
 - [1. Motivation & Project Goals](#1-motivation--project-goals)
 - [2. Conceptual Overview: Why Traditional Tools Struggle & How We Fix It](#2-conceptual-overview-why-traditional-tools-struggle--how-we-fix-it)
-- [3. Pre-Compiled Extension Installation & Docker Quickstart](#3-pre-compiled-extension-installation--docker-quickstart-)
+- [3. Pre-Compiled Extension Installation & Docker Quickstart](#3-pre-compiled-extension-installation--docker-quickstart)
 - [4. SQL Usage & Practical Recipes](#4-sql-usage--practical-recipes)
 - [5. Core Engineering Innovations](#5-core-engineering-innovations)
 - [6. Sub-Pixel Super-Sampling Guide](#6-sub-pixel-super-sampling-guide)
@@ -958,6 +958,20 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, `'5point'`, `'8rooks'`, `'9point'`, `'16point'`). |
 | `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Region of Interest (ROI) bounding box coordinates for chunk pruning. |
+| `bbox` | `VARCHAR` | `None` | Bounding box as a single string: `'min_lon,min_lat,max_lon,max_lat'` (alternative to individual coordinate parameters). |
+| `h3_cell` | `BIGINT` | `None` | Single H3 cell index for predicate pushdown (only process chunks intersecting this cell). |
+| `h3_hex` | `VARCHAR` | `None` | Single H3 hex string for predicate pushdown (alternative to `h3_cell`). |
+| `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR column for reduced memory). |
+| `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'` (Voronoi bisector), `'first'` (painter's precedence), `'average'` (blend). |
+| `workers` / `threads` | `BIGINT` | `auto` | Number of background decompression worker threads. |
+| `formula` | `VARCHAR` | `None` | Spectral index formula: `'ndvi'`, `'ndwi'`, `'nbr'`, `'evi'`. Requires multi-band raster. |
+| `nir_band`, `red_band`, `green_band`, `blue_band`, `swir_band` | `BIGINT` | `auto` | 1-indexed band assignments for spectral index formulas. |
+| `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold — cells below this are excluded from output. |
+| `min_mean` | `DOUBLE` | `None` | Minimum mean value filter — cells with mean below this are excluded. |
+| `max_mean` | `DOUBLE` | `None` | Maximum mean value filter — cells with mean above this are excluded. |
+| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with 125-byte OGC WKB 2D Polygon hexagons (enables DuckDB Spatial interop). |
+| `quantiles` | `VARCHAR` | `None` | Streaming quantile targets: `'p50,p90,p99'`, `'iqr'`, `'deciles'`, `'quartiles'`. Adds percentile columns to output. |
+| `percentiles` | `VARCHAR` | `None` | Alias for `quantiles`. |
 
 #### Output Schema
 | Column Name | Logical Type | Description |
@@ -1004,6 +1018,16 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, etc.). |
 | `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Bounding box coordinates for spatial Region of Interest (ROI) chunk pruning. |
+| `bbox` | `VARCHAR` | `None` | Bounding box as a single string: `'min_lon,min_lat,max_lon,max_lat'`. |
+| `h3_cell` | `BIGINT` | `None` | Single H3 cell index for predicate pushdown. |
+| `h3_hex` | `VARCHAR` | `None` | Single H3 hex string for predicate pushdown. |
+| `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR column). |
+| `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'`, `'first'`, `'average'`. |
+| `workers` / `threads` | `BIGINT` | `auto` | Number of background decompression worker threads. |
+| `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold for output. |
+| `min_majority_fraction` | `DOUBLE` | `None` | Minimum majority class fraction — cells below this threshold are excluded. |
+| `remap` | `VARCHAR` | `None` | Category remapping rules: exact (`'10=Forest,20=Urban'`), range (`'20-29=Urban'`), wildcard (`'*=Other'`). |
+| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with OGC WKB 2D Polygon hexagons. |
 
 #### Wide Format Output Schema (`format := 'wide'`, Default)
 | Column Name | Logical Type | Description |
@@ -1035,6 +1059,57 @@ If opening `pmtiles_viewer/index.html` directly from disk (`file:///`), Chrome b
 | `entropy` | `DOUBLE` | Alias for `shannon_entropy`. |
 | `distinct_classes`| `BIGINT` | Number of distinct categories in the parent hexagon. |
 | `unique_classes`  | `BIGINT` | Alias for `distinct_classes`. |
+
+---
+
+### Direct Parquet Export: `h3_raster_to_parquet(file_path, output_parquet, ...)`
+
+Stream a GeoTIFF directly into a native Parquet file in a single command, with optional OGC GeoParquet 1.1 metadata.
+
+```sql
+SELECT * FROM h3_raster_to_parquet(
+    'elevation.tif',
+    'elevation_h3.parquet',
+    resolution := 8,
+    sampling := 'rgss',
+    geoparquet := true,
+    compression := 'zstd'
+);
+```
+
+#### Positional Parameters
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :---: | :--- | :--- |
+| `file_path` | `VARCHAR` | **Yes** | — | Input GeoTIFF / Cloud-Optimized GeoTIFF file path or URL. |
+| `output_parquet` | `VARCHAR` | **Yes** | — | Destination path for the output `.parquet` file. |
+
+#### Named Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `resolution` | `BIGINT` | `8` | Target H3 grid resolution level (0 to 15). |
+| `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset. |
+| `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
+| `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
+| `categorical` | `BOOLEAN` | `false` | Whether to aggregate categorical raster classes instead of continuous stats. |
+| `compact` | `BOOLEAN` | `false` | Compact output format (fewer columns). |
+| `compression` | `VARCHAR` | `'snappy'` | Parquet compression codec: `'snappy'`, `'zstd'`, `'gzip'`, `'lz4'`, `'brotli'`, `'none'`. |
+| `row_group_size` | `BIGINT` | `122880` | Maximum rows per Parquet row group. |
+| `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Spatial bounding box for chunk pruning. |
+| `bbox` | `VARCHAR` | `None` | Bounding box as a single string: `'min_lon,min_lat,max_lon,max_lat'`. |
+| `h3_cell` | `BIGINT` | `None` | Single H3 cell predicate pushdown filter. |
+| `h3_hex` | `VARCHAR` | `None` | Single H3 hex string predicate pushdown filter. |
+| `geoparquet` | `BOOLEAN` | `false` | Emit OGC GeoParquet 1.1 metadata in Parquet FileMetaData with PROJJSON `OGC:CRS84` datum. |
+| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with 125-byte OGC WKB 2D Polygon hexagons. |
+| `source_crs` / `crs` | `VARCHAR` | `None` (auto) | CRS override (e.g. `'EPSG:4326'`). Required if raster lacks embedded CRS. |
+
+#### Output Schema (1 Summary Row)
+| Column Name | Logical Type | Description |
+| :--- | :--- | :--- |
+| `total_hexagons` | `BIGINT` | Total H3 hexagons written to the Parquet file. |
+| `parquet_size_bytes` | `BIGINT` | File size of the generated `.parquet` file in bytes. |
+| `elapsed_ms` | `DOUBLE` | Total end-to-end execution time in milliseconds. |
+| `output_path` | `VARCHAR` | Path to the created `.parquet` file. |
+| `status` | `VARCHAR` | Execution status (`'SUCCESS'` or error message). |
 
 ---
 

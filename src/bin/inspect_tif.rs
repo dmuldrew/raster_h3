@@ -5,7 +5,7 @@
 //! projected/WGS84 bounding boxes, and H3 cell mappings.
 //!
 //! Usage:
-//!   cargo run --bin inspect_tif -- <path_or_url> [options]
+//!   cargo run --bin inspect_tif -- \<path_or_url\> \[options\]
 
 use h3o::{LatLng, Resolution};
 use serde_json::json;

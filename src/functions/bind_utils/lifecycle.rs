@@ -50,7 +50,7 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
     }
 }
 
-/// Generic C-compatible deallocator for Box<T> allocated data pointers
+/// Generic C-compatible deallocator for `Box<T>` allocated data pointers
 pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
     if !data.is_null() {
         drop(Box::from_raw(data as *mut T));

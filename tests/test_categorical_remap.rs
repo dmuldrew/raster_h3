@@ -1,3 +1,8 @@
+//! Tests the category remapping engine for categorical raster pipelines.
+//!
+//! Validates exact, range, list, and wildcard remapping syntax rules, NoData handling,
+//! unmapped passthrough fallbacks, and integration with categorical horizon streaming.
+
 mod helpers;
 
 use std::collections::HashMap;

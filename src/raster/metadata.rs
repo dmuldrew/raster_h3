@@ -51,7 +51,7 @@ pub fn extract_nodata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Option<f64> {
     None
 }
 
-/// Extract CRS from GeoKeyDirectoryTag: returns (Option<epsg>, Option<proj_string>)
+/// Extract CRS from GeoKeyDirectoryTag: returns (`Option<epsg>`, `Option<proj_string>`)
 pub fn extract_crs<R: Read + Seek>(decoder: &mut Decoder<R>) -> (Option<u32>, Option<String>) {
     let keys_res = decoder
         .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)

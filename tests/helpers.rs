@@ -1,3 +1,8 @@
+//! Shared test fixture builders and synthetic GeoTIFF generators for test suites.
+//!
+//! Provides [`TestGeoTiffBuilder`], the [`TestTiffSample`] trait, wave and gradient
+//! pattern generators, and convenience functions for constructing temporary GeoTIFFs.
+
 #![allow(dead_code)]
 
 use std::fs::File;

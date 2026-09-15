@@ -1,3 +1,9 @@
+//! Verifies spatial bounding box predicate pushdown with chunk-level pruning statistics.
+//!
+//! Compares a full raster scan against a targeted bounding box query to measure speedup and chunk skipping.
+//!
+//! Run with: `cargo run --example verify_pushdown`
+
 use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 use std::path::Path;

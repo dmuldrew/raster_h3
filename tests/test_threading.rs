@@ -1,3 +1,8 @@
+//! Tests multi-threaded raster aggregation and thread pool scaling.
+//!
+//! Validates deterministic aggregation results across varying Rayon worker thread counts,
+//! prefetched chunk reader ordering, and resilience under high thread-contention stress.
+
 use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use raster_h3::error::Result;

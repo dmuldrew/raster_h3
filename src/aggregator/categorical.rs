@@ -228,7 +228,7 @@ impl CategoricalAccumulator {
 
 /// Trait for numeric raster pixel types that support high-throughput SIMD / branchless span uniformity detection.
 pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {
-    /// Return true if all values in the slice are identical to slice[0], or if slice is empty.
+    /// Return true if all values in the slice are identical to `slice[0]`, or if slice is empty.
     fn is_uniform(slice: &[Self]) -> bool;
 
     /// Convert native pixel value to an i64 category ID if in valid range

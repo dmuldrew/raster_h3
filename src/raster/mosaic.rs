@@ -25,6 +25,14 @@ pub enum OverlapRule {
 }
 
 impl OverlapRule {
+    /// Parse an overlap resolution strategy from a string slice.
+    ///
+    /// Supported string values (case-insensitive):
+    /// - `"cutline"`, `"voronoi"`, `"nearest"` -> [`OverlapRule::Cutline`]
+    /// - `"first"`, `"priority"`, `"painter"` -> [`OverlapRule::First`]
+    /// - `"average"`, `"mean"`, `"all"`, `"multi_temporal"` -> [`OverlapRule::Average`]
+    ///
+    /// Any unrecognized value defaults to [`OverlapRule::Cutline`].
     pub fn parse(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "cutline" | "voronoi" | "nearest" => Self::Cutline,
@@ -216,11 +224,17 @@ pub fn resolve_raster_sources(input: &str) -> Result<Vec<PathBuf>> {
 /// Metadata and spatial bounds for a single tile in a mosaic
 #[derive(Clone)]
 pub struct TileDescriptor {
+    /// 0-based index of this tile in the mosaic's tile array.
     pub tile_idx: usize,
+    /// Path or remote URL to the GeoTIFF file.
     pub file_path: PathBuf,
+    /// Streaming GeoTIFF reader for this tile.
     pub reader: GeoTiffStreamReader,
-    pub bounds_wgs84: [f64; 4],     // [min_lon, min_lat, max_lon, max_lat]
-    pub centroid_wgs84: (f64, f64), // (lon, lat)
+    /// Spatial bounding box in WGS 84 coordinates: `[min_lon, min_lat, max_lon, max_lat]`.
+    pub bounds_wgs84: [f64; 4],
+    /// Geographic centroid in WGS 84 coordinates: `(lon, lat)`.
+    pub centroid_wgs84: (f64, f64),
+    /// CRS transformer for projecting raster coordinates to WGS 84.
     pub crs_transformer: CrsTransformer,
 }
 
@@ -294,19 +308,29 @@ impl TileDescriptor {
 /// Global chunk reference across all tiles in a mosaic, sorted by latitude
 #[derive(Debug, Clone, Copy)]
 pub struct MosaicChunkRef {
+    /// Index of the parent tile within the mosaic's tile array.
     pub tile_idx: usize,
+    /// 0-based chunk index within the parent tile's chunk layout.
     pub chunk_idx: u32,
+    /// Northernmost (maximum) latitude bound of this chunk in WGS 84 coordinates.
     pub north_lat: f64,
+    /// Southernmost (minimum) latitude bound of this chunk in WGS 84 coordinates.
     pub south_lat: f64,
+    /// Whether this chunk spatially overlaps with another tile in the mosaic.
     pub has_overlap: bool,
 }
 
 /// Multi-file mosaic reader managing tile descriptors and globally interleaved chunk prefetching
 pub struct MosaicReader {
+    /// Descriptors for all constituent GeoTIFF tiles in the mosaic.
     pub tiles: Vec<TileDescriptor>,
+    /// Global spatial bounding box encompassing all tiles in WGS 84 coordinates: `[min_lon, min_lat, max_lon, max_lat]`.
     pub mosaic_bounds_wgs84: [f64; 4],
+    /// Strategy used to resolve pixel ownership in overlapping tile regions.
     pub overlap_rule: OverlapRule,
+    /// Globally interleaved chunk references across all tiles, sorted North-to-South by latitude.
     pub chunk_refs: Vec<MosaicChunkRef>,
+    /// Maximum number of samples (bands) per pixel across all tiles in the mosaic.
     pub max_samples_per_pixel: u16,
 }
 

@@ -1,3 +1,8 @@
+//! Tests OGC GeoParquet 1.1 encoding and metadata specification compliance.
+//!
+//! Validates WKB polygon geometry generation for H3 cells, PROJJSON and spherical CRS metadata,
+//! compact and standard formats, column projection, and continuous/categorical parquet schemas.
+
 mod helpers;
 
 use std::fs::File;

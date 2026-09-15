@@ -1,3 +1,9 @@
+//! Evaluates sub-pixel super-sampling patterns and scanline lookahead acceleration.
+//!
+//! Benchmarks center, RGSS, quincunx, Gaussian, hexagonal, and grid sampling patterns.
+//!
+//! Run with: `cargo run --example benchmark_sampling_lookahead`
+
 use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;

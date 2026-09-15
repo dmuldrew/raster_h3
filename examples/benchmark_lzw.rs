@@ -1,3 +1,9 @@
+//! Benchmarks weezl-accelerated LZW decompression versus standard TIFF decoder paths.
+//!
+//! Measures per-chunk decompression bandwidth, latency, and end-to-end multi-core streaming throughput.
+//!
+//! Run with: `cargo run --example benchmark_lzw`
+
 use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
