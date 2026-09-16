@@ -90,7 +90,8 @@ impl QuantileSketch {
         let z = (m - 1.0) / (m + 1.0);
         let z2 = z * z;
 
-        let poly = TWO_LOG_GAMMA_INV + z2 * (C_P1 + z2 * (C_P2 + z2 * (C_P3 + z2 * (C_P4 + z2 * C_P5))));
+        let poly =
+            TWO_LOG_GAMMA_INV + z2 * (C_P1 + z2 * (C_P2 + z2 * (C_P3 + z2 * (C_P4 + z2 * C_P5))));
         let log_gamma_m = z * poly;
         let log_gamma_val = exponent * LN_2_DIV_LN_GAMMA + log_gamma_m;
 
@@ -245,11 +246,8 @@ impl QuantileSketch {
             return vec![min; targets.len()];
         }
 
-        let mut sorted_targets: Vec<(usize, f64)> = targets
-            .iter()
-            .enumerate()
-            .map(|(i, &q)| (i, q))
-            .collect();
+        let mut sorted_targets: Vec<(usize, f64)> =
+            targets.iter().enumerate().map(|(i, &q)| (i, q)).collect();
         sorted_targets.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut results = vec![0.0f64; targets.len()];

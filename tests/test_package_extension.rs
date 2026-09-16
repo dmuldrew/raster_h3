@@ -1,7 +1,12 @@
+//! Tests the DuckDB extension packaging binary and metadata footer structure.
+//!
+//! Verifies binary execution, WebAssembly custom section headers, ABI metadata fields,
+//! version strings, platform tags, zeroed signature space, and gzip compression output.
+
+use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{Read, Write};
 use tempfile::tempdir;
-use flate2::read::GzDecoder;
 
 #[test]
 fn test_duckdb_extension_footer_layout() {
@@ -38,7 +43,10 @@ fn test_duckdb_extension_footer_layout() {
     assert!(dummy_ext_path.exists());
 
     let mut ext_bytes = Vec::new();
-    File::open(&dummy_ext_path).unwrap().read_to_end(&mut ext_bytes).unwrap();
+    File::open(&dummy_ext_path)
+        .unwrap()
+        .read_to_end(&mut ext_bytes)
+        .unwrap();
     assert_eq!(ext_bytes.len(), 1024 + 534);
 
     // Verify original payload is intact
@@ -85,6 +93,12 @@ fn test_duckdb_extension_footer_layout() {
         .arg(&dummy_gz_path)
         .arg("-p")
         .arg("linux_amd64")
+        .arg("-d")
+        .arg("v1.2.0")
+        .arg("-v")
+        .arg("v0.1.0")
+        .arg("-a")
+        .arg("1")
         .arg("-z")
         .status()
         .expect("Failed to execute package_extension with -z");

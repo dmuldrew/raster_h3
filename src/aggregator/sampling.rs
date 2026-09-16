@@ -37,10 +37,26 @@ impl SamplingPattern {
     pub fn rgss() -> Self {
         Self {
             points: vec![
-                SamplePoint { dx: 0.375, dy: 0.125, weight: 0.25 },
-                SamplePoint { dx: 0.875, dy: 0.375, weight: 0.25 },
-                SamplePoint { dx: 0.125, dy: 0.625, weight: 0.25 },
-                SamplePoint { dx: 0.625, dy: 0.875, weight: 0.25 },
+                SamplePoint {
+                    dx: 0.375,
+                    dy: 0.125,
+                    weight: 0.25,
+                },
+                SamplePoint {
+                    dx: 0.875,
+                    dy: 0.375,
+                    weight: 0.25,
+                },
+                SamplePoint {
+                    dx: 0.125,
+                    dy: 0.625,
+                    weight: 0.25,
+                },
+                SamplePoint {
+                    dx: 0.625,
+                    dy: 0.875,
+                    weight: 0.25,
+                },
             ],
         }
     }
@@ -49,11 +65,31 @@ impl SamplingPattern {
     pub fn five_point() -> Self {
         Self {
             points: vec![
-                SamplePoint { dx: 0.5, dy: 0.5, weight: 0.2 },
-                SamplePoint { dx: 0.2, dy: 0.2, weight: 0.2 },
-                SamplePoint { dx: 0.8, dy: 0.2, weight: 0.2 },
-                SamplePoint { dx: 0.2, dy: 0.8, weight: 0.2 },
-                SamplePoint { dx: 0.8, dy: 0.8, weight: 0.2 },
+                SamplePoint {
+                    dx: 0.5,
+                    dy: 0.5,
+                    weight: 0.2,
+                },
+                SamplePoint {
+                    dx: 0.2,
+                    dy: 0.2,
+                    weight: 0.2,
+                },
+                SamplePoint {
+                    dx: 0.8,
+                    dy: 0.2,
+                    weight: 0.2,
+                },
+                SamplePoint {
+                    dx: 0.2,
+                    dy: 0.8,
+                    weight: 0.2,
+                },
+                SamplePoint {
+                    dx: 0.8,
+                    dy: 0.8,
+                    weight: 0.2,
+                },
             ],
         }
     }
@@ -63,11 +99,31 @@ impl SamplingPattern {
     pub fn gaussian_five_point() -> Self {
         Self {
             points: vec![
-                SamplePoint { dx: 0.5, dy: 0.5, weight: 0.50 },
-                SamplePoint { dx: 0.2, dy: 0.5, weight: 0.125 },
-                SamplePoint { dx: 0.8, dy: 0.5, weight: 0.125 },
-                SamplePoint { dx: 0.5, dy: 0.2, weight: 0.125 },
-                SamplePoint { dx: 0.5, dy: 0.8, weight: 0.125 },
+                SamplePoint {
+                    dx: 0.5,
+                    dy: 0.5,
+                    weight: 0.50,
+                },
+                SamplePoint {
+                    dx: 0.2,
+                    dy: 0.5,
+                    weight: 0.125,
+                },
+                SamplePoint {
+                    dx: 0.8,
+                    dy: 0.5,
+                    weight: 0.125,
+                },
+                SamplePoint {
+                    dx: 0.5,
+                    dy: 0.2,
+                    weight: 0.125,
+                },
+                SamplePoint {
+                    dx: 0.5,
+                    dy: 0.8,
+                    weight: 0.125,
+                },
             ],
         }
     }
@@ -77,7 +133,11 @@ impl SamplingPattern {
         let r = 0.35; // Radius from pixel center
         let w = 1.0 / 7.0;
         let mut points = Vec::with_capacity(7);
-        points.push(SamplePoint { dx: 0.5, dy: 0.5, weight: w });
+        points.push(SamplePoint {
+            dx: 0.5,
+            dy: 0.5,
+            weight: w,
+        });
 
         for i in 0..6 {
             let angle = (i as f64) * std::f64::consts::PI / 3.0;
@@ -156,8 +216,12 @@ impl SamplingPattern {
         let mut min_dx = 1.0f64;
         let mut max_dx = 0.0f64;
         for p in &self.points {
-            if p.dx < min_dx { min_dx = p.dx; }
-            if p.dx > max_dx { max_dx = p.dx; }
+            if p.dx < min_dx {
+                min_dx = p.dx;
+            }
+            if p.dx > max_dx {
+                max_dx = p.dx;
+            }
         }
         (min_dx, max_dx)
     }
@@ -168,8 +232,12 @@ impl SamplingPattern {
         let mut min_dy = 1.0f64;
         let mut max_dy = 0.0f64;
         for p in &self.points {
-            if p.dy < min_dy { min_dy = p.dy; }
-            if p.dy > max_dy { max_dy = p.dy; }
+            if p.dy < min_dy {
+                min_dy = p.dy;
+            }
+            if p.dy > max_dy {
+                max_dy = p.dy;
+            }
         }
         (min_dy, max_dy)
     }
@@ -193,13 +261,26 @@ mod tests {
         ];
 
         for (name, pattern, expected_len) in presets {
-            assert_eq!(pattern.points.len(), expected_len, "Failed len for {}", name);
+            assert_eq!(
+                pattern.points.len(),
+                expected_len,
+                "Failed len for {}",
+                name
+            );
             let sum_w: f64 = pattern.points.iter().map(|p| p.weight).sum();
-            assert!((sum_w - 1.0).abs() < 1e-9, "Weights did not sum to 1 for {}", name);
+            assert!(
+                (sum_w - 1.0).abs() < 1e-9,
+                "Weights did not sum to 1 for {}",
+                name
+            );
             for p in &pattern.points {
                 assert!(p.dx >= 0.0 && p.dx <= 1.0, "dx out of bounds for {}", name);
                 assert!(p.dy >= 0.0 && p.dy <= 1.0, "dy out of bounds for {}", name);
-                assert!(p.weight > 0.0 && p.weight <= 1.0, "weight out of bounds for {}", name);
+                assert!(
+                    p.weight > 0.0 && p.weight <= 1.0,
+                    "weight out of bounds for {}",
+                    name
+                );
             }
         }
     }

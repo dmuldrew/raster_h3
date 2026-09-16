@@ -4,16 +4,16 @@
 //! Uses HTTP Range requests (`bytes=start-end`) to read only the initial IFD header
 //! and the specific tile chunks intersecting the scanline horizon or spatial bounding box.
 
+use fxhash::FxHashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
-use fxhash::FxHashMap;
 use ureq::Agent;
 use url::Url;
 
 use crate::error::{RasterH3Error, Result};
 
-/// Default block cache size for header and tag reading (64 KB)
-pub const DEFAULT_BLOCK_SIZE: usize = 65536;
+/// Default block cache size for header and tag reading (128 KB)
+pub const DEFAULT_BLOCK_SIZE: usize = 131072;
 
 /// Check if a path or string is a remote URL (http, https, or s3)
 pub fn is_remote_url(path: &str) -> bool {
@@ -21,7 +21,7 @@ pub fn is_remote_url(path: &str) -> bool {
     p.starts_with("http://") || p.starts_with("https://") || p.starts_with("s3://")
 }
 
-/// Normalize input URL, resolving `s3://bucket/key` into an HTTPS URL
+/// Normalize input URL, resolving `s3://bucket/key` into an HTTPS URL with region and endpoint support
 pub fn normalize_url(raw_url: &str) -> Result<String> {
     let trimmed = raw_url.trim();
     if trimmed.starts_with("s3://") {
@@ -35,11 +35,48 @@ pub fn normalize_url(raw_url: &str) -> Result<String> {
                 raw_url
             )));
         }
-        if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
+
+        // 1. Check for custom endpoint (AWS_ENDPOINT_URL or AWS_S3_ENDPOINT)
+        let custom_endpoint = std::env::var("AWS_ENDPOINT_URL")
+            .or_else(|_| std::env::var("AWS_S3_ENDPOINT"))
+            .ok();
+
+        if let Some(endpoint) = custom_endpoint {
             let endpoint_trimmed = endpoint.trim_end_matches('/');
-            Ok(format!("{}/{}/{}", endpoint_trimmed, bucket, key))
+            let addressing_style = std::env::var("AWS_S3_ADDRESSING_STYLE")
+                .unwrap_or_else(|_| "path".to_string())
+                .to_lowercase();
+
+            if addressing_style == "virtual" {
+                if let Some(rest) = endpoint_trimmed.strip_prefix("https://") {
+                    Ok(format!("https://{}.{}/{}", bucket, rest, key))
+                } else if let Some(rest) = endpoint_trimmed.strip_prefix("http://") {
+                    Ok(format!("http://{}.{}/{}", bucket, rest, key))
+                } else {
+                    Ok(format!("https://{}.{}/{}", bucket, endpoint_trimmed, key))
+                }
+            } else {
+                Ok(format!("{}/{}/{}", endpoint_trimmed, bucket, key))
+            }
         } else {
-            Ok(format!("https://{}.s3.amazonaws.com/{}", bucket, key))
+            // 2. Check for explicit region (AWS_REGION or AWS_DEFAULT_REGION)
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .ok();
+
+            if let Some(reg) = region {
+                let reg_trimmed = reg.trim();
+                if !reg_trimmed.is_empty() && reg_trimmed != "us-east-1" {
+                    Ok(format!(
+                        "https://{}.s3.{}.amazonaws.com/{}",
+                        bucket, reg_trimmed, key
+                    ))
+                } else {
+                    Ok(format!("https://{}.s3.amazonaws.com/{}", bucket, key))
+                }
+            } else {
+                Ok(format!("https://{}.s3.amazonaws.com/{}", bucket, key))
+            }
         }
     } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         Url::parse(trimmed).map_err(|e| {
@@ -54,57 +91,137 @@ pub fn normalize_url(raw_url: &str) -> Result<String> {
     }
 }
 
+/// Retrieve default headers for cloud requests (requester pays, auth tokens)
+fn get_default_headers() -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+
+    // Requester pays (AWS Open Data Program)
+    if let Ok(payer) = std::env::var("AWS_REQUEST_PAYER") {
+        if payer.trim().eq_ignore_ascii_case("requester") {
+            headers.push(("x-amz-request-payer".to_string(), "requester".to_string()));
+        }
+    }
+
+    // Bearer token or AWS session token
+    if let Ok(token) = std::env::var("RASTER_H3_AUTH_TOKEN") {
+        if !token.trim().is_empty() {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", token.trim()),
+            ));
+        }
+    } else if let Ok(session_token) = std::env::var("AWS_SESSION_TOKEN") {
+        if !session_token.trim().is_empty() {
+            headers.push((
+                "x-amz-security-token".to_string(),
+                session_token.trim().to_string(),
+            ));
+        }
+    }
+
+    headers
+}
+
+/// Check if an HTTP error is transient and eligible for retry
+fn is_transient_error(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Status(status, _) => {
+            // 429: Too Many Requests / S3 SlowDown
+            // 500: Internal Server Error
+            // 502: Bad Gateway
+            // 503: Service Unavailable (S3 503 SlowDown)
+            // 504: Gateway Timeout
+            matches!(*status, 429 | 500 | 502 | 503 | 504)
+        }
+        ureq::Error::Transport(_) => true,
+    }
+}
+
+/// Execute a request with automatic exponential backoff retry on transient errors
+fn execute_request_with_retry<F>(
+    url: &str,
+    max_retries: usize,
+    mut make_request: F,
+) -> Result<ureq::Response>
+where
+    F: FnMut() -> std::result::Result<ureq::Response, ureq::Error>,
+{
+    let mut attempt = 0;
+    let base_delay_ms = 100u64;
+
+    loop {
+        match make_request() {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if attempt >= max_retries || !is_transient_error(&e) {
+                    return match e {
+                        ureq::Error::Status(404, _) => Err(RasterH3Error::InvalidParameter(
+                            format!("Remote raster not found (HTTP 404): {}", url),
+                        )),
+                        ureq::Error::Status(status, r) => {
+                            Err(RasterH3Error::InvalidParameter(format!(
+                                "HTTP request failed for '{}': HTTP {} - {}",
+                                url,
+                                status,
+                                r.status_text()
+                            )))
+                        }
+                        ureq::Error::Transport(t) => Err(RasterH3Error::InvalidParameter(format!(
+                            "Network transport error connecting to '{}': {}",
+                            url, t
+                        ))),
+                    };
+                }
+
+                // Exponential backoff with small jitter
+                let jitter = (attempt as u64 * 37) % 50;
+                let backoff_ms = (base_delay_ms * (1 << attempt) + jitter).min(2000);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Shared, thread-safe connection and block-cache state for a remote GeoTIFF
 pub struct RemoteHttpSource {
     pub url: String,
     pub total_size: u64,
     agent: Agent,
+    headers: Vec<(String, String)>,
     cache: RwLock<FxHashMap<u64, Arc<Vec<u8>>>>,
     block_size: usize,
 }
 
 impl RemoteHttpSource {
-    /// Open a remote GeoTIFF, probing byte-range support and fetching the initial 64 KB header block
+    /// Open a remote GeoTIFF, probing byte-range support and fetching the initial header block
     pub fn open(raw_url: &str) -> Result<Self> {
         let url = normalize_url(raw_url)?;
 
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(15))
             .timeout_read(std::time::Duration::from_secs(60))
+            .max_idle_connections(128)
+            .max_idle_connections_per_host(32)
             .build();
 
+        let headers = get_default_headers();
         let initial_fetch_len = DEFAULT_BLOCK_SIZE;
         let range_header = format!("bytes=0-{}", initial_fetch_len - 1);
 
-        let resp = match agent.get(&url).set("Range", &range_header).call() {
-            Ok(r) => r,
-            Err(ureq::Error::Status(404, _)) => {
-                return Err(RasterH3Error::InvalidParameter(format!(
-                    "Remote raster not found (HTTP 404): {}",
-                    url
-                )));
+        let resp = execute_request_with_retry(&url, 4, || {
+            let mut req = agent.get(&url).set("Range", &range_header);
+            for (k, v) in &headers {
+                req = req.set(k, v);
             }
-            Err(ureq::Error::Status(status, r)) => {
-                return Err(RasterH3Error::InvalidParameter(format!(
-                    "Failed to fetch remote raster '{}': HTTP {} - {}",
-                    url,
-                    status,
-                    r.status_text()
-                )));
-            }
-            Err(e) => {
-                return Err(RasterH3Error::InvalidParameter(format!(
-                    "Network error connecting to remote raster '{}': {}",
-                    url, e
-                )));
-            }
-        };
+            req.call()
+        })?;
 
         let status = resp.status();
         let mut total_size = 0u64;
 
         let initial_bytes = if status == 206 {
-            // Parse Content-Range: bytes 0-65535/total_size
+            // Parse Content-Range: bytes 0-131071/total_size
             if let Some(cr) = resp.header("Content-Range") {
                 if let Some(slash_idx) = cr.rfind('/') {
                     let total_str = &cr[slash_idx + 1..].trim();
@@ -156,37 +273,22 @@ impl RemoteHttpSource {
             url,
             total_size,
             agent,
+            headers,
             cache: RwLock::new(cache),
             block_size: initial_fetch_len,
         })
     }
 
-    /// Fetch an arbitrary byte range directly from the remote server
+    /// Fetch an arbitrary byte range directly from the remote server with retry
     pub fn fetch_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
         let range_header = format!("bytes={}-{}", start, end);
-        let resp = match self
-            .agent
-            .get(&self.url)
-            .set("Range", &range_header)
-            .call()
-        {
-            Ok(r) => r,
-            Err(ureq::Error::Status(status, r)) => {
-                return Err(RasterH3Error::InvalidParameter(format!(
-                    "HTTP Range request {} failed for '{}': HTTP {} - {}",
-                    range_header,
-                    self.url,
-                    status,
-                    r.status_text()
-                )));
+        let resp = execute_request_with_retry(&self.url, 4, || {
+            let mut req = self.agent.get(&self.url).set("Range", &range_header);
+            for (k, v) in &self.headers {
+                req = req.set(k, v);
             }
-            Err(e) => {
-                return Err(RasterH3Error::InvalidParameter(format!(
-                    "HTTP Range request {} network error for '{}': {}",
-                    range_header, self.url, e
-                )));
-            }
-        };
+            req.call()
+        })?;
 
         let mut reader = resp.into_reader();
         let mut buf = Vec::with_capacity((end - start + 1) as usize);
@@ -229,7 +331,8 @@ impl RemoteHttpSource {
             if let Some(block) = cache.get(&block_idx) {
                 if offset_in_block < block.len() {
                     let available = (block.len() - offset_in_block).min(actual_len);
-                    out[..available].copy_from_slice(&block[offset_in_block..offset_in_block + available]);
+                    out[..available]
+                        .copy_from_slice(&block[offset_in_block..offset_in_block + available]);
                     return Ok(available);
                 }
             }
@@ -252,7 +355,8 @@ impl RemoteHttpSource {
         };
 
         let available = (final_block.len().saturating_sub(offset_in_block)).min(actual_len);
-        out[..available].copy_from_slice(&final_block[offset_in_block..offset_in_block + available]);
+        out[..available]
+            .copy_from_slice(&final_block[offset_in_block..offset_in_block + available]);
         Ok(available)
     }
 

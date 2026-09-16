@@ -1,3 +1,9 @@
+//! Benchmarks single-pass multi-resolution fusion versus sequential multi-pass raster scans.
+//!
+//! Compares streaming execution time, throughput, and speedup across multiple simultaneous H3 resolutions.
+//!
+//! Run with: `cargo run --example benchmark_multi_resolution`
+
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -7,16 +13,16 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use raster_h3::aggregator::{
-    AggregationConfig, CategoricalHorizonStreamer, MultiCategoricalHorizonStreamer,
-    MultiResolutionConfig, MultiScanHorizonStreamer, SamplingPattern, ScanHorizonStreamer,
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+    SamplingPattern,
 };
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 fn generate_benchmark_raster(path: &Path, width: u32, height: u32) -> std::io::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-    let mut encoder = TiffEncoder::new(writer)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut encoder =
+        TiffEncoder::new(writer).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let mut image = encoder
         .new_image::<Gray32Float>(width, height)
@@ -25,7 +31,10 @@ fn generate_benchmark_raster(path: &Path, width: u32, height: u32) -> std::io::R
     // ModelTiepoint: San Francisco (-122.50, 37.85)
     image
         .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..])
+        .write_tag(
+            Tag::Unknown(33922),
+            &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..],
+        )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Pixel Scale: ~10m resolution (0.0001 deg)
@@ -35,11 +44,7 @@ fn generate_benchmark_raster(path: &Path, width: u32, height: u32) -> std::io::R
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // EPSG:4326 GeoKeys
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
     image
         .encoder()
         .write_tag(Tag::Unknown(34735), &geokeys[..])
@@ -84,85 +89,133 @@ fn benchmark_dataset(path: &Path, label: &str) {
     println!("\n--- [Continuous: Center Point] ---");
     let t_res8 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 8, ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
-        let start = Instant::now();
-        let mut count = 0;
-        loop {
-            let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
-            count += b.len();
-        }
-        let dur = start.elapsed().as_secs_f64();
-        println!("  Standalone Res 8:       {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
-        dur
-    };
-
-    let t_res9 = {
-        let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 9, ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
-        let start = Instant::now();
-        let mut count = 0;
-        loop {
-            let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
-            count += b.len();
-        }
-        let dur = start.elapsed().as_secs_f64();
-        println!("  Standalone Res 9:       {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
-        dur
-    };
-    let t_seq = t_res8 + t_res9;
-    println!("  Sequential Total:       {:6.2} ms ({:6.2} Mpx/s eqv)", t_seq * 1000.0, (2.0 * mpx) / t_seq);
-
-    let t_fused = {
-        let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = MultiResolutionConfig { resolutions: vec![8, 9], ..Default::default() };
+        let cfg = MultiResolutionConfig::single(8);
         let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Fused Res [8, 9]:       {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Standalone Res 8:       {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
+        dur
+    };
+
+    let t_res9 = {
+        let r = GeoTiffStreamReader::open(path).unwrap();
+        let cfg = MultiResolutionConfig::single(9);
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
+        let start = Instant::now();
+        let mut count = 0;
+        loop {
+            let b = streamer.fetch_next_batch(32);
+            if b.is_empty() {
+                break;
+            }
+            count += b.len();
+        }
+        let dur = start.elapsed().as_secs_f64();
+        println!(
+            "  Standalone Res 9:       {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
+        dur
+    };
+    let t_seq = t_res8 + t_res9;
+    println!(
+        "  Sequential Total:       {:6.2} ms ({:6.2} Mpx/s eqv)",
+        t_seq * 1000.0,
+        (2.0 * mpx) / t_seq
+    );
+
+    let t_fused = {
+        let r = GeoTiffStreamReader::open(path).unwrap();
+        let cfg = MultiResolutionConfig {
+            resolutions: vec![8, 9],
+            ..Default::default()
+        };
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
+        let start = Instant::now();
+        let mut count = 0;
+        loop {
+            let b = streamer.fetch_next_batch(32);
+            if b.is_empty() {
+                break;
+            }
+            count += b.len();
+        }
+        let dur = start.elapsed().as_secs_f64();
+        println!(
+            "  Fused Res [8, 9]:       {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let speedup = t_seq / t_fused;
-    println!("  >> Speedup vs Sequential: {:.2}x ({:.1}% time saved)", speedup, (1.0 - t_fused / t_seq) * 100.0);
+    println!(
+        "  >> Speedup vs Sequential: {:.2}x ({:.1}% time saved)",
+        speedup,
+        (1.0 - t_fused / t_seq) * 100.0
+    );
 
     println!("\n--- [Continuous: 5-Point Super-Sampling] ---");
     let t_res8_5p = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 8, sampling: SamplingPattern::five_point(), ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
+        let mut cfg = MultiResolutionConfig::single(8);
+        cfg.sampling = SamplingPattern::five_point();
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Standalone Res 8 (5pt): {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Standalone Res 8 (5pt): {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let t_res9_5p = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 9, sampling: SamplingPattern::five_point(), ..Default::default() };
-        let mut streamer = ScanHorizonStreamer::new(r, &cfg).unwrap();
+        let mut cfg = MultiResolutionConfig::single(9);
+        cfg.sampling = SamplingPattern::five_point();
+        let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Standalone Res 9 (5pt): {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Standalone Res 9 (5pt): {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let t_seq_5p = t_res8_5p + t_res9_5p;
@@ -170,51 +223,80 @@ fn benchmark_dataset(path: &Path, label: &str) {
 
     let t_fused_5p = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = MultiResolutionConfig { resolutions: vec![8, 9], sampling: SamplingPattern::five_point(), ..Default::default() };
+        let cfg = MultiResolutionConfig {
+            resolutions: vec![8, 9],
+            sampling: SamplingPattern::five_point(),
+            ..Default::default()
+        };
         let mut streamer = MultiScanHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Fused Res [8, 9] (5pt): {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Fused Res [8, 9] (5pt): {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let speedup_5p = t_seq_5p / t_fused_5p;
-    println!("  >> Speedup vs Sequential: {:.2}x ({:.1}% time saved)", speedup_5p, (1.0 - t_fused_5p / t_seq_5p) * 100.0);
+    println!(
+        "  >> Speedup vs Sequential: {:.2}x ({:.1}% time saved)",
+        speedup_5p,
+        (1.0 - t_fused_5p / t_seq_5p) * 100.0
+    );
 
     println!("\n--- [Categorical: Center Point] ---");
     let t_cat_res8 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 8, ..Default::default() };
-        let mut streamer = CategoricalHorizonStreamer::new(r, &cfg).unwrap();
+        let cfg = MultiResolutionConfig::single(8);
+        let mut streamer = MultiCategoricalHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Standalone Res 8:       {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Standalone Res 8:       {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let t_cat_res9 = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = AggregationConfig { resolution: 9, ..Default::default() };
-        let mut streamer = CategoricalHorizonStreamer::new(r, &cfg).unwrap();
+        let cfg = MultiResolutionConfig::single(9);
+        let mut streamer = MultiCategoricalHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Standalone Res 9:       {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Standalone Res 9:       {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let t_cat_seq = t_cat_res8 + t_cat_res9;
@@ -222,21 +304,35 @@ fn benchmark_dataset(path: &Path, label: &str) {
 
     let t_cat_fused = {
         let r = GeoTiffStreamReader::open(path).unwrap();
-        let cfg = MultiResolutionConfig { resolutions: vec![8, 9], ..Default::default() };
+        let cfg = MultiResolutionConfig {
+            resolutions: vec![8, 9],
+            ..Default::default()
+        };
         let mut streamer = MultiCategoricalHorizonStreamer::new(r, &cfg).unwrap();
         let start = Instant::now();
         let mut count = 0;
         loop {
             let b = streamer.fetch_next_batch(32);
-            if b.is_empty() { break; }
+            if b.is_empty() {
+                break;
+            }
             count += b.len();
         }
         let dur = start.elapsed().as_secs_f64();
-        println!("  Fused Res [8, 9]:       {:6.2} ms ({:6.2} Mpx/s, {} cells)", dur * 1000.0, mpx / dur, count);
+        println!(
+            "  Fused Res [8, 9]:       {:6.2} ms ({:6.2} Mpx/s, {} cells)",
+            dur * 1000.0,
+            mpx / dur,
+            count
+        );
         dur
     };
     let cat_speedup = t_cat_seq / t_cat_fused;
-    println!("  >> Speedup vs Sequential: {:.2}x ({:.1}% time saved)", cat_speedup, (1.0 - t_cat_fused / t_cat_seq) * 100.0);
+    println!(
+        "  >> Speedup vs Sequential: {:.2}x ({:.1}% time saved)",
+        cat_speedup,
+        (1.0 - t_cat_fused / t_cat_seq) * 100.0
+    );
 }
 
 fn main() {
@@ -251,6 +347,9 @@ fn main() {
 
     let cfl_path = Path::new("data/CFL_HI.tif");
     if cfl_path.exists() {
-        benchmark_dataset(cfl_path, "Real Dataset: Hawaii Canopy Fuel Load (CFL_HI.tif)");
+        benchmark_dataset(
+            cfl_path,
+            "Real Dataset: Hawaii Canopy Fuel Load (CFL_HI.tif)",
+        );
     }
 }

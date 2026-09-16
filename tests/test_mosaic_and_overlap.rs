@@ -1,50 +1,21 @@
+//! Tests multi-file raster mosaic ingestion and overlap resolution rules.
+//!
+//! Evaluates glob pattern expansion, GDAL VRT XML source resolution, cutline, first,
+//! and average overlap handling, and multi-worker concurrent prefetched mosaic reading.
+
+mod helpers;
+
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
 
+use helpers::create_constant_gray8_geotiff as create_test_geotiff;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
-use raster_h3::raster::mosaic::{
-    glob_match, resolve_raster_sources, MosaicReader, OverlapRule,
-};
-use tiff::encoder::{colortype, TiffEncoder};
-use tiff::tags::Tag;
-
-fn create_test_geotiff(
-    path: &Path,
-    width: u32,
-    height: u32,
-    origin_lon: f64,
-    origin_lat: f64,
-    pixel_size: f64,
-    fill_val: u8,
-) {
-    let file = File::create(path).expect("failed to create tiff file");
-    let mut encoder = TiffEncoder::new(file).expect("failed to create encoder");
-    let mut image = encoder
-        .new_image::<colortype::Gray8>(width, height)
-        .expect("failed to create image");
-
-    image
-        .encoder()
-        .write_tag(
-            Tag::ModelTiepointTag,
-            &[0.0_f64, 0.0, 0.0, origin_lon, origin_lat, 0.0][..],
-        )
-        .expect("write tiepoint tag");
-    image
-        .encoder()
-        .write_tag(
-            Tag::ModelPixelScaleTag,
-            &[pixel_size, pixel_size, 0.0][..],
-        )
-        .expect("write pixel scale tag");
-
-    let data = vec![fill_val; (width * height) as usize];
-    image.write_data(&data).expect("write data");
-}
+use raster_h3::raster::mosaic::{glob_match, resolve_raster_sources, MosaicReader, OverlapRule};
+use raster_h3::raster::prefetch::PrefetchedMosaicReader;
+use tiff::decoder::DecodingResult;
 
 #[test]
 fn test_glob_match_patterns() {
@@ -94,7 +65,9 @@ fn test_resolve_sources_glob() {
     let glob_pat = format!("{}/alpha_*.tif", temp_dir.display());
     let resolved = resolve_raster_sources(&glob_pat).expect("resolve glob");
     assert_eq!(resolved.len(), 2);
-    assert!(resolved.iter().all(|p| p.to_string_lossy().contains("alpha_")));
+    assert!(resolved
+        .iter()
+        .all(|p| p.to_string_lossy().contains("alpha_")));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -123,7 +96,9 @@ fn test_resolve_sources_vrt_xml() {
 </VRTDataset>"#
     );
     let mut vrt_file = File::create(&vrt_path).expect("create vrt");
-    vrt_file.write_all(vrt_content.as_bytes()).expect("write vrt");
+    vrt_file
+        .write_all(vrt_content.as_bytes())
+        .expect("write vrt");
 
     let resolved = resolve_raster_sources(&vrt_path.to_string_lossy()).expect("resolve vrt");
     assert_eq!(resolved.len(), 2);
@@ -203,7 +178,10 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         // Combined span: [-122.45, -122.39] = 60 pixels wide by 40 tall = 2400 unique ground pixels
-        assert_eq!(total_pixels as u64, 2400, "Cutline must not double-count pixels");
+        assert_eq!(
+            total_pixels as u64, 2400,
+            "Cutline must not double-count pixels"
+        );
     }
 
     // 2. First (Painter's algorithm: Tile 1 takes precedence in overlap)
@@ -218,7 +196,10 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         let records = streamer.fetch_next_batch(100_000);
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
-        assert_eq!(total_pixels as u64, 2400, "First must not double-count pixels");
+        assert_eq!(
+            total_pixels as u64, 2400,
+            "First must not double-count pixels"
+        );
     }
 
     // 3. Average (Accumulate all overlapping observations)
@@ -228,13 +209,15 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         );
         let mut config = MultiResolutionConfig::new(vec![9]);
         config.overlap_rule = OverlapRule::Average;
-        let mut streamer =
-            MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init avg");
+        let mut streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init avg");
         let records = streamer.fetch_next_batch(100_000);
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         // 40*40 + 40*40 = 3200 accumulated observations
-        assert_eq!(total_pixels as u64, 3200, "Average must accumulate both observations in overlap");
+        assert_eq!(
+            total_pixels as u64, 3200,
+            "Average must accumulate both observations in overlap"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -261,11 +244,124 @@ fn test_categorical_mosaic_with_overlap() {
         MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config).expect("init cat streamer");
 
     let records = streamer.fetch_next_batch(10_000);
-    assert!(!records.is_empty(), "Categorical mosaic should yield records");
+    assert!(
+        !records.is_empty(),
+        "Categorical mosaic should yield records"
+    );
 
     let total_count: f64 = records.iter().map(|r| r.accumulator.total_count).sum();
     // 50 x 30 = 1500 unique pixels
     assert_eq!(total_count as u64, 1500);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
+    let temp_dir = std::env::temp_dir().join("raster_h3_test_mosaic_prefetch");
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // Create 3 tiles with different fill values
+    let f1 = temp_dir.join("tile_0.tif");
+    let f2 = temp_dir.join("tile_1.tif");
+    let f3 = temp_dir.join("tile_2.tif");
+    create_test_geotiff(&f1, 40, 40, -122.50, 37.85, 0.001, 10);
+    create_test_geotiff(&f2, 40, 40, -122.45, 37.85, 0.001, 20);
+    create_test_geotiff(&f3, 40, 40, -122.40, 37.85, 0.001, 30);
+
+    let paths = vec![f1, f2, f3];
+    let mosaic = Arc::new(
+        MosaicReader::open(&paths, None, None, OverlapRule::Cutline).expect("open mosaic"),
+    );
+
+    let total_jobs = mosaic.chunk_refs.len();
+    assert!(total_jobs >= 3, "Mosaic should have at least 3 chunks");
+
+    // Spawn PrefetchedMosaicReader with 4 worker threads
+    let prefetcher = PrefetchedMosaicReader::spawn_with_workers(Arc::clone(&mosaic), 16, 4);
+
+    let mut received_chunks = 0;
+    for job_id in 0..total_jobs {
+        let item = prefetcher
+            .next_chunk()
+            .expect("Expected chunk from prefetcher");
+        let (tile_idx, chunk_idx, bounds, data, has_overlap) = item.expect("Chunk decoding failed");
+
+        // Verify sequential job ordering invariants
+        let expected_ref = mosaic.chunk_refs[job_id];
+        assert_eq!(
+            tile_idx, expected_ref.tile_idx,
+            "tile_idx mismatch at job {}",
+            job_id
+        );
+        assert_eq!(
+            chunk_idx, expected_ref.chunk_idx,
+            "chunk_idx mismatch at job {}",
+            job_id
+        );
+        assert_eq!(
+            has_overlap, expected_ref.has_overlap,
+            "has_overlap mismatch at job {}",
+            job_id
+        );
+        assert!(bounds.width > 0 && bounds.height > 0);
+
+        // Verify pixel data content matches tile fill value
+        let expected_fill = match tile_idx {
+            0 => 10u8,
+            1 => 20u8,
+            2 => 30u8,
+            _ => unreachable!(),
+        };
+
+        match data {
+            DecodingResult::U8(ref pixels) => {
+                assert_eq!(pixels.len(), (bounds.width * bounds.height) as usize);
+                assert!(
+                    pixels.iter().all(|&p| p == expected_fill),
+                    "Pixel value corrupted"
+                );
+            }
+            _ => panic!("Expected U8 decoding result"),
+        }
+
+        // Test buffer recycling back to worker pool
+        prefetcher.recycle_batch(std::iter::once(data));
+        received_chunks += 1;
+    }
+
+    assert_eq!(received_chunks, total_jobs);
+    assert!(
+        prefetcher.next_chunk().is_none(),
+        "Queue should be empty after all chunks pulled"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_prefetched_mosaic_reader_early_drop() {
+    let temp_dir = std::env::temp_dir().join("raster_h3_test_mosaic_early_drop");
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let f1 = temp_dir.join("ed_0.tif");
+    let f2 = temp_dir.join("ed_1.tif");
+    create_test_geotiff(&f1, 50, 50, -122.50, 37.85, 0.001, 10);
+    create_test_geotiff(&f2, 50, 50, -122.45, 37.85, 0.001, 20);
+
+    let paths = vec![f1, f2];
+    let mosaic = Arc::new(
+        MosaicReader::open(&paths, None, None, OverlapRule::Cutline).expect("open mosaic"),
+    );
+
+    let prefetcher = PrefetchedMosaicReader::spawn_with_workers(Arc::clone(&mosaic), 16, 4);
+
+    // Pull only 1 chunk then immediately drop prefetcher
+    let first = prefetcher.next_chunk();
+    assert!(first.is_some(), "Should receive first chunk");
+
+    // Dropping prefetcher must close queue and terminate worker threads promptly without deadlock
+    drop(prefetcher);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

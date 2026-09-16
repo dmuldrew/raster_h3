@@ -11,12 +11,18 @@ pub mod categorical_streamer;
 pub mod config;
 pub mod continuous;
 pub mod continuous_streamer;
+pub mod controller;
+pub mod sharded_map;
+pub mod walker;
 
 pub use categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
 pub use categorical_streamer::MultiCategoricalHorizonStreamer;
 pub use config::{MultiResolutionConfig, QuantileTarget, SpectralFormula};
-pub use continuous::{
-    is_slice_all_native_nodata, process_continuous_chunk_payload_into, MultiContinuousRecord,
-    RAD_TO_DEG, WGS84_A,
-};
+pub use continuous::{process_continuous_chunk_payload_into, MultiContinuousRecord};
 pub use continuous_streamer::MultiScanHorizonStreamer;
+pub use controller::{HorizonStreamKernel, MultiHorizonStreamer};
+pub use sharded_map::{get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS};
+pub use walker::{
+    is_slice_all_native_nodata, scanline_walk, walk_overlap_pixel_cells, RowCoordinates,
+    RowGeometryContext, ScanlineEngine, RAD_TO_DEG, WGS84_A,
+};

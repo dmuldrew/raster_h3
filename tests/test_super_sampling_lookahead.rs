@@ -1,58 +1,16 @@
-use raster_h3::aggregator::{AggregationConfig, CategoricalHorizonStreamer, ScanHorizonStreamer};
+//! Tests sub-pixel super-sampling pattern conservation and scanline lookahead.
+//!
+//! Validates total pixel mass conservation across center, RGSS, quincunx, Gaussian, hexagonal,
+//! and grid patterns under geographic (EPSG:4326) and projected (UTM) coordinate reference systems.
+
+mod helpers;
+
+use helpers::{create_fn_f32_geotiff as create_test_geotiff, TestGeoTiffBuilder};
+use raster_h3::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+};
 use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::GeoTiffStreamReader;
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::PathBuf;
-use tempfile::NamedTempFile;
-use tiff::encoder::colortype::Gray32Float;
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
-
-fn create_test_geotiff(
-    width: u32,
-    height: u32,
-    val_fn: impl Fn(u32, u32) -> f32,
-) -> (NamedTempFile, PathBuf) {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for row in 0..height {
-        for col in 0..width {
-            data.push(val_fn(col, row));
-        }
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-
-        // ModelTiepointTag: (I, J, K, X, Y, Z) -> (0, 0, 0, -122.45, 37.85, 0.0)
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
-            .unwrap();
-        // ModelPixelScaleTag: (ScaleX, ScaleY, ScaleZ) -> (0.0005, 0.0005, 0.0)
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.0005f64, 0.0005, 0.0][..])
-            .unwrap();
-
-        // EPSG:4326 GeoKeyDirectoryTag
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        image.write_data(&data).unwrap();
-    }
-
-    (temp_file, path)
-}
 
 #[test]
 fn test_continuous_supersampling_all_patterns_conservation() {
@@ -67,20 +25,20 @@ fn test_continuous_supersampling_all_patterns_conservation() {
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
 
     for (name, pattern) in patterns {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: 8,
-            sampling: pattern,
-            ..Default::default()
-        };
+        let mut config = MultiResolutionConfig::single(8);
+        config.sampling = pattern;
 
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut total_count = 0.0;
         let mut total_sum = 0.0;
         let mut cell_count = 0;
@@ -90,7 +48,8 @@ fn test_continuous_supersampling_all_patterns_conservation() {
             if batch.is_empty() {
                 break;
             }
-            for (_cell, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 cell_count += 1;
                 total_count += acc.count;
                 total_sum += acc.sum;
@@ -121,7 +80,7 @@ fn test_continuous_supersampling_all_patterns_conservation() {
             total_count,
             expected_pixels
         );
-        // Conservation of total sum
+        // Conservation of total integral / sum
         let expected_sum = expected_pixels * constant_val as f64;
         assert!(
             (total_sum - expected_sum).abs() < 1e-3,
@@ -139,14 +98,19 @@ fn test_continuous_gradient_supersampling_consistency() {
     let height = 128u32;
     let expected_pixels = (width * height) as f64;
 
-    // Linear gradient raster
-    let (_tmp, path) = create_test_geotiff(width, height, |c, r| (c + r) as f32);
+    // Linear diagonal gradient: f(x, y) = 10.0 + x * 0.5 + y * 0.5
+    let (_tmp, path) = create_test_geotiff(width, height, |c, r| {
+        10.0 + (c as f32) * 0.5 + (r as f32) * 0.5
+    });
 
     let patterns = [
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
@@ -155,27 +119,30 @@ fn test_continuous_gradient_supersampling_consistency() {
 
     for (name, pattern) in patterns {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: 8,
-            sampling: pattern,
-            ..Default::default()
-        };
+        let mut config = MultiResolutionConfig::single(8);
+        config.sampling = pattern;
 
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut total_count = 0.0;
         let mut total_sum = 0.0;
+        let mut cell_count = 0;
 
         loop {
             let batch = streamer.fetch_next_batch(64);
             if batch.is_empty() {
                 break;
             }
-            for (_cell, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
+                cell_count += 1;
                 total_count += acc.count;
                 total_sum += acc.sum;
+                assert!(acc.min <= acc.mean() + 1e-5);
+                assert!(acc.mean() <= acc.max + 1e-5);
             }
         }
 
+        assert!(cell_count > 0);
         assert!(
             (total_count - expected_pixels).abs() < 1e-5,
             "Pattern {} count {} != expected {}",
@@ -190,7 +157,7 @@ fn test_continuous_gradient_supersampling_consistency() {
     // should be closely conserved across all sampling schemes (within sub-pixel boundary shift tolerance)
     let baseline_sum = pattern_sums[0].1;
     for (name, sum) in &pattern_sums[1..] {
-        let rel_diff = (sum - baseline_sum).abs() / baseline_sum;
+        let rel_diff = (*sum - baseline_sum).abs() / baseline_sum;
         assert!(
             rel_diff < 0.005,
             "Pattern {} sum {} deviated from baseline {} by {:.4}%",
@@ -218,20 +185,20 @@ fn test_categorical_supersampling_all_patterns_conservation() {
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
 
     for (name, pattern) in patterns {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: 8,
-            sampling: pattern,
-            ..Default::default()
-        };
+        let mut config = MultiResolutionConfig::single(8);
+        config.sampling = pattern;
 
-        let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
         let mut total_count = 0.0;
         let mut cell_count = 0;
 
@@ -240,7 +207,8 @@ fn test_categorical_supersampling_all_patterns_conservation() {
             if batch.is_empty() {
                 break;
             }
-            for (_cell, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 cell_count += 1;
                 total_count += acc.total_count;
                 let (maj_class, maj_cnt, maj_frac) = acc.majority();
@@ -268,59 +236,30 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
     let expected_pixels = (width * height) as f64;
     let constant_val = 17.25f32;
 
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for _ in 0..(width * height) {
-        data.push(constant_val);
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-
-        // ModelTiepointTag: (0, 0, 0, 500000.0, 4180000.0, 0.0) - SF Bay area in UTM Zone 10N
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, 500000.0, 4180000.0, 0.0][..])
-            .unwrap();
-        // ModelPixelScaleTag: 30m resolution (ScaleX = 30.0, ScaleY = 30.0)
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[30.0f64, 30.0, 0.0][..])
-            .unwrap();
-
-        // EPSG:32610 GeoKeys (UTM Zone 10N)
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 1, // ModelTypeProjected
-            3072, 0, 1, 32610, // EPSG:32610
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = TestGeoTiffBuilder::new(width, height)
+        .origin(500000.0, 4180000.0)
+        .pixel_size(30.0)
+        .epsg(32610)
+        .create_f32_tempfile(|_, _| constant_val);
 
     let patterns = [
         ("center", SamplingPattern::center()),
         ("rgss", SamplingPattern::rgss()),
         ("five_point", SamplingPattern::five_point()),
-        ("gaussian_five_point", SamplingPattern::gaussian_five_point()),
+        (
+            "gaussian_five_point",
+            SamplingPattern::gaussian_five_point(),
+        ),
         ("hex_seven_point", SamplingPattern::hex_seven_point()),
         ("sixteen_point", SamplingPattern::sixteen_point()),
     ];
 
     for (name, pattern) in patterns {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: 9,
-            sampling: pattern,
-            ..Default::default()
-        };
+        let mut config = MultiResolutionConfig::single(9);
+        config.sampling = pattern;
 
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut total_count = 0.0;
         let mut total_sum = 0.0;
         let mut cell_count = 0;
@@ -330,7 +269,8 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
             if batch.is_empty() {
                 break;
             }
-            for (_cell, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 cell_count += 1;
                 total_count += acc.count;
                 total_sum += acc.sum;

@@ -1,58 +1,29 @@
-use std::fs::File;
-use std::io::BufWriter;
+//! Performance regression guards and throughput baseline tests.
+//!
+//! Evaluates streaming throughput baselines, memory bounds, multi-resolution scaling,
+//! categorical aggregation efficiency, and sub-pixel super-sampling conservation.
+
+mod helpers;
+
 use std::time::Instant;
 use tempfile::NamedTempFile;
-use tiff::encoder::colortype::Gray32Float;
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
 
-use raster_h3::aggregator::{
-    AggregationConfig, CategoricalHorizonStreamer, SamplingPattern, ScanHorizonStreamer,
+use raster_h3::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
+use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::raster::GeoTiffStreamReader;
 
 /// Helper to generate synthetic floating point test GeoTIFF
-fn create_benchmark_geotiff(width: u32, height: u32, base_val: f32) -> (NamedTempFile, std::path::PathBuf) {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for row in 0..height {
-        for col in 0..width {
-            let val = base_val + (row as f32 * 0.1) + (col as f32 * 0.05);
-            data.push(val);
-        }
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-
-        // Tiepoint (top-left at San Francisco coordinates)
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
-            .unwrap();
-
-        // Pixel scale: 0.0005 deg per pixel (~50m resolution)
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.0005f64, 0.0005, 0.0][..])
-            .unwrap();
-
-        // EPSG:4326 GeoKeys
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        image.write_data(&data).unwrap();
-    }
-
-    (temp_file, path)
+fn create_benchmark_geotiff(
+    width: u32,
+    height: u32,
+    base_val: f32,
+) -> (NamedTempFile, std::path::PathBuf) {
+    helpers::TestGeoTiffBuilder::new(width, height)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.0005)
+        .create_f32_tempfile(|col, row| base_val + (row as f32 * 0.1) + (col as f32 * 0.05))
 }
 
 #[test]
@@ -63,13 +34,10 @@ fn test_streaming_throughput_and_memory_bounding() {
     let (_tmp, path) = create_benchmark_geotiff(width, height, 100.0);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(8);
 
     let start = Instant::now();
-    let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
 
     let mut accumulated_pixels = 0.0;
     let mut total_batches = 0;
@@ -81,7 +49,8 @@ fn test_streaming_throughput_and_memory_bounding() {
             break;
         }
         total_batches += 1;
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_cells += 1;
             accumulated_pixels += acc.count;
             assert!(acc.mean() >= 100.0);
@@ -102,7 +71,11 @@ fn test_streaming_throughput_and_memory_bounding() {
     assert!(total_cells > 0);
     assert!(total_batches > 1);
     // Reasonable time check: must finish within 2 seconds
-    assert!(elapsed.as_secs() < 2, "Streaming took too long: {:?}", elapsed);
+    assert!(
+        elapsed.as_secs() < 2,
+        "Streaming took too long: {:?}",
+        elapsed
+    );
 }
 
 #[test]
@@ -118,13 +91,10 @@ fn test_multi_resolution_conservation_and_scaling() {
 
     for &res in &resolutions {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: res,
-            ..Default::default()
-        };
+        let config = MultiResolutionConfig::single(res);
 
         let start = Instant::now();
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut res_pixels = 0.0;
         let mut res_cells = 0;
 
@@ -133,7 +103,8 @@ fn test_multi_resolution_conservation_and_scaling() {
             if batch.is_empty() {
                 break;
             }
-            for (_, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 res_cells += 1;
                 res_pixels += acc.count;
             }
@@ -159,7 +130,10 @@ fn test_multi_resolution_conservation_and_scaling() {
         assert!(
             cell_counts[i] >= cell_counts[i - 1],
             "Cell count should increase with resolution: res {} ({}) < res {} ({})",
-            resolutions[i], cell_counts[i], resolutions[i - 1], cell_counts[i - 1]
+            resolutions[i],
+            cell_counts[i],
+            resolutions[i - 1],
+            cell_counts[i - 1]
         );
     }
 }
@@ -170,50 +144,16 @@ fn test_categorical_streaming_performance_scaling() {
     let height = 256u32;
     let total_pixels = (width * height) as f64;
 
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    // 10 distinct land cover classes (1..=10)
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for row in 0..height {
-        for col in 0..width {
-            let class_id = ((row / 32) * 2 + (col / 128) + 1) as f32;
-            data.push(class_id);
-        }
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
-
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
-            .unwrap();
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.0005f64, 0.0005, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        image.write_data(&data).unwrap();
-    }
+    let (_temp_file, path) = helpers::TestGeoTiffBuilder::new(width, height)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.0005)
+        .create_f32_tempfile(|col, row| ((row / 32) * 2 + (col / 128) + 1) as f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
-    let config = AggregationConfig {
-        resolution: 8,
-        ..Default::default()
-    };
+    let config = MultiResolutionConfig::single(8);
 
     let start = Instant::now();
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
 
     let mut accumulated_pixels = 0.0;
     let mut total_cells = 0;
@@ -223,7 +163,8 @@ fn test_categorical_streaming_performance_scaling() {
         if batch.is_empty() {
             break;
         }
-        for (_, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_cells += 1;
             accumulated_pixels += acc.total_count;
             assert!(acc.unique_classes() >= 1);
@@ -261,14 +202,11 @@ fn test_subpixel_sampling_scaling_and_conservation() {
 
     for (name, pattern) in patterns {
         let reader = GeoTiffStreamReader::open(&path).unwrap();
-        let config = AggregationConfig {
-            resolution: 8,
-            sampling: pattern,
-            ..Default::default()
-        };
+        let mut config = MultiResolutionConfig::single(8);
+        config.sampling = pattern;
 
         let start = Instant::now();
-        let mut streamer = ScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut total_weighted_count = 0.0;
         let mut cells = 0;
 
@@ -277,7 +215,8 @@ fn test_subpixel_sampling_scaling_and_conservation() {
             if batch.is_empty() {
                 break;
             }
-            for (_, acc) in batch {
+            for rec in batch {
+                let acc = rec.accumulator;
                 cells += 1;
                 total_weighted_count += acc.count;
             }
@@ -288,7 +227,9 @@ fn test_subpixel_sampling_scaling_and_conservation() {
         assert!(
             (total_weighted_count - expected_pixels).abs() < 1e-6,
             "Pattern {} weighted count {} != expected {}",
-            name, total_weighted_count, expected_pixels
+            name,
+            total_weighted_count,
+            expected_pixels
         );
 
         println!(

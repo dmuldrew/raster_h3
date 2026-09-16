@@ -1,3 +1,9 @@
+//! Configuration for multi-resolution H3 aggregation.
+//!
+//! Defines [`MultiResolutionConfig`] and supporting types for multi-resolution H3
+//! raster processing, including resolution ranges, spectral indices ([`SpectralFormula`]),
+//! streaming quantile and percentile targets ([`QuantileTarget`]), and category remapping.
+
 use std::sync::Arc;
 
 use crate::aggregator::remap::CategoryRemapper;
@@ -8,20 +14,105 @@ use crate::raster::mosaic::OverlapRule;
 /// Supported on-the-fly spectral index formulas
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpectralFormula {
-    Ndvi { nir_band: usize, red_band: usize },
-    Ndwi { green_band: usize, nir_band: usize },
-    Nbr { nir_band: usize, swir_band: usize },
-    Evi { nir_band: usize, red_band: usize, blue_band: usize },
+    /// Normalized Difference Vegetation Index: `(NIR - Red) / (NIR + Red)`.
+    Ndvi {
+        /// 1-indexed Near-Infrared (NIR) band.
+        nir_band: usize,
+        /// 1-indexed Red band.
+        red_band: usize,
+    },
+    /// Normalized Difference Water Index: `(Green - NIR) / (Green + NIR)`.
+    Ndwi {
+        /// 1-indexed Green band.
+        green_band: usize,
+        /// 1-indexed Near-Infrared (NIR) band.
+        nir_band: usize,
+    },
+    /// Normalized Burn Ratio: `(NIR - SWIR) / (NIR + SWIR)`.
+    Nbr {
+        /// 1-indexed Near-Infrared (NIR) band.
+        nir_band: usize,
+        /// 1-indexed Short-Wave Infrared (SWIR) band.
+        swir_band: usize,
+    },
+    /// Enhanced Vegetation Index: `2.5 * (NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1)`.
+    Evi {
+        /// 1-indexed Near-Infrared (NIR) band.
+        nir_band: usize,
+        /// 1-indexed Red band.
+        red_band: usize,
+        /// 1-indexed Blue band.
+        blue_band: usize,
+    },
 }
 
 impl SpectralFormula {
-    pub fn parse(name: &str, nir: usize, red: usize, green: usize, blue: usize, swir: usize) -> Option<Self> {
+    pub fn parse(
+        name: &str,
+        nir: usize,
+        red: usize,
+        green: usize,
+        blue: usize,
+        swir: usize,
+    ) -> Option<Self> {
         match name.to_lowercase().trim() {
-            "ndvi" => Some(Self::Ndvi { nir_band: nir, red_band: red }),
-            "ndwi" => Some(Self::Ndwi { green_band: green, nir_band: nir }),
-            "nbr" => Some(Self::Nbr { nir_band: nir, swir_band: swir }),
-            "evi" => Some(Self::Evi { nir_band: nir, red_band: red, blue_band: blue }),
+            "ndvi" => Some(Self::Ndvi {
+                nir_band: nir,
+                red_band: red,
+            }),
+            "ndwi" => Some(Self::Ndwi {
+                green_band: green,
+                nir_band: nir,
+            }),
+            "nbr" => Some(Self::Nbr {
+                nir_band: nir,
+                swir_band: swir,
+            }),
+            "evi" => Some(Self::Evi {
+                nir_band: nir,
+                red_band: red,
+                blue_band: blue,
+            }),
             _ => None,
+        }
+    }
+
+    /// Evaluate the spectral formula for given physical band reflectance values.
+    /// Returns None if the denominator is within [-1e-12, 1e-12] (division-by-zero protection).
+    pub fn compute(&self, nir: f64, red: f64, green: f64, blue: f64, swir: f64) -> Option<f64> {
+        match *self {
+            Self::Ndvi { .. } => {
+                let denom = nir + red;
+                if denom.abs() > 1e-12 {
+                    Some((nir - red) / denom)
+                } else {
+                    None
+                }
+            }
+            Self::Ndwi { .. } => {
+                let denom = green + nir;
+                if denom.abs() > 1e-12 {
+                    Some((green - nir) / denom)
+                } else {
+                    None
+                }
+            }
+            Self::Nbr { .. } => {
+                let denom = nir + swir;
+                if denom.abs() > 1e-12 {
+                    Some((nir - swir) / denom)
+                } else {
+                    None
+                }
+            }
+            Self::Evi { .. } => {
+                let denom = nir + 6.0 * red - 7.5 * blue + 1.0;
+                if denom.abs() > 1e-12 {
+                    Some(2.5 * (nir - red) / denom)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -29,7 +120,9 @@ impl SpectralFormula {
 /// Quantile target specification (percentile in [0.0, 1.0] or interquartile range)
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuantileTarget {
+    /// A specific percentile (e.g. 0.50 for P50), along with its output column name.
     Percentile(f64, String),
+    /// Interquartile range (IQR = P75 - P25), along with its output column name.
     Iqr(String),
 }
 
@@ -168,21 +261,37 @@ impl QuantileTarget {
 /// Configuration for multi-resolution aggregation
 #[derive(Debug, Clone)]
 pub struct MultiResolutionConfig {
+    /// Sorted list of target H3 resolution levels.
     pub resolutions: Vec<u8>,
+    /// 1-indexed raster band to extract.
     pub band: usize,
+    /// Optional user-specified NoData override.
     pub custom_nodata: Option<f64>,
+    /// Optional spatial bounding box for chunk-level pruning.
     pub bbox: Option<[f64; 4]>,
+    /// Sub-pixel super-sampling pattern.
     pub sampling: SamplingPattern,
+    /// Optional CRS override string (e.g. `"EPSG:4326"`).
     pub custom_crs: Option<String>,
+    /// Optional property whitelist for selective output.
     pub properties: Option<String>,
+    /// Optional spectral index formula for multi-band computation.
     pub spectral_formula: Option<SpectralFormula>,
+    /// Minimum pixel count threshold for output.
     pub min_count: Option<f64>,
+    /// Minimum mean value filter.
     pub min_mean: Option<f64>,
+    /// Maximum mean value filter.
     pub max_mean: Option<f64>,
+    /// Minimum majority class fraction for categorical filtering.
     pub min_majority_fraction: Option<f64>,
+    /// Whether to use compact output format.
     pub compact: bool,
+    /// Mosaic overlap resolution strategy.
     pub overlap_rule: OverlapRule,
+    /// List of quantile/percentile targets to compute.
     pub quantiles: Vec<QuantileTarget>,
+    /// Optional category remapping configuration.
     pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
@@ -209,6 +318,11 @@ impl MultiResolutionConfig {
         }
     }
 
+    /// Create a single-resolution configuration (convenience constructor)
+    pub fn single(resolution: u8) -> Self {
+        Self::new(vec![resolution])
+    }
+
     /// Check whether streaming quantile calculations are enabled
     #[inline(always)]
     pub fn track_quantiles(&self) -> bool {
@@ -219,5 +333,134 @@ impl MultiResolutionConfig {
 impl Default for MultiResolutionConfig {
     fn default() -> Self {
         Self::new(vec![8])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spectral_formula_parsing() {
+        assert_eq!(
+            SpectralFormula::parse("ndvi", 4, 3, 2, 1, 5),
+            Some(SpectralFormula::Ndvi {
+                nir_band: 4,
+                red_band: 3
+            })
+        );
+        assert_eq!(
+            SpectralFormula::parse("  NDVI  ", 4, 3, 2, 1, 5),
+            Some(SpectralFormula::Ndvi {
+                nir_band: 4,
+                red_band: 3
+            })
+        );
+        assert_eq!(
+            SpectralFormula::parse("ndwi", 4, 3, 2, 1, 5),
+            Some(SpectralFormula::Ndwi {
+                green_band: 2,
+                nir_band: 4
+            })
+        );
+        assert_eq!(
+            SpectralFormula::parse("nbr", 4, 3, 2, 1, 5),
+            Some(SpectralFormula::Nbr {
+                nir_band: 4,
+                swir_band: 5
+            })
+        );
+        assert_eq!(
+            SpectralFormula::parse("evi", 4, 3, 2, 1, 5),
+            Some(SpectralFormula::Evi {
+                nir_band: 4,
+                red_band: 3,
+                blue_band: 1
+            })
+        );
+        assert_eq!(SpectralFormula::parse("invalid", 4, 3, 2, 1, 5), None);
+    }
+
+    #[test]
+    fn test_spectral_formula_ndvi_computation_and_edge_cases() {
+        let formula = SpectralFormula::Ndvi {
+            nir_band: 4,
+            red_band: 3,
+        };
+
+        // 1. Standard positive vegetation
+        let ndvi = formula.compute(0.8, 0.2, 0.0, 0.0, 0.0).unwrap();
+        assert!((ndvi - 0.6).abs() < 1e-12);
+
+        // 2. Negative vegetation / water
+        let ndvi_water = formula.compute(0.1, 0.5, 0.0, 0.0, 0.0).unwrap();
+        assert!((ndvi_water - (-0.4 / 0.6)).abs() < 1e-12);
+
+        // 3. Complete absorption / zero denominator
+        assert_eq!(formula.compute(0.0, 0.0, 0.0, 0.0, 0.0), None);
+
+        // 4. Denominator very close to zero (|denom| <= 1e-12)
+        assert_eq!(formula.compute(1e-13, -1e-13, 0.0, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn test_spectral_formula_ndwi_computation_and_edge_cases() {
+        let formula = SpectralFormula::Ndwi {
+            green_band: 2,
+            nir_band: 4,
+        };
+
+        // 1. Standard water body
+        let ndwi = formula.compute(0.1, 0.0, 0.4, 0.0, 0.0).unwrap();
+        assert!((ndwi - (0.3 / 0.5)).abs() < 1e-12);
+
+        // 2. Dense vegetation (negative NDWI)
+        let ndwi_veg = formula.compute(0.8, 0.0, 0.2, 0.0, 0.0).unwrap();
+        assert!((ndwi_veg - (-0.6 / 1.0)).abs() < 1e-12);
+
+        // 3. Zero denominator
+        assert_eq!(formula.compute(0.0, 0.0, 0.0, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn test_spectral_formula_nbr_computation_and_edge_cases() {
+        let formula = SpectralFormula::Nbr {
+            nir_band: 4,
+            swir_band: 5,
+        };
+
+        // 1. Healthy forest (high NIR, low SWIR)
+        let nbr_healthy = formula.compute(0.7, 0.0, 0.0, 0.0, 0.2).unwrap();
+        assert!((nbr_healthy - (0.5 / 0.9)).abs() < 1e-12);
+
+        // 2. Burned scar (low NIR, high SWIR)
+        let nbr_burned = formula.compute(0.2, 0.0, 0.0, 0.0, 0.6).unwrap();
+        assert!((nbr_burned - (-0.4 / 0.8)).abs() < 1e-12);
+
+        // 3. Zero denominator
+        assert_eq!(formula.compute(0.0, 0.0, 0.0, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn test_spectral_formula_evi_computation_and_edge_cases() {
+        let formula = SpectralFormula::Evi {
+            nir_band: 4,
+            red_band: 3,
+            blue_band: 1,
+        };
+
+        // 1. Standard EVI calculation: 2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1)
+        // NIR = 0.5, Red = 0.1, Blue = 0.05
+        // denom = 0.5 + 0.6 - 0.375 + 1.0 = 1.725
+        // numerator = 2.5 * 0.4 = 1.0
+        // expected = 1.0 / 1.725
+        let evi = formula.compute(0.5, 0.1, 0.0, 0.05, 0.0).unwrap();
+        let expected = 1.0 / 1.725;
+        assert!((evi - expected).abs() < 1e-12);
+
+        // 2. Zero denominator singularity protection
+        // E.g., denom = NIR + 6*Red - 7.5*Blue + 1.0 = 0
+        // NIR = -1.0, Red = 0.0, Blue = 0.0 -> denom = -1 + 1 = 0
+        assert_eq!(formula.compute(-1.0, 0.0, 0.0, 0.0, 0.0), None);
     }
 }

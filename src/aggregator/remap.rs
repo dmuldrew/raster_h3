@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use fxhash::FxHashMap;
 use crate::error::{RasterH3Error, Result};
+use fxhash::FxHashMap;
+use std::sync::Arc;
 
 /// Action to take for categories not explicitly matched by any remapping rule
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,11 @@ impl CategoryRemapper {
                     }
                 }
                 RemapRule::Range(start, end, target) => {
-                    let (s, e) = if start <= end { (start, end) } else { (end, start) };
+                    let (s, e) = if start <= end {
+                        (start, end)
+                    } else {
+                        (end, start)
+                    };
                     range_rules.push((s, e, target));
                     if !has_values {
                         min_val = s;
@@ -246,10 +250,7 @@ fn clean_token(s: &str) -> String {
 
 fn parse_target(s: &str) -> Result<Option<i64>> {
     let lower = s.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "null" | "none" | "nodata" | "drop" | "skip"
-    ) {
+    if matches!(lower.as_str(), "null" | "none" | "nodata" | "drop" | "skip") {
         return Ok(None);
     }
     s.parse::<i64>().map(Some).map_err(|_| {

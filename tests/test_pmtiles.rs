@@ -1,10 +1,17 @@
-use std::fs::File;
-use std::io::Read;
+//! Tests PMTiles v3 archive generation and Mapbox Vector Tile (MVT) encoding.
+//!
+//! Validates Hilbert curve tile ID addressing, directory structures, MVT protobuf serialization,
+//! selective property filtering, parent zoom aggregation, and GeoTIFF/Parquet-to-PMTiles pipelines.
+
 use flate2::read::GzDecoder;
 use raster_h3::aggregator::multi_horizon::MultiResolutionConfig;
-use raster_h3::pmtiles::mvt::{FeatureProperties, MercatorPoint, MvtLayer, MvtValue, PropertyFilter};
+use raster_h3::pmtiles::mvt::{
+    FeatureProperties, MercatorPoint, MvtLayer, MvtValue, PropertyFilter,
+};
 use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3::pmtiles::writer::{zxy_to_tile_id, PmtilesWriter};
+use std::fs::File;
+use std::io::Read;
 use tempfile::NamedTempFile;
 
 #[path = "helpers.rs"]
@@ -21,7 +28,10 @@ fn test_mvt_protobuf_encoding() {
 
     let properties = vec![
         ("h3_index".into(), MvtValue::UInt(cell.into())),
-        ("h3_hex".into(), MvtValue::String("8728308281fffff".to_string())),
+        (
+            "h3_hex".into(),
+            MvtValue::String("8728308281fffff".to_string()),
+        ),
         ("mean".into(), MvtValue::Double(123.45)),
         ("count".into(), MvtValue::Double(42.0)),
     ];
@@ -38,7 +48,10 @@ fn test_mvt_protobuf_encoding() {
 
     let mvt_bytes = layer.encode();
     assert!(!mvt_bytes.is_empty(), "Encoded MVT bytes must not be empty");
-    assert!(mvt_bytes.len() > 20, "MVT bytes should contain layer headers and features");
+    assert!(
+        mvt_bytes.len() > 20,
+        "MVT bytes should contain layer headers and features"
+    );
 }
 
 #[test]
@@ -62,7 +75,11 @@ fn test_pmtiles_v3_header_and_archive_validation() {
     file.read_exact(&mut header).unwrap();
 
     // 1. Magic bytes
-    assert_eq!(&header[0..7], b"PMTiles", "Header must start with PMTiles magic bytes");
+    assert_eq!(
+        &header[0..7],
+        b"PMTiles",
+        "Header must start with PMTiles magic bytes"
+    );
     // 2. Version 3
     assert_eq!(header[7], 3, "PMTiles version must be 3");
 
@@ -75,24 +92,37 @@ fn test_pmtiles_v3_header_and_archive_validation() {
     let tile_data_len = u64::from_le_bytes(header[64..72].try_into().unwrap());
     let addressed_tiles = u64::from_le_bytes(header[72..80].try_into().unwrap());
 
-    assert_eq!(root_dir_offset, 127, "Root directory must start immediately after header");
+    assert_eq!(
+        root_dir_offset, 127,
+        "Root directory must start immediately after header"
+    );
     assert!(root_dir_len > 0, "Root directory length must be positive");
     assert_eq!(json_metadata_offset, root_dir_offset + root_dir_len);
-    assert!(json_metadata_len > 0, "JSON metadata length must be positive");
+    assert!(
+        json_metadata_len > 0,
+        "JSON metadata length must be positive"
+    );
     assert_eq!(tile_data_offset, json_metadata_offset + json_metadata_len);
     assert!(tile_data_len > 0, "Tile data length must be positive");
-    assert_eq!(addressed_tiles, 2, "Should contain exactly 2 addressed tiles");
+    assert_eq!(
+        addressed_tiles, 2,
+        "Should contain exactly 2 addressed tiles"
+    );
 
     // 4. Validate JSON metadata decompression
     let mut full_file = Vec::new();
     let mut file_read = File::open(&pmtiles_path).unwrap();
     file_read.read_to_end(&mut full_file).unwrap();
 
-    let meta_slice = &full_file[(json_metadata_offset as usize)..((json_metadata_offset + json_metadata_len) as usize)];
+    let meta_slice = &full_file
+        [(json_metadata_offset as usize)..((json_metadata_offset + json_metadata_len) as usize)];
     let mut gz = GzDecoder::new(meta_slice);
     let mut decompressed_json = String::new();
     gz.read_to_string(&mut decompressed_json).unwrap();
-    assert!(decompressed_json.contains("h3_hexagons"), "Metadata must contain vector layer definition");
+    assert!(
+        decompressed_json.contains("h3_hexagons"),
+        "Metadata must contain vector layer definition"
+    );
 }
 
 #[test]
@@ -105,18 +135,21 @@ fn test_geotiff_to_pmtiles_end_to_end() {
     let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
 
     let config = MultiResolutionConfig::new(vec![7, 8]);
-    let total_hexagons = H3PmtilesTiler::process_geotiff_to_pmtiles(
-        &tiff_path,
-        &pmtiles_path,
-        config,
-    ).unwrap();
+    let total_hexagons =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_path, config).unwrap();
 
-    assert!(total_hexagons > 0, "Should have generated H3 hexagons across resolutions 7 and 8");
+    assert!(
+        total_hexagons > 0,
+        "Should have generated H3 hexagons across resolutions 7 and 8"
+    );
 
     // Verify PMTiles file size and header
     let file = File::open(&pmtiles_path).unwrap();
     let metadata = file.metadata().unwrap();
-    assert!(metadata.len() > 127, "PMTiles file must be larger than the 127-byte header");
+    assert!(
+        metadata.len() > 127,
+        "PMTiles file must be larger than the 127-byte header"
+    );
 
     let mut header = [0u8; 127];
     let mut f = File::open(&pmtiles_path).unwrap();
@@ -150,8 +183,8 @@ fn test_hilbert_zxy_tile_id_ordering() {
 
 #[test]
 fn test_export_generic_h3_features_with_validation() {
-    use raster_h3::pmtiles::tiler::H3Feature;
     use raster_h3::pmtiles::mvt::MvtValue;
+    use raster_h3::pmtiles::tiler::H3Feature;
 
     let pmtiles_tmp = NamedTempFile::new().unwrap();
     let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
@@ -162,20 +195,34 @@ fn test_export_generic_h3_features_with_validation() {
     let invalid_cell_2 = 0xFFFFFFFFFFFFFFFFu64;
 
     let features = vec![
-        H3Feature::new(valid_cell_1, vec![
-            ("population".to_string(), MvtValue::Double(1420.0)),
-            ("category".to_string(), MvtValue::String("Urban".to_string())),
-        ]),
-        H3Feature::new(invalid_cell_1, vec![
-            ("population".to_string(), MvtValue::Double(0.0)),
-        ]),
-        H3Feature::new(valid_cell_2, vec![
-            ("population".to_string(), MvtValue::Double(980.0)),
-            ("category".to_string(), MvtValue::String("Suburban".to_string())),
-        ]),
-        H3Feature::new(invalid_cell_2, vec![
-            ("population".to_string(), MvtValue::Double(12.0)),
-        ]),
+        H3Feature::new(
+            valid_cell_1,
+            vec![
+                ("population".to_string(), MvtValue::Double(1420.0)),
+                (
+                    "category".to_string(),
+                    MvtValue::String("Urban".to_string()),
+                ),
+            ],
+        ),
+        H3Feature::new(
+            invalid_cell_1,
+            vec![("population".to_string(), MvtValue::Double(0.0))],
+        ),
+        H3Feature::new(
+            valid_cell_2,
+            vec![
+                ("population".to_string(), MvtValue::Double(980.0)),
+                (
+                    "category".to_string(),
+                    MvtValue::String("Suburban".to_string()),
+                ),
+            ],
+        ),
+        H3Feature::new(
+            invalid_cell_2,
+            vec![("population".to_string(), MvtValue::Double(12.0))],
+        ),
     ];
 
     let summary = H3PmtilesTiler::export_h3_features(features, &pmtiles_path).unwrap();
@@ -200,7 +247,12 @@ fn test_h3_res_to_zoom_monotonicity_all_levels() {
     let mut prev_zoom = 0u8;
     for res in 0..=15 {
         let zoom = h3_res_to_zoom(res);
-        assert!(zoom >= prev_zoom, "Zoom must be monotonically non-decreasing with H3 resolution (res: {}, zoom: {})", res, zoom);
+        assert!(
+            zoom >= prev_zoom,
+            "Zoom must be monotonically non-decreasing with H3 resolution (res: {}, zoom: {})",
+            res,
+            zoom
+        );
         prev_zoom = zoom;
     }
 
@@ -212,9 +264,9 @@ fn test_h3_res_to_zoom_monotonicity_all_levels() {
 
 #[test]
 fn test_parquet_to_pmtiles_end_to_end() {
-    use parquet::schema::parser::parse_message_type;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
     use std::sync::Arc;
 
     let parquet_tmp = NamedTempFile::new().unwrap();
@@ -235,19 +287,28 @@ fn test_parquet_to_pmtiles_end_to_end() {
 
     // Write column 0 (h3_index)
     let mut col_writer = row_group.next_column().unwrap().unwrap();
-    col_writer.typed::<parquet::data_type::Int64Type>().write_batch(&[0x8828308281fffff, 0x8828308283fffff], None, None).unwrap();
+    col_writer
+        .typed::<parquet::data_type::Int64Type>()
+        .write_batch(&[0x8828308281fffff, 0x8828308283fffff], None, None)
+        .unwrap();
     col_writer.close().unwrap();
 
     // Write column 1 (population)
     let mut col_writer = row_group.next_column().unwrap().unwrap();
-    col_writer.typed::<parquet::data_type::DoubleType>().write_batch(&[850000.0, 120000.0], None, None).unwrap();
+    col_writer
+        .typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[850000.0, 120000.0], None, None)
+        .unwrap();
     col_writer.close().unwrap();
 
     // Write column 2 (city)
     let mut col_writer = row_group.next_column().unwrap().unwrap();
     let val1 = parquet::data_type::ByteArray::from("San Francisco");
     let val2 = parquet::data_type::ByteArray::from("Oakland");
-    col_writer.typed::<parquet::data_type::ByteArrayType>().write_batch(&[val1, val2], None, None).unwrap();
+    col_writer
+        .typed::<parquet::data_type::ByteArrayType>()
+        .write_batch(&[val1, val2], None, None)
+        .unwrap();
     col_writer.close().unwrap();
 
     row_group.close().unwrap();
@@ -257,7 +318,8 @@ fn test_parquet_to_pmtiles_end_to_end() {
     let pmtiles_tmp = NamedTempFile::new().unwrap();
     let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
 
-    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
+    let summary =
+        H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
     assert_eq!(summary.total_features, 2);
     assert_eq!(summary.valid_features, 2);
     assert_eq!(summary.invalid_features_dropped, 0);
@@ -273,9 +335,9 @@ fn test_parquet_to_pmtiles_end_to_end() {
 
 #[test]
 fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
-    use parquet::schema::parser::parse_message_type;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
     use std::sync::Arc;
 
     let parquet_tmp = NamedTempFile::new().unwrap();
@@ -297,12 +359,18 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
     let mut col_writer = row_group.next_column().unwrap().unwrap();
     let val1 = parquet::data_type::ByteArray::from("8828308281fffff");
     let val2 = parquet::data_type::ByteArray::from("8828308283fffff");
-    col_writer.typed::<parquet::data_type::ByteArrayType>().write_batch(&[val1, val2], None, None).unwrap();
+    col_writer
+        .typed::<parquet::data_type::ByteArrayType>()
+        .write_batch(&[val1, val2], None, None)
+        .unwrap();
     col_writer.close().unwrap();
 
     // Write column 1 (metric)
     let mut col_writer = row_group.next_column().unwrap().unwrap();
-    col_writer.typed::<parquet::data_type::DoubleType>().write_batch(&[99.5, 42.1], None, None).unwrap();
+    col_writer
+        .typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[99.5, 42.1], None, None)
+        .unwrap();
     col_writer.close().unwrap();
 
     row_group.close().unwrap();
@@ -311,7 +379,12 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
     let pmtiles_tmp = NamedTempFile::new().unwrap();
     let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
 
-    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, Some("custom_hex_id")).unwrap();
+    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(
+        &parquet_path,
+        &pmtiles_path,
+        Some("custom_hex_id"),
+    )
+    .unwrap();
     assert_eq!(summary.total_features, 2);
     assert_eq!(summary.valid_features, 2);
     assert_eq!(summary.invalid_features_dropped, 0);
@@ -320,11 +393,11 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
 
 #[test]
 fn test_parquet_to_pmtiles_multi_row_group_eviction() {
-    use parquet::schema::parser::parse_message_type;
+    use h3o::{LatLng, Resolution};
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
     use std::sync::Arc;
-    use h3o::{LatLng, Resolution};
 
     let parquet_tmp = NamedTempFile::new().unwrap();
     let parquet_path = parquet_tmp.path().to_str().unwrap().to_string();
@@ -341,35 +414,53 @@ fn test_parquet_to_pmtiles_multi_row_group_eviction() {
     let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
 
     // RG 0: Los Angeles (South, lat ~34.0)
-    let la_cell = LatLng::new(34.0522, -118.2437).unwrap().to_cell(Resolution::Eight);
+    let la_cell = LatLng::new(34.0522, -118.2437)
+        .unwrap()
+        .to_cell(Resolution::Eight);
     let mut rg0 = writer.next_row_group().unwrap();
     let mut c0 = rg0.next_column().unwrap().unwrap();
-    c0.typed::<parquet::data_type::Int64Type>().write_batch(&[u64::from(la_cell) as i64], None, None).unwrap();
+    c0.typed::<parquet::data_type::Int64Type>()
+        .write_batch(&[u64::from(la_cell) as i64], None, None)
+        .unwrap();
     c0.close().unwrap();
     let mut c1 = rg0.next_column().unwrap().unwrap();
-    c1.typed::<parquet::data_type::DoubleType>().write_batch(&[10.0], None, None).unwrap();
+    c1.typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[10.0], None, None)
+        .unwrap();
     c1.close().unwrap();
     rg0.close().unwrap();
 
     // RG 1: Seattle (North, lat ~47.6)
-    let sea_cell = LatLng::new(47.6062, -122.3321).unwrap().to_cell(Resolution::Eight);
+    let sea_cell = LatLng::new(47.6062, -122.3321)
+        .unwrap()
+        .to_cell(Resolution::Eight);
     let mut rg1 = writer.next_row_group().unwrap();
     let mut c0 = rg1.next_column().unwrap().unwrap();
-    c0.typed::<parquet::data_type::Int64Type>().write_batch(&[u64::from(sea_cell) as i64], None, None).unwrap();
+    c0.typed::<parquet::data_type::Int64Type>()
+        .write_batch(&[u64::from(sea_cell) as i64], None, None)
+        .unwrap();
     c0.close().unwrap();
     let mut c1 = rg1.next_column().unwrap().unwrap();
-    c1.typed::<parquet::data_type::DoubleType>().write_batch(&[20.0], None, None).unwrap();
+    c1.typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[20.0], None, None)
+        .unwrap();
     c1.close().unwrap();
     rg1.close().unwrap();
 
     // RG 2: San Francisco (Mid, lat ~37.7)
-    let sf_cell = LatLng::new(37.7749, -122.4194).unwrap().to_cell(Resolution::Eight);
+    let sf_cell = LatLng::new(37.7749, -122.4194)
+        .unwrap()
+        .to_cell(Resolution::Eight);
     let mut rg2 = writer.next_row_group().unwrap();
     let mut c0 = rg2.next_column().unwrap().unwrap();
-    c0.typed::<parquet::data_type::Int64Type>().write_batch(&[u64::from(sf_cell) as i64], None, None).unwrap();
+    c0.typed::<parquet::data_type::Int64Type>()
+        .write_batch(&[u64::from(sf_cell) as i64], None, None)
+        .unwrap();
     c0.close().unwrap();
     let mut c1 = rg2.next_column().unwrap().unwrap();
-    c1.typed::<parquet::data_type::DoubleType>().write_batch(&[30.0], None, None).unwrap();
+    c1.typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[30.0], None, None)
+        .unwrap();
     c1.close().unwrap();
     rg2.close().unwrap();
 
@@ -378,7 +469,8 @@ fn test_parquet_to_pmtiles_multi_row_group_eviction() {
     let pmtiles_tmp = NamedTempFile::new().unwrap();
     let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
 
-    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
+    let summary =
+        H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
     assert_eq!(summary.total_features, 3);
     assert_eq!(summary.valid_features, 3);
     assert_eq!(summary.invalid_features_dropped, 0);
@@ -425,11 +517,8 @@ fn test_pmtiles_coarse_zoom_parent_aggregation_content() {
 
     // Export fine resolutions 7 and 8
     let config = MultiResolutionConfig::new(vec![7, 8]);
-    let total_hexagons = H3PmtilesTiler::process_geotiff_to_pmtiles(
-        &tiff_path,
-        &pmtiles_path,
-        config,
-    ).unwrap();
+    let total_hexagons =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_path, config).unwrap();
 
     assert!(total_hexagons > 0);
 
@@ -442,12 +531,21 @@ fn test_pmtiles_coarse_zoom_parent_aggregation_content() {
     assert_eq!(header[7], 3);
 
     let addressed_tiles = u64::from_le_bytes(header[72..80].try_into().unwrap());
-    assert!(addressed_tiles > 0, "Archive should contain multiple pyramid zoom tiles");
+    assert!(
+        addressed_tiles > 0,
+        "Archive should contain multiple pyramid zoom tiles"
+    );
 
     let min_zoom = header[100];
     let max_zoom = header[101];
-    assert_eq!(min_zoom, 0, "Min zoom should cover coarse zooms starting at 0");
-    assert!(max_zoom >= 13, "Max zoom should reach fine resolution zoom >= 13");
+    assert_eq!(
+        min_zoom, 0,
+        "Min zoom should cover coarse zooms starting at 0"
+    );
+    assert!(
+        max_zoom >= 13,
+        "Max zoom should reach fine resolution zoom >= 13"
+    );
 }
 
 #[test]
@@ -470,11 +568,16 @@ fn test_all_nodata_geotiff_to_pmtiles_export() {
         let file = File::create(&tiff_path).unwrap();
         let writer = BufWriter::new(file);
         let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32).unwrap();
+        let mut image = encoder
+            .new_image::<Gray32Float>(width as u32, height as u32)
+            .unwrap();
 
         image
             .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..])
+            .write_tag(
+                Tag::Unknown(33922),
+                &[-0.0f64, 0.0, 0.0, -122.50, 37.80, 0.0][..],
+            )
             .unwrap();
         image
             .encoder()
@@ -485,12 +588,11 @@ fn test_all_nodata_geotiff_to_pmtiles_export() {
             .write_tag(Tag::Unknown(42113), "-9999")
             .unwrap();
 
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+        let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &geokeys[..])
+            .unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -498,11 +600,8 @@ fn test_all_nodata_geotiff_to_pmtiles_export() {
     let pmtiles_path = pmtiles_tmp.path().to_str().unwrap().to_string();
 
     let config = MultiResolutionConfig::new(vec![7, 8]);
-    let total_hexagons = H3PmtilesTiler::process_geotiff_to_pmtiles(
-        &tiff_path,
-        &pmtiles_path,
-        config,
-    ).unwrap();
+    let total_hexagons =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_path, config).unwrap();
 
     // Should complete cleanly with 0 hexagons emitted
     assert_eq!(total_hexagons, 0);
@@ -520,7 +619,7 @@ fn test_all_nodata_geotiff_to_pmtiles_export() {
 
 #[test]
 fn test_hilbert_zxy_tile_id_bijective_roundtrip() {
-    use raster_h3::pmtiles::writer::{zxy_to_tile_id, tile_id_to_zxy};
+    use raster_h3::pmtiles::writer::{tile_id_to_zxy, zxy_to_tile_id};
 
     // 1. Base case: Zoom 0 root tile
     assert_eq!(zxy_to_tile_id(0, 0, 0), 0);
@@ -543,7 +642,18 @@ fn test_hilbert_zxy_tile_id_bijective_roundtrip() {
             if x < max_coord && y < max_coord {
                 let tile_id = zxy_to_tile_id(z, x, y);
                 let (dec_z, dec_x, dec_y) = tile_id_to_zxy(tile_id);
-                assert_eq!((dec_z, dec_x, dec_y), (z, x, y), "Hilbert mapping failed round-trip for ({}, {}, {}) -> ID {} -> ({}, {}, {})", z, x, y, tile_id, dec_z, dec_x, dec_y);
+                assert_eq!(
+                    (dec_z, dec_x, dec_y),
+                    (z, x, y),
+                    "Hilbert mapping failed round-trip for ({}, {}, {}) -> ID {} -> ({}, {}, {})",
+                    z,
+                    x,
+                    y,
+                    tile_id,
+                    dec_z,
+                    dec_x,
+                    dec_y
+                );
             }
         }
     }
@@ -551,7 +661,10 @@ fn test_hilbert_zxy_tile_id_bijective_roundtrip() {
     // 3. Monotonicity: Tile IDs for zoom level Z are strictly less than Tile IDs for zoom level Z+1
     let max_id_z4 = zxy_to_tile_id(4, 15, 15);
     let min_id_z5 = zxy_to_tile_id(5, 0, 0);
-    assert!(max_id_z4 < min_id_z5, "Hilbert IDs across zoom levels must be strictly monotonic");
+    assert!(
+        max_id_z4 < min_id_z5,
+        "Hilbert IDs across zoom levels must be strictly monotonic"
+    );
 }
 
 #[test]
@@ -589,7 +702,10 @@ fn test_property_filter_and_mvt_encoding() {
     let mvt_str = String::from_utf8_lossy(&mvt_bytes);
     assert!(mvt_str.contains("mean"), "Should contain key 'mean'");
     assert!(mvt_str.contains("count"), "Should contain key 'count'");
-    assert!(!mvt_str.contains("stddev"), "Should NOT contain key 'stddev'");
+    assert!(
+        !mvt_str.contains("stddev"),
+        "Should NOT contain key 'stddev'"
+    );
     assert!(!mvt_str.contains("sum"), "Should NOT contain key 'sum'");
     assert!(!mvt_str.contains("min"), "Should NOT contain key 'min'");
     assert!(!mvt_str.contains("max"), "Should NOT contain key 'max'");
@@ -605,19 +721,36 @@ fn test_geotiff_to_pmtiles_selective_properties() {
     let pmtiles_all_tmp = NamedTempFile::new().unwrap();
     let pmtiles_all_path = pmtiles_all_tmp.path().to_str().unwrap().to_string();
     let config_all = MultiResolutionConfig::new(vec![7, 8]);
-    let hex_all = H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_all_path, config_all).unwrap();
-    let size_all = File::open(&pmtiles_all_path).unwrap().metadata().unwrap().len();
+    let hex_all =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_all_path, config_all)
+            .unwrap();
+    let size_all = File::open(&pmtiles_all_path)
+        .unwrap()
+        .metadata()
+        .unwrap()
+        .len();
 
     // 2. Generate selective archive with only "mean,count"
     let pmtiles_sel_tmp = NamedTempFile::new().unwrap();
     let pmtiles_sel_path = pmtiles_sel_tmp.path().to_str().unwrap().to_string();
     let mut config_sel = MultiResolutionConfig::new(vec![7, 8]);
     config_sel.properties = Some("mean,count".to_string());
-    let hex_sel = H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_sel_path, config_sel).unwrap();
-    let size_sel = File::open(&pmtiles_sel_path).unwrap().metadata().unwrap().len();
+    let hex_sel =
+        H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_sel_path, config_sel)
+            .unwrap();
+    let size_sel = File::open(&pmtiles_sel_path)
+        .unwrap()
+        .metadata()
+        .unwrap()
+        .len();
 
     assert_eq!(hex_all, hex_sel, "Hexagon count should be identical");
-    assert!(size_sel < size_all, "Selective properties archive ({}) should be smaller than full archive ({})", size_sel, size_all);
+    assert!(
+        size_sel < size_all,
+        "Selective properties archive ({}) should be smaller than full archive ({})",
+        size_sel,
+        size_all
+    );
 
     // Read and validate JSON metadata fields in selective archive
     let mut f = File::open(&pmtiles_sel_path).unwrap();
@@ -629,20 +762,42 @@ fn test_geotiff_to_pmtiles_selective_properties() {
     let mut full_file = Vec::new();
     let mut file_read = File::open(&pmtiles_sel_path).unwrap();
     file_read.read_to_end(&mut full_file).unwrap();
-    let meta_slice = &full_file[(json_metadata_offset as usize)..((json_metadata_offset + json_metadata_len) as usize)];
+    let meta_slice = &full_file
+        [(json_metadata_offset as usize)..((json_metadata_offset + json_metadata_len) as usize)];
     let mut gz = GzDecoder::new(meta_slice);
     let mut decompressed_json = String::new();
     gz.read_to_string(&mut decompressed_json).unwrap();
 
     let v: serde_json::Value = serde_json::from_str(&decompressed_json).unwrap();
     let fields = &v["vector_layers"][0]["fields"];
-    assert!(fields.get("mean").is_some(), "Metadata fields must contain 'mean'");
-    assert!(fields.get("count").is_some(), "Metadata fields must contain 'count'");
-    assert!(fields.get("stddev").is_none(), "Metadata fields must NOT contain 'stddev'");
-    assert!(fields.get("sum").is_none(), "Metadata fields must NOT contain 'sum'");
-    assert!(fields.get("min").is_none(), "Metadata fields must NOT contain 'min'");
-    assert!(fields.get("max").is_none(), "Metadata fields must NOT contain 'max'");
-    assert!(fields.get("h3_hex").is_none(), "Metadata fields must NOT contain 'h3_hex'");
+    assert!(
+        fields.get("mean").is_some(),
+        "Metadata fields must contain 'mean'"
+    );
+    assert!(
+        fields.get("count").is_some(),
+        "Metadata fields must contain 'count'"
+    );
+    assert!(
+        fields.get("stddev").is_none(),
+        "Metadata fields must NOT contain 'stddev'"
+    );
+    assert!(
+        fields.get("sum").is_none(),
+        "Metadata fields must NOT contain 'sum'"
+    );
+    assert!(
+        fields.get("min").is_none(),
+        "Metadata fields must NOT contain 'min'"
+    );
+    assert!(
+        fields.get("max").is_none(),
+        "Metadata fields must NOT contain 'max'"
+    );
+    assert!(
+        fields.get("h3_hex").is_none(),
+        "Metadata fields must NOT contain 'h3_hex'"
+    );
 }
 
 #[test]

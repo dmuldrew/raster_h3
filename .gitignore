@@ -17,4 +17,6 @@ target/
 #.idea/
 
 data/
+dist/
+*.duckdb_extension
 .DS_Store

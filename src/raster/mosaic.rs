@@ -25,6 +25,14 @@ pub enum OverlapRule {
 }
 
 impl OverlapRule {
+    /// Parse an overlap resolution strategy from a string slice.
+    ///
+    /// Supported string values (case-insensitive):
+    /// - `"cutline"`, `"voronoi"`, `"nearest"` -> [`OverlapRule::Cutline`]
+    /// - `"first"`, `"priority"`, `"painter"` -> [`OverlapRule::First`]
+    /// - `"average"`, `"mean"`, `"all"`, `"multi_temporal"` -> [`OverlapRule::Average`]
+    ///
+    /// Any unrecognized value defaults to [`OverlapRule::Cutline`].
     pub fn parse(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "cutline" | "voronoi" | "nearest" => Self::Cutline,
@@ -174,9 +182,18 @@ pub fn resolve_raster_sources(input: &str) -> Result<Vec<PathBuf>> {
 
         let (base_dir, file_pattern) = if let Some(parent) = path_obj.parent() {
             if parent.as_os_str().is_empty() {
-                (Path::new("."), path_obj.file_name().and_then(|f| f.to_str()).unwrap_or(trimmed))
+                (
+                    Path::new("."),
+                    path_obj
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or(trimmed),
+                )
             } else {
-                (parent, path_obj.file_name().and_then(|f| f.to_str()).unwrap_or("*"))
+                (
+                    parent,
+                    path_obj.file_name().and_then(|f| f.to_str()).unwrap_or("*"),
+                )
             }
         } else {
             (Path::new("."), trimmed)
@@ -207,11 +224,17 @@ pub fn resolve_raster_sources(input: &str) -> Result<Vec<PathBuf>> {
 /// Metadata and spatial bounds for a single tile in a mosaic
 #[derive(Clone)]
 pub struct TileDescriptor {
+    /// 0-based index of this tile in the mosaic's tile array.
     pub tile_idx: usize,
+    /// Path or remote URL to the GeoTIFF file.
     pub file_path: PathBuf,
+    /// Streaming GeoTIFF reader for this tile.
     pub reader: GeoTiffStreamReader,
-    pub bounds_wgs84: [f64; 4], // [min_lon, min_lat, max_lon, max_lat]
-    pub centroid_wgs84: (f64, f64), // (lon, lat)
+    /// Spatial bounding box in WGS 84 coordinates: `[min_lon, min_lat, max_lon, max_lat]`.
+    pub bounds_wgs84: [f64; 4],
+    /// Geographic centroid in WGS 84 coordinates: `(lon, lat)`.
+    pub centroid_wgs84: (f64, f64),
+    /// CRS transformer for projecting raster coordinates to WGS 84.
     pub crs_transformer: CrsTransformer,
 }
 
@@ -221,10 +244,28 @@ impl TileDescriptor {
         reader: GeoTiffStreamReader,
         custom_crs: Option<&str>,
     ) -> Result<Self> {
-        let crs_transformer = CrsTransformer::from_crs_or_epsg(
-            reader.metadata.epsg,
-            custom_crs.or(reader.metadata.proj_string.as_deref()),
-        )?;
+        let (epsg_to_use, proj_to_use) = if let Some(custom) = custom_crs {
+            (None, Some(custom))
+        } else {
+            (reader.metadata.epsg, reader.metadata.proj_string.as_deref())
+        };
+
+        let crs_transformer =
+            CrsTransformer::from_crs_or_epsg(epsg_to_use, proj_to_use).map_err(|e| match e {
+                RasterH3Error::CrsNotDetected(msg) => RasterH3Error::CrsNotDetected(format!(
+                    "Tile {} ({:?}): {}",
+                    tile_idx, reader.file_path, msg
+                )),
+                RasterH3Error::CrsError(msg) => RasterH3Error::CrsError(format!(
+                    "Tile {} ({:?}): {}",
+                    tile_idx, reader.file_path, msg
+                )),
+                RasterH3Error::UnsupportedEpsg { code, detail } => RasterH3Error::UnsupportedEpsg {
+                    code,
+                    detail: format!("Tile {} ({:?}): {}", tile_idx, reader.file_path, detail),
+                },
+                other => other,
+            })?;
 
         let w = reader.metadata.width as f64;
         let h = reader.metadata.height as f64;
@@ -267,19 +308,29 @@ impl TileDescriptor {
 /// Global chunk reference across all tiles in a mosaic, sorted by latitude
 #[derive(Debug, Clone, Copy)]
 pub struct MosaicChunkRef {
+    /// Index of the parent tile within the mosaic's tile array.
     pub tile_idx: usize,
+    /// 0-based chunk index within the parent tile's chunk layout.
     pub chunk_idx: u32,
+    /// Northernmost (maximum) latitude bound of this chunk in WGS 84 coordinates.
     pub north_lat: f64,
+    /// Southernmost (minimum) latitude bound of this chunk in WGS 84 coordinates.
     pub south_lat: f64,
+    /// Whether this chunk spatially overlaps with another tile in the mosaic.
     pub has_overlap: bool,
 }
 
 /// Multi-file mosaic reader managing tile descriptors and globally interleaved chunk prefetching
 pub struct MosaicReader {
+    /// Descriptors for all constituent GeoTIFF tiles in the mosaic.
     pub tiles: Vec<TileDescriptor>,
+    /// Global spatial bounding box encompassing all tiles in WGS 84 coordinates: `[min_lon, min_lat, max_lon, max_lat]`.
     pub mosaic_bounds_wgs84: [f64; 4],
+    /// Strategy used to resolve pixel ownership in overlapping tile regions.
     pub overlap_rule: OverlapRule,
+    /// Globally interleaved chunk references across all tiles, sorted North-to-South by latitude.
     pub chunk_refs: Vec<MosaicChunkRef>,
+    /// Maximum number of samples (bands) per pixel across all tiles in the mosaic.
     pub max_samples_per_pixel: u16,
 }
 
@@ -315,10 +366,22 @@ impl MosaicReader {
             }
 
             let corners = [
-                gt.pixel_to_coord(chunk_bounds.col_offset as f64, chunk_bounds.row_offset as f64),
-                gt.pixel_to_coord((chunk_bounds.col_offset + chunk_bounds.width) as f64, chunk_bounds.row_offset as f64),
-                gt.pixel_to_coord((chunk_bounds.col_offset + chunk_bounds.width) as f64, (chunk_bounds.row_offset + chunk_bounds.height) as f64),
-                gt.pixel_to_coord(chunk_bounds.col_offset as f64, (chunk_bounds.row_offset + chunk_bounds.height) as f64),
+                gt.pixel_to_coord(
+                    chunk_bounds.col_offset as f64,
+                    chunk_bounds.row_offset as f64,
+                ),
+                gt.pixel_to_coord(
+                    (chunk_bounds.col_offset + chunk_bounds.width) as f64,
+                    chunk_bounds.row_offset as f64,
+                ),
+                gt.pixel_to_coord(
+                    (chunk_bounds.col_offset + chunk_bounds.width) as f64,
+                    (chunk_bounds.row_offset + chunk_bounds.height) as f64,
+                ),
+                gt.pixel_to_coord(
+                    chunk_bounds.col_offset as f64,
+                    (chunk_bounds.row_offset + chunk_bounds.height) as f64,
+                ),
             ];
 
             let mut north_lat = f64::NEG_INFINITY;
@@ -429,10 +492,22 @@ impl MosaicReader {
                 }
 
                 let corners = [
-                    gt.pixel_to_coord(chunk_bounds.col_offset as f64, chunk_bounds.row_offset as f64),
-                    gt.pixel_to_coord((chunk_bounds.col_offset + chunk_bounds.width) as f64, chunk_bounds.row_offset as f64),
-                    gt.pixel_to_coord((chunk_bounds.col_offset + chunk_bounds.width) as f64, (chunk_bounds.row_offset + chunk_bounds.height) as f64),
-                    gt.pixel_to_coord(chunk_bounds.col_offset as f64, (chunk_bounds.row_offset + chunk_bounds.height) as f64),
+                    gt.pixel_to_coord(
+                        chunk_bounds.col_offset as f64,
+                        chunk_bounds.row_offset as f64,
+                    ),
+                    gt.pixel_to_coord(
+                        (chunk_bounds.col_offset + chunk_bounds.width) as f64,
+                        chunk_bounds.row_offset as f64,
+                    ),
+                    gt.pixel_to_coord(
+                        (chunk_bounds.col_offset + chunk_bounds.width) as f64,
+                        (chunk_bounds.row_offset + chunk_bounds.height) as f64,
+                    ),
+                    gt.pixel_to_coord(
+                        chunk_bounds.col_offset as f64,
+                        (chunk_bounds.row_offset + chunk_bounds.height) as f64,
+                    ),
                 ];
 
                 let mut c_min_lon = f64::INFINITY;
@@ -463,7 +538,11 @@ impl MosaicReader {
                             continue;
                         }
                         let ob = &other_tile.bounds_wgs84;
-                        if !(c_max_lon < ob[0] || c_min_lon > ob[2] || c_max_lat < ob[1] || c_min_lat > ob[3]) {
+                        if !(c_max_lon < ob[0]
+                            || c_min_lon > ob[2]
+                            || c_max_lat < ob[1]
+                            || c_min_lat > ob[3])
+                        {
                             has_overlap = true;
                             break;
                         }

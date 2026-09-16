@@ -1,10 +1,16 @@
 [package]
 name = "raster_h3"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["raster_h3 contributors"]
 description = "High-performance DuckDB extension in Rust to aggregate raster pixels to H3 hexagonal indices"
 license = "MIT"
+repository = "https://github.com/dmuldrew/raster_h3_hexification"
+homepage = "https://github.com/dmuldrew/raster_h3_hexification"
+readme = "README.md"
+keywords = ["geospatial", "duckdb", "h3", "raster", "geotiff"]
+categories = ["science::geo", "database-implementations"]
+exclude = ["data/*", "assets/*", "pmtiles_viewer/debug/*", "tests/data/*"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -39,6 +45,8 @@ tempfile = "3.10"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"
 weezl = "0.1"
+libc = "0.2"
+crossbeam-deque = "0.8"
 
 [profile.release]
 opt-level = 3

@@ -1,7 +1,9 @@
 pub mod geotiff;
 pub mod geotransform;
 pub mod http_range;
+pub mod metadata;
 pub mod mosaic;
+pub mod predictor;
 pub mod prefetch;
 pub mod remote_prefetch;
 
@@ -10,7 +12,10 @@ pub use geotiff::{
 };
 pub use geotransform::GeoTransform;
 pub use http_range::{is_remote_url, normalize_url, HttpRangeReader, RemoteHttpSource};
-pub use mosaic::{glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor};
+pub use metadata::{extract_crs, extract_geotransform, extract_nodata, parse_wkt_or_ascii_to_proj};
+pub use mosaic::{
+    glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor,
+};
 pub use prefetch::{MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader};
 pub use remote_prefetch::{
     coalesce_chunk_ranges, ChunkLocation, CoalescedRange, RemoteChunkPrefetchQueue,

@@ -1,15 +1,25 @@
+//! Benchmarks weezl-accelerated LZW decompression versus standard TIFF decoder paths.
+//!
+//! Measures per-chunk decompression bandwidth, latency, and end-to-end multi-core streaming throughput.
+//!
+//! Run with: `cargo run --example benchmark_lzw`
+
 use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
 use tiff::decoder::{Decoder, DecodingResult};
 
-use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer, MultiCategoricalHorizonStreamer};
+use raster_h3::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 fn benchmark_file(path: &str, sample_count_limit: Option<usize>) {
     println!("\n=========================================================================================");
     println!("  Benchmarking: {}", path);
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
 
     if !Path::new(path).exists() {
         eprintln!("Error: file {} not found", path);
@@ -26,11 +36,23 @@ fn benchmark_file(path: &str, sample_count_limit: Option<usize>) {
     let uncomp_chunk_bytes = (chunk_w * chunk_h) as usize * bytes_per_sample;
     let total_uncompressed_mb = (chunks_to_test * uncomp_chunk_bytes) as f64 / (1024.0 * 1024.0);
 
-    println!("  • Grid Size      : {} x {}", reader.metadata.width, reader.metadata.height);
-    println!("  • Total Chunks   : {} (testing {} chunks)", total_chunks, chunks_to_test);
-    println!("  • Chunk Dims     : {} x {} ({} bytes uncompressed/chunk)", chunk_w, chunk_h, uncomp_chunk_bytes);
+    println!(
+        "  • Grid Size      : {} x {}",
+        reader.metadata.width, reader.metadata.height
+    );
+    println!(
+        "  • Total Chunks   : {} (testing {} chunks)",
+        total_chunks, chunks_to_test
+    );
+    println!(
+        "  • Chunk Dims     : {} x {} ({} bytes uncompressed/chunk)",
+        chunk_w, chunk_h, uncomp_chunk_bytes
+    );
     println!("  • Compression    : {:?}", chunk_info.compression);
-    println!("  • Sample Format  : {:?} ({} bits)", chunk_info.sample_format, chunk_info.bits_per_sample);
+    println!(
+        "  • Sample Format  : {:?} ({} bits)",
+        chunk_info.sample_format, chunk_info.bits_per_sample
+    );
 
     // =========================================================================
     // BENCHMARK 1: Standard tiff crate LZW decoder
@@ -56,7 +78,10 @@ fn benchmark_file(path: &str, sample_count_limit: Option<usize>) {
 
     println!("  • Total Time      : {:.2?}", dur_std);
     println!("  • Decomp Bandwidth: {:.2} MB/sec", std_bandwidth);
-    println!("  • Average Latency : {:.2} µs / chunk", std_latency_per_chunk);
+    println!(
+        "  • Average Latency : {:.2} µs / chunk",
+        std_latency_per_chunk
+    );
 
     // =========================================================================
     // BENCHMARK 2: Accelerated Zero-Allocation LZW ChunkDecoder
@@ -82,7 +107,10 @@ fn benchmark_file(path: &str, sample_count_limit: Option<usize>) {
 
     println!("  • Total Time      : {:.2?}", dur_fast);
     println!("  • Decomp Bandwidth: {:.2} MB/sec", fast_bandwidth);
-    println!("  • Average Latency : {:.2} µs / chunk", fast_latency_per_chunk);
+    println!(
+        "  • Average Latency : {:.2} µs / chunk",
+        fast_latency_per_chunk
+    );
 
     assert_eq!(std_samples, fast_samples);
     let speedup = dur_std.as_secs_f64() / dur_fast.as_secs_f64();
@@ -92,9 +120,13 @@ fn benchmark_file(path: &str, sample_count_limit: Option<usize>) {
 }
 
 fn main() {
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
     println!("       raster_h3 Benchmark: Accelerated Zero-Allocation LZW Decompression                 ");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
 
     // Benchmark both Hawaii files
     // Use 2,000 chunks for quick, highly accurate microbenchmark comparison
@@ -104,7 +136,9 @@ fn main() {
     // Full Archipelago End-to-End Streaming Aggregation
     println!("\n=========================================================================================");
     println!("  End-to-End Multi-Core Streaming Throughput with Fast LZW (All 15,840 Chunks)");
-    println!("=========================================================================================");
+    println!(
+        "========================================================================================="
+    );
 
     // Continuous CFL_HI
     let cfl_path = "data/CFL_HI.tif";
@@ -119,12 +153,16 @@ fn main() {
             cfl_hexes += 1;
             cfl_pixels += rec.accumulator.count;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_cfl = t_cfl.elapsed();
     let mpx_cfl = (cfl_pixels / 1_000_000.0) / dur_cfl.as_secs_f64();
-    println!("  • CFL_HI.tif (Continuous) : {:.2?} | {:.0} pixels | {} hexes | {:.2} Mpx/sec",
-        dur_cfl, cfl_pixels, cfl_hexes, mpx_cfl);
+    println!(
+        "  • CFL_HI.tif (Continuous) : {:.2?} | {:.0} pixels | {} hexes | {:.2} Mpx/sec",
+        dur_cfl, cfl_pixels, cfl_hexes, mpx_cfl
+    );
 
     // Categorical Landfire
     let lf_path = "data/LF2024_FBFM40_HI.tif";
@@ -138,7 +176,9 @@ fn main() {
             lf_hexes += 1;
             lf_pixels += rec.accumulator.total_count;
         });
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     let dur_lf = t_lf.elapsed();
     let mpx_lf = (256_542_384.0 / 1_000_000.0) / dur_lf.as_secs_f64();
@@ -146,6 +186,10 @@ fn main() {
         dur_lf, lf_hexes, mpx_lf);
 
     println!("\n=========================================================================================");
-    println!("                          LZW BENCHMARK COMPLETED SUCCESSFULLY                          ");
-    println!("=========================================================================================");
+    println!(
+        "                          LZW BENCHMARK COMPLETED SUCCESSFULLY                          "
+    );
+    println!(
+        "========================================================================================="
+    );
 }

@@ -1,18 +1,18 @@
+//! Tests the category remapping engine for categorical raster pipelines.
+//!
+//! Validates exact, range, list, and wildcard remapping syntax rules, NoData handling,
+//! unmapped passthrough fallbacks, and integration with categorical horizon streaming.
+
+mod helpers;
+
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufWriter;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
-use tiff::encoder::colortype::Gray8;
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
 
-use raster_h3::aggregator::remap::CategoryRemapper;
-use raster_h3::aggregator::horizon_streamer::AggregationConfig;
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig,
 };
-use raster_h3::aggregator::CategoricalHorizonStreamer;
+use raster_h3::aggregator::remap::CategoryRemapper;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 #[test]
@@ -82,55 +82,20 @@ fn test_remapper_invalid_syntax() {
 }
 
 fn create_categorical_test_raster(width: usize, height: usize) -> NamedTempFile {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    // Fill raster with:
-    // Top 25 rows: class 101, 102, 103 (Landfire Shrub)
-    // Next 25 rows: class 121, 122 (Landfire Timber)
-    // Next 25 rows: class 99 (Nodata / Water)
-    // Bottom 25 rows: class 42 (Unmapped / Agriculture)
-    let mut data = vec![0u8; width * height];
-    for r in 0..height {
-        let val = if r < 25 {
-            101 + (r % 3) as u8
-        } else if r < 50 {
-            121 + (r % 2) as u8
-        } else if r < 75 {
-            99
-        } else {
-            42
-        };
-        for c in 0..width {
-            data[r * width + c] = val;
-        }
-    }
-
-    {
-        let file = File::create(&path).unwrap();
-        let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer).unwrap();
-        let mut image = encoder.new_image::<Gray8>(width as u32, height as u32).unwrap();
-
-        // Coordinates around SF Bay Area
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..])
-            .unwrap();
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
-            .unwrap();
-
-        let geokeys: [u16; 12] = [
-            1, 1, 0, 2,
-            1024, 0, 1, 2,
-            2048, 0, 1, 4326,
-        ];
-        image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        image.write_data(&data).unwrap();
-    }
-
+    let (temp_file, _path) = helpers::TestGeoTiffBuilder::new(width as u32, height as u32)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_tempfile(|_c, r| {
+            if r < 25 {
+                101 + (r % 3) as u8
+            } else if r < 50 {
+                121 + (r % 2) as u8
+            } else if r < 75 {
+                99
+            } else {
+                42
+            }
+        });
     temp_file
 }
 
@@ -144,20 +109,13 @@ fn test_categorical_streamer_with_remapping() {
     // 121..122 -> 2 (Timber)
     // 99 -> null (Dropped)
     // 42 -> passes through unchanged
-    let remapper = Arc::new(
-        CategoryRemapper::parse("{101..103: 1, 121..122: 2, 99: null}").unwrap(),
-    );
+    let remapper =
+        Arc::new(CategoryRemapper::parse("{101..103: 1, 121..122: 2, 99: null}").unwrap());
 
-    let config = AggregationConfig {
-        resolution: 8,
-        custom_crs: None,
-        custom_nodata: None,
-        bbox: None,
-        remapper: Some(remapper),
-        ..Default::default()
-    };
+    let mut config = MultiResolutionConfig::single(8);
+    config.remapper = Some(remapper);
 
-    let mut streamer = CategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     let mut class_counts: HashMap<i64, f64> = HashMap::new();
 
@@ -166,7 +124,8 @@ fn test_categorical_streamer_with_remapping() {
         if batch.is_empty() {
             break;
         }
-        for (_cell, acc) in batch {
+        for rec in batch {
+            let acc = rec.accumulator;
             total_pixels += acc.total_count;
             acc.for_each_class(|cat, cnt| {
                 *class_counts.entry(cat).or_insert(0.0) += cnt;
@@ -205,9 +164,8 @@ fn test_multi_categorical_horizon_streamer_with_remapping() {
     // 101..103 -> 1
     // 121..122 -> 2
     // else -> null (drops 99 and 42!)
-    let remapper = Arc::new(
-        CategoryRemapper::parse("{101..103: 1, 121..122: 2, else: null}").unwrap(),
-    );
+    let remapper =
+        Arc::new(CategoryRemapper::parse("{101..103: 1, 121..122: 2, else: null}").unwrap());
 
     let mut multi_config = MultiResolutionConfig::new(vec![7, 8]);
     multi_config.remapper = Some(remapper);
@@ -222,8 +180,11 @@ fn test_multi_categorical_horizon_streamer_with_remapping() {
             break;
         }
         for rec in batch {
-            *total_pixels_by_res.entry(rec.resolution).or_insert(0.0) += rec.accumulator.total_count;
-            let class_map = counts_by_res.entry(rec.resolution).or_insert_with(HashMap::new);
+            *total_pixels_by_res.entry(rec.resolution).or_insert(0.0) +=
+                rec.accumulator.total_count;
+            let class_map = counts_by_res
+                .entry(rec.resolution)
+                .or_insert_with(HashMap::new);
             rec.accumulator.for_each_class(|cat, cnt| {
                 *class_map.entry(cat).or_insert(0.0) += cnt;
             });

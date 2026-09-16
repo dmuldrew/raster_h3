@@ -1,3 +1,8 @@
+//! Tests accelerated zero-allocation LZW decompression powered by `weezl`.
+//!
+//! Validates bitwise equivalence against the standard TIFF decoder on real-world and synthetic datasets,
+//! horizontal differencing predictors, edge padding, buffer recycling, and corrupted or truncated payloads.
+
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -24,7 +29,20 @@ fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
     let total_chunks = reader.chunk_layout.total_chunks;
     // Test a representative sample of chunks across beginning, middle, and end of the raster
     let test_indices = [
-        0, 1, 2, 50, 100, 500, 1000, 2500, 5000, 7500, 10000, 12500, 15000, total_chunks - 1,
+        0,
+        1,
+        2,
+        50,
+        100,
+        500,
+        1000,
+        2500,
+        5000,
+        7500,
+        10000,
+        12500,
+        15000,
+        total_chunks - 1,
     ];
 
     for &chunk_idx in &test_indices {
@@ -77,7 +95,20 @@ fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
 
     let total_chunks = reader.chunk_layout.total_chunks;
     let test_indices = [
-        0, 1, 2, 50, 100, 500, 1000, 2500, 5000, 7500, 10000, 12500, 15000, total_chunks - 1,
+        0,
+        1,
+        2,
+        50,
+        100,
+        500,
+        1000,
+        2500,
+        5000,
+        7500,
+        10000,
+        12500,
+        15000,
+        total_chunks - 1,
     ];
 
     for &chunk_idx in &test_indices {
@@ -176,8 +207,8 @@ fn write_synthetic_lzw_geotiff(
             for r in 0..tile_h as usize {
                 let row_start = r * tile_w as usize;
                 for col in (1..tile_w as usize).rev() {
-                    processed_u16[row_start + col] =
-                        processed_u16[row_start + col].wrapping_sub(processed_u16[row_start + col - 1]);
+                    processed_u16[row_start + col] = processed_u16[row_start + col]
+                        .wrapping_sub(processed_u16[row_start + col - 1]);
                 }
             }
         }
@@ -242,7 +273,7 @@ fn write_synthetic_lzw_geotiff(
     write_tag(&mut file, 256, 4, 1, width);
     write_tag(&mut file, 257, 4, 1, height);
     write_tag(&mut file, 258, 3, 1, 16); // BitsPerSample = 16
-    write_tag(&mut file, 259, 3, 1, 5);  // Compression = 5 (LZW)
+    write_tag(&mut file, 259, 3, 1, 5); // Compression = 5 (LZW)
     write_tag(&mut file, 262, 3, 1, 1);
     write_tag(&mut file, 277, 3, 1, 1);
     write_tag(&mut file, 317, 3, 1, predictor as u32); // Predictor
@@ -319,5 +350,129 @@ fn test_lzw_tiled_with_edge_padding_parity() {
             }
             _ => panic!("Expected U16 DecodingResult"),
         }
+    }
+}
+
+#[test]
+fn test_lzw_corrupted_byte_stream_hardening() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path();
+
+    let width = 64u32;
+    let height = 64u32;
+    let tile_w = 32u32;
+    let tile_h = 32u32;
+    write_synthetic_lzw_geotiff(path, width, height, tile_w, tile_h, 1);
+
+    let reader = GeoTiffStreamReader::open(path).expect("Failed to open synthetic raster");
+    let mut fast_decoder = reader.open_decoder().unwrap();
+
+    // 1. Empty byte slice
+    let res_empty = fast_decoder.decompress_chunk_fast_bytes(0, &[], None);
+    assert!(res_empty.is_err(), "Empty byte slice must return Err");
+
+    // 2. Truncated byte slice
+    let res_one_byte = fast_decoder.decompress_chunk_fast_bytes(0, &[0x80], None);
+    assert!(res_one_byte.is_err(), "Single byte stream must return Err");
+
+    // 3. Corrupted / fuzz byte streams
+    let corrupt_cases: Vec<Vec<u8>> = vec![
+        vec![0x00; 64],
+        vec![0xFF; 64],
+        (0..128).map(|x| (x * 43) as u8).collect(),
+        vec![0x80, 0x01, 0xFF, 0xFE, 0x00],
+    ];
+
+    for (i, corrupted) in corrupt_cases.iter().enumerate() {
+        let res = fast_decoder.decompress_chunk_fast_bytes(0, corrupted, None);
+        assert!(
+            res.is_err(),
+            "Corrupted LZW case {} must return Err without panicking",
+            i
+        );
+
+        // Fallback resilience: when provided corrupted payload fails, read_chunk_with_payload
+        // safely falls back to standard TIFF reader without panicking
+        let res_payload = fast_decoder.read_chunk_with_payload(0, Some(corrupted), None);
+        assert!(
+            res_payload.is_ok(),
+            "Fallback to file on corrupted payload must succeed gracefully"
+        );
+    }
+}
+
+#[test]
+fn test_lzw_truncated_valid_stream() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path();
+
+    let width = 64u32;
+    let height = 64u32;
+    let tile_w = 32u32;
+    let tile_h = 32u32;
+    write_synthetic_lzw_geotiff(path, width, height, tile_w, tile_h, 1);
+
+    let reader = GeoTiffStreamReader::open(path).unwrap();
+    let mut fast_decoder = reader.open_decoder().unwrap();
+
+    let info = reader.chunk_info.as_ref().unwrap();
+    let valid_payload = reader.source.get_chunk_payload(0, info).unwrap();
+    let payload_bytes = valid_payload.as_ref();
+    assert!(
+        payload_bytes.len() > 10,
+        "Payload must have sufficient length"
+    );
+
+    // Truncate at 25% and 50%
+    let quarter = &payload_bytes[..payload_bytes.len() / 4];
+    let half = &payload_bytes[..payload_bytes.len() / 2];
+
+    let res_quarter = fast_decoder.decompress_chunk_fast_bytes(0, quarter, None);
+    assert!(
+        res_quarter.is_err(),
+        "Truncated 25% LZW stream must return Err"
+    );
+
+    let res_half = fast_decoder.decompress_chunk_fast_bytes(0, half, None);
+    assert!(
+        res_half.is_err(),
+        "Truncated 50% LZW stream must return Err"
+    );
+}
+
+#[test]
+fn test_lzw_buffer_auto_resizing_hardening() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path();
+
+    let width = 64u32;
+    let height = 64u32;
+    let tile_w = 32u32;
+    let tile_h = 32u32;
+    write_synthetic_lzw_geotiff(path, width, height, tile_w, tile_h, 1);
+
+    let reader = GeoTiffStreamReader::open(path).unwrap();
+    let mut fast_decoder = reader.open_decoder().unwrap();
+
+    let (bounds, read_res) = fast_decoder.read_chunk(0).unwrap();
+    assert_eq!(bounds.width, 32);
+
+    // Pass an undersized U16 buffer
+    let undersized = DecodingResult::U16(vec![0u16; 4]);
+    let (_, res_buf) = fast_decoder.read_chunk_into(0, undersized).unwrap();
+
+    match (read_res, res_buf) {
+        (DecodingResult::U16(expected), DecodingResult::U16(actual)) => {
+            assert_eq!(
+                actual.len(),
+                1024,
+                "Buffer must be resized to chunk dimensions"
+            );
+            assert_eq!(
+                actual, expected,
+                "Pixel data must match expected chunk decode"
+            );
+        }
+        _ => panic!("Expected U16 results"),
     }
 }

@@ -1,11 +1,6 @@
-use std::collections::HashMap;
 use fxhash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
-
-use crate::aggregator::horizon_streamer::AggregationConfig;
-use crate::aggregator::multi_horizon::{MultiCategoricalHorizonStreamer, MultiResolutionConfig};
-use crate::error::Result;
-use crate::raster::geotiff::GeoTiffStreamReader;
+use std::collections::HashMap;
 
 /// Maximum number of distinct categories tracked inline without heap allocation.
 pub const INLINE_CAPACITY: usize = 16;
@@ -100,7 +95,8 @@ impl CategoricalAccumulator {
             self.inline_len += 1;
         } else {
             // Spill to heap
-            let mut map: HashMap<i64, f64, FxBuildHasher> = HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
+            let mut map: HashMap<i64, f64, FxBuildHasher> =
+                HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
             for i in 0..INLINE_CAPACITY {
                 map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
             }
@@ -230,42 +226,21 @@ impl CategoricalAccumulator {
     }
 }
 
-/// Streaming categorical aggregator using Southernmost Scan-Line Horizon Eviction.
-/// Delegates to the optimized multi-resolution categorical streaming engine.
-pub struct CategoricalHorizonStreamer {
-    inner: MultiCategoricalHorizonStreamer,
-}
-
-impl CategoricalHorizonStreamer {
-    /// Initialize a new CategoricalHorizonStreamer with background async prefetching and bbox pruning
-    pub fn new(reader: GeoTiffStreamReader, config: &AggregationConfig) -> Result<Self> {
-        let multi_config = MultiResolutionConfig::from(config);
-        let inner = MultiCategoricalHorizonStreamer::new(reader, &multi_config)?;
-        Ok(Self { inner })
-    }
-
-    /// Pull up to `max_rows` completed categorical records from the stream
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<(u64, CategoricalAccumulator)> {
-        self.inner
-            .fetch_next_batch(max_rows)
-            .into_iter()
-            .map(|record| (record.h3_index, record.accumulator))
-            .collect()
-    }
-
-    /// Return current number of active cells in memory
-    pub fn active_cell_count(&self) -> usize {
-        self.inner.active_cell_count()
-    }
-}
-
 /// Trait for numeric raster pixel types that support high-throughput SIMD / branchless span uniformity detection.
 pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {
-    /// Return true if all values in the slice are identical to slice[0], or if slice is empty.
+    /// Return true if all values in the slice are identical to `slice[0]`, or if slice is empty.
     fn is_uniform(slice: &[Self]) -> bool;
+
+    /// Convert native pixel value to an i64 category ID if in valid range
+    fn to_category(self) -> Option<i64>;
 }
 
 impl CategoricalUniformity for u8 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -295,15 +270,24 @@ impl CategoricalUniformity for u8 {
 
 impl CategoricalUniformity for i8 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u8_slice: &[u8] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len())
-        };
+        let u8_slice: &[u8] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
         u8::is_uniform(u8_slice)
     }
 }
 
 impl CategoricalUniformity for u16 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -333,15 +317,24 @@ impl CategoricalUniformity for u16 {
 
 impl CategoricalUniformity for i16 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u16_slice: &[u16] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len())
-        };
+        let u16_slice: &[u16] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len()) };
         u16::is_uniform(u16_slice)
     }
 }
 
 impl CategoricalUniformity for u32 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -371,15 +364,28 @@ impl CategoricalUniformity for u32 {
 
 impl CategoricalUniformity for i32 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self as i64)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u32_slice: &[u32] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len())
-        };
+        let u32_slice: &[u32] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len()) };
         u32::is_uniform(u32_slice)
     }
 }
 
 impl CategoricalUniformity for u64 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        if self <= i64::MAX as u64 {
+            Some(self as i64)
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -409,15 +415,28 @@ impl CategoricalUniformity for u64 {
 
 impl CategoricalUniformity for i64 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        Some(self)
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
-        let u64_slice: &[u64] = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len())
-        };
+        let u64_slice: &[u64] =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len()) };
         u64::is_uniform(u64_slice)
     }
 }
 
 impl CategoricalUniformity for f32 {
+    #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        if self.is_finite() {
+            Some(self.round() as i64)
+        } else {
+            None
+        }
+    }
+
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
@@ -452,6 +471,15 @@ impl CategoricalUniformity for f32 {
 
 impl CategoricalUniformity for f64 {
     #[inline(always)]
+    fn to_category(self) -> Option<i64> {
+        if self.is_finite() {
+            Some(self.round() as i64)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
         if slice.len() <= 1 {
             return true;
@@ -480,5 +508,161 @@ impl CategoricalUniformity for f64 {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_categorical_inline_to_heap_spillover_boundary() {
+        let mut acc = CategoricalAccumulator::new();
+        assert_eq!(acc.unique_classes(), 0);
+        assert!(acc.heap_counts.is_none());
+
+        // Fill up to exactly 16 unique classes (INLINE_CAPACITY)
+        for c in 0..16 {
+            acc.update_weighted(c, 1.0);
+            assert_eq!(acc.unique_classes(), (c + 1) as usize);
+            assert!(
+                acc.heap_counts.is_none(),
+                "Must remain in inline storage for <= 16 classes"
+            );
+        }
+        assert_eq!(acc.inline_len, 16);
+        assert_eq!(acc.total_count, 16.0);
+
+        // Update existing class 5: must NOT trigger heap spillover
+        acc.update_weighted(5, 4.0);
+        assert!(
+            acc.heap_counts.is_none(),
+            "Updating existing class must not allocate heap"
+        );
+        assert_eq!(acc.unique_classes(), 16);
+        assert_eq!(acc.get_class_count(5), 5.0);
+        assert_eq!(acc.total_count, 20.0);
+
+        // Add 17th class: triggers spillover to heap
+        acc.update_weighted(100, 10.0);
+        assert!(
+            acc.heap_counts.is_some(),
+            "Adding 17th class must spill to heap HashMap"
+        );
+        assert_eq!(acc.unique_classes(), 17);
+        assert_eq!(acc.total_count, 30.0);
+
+        // Verify all 16 previous classes are preserved in heap map
+        for c in 0..16 {
+            let expected = if c == 5 { 5.0 } else { 1.0 };
+            assert_eq!(
+                acc.get_class_count(c),
+                expected,
+                "Preserved class count mismatch for class {}",
+                c
+            );
+        }
+        assert_eq!(acc.get_class_count(100), 10.0);
+
+        // Add more classes to heap
+        for c in 200..233 {
+            acc.update(c);
+        }
+        assert_eq!(acc.unique_classes(), 17 + 33); // 50 unique classes
+
+        // Test merge of another accumulator that has 16 inline classes
+        let mut acc2 = CategoricalAccumulator::new();
+        for c in 0..16 {
+            acc2.update_weighted(c, 2.0);
+        }
+        acc.merge(&acc2);
+
+        // Class 5 should now have 5.0 + 2.0 = 7.0
+        assert_eq!(acc.get_class_count(5), 7.0);
+        // Class 0 should have 1.0 + 2.0 = 3.0
+        assert_eq!(acc.get_class_count(0), 3.0);
+    }
+
+    #[test]
+    fn test_categorical_shannon_entropy_theoretical_bounds() {
+        // 1. Empty accumulator: entropy must be 0.0
+        let empty = CategoricalAccumulator::new();
+        assert_eq!(empty.shannon_entropy(), 0.0);
+
+        // 2. Single class: entropy must be 0.0 regardless of sample count
+        let mut single = CategoricalAccumulator::new();
+        single.update_weighted(42, 50000.0);
+        assert_eq!(single.shannon_entropy(), 0.0);
+
+        // 3. K equiprobable classes: entropy must theoretically equal ln(K)
+        for &k in &[2, 4, 8, 16, 32, 64] {
+            let mut acc = CategoricalAccumulator::new();
+            for i in 0..k {
+                acc.update_weighted(i, 10.0); // uniform weight
+            }
+            let entropy = acc.shannon_entropy();
+            let theoretical = (k as f64).ln();
+            assert!(
+                (entropy - theoretical).abs() < 1e-12,
+                "Entropy for K={} must be ln({}): {} vs {}",
+                k,
+                k,
+                entropy,
+                theoretical
+            );
+        }
+
+        // 4. Heavily skewed distribution: entropy must be strictly > 0 and < ln(2)
+        let mut skewed = CategoricalAccumulator::new();
+        skewed.update_weighted(1, 1_000_000.0);
+        skewed.update_weighted(2, 1.0);
+        let s_entropy = skewed.shannon_entropy();
+        assert!(s_entropy > 0.0);
+        assert!(s_entropy < 2.0f64.ln());
+        assert!(
+            s_entropy < 1e-4,
+            "Skewed distribution must have near-zero entropy: got {}",
+            s_entropy
+        );
+    }
+
+    #[test]
+    fn test_categorical_tied_majority_determinism() {
+        let mut acc = CategoricalAccumulator::new();
+        // Empty accumulator majority
+        assert_eq!(acc.majority(), (0, 0.0, 0.0));
+
+        // Two perfectly tied classes: 10 and 20 each with 50.0
+        acc.update_weighted(10, 50.0);
+        acc.update_weighted(20, 50.0);
+        let (maj_cat, maj_cnt, maj_frac) = acc.majority();
+        assert_eq!(maj_cnt, 50.0);
+        assert!((maj_frac - 0.5).abs() < 1e-9);
+        assert!(maj_cat == 10 || maj_cat == 20);
+
+        // Adding 0.001 to class 20 cleanly breaks tie
+        acc.update_weighted(20, 0.001);
+        let (maj_cat2, maj_cnt2, _) = acc.majority();
+        assert_eq!(maj_cat2, 20);
+        assert_eq!(maj_cnt2, 50.001);
+    }
+
+    #[test]
+    fn test_categorical_histogram_json_formatting() {
+        let mut acc = CategoricalAccumulator::new();
+        acc.update_weighted(3, 25.0);
+        acc.update_weighted(1, 75.0);
+
+        let json = acc.histogram_json();
+        // Keys must be ordered numerically: "1" before "3"
+        assert_eq!(json, r#"{"1": 0.7500, "3": 0.2500}"#);
+
+        // Test with > 16 classes (heap path)
+        for i in 4..25 {
+            acc.update_weighted(i, 1.0);
+        }
+        let json_heap = acc.histogram_json();
+        assert!(json_heap.starts_with(r#"{"1":"#));
+        assert!(json_heap.ends_with('}'));
     }
 }

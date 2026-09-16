@@ -1,3 +1,8 @@
+//! Tests WKB polygon geometry emission and DuckDB spatial extension integration.
+//!
+//! Validates OGC-compliant WKB hexagon generation across all H3 resolutions, DuckDB version detection,
+//! spatial extension toggles, projection pushdown column indices, and error handling for invalid cells.
+
 use raster_h3::ffi::{
     is_duckdb_version_at_least, is_geometry_available, parse_version_string, set_spatial_loaded,
 };

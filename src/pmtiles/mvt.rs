@@ -3,9 +3,9 @@
 //! Encodes H3 hexagonal geometries and statistical properties directly into
 //! standard MVT protocol buffer byte streams without intermediate GIS allocations.
 
-use std::borrow::Cow;
 use fxhash::FxHashSet;
 use h3o::LatLng;
+use std::borrow::Cow;
 
 /// Normalized Web Mercator point with coordinates in [0.0, 1.0]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -275,8 +275,12 @@ impl PropertyFilter {
                 "min" | "minimum" => cont_mask |= PROP_MIN,
                 "max" | "maximum" => cont_mask |= PROP_MAX,
                 "majority" | "mode" => cat_mask |= PROP_CAT_MAJORITY,
-                "majority_fraction" | "fraction" | "purity" => cat_mask |= PROP_CAT_MAJORITY_FRACTION,
-                "distinct_classes" | "unique_classes" | "num_classes" => cat_mask |= PROP_CAT_DISTINCT_CLASSES,
+                "majority_fraction" | "fraction" | "purity" => {
+                    cat_mask |= PROP_CAT_MAJORITY_FRACTION
+                }
+                "distinct_classes" | "unique_classes" | "num_classes" => {
+                    cat_mask |= PROP_CAT_DISTINCT_CLASSES
+                }
                 "entropy" | "shannon_entropy" => cat_mask |= PROP_CAT_ENTROPY,
                 _ => {}
             }
@@ -430,7 +434,10 @@ impl FeatureProperties {
                     f("majority_fraction", &MvtValue::Double(*majority_fraction));
                 }
                 if filter.has_categorical(PROP_CAT_DISTINCT_CLASSES) {
-                    f("distinct_classes", &MvtValue::UInt(*distinct_classes as u64));
+                    f(
+                        "distinct_classes",
+                        &MvtValue::UInt(*distinct_classes as u64),
+                    );
                 }
                 if filter.has_categorical(PROP_CAT_ENTROPY) {
                     f("entropy", &MvtValue::Double(*entropy));
@@ -631,8 +638,10 @@ impl MvtLayer {
 
         let max_lat_rad = tile_max_lat.to_radians();
         let min_lat_rad = tile_min_lat.to_radians();
-        let y_merc_top = (1.0 - (max_lat_rad.tan() + 1.0 / max_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
-        let y_merc_bottom = (1.0 - (min_lat_rad.tan() + 1.0 / min_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+        let y_merc_top =
+            (1.0 - (max_lat_rad.tan() + 1.0 / max_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+        let y_merc_bottom =
+            (1.0 - (min_lat_rad.tan() + 1.0 / min_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
         let merc_span = y_merc_bottom - y_merc_top;
 
         let count = vertices.len().min(8);
@@ -644,7 +653,8 @@ impl MvtLayer {
 
             let lat_clamped = v.lat().max(-85.05112878).min(85.05112878);
             let lat_rad = lat_clamped.to_radians();
-            let y_merc = (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+            let y_merc =
+                (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
             py[i] = if merc_span > 0.0 {
                 ((y_merc - y_merc_top) / merc_span * extent_f).round() as i32
             } else {
@@ -677,34 +687,35 @@ impl MvtLayer {
 
         for feat in &self.features {
             tag_bytes.clear();
-            feat.properties.for_each_filtered(&self.property_filter, |k, v| {
-                let key_idx = match key_map.get(k) {
-                    Some(&idx) => idx,
-                    None => {
-                        let idx = keys.len() as u32;
-                        keys.push(k.to_string());
-                        key_map.insert(Cow::Owned(k.to_string()), idx);
-                        idx
-                    }
-                };
-                let val_idx = if k == "h3_index" || k == "h3_hex" {
-                    let idx = values.len() as u32;
-                    values.push(v.clone());
-                    idx
-                } else {
-                    match val_map.get(v) {
+            feat.properties
+                .for_each_filtered(&self.property_filter, |k, v| {
+                    let key_idx = match key_map.get(k) {
                         Some(&idx) => idx,
                         None => {
-                            let idx = values.len() as u32;
-                            values.push(v.clone());
-                            val_map.insert(v.clone(), idx);
+                            let idx = keys.len() as u32;
+                            keys.push(k.to_string());
+                            key_map.insert(Cow::Owned(k.to_string()), idx);
                             idx
                         }
-                    }
-                };
-                write_varint(&mut tag_bytes, key_idx as u64);
-                write_varint(&mut tag_bytes, val_idx as u64);
-            });
+                    };
+                    let val_idx = if k == "h3_index" || k == "h3_hex" {
+                        let idx = values.len() as u32;
+                        values.push(v.clone());
+                        idx
+                    } else {
+                        match val_map.get(v) {
+                            Some(&idx) => idx,
+                            None => {
+                                let idx = values.len() as u32;
+                                values.push(v.clone());
+                                val_map.insert(v.clone(), idx);
+                                idx
+                            }
+                        }
+                    };
+                    write_varint(&mut tag_bytes, key_idx as u64);
+                    write_varint(&mut tag_bytes, val_idx as u64);
+                });
 
             // Encode geometry commands: MoveTo(1) -> LineTo(N-1) -> ClosePath(1) directly to geom_bytes
             geom_bytes.clear();
@@ -716,7 +727,10 @@ impl MvtLayer {
                 write_varint(&mut geom_bytes, zigzag_encode(p0_y) as u64);
 
                 let line_count = (feat.num_points - 1) as u32;
-                write_varint(&mut geom_bytes, ((CMD_LINE_TO & 0x7) | (line_count << 3)) as u64);
+                write_varint(
+                    &mut geom_bytes,
+                    ((CMD_LINE_TO & 0x7) | (line_count << 3)) as u64,
+                );
                 let mut prev_x = p0_x;
                 let mut prev_y = p0_y;
                 for i in 1..feat.num_points as usize {

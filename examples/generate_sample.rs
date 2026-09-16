@@ -1,3 +1,9 @@
+//! Generates a synthetic sample GeoTIFF with a radial elevation gradient for testing.
+//!
+//! Encodes WGS84 geographic metadata (EPSG:4326) and writes an elevation surface around San Francisco.
+//!
+//! Run with: `cargo run --example generate_sample`
+
 use std::fs::File;
 use std::io::BufWriter;
 use tiff::encoder::colortype::Gray32Float;
@@ -33,9 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut image = encoder.new_image::<Gray32Float>(width as u32, height as u32)?;
 
     // Tiepoint: pixel (0,0) -> (-122.50, 37.85) San Francisco Bay Area (WGS84)
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..])?;
+    image.encoder().write_tag(
+        Tag::Unknown(33922),
+        &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..],
+    )?;
 
     // Pixel Scale: 0.001 deg/pixel (~100m)
     image
@@ -46,11 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // KeyDirectoryVersion=1, KeyRevision=1, MinorRevision=0, NumberOfKeys=2
     // Key 1: GTModelTypeGeoKey (1024) = 2 (Geographic 2D)
     // Key 2: GeographicTypeGeoKey (2048) = 4326 (WGS84)
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
     image
         .encoder()
         .write_tag(Tag::Unknown(34735), &geokeys[..])?;

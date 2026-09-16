@@ -1,3 +1,8 @@
+//! Tests SIMD-accelerated Deflate decompression using `libdeflater`.
+//!
+//! Verifies exact bitwise parity with standard `flate2`/`tiff` decoders across tiled and striped
+//! layouts, horizontal and floating-point predictors, corrupted stream handling, and buffer auto-resizing.
+
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -195,7 +200,11 @@ fn test_deflate_striped_u8_parity() {
         let file = File::create(path).unwrap();
         let mut encoder = TiffEncoder::new(BufWriter::new(file)).unwrap();
         let mut img = encoder
-            .new_image_with_compression::<colortype::Gray8, Deflate>(width, height, Deflate::default())
+            .new_image_with_compression::<colortype::Gray8, Deflate>(
+                width,
+                height,
+                Deflate::default(),
+            )
             .unwrap();
         img.rows_per_strip(16).unwrap();
         img.write_data(&ground_truth).unwrap();
@@ -264,7 +273,8 @@ fn test_deflate_striped_f32_parity_and_streaming() {
                 for c in 0..bounds.width {
                     let gx = bounds.col_offset + c;
                     let gy = bounds.row_offset + r;
-                    all_pixels[(gy * width + gx) as usize] = pixels[(r * bounds.width + c) as usize];
+                    all_pixels[(gy * width + gx) as usize] =
+                        pixels[(r * bounds.width + c) as usize];
                 }
             }
         } else {
@@ -314,7 +324,8 @@ fn test_deflate_tiled_f32_with_padding_parity() {
                 for c in 0..bounds.width {
                     let gx = bounds.col_offset + c;
                     let gy = bounds.row_offset + r;
-                    reconstructed[(gy * width + gx) as usize] = pixels[(r * bounds.width + c) as usize];
+                    reconstructed[(gy * width + gx) as usize] =
+                        pixels[(r * bounds.width + c) as usize];
                 }
             }
         } else {
@@ -362,7 +373,8 @@ fn test_deflate_tiled_f32_floating_point_predictor() {
                 for c in 0..bounds.width {
                     let gx = bounds.col_offset + c;
                     let gy = bounds.row_offset + r;
-                    reconstructed[(gy * width + gx) as usize] = pixels[(r * bounds.width + c) as usize];
+                    reconstructed[(gy * width + gx) as usize] =
+                        pixels[(r * bounds.width + c) as usize];
                 }
             }
         } else {
@@ -512,15 +524,15 @@ fn write_tiled_deflate_u16_geotiff(
     write_tag(&mut file, 256, 4, 1, width);
     write_tag(&mut file, 257, 4, 1, height);
     write_tag(&mut file, 258, 3, 1, 16); // BitsPerSample = 16
-    write_tag(&mut file, 259, 3, 1, 8);  // Compression = Deflate
-    write_tag(&mut file, 262, 3, 1, 1);  // BlackIsZero
-    write_tag(&mut file, 277, 3, 1, 1);  // SamplesPerPixel = 1
+    write_tag(&mut file, 259, 3, 1, 8); // Compression = Deflate
+    write_tag(&mut file, 262, 3, 1, 1); // BlackIsZero
+    write_tag(&mut file, 277, 3, 1, 1); // SamplesPerPixel = 1
     write_tag(&mut file, 317, 3, 1, predictor as u32);
     write_tag(&mut file, 322, 4, 1, tile_w);
     write_tag(&mut file, 323, 4, 1, tile_h);
     write_tag(&mut file, 324, 4, total_tiles, tile_offsets_pos as u32);
     write_tag(&mut file, 325, 4, total_tiles, tile_byte_counts_pos as u32);
-    write_tag(&mut file, 339, 3, 1, 1);  // SampleFormat = 1 (Uint)
+    write_tag(&mut file, 339, 3, 1, 1); // SampleFormat = 1 (Uint)
     write_tag(&mut file, 33550, 12, 3, scale_offset as u32);
     write_tag(&mut file, 33922, 12, 6, tiepoint_offset as u32);
 
@@ -562,7 +574,8 @@ fn test_deflate_tiled_u16_horizontal_predictor() {
                 for c in 0..bounds.width {
                     let gx = bounds.col_offset + c;
                     let gy = bounds.row_offset + r;
-                    reconstructed[(gy * width + gx) as usize] = pixels[(r * bounds.width + c) as usize];
+                    reconstructed[(gy * width + gx) as usize] =
+                        pixels[(r * bounds.width + c) as usize];
                 }
             }
         } else {
@@ -622,5 +635,87 @@ fn test_deflate_exact_bitwise_equivalence_with_tiff_decoder() {
             }
             _ => panic!("Expected F32 DecodingResult for both standard and SIMD"),
         }
+    }
+}
+
+#[test]
+fn test_deflate_corrupted_byte_stream_hardening() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path();
+
+    let width = 64u32;
+    let height = 64u32;
+    let ground_truth: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(path, width, height, 32, 32, 1, &ground_truth);
+
+    let reader = GeoTiffStreamReader::open(path).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+
+    // 1. Empty byte slice
+    let res_empty = decoder.decompress_chunk_fast_bytes(0, &[], None);
+    assert!(res_empty.is_err(), "Empty byte slice must return Err");
+
+    // 2. Truncated zlib header (only 2 bytes)
+    let res_trunc = decoder.decompress_chunk_fast_bytes(0, &[0x78, 0x9c], None);
+    assert!(res_trunc.is_err(), "Truncated zlib stream must return Err");
+
+    // 3. Fuzzing: random / invalid byte streams
+    let corrupt_cases: Vec<Vec<u8>> = vec![
+        vec![0xFF; 64],
+        vec![0x00; 128],
+        vec![0x78, 0x9c, 0xFF, 0xFF, 0x00, 0x01],
+        (0..255).map(|x| (x * 37) as u8).collect(),
+        vec![0xAA; 1024],
+    ];
+
+    for (i, corrupted) in corrupt_cases.iter().enumerate() {
+        let res = decoder.decompress_chunk_fast_bytes(0, corrupted, None);
+        assert!(
+            res.is_err(),
+            "Corrupted stream case {} must return Err without panicking",
+            i
+        );
+
+        // Fallback resilience: when corrupted payload fails, read_chunk_with_payload
+        // safely falls back to reading from disk without crashing or panicking
+        let res_payload = decoder.read_chunk_with_payload(0, Some(corrupted), None);
+        assert!(
+            res_payload.is_ok(),
+            "Fallback to file on corrupted payload must succeed gracefully"
+        );
+    }
+}
+
+#[test]
+fn test_deflate_buffer_auto_resizing_hardening() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path();
+
+    let width = 64u32;
+    let height = 64u32;
+    let ground_truth: Vec<f32> = (0..width * height).map(|v| v as f32 * 2.5).collect();
+    write_tiled_deflate_geotiff(path, width, height, 32, 32, 1, &ground_truth);
+
+    let reader = GeoTiffStreamReader::open(path).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+
+    let (bounds, _read_res) = decoder.read_chunk(0).expect("read_chunk(0) failed");
+    assert_eq!(bounds.width, 32);
+    assert_eq!(bounds.height, 32);
+
+    // Pass an undersized target buffer: only 4 elements instead of required 1024
+    let undersized = DecodingResult::F32(vec![0.0f32; 4]);
+    let (_, res_buf) = decoder
+        .read_chunk_into(0, undersized)
+        .expect("read_chunk_into failed");
+    if let DecodingResult::F32(ref v) = res_buf {
+        assert_eq!(
+            v.len(),
+            1024,
+            "Buffer must be automatically resized to match chunk sample count"
+        );
+        assert_eq!(v[0], ground_truth[0]);
+    } else {
+        panic!("Expected F32 DecodingResult");
     }
 }

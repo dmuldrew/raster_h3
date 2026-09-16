@@ -1,15 +1,17 @@
+//! Tests streaming quantile sketches and DDSketch accuracy within H3 accumulators.
+//!
+//! Validates quantile estimation precision, merge associativity and commutativity, preset and custom
+//! spec parsing, zero-overhead disabling, and edge cases including empty and single-value inputs.
+
 use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::aggregator::multi_horizon::{
     MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
 };
 use raster_h3::aggregator::quantiles::QuantileSketch;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
-use std::fs::File;
-use std::io::BufWriter;
-use tempfile::NamedTempFile;
-use tiff::encoder::colortype::Gray32Float;
-use tiff::encoder::TiffEncoder;
-use tiff::tags::Tag;
+mod helpers;
+
+use helpers::create_wave_test_geotiff as create_test_geotiff;
 
 #[test]
 fn test_quantile_sketch_empty() {
@@ -199,64 +201,46 @@ fn test_parse_quantile_specs_presets() {
 fn test_parse_quantile_specs_custom_and_aliases() {
     let custom = QuantileTarget::parse_list("p01, p05, median, q3, p99_5, iqr").unwrap();
     assert_eq!(custom.len(), 6);
-    assert_eq!(custom[0], QuantileTarget::Percentile(0.01, "p01".to_string()));
-    assert_eq!(custom[1], QuantileTarget::Percentile(0.05, "p05".to_string()));
-    assert_eq!(custom[2], QuantileTarget::Percentile(0.50, "median".to_string()));
-    assert_eq!(custom[3], QuantileTarget::Percentile(0.75, "q3".to_string()));
-    assert_eq!(custom[4], QuantileTarget::Percentile(0.995, "p99_5".to_string()));
+    assert_eq!(
+        custom[0],
+        QuantileTarget::Percentile(0.01, "p01".to_string())
+    );
+    assert_eq!(
+        custom[1],
+        QuantileTarget::Percentile(0.05, "p05".to_string())
+    );
+    assert_eq!(
+        custom[2],
+        QuantileTarget::Percentile(0.50, "median".to_string())
+    );
+    assert_eq!(
+        custom[3],
+        QuantileTarget::Percentile(0.75, "q3".to_string())
+    );
+    assert_eq!(
+        custom[4],
+        QuantileTarget::Percentile(0.995, "p99_5".to_string())
+    );
     assert_eq!(custom[5], QuantileTarget::Iqr("iqr".to_string()));
 
     let decimals = QuantileTarget::parse_list("0.05, 0.50, 0.95").unwrap();
     assert_eq!(decimals.len(), 3);
-    assert_eq!(decimals[0], QuantileTarget::Percentile(0.05, "p05".to_string()));
-    assert_eq!(decimals[1], QuantileTarget::Percentile(0.50, "p50".to_string()));
-    assert_eq!(decimals[2], QuantileTarget::Percentile(0.95, "p95".to_string()));
+    assert_eq!(
+        decimals[0],
+        QuantileTarget::Percentile(0.05, "p05".to_string())
+    );
+    assert_eq!(
+        decimals[1],
+        QuantileTarget::Percentile(0.50, "p50".to_string())
+    );
+    assert_eq!(
+        decimals[2],
+        QuantileTarget::Percentile(0.95, "p95".to_string())
+    );
 
     // Deduplication test
     let dup = QuantileTarget::parse_list("p50, p50, median, 0.50").unwrap();
     assert_eq!(dup.len(), 2); // "p50" and "median" (distinct column names)
-}
-
-fn create_test_geotiff(width: usize, height: usize) -> NamedTempFile {
-    let temp_file = NamedTempFile::new().unwrap();
-    let path = temp_file.path().to_path_buf();
-
-    let mut data = Vec::with_capacity(width * height);
-    for row in 0..height {
-        let r_f = row as f32;
-        for col in 0..width {
-            let c_f = col as f32;
-            let val = (r_f * 0.1).sin() * 20.0 + (c_f * 0.1).cos() * 15.0 + 100.0;
-            data.push(val);
-        }
-    }
-
-    let file = File::create(&path).unwrap();
-    let writer = BufWriter::new(file);
-    let mut encoder = TiffEncoder::new(writer).unwrap();
-    let mut image = encoder
-        .new_image::<Gray32Float>(width as u32, height as u32)
-        .unwrap();
-
-    // Top-left: SF Bay (-122.45, 37.80)
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..])
-        .unwrap();
-    image
-        .encoder()
-        .write_tag(Tag::Unknown(33550), &[0.0005f64, 0.0005, 0.0][..])
-        .unwrap();
-
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-    image.write_data(&data).unwrap();
-
-    temp_file
 }
 
 #[test]
@@ -279,14 +263,27 @@ fn test_multi_scan_streamer_with_quantiles_enabled() {
         }
         for rec in &batch {
             total_records += 1;
-            assert!(rec.accumulator.quantiles.is_some(), "Quantiles should be tracked");
+            assert!(
+                rec.accumulator.quantiles.is_some(),
+                "Quantiles should be tracked"
+            );
             let p25 = rec.accumulator.quantile(0.25);
             let p50 = rec.accumulator.quantile(0.50);
             let p75 = rec.accumulator.quantile(0.75);
             let iqr = rec.accumulator.iqr();
 
-            assert!(p25 <= p50 + 1e-6, "Monotonicity: p25 {} <= p50 {}", p25, p50);
-            assert!(p50 <= p75 + 1e-6, "Monotonicity: p50 {} <= p75 {}", p50, p75);
+            assert!(
+                p25 <= p50 + 1e-6,
+                "Monotonicity: p25 {} <= p50 {}",
+                p25,
+                p50
+            );
+            assert!(
+                p50 <= p75 + 1e-6,
+                "Monotonicity: p50 {} <= p75 {}",
+                p50,
+                p75
+            );
             assert!(iqr >= 0.0, "IQR should be non-negative: {}", iqr);
             assert!(p50 >= rec.accumulator.min - 1e-6);
             assert!(p50 <= rec.accumulator.max + 1e-6);
@@ -314,7 +311,10 @@ fn test_multi_scan_streamer_with_quantiles_disabled_zero_cost() {
         }
         for rec in &batch {
             total_records += 1;
-            assert!(rec.accumulator.quantiles.is_none(), "Quantiles should be None when disabled");
+            assert!(
+                rec.accumulator.quantiles.is_none(),
+                "Quantiles should be None when disabled"
+            );
             assert!(rec.accumulator.quantile(0.5).is_nan());
             assert!(rec.accumulator.iqr().is_nan());
         }

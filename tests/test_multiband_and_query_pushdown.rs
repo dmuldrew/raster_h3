@@ -1,3 +1,8 @@
+//! Tests multi-band extraction, spectral index calculation, and predicate pushdown filtering.
+//!
+//! Evaluates on-the-fly NDVI, NDWI, NBR, and EVI spectral formulas, NoData and division-by-zero resilience,
+//! predicate pushdown row pruning, and hierarchical H3 compaction conservation.
+
 use std::fs::File;
 use std::io::BufWriter;
 use tempfile::NamedTempFile;
@@ -43,19 +48,21 @@ fn create_test_rgba_geotiff(
     // Tie point: SF Bay (-122.45, 37.80)
     image
         .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..])
+        .write_tag(
+            Tag::Unknown(33922),
+            &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..],
+        )
         .unwrap();
     image
         .encoder()
         .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
         .unwrap();
 
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(34735), &geokeys[..])
+        .unwrap();
     image.write_data(&data).unwrap();
 
     temp_file
@@ -86,19 +93,21 @@ fn create_test_gray8_geotiff(
 
     image
         .encoder()
-        .write_tag(Tag::Unknown(33922), &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..])
+        .write_tag(
+            Tag::Unknown(33922),
+            &[-0.0f64, 0.0, 0.0, -122.45, 37.80, 0.0][..],
+        )
         .unwrap();
     image
         .encoder()
         .write_tag(Tag::Unknown(33550), &[0.001f64, 0.001, 0.0][..])
         .unwrap();
 
-    let geokeys: [u16; 12] = [
-        1, 1, 0, 2,
-        1024, 0, 1, 2,
-        2048, 0, 1, 4326,
-    ];
-    image.encoder().write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+    let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(34735), &geokeys[..])
+        .unwrap();
     image.write_data(&data).unwrap();
 
     temp_file
@@ -280,13 +289,18 @@ fn test_continuous_predicate_pushdown_min_count_and_mean() {
 #[test]
 fn test_categorical_predicate_pushdown_majority_fraction() {
     // Raster where left half is class 1 (uniform), right half alternates 2 and 3 at pixel level
-    let temp_raster = create_test_gray8_geotiff(64, 64, |c, r| {
-        if c < 32 {
-            1
-        } else {
-            ((c + r) % 2 + 2) as u8
-        }
-    });
+    let temp_raster =
+        create_test_gray8_geotiff(
+            64,
+            64,
+            |c, r| {
+                if c < 32 {
+                    1
+                } else {
+                    ((c + r) % 2 + 2) as u8
+                }
+            },
+        );
     let raster_path = temp_raster.path();
 
     // 1. Baseline unfiltered
@@ -360,7 +374,10 @@ fn test_hierarchical_compaction_continuous_conservation() {
         uncompacted_records.extend(b);
     }
 
-    let uncompacted_count: f64 = uncompacted_records.iter().map(|r| r.accumulator.count).sum();
+    let uncompacted_count: f64 = uncompacted_records
+        .iter()
+        .map(|r| r.accumulator.count)
+        .sum();
     let uncompacted_sum: f64 = uncompacted_records.iter().map(|r| r.accumulator.sum).sum();
 
     // 2. Run with compaction enabled (compact := true)
@@ -384,15 +401,27 @@ fn test_hierarchical_compaction_continuous_conservation() {
     assert!(compacted_records.len() < uncompacted_records.len());
 
     // Check that some records were compacted to resolution 7!
-    let compacted_to_res_7 = compacted_records.iter().filter(|r| r.resolution == 7).count();
-    assert!(compacted_to_res_7 > 0, "Expected at least some complete parent cells at res 7");
+    let compacted_to_res_7 = compacted_records
+        .iter()
+        .filter(|r| r.resolution == 7)
+        .count();
+    assert!(
+        compacted_to_res_7 > 0,
+        "Expected at least some complete parent cells at res 7"
+    );
 
     // Total pixel count and pixel sum MUST BE 100% CONSERVED!
     let compacted_count: f64 = compacted_records.iter().map(|r| r.accumulator.count).sum();
     let compacted_sum: f64 = compacted_records.iter().map(|r| r.accumulator.sum).sum();
 
-    assert!((compacted_count - uncompacted_count).abs() < 1e-5, "Count conservation failed");
-    assert!((compacted_sum - uncompacted_sum).abs() < 1e-5, "Sum conservation failed");
+    assert!(
+        (compacted_count - uncompacted_count).abs() < 1e-5,
+        "Count conservation failed"
+    );
+    assert!(
+        (compacted_sum - uncompacted_sum).abs() < 1e-5,
+        "Sum conservation failed"
+    );
 }
 
 #[test]
@@ -426,7 +455,8 @@ fn test_hierarchical_compaction_categorical_conservation() {
         compact: true,
         ..Default::default()
     };
-    let mut streamer_comp = MultiCategoricalHorizonStreamer::new(reader_comp, &config_comp).unwrap();
+    let mut streamer_comp =
+        MultiCategoricalHorizonStreamer::new(reader_comp, &config_comp).unwrap();
     let mut compacted = Vec::new();
     loop {
         let b = streamer_comp.fetch_next_batch(500);
@@ -442,4 +472,122 @@ fn test_hierarchical_compaction_categorical_conservation() {
 
     let comp_total_pixels: f64 = compacted.iter().map(|r| r.accumulator.total_count).sum();
     assert!((comp_total_pixels - raw_total_pixels).abs() < 1e-5);
+}
+
+#[test]
+fn test_spectral_formula_nbr_on_the_fly() {
+    // 4-band raster: R=50, G=100, SWIR/B=60, NIR/A=140
+    // Expected NBR = (NIR - SWIR) / (NIR + SWIR) = (140 - 60) / (140 + 60) = 80 / 200 = 0.40
+    let temp_raster = create_test_rgba_geotiff(64, 64, 50, 100, 60, 140);
+    let raster_path = temp_raster.path();
+
+    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+
+    let config = MultiResolutionConfig {
+        resolutions: vec![8],
+        spectral_formula: Some(SpectralFormula::Nbr {
+            nir_band: 4,
+            swir_band: 3,
+        }),
+        ..Default::default()
+    };
+
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+    let records = streamer.fetch_next_batch(1000);
+    assert!(!records.is_empty());
+    for rec in &records {
+        assert!((rec.accumulator.mean() - 0.40).abs() < 1e-6);
+        assert!((rec.accumulator.min - 0.40).abs() < 1e-6);
+        assert!((rec.accumulator.max - 0.40).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn test_spectral_formula_evi_on_the_fly() {
+    // 4-band raster: R=20, G=30, B=10, NIR=80
+    // Expected EVI = 2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1.0)
+    // Numerator = 2.5 * (80 - 20) = 150.0
+    // Denominator = 80 + 6*20 - 7.5*10 + 1 = 80 + 120 - 75 + 1 = 126.0
+    // Expected = 150.0 / 126.0 = 1.19047619...
+    let temp_raster = create_test_rgba_geotiff(64, 64, 20, 30, 10, 80);
+    let raster_path = temp_raster.path();
+
+    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+
+    let config = MultiResolutionConfig {
+        resolutions: vec![8],
+        spectral_formula: Some(SpectralFormula::Evi {
+            nir_band: 4,
+            red_band: 1,
+            blue_band: 3,
+        }),
+        ..Default::default()
+    };
+
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+    let records = streamer.fetch_next_batch(1000);
+    assert!(!records.is_empty());
+    let expected_evi = 150.0 / 126.0;
+    for rec in &records {
+        assert!((rec.accumulator.mean() - expected_evi).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn test_spectral_formula_zero_denominator_and_nodata_resilience() {
+    // 4-band raster where NIR=0 and Red=0 everywhere (denominator NIR + Red == 0)
+    let temp_raster = create_test_rgba_geotiff(64, 64, 0, 0, 0, 0);
+    let raster_path = temp_raster.path();
+
+    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+
+    let config = MultiResolutionConfig {
+        resolutions: vec![8],
+        spectral_formula: Some(SpectralFormula::Ndvi {
+            nir_band: 4,
+            red_band: 1,
+        }),
+        ..Default::default()
+    };
+
+    // Streamer must handle 0/0 gracefully without NaN, Inf, or panicking
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+    let mut records = Vec::new();
+    loop {
+        let b = streamer.fetch_next_batch(500);
+        if b.is_empty() {
+            break;
+        }
+        records.extend(b);
+    }
+    // Because all pixels have denom = 0, they are all skipped, resulting in 0 valid pixel accumulations
+    for rec in &records {
+        assert_eq!(rec.accumulator.count, 0.0);
+    }
+}
+
+#[test]
+fn test_spectral_formula_out_of_bounds_band_clamping() {
+    // Request Band 99 on a 4-band raster. Clamped safely to spp-1 (Band 4)
+    let temp_raster = create_test_rgba_geotiff(64, 64, 50, 100, 150, 200);
+    let raster_path = temp_raster.path();
+
+    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+
+    let config = MultiResolutionConfig {
+        resolutions: vec![8],
+        spectral_formula: Some(SpectralFormula::Ndvi {
+            nir_band: 99,
+            red_band: 1,
+        }),
+        ..Default::default()
+    };
+
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+    let records = streamer.fetch_next_batch(1000);
+    assert!(!records.is_empty());
+    // Band 99 is clamped to Band 4 (NIR=200), Red is Band 1 (Red=50) -> NDVI = 0.60
+    for rec in &records {
+        assert!((rec.accumulator.mean() - 0.60).abs() < 1e-6);
+    }
 }
