@@ -10,97 +10,30 @@ pub trait NodataCast: Copy + PartialEq + Send + Sync + 'static {
     fn from_nodata_f64(nodata: Option<f64>) -> Option<Self>;
 }
 
-impl NodataCast for u8 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| {
-            if (0.0..=255.0).contains(&v) {
-                Some(v as u8)
-            } else {
-                None
+macro_rules! impl_integer_nodata_cast {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl NodataCast for $ty {
+            #[inline(always)]
+            fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
+                nodata.and_then(|v| {
+                    // The upper bound is exclusive: i64::MAX and u64::MAX round
+                    // upward in f64, so an inclusive comparison accepts overflow.
+                    if v.is_finite()
+                        && v.fract() == 0.0
+                        && v >= <$ty>::MIN as f64
+                        && v < (<$ty>::MAX as f64) + 1.0
+                    {
+                        Some(v as $ty)
+                    } else {
+                        None
+                    }
+                })
             }
-        })
-    }
+        })+
+    };
 }
 
-impl NodataCast for u16 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| {
-            if (0.0..=65535.0).contains(&v) {
-                Some(v as u16)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-impl NodataCast for u32 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| {
-            if v >= 0.0 && v <= u32::MAX as f64 {
-                Some(v as u32)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-impl NodataCast for u64 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| if v >= 0.0 { Some(v as u64) } else { None })
-    }
-}
-
-impl NodataCast for i8 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| {
-            if (-128.0..=127.0).contains(&v) {
-                Some(v as i8)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-impl NodataCast for i16 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| {
-            if (-32768.0..=32767.0).contains(&v) {
-                Some(v as i16)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-impl NodataCast for i32 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.and_then(|v| {
-            if v >= i32::MIN as f64 && v <= i32::MAX as f64 {
-                Some(v as i32)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-impl NodataCast for i64 {
-    #[inline(always)]
-    fn from_nodata_f64(nodata: Option<f64>) -> Option<Self> {
-        nodata.map(|v| v as i64)
-    }
-}
+impl_integer_nodata_cast!(u8, u16, u32, u64, i8, i16, i32, i64);
 
 impl NodataCast for f32 {
     #[inline(always)]
@@ -238,6 +171,35 @@ mod tests {
         // f32 and f64
         assert_eq!(f32::from_nodata_f64(Some(-9999.0)), Some(-9999.0f32));
         assert_eq!(f64::from_nodata_f64(Some(-9999.0)), Some(-9999.0f64));
+    }
+
+    #[test]
+    fn integer_nodata_rejects_fractional_nonfinite_and_out_of_range_values() {
+        macro_rules! check_invalid {
+            ($ty:ty) => {
+                assert_eq!(<$ty>::from_nodata_f64(Some(1.9)), None);
+                assert_eq!(<$ty>::from_nodata_f64(Some(f64::NAN)), None);
+                assert_eq!(<$ty>::from_nodata_f64(Some(f64::INFINITY)), None);
+                assert_eq!(<$ty>::from_nodata_f64(Some(f64::NEG_INFINITY)), None);
+                assert_eq!(
+                    <$ty>::from_nodata_f64(Some((<$ty>::MAX as f64) + 1.0)),
+                    None
+                );
+            };
+        }
+        check_invalid!(u8);
+        check_invalid!(u16);
+        check_invalid!(u32);
+        check_invalid!(u64);
+        check_invalid!(i8);
+        check_invalid!(i16);
+        check_invalid!(i32);
+        check_invalid!(i64);
+        assert_eq!(
+            u64::from_nodata_f64(Some(2f64.powi(64) - 2048.0)),
+            Some(u64::MAX - 2047)
+        );
+        assert_eq!(i64::from_nodata_f64(Some(-(2f64.powi(63)))), Some(i64::MIN));
     }
 
     #[test]

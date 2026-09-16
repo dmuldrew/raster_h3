@@ -286,7 +286,33 @@ fn initial_full_body_response_serves_later_blocks_from_cache() {
     let mut actual = [0u8; 20];
     assert_eq!(source.read_range_into(150_000, &mut actual).unwrap(), 20);
     assert_eq!(&actual, &data[150_000..150_020]);
+    assert_eq!(source.read_range(0, 150_000).unwrap(), data[..150_000]);
     assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn remote_read_crossing_cache_blocks_returns_all_bytes() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let source = RemoteHttpSource::open(&format!("{}/ranged", server.url_base)).unwrap();
+
+    let mut across_boundary = [0u8; 10];
+    assert_eq!(
+        source
+            .read_range_into(131_070, &mut across_boundary)
+            .unwrap(),
+        10
+    );
+    assert_eq!(&across_boundary, &data[131_070..131_080]);
+    assert_eq!(
+        source.read_range(131_070, 10).unwrap(),
+        data[131_070..131_080]
+    );
+    assert_eq!(source.read_range(299_996, 10).unwrap(), data[299_996..]);
 }
 
 fn parse_byte_range(range_str: &str, total_size: usize) -> Option<(usize, usize)> {

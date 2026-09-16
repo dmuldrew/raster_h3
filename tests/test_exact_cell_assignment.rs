@@ -208,6 +208,27 @@ fn nan_nodata_preserves_finite_raster_values() {
 }
 
 #[test]
+fn fractional_integer_nodata_does_not_exclude_pixel_values() {
+    let (_file, path) = TestGeoTiffBuilder::new(16, 16)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.0001)
+        .gdal_nodata("1.9")
+        .create_constant_tempfile(1u8);
+    let config = MultiResolutionConfig::single(7);
+    let mut streamer =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config).unwrap();
+    let mut count = 0.0;
+    loop {
+        let batch = streamer.fetch_next_batch(16).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        count += batch.iter().map(|rec| rec.accumulator.count).sum::<f64>();
+    }
+    assert_eq!(count, 256.0);
+}
+
+#[test]
 fn compact_adjacent_resolutions_are_rejected() {
     let (_file, path) = TestGeoTiffBuilder::new(8, 8)
         .origin(-122.45, 37.85)

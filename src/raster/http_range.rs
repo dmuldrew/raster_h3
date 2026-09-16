@@ -426,19 +426,11 @@ impl RemoteHttpSource {
 
         let actual_len = out.len().min((self.total_size - offset) as usize);
 
-        // For large reads (larger than 1 block), bypass the block cache and fetch exact range
-        if actual_len > self.block_size {
-            let fetched = self.fetch_range(offset, offset + actual_len as u64 - 1)?;
-            let to_copy = fetched.len().min(actual_len);
-            out[..to_copy].copy_from_slice(&fetched[..to_copy]);
-            return Ok(to_copy);
-        }
-
         let block_idx = offset / self.block_size as u64;
         let block_start = block_idx * self.block_size as u64;
         let offset_in_block = (offset - block_start) as usize;
 
-        // 1. Fast path: check block cache under read lock
+        // 1. Fast path: the initial request may have returned the whole file.
         {
             let cache = self.cache.read().map_err(|_| {
                 RasterH3Error::InvalidParameter("Remote HTTP cache lock poisoned".to_string())
@@ -452,14 +444,23 @@ impl RemoteHttpSource {
                     return Ok(actual_len);
                 }
             }
-            if let Some(block) = cache.get(&block_idx) {
-                if offset_in_block < block.len() {
-                    let available = (block.len() - offset_in_block).min(actual_len);
-                    out[..available]
-                        .copy_from_slice(&block[offset_in_block..offset_in_block + available]);
-                    return Ok(available);
+            if actual_len <= self.block_size - offset_in_block {
+                if let Some(block) = cache.get(&block_idx) {
+                    if offset_in_block < block.len() {
+                        out[..actual_len]
+                            .copy_from_slice(&block[offset_in_block..offset_in_block + actual_len]);
+                        return Ok(actual_len);
+                    }
                 }
             }
+        }
+
+        // A request spanning blocks needs one exact range fetch. Returning the
+        // tail of the first block would silently truncate a TIFF chunk payload.
+        if actual_len > self.block_size - offset_in_block {
+            let fetched = self.fetch_range(offset, offset + actual_len as u64 - 1)?;
+            out[..actual_len].copy_from_slice(&fetched);
+            return Ok(actual_len);
         }
 
         // 2. Slow path: fetch block without holding write lock to allow parallel fetches

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.
+- Return complete remote byte reads across cache blocks and use a cached full-file HTTP response for large reads.
 - Preserve supersamples that fall inside a bounding box when their pixel center falls outside it.
 - Reject compact multi-resolution requests that would emit both a requested parent cell and a compacted child-cell parent.
 - Validate HTTP partial-content status, range offsets, total size, and body length before accepting remote COG bytes.
