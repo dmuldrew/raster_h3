@@ -32,7 +32,39 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets (dx_i, dy_i) are eval
 | **`8rooks`** | 8 | **$\sim 0.55\times$** | Full Stratified Anti-Aliasing | Highly complex boundary contours with diagonal edges |
 | **`16point`** | 16 | **$\sim 0.35\times$** | Sub-Grid Reconstruction | Coarse rasters (e.g. 1km climate grids) aggregated into fine H3 cells (Res 9–11) |
 
-### Performance Tuning Tips
+## The Recommended Compromise: Why RGSS is the Optimal Default
+
+For production workflows, **`'rgss'` (Rotated Grid Super-Sampling, 4-point)** provides the ideal compromise between boundary accuracy and throughput.
+
+### 1. Geometric Efficiency
+Standard axis-aligned grids (such as a regular $2 \times 2$ grid or 5-point quincunx) suffer from collinear blind spots: when a hexagonal boundary cuts parallel to an axis, multiple sample points fall on the same side of the cut line, degrading anti-aliasing efficiency. 
+
+RGSS rotates the sub-pixel grid by $\arctan(0.5) \approx 26.57^\circ$:
+$$\left( \frac{3}{8}, \frac{1}{8} \right), \quad \left( \frac{7}{8}, \frac{3}{8} \right), \quad \left( \frac{1}{8}, \frac{5}{8} \right), \quad \left( \frac{5}{8}, \frac{7}{8} \right)$$
+
+Because **no two points share the same horizontal ($X$) or vertical ($Y$) coordinate**, RGSS provides 4 distinct 1D projection slices across any arbitrary hexagon edge with only 4 evaluation points.
+
+### 2. Algorithmic Synergy with Core Span Lookahead
+The scanline walker separates raster rows into:
+- **Core Interior Spans**: Pixels whose full sub-pixel bounding envelope $[0.125, 0.875] \times [0.125, 0.875]$ is guaranteed to lie inside the active H3 hexagon. These pixels are accumulated in bulk using single-pass SIMD vectorization at baseline speed with zero coordinate transformations or H3 lookups.
+- **Boundary Perimeter Pixels**: Only pixels straddling the hexagon edge execute exact spherical H3 cell resolution.
+
+Because the RGSS envelope is compact and interior pixels bypass individual sample indexing, **a $4\times$ increase in sampling density incurs only a $\sim 2.1\times$ runtime difference rather than a $4\times$ penalty**.
+
+### 4. Selection Heuristic
+
+```
+Is raster pixel resolution significantly smaller than H3 cell? (e.g. 10m pixels into Res 7/8)
+ ├── YES ──> Use 'center' (Maximum throughput; boundary partial-pixel area error is < 0.5%)
+ └── NO
+      ├── Are raster pixels LARGER than H3 cells? (e.g. 1km climate grids into Res 9+)
+      │    └── YES ──> Use '16point' (Prevents blocky spatial quantization across hexagons)
+      └── Standard Production & Analytical Queries
+           └── YES ──> Use 'rgss' (Optimal balance: eliminates collinear aliasing with minimal overhead)
+```
+
+## Performance Tuning Tips
 1. **Match `chunk_size` to Tile Dimensions**: For tiled GeoTIFFs (e.g., $256 \times 256$ or $512 \times 512$ tiles), set `chunk_size := 512` to align DuckDB decompressor buffers with native TIFF block boundaries.
 2. **Region of Interest (ROI) Pruning**: Always specify `min_lon`, `min_lat`, `max_lon`, `max_lat` when analyzing spatial subsets. Non-overlapping GeoTIFF blocks are discarded instantly before reading from disk.
 3. **Multi-Resolution Single Passes**: When creating multi-zoom web layers, use `resolutions := [6, 7, 8]` or `h3_raster_to_pmtiles(...)` rather than separate SQL queries to read the underlying GeoTIFF only once.
+
