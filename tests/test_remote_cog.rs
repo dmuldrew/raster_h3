@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use raster_h3::error::RasterH3Error;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
-use raster_h3::raster::http_range::{is_remote_url, normalize_url};
+use raster_h3::raster::http_range::{is_remote_url, normalize_url, RemoteHttpSource};
 use raster_h3::raster::mosaic::{resolve_raster_sources, MosaicReader};
 use tiff::decoder::DecodingResult;
 
@@ -182,6 +182,33 @@ impl MockHttpServer {
 
         let total_size = file_bytes.len();
 
+        // Exercise servers that ignore Range or lie about the returned offset.
+        // The initial header request remains valid so the failure occurs in fetch_range.
+        if path.contains("full_body")
+            || (path.contains("ignore_range") && range_header.as_deref() != Some("bytes=0-131071"))
+        {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                total_size
+            );
+            if stream.write_all(header.as_bytes()).is_ok() && method == "GET" {
+                let _ = stream.write_all(file_bytes);
+            }
+            return;
+        }
+
+        if path.contains("wrong_range") && range_header.as_deref() != Some("bytes=0-131071") {
+            let body = &file_bytes[..10];
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/{}\r\nContent-Length: 10\r\nConnection: close\r\n\r\n",
+                total_size
+            );
+            if stream.write_all(header.as_bytes()).is_ok() && method == "GET" {
+                let _ = stream.write_all(body);
+            }
+            return;
+        }
+
         if let Some(range_str) = range_header {
             if let Some((start, end)) = parse_byte_range(&range_str, total_size) {
                 let slice = &file_bytes[start..=end];
@@ -228,6 +255,38 @@ impl Drop for MockHttpServer {
             let _ = handle.join();
         }
     }
+}
+
+#[test]
+fn remote_range_reader_rejects_ignored_and_wrong_ranges() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let server = MockHttpServer::start(vec![0u8; 200_000]);
+    for path in ["ignore_range", "wrong_range"] {
+        let source = RemoteHttpSource::open(&format!("{}/{}", server.url_base, path)).unwrap();
+        let err = source.fetch_range(100, 109).unwrap_err();
+        assert!(
+            err.to_string().contains("range"),
+            "unexpected error for {path}: {err}"
+        );
+    }
+}
+
+#[test]
+fn initial_full_body_response_serves_later_blocks_from_cache() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let source = RemoteHttpSource::open(&format!("{}/full_body", server.url_base)).unwrap();
+    let mut actual = [0u8; 20];
+    assert_eq!(source.read_range_into(150_000, &mut actual).unwrap(), 20);
+    assert_eq!(&actual, &data[150_000..150_020]);
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
 }
 
 fn parse_byte_range(range_str: &str, total_size: usize) -> Option<(usize, usize)> {

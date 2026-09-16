@@ -29,7 +29,7 @@ This document provides the complete API reference for the DuckDB H3 Raster Hexif
 | `bbox` | `VARCHAR` | `None` | Bounding box as a single string: `'min_lon,min_lat,max_lon,max_lat'` (alternative to individual coordinate parameters). |
 | `h3_cell` | `BIGINT` | `None` | Single H3 cell index for predicate pushdown (only process chunks intersecting this cell). |
 | `h3_hex` | `VARCHAR` | `None` | Single H3 hex string for predicate pushdown (alternative to `h3_cell`). |
-| `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR column for reduced memory). |
+| `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR) and merge complete sets of seven H3 children into a parent. Cannot be combined with adjacent requested resolutions, which would duplicate parent cells. |
 | `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'` (Voronoi bisector), `'first'` (painter's precedence), `'average'` (blend). |
 | `workers` / `threads` | `BIGINT` | `auto` | Number of background decompression worker threads. |
 | `formula` | `VARCHAR` | `None` | Spectral index formula: `'ndvi'`, `'ndwi'`, `'nbr'`, `'evi'`. Requires multi-band raster. |
@@ -91,7 +91,7 @@ This document provides the complete API reference for the DuckDB H3 Raster Hexif
 | `bbox` | `VARCHAR` | `None` | Bounding box as a single string: `'min_lon,min_lat,max_lon,max_lat'`. |
 | `h3_cell` | `BIGINT` | `None` | Single H3 cell index for predicate pushdown. |
 | `h3_hex` | `VARCHAR` | `None` | Single H3 hex string for predicate pushdown. |
-| `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR column). |
+| `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR) and merge complete sets of seven H3 children into a parent. Cannot be combined with adjacent requested resolutions. |
 | `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'`, `'first'`, `'average'`. |
 | `workers` / `threads` | `BIGINT` | `auto` | Number of background decompression worker threads. |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold for output. |

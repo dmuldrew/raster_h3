@@ -104,6 +104,22 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             ));
         }
 
+        if config.compact {
+            let requested: std::collections::HashSet<u8> =
+                config.resolutions.iter().copied().collect();
+            if let Some(&child) = config
+                .resolutions
+                .iter()
+                .find(|&&res| res > 0 && requested.contains(&(res - 1)))
+            {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "compact output cannot combine H3 resolutions {} and {}: compaction would emit duplicate parent cells",
+                    child - 1,
+                    child
+                )));
+            }
+        }
+
         let mut resolutions = Vec::with_capacity(config.resolutions.len());
         let mut resolution_u8s = Vec::with_capacity(config.resolutions.len());
         for &res_u8 in &config.resolutions {

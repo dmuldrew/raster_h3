@@ -15,6 +15,70 @@ use crate::error::{RasterH3Error, Result};
 /// Default block cache size for header and tag reading (128 KB)
 pub const DEFAULT_BLOCK_SIZE: usize = 131072;
 
+/// Parse a standards-compliant `Content-Range` value of the form
+/// `bytes start-end/total`.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total = total.parse().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
+}
+
+fn validate_range_response(
+    status: u16,
+    content_range: Option<&str>,
+    start: u64,
+    end: u64,
+    expected_total: Option<u64>,
+    body_len: usize,
+) -> Result<u64> {
+    let total = validate_range_response_headers(status, content_range, start, end, expected_total)?;
+    if body_len != (end - start + 1) as usize {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "Remote range response for bytes {}-{} has {} bytes, expected {}",
+            start,
+            end,
+            body_len,
+            end - start + 1
+        )));
+    }
+    Ok(total)
+}
+
+fn validate_range_response_headers(
+    status: u16,
+    content_range: Option<&str>,
+    start: u64,
+    end: u64,
+    expected_total: Option<u64>,
+) -> Result<u64> {
+    if status != 206 {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "Remote server ignored byte range {}-{} (HTTP {})",
+            start, end, status
+        )));
+    }
+    let (actual_start, actual_end, total) =
+        content_range.and_then(parse_content_range).ok_or_else(|| {
+            RasterH3Error::InvalidParameter(
+                "Remote range response lacks a valid Content-Range header".to_string(),
+            )
+        })?;
+    if actual_start != start
+        || actual_end != end
+        || expected_total.is_some_and(|size| size != total)
+    {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "Remote range response does not match requested bytes {}-{}",
+            start, end
+        )));
+    }
+    Ok(total)
+}
+
 /// Check if a path or string is a remote URL (http, https, or s3)
 pub fn is_remote_url(path: &str) -> bool {
     let p = path.trim().to_lowercase();
@@ -218,27 +282,44 @@ impl RemoteHttpSource {
         })?;
 
         let status = resp.status();
-        let mut total_size = 0u64;
-
-        let initial_bytes = if status == 206 {
-            // Parse Content-Range: bytes 0-131071/total_size
-            if let Some(cr) = resp.header("Content-Range") {
-                if let Some(slash_idx) = cr.rfind('/') {
-                    let total_str = &cr[slash_idx + 1..].trim();
-                    if let Ok(ts) = total_str.parse::<u64>() {
-                        total_size = ts;
-                    }
-                }
-            }
-            let mut reader = resp.into_reader();
+        let (initial_bytes, total_size) = if status == 206 {
+            let content_range = resp.header("Content-Range").map(str::to_owned);
+            let (_, _, parsed_total) = content_range
+                .as_deref()
+                .and_then(parse_content_range)
+                .ok_or_else(|| {
+                    RasterH3Error::InvalidParameter(
+                        "Remote range response lacks a valid Content-Range header".to_string(),
+                    )
+                })?;
+            let expected_end = (initial_fetch_len as u64 - 1).min(parsed_total - 1);
+            validate_range_response_headers(
+                status,
+                content_range.as_deref(),
+                0,
+                expected_end,
+                None,
+            )?;
+            let reader = resp.into_reader();
             let mut buf = Vec::with_capacity(initial_fetch_len);
-            reader.read_to_end(&mut buf).map_err(|e| {
-                RasterH3Error::InvalidParameter(format!(
-                    "Failed reading initial header bytes from '{}': {}",
-                    url, e
-                ))
-            })?;
-            buf
+            reader
+                .take(initial_fetch_len as u64 + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| {
+                    RasterH3Error::InvalidParameter(format!(
+                        "Failed reading initial header bytes from '{}': {}",
+                        url, e
+                    ))
+                })?;
+            let total_size = validate_range_response(
+                status,
+                content_range.as_deref(),
+                0,
+                expected_end,
+                None,
+                buf.len(),
+            )?;
+            (buf, total_size)
         } else if status == 200 {
             // Server returned entire body (or file is small)
             let cl = resp
@@ -253,18 +334,21 @@ impl RemoteHttpSource {
                     url, e
                 ))
             })?;
-            total_size = if cl > 0 { cl } else { buf.len() as u64 };
-            buf
+            if cl > 0 && cl != buf.len() as u64 {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Remote response has {} bytes but Content-Length says {}",
+                    buf.len(),
+                    cl
+                )));
+            }
+            let total_size = buf.len() as u64;
+            (buf, total_size)
         } else {
             return Err(RasterH3Error::InvalidParameter(format!(
                 "Unexpected HTTP status {} from '{}'",
                 status, url
             )));
         };
-
-        if total_size == 0 {
-            total_size = initial_bytes.len() as u64;
-        }
 
         let mut cache = FxHashMap::default();
         cache.insert(0, Arc::new(initial_bytes));
@@ -281,6 +365,12 @@ impl RemoteHttpSource {
 
     /// Fetch an arbitrary byte range directly from the remote server with retry
     pub fn fetch_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        if start > end || end >= self.total_size {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "Requested remote byte range {}-{} lies outside file of {} bytes",
+                start, end, self.total_size
+            )));
+        }
         let range_header = format!("bytes={}-{}", start, end);
         let resp = execute_request_with_retry(&self.url, 4, || {
             let mut req = self.agent.get(&self.url).set("Range", &range_header);
@@ -290,14 +380,39 @@ impl RemoteHttpSource {
             req.call()
         })?;
 
-        let mut reader = resp.into_reader();
-        let mut buf = Vec::with_capacity((end - start + 1) as usize);
-        reader.read_to_end(&mut buf).map_err(|e| {
-            RasterH3Error::InvalidParameter(format!(
-                "Failed reading range {} from '{}': {}",
-                range_header, self.url, e
-            ))
-        })?;
+        let status = resp.status();
+        let content_range = resp.header("Content-Range").map(str::to_owned);
+
+        // Reject an ignored or shifted range before buffering its response body.
+        let expected_len = (end - start + 1) as usize;
+        validate_range_response_headers(
+            status,
+            content_range.as_deref(),
+            start,
+            end,
+            Some(self.total_size),
+        )?;
+
+        let reader = resp.into_reader();
+        let mut buf = Vec::with_capacity(expected_len);
+        reader
+            .take(expected_len as u64 + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                RasterH3Error::InvalidParameter(format!(
+                    "Failed reading range {} from '{}': {}",
+                    range_header, self.url, e
+                ))
+            })?;
+
+        validate_range_response(
+            status,
+            content_range.as_deref(),
+            start,
+            end,
+            Some(self.total_size),
+            buf.len(),
+        )?;
 
         Ok(buf)
     }
@@ -328,6 +443,15 @@ impl RemoteHttpSource {
             let cache = self.cache.read().map_err(|_| {
                 RasterH3Error::InvalidParameter("Remote HTTP cache lock poisoned".to_string())
             })?;
+            // A server may answer the initial Range request with the entire file.
+            // That body already covers every block, so no further HTTP reads are needed.
+            if let Some(full) = cache.get(&0) {
+                if full.len() as u64 == self.total_size {
+                    out[..actual_len]
+                        .copy_from_slice(&full[offset as usize..offset as usize + actual_len]);
+                    return Ok(actual_len);
+                }
+            }
             if let Some(block) = cache.get(&block_idx) {
                 if offset_in_block < block.len() {
                     let available = (block.len() - offset_in_block).min(actual_len);
@@ -433,5 +557,34 @@ impl Seek for HttpRangeReader {
 
         self.cursor = new_cursor;
         Ok(self.cursor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_validates_exact_partial_content() {
+        assert_eq!(parse_content_range("bytes 10-19/100"), Some((10, 19, 100)));
+        assert_eq!(parse_content_range("bytes 19-10/100"), None);
+        assert_eq!(parse_content_range("items 10-19/100"), None);
+        assert_eq!(
+            validate_range_response(206, Some("bytes 10-19/100"), 10, 19, Some(100), 10).unwrap(),
+            100
+        );
+    }
+
+    #[test]
+    fn rejects_ignored_or_malformed_range_responses() {
+        for (status, header, body_len) in [
+            (200, Some("bytes 10-19/100"), 10),
+            (206, None, 10),
+            (206, Some("bytes 0-9/100"), 10),
+            (206, Some("bytes 10-19/99"), 10),
+            (206, Some("bytes 10-19/100"), 9),
+        ] {
+            assert!(validate_range_response(status, header, 10, 19, Some(100), body_len).is_err());
+        }
     }
 }

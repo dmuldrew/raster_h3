@@ -47,10 +47,6 @@ fn supersampling_matches_direct_h3_per_cell_and_per_class() {
             SamplingPattern::sixteen_point(),
         ] {
             for bbox in [None, Some([-122.46, 37.87, -122.40, 37.96])] {
-                // Clipping rotated rows must consider the changing latitude along the row.
-                if bbox.is_some() && b == 0.0 && d == 0.0 {
-                    continue;
-                }
                 for resolutions in [vec![8], vec![7, 8, 9]] {
                     let mut reader = GeoTiffStreamReader::open(&path).unwrap();
                     // Override the affine geometry to isolate walker behavior from TIFF tags.
@@ -209,4 +205,50 @@ fn nan_nodata_preserves_finite_raster_values() {
             }
         }
     }
+}
+
+#[test]
+fn compact_adjacent_resolutions_are_rejected() {
+    let (_file, path) = TestGeoTiffBuilder::new(8, 8)
+        .origin(-122.45, 37.85)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|_, _| 1.0);
+    let mut config = MultiResolutionConfig::new(vec![7, 8]);
+    config.compact = true;
+
+    let err =
+        match MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config) {
+            Ok(_) => panic!("adjacent compact resolutions should be rejected"),
+            Err(err) => err,
+        };
+    assert!(err.to_string().contains("duplicate parent cells"));
+
+    config.resolutions = vec![7, 9];
+    assert!(
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config).is_ok()
+    );
+}
+
+#[test]
+fn bbox_keeps_subpixel_samples_when_center_is_outside() {
+    let (_file, path) = TestGeoTiffBuilder::new(1, 1)
+        .origin(0.0, 1.0)
+        .pixel_size(1.0)
+        .create_f32_tempfile(|_, _| 7.0);
+    let mut config = MultiResolutionConfig::single(5);
+    config.sampling = SamplingPattern::five_point();
+    config.bbox = Some([0.1, 0.7, 0.3, 0.9]);
+
+    let mut continuous =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config).unwrap();
+    let mut categorical =
+        MultiCategoricalHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config)
+            .unwrap();
+    let records = continuous.fetch_next_batch(10).unwrap();
+    let categories = categorical.fetch_next_batch(10).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(categories.len(), 1);
+    assert!((records[0].accumulator.count - 0.2).abs() < 1e-10);
+    assert!((records[0].accumulator.sum - 1.4).abs() < 1e-10);
+    assert!((categories[0].accumulator.total_count - 0.2).abs() < 1e-10);
 }

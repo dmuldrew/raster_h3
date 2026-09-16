@@ -132,7 +132,9 @@ impl RowCoordinates {
             }
         };
 
-        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
+        // Center coordinates are sufficient for a single center sample only. A
+        // supersampled pixel can overlap the bbox even when its center is out.
+        if sampling.is_single_point() && ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
             if let Some([_, b_min_lat, _, b_max_lat]) = bbox {
                 if lat_row < b_min_lat || lat_row > b_max_lat {
                     return None;
@@ -171,41 +173,44 @@ impl RowCoordinates {
             (0.0, 0.0, 0.0, 0.0)
         };
 
-        let (row_c_start, row_c_end) =
-            if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) && bbox.is_some() {
-                let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
-                if ctx.d_lon_step > 0.0 {
-                    let c_s = if lon_start < b_min_lon {
-                        ((b_min_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
-                    } else {
-                        0
-                    };
-                    let c_e = if lon_start < b_max_lon {
-                        (((b_max_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
-                            .min(row_width)
-                    } else {
-                        0
-                    };
-                    (c_s, c_e)
-                } else if ctx.d_lon_step < 0.0 {
-                    let c_s = if lon_start > b_max_lon {
-                        ((b_max_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
-                    } else {
-                        0
-                    };
-                    let c_e = if lon_start > b_min_lon {
-                        (((b_min_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
-                            .min(row_width)
-                    } else {
-                        0
-                    };
-                    (c_s, c_e)
+        let (row_c_start, row_c_end) = if sampling.is_single_point()
+            && ctx.is_north_up
+            && (ctx.is_wgs84 || ctx.is_web_mercator)
+            && bbox.is_some()
+        {
+            let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
+            if ctx.d_lon_step > 0.0 {
+                let c_s = if lon_start < b_min_lon {
+                    ((b_min_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
                 } else {
-                    (0, row_width)
-                }
+                    0
+                };
+                let c_e = if lon_start < b_max_lon {
+                    (((b_max_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
+                        .min(row_width)
+                } else {
+                    0
+                };
+                (c_s, c_e)
+            } else if ctx.d_lon_step < 0.0 {
+                let c_s = if lon_start > b_max_lon {
+                    ((b_max_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
+                } else {
+                    0
+                };
+                let c_e = if lon_start > b_min_lon {
+                    (((b_min_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
+                        .min(row_width)
+                } else {
+                    0
+                };
+                (c_s, c_e)
             } else {
                 (0, row_width)
-            };
+            }
+        } else {
+            (0, row_width)
+        };
 
         if row_c_start >= row_c_end || row_c_start >= row_width {
             return None;
@@ -694,8 +699,8 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                     }
                 };
 
-                if (is_north_up && !is_wgs84 && !is_web_mercator)
-                    || (!is_north_up && is_single_point)
+                if is_single_point
+                    && ((is_north_up && !is_wgs84 && !is_web_mercator) || !is_north_up)
                 {
                     if !is_point_in_bbox(lon, lat, bbox) {
                         known_next_cell = None;
@@ -885,8 +890,8 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                     }
                 };
 
-                if (is_north_up && !is_wgs84 && !is_web_mercator)
-                    || (!is_north_up && is_single_point)
+                if is_single_point
+                    && ((is_north_up && !is_wgs84 && !is_web_mercator) || !is_north_up)
                 {
                     if !is_point_in_bbox(lon, lat, bbox) {
                         for i in 0..num_res {
