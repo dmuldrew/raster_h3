@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Preserve finite Float32 values when the NoData marker is NaN, including span statistics and variance.
+- Apply full affine coordinates to rotated/sheared raster centers and subpixel samples, including WGS84 and Web Mercator. Disable north-up scanline shortcuts for these rasters.
 - Mix all 64 bits of H3 indices when choosing aggregation shards, preventing resolutions 0–13 from collapsing into a single shard. Added distribution tests across resolutions 0–15 and local neighborhoods, plus continuous/categorical merge and eviction checks with one and four Rayon threads.
 - Propagate chunk decoding and remote prefetch errors through continuous/categorical streamers, DuckDB table functions, and Parquet/PMTiles exporters. Failed streams continue returning an error on subsequent reads instead of reporting successful EOF.
 - Deliver prefetch initialization failures even when earlier chunk slots are still empty.

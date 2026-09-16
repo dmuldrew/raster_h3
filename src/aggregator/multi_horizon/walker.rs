@@ -132,7 +132,7 @@ impl RowCoordinates {
             }
         };
 
-        if ctx.is_wgs84 || ctx.is_web_mercator {
+        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
             if let Some([_, b_min_lat, _, b_max_lat]) = bbox {
                 if lat_row < b_min_lat || lat_row > b_max_lat {
                     return None;
@@ -141,7 +141,7 @@ impl RowCoordinates {
         }
 
         let is_single_point = sampling.is_single_point();
-        let (d_lon_dx, d_lat_dx, d_lon_dy, d_lat_dy) = if !is_single_point {
+        let (d_lon_dx, d_lat_dx, d_lon_dy, d_lat_dy) = if !is_single_point && ctx.is_north_up {
             if ctx.is_wgs84 {
                 (gt.a, gt.d, gt.b, gt.e)
             } else if ctx.is_web_mercator {
@@ -171,40 +171,41 @@ impl RowCoordinates {
             (0.0, 0.0, 0.0, 0.0)
         };
 
-        let (row_c_start, row_c_end) = if (ctx.is_wgs84 || ctx.is_web_mercator) && bbox.is_some() {
-            let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
-            if ctx.d_lon_step > 0.0 {
-                let c_s = if lon_start < b_min_lon {
-                    ((b_min_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
+        let (row_c_start, row_c_end) =
+            if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) && bbox.is_some() {
+                let [b_min_lon, _, b_max_lon, _] = bbox.unwrap();
+                if ctx.d_lon_step > 0.0 {
+                    let c_s = if lon_start < b_min_lon {
+                        ((b_min_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
+                    } else {
+                        0
+                    };
+                    let c_e = if lon_start < b_max_lon {
+                        (((b_max_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
+                            .min(row_width)
+                    } else {
+                        0
+                    };
+                    (c_s, c_e)
+                } else if ctx.d_lon_step < 0.0 {
+                    let c_s = if lon_start > b_max_lon {
+                        ((b_max_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
+                    } else {
+                        0
+                    };
+                    let c_e = if lon_start > b_min_lon {
+                        (((b_min_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
+                            .min(row_width)
+                    } else {
+                        0
+                    };
+                    (c_s, c_e)
                 } else {
-                    0
-                };
-                let c_e = if lon_start < b_max_lon {
-                    (((b_max_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
-                        .min(row_width)
-                } else {
-                    0
-                };
-                (c_s, c_e)
-            } else if ctx.d_lon_step < 0.0 {
-                let c_s = if lon_start > b_max_lon {
-                    ((b_max_lon - lon_start) / ctx.d_lon_step).ceil().max(0.0) as usize
-                } else {
-                    0
-                };
-                let c_e = if lon_start > b_min_lon {
-                    (((b_min_lon - lon_start) / ctx.d_lon_step).floor().max(0.0) as usize + 1)
-                        .min(row_width)
-                } else {
-                    0
-                };
-                (c_s, c_e)
+                    (0, row_width)
+                }
             } else {
                 (0, row_width)
-            }
-        } else {
-            (0, row_width)
-        };
+            };
 
         if row_c_start >= row_c_end || row_c_start >= row_width {
             return None;
@@ -237,7 +238,7 @@ impl RowCoordinates {
         crs_transformer: &CrsTransformer,
         col_offset: usize,
     ) -> Option<(f64, f64)> {
-        if ctx.is_wgs84 || ctx.is_web_mercator {
+        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
             Some((lon_curr, self.lat_row))
         } else if ctx.is_north_up {
             crs_transformer.transform_point(x_curr, self.y_row).ok()
@@ -260,7 +261,7 @@ impl RowCoordinates {
         run_cell: u64,
         bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
-        if ctx.is_wgs84 || ctx.is_web_mercator {
+        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
             row_cache.find_span_end(
                 c,
                 self.row_c_end,
@@ -313,6 +314,10 @@ impl RowCoordinates {
     where
         FCheck: FnMut(f64, f64) -> bool,
     {
+        // A rotated pixel needs the full affine transform for each sample.
+        if !ctx.is_north_up {
+            return (c, c);
+        }
         row_cache.find_core_span(c, span_end, dx_bounds, dy_bounds, |px, py| {
             let (lon, lat) = if ctx.is_wgs84 {
                 (
@@ -354,20 +359,23 @@ impl RowCoordinates {
     ) where
         F: FnMut(f64, f64, f64, f64, f64),
     {
+        if !ctx.is_north_up {
+            for sp in &sampling.points {
+                let (x, y) =
+                    gt.pixel_to_coord((col_offset + k) as f64 + sp.dx, self.row_idx as f64 + sp.dy);
+                if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
+                    if is_point_in_bbox(lon, lat, bbox) {
+                        f(lon, lat, sp.dx - 0.5, sp.dy - 0.5, sp.weight);
+                    }
+                }
+            }
+            return;
+        }
         let (k_lon, k_lat) = if ctx.is_wgs84 || ctx.is_web_mercator {
             (self.lon_start + (k as f64) * ctx.d_lon_step, self.lat_row)
-        } else if ctx.is_north_up {
+        } else {
             let x_k = self.x_start + (k as f64) * ctx.dx_step;
             match crs_transformer.transform_point(x_k, self.y_row) {
-                Ok(coords) => coords,
-                Err(_) => (
-                    self.lon_start + (k as f64) * self.d_lon_dx,
-                    self.lat_row + (k as f64) * self.d_lat_dx,
-                ),
-            }
-        } else {
-            let (x_k, y_k) = gt.pixel_center_to_coord(col_offset + k, self.row_idx);
-            match crs_transformer.transform_point(x_k, y_k) {
                 Ok(coords) => coords,
                 Err(_) => (
                     self.lon_start + (k as f64) * self.d_lon_dx,
@@ -686,7 +694,9 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                     }
                 };
 
-                if !is_wgs84 && !is_web_mercator {
+                if (is_north_up && !is_wgs84 && !is_web_mercator)
+                    || (!is_north_up && is_single_point)
+                {
                     if !is_point_in_bbox(lon, lat, bbox) {
                         known_next_cell = None;
                         c += 1;
@@ -875,7 +885,9 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                     }
                 };
 
-                if !is_wgs84 && !is_web_mercator {
+                if (is_north_up && !is_wgs84 && !is_web_mercator)
+                    || (!is_north_up && is_single_point)
+                {
                     if !is_point_in_bbox(lon, lat, bbox) {
                         for i in 0..num_res {
                             if run_cells[i] != 0 && engine.has_samples(&run_accs[i]) {
