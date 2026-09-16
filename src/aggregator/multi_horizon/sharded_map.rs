@@ -9,10 +9,17 @@ use crate::aggregator::horizon_streamer::{compute_cell_south_lat, HexEvictionEnt
 /// Number of concurrent shards for parallel active map merging
 pub const NUM_SHARDS: usize = 32;
 
-/// Fast, uniform shard partitioner for 64-bit H3 cell indices
+/// Mix the full H3 index before selecting a power-of-two shard.
+/// Unused H3 child digits fill the low bits with ones, so masking the low
+/// bits of a simple product sends every cell at resolutions 0..=13 to one shard.
 #[inline(always)]
 pub fn get_shard(cell_u64: u64) -> usize {
-    let h = cell_u64.wrapping_mul(0x517c_c1b7_2722_0a95);
+    // SplitMix64 finalizer: fold the varying base-cell and child digits into
+    // every output bit. Keep all arithmetic in u64 on both 32- and 64-bit hosts.
+    let mut h = cell_u64;
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
     (h as usize) & (NUM_SHARDS - 1)
 }
 

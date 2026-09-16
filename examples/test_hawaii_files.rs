@@ -55,11 +55,13 @@ fn main() {
     let mut cfl_sum_val = 0.0f64;
 
     loop {
-        let n = streamer_cfl.drain_completed_into(2048, |_i, rec| {
-            total_cfl_hexes += 1;
-            total_cfl_pixels += rec.accumulator.count;
-            cfl_sum_val += rec.accumulator.sum;
-        });
+        let n = streamer_cfl
+            .drain_completed_into(2048, |_i, rec| {
+                total_cfl_hexes += 1;
+                total_cfl_pixels += rec.accumulator.count;
+                cfl_sum_val += rec.accumulator.sum;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -96,10 +98,12 @@ fn main() {
     let mut bbox_cfl_pixels = 0.0f64;
 
     loop {
-        let n = streamer_cfl_bbox.drain_completed_into(2048, |_i, rec| {
-            bbox_cfl_hexes += 1;
-            bbox_cfl_pixels += rec.accumulator.count;
-        });
+        let n = streamer_cfl_bbox
+            .drain_completed_into(2048, |_i, rec| {
+                bbox_cfl_hexes += 1;
+                bbox_cfl_pixels += rec.accumulator.count;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -131,20 +135,22 @@ fn main() {
     let mut point_cell_found = false;
 
     loop {
-        let n = streamer_cfl_cell.drain_completed_into(2048, |_i, rec| {
-            point_hexes += 1;
-            if rec.h3_index == u64::from(target_cell) {
-                point_cell_found = true;
-                println!(
-                    "      - Cell {:x}: Mean={:.2}, Count={:.0}, Min={:.2}, Max={:.2}",
-                    rec.h3_index,
-                    rec.accumulator.mean(),
-                    rec.accumulator.count,
-                    rec.accumulator.min,
-                    rec.accumulator.max
-                );
-            }
-        });
+        let n = streamer_cfl_cell
+            .drain_completed_into(2048, |_i, rec| {
+                point_hexes += 1;
+                if rec.h3_index == u64::from(target_cell) {
+                    point_cell_found = true;
+                    println!(
+                        "      - Cell {:x}: Mean={:.2}, Count={:.0}, Min={:.2}, Max={:.2}",
+                        rec.h3_index,
+                        rec.accumulator.mean(),
+                        rec.accumulator.count,
+                        rec.accumulator.min,
+                        rec.accumulator.max
+                    );
+                }
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -195,12 +201,14 @@ fn main() {
     let mut class_distribution = std::collections::HashMap::new();
 
     loop {
-        let n = streamer_lf.drain_completed_into(2048, |_i, rec| {
-            total_lf_hexes += 1;
-            total_lf_pixels += rec.accumulator.total_count;
-            let (maj_cls, _, _) = rec.accumulator.majority();
-            *class_distribution.entry(maj_cls).or_insert(0usize) += 1;
-        });
+        let n = streamer_lf
+            .drain_completed_into(2048, |_i, rec| {
+                total_lf_hexes += 1;
+                total_lf_pixels += rec.accumulator.total_count;
+                let (maj_cls, _, _) = rec.accumulator.majority();
+                *class_distribution.entry(maj_cls).or_insert(0usize) += 1;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -241,11 +249,13 @@ fn main() {
     let mut projected_hexes = 0usize;
 
     loop {
-        let n = streamer_lf_proj.drain_completed_into(2048, |_i, rec| {
-            // Projected query: only majority class needed, JSON histogram bypassed
-            let _ = rec.accumulator.majority();
-            projected_hexes += 1;
-        });
+        let n = streamer_lf_proj
+            .drain_completed_into(2048, |_i, rec| {
+                // Projected query: only majority class needed, JSON histogram bypassed
+                let _ = rec.accumulator.majority();
+                projected_hexes += 1;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -276,10 +286,12 @@ fn main() {
     let mut maui_pixels = 0.0f64;
 
     loop {
-        let n = streamer_lf_maui.drain_completed_into(2048, |_i, rec| {
-            maui_hexes += 1;
-            maui_pixels += rec.accumulator.total_count;
-        });
+        let n = streamer_lf_maui
+            .drain_completed_into(2048, |_i, rec| {
+                maui_hexes += 1;
+                maui_pixels += rec.accumulator.total_count;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -306,13 +318,15 @@ fn main() {
     let mut r8_count = 0usize;
 
     loop {
-        let n = streamer_multi.drain_completed_into(2048, |_i, rec| {
-            if rec.resolution == 7 {
-                r7_count += 1;
-            } else if rec.resolution == 8 {
-                r8_count += 1;
-            }
-        });
+        let n = streamer_multi
+            .drain_completed_into(2048, |_i, rec| {
+                if rec.resolution == 7 {
+                    r7_count += 1;
+                } else if rec.resolution == 8 {
+                    r8_count += 1;
+                }
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -341,23 +355,25 @@ fn main() {
     let mut max_distinct = 0usize;
 
     loop {
-        let n = streamer_ent.drain_completed_into(2048, |_i, rec| {
-            total_ent_hexes += 1;
-            let entropy = rec.accumulator.shannon_entropy();
-            let distinct = rec.accumulator.unique_classes();
-            if entropy == 0.0 {
-                pure_hexes += 1;
-            }
-            if entropy > 1.0 {
-                diverse_hexes += 1;
-            }
-            if entropy > max_entropy {
-                max_entropy = entropy;
-            }
-            if distinct > max_distinct {
-                max_distinct = distinct;
-            }
-        });
+        let n = streamer_ent
+            .drain_completed_into(2048, |_i, rec| {
+                total_ent_hexes += 1;
+                let entropy = rec.accumulator.shannon_entropy();
+                let distinct = rec.accumulator.unique_classes();
+                if entropy == 0.0 {
+                    pure_hexes += 1;
+                }
+                if entropy > 1.0 {
+                    diverse_hexes += 1;
+                }
+                if entropy > max_entropy {
+                    max_entropy = entropy;
+                }
+                if distinct > max_distinct {
+                    max_distinct = distinct;
+                }
+            })
+            .unwrap();
         if n == 0 {
             break;
         }

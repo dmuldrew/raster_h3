@@ -130,7 +130,7 @@ fn test_multiband_selection_and_samples_per_pixel() {
         ..Default::default()
     };
     let mut streamer_b1 = MultiScanHorizonStreamer::new(reader.clone(), &config_b1).unwrap();
-    let records_b1 = streamer_b1.fetch_next_batch(1000);
+    let records_b1 = streamer_b1.fetch_next_batch(1000).unwrap();
     assert!(!records_b1.is_empty());
     for rec in &records_b1 {
         assert_eq!(rec.accumulator.mean(), 50.0);
@@ -143,7 +143,7 @@ fn test_multiband_selection_and_samples_per_pixel() {
         ..Default::default()
     };
     let mut streamer_b2 = MultiScanHorizonStreamer::new(reader.clone(), &config_b2).unwrap();
-    let records_b2 = streamer_b2.fetch_next_batch(1000);
+    let records_b2 = streamer_b2.fetch_next_batch(1000).unwrap();
     assert!(!records_b2.is_empty());
     for rec in &records_b2 {
         assert_eq!(rec.accumulator.mean(), 100.0);
@@ -156,7 +156,7 @@ fn test_multiband_selection_and_samples_per_pixel() {
         ..Default::default()
     };
     let mut streamer_b4 = MultiScanHorizonStreamer::new(reader, &config_b4).unwrap();
-    let records_b4 = streamer_b4.fetch_next_batch(1000);
+    let records_b4 = streamer_b4.fetch_next_batch(1000).unwrap();
     assert!(!records_b4.is_empty());
     for rec in &records_b4 {
         assert_eq!(rec.accumulator.mean(), 200.0);
@@ -182,7 +182,7 @@ fn test_spectral_formula_ndvi_on_the_fly() {
     };
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000);
+    let records = streamer.fetch_next_batch(1000).unwrap();
     assert!(!records.is_empty());
     for rec in &records {
         assert!((rec.accumulator.mean() - 0.60).abs() < 1e-6);
@@ -211,7 +211,7 @@ fn test_spectral_formula_ndwi_on_the_fly() {
     };
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000);
+    let records = streamer.fetch_next_batch(1000).unwrap();
     assert!(!records.is_empty());
     for rec in &records {
         assert!((rec.accumulator.mean() - (-1.0 / 3.0)).abs() < 1e-6);
@@ -233,7 +233,7 @@ fn test_continuous_predicate_pushdown_min_count_and_mean() {
     let mut streamer_base = MultiScanHorizonStreamer::new(reader_base, &config_base).unwrap();
     let mut baseline_records = Vec::new();
     loop {
-        let b = streamer_base.fetch_next_batch(200);
+        let b = streamer_base.fetch_next_batch(200).unwrap();
         if b.is_empty() {
             break;
         }
@@ -251,7 +251,7 @@ fn test_continuous_predicate_pushdown_min_count_and_mean() {
     let mut streamer_count = MultiScanHorizonStreamer::new(reader_count, &config_count).unwrap();
     let mut count_filtered = Vec::new();
     loop {
-        let b = streamer_count.fetch_next_batch(200);
+        let b = streamer_count.fetch_next_batch(200).unwrap();
         if b.is_empty() {
             break;
         }
@@ -273,7 +273,7 @@ fn test_continuous_predicate_pushdown_min_count_and_mean() {
     let mut streamer_mean = MultiScanHorizonStreamer::new(reader_mean, &config_mean).unwrap();
     let mut mean_filtered = Vec::new();
     loop {
-        let b = streamer_mean.fetch_next_batch(200);
+        let b = streamer_mean.fetch_next_batch(200).unwrap();
         if b.is_empty() {
             break;
         }
@@ -312,7 +312,7 @@ fn test_categorical_predicate_pushdown_majority_fraction() {
     let mut streamer_all = MultiCategoricalHorizonStreamer::new(reader_all, &config_all).unwrap();
     let mut all_records = Vec::new();
     loop {
-        let b = streamer_all.fetch_next_batch(200);
+        let b = streamer_all.fetch_next_batch(200).unwrap();
         if b.is_empty() {
             break;
         }
@@ -337,7 +337,7 @@ fn test_categorical_predicate_pushdown_majority_fraction() {
     let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut filtered = Vec::new();
     loop {
-        let b = streamer.fetch_next_batch(200);
+        let b = streamer.fetch_next_batch(200).unwrap();
         if b.is_empty() {
             break;
         }
@@ -367,7 +367,7 @@ fn test_hierarchical_compaction_continuous_conservation() {
     let mut streamer_raw = MultiScanHorizonStreamer::new(reader_raw, &config_raw).unwrap();
     let mut uncompacted_records = Vec::new();
     loop {
-        let b = streamer_raw.fetch_next_batch(500);
+        let b = streamer_raw.fetch_next_batch(500).unwrap();
         if b.is_empty() {
             break;
         }
@@ -390,7 +390,7 @@ fn test_hierarchical_compaction_continuous_conservation() {
     let mut streamer_comp = MultiScanHorizonStreamer::new(reader_comp, &config_comp).unwrap();
     let mut compacted_records = Vec::new();
     loop {
-        let b = streamer_comp.fetch_next_batch(500);
+        let b = streamer_comp.fetch_next_batch(500).unwrap();
         if b.is_empty() {
             break;
         }
@@ -439,7 +439,7 @@ fn test_hierarchical_compaction_categorical_conservation() {
     let mut streamer_raw = MultiCategoricalHorizonStreamer::new(reader_raw, &config_raw).unwrap();
     let mut uncompacted = Vec::new();
     loop {
-        let b = streamer_raw.fetch_next_batch(500);
+        let b = streamer_raw.fetch_next_batch(500).unwrap();
         if b.is_empty() {
             break;
         }
@@ -459,7 +459,7 @@ fn test_hierarchical_compaction_categorical_conservation() {
         MultiCategoricalHorizonStreamer::new(reader_comp, &config_comp).unwrap();
     let mut compacted = Vec::new();
     loop {
-        let b = streamer_comp.fetch_next_batch(500);
+        let b = streamer_comp.fetch_next_batch(500).unwrap();
         if b.is_empty() {
             break;
         }
@@ -493,7 +493,7 @@ fn test_spectral_formula_nbr_on_the_fly() {
     };
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000);
+    let records = streamer.fetch_next_batch(1000).unwrap();
     assert!(!records.is_empty());
     for rec in &records {
         assert!((rec.accumulator.mean() - 0.40).abs() < 1e-6);
@@ -525,7 +525,7 @@ fn test_spectral_formula_evi_on_the_fly() {
     };
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000);
+    let records = streamer.fetch_next_batch(1000).unwrap();
     assert!(!records.is_empty());
     let expected_evi = 150.0 / 126.0;
     for rec in &records {
@@ -554,7 +554,7 @@ fn test_spectral_formula_zero_denominator_and_nodata_resilience() {
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut records = Vec::new();
     loop {
-        let b = streamer.fetch_next_batch(500);
+        let b = streamer.fetch_next_batch(500).unwrap();
         if b.is_empty() {
             break;
         }
@@ -584,7 +584,7 @@ fn test_spectral_formula_out_of_bounds_band_clamping() {
     };
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000);
+    let records = streamer.fetch_next_batch(1000).unwrap();
     assert!(!records.is_empty());
     // Band 99 is clamped to Band 4 (NIR=200), Red is Band 1 (Red=50) -> NDVI = 0.60
     for rec in &records {

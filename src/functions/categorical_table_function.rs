@@ -231,7 +231,13 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 });
 
             let batch = match batch_opt {
-                Some(b) if !b.is_empty() => b,
+                Ok(Some(b)) if !b.is_empty() => b,
+                Err(error) => {
+                    let message = to_c_string(&error.to_string());
+                    duckdb_function_set_error(info, message.as_ptr());
+                    duckdb_data_chunk_set_size(output, 0);
+                    return;
+                }
                 _ => {
                     duckdb_data_chunk_set_size(output, 0);
                     return;
@@ -392,7 +398,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     };
 
                     let mut added_any = false;
-                    streamer.drain_completed_into(512, |_i, rec| {
+                    let result = streamer.drain_completed_into(512, |_i, rec| {
                         added_any = true;
                         let mut entries: Vec<(i64, f64)> =
                             Vec::with_capacity(rec.accumulator.unique_classes());
@@ -422,6 +428,13 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         }
                     });
 
+                    if let Err(error) = result {
+                        long_queue.clear();
+                        let message = to_c_string(&error.to_string());
+                        duckdb_function_set_error(info, message.as_ptr());
+                        duckdb_data_chunk_set_size(output, 0);
+                        return;
+                    }
                     if !added_any {
                         break;
                     }

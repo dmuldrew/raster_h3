@@ -42,7 +42,7 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
     multi_res_map.insert(9, HashMap::new());
 
     loop {
-        let batch = multi_streamer.fetch_next_batch(32);
+        let batch = multi_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -66,7 +66,7 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -139,7 +139,7 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
     multi_cat_map.insert(8, HashMap::new());
 
     loop {
-        let batch = multi_cat_streamer.fetch_next_batch(32);
+        let batch = multi_cat_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -162,7 +162,7 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -255,7 +255,7 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
     multi_res_map.insert(9, HashMap::new());
 
     loop {
-        let batch = multi_streamer.fetch_next_batch(32);
+        let batch = multi_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -280,7 +280,7 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -358,7 +358,7 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
     multi_cat_map.insert(9, HashMap::new());
 
     loop {
-        let batch = multi_cat_streamer.fetch_next_batch(32);
+        let batch = multi_cat_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -382,7 +382,7 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }

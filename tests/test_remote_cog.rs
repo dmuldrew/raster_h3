@@ -568,7 +568,7 @@ fn test_remote_end_to_end_multi_resolution_streamer() {
     let mut streamer = MultiScanHorizonStreamer::new(remote_reader, &config).unwrap();
     let mut records = Vec::new();
     loop {
-        let batch = streamer.fetch_next_batch(256);
+        let batch = streamer.fetch_next_batch(256).unwrap();
         if batch.is_empty() {
             break;
         }

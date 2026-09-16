@@ -214,7 +214,13 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
         });
 
     let batch = match batch_opt {
-        Some(b) if !b.is_empty() => b,
+        Ok(Some(b)) if !b.is_empty() => b,
+        Err(error) => {
+            let message = to_c_string(&error.to_string());
+            duckdb_function_set_error(info, message.as_ptr());
+            duckdb_data_chunk_set_size(output, 0);
+            return;
+        }
         _ => {
             duckdb_data_chunk_set_size(output, 0);
             return;

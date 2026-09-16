@@ -103,7 +103,7 @@ fn main() {
 
     loop {
         max_in_flight = max_in_flight.max(streamer.active_cell_count());
-        let batch = streamer.fetch_next_batch(256);
+        let batch = streamer.fetch_next_batch(256).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -145,7 +145,7 @@ fn main() {
     let mut cat_mass = 0.0;
 
     loop {
-        let batch = cat_streamer.fetch_next_batch(256);
+        let batch = cat_streamer.fetch_next_batch(256).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -184,7 +184,7 @@ fn main() {
     let mut rgss_mass = 0.0;
 
     loop {
-        let batch = rgss_streamer.fetch_next_batch(256);
+        let batch = rgss_streamer.fetch_next_batch(256).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -216,7 +216,7 @@ fn main() {
     let mut roi_mass = 0.0;
 
     loop {
-        let batch = roi_streamer.fetch_next_batch(256);
+        let batch = roi_streamer.fetch_next_batch(256).unwrap();
         if batch.is_empty() {
             break;
         }

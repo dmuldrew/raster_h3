@@ -157,13 +157,13 @@ impl MultiScanHorizonStreamer {
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
     #[inline(always)]
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<MultiContinuousRecord> {
+    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<MultiContinuousRecord>> {
         self.inner.fetch_next_batch(max_rows)
     }
 
     /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
     #[inline(always)]
-    pub fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> usize
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
     where
         F: FnMut(usize, MultiContinuousRecord),
     {
@@ -172,8 +172,8 @@ impl MultiScanHorizonStreamer {
 
     /// Advance scanline horizon until at least `min_rows` completed records are available or finished
     #[inline(always)]
-    pub fn advance_until_completed(&mut self, min_rows: usize) {
-        self.inner.advance_until_completed(min_rows);
+    pub fn advance_until_completed(&mut self, min_rows: usize) -> Result<()> {
+        self.inner.advance_until_completed(min_rows)
     }
 
     /// Return current southernmost latitude reached by scanline horizon

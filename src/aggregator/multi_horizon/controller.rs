@@ -69,6 +69,7 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     pub resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
     pub completed_buffer: VecDeque<K::Record>,
     pub is_finished: bool,
+    failure: Option<String>,
     pub current_lat_horizon: f64,
     pub profile_stats: [u64; 4],
     pub processed_chunk_count: usize,
@@ -131,6 +132,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             resolution_shards,
             completed_buffer: VecDeque::with_capacity(2048),
             is_finished: false,
+            failure: None,
             current_lat_horizon: f64::INFINITY,
             profile_stats: [0; 4],
             processed_chunk_count: 0,
@@ -240,7 +242,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     }
 
     /// Advance scanline horizon until at least `min_rows` completed records are available or finished
-    pub fn advance_until_completed(&mut self, min_rows: usize) {
+    pub fn advance_until_completed(&mut self, min_rows: usize) -> Result<()> {
+        if let Some(reason) = &self.failure {
+            return Err(RasterH3Error::StreamFailed(reason.clone()));
+        }
         let batch_size = (rayon::current_num_threads() * 8).clamp(64, 256);
         let min_batch = (rayon::current_num_threads() * 2).clamp(16, 64);
         let mut chunk_items = Vec::with_capacity(batch_size);
@@ -253,7 +258,19 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
             self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
 
+            // Reject the whole batch before merging or emitting any of its records.
+            if let Some(error) = chunk_items.iter().find_map(|item| item.as_ref().err()) {
+                return Err(self.fail(error.to_string()));
+            }
+
             if chunk_items.is_empty() {
+                if self.processed_chunk_count != self.mosaic.chunk_refs.len() {
+                    return Err(self.fail(format!(
+                        "Prefetch ended after {} of {} chunks",
+                        self.processed_chunk_count,
+                        self.mosaic.chunk_refs.len()
+                    )));
+                }
                 self.is_finished = true;
                 self.current_lat_horizon = f64::NEG_INFINITY;
                 let num_res = self.resolutions.len();
@@ -343,7 +360,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                                 std::mem::replace(decoding_result, DecodingResult::U8(Vec::new())),
                             )
                         }
-                        Err(_) => (Vec::new(), DecodingResult::U8(Vec::new())),
+                        Err(_) => unreachable!("chunk errors were checked before dispatch"),
                     },
                 )
                 .collect();
@@ -376,11 +393,22 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Latch failures so subsequent reads cannot mistake a failed stream for EOF.
+    fn fail(&mut self, reason: String) -> RasterH3Error {
+        self.failure = Some(reason.clone());
+        self.prefetcher.take();
+        self.completed_buffer.clear();
+        self.pending_compact.clear();
+        self.resolution_shards.clear();
+        RasterH3Error::StreamFailed(reason)
     }
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<K::Record> {
-        self.advance_until_completed(max_rows);
+    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<K::Record>> {
+        self.advance_until_completed(max_rows)?;
         let num_to_take = max_rows.min(self.completed_buffer.len());
         let mut batch = Vec::with_capacity(num_to_take);
         for _ in 0..num_to_take {
@@ -388,22 +416,22 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 batch.push(record);
             }
         }
-        batch
+        Ok(batch)
     }
 
     /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
-    pub fn drain_completed_into<F>(&mut self, max_rows: usize, mut consumer: F) -> usize
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, mut consumer: F) -> Result<usize>
     where
         F: FnMut(usize, K::Record),
     {
-        self.advance_until_completed(max_rows);
+        self.advance_until_completed(max_rows)?;
         let num_to_take = max_rows.min(self.completed_buffer.len());
         for i in 0..num_to_take {
             if let Some(record) = self.completed_buffer.pop_front() {
                 consumer(i, record);
             }
         }
-        num_to_take
+        Ok(num_to_take)
     }
 
     /// Return total active in-flight cells across all resolutions

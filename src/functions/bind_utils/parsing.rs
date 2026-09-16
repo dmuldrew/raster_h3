@@ -109,25 +109,29 @@ mod tests {
         let streamer = Mutex::new(vec![10u64, 20, 30, 40, 50]);
 
         // First refill
-        let b1 = queue.pop_or_refill(&streamer, |s, max_rows, f| {
-            let num = max_rows.min(s.len());
-            let taken: Vec<u64> = s.drain(..num).collect();
-            for (i, v) in taken.into_iter().enumerate() {
-                f(i, v);
-            }
-            num
-        });
+        let b1 = queue
+            .pop_or_refill(&streamer, |s, max_rows, f| {
+                let num = max_rows.min(s.len());
+                let taken: Vec<u64> = s.drain(..num).collect();
+                for (i, v) in taken.into_iter().enumerate() {
+                    f(i, v);
+                }
+                Ok(num)
+            })
+            .unwrap();
         assert_eq!(b1, Some(vec![10, 20, 30, 40, 50]));
 
         // Second refill at EOF
-        let b2 = queue.pop_or_refill(&streamer, |s, max_rows, f| {
-            let num = max_rows.min(s.len());
-            let taken: Vec<u64> = s.drain(..num).collect();
-            for (i, v) in taken.into_iter().enumerate() {
-                f(i, v);
-            }
-            num
-        });
+        let b2 = queue
+            .pop_or_refill(&streamer, |s, max_rows, f| {
+                let num = max_rows.min(s.len());
+                let taken: Vec<u64> = s.drain(..num).collect();
+                for (i, v) in taken.into_iter().enumerate() {
+                    f(i, v);
+                }
+                Ok(num)
+            })
+            .unwrap();
         assert_eq!(b2, None);
         assert!(queue.is_finished.load(Ordering::Acquire));
     }

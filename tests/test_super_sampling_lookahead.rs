@@ -44,7 +44,7 @@ fn test_continuous_supersampling_all_patterns_conservation() {
         let mut cell_count = 0;
 
         loop {
-            let batch = streamer.fetch_next_batch(64);
+            let batch = streamer.fetch_next_batch(64).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -128,7 +128,7 @@ fn test_continuous_gradient_supersampling_consistency() {
         let mut cell_count = 0;
 
         loop {
-            let batch = streamer.fetch_next_batch(64);
+            let batch = streamer.fetch_next_batch(64).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -203,7 +203,7 @@ fn test_categorical_supersampling_all_patterns_conservation() {
         let mut cell_count = 0;
 
         loop {
-            let batch = streamer.fetch_next_batch(64);
+            let batch = streamer.fetch_next_batch(64).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -265,7 +265,7 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
         let mut cell_count = 0;
 
         loop {
-            let batch = streamer.fetch_next_batch(64);
+            let batch = streamer.fetch_next_batch(64).unwrap();
             if batch.is_empty() {
                 break;
             }

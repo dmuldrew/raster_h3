@@ -121,7 +121,11 @@ pub trait ParquetStreamer {
     type Record;
 
     /// Drain up to `max_rows` completed records directly into a consumer closure
-    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> usize
+    fn drain_completed_into<F>(
+        &mut self,
+        max_rows: usize,
+        consumer: F,
+    ) -> crate::error::Result<usize>
     where
         F: FnMut(usize, Self::Record);
 
@@ -135,7 +139,11 @@ impl ParquetStreamer for MultiScanHorizonStreamer {
     type Record = MultiContinuousRecord;
 
     #[inline(always)]
-    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> usize
+    fn drain_completed_into<F>(
+        &mut self,
+        max_rows: usize,
+        consumer: F,
+    ) -> crate::error::Result<usize>
     where
         F: FnMut(usize, Self::Record),
     {
@@ -152,7 +160,11 @@ impl ParquetStreamer for MultiCategoricalHorizonStreamer {
     type Record = MultiCategoricalRecord;
 
     #[inline(always)]
-    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> usize
+    fn drain_completed_into<F>(
+        &mut self,
+        max_rows: usize,
+        consumer: F,
+    ) -> crate::error::Result<usize>
     where
         F: FnMut(usize, Self::Record),
     {
@@ -778,7 +790,15 @@ where
         }
     }
 
-    let file = File::create(&parquet_path)?;
+    // Publish only a complete export. Failed streams must not replace an existing file
+    // with a valid-looking, partial Parquet dataset.
+    let parent = parquet_path
+        .as_ref()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output_file = tempfile::NamedTempFile::new_in(parent)?;
+    let file = output_file.reopen()?;
     let mut writer = SerializedFileWriter::new(file, schema, props)?;
 
     let (writer_tx, writer_rx) = sync_channel::<B>(2);
@@ -811,9 +831,18 @@ where
 
     loop {
         let space_left = row_group_size.saturating_sub(current_buf.len()).max(1);
-        let drained = streamer.drain_completed_into(space_left, |_, record| {
+        let drained = match streamer.drain_completed_into(space_left, |_, record| {
             current_buf.push_record(record);
-        });
+        }) {
+            Ok(n) => n,
+            Err(error) => {
+                // Unblock the writer and join it before returning the stream failure.
+                drop(writer_tx);
+                drop(recycle_rx);
+                let _ = writer_handle.join();
+                return Err(error.into());
+            }
+        };
         total_drained += drained;
         if drained > 0 {
             progress_callback(total_drained);
@@ -842,6 +871,7 @@ where
         Ok(res) => res?,
         Err(_) => return Err("Background Parquet writer thread panicked".into()),
     };
+    output_file.persist(&parquet_path)?;
     Ok(total_hexagons)
 }
 

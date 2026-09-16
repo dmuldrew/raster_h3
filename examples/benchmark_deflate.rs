@@ -232,10 +232,12 @@ fn main() {
     let mut total_pixels_streamed = 0.0f64;
 
     loop {
-        let n = streamer.drain_completed_into(2048, |_i, rec| {
-            total_hexes += 1;
-            total_pixels_streamed += rec.accumulator.count;
-        });
+        let n = streamer
+            .drain_completed_into(2048, |_i, rec| {
+                total_hexes += 1;
+                total_pixels_streamed += rec.accumulator.count;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }

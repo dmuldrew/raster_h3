@@ -180,7 +180,7 @@ fn test_scan_horizon_streamer_with_prefetch_and_coherence() {
 
     let mut all_yielded = Vec::new();
     loop {
-        let batch = streamer.fetch_next_batch(10);
+        let batch = streamer.fetch_next_batch(10).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -215,7 +215,7 @@ fn test_bounding_box_pruning() {
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut filtered_pixels: f64 = 0.0;
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -248,7 +248,7 @@ fn test_web_mercator_hoisted_streaming() {
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_count: f64 = 0.0;
     loop {
-        let batch = streamer.fetch_next_batch(64);
+        let batch = streamer.fetch_next_batch(64).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -383,7 +383,7 @@ fn test_categorical_horizon_streaming() {
     let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let mut all_yielded = Vec::new();
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -416,7 +416,7 @@ fn test_u16_raster_streaming() {
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -444,7 +444,7 @@ fn test_f64_raster_streaming() {
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -472,7 +472,7 @@ fn test_subpixel_rgss_streaming() {
     let mut has_fractional_cell = false;
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -514,7 +514,7 @@ fn test_subpixel_hex_streaming() {
     let mut total_pixels = 0.0;
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -548,7 +548,7 @@ fn test_nodata_filtering_preserves_statistics() {
     let mut total_pixels = 0.0;
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -582,7 +582,7 @@ fn test_nan_filtering_in_streaming() {
     let mut total_pixels = 0.0;
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -613,7 +613,7 @@ fn test_custom_nodata_override() {
     let mut total_pixels = 0.0;
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -717,7 +717,7 @@ fn test_categorical_homogeneous_raster() {
     let mut all_yielded = Vec::new();
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -852,7 +852,7 @@ fn test_plain_tiff_without_geokeys() {
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_pixels = 0.0;
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -1069,7 +1069,7 @@ fn test_all_nodata_full_stream_scan_and_categorical() {
     let mut scan_streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let mut total_accumulated_pixels = 0.0;
     loop {
-        let batch = scan_streamer.fetch_next_batch(16);
+        let batch = scan_streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -1084,7 +1084,7 @@ fn test_all_nodata_full_stream_scan_and_categorical() {
     let mut cat_streamer = MultiCategoricalHorizonStreamer::new(reader_cat, &config).unwrap();
     let mut total_categorical_pixels = 0.0;
     loop {
-        let batch = cat_streamer.fetch_next_batch(16);
+        let batch = cat_streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -1200,7 +1200,7 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
     let mut class_10_total = 0.0;
 
     loop {
-        let batch = streamer.fetch_next_batch(16);
+        let batch = streamer.fetch_next_batch(16).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -1239,7 +1239,7 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
     let mut map: std::collections::HashMap<u64, raster_h3::aggregator::accumulator::H3Accumulator> =
         std::collections::HashMap::new();
     while !streamer.is_finished() {
-        for record in streamer.fetch_next_batch(2048) {
+        for record in streamer.fetch_next_batch(2048).unwrap() {
             map.entry(record.h3_index)
                 .and_modify(|acc| acc.merge(&record.accumulator))
                 .or_insert(record.accumulator);
@@ -1281,16 +1281,18 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
     let mut r8_class_distribution: HashMap<i64, usize> = HashMap::new();
 
     loop {
-        let n = streamer.drain_completed_into(2048, |_i, rec| {
-            if rec.resolution == 7 {
-                r7_count += 1;
-            } else if rec.resolution == 8 {
-                r8_count += 1;
-                total_pixels += rec.accumulator.total_count;
-                let (maj_cls, _, _) = rec.accumulator.majority();
-                *r8_class_distribution.entry(maj_cls).or_insert(0usize) += 1;
-            }
-        });
+        let n = streamer
+            .drain_completed_into(2048, |_i, rec| {
+                if rec.resolution == 7 {
+                    r7_count += 1;
+                } else if rec.resolution == 8 {
+                    r8_count += 1;
+                    total_pixels += rec.accumulator.total_count;
+                    let (maj_cls, _, _) = rec.accumulator.majority();
+                    *r8_class_distribution.entry(maj_cls).or_insert(0usize) += 1;
+                }
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -1337,9 +1339,11 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
     let mut maui_hexes = 0usize;
 
     loop {
-        let n = streamer_maui.drain_completed_into(2048, |_i, _rec| {
-            maui_hexes += 1;
-        });
+        let n = streamer_maui
+            .drain_completed_into(2048, |_i, _rec| {
+                maui_hexes += 1;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -1363,7 +1367,7 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
     let mut streamer_full = MultiScanHorizonStreamer::new(reader_full, &config_full).unwrap();
     let mut full_pixels = 0.0f64;
     loop {
-        let batch = streamer_full.fetch_next_batch(100);
+        let batch = streamer_full.fetch_next_batch(100).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -1384,7 +1388,7 @@ fn test_spatial_filter_pushdown_chunk_skipping() {
         MultiScanHorizonStreamer::new(reader_filtered, &config_filtered).unwrap();
     let mut filtered_pixels = 0.0f64;
     loop {
-        let batch = streamer_filtered.fetch_next_batch(100);
+        let batch = streamer_filtered.fetch_next_batch(100).unwrap();
         if batch.is_empty() {
             break;
         }

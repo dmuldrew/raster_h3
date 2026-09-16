@@ -7,9 +7,7 @@ use fxhash::FxBuildHasher;
 use h3o::{LatLng, Resolution};
 use std::collections::HashMap;
 
-use crate::aggregator::h3_scanline::{
-    can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead,
-};
+use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
@@ -105,9 +103,6 @@ pub struct RowCoordinates {
     pub d_lat_dy: f64,
     pub row_c_start: usize,
     pub row_c_end: usize,
-    pub cos_lat: f64,
-    pub cos_lat_sq: f64,
-    pub px_diag_m: f64,
 }
 
 impl RowCoordinates {
@@ -215,27 +210,6 @@ impl RowCoordinates {
             return None;
         }
 
-        let cos_lat = lat_row.to_radians().cos();
-        let cos_lat_sq = cos_lat * cos_lat;
-
-        let px_diag_m = if !is_single_point {
-            if ctx.is_wgs84 {
-                let dx_m = ctx.d_lon_step.abs() * 111_320.0 * cos_lat;
-                let dy_m = gt.e.abs() * 110_540.0;
-                dx_m.hypot(dy_m)
-            } else if ctx.is_web_mercator {
-                let dx_m = ctx.d_lon_step.abs() * 111_320.0 * cos_lat;
-                let dy_m = d_lat_dy.abs() * 110_540.0;
-                dx_m.hypot(dy_m)
-            } else {
-                let dx_m = (d_lon_dx * cos_lat).hypot(d_lat_dx) * 111_320.0;
-                let dy_m = (d_lon_dy * cos_lat).hypot(d_lat_dy) * 110_540.0;
-                dx_m.hypot(dy_m)
-            }
-        } else {
-            0.0
-        };
-
         Some(Self {
             row_idx,
             x_start,
@@ -248,9 +222,6 @@ impl RowCoordinates {
             d_lat_dy,
             row_c_start,
             row_c_end,
-            cos_lat,
-            cos_lat_sq,
-            px_diag_m,
         })
     }
 
@@ -430,7 +401,7 @@ pub fn is_point_in_bbox(lon: f64, lat: f64, bbox: Option<[f64; 4]>) -> bool {
     }
 }
 
-/// Resolve subpixel cell taking fast-paths into account (e.g. center sample or neighbor disk cache)
+/// Resolve boundary samples with exact H3 indexing; reuse only the exact center sample.
 #[inline(always)]
 pub fn resolve_subpixel_cell(
     run_cell: u64,
@@ -439,13 +410,9 @@ pub fn resolve_subpixel_cell(
     d_x: f64,
     d_y: f64,
     res: Resolution,
-    use_neighbor_cache: bool,
-    disk_cache: &mut H3NeighborDiskCache,
 ) -> Option<u64> {
-    if d_x.abs() < 1e-9 && d_y.abs() < 1e-9 {
+    if d_x == 0.0 && d_y == 0.0 {
         Some(run_cell)
-    } else if use_neighbor_cache {
-        Some(disk_cache.resolve_point(lat, lon))
     } else {
         LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
     }
@@ -681,8 +648,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
             lon_start,
             row_c_start,
             row_c_end,
-            cos_lat_sq,
-            px_diag_m,
             ..
         } = coords;
 
@@ -694,9 +659,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
             row_cache.reset_row();
             let mut run_cell: u64 = 0;
             let mut run_acc = engine.new_acc();
-
-            let use_neighbor_cache = !is_single_point && can_use_neighbor_cache(px_diag_m, res);
-            let mut disk_cache = H3NeighborDiskCache::default();
 
             let mut lon_curr = lon_start + (row_c_start as f64) * d_lon_step;
             let mut x_curr = x_start + (row_c_start as f64) * dx_step;
@@ -750,9 +712,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                         run_cell = cell_u64;
                         engine.clear_acc(&mut run_acc);
                         row_cache.on_cell_changed();
-                        if use_neighbor_cache {
-                            disk_cache.update(run_cell, cos_lat_sq);
-                        }
                     }
 
                     let (span_end, next_cell) = coords.find_span_end(
@@ -780,18 +739,14 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                             gt,
                             bbox,
                             |lat, lon| {
-                                if use_neighbor_cache {
-                                    disk_cache.is_in_run_cell(lat, lon)
-                                } else {
-                                    LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
-                                        == Some(run_cell)
-                                }
+                                LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
+                                    == Some(run_cell)
                             },
                         );
 
-                        let mut evaluate_boundary = |k: usize,
-                                                     run_acc: &mut Acc,
-                                                     active_map: &mut HashMap<
+                        let evaluate_boundary = |k: usize,
+                                                 run_acc: &mut Acc,
+                                                 active_map: &mut HashMap<
                             u64,
                             Acc,
                             FxBuildHasher,
@@ -808,14 +763,7 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                                     bbox,
                                     |lon, lat, d_x, d_y, weight| {
                                         let cell = match resolve_subpixel_cell(
-                                            run_cell,
-                                            lat,
-                                            lon,
-                                            d_x,
-                                            d_y,
-                                            res,
-                                            use_neighbor_cache,
-                                            &mut disk_cache,
+                                            run_cell, lat, lon, d_x, d_y, res,
                                         ) {
                                             Some(c) => c,
                                             None => return,
@@ -881,12 +829,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                     .or_insert_with(|| run_acc.clone());
             }
         } else {
-            let use_neighbor_caches: Vec<bool> = resolutions
-                .iter()
-                .map(|&r| !is_single_point && can_use_neighbor_cache(px_diag_m, r))
-                .collect();
-            let mut disk_caches = vec![H3NeighborDiskCache::default(); num_res];
-
             for i in 0..num_res {
                 row_caches[i].reset_row();
                 run_cells[i] = 0;
@@ -973,9 +915,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                                 }
                                 run_cells[i] = cell_u64;
                                 row_caches[i].on_cell_changed();
-                                if use_neighbor_caches[i] {
-                                    disk_caches[i].update(run_cells[i], cos_lat_sq);
-                                }
                             }
 
                             let (span_end, next_cell) = coords.find_span_end(
@@ -1003,14 +942,10 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                                     gt,
                                     bbox,
                                     |test_lat, test_lon| {
-                                        if use_neighbor_caches[i] {
-                                            disk_caches[i].is_in_run_cell(test_lat, test_lon)
-                                        } else {
-                                            LatLng::new(test_lat, test_lon)
-                                                .ok()
-                                                .map(|ll| ll.to_cell(res).into())
-                                                == Some(run_cells[i])
-                                        }
+                                        LatLng::new(test_lat, test_lon)
+                                            .ok()
+                                            .map(|ll| ll.to_cell(res).into())
+                                            == Some(run_cells[i])
                                     },
                                 );
                                 core_starts[i] = c_start;
@@ -1052,9 +987,9 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                         }
                     }
 
-                    let mut evaluate_boundary_multi = |k: usize,
-                                                       run_accs: &mut [Acc],
-                                                       chunk_maps: &mut [HashMap<
+                    let evaluate_boundary_multi = |k: usize,
+                                                   run_accs: &mut [Acc],
+                                                   chunk_maps: &mut [HashMap<
                         u64,
                         Acc,
                         FxBuildHasher,
@@ -1097,8 +1032,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                                                 d_x,
                                                 d_y,
                                                 res,
-                                                use_neighbor_caches[i],
-                                                &mut disk_caches[i],
                                             ) {
                                                 Some(c) => c,
                                                 None => continue,
@@ -1192,18 +1125,8 @@ mod tests {
     #[test]
     fn test_resolve_subpixel_cell_center_fastpath() {
         let run_cell = 0x8828308281ffffff;
-        let mut disk_cache = H3NeighborDiskCache::default();
         let res = Resolution::try_from(8).unwrap();
-        let cell = resolve_subpixel_cell(
-            run_cell,
-            37.75,
-            -122.25,
-            0.0,
-            0.0,
-            res,
-            false,
-            &mut disk_cache,
-        );
+        let cell = resolve_subpixel_cell(run_cell, 37.75, -122.25, 0.0, 0.0, res);
         assert_eq!(cell, Some(run_cell));
     }
 }

@@ -317,24 +317,27 @@ impl H3PmtilesTiler {
         )?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<ContinuousStreamBatch>(4);
-        let producer_handle = std::thread::spawn(move || loop {
-            let mut records = Vec::with_capacity(8192);
-            streamer.drain_completed_into(8192, |_i, record| {
-                records.push(record);
-            });
-            if records.is_empty() {
-                break;
+        let producer_handle = std::thread::spawn(move || -> crate::error::Result<()> {
+            loop {
+                let mut records = Vec::with_capacity(8192);
+                streamer.drain_completed_into(8192, |_i, record| {
+                    records.push(record);
+                })?;
+                if records.is_empty() {
+                    break;
+                }
+                let lat_horizon = streamer.current_lat_horizon();
+                if tx
+                    .send(ContinuousStreamBatch {
+                        records,
+                        lat_horizon,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let lat_horizon = streamer.current_lat_horizon();
-            if tx
-                .send(ContinuousStreamBatch {
-                    records,
-                    lat_horizon,
-                })
-                .is_err()
-            {
-                break;
-            }
+            Ok(())
         });
 
         while let Ok(batch) = rx.recv() {
@@ -527,8 +530,9 @@ impl H3PmtilesTiler {
             accumulator.evict_and_write_tiles(batch.lat_horizon, &mut writer)?;
         }
 
-        if let Err(e) = producer_handle.join() {
-            return Err(format!("Producer thread panicked: {:?}", e).into());
+        match producer_handle.join() {
+            Ok(result) => result?,
+            Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
         accumulator.flush_all(&mut writer)?;
@@ -700,24 +704,27 @@ impl H3PmtilesTiler {
         )?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<CategoricalStreamBatch>(4);
-        let producer_handle = std::thread::spawn(move || loop {
-            let mut records = Vec::with_capacity(8192);
-            streamer.drain_completed_into(8192, |_i, record| {
-                records.push(record);
-            });
-            if records.is_empty() {
-                break;
+        let producer_handle = std::thread::spawn(move || -> crate::error::Result<()> {
+            loop {
+                let mut records = Vec::with_capacity(8192);
+                streamer.drain_completed_into(8192, |_i, record| {
+                    records.push(record);
+                })?;
+                if records.is_empty() {
+                    break;
+                }
+                let lat_horizon = streamer.current_lat_horizon();
+                if tx
+                    .send(CategoricalStreamBatch {
+                        records,
+                        lat_horizon,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let lat_horizon = streamer.current_lat_horizon();
-            if tx
-                .send(CategoricalStreamBatch {
-                    records,
-                    lat_horizon,
-                })
-                .is_err()
-            {
-                break;
-            }
+            Ok(())
         });
 
         while let Ok(batch) = rx.recv() {
@@ -919,8 +926,9 @@ impl H3PmtilesTiler {
             accumulator.evict_and_write_tiles(batch.lat_horizon, &mut writer)?;
         }
 
-        if let Err(e) = producer_handle.join() {
-            return Err(format!("Producer thread panicked: {:?}", e).into());
+        match producer_handle.join() {
+            Ok(result) => result?,
+            Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
         accumulator.flush_all(&mut writer)?;

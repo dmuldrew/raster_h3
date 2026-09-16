@@ -120,7 +120,7 @@ fn test_categorical_streamer_with_remapping() {
     let mut class_counts: HashMap<i64, f64> = HashMap::new();
 
     loop {
-        let batch = streamer.fetch_next_batch(64);
+        let batch = streamer.fetch_next_batch(64).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -175,7 +175,7 @@ fn test_multi_categorical_horizon_streamer_with_remapping() {
     let mut total_pixels_by_res: HashMap<u8, f64> = HashMap::new();
 
     loop {
-        let batch = streamer.fetch_next_batch(64);
+        let batch = streamer.fetch_next_batch(64).unwrap();
         if batch.is_empty() {
             break;
         }

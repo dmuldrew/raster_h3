@@ -68,10 +68,12 @@ fn main() {
         let mut total_hexes = 0;
         let mut total_weight = 0.0;
         loop {
-            let n = streamer.drain_completed_into(4096, |_, rec| {
-                total_hexes += 1;
-                total_weight += rec.accumulator.count;
-            });
+            let n = streamer
+                .drain_completed_into(4096, |_, rec| {
+                    total_hexes += 1;
+                    total_weight += rec.accumulator.count;
+                })
+                .unwrap();
             if n == 0 {
                 break;
             }
@@ -127,7 +129,9 @@ fn main() {
                 .unwrap();
             let mut total_hexes = 0;
             loop {
-                let n = streamer.drain_completed_into(4096, |_, _| total_hexes += 1);
+                let n = streamer
+                    .drain_completed_into(4096, |_, _| total_hexes += 1)
+                    .unwrap();
                 if n == 0 {
                     break;
                 }
