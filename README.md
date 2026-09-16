@@ -158,7 +158,6 @@ Pre-compiled binaries with native DuckDB extension footers and gzip compression 
 | **`osx_arm64`** | Apple Silicon | macOS M1/M2/M3/M4 (ARM64) | `raster_h3-osx_arm64.duckdb_extension.gz` |
 | **`osx_amd64`** | Intel Mac | macOS x86_64 | `raster_h3-osx_amd64.duckdb_extension.gz` |
 | **`linux_amd64`** | Linux x86_64 | Ubuntu, Debian, CentOS, Fedora, Arch (glibc) | `raster_h3-linux_amd64.duckdb_extension.gz` |
-| **`linux_amd64_musl`** | Linux Musl | Alpine Linux, musl-based containers | `raster_h3-linux_amd64_musl.duckdb_extension.gz` |
 | **`linux_arm64`** | Linux ARM64 | AWS Graviton, Raspberry Pi 4/5, Linux AArch64 | `raster_h3-linux_arm64.duckdb_extension.gz` |
 | **`windows_amd64`** | Windows x64 | Windows 10/11, Windows Server (MSVC x86_64) | `raster_h3-windows_amd64.duckdb_extension.gz` |
 
