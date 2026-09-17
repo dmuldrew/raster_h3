@@ -56,6 +56,9 @@ impl MockHttpServer {
 
                 let file_data = Arc::clone(&file_bytes_arc);
                 thread::spawn(move || {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                     let mut reader = BufReader::new(&stream);
                     let mut req_line = String::new();
                     if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
@@ -90,6 +93,8 @@ impl MockHttpServer {
                             );
                             let _ = stream.write_all(header.as_bytes());
                             let _ = stream.write_all(slice);
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
                             return;
                         }
                     }
@@ -104,6 +109,14 @@ impl MockHttpServer {
                     );
                     let _ = stream.write_all(header.as_bytes());
                     let _ = stream.write_all(&file_data);
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let mut drain = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut drain) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
                 });
             }
         });
