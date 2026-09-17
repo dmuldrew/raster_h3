@@ -226,8 +226,10 @@ impl CategoricalAccumulator {
     }
 }
 
+use crate::aggregator::nodata::NativeNoData;
+
 /// Trait for numeric raster pixel types that support high-throughput SIMD / branchless span uniformity detection.
-pub trait CategoricalUniformity: Copy + PartialEq + Send + Sync + 'static {
+pub trait CategoricalUniformity: NativeNoData {
     /// Return true if all values in the slice are identical to `slice[0]`, or if slice is empty.
     fn is_uniform(slice: &[Self]) -> bool;
 

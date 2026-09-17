@@ -1,3 +1,5 @@
+//! Fast zero-allocation hexadecimal formatting and parsing for 64-bit H3 cell indices.
+
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 /// Format a u64 as lowercase hexadecimal ASCII bytes into a fixed 16-byte buffer with zero heap allocations.

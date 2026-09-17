@@ -626,6 +626,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ];
 
     let parquet_config = ParquetExportConfig {
+        omit_redundant_columns: compact,
         compact,
         compression,
         row_group_size,

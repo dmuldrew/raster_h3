@@ -28,6 +28,8 @@
 pub mod aggregator;
 /// Coordinate reference system (CRS) detection, parsing, and reprojection.
 pub mod crs;
+/// Shared zero-allocation hexadecimal formatting and WKB geometry encoding utilities.
+pub mod encoding;
 /// Crate-wide error handling types and result alias.
 pub mod error;
 /// DuckDB C-API foreign function interface (FFI) bindings and wrappers.
@@ -40,6 +42,8 @@ pub mod parquet;
 pub mod pmtiles;
 /// GeoTIFF file decoding, metadata extraction, and chunked raster I/O.
 pub mod raster;
+/// Cross-format dataset transcoding pipelines (e.g. Parquet to PMTiles).
+pub mod transcode;
 
 use std::ffi::c_char;
 use std::ptr;

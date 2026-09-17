@@ -76,6 +76,7 @@ fn test_conus_batch_and_evict_pipeline_simulation() {
     let mut progress_invocations = 0usize;
     let mut last_progress_count = 0usize;
     let parquet_config = ParquetExportConfig {
+        omit_redundant_columns: true,
         compact: true,
         compression: parquet::basic::Compression::SNAPPY,
         row_group_size: 64,

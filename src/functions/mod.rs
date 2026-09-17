@@ -25,8 +25,8 @@
 pub mod bind_utils;
 /// Categorical raster aggregation table function (`raster_h3_categorical`).
 pub mod categorical_table_function;
-/// Fast zero-allocation hexadecimal formatting and parsing for 64-bit H3 cell indices.
-pub mod fast_hex;
+/// Fast zero-allocation hexadecimal formatting and parsing for 64-bit H3 cell indices (re-exported from crate::encoding).
+pub use crate::encoding::fast_hex;
 /// Direct streaming export of H3 aggregations to Parquet files (`raster_h3_parquet`).
 pub mod parquet_table_function;
 /// Direct streaming export of H3 aggregations to PMTiles archives (`raster_h3_pmtiles`).
@@ -35,9 +35,13 @@ pub mod pmtiles_table_function;
 pub mod scalar;
 /// Continuous raster aggregation table function (`raster_h3`).
 pub mod table_function;
-/// Well-Known Binary (WKB) geometry serialization for H3 cells.
-pub mod wkb;
+/// Well-Known Binary (WKB) geometry serialization for H3 cells (re-exported from crate::encoding).
+pub use crate::encoding::wkb;
 
+/// Well-Known Binary (WKB) geometry encoding utilities for H3 cells.
+pub use crate::encoding::{cell_to_wkb, h3_index_to_wkb};
+/// Fast hexadecimal encoding and decoding utilities for H3 cell index `u64` values.
+pub use crate::encoding::{fast_hex_u64, parse_hex_u64};
 /// Shared parameter parsing, bind state, chunk writing, and lifecycle utilities.
 pub use bind_utils::{
     add_named_parameter, add_positional_parameter, delete_boxed, estimate_raster_cardinality,
@@ -46,8 +50,6 @@ pub use bind_utils::{
 };
 /// Registers the `raster_h3_categorical` DuckDB table function for categorical raster aggregation.
 pub use categorical_table_function::register_categorical_table_function;
-/// Fast hexadecimal encoding and decoding utilities for H3 cell index `u64` values.
-pub use fast_hex::{fast_hex_u64, parse_hex_u64};
 /// Registers the `raster_h3_parquet` DuckDB table function for direct Parquet export.
 pub use parquet_table_function::register_parquet_table_function;
 /// Registers the `raster_h3_pmtiles` DuckDB table function for direct PMTiles export.
@@ -56,5 +58,3 @@ pub use pmtiles_table_function::register_pmtiles_table_function;
 pub use scalar::register_scalar_functions;
 /// Registers the `raster_h3` DuckDB table function for continuous raster aggregation.
 pub use table_function::register_table_function;
-/// Well-Known Binary (WKB) geometry encoding utilities for H3 cells.
-pub use wkb::{cell_to_wkb, h3_index_to_wkb};

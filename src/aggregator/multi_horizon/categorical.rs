@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::{CategoricalAccumulator, CategoricalUniformity};
-use crate::aggregator::nodata::is_decoding_result_all_nodata;
+use crate::aggregator::nodata::{is_decoding_result_all_nodata, PixelValidity};
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
@@ -25,37 +25,29 @@ pub struct MultiCategoricalRecord {
 }
 
 /// Direct pixel-by-pixel categorical slice aggregation with strict tile ownership resolution
-fn process_categorical_overlap_slice_into_maps<T, N>(
+fn process_categorical_overlap_slice_into_maps<T>(
     slice: &[T],
     chunk: &RasterChunk,
-    native_nodata: Option<N>,
+    native_nodata: Option<T>,
     resolutions: &[Resolution],
     crs_transformer: &CrsTransformer,
     gt: &GeoTransform,
     sampling: &SamplingPattern,
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
-    nodata: Option<f64>,
     tile_idx: usize,
     mosaic: &MosaicReader,
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) where
     T: CategoricalUniformity,
-    N: Copy + PartialEq<T>,
 {
     let resolve_cat = |val: T| -> Option<i64> {
-        if let Some(nd) = native_nodata {
-            if nd == val {
-                return None;
-            }
+        let rule = PixelValidity::new(native_nodata);
+        if !rule.is_valid(val) {
+            return None;
         }
         let raw_cat = val.to_category()?;
-        if let Some(nd_f64) = nodata {
-            if (raw_cat as f64 - nd_f64).abs() < 1e-6 {
-                return None;
-            }
-        }
         if let Some(rem) = remapper {
             rem.remap(raw_cat)
         } else {
@@ -91,23 +83,21 @@ fn process_categorical_overlap_slice_into_maps<T, N>(
 }
 
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
-fn process_categorical_slice_into_maps<T, N>(
+fn process_categorical_slice_into_maps<T>(
     slice: &[T],
     chunk: &RasterChunk,
-    native_nodata: Option<N>,
+    native_nodata: Option<T>,
     resolutions: &[Resolution],
     crs_transformer: &CrsTransformer,
     gt: &GeoTransform,
     sampling: &SamplingPattern,
     bbox: Option<[f64; 4]>,
     chunk_stride: u32,
-    nodata: Option<f64>,
     overlap_ctx: Option<(usize, &MosaicReader)>,
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) where
     T: CategoricalUniformity,
-    N: Copy + PartialEq<T>,
 {
     if slice.is_empty() {
         return;
@@ -124,7 +114,6 @@ fn process_categorical_slice_into_maps<T, N>(
             sampling,
             bbox,
             chunk_stride,
-            nodata,
             tile_idx,
             mosaic,
             remapper,
@@ -133,7 +122,7 @@ fn process_categorical_slice_into_maps<T, N>(
         return;
     }
 
-    let engine = CategoricalEngine::new(native_nodata, nodata, remapper);
+    let engine = CategoricalEngine::new(native_nodata, remapper);
     scanline_walk(
         slice,
         chunk,
@@ -149,26 +138,16 @@ fn process_categorical_slice_into_maps<T, N>(
     );
 }
 
-struct CategoricalEngine<'a, T, N> {
-    native_nodata: Option<N>,
-    nodata: Option<f64>,
+struct CategoricalEngine<'a, T> {
+    native_nodata: Option<T>,
     remapper: Option<&'a CategoryRemapper>,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T, N> CategoricalEngine<'a, T, N>
-where
-    T: CategoricalUniformity,
-    N: Copy + PartialEq<T>,
-{
-    fn new(
-        native_nodata: Option<N>,
-        nodata: Option<f64>,
-        remapper: Option<&'a CategoryRemapper>,
-    ) -> Self {
+impl<'a, T: CategoricalUniformity> CategoricalEngine<'a, T> {
+    fn new(native_nodata: Option<T>, remapper: Option<&'a CategoryRemapper>) -> Self {
         Self {
             native_nodata,
-            nodata,
             remapper,
             _marker: std::marker::PhantomData,
         }
@@ -176,19 +155,11 @@ where
 
     #[inline(always)]
     fn resolve_category(&self, val: T) -> Option<i64> {
-        if let Some(nd_nat) = self.native_nodata {
-            if nd_nat == val {
-                return None;
-            }
+        let rule = PixelValidity::new(self.native_nodata);
+        if !rule.is_valid(val) {
+            return None;
         }
         let raw_cat = val.to_category()?;
-        if self.native_nodata.is_none() {
-            if let Some(nd) = self.nodata {
-                if (raw_cat as f64 - nd).abs() < 1e-6 {
-                    return None;
-                }
-            }
-        }
         if let Some(rem) = self.remapper {
             rem.remap(raw_cat)
         } else {
@@ -197,10 +168,8 @@ where
     }
 }
 
-impl<'a, T, N> ScanlineEngine<T, CategoricalAccumulator> for CategoricalEngine<'a, T, N>
-where
-    T: CategoricalUniformity,
-    N: Copy + PartialEq<T>,
+impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
+    for CategoricalEngine<'a, T>
 {
     type Sample = i64;
 
@@ -455,7 +424,6 @@ pub fn process_categorical_chunk_payload_into(
                 sampling,
                 bbox,
                 chunk_stride,
-                nodata,
                 overlap_ctx,
                 remapper,
                 chunk_maps,

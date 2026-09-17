@@ -1,12 +1,11 @@
 use std::ffi::CString;
 
+use crate::encoding::{fast_hex_u64, h3_index_to_wkb};
 use crate::ffi::{
     duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size, duckdb_vector,
     duckdb_vector_assign_string_element, duckdb_vector_assign_string_element_len,
     duckdb_vector_get_data, idx_t,
 };
-use crate::functions::fast_hex::fast_hex_u64;
-use crate::functions::wkb::h3_index_to_wkb;
 
 /// Safe, ergonomic wrapper around DuckDB's output `duckdb_data_chunk`
 pub struct ChunkWriter {
@@ -34,8 +33,13 @@ impl ChunkWriter {
     ///     *dest = rec.accumulator.mean();
     /// }
     /// ```
+    ///
+    /// # Safety
+    /// The chunk must be live, the column must have physical type `T`, and its
+    /// buffer must hold `len` elements. No other references may alias the buffer
+    /// for the lifetime of the returned slice.
     #[inline(always)]
-    pub unsafe fn get_data_slice_mut<T>(&self, col_idx: usize, len: usize) -> &mut [T] {
+    pub unsafe fn get_data_slice_mut<T>(&mut self, col_idx: usize, len: usize) -> &mut [T] {
         let v = self.get_vector(col_idx);
         let ptr = duckdb_vector_get_data(v) as *mut T;
         std::slice::from_raw_parts_mut(ptr, len)
@@ -103,7 +107,7 @@ impl ChunkWriter {
     /// Fill a primitive copyable column slice from an iterator
     #[inline(always)]
     pub unsafe fn fill_column<T: Copy, I: IntoIterator<Item = T>>(
-        &self,
+        &mut self,
         col_idx: usize,
         count: usize,
         values: I,

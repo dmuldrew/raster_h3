@@ -120,6 +120,17 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 
 ---
 
+### `src/encoding/` — Zero-Allocation Hex & WKB Geometry Serialization
+*Maps to: §5 Stack-Allocated Hex LUT, §11 Native OGC GeoParquet 1.1 Exporter*
+
+| File | Responsibility |
+| :--- | :--- |
+| `mod.rs` | Module declarations and public re-exports (`fast_hex_u64`, `parse_hex_u64`, `cell_to_wkb`, `h3_index_to_wkb`). |
+| `fast_hex.rs` | Zero-allocation hexadecimal formatting (`fast_hex_u64`) and parsing (`parse_hex_u64`) between 64-bit integer H3 cell IDs and lowercase hexadecimal ASCII strings using a 16-byte stack lookup table. |
+| `wkb.rs` | Stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`). Converts H3 cell boundaries directly into 125-byte (hexagon) or 109-byte (pentagon) WKB buffers in ~10–15 ns with zero heap allocations. |
+
+---
+
 ### `src/ffi/` — DuckDB C-API Foreign Function Interface
 *Maps to: §6 Dynamic Work-Stealing Parallelism*
 
@@ -178,6 +189,8 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | `categorical.rs` | Categorical chunk payload processing (`MultiCategoricalRecord`). Processes discrete integer chunk data into class histograms per H3 cell, enforcing mosaic tile ownership rules and class remappings. |
 | `categorical_streamer.rs` | Categorical raster horizon streamer (`CategoricalKernel`, `MultiCategoricalHorizonStreamer`). Drives single-pass multi-resolution class aggregation, remapping, and majority fraction filtering. |
 | `overlap_walker.rs` | Pixel-by-pixel mosaic overlap walker (`walk_overlap_pixel_cells`). Evaluates per-pixel tile ownership when chunks intersect overlapping mosaic tiles, applying cutline/Voronoi, first, or average rules. |
+| `spectral.rs` | On-the-fly spectral index formulas (`SpectralFormula`) and physical reflectance evaluation for NDVI, NDWI, NBR, and EVI with singularity/zero-division protections. |
+
 
 ##### `walker.rs`, `coordinates.rs`, `span.rs` — Hot-Path Scanline Traversal
 
@@ -213,12 +226,12 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | :--- | :--- |
 | `scalar.rs` | Registers DuckDB scalar functions: `h3_to_string`, `h3_string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, and `h3_to_geometry` / `h3_cell_to_geometry`. Uses generic zero-cost unary scalar execution kernels. |
 
-#### Encoding Utilities
+#### Re-exported Encoding Utilities (implemented in `crate::encoding`)
 
 | File | Responsibility |
 | :--- | :--- |
-| `fast_hex.rs` | Zero-allocation hexadecimal formatting (`fast_hex_u64`) and parsing (`parse_hex_u64`) between 64-bit integer H3 cell IDs and lowercase hexadecimal ASCII strings using a 16-byte stack lookup table. |
-| `wkb.rs` | Stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`). Converts H3 cell boundaries directly into 125-byte (hexagon) or 109-byte (pentagon) WKB buffers in ~10–15 ns with zero heap allocations. |
+| `fast_hex` | Re-exports zero-allocation hexadecimal formatting (`fast_hex_u64`) and parsing (`parse_hex_u64`) from `crate::encoding::fast_hex`. |
+| `wkb` | Re-exports stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`) from `crate::encoding::wkb`. |
 
 #### `bind_utils/` — Shared Table Function Infrastructure
 
@@ -238,8 +251,10 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 
 | File | Responsibility |
 | :--- | :--- |
-| `mod.rs` | Module declarations and public re-exports. |
-| `writer.rs` | Streams aggregated multi-resolution H3 records directly into compressed Apache Parquet files (`write_continuous_parquet`, `write_categorical_parquet`). Employs a lock-free double-buffered channel pipeline where the streaming aggregator drains into one buffer while a background thread sorts and flushes the previous buffer. Generates OGC GeoParquet 1.1 JSON metadata (PROJJSON `OGC:CRS84` datum, planar edges, per-column bounding boxes). Configurable Snappy/ZSTD/Gzip compression and spatial locality sorting by H3 cell index within row groups. |
+| `mod.rs` | Module declarations and public re-exports (`build_geoparquet_metadata`, `run_parquet_streaming_pipeline`, `ParquetStreamer`, `ParquetRowGroupBuffer`, `H3ParquetWriter`, etc.). |
+| `geoparquet_metadata.rs` | Specification-compliant OGC GeoParquet 1.1 JSON metadata builder (`build_geoparquet_metadata`) embedded in Parquet `FileMetaData`, including official PROJJSON `OGC:CRS84` datum ensemble definitions, planar edge definitions, and per-column bounding boxes. |
+| `pipeline.rs` | Double-buffered channel streaming pipeline (`run_parquet_streaming_pipeline`, `run_parquet_streaming_pipeline_with_progress`), streaming source abstraction (`ParquetStreamer`), row group buffer abstraction (`ParquetRowGroupBuffer`), in-memory spatial sorting by H3 index, and low-level typed column writers. |
+| `writer.rs` | Schema-specific columnar row group buffers (`ContinuousRowGroupBuffer`, `CategoricalRowGroupBuffer`), export configuration (`ParquetExportConfig`), and high-level export facade (`H3ParquetWriter`). |
 
 ---
 
@@ -254,4 +269,16 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | `pyramid.rs` | Web Mercator tile pyramid coordinate math. Implements `lon_lat_to_tile_xy`, `tile_xy_to_bbox`, bidirectional H3 resolution ↔ zoom level mapping (`h3_res_to_zoom`, `zoom_to_h3_res`), and cell boundary Mercator projection for tile intersection ranges. |
 | `features.rs` | PMTiles feature definitions, per-resolution summary statistics (`TilePyramidAccumulator`), layer metadata JSON construction (`build_pmtiles_metadata`), and export summary metrics (`PmtilesExportSummary`). |
 | `tiler.rs` | Multi-resolution H3-to-PMTiles v3 tiling engine (`stream_raster_to_pmtiles`, `stream_categorical_raster_to_pmtiles`). Orchestrates streaming raster aggregation into multi-zoom PMTiles archives, connecting multi-resolution horizon streamers to Rayon parallel MVT feature encoding with tile eviction when scanline horizons pass tile southern boundaries. |
-| `parquet_tiler.rs` | Parquet-to-PMTiles v3 transcoding engine (`transcode_parquet_to_pmtiles`). Reads pre-aggregated H3 records from Parquet files, pre-scans row group extents, and transcodes them into multi-zoom PMTiles archives using streaming latitude eviction to bound memory. |
+| `parquet_tiler` | Re-exports `process_parquet_to_pmtiles` and `RowGroupExtent` from `crate::transcode::parquet_tiler`. |
+
+---
+
+### `src/transcode/` — Cross-Format Dataset Transcoding
+*Maps to: §1 Horizon Eviction, §6 Work-Stealing Parallelism*
+
+| File | Responsibility |
+| :--- | :--- |
+| `mod.rs` | Module declarations and public re-exports (`process_parquet_to_pmtiles`, `RowGroupExtent`, `scan_row_group_h3_extent`). |
+| `parquet_tiler.rs` | Parquet-to-PMTiles v3 transcoding engine (`process_parquet_to_pmtiles`). Reads pre-aggregated H3 records from Parquet files, pre-scans row group extents, and transcodes them into multi-zoom PMTiles archives using streaming latitude eviction to bound memory. |
+
+See [Rust API migration](refactor-migration.md) for configuration defaults, compatibility adapters, and updated safety contracts.

@@ -1,9 +1,8 @@
 use h3o::{CellIndex, LatLng, Resolution};
 use std::ffi::c_char;
 
+use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64};
 use crate::ffi::*;
-use crate::functions::fast_hex::{fast_hex_u64, parse_hex_u64};
-use crate::functions::wkb::h3_index_to_wkb;
 
 // =========================================================================
 // Generic Zero-Cost Scalar Execution Kernels

@@ -147,7 +147,7 @@ impl MvtValue {
     #[inline(always)]
     pub fn from_hex_u64(h3_index: u64) -> Self {
         let mut buf = [0u8; 16];
-        let bytes = crate::functions::fast_hex::fast_hex_u64(h3_index, &mut buf);
+        let bytes = crate::encoding::fast_hex_u64(h3_index, &mut buf);
         let len = bytes.len() as u8;
         MvtValue::HexStr(buf, len)
     }

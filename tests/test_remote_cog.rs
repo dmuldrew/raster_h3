@@ -20,6 +20,31 @@ use tiff::decoder::DecodingResult;
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+mod helpers;
+
+#[test]
+fn remote_chunk_payload_rejects_truncated_range() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let (file, path) = helpers::TestGeoTiffBuilder::new(2, 2).create_f32_tempfile(|_, _| 1.0);
+    let bytes = std::fs::read(file.path()).unwrap();
+    let size = bytes.len() as u64;
+    let server = MockHttpServer::start(bytes);
+    let remote = Arc::new(RemoteHttpSource::open(&format!("{}/ranged", server.url_base)).unwrap());
+    let local = GeoTiffStreamReader::open(&path).unwrap();
+    let mut info = local.chunk_info.as_ref().unwrap().as_ref().clone();
+    info.chunk_offsets = vec![size - 1].into();
+    info.chunk_bytes = vec![2].into();
+    let source = raster_h3::raster::geotiff::DecoderSource::Remote(remote);
+    let error = match source.get_chunk_payload(0, &info) {
+        Ok(_) => panic!("truncated payload must be rejected before decoding"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("extends beyond file"));
+}
+
 /// Lightweight mock HTTP server supporting HTTP Range requests (`bytes=start-end`)
 struct MockHttpServer {
     #[allow(dead_code)]
@@ -1030,10 +1055,11 @@ fn test_remote_cog_to_parquet_streaming_pipeline() {
 
     let config = MultiResolutionConfig::new(vec![7]);
     let parquet_config = ParquetExportConfig {
+        omit_redundant_columns: false,
+        compact: false,
         row_group_size: 1000,
         compression: parquet::basic::Compression::SNAPPY,
         is_categorical: false,
-        compact: false,
         geoparquet: false,
     };
 

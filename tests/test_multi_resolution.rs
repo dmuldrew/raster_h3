@@ -547,3 +547,15 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
         current_rg_rows += 1;
     }
 }
+#[test]
+fn constructors_validate_compaction_configuration() {
+    let file = create_test_geotiff(2, 2);
+    let mut config = MultiResolutionConfig::new(vec![7, 8]);
+    // Exercise the new option, independently of the legacy adapter.
+    config.compact_h3_children = true;
+    assert!(config.validate().is_err());
+    let reader = GeoTiffStreamReader::open(file.path().to_str().unwrap()).unwrap();
+    assert!(MultiScanHorizonStreamer::new(reader, &config).is_err());
+    let reader = GeoTiffStreamReader::open(file.path().to_str().unwrap()).unwrap();
+    assert!(MultiCategoricalHorizonStreamer::new(reader, &config).is_err());
+}

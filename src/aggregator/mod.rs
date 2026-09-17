@@ -50,7 +50,7 @@ pub use horizon_streamer::{chunk_intersects_bbox, compute_cell_south_lat, HexEvi
 /// Multi-resolution horizon streamers, output records, and configuration.
 pub use multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
-    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
+    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget, RecordStreamer,
 };
 /// NoData detection, chunk skipping checks, and sentinel value casting.
 pub use nodata::{is_chunk_all_nodata, is_decoding_result_all_nodata, NodataCast};

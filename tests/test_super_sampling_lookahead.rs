@@ -5,6 +5,91 @@
 
 mod helpers;
 
+#[test]
+fn web_mercator_samples_match_exact_projection() {
+    use h3o::{LatLng, Resolution};
+    use raster_h3::crs::transformer::CrsTransformer;
+    use std::collections::HashMap;
+
+    // Large high-latitude pixels expose nonlinear latitude errors; small
+    // pixels at a coarser H3 resolution exercise shared-cell core spans.
+    for (size, resolution) in [(100_000.0, 12), (100.0, 5)] {
+        let (_file, path) = TestGeoTiffBuilder::new(32, 2)
+            .origin(0.0, 15_000_000.0)
+            .pixel_size(size)
+            .epsg(3857)
+            .create_f32_tempfile(|_, _| 3.0);
+        for pattern in [SamplingPattern::five_point(), SamplingPattern::rgss()] {
+            for bbox in [None, Some([0.0, 78.0, 15.0, 81.0])] {
+                let reader = GeoTiffStreamReader::open(&path).unwrap();
+                let gt = reader.metadata.geotransform;
+                let crs = CrsTransformer::from_crs_or_epsg(Some(3857), None).unwrap();
+                let mut expected = HashMap::<u64, f64>::new();
+                for row in 0..2 {
+                    for col in 0..32 {
+                        for sample in &pattern.points {
+                            let (x, y) =
+                                gt.pixel_to_coord(col as f64 + sample.dx, row as f64 + sample.dy);
+                            let (lon, lat) = crs.transform_point(x, y).unwrap();
+                            if let Some([west, south, east, north]) = bbox {
+                                if lon < west || lon > east || lat < south || lat > north {
+                                    continue;
+                                }
+                            }
+                            let cell = LatLng::new(lat, lon)
+                                .unwrap()
+                                .to_cell(Resolution::try_from(resolution).unwrap());
+                            *expected.entry(cell.into()).or_default() += sample.weight;
+                        }
+                    }
+                }
+                let mut config = MultiResolutionConfig::single(resolution);
+                config.sampling = pattern.clone();
+                config.bbox = bbox;
+                let mut continuous = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+                let mut actual = HashMap::new();
+                loop {
+                    let batch = continuous.fetch_next_batch(17).unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for record in batch {
+                        assert!(actual
+                            .insert(record.h3_index, record.accumulator.count)
+                            .is_none());
+                        assert!(
+                            (record.accumulator.sum - 3.0 * record.accumulator.count).abs() < 1e-8
+                        );
+                    }
+                }
+                let mut categorical = MultiCategoricalHorizonStreamer::new(
+                    GeoTiffStreamReader::open(&path).unwrap(),
+                    &config,
+                )
+                .unwrap();
+                let mut categories = HashMap::new();
+                loop {
+                    let batch = categorical.fetch_next_batch(17).unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for record in batch {
+                        assert!(categories
+                            .insert(record.h3_index, record.accumulator.total_count)
+                            .is_none());
+                    }
+                }
+                for output in [actual, categories] {
+                    assert_eq!(output.len(), expected.len());
+                    for (cell, count) in &expected {
+                        assert!((output[cell] - count).abs() < 1e-8, "cell {cell}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 use helpers::{create_fn_f32_geotiff as create_test_geotiff, TestGeoTiffBuilder};
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
@@ -299,6 +384,86 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
             name,
             total_sum,
             expected_sum
+        );
+    }
+}
+
+#[test]
+fn test_projected_utm_gradient_exact_cell_assignment() {
+    use h3o::{LatLng, Resolution};
+    use raster_h3::crs::transformer::CrsTransformer;
+    use std::collections::HashMap;
+
+    let width = 32u32;
+    let height = 32u32;
+    let (_temp_file, path) = TestGeoTiffBuilder::new(width, height)
+        .origin(500000.0, 4180000.0)
+        .pixel_size(30.0)
+        .epsg(32610)
+        .create_f32_tempfile(|c, r| (c * 2 + r * 3) as f32);
+
+    let pattern = SamplingPattern::rgss();
+    let res = Resolution::try_from(10).unwrap();
+
+    // 1. Compute ground-truth reference by direct per-sample transformation
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let gt = reader.metadata.geotransform;
+    let crs_trans = CrsTransformer::from_crs_or_epsg(Some(32610), None).unwrap();
+
+    let mut expected_cells: HashMap<u64, (f64, f64)> = HashMap::new();
+    for r in 0..height {
+        for c in 0..width {
+            let val = (c * 2 + r * 3) as f64;
+            for sp in &pattern.points {
+                let (x, y) = gt.pixel_to_coord(c as f64 + sp.dx, r as f64 + sp.dy);
+                let (lon, lat) = crs_trans.transform_point(x, y).unwrap();
+                let cell: u64 = LatLng::new(lat, lon).unwrap().to_cell(res).into();
+                let entry = expected_cells.entry(cell).or_insert((0.0, 0.0));
+                entry.0 += sp.weight;
+                entry.1 += sp.weight * val;
+            }
+        }
+    }
+
+    // 2. Stream through MultiScanHorizonStreamer
+    let mut config = MultiResolutionConfig::single(10);
+    config.sampling = pattern;
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+
+    let mut streamed_cells: HashMap<u64, (f64, f64)> = HashMap::new();
+    loop {
+        let batch = streamer.fetch_next_batch(64).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            streamed_cells.insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.sum));
+        }
+    }
+
+    assert_eq!(
+        streamed_cells.len(),
+        expected_cells.len(),
+        "Number of cells must match ground truth reference"
+    );
+
+    for (cell, (exp_count, exp_sum)) in &expected_cells {
+        let (act_count, act_sum) = streamed_cells
+            .get(cell)
+            .unwrap_or_else(|| panic!("Cell {} missing from streamer output", cell));
+        assert!(
+            (act_count - exp_count).abs() < 1e-5,
+            "Cell {} count mismatch: {} vs {}",
+            cell,
+            act_count,
+            exp_count
+        );
+        assert!(
+            (act_sum - exp_sum).abs() < 1e-3,
+            "Cell {} sum mismatch: {} vs {}",
+            cell,
+            act_sum,
+            exp_sum
         );
     }
 }

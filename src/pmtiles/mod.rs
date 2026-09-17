@@ -5,17 +5,17 @@
 
 pub mod features;
 pub mod mvt;
-pub mod parquet_tiler;
+pub use crate::transcode::parquet_tiler;
 pub mod pyramid;
 pub mod tiler;
 pub mod writer;
 
+pub use crate::transcode::{process_parquet_to_pmtiles, RowGroupExtent};
 pub use features::{
     build_default_pmtiles_fields, build_pmtiles_metadata, H3Feature, PmtilesExportSummary,
     ResolutionAccumulatorStats, TileEvictionEntry, TilePyramidAccumulator,
 };
 pub use mvt::{FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue};
-pub use parquet_tiler::{process_parquet_to_pmtiles, RowGroupExtent};
 pub use pyramid::{
     cell_boundary_mercator, cell_tile_range, cell_tile_range_mercator, h3_res_for_zoom,
     h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy, tile_xy_to_bbox,

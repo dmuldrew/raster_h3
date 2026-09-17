@@ -4,38 +4,39 @@
 //! `MultiCategoricalHorizonStreamer` into Snappy- or ZSTD-compressed Parquet row groups
 //! without crossing DuckDB SQL/C-FFI boundaries.
 //!
-//! Employs lock-free double-buffered channel streaming: the aggregation stream drains
-//! into the current buffer while a background thread sorts and flushes the previous buffer
-//! to disk with zero pipeline stalls.
+//! Employs lock-free double-buffered channel streaming via [`super::pipeline`].
 
 use std::fs::File;
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
-use std::thread;
 
 use h3o::{CellIndex, LatLng};
-use parquet::basic::{Compression, Encoding};
-use parquet::column::writer::ColumnWriter;
+use parquet::basic::Compression;
 use parquet::data_type::ByteArray;
-use parquet::file::properties::{WriterProperties, WriterVersion};
-use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
-use parquet::schema::parser::parse_message_type;
-use parquet::schema::types::ColumnPath;
-
-use parquet::file::metadata::KeyValue;
-use serde_json::json;
+use parquet::file::writer::SerializedFileWriter;
 
 use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
-use crate::functions::fast_hex::fast_hex_u64;
-use crate::functions::wkb::cell_to_wkb;
+use crate::encoding::{cell_to_wkb, fast_hex_u64};
 use crate::raster::geotiff::GeoTiffStreamReader;
+
+use super::pipeline::{
+    compute_sort_permutation, reorder_by_perm, reorder_by_perm_take, write_byte_array_column,
+    write_f64_column, write_i64_column,
+};
+
+pub use super::geoparquet_metadata::build_geoparquet_metadata;
+pub use super::pipeline::{
+    run_parquet_streaming_pipeline, run_parquet_streaming_pipeline_with_progress,
+    ParquetRowGroupBuffer, ParquetStreamer, RecordStreamer,
+};
 
 #[derive(Debug, Clone)]
 pub struct ParquetExportConfig {
+    /// Whether to omit redundant columns (`h3_hex`, `lat`, `lng`).
+    pub omit_redundant_columns: bool,
+    /// Legacy external adapter parameter: whether to omit redundant columns (`h3_hex`, `lat`, `lng`).
     pub compact: bool,
     pub compression: Compression,
     pub row_group_size: usize,
@@ -43,9 +44,23 @@ pub struct ParquetExportConfig {
     pub geoparquet: bool,
 }
 
+impl ParquetExportConfig {
+    /// Create a new ParquetExportConfig with defaults
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Internal adapter: whether redundant columns (`lat`, `lng`, `h3_hex`) should be omitted.
+    #[inline(always)]
+    pub fn should_omit_redundant_columns(&self) -> bool {
+        self.omit_redundant_columns && self.compact
+    }
+}
+
 impl Default for ParquetExportConfig {
     fn default() -> Self {
         Self {
+            omit_redundant_columns: true,
             compact: true,
             compression: Compression::SNAPPY,
             row_group_size: 131_072,
@@ -53,248 +68,6 @@ impl Default for ParquetExportConfig {
             geoparquet: false,
         }
     }
-}
-
-/// Build an OGC GeoParquet 1.1 compliant JSON metadata object for Parquet FileMetaData key-value store
-pub fn build_geoparquet_metadata(primary_column: &str, bbox: [f64; 4]) -> String {
-    let geo = json!({
-        "version": "1.1.0",
-        "primary_column": primary_column,
-        "columns": {
-            primary_column: {
-                "encoding": "WKB",
-                "geometry_types": ["Polygon"],
-                "crs": {
-                    "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
-                    "type": "GeographicCRS",
-                    "name": "WGS 84 (CRS84)",
-                    "datum_ensemble": {
-                        "name": "World Geodetic System 1984 ensemble",
-                        "members": [
-                            { "name": "World Geodetic System 1984 (Transit)" },
-                            { "name": "World Geodetic System 1984 (G730)" },
-                            { "name": "World Geodetic System 1984 (G873)" },
-                            { "name": "World Geodetic System 1984 (G1150)" },
-                            { "name": "World Geodetic System 1984 (G1674)" },
-                            { "name": "World Geodetic System 1984 (G1762)" },
-                            { "name": "World Geodetic System 1984 (G2139)" }
-                        ],
-                        "ellipsoid": {
-                            "name": "WGS 84",
-                            "semi_major_axis": 6378137.0,
-                            "inverse_flattening": 298.257223563
-                        },
-                        "accuracy": "2.0"
-                    },
-                    "coordinate_system": {
-                        "subtype": "ellipsoidal",
-                        "axis": [
-                            {
-                                "name": "Geodetic longitude",
-                                "abbreviation": "Lon",
-                                "direction": "east",
-                                "unit": "degree"
-                            },
-                            {
-                                "name": "Geodetic latitude",
-                                "abbreviation": "Lat",
-                                "direction": "north",
-                                "unit": "degree"
-                            }
-                        ]
-                    },
-                    "id": {
-                        "authority": "OGC",
-                        "code": "CRS84"
-                    }
-                },
-                "bbox": [bbox[0], bbox[1], bbox[2], bbox[3]],
-                "edges": "planar"
-            }
-        }
-    });
-    geo.to_string()
-}
-
-/// Common interface for horizon streamers supplying records to the Parquet pipeline
-pub trait ParquetStreamer {
-    type Record;
-
-    /// Drain up to `max_rows` completed records directly into a consumer closure
-    fn drain_completed_into<F>(
-        &mut self,
-        max_rows: usize,
-        consumer: F,
-    ) -> crate::error::Result<usize>
-    where
-        F: FnMut(usize, Self::Record);
-
-    /// Optional spatial bounding box in WGS84 [min_lon, min_lat, max_lon, max_lat]
-    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
-        None
-    }
-}
-
-impl ParquetStreamer for MultiScanHorizonStreamer {
-    type Record = MultiContinuousRecord;
-
-    #[inline(always)]
-    fn drain_completed_into<F>(
-        &mut self,
-        max_rows: usize,
-        consumer: F,
-    ) -> crate::error::Result<usize>
-    where
-        F: FnMut(usize, Self::Record),
-    {
-        self.drain_completed_into(max_rows, consumer)
-    }
-
-    #[inline]
-    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
-        Some(self.mosaic.mosaic_bounds_wgs84)
-    }
-}
-
-impl ParquetStreamer for MultiCategoricalHorizonStreamer {
-    type Record = MultiCategoricalRecord;
-
-    #[inline(always)]
-    fn drain_completed_into<F>(
-        &mut self,
-        max_rows: usize,
-        consumer: F,
-    ) -> crate::error::Result<usize>
-    where
-        F: FnMut(usize, Self::Record),
-    {
-        self.drain_completed_into(max_rows, consumer)
-    }
-
-    #[inline]
-    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
-        Some(self.mosaic.mosaic_bounds_wgs84)
-    }
-}
-
-#[inline]
-fn compute_sort_permutation(h3_indices: &[i64]) -> Option<Vec<usize>> {
-    let n = h3_indices.len();
-    if n <= 1 {
-        return None;
-    }
-    let mut already_sorted = true;
-    for i in 1..n {
-        if h3_indices[i] < h3_indices[i - 1] {
-            already_sorted = false;
-            break;
-        }
-    }
-    if already_sorted {
-        return None;
-    }
-    let mut perm: Vec<usize> = (0..n).collect();
-    perm.sort_unstable_by_key(|&i| h3_indices[i]);
-    Some(perm)
-}
-
-#[inline]
-fn reorder_by_perm<T: Copy>(vec: &mut Vec<T>, perm: &[usize]) {
-    let mut reordered = Vec::with_capacity(perm.len());
-    for &i in perm {
-        reordered.push(vec[i]);
-    }
-    *vec = reordered;
-}
-
-#[inline]
-fn reorder_by_perm_take<T: Default>(vec: &mut Vec<T>, perm: &[usize]) {
-    let mut reordered = Vec::with_capacity(perm.len());
-    for &i in perm {
-        reordered.push(std::mem::take(&mut vec[i]));
-    }
-    *vec = reordered;
-}
-
-#[inline(always)]
-fn write_i64_column(
-    row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
-    values: &[i64],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(mut col_writer) = row_group_writer.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(ref mut typed) = col_writer.untyped() {
-            typed.write_batch(values, None, None)?;
-        }
-        col_writer.close()?;
-    }
-    Ok(())
-}
-
-#[inline(always)]
-fn write_f64_column(
-    row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
-    values: &[f64],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(mut col_writer) = row_group_writer.next_column()? {
-        if let ColumnWriter::DoubleColumnWriter(ref mut typed) = col_writer.untyped() {
-            typed.write_batch(values, None, None)?;
-        }
-        col_writer.close()?;
-    }
-    Ok(())
-}
-
-#[inline(always)]
-fn write_byte_array_column(
-    row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
-    values: &[ByteArray],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(mut col_writer) = row_group_writer.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(ref mut typed) = col_writer.untyped() {
-            typed.write_batch(values, None, None)?;
-        }
-        col_writer.close()?;
-    }
-    Ok(())
-}
-
-///// Common trait for Parquet row group column buffers (continuous and categorical)
-pub trait ParquetRowGroupBuffer: Sized + Send + 'static {
-    type Record;
-
-    /// Allocate a new buffer with target row group capacity and options
-    fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self;
-
-    /// Allocate a new buffer with target row group capacity (default geoparquet: false)
-    fn with_capacity(capacity: usize, compact: bool) -> Self {
-        Self::with_capacity_and_options(capacity, compact, false)
-    }
-
-    /// Push a single stream record into column vectors
-    fn push_record(&mut self, record: Self::Record);
-
-    /// Current number of rows in the buffer
-    fn len(&self) -> usize;
-
-    /// Check if the buffer is empty
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Clear all column vectors for buffer recycling
-    fn clear(&mut self);
-
-    /// Sort all columns by H3 index in-place (if not already sorted)
-    fn sort_by_h3_index(&mut self);
-
-    /// Write all columns as a new row group in the Parquet file
-    fn flush_to_row_group(
-        &self,
-        writer: &mut SerializedFileWriter<File>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Return schema definition string for this buffer type
-    fn schema_message(compact: bool, geoparquet: bool) -> &'static str;
 }
 
 /// Columnar buffer for continuous raster aggregation row groups
@@ -746,152 +519,6 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             }
         }
     }
-}
-
-/// Generic double-buffered streaming pipeline from any horizon streamer to Parquet with progress reporting
-pub fn run_parquet_streaming_pipeline_with_progress<S, B, P, F>(
-    mut streamer: S,
-    parquet_path: P,
-    parquet_config: ParquetExportConfig,
-    mut progress_callback: F,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
-where
-    S: ParquetStreamer,
-    B: ParquetRowGroupBuffer<Record = S::Record>,
-    P: AsRef<Path>,
-    F: FnMut(usize),
-{
-    let compact = parquet_config.compact;
-    let geoparquet = parquet_config.geoparquet;
-    let row_group_size = parquet_config.row_group_size.max(1);
-
-    let message_type = B::schema_message(compact, geoparquet);
-    let schema = Arc::new(parse_message_type(message_type)?);
-
-    let mut props_builder = WriterProperties::builder()
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_column_encoding(ColumnPath::from("h3_index"), Encoding::DELTA_BINARY_PACKED)
-        .set_compression(parquet_config.compression);
-
-    if geoparquet {
-        let bbox = streamer
-            .bounds_wgs84()
-            .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
-        let geo_json = build_geoparquet_metadata("geometry", bbox);
-        props_builder = props_builder
-            .set_key_value_metadata(Some(vec![KeyValue::new("geo".to_string(), geo_json)]));
-    }
-
-    let props = Arc::new(props_builder.build());
-
-    if let Some(parent) = parquet_path.as_ref().parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    // Publish only a complete export. Failed streams must not replace an existing file
-    // with a valid-looking, partial Parquet dataset.
-    let parent = parquet_path
-        .as_ref()
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let output_file = tempfile::NamedTempFile::new_in(parent)?;
-    let file = output_file.reopen()?;
-    let mut writer = SerializedFileWriter::new(file, schema, props)?;
-
-    let (writer_tx, writer_rx) = sync_channel::<B>(2);
-    let (recycle_tx, recycle_rx) = sync_channel::<B>(2);
-
-    let buf1 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
-    let buf2 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
-    let _ = recycle_tx.send(buf2);
-
-    let writer_handle = thread::spawn(
-        move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-            let mut total_rows = 0usize;
-            while let Ok(mut buf) = writer_rx.recv() {
-                if !buf.is_empty() {
-                    buf.sort_by_h3_index();
-                    let count = buf.len();
-                    buf.flush_to_row_group(&mut writer)?;
-                    total_rows += count;
-                    buf.clear();
-                    let _ = recycle_tx.send(buf);
-                }
-            }
-            writer.close()?;
-            Ok(total_rows)
-        },
-    );
-
-    let mut current_buf = buf1;
-    let mut total_drained = 0usize;
-
-    loop {
-        let space_left = row_group_size.saturating_sub(current_buf.len()).max(1);
-        let drained = match streamer.drain_completed_into(space_left, |_, record| {
-            current_buf.push_record(record);
-        }) {
-            Ok(n) => n,
-            Err(error) => {
-                // Unblock the writer and join it before returning the stream failure.
-                drop(writer_tx);
-                drop(recycle_rx);
-                let _ = writer_handle.join();
-                return Err(error.into());
-            }
-        };
-        total_drained += drained;
-        if drained > 0 {
-            progress_callback(total_drained);
-        }
-
-        if current_buf.len() >= row_group_size {
-            if writer_tx.send(current_buf).is_err() {
-                break;
-            }
-            current_buf = match recycle_rx.recv() {
-                Ok(b) => b,
-                Err(_) => B::with_capacity_and_options(row_group_size, compact, geoparquet),
-            };
-        }
-
-        if drained == 0 {
-            if !current_buf.is_empty() {
-                let _ = writer_tx.send(current_buf);
-            }
-            break;
-        }
-    }
-
-    drop(writer_tx);
-    let total_hexagons = match writer_handle.join() {
-        Ok(res) => res?,
-        Err(_) => return Err("Background Parquet writer thread panicked".into()),
-    };
-    output_file.persist(&parquet_path)?;
-    Ok(total_hexagons)
-}
-
-/// Generic double-buffered streaming pipeline from any horizon streamer to Parquet
-pub fn run_parquet_streaming_pipeline<S, B, P>(
-    streamer: S,
-    parquet_path: P,
-    parquet_config: ParquetExportConfig,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
-where
-    S: ParquetStreamer,
-    B: ParquetRowGroupBuffer<Record = S::Record>,
-    P: AsRef<Path>,
-{
-    run_parquet_streaming_pipeline_with_progress::<S, B, P, _>(
-        streamer,
-        parquet_path,
-        parquet_config,
-        |_| {},
-    )
 }
 
 pub struct H3ParquetWriter;

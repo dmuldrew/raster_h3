@@ -167,6 +167,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     config.min_mean = bind_data.min_mean;
     config.max_mean = bind_data.max_mean;
     config.compact = bind_data.common.compact;
+    config.compact_h3_children = bind_data.common.compact;
     config.quantiles = bind_data.quantiles.clone();
 
     let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
@@ -228,7 +229,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
     };
 
     let proj_cols = &global_data.projected_columns;
-    let writer = ChunkWriter::new(output);
+    let mut writer = ChunkWriter::new(output);
 
     // Fast path: if 0 columns are projected (e.g. SELECT count(*))
     if proj_cols.is_empty() {

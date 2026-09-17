@@ -1726,6 +1726,37 @@ fn test_simd_span_integer_types() {
 }
 
 #[test]
+fn test_simd_span_large_integers_precision_preservation() {
+    use raster_h3::aggregator::simd::SimdSpanAccumulate;
+
+    // Values beyond 2^53 (9_007_199_254_740_992) where f64 loses integer precision.
+    // 2^53 + 1 cannot be represented distinctly in f64 from 2^53.
+    let base_u64: u64 = 1u64 << 53; // 9_007_199_254_740_992
+    let val_distinct = base_u64 + 1; // 9_007_199_254_740_993
+    let nodata_marker = base_u64;
+
+    // Verify in f64 that (val_distinct as f64) == (nodata_marker as f64)
+    assert_eq!(
+        val_distinct as f64, nodata_marker as f64,
+        "IEEE 754 precision loss must hold for this test setup"
+    );
+
+    // Test that native u64 NoData check does NOT treat val_distinct as nodata
+    let u64_slice = vec![base_u64, val_distinct, base_u64 + 2, base_u64];
+    let u64_acc = u64::accumulate_span(&u64_slice, Some(nodata_marker));
+    // Only the two occurrences of base_u64 should be skipped; val_distinct and base_u64 + 2 must be kept!
+    assert_eq!(u64_acc.count, 2.0);
+
+    // Test i64 similarly with large values
+    let base_i64: i64 = 1i64 << 53;
+    let i64_distinct = base_i64 + 1;
+    let i64_nodata = base_i64;
+    let i64_slice = vec![base_i64, i64_distinct, -base_i64, -base_i64 - 1];
+    let i64_acc = i64::accumulate_span(&i64_slice, Some(i64_nodata));
+    assert_eq!(i64_acc.count, 3.0);
+}
+
+#[test]
 fn test_categorical_16_slot_inline_and_heap_spillover() {
     use raster_h3::aggregator::categorical::CategoricalAccumulator;
 

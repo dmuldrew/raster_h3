@@ -21,7 +21,7 @@ use crate::raster::RasterChunk;
 
 use super::config::{MultiResolutionConfig, SpectralFormula};
 use super::continuous::{process_continuous_chunk_payload_into, MultiContinuousRecord};
-use super::controller::{HorizonStreamKernel, MultiHorizonStreamer};
+use super::controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
 
 /// Kernel implementation for continuous (floating point / spectral) raster aggregation
 #[derive(Clone)]
@@ -220,5 +220,37 @@ impl DerefMut for MultiScanHorizonStreamer {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+impl RecordStreamer for MultiScanHorizonStreamer {
+    type Record = MultiContinuousRecord;
+
+    #[inline(always)]
+    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
+    where
+        F: FnMut(usize, Self::Record),
+    {
+        self.inner.drain_completed_into(max_rows, consumer)
+    }
+
+    #[inline(always)]
+    fn current_lat_horizon(&self) -> f64 {
+        self.inner.current_lat_horizon()
+    }
+
+    #[inline(always)]
+    fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
+    #[inline(always)]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        Some(self.inner.mosaic.mosaic_bounds_wgs84)
+    }
+
+    #[inline(always)]
+    fn resolution_u8s(&self) -> &[u8] {
+        self.inner.resolution_u8s()
     }
 }

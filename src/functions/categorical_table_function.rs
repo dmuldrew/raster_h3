@@ -177,6 +177,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
     config.min_count = bind_data.min_count;
     config.min_majority_fraction = bind_data.min_majority_fraction;
     config.compact = bind_data.common.compact;
+    config.compact_h3_children = bind_data.common.compact;
     config.remapper = bind_data.remapper.clone();
 
     let streamer = match MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config) {
@@ -244,7 +245,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
             };
 
-            let writer = ChunkWriter::new(output);
+            let mut writer = ChunkWriter::new(output);
 
             // Fast path: if 0 columns are projected (e.g. SELECT count(*))
             if proj_cols.is_empty() {
@@ -320,57 +321,40 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
             }
 
             if out_maj_cls.is_some() || out_maj_frac.is_some() || out_maj_cnt.is_some() {
-                let mut slice_cls =
-                    out_maj_cls.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
-                let mut slice_frac =
-                    out_maj_frac.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
-                let mut slice_cnt =
-                    out_maj_cnt.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
-
                 for (i, rec) in batch.iter().enumerate() {
                     let (maj_cls, maj_cnt, maj_frac) = rec.accumulator.majority();
-                    if let Some(ref mut s) = slice_cls {
-                        s[i] = maj_cls;
+                    if let Some(col) = out_maj_cls {
+                        writer.set_int64(col, i, maj_cls);
                     }
-                    if let Some(ref mut s) = slice_frac {
-                        s[i] = maj_frac;
+                    if let Some(col) = out_maj_frac {
+                        writer.set_double(col, i, maj_frac);
                     }
-                    if let Some(ref mut s) = slice_cnt {
-                        s[i] = maj_cnt;
+                    if let Some(col) = out_maj_cnt {
+                        writer.set_double(col, i, maj_cnt);
                     }
                 }
             }
 
             if out_uniq.is_some() || out_distinct.is_some() {
-                let mut slice_uniq =
-                    out_uniq.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
-                let mut slice_dist =
-                    out_distinct.map(|col| writer.get_data_slice_mut::<i64>(col, batch_len));
-
                 for (i, rec) in batch.iter().enumerate() {
                     let distinct = rec.accumulator.unique_classes() as i64;
-                    if let Some(ref mut s) = slice_uniq {
-                        s[i] = distinct;
+                    if let Some(col) = out_uniq {
+                        writer.set_int64(col, i, distinct);
                     }
-                    if let Some(ref mut s) = slice_dist {
-                        s[i] = distinct;
+                    if let Some(col) = out_distinct {
+                        writer.set_int64(col, i, distinct);
                     }
                 }
             }
 
             if out_shannon.is_some() || out_entropy.is_some() {
-                let mut slice_shannon =
-                    out_shannon.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
-                let mut slice_ent =
-                    out_entropy.map(|col| writer.get_data_slice_mut::<f64>(col, batch_len));
-
                 for (i, rec) in batch.iter().enumerate() {
                     let ent = rec.accumulator.shannon_entropy();
-                    if let Some(ref mut s) = slice_shannon {
-                        s[i] = ent;
+                    if let Some(col) = out_shannon {
+                        writer.set_double(col, i, ent);
                     }
-                    if let Some(ref mut s) = slice_ent {
-                        s[i] = ent;
+                    if let Some(col) = out_entropy {
+                        writer.set_double(col, i, ent);
                     }
                 }
             }
@@ -456,7 +440,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 return;
             }
 
-            let writer = ChunkWriter::new(output);
+            let mut writer = ChunkWriter::new(output);
 
             if proj_cols.is_empty() {
                 writer.set_size(num_taken);
