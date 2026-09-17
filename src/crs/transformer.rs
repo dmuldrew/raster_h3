@@ -46,6 +46,23 @@ pub struct AlbersConicFast {
     pub qp: f64,
 }
 
+/// Tokenize a PROJ string into key-value pairs.
+pub(crate) fn tokenize_proj_string(src: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for token in src.split_whitespace() {
+        let token = token.trim().trim_start_matches('+');
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = token.split_once('=') {
+            map.insert(k.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase());
+        } else {
+            map.insert(token.to_ascii_lowercase(), String::new());
+        }
+    }
+    map
+}
+
 impl AlbersConicFast {
     /// Initialize with standard 2 parallels and origin (in degrees) on GRS80/WGS84 spheroid
     pub fn new(lat1_deg: f64, lat2_deg: f64, lat0_deg: f64, lon0_deg: f64) -> Self {
@@ -120,41 +137,30 @@ impl AlbersConicFast {
         Self::new(29.5, 45.5, 23.0, -96.0)
     }
 
-    /// Parse PROJ string parameters for an Albers Equal Area projection (+proj=aea)
-    pub fn from_proj_string(src: &str) -> Option<Self> {
-        let lower = src.to_lowercase();
-        if !lower.contains("proj=aea") {
+    /// Parse PROJ string parameters for an Albers Equal Area projection (+proj=aea) from token map
+    pub fn from_proj_tokens(tokens: &std::collections::HashMap<String, String>) -> Option<Self> {
+        if tokens.get("proj").map(|s| s.as_str()) != Some("aea") {
             return None;
         }
 
         // Fall back to proj4rs for non-GRS80/WGS84 ellipsoids requiring datum transforms
-        if lower.contains("clrk66") || lower.contains("nad27") || lower.contains("bessel") {
-            return None;
-        }
-
-        let mut lat_1 = None;
-        let mut lat_2 = None;
-        let mut lat_0 = None;
-        let mut lon_0 = None;
-        let mut x_0 = 0.0;
-        let mut y_0 = 0.0;
-
-        for token in lower.split(|c: char| c.is_whitespace() || c == '+') {
-            if token.is_empty() {
-                continue;
-            }
-            if let Some((k, v)) = token.split_once('=') {
-                match k.trim() {
-                    "lat_1" => lat_1 = v.parse::<f64>().ok(),
-                    "lat_2" => lat_2 = v.parse::<f64>().ok(),
-                    "lat_0" => lat_0 = v.parse::<f64>().ok(),
-                    "lon_0" => lon_0 = v.parse::<f64>().ok(),
-                    "x_0" => x_0 = v.parse::<f64>().unwrap_or(0.0),
-                    "y_0" => y_0 = v.parse::<f64>().unwrap_or(0.0),
-                    _ => {}
-                }
+        if let Some(ellps) = tokens.get("ellps") {
+            if ellps.contains("clrk66") || ellps.contains("nad27") || ellps.contains("bessel") {
+                return None;
             }
         }
+        if let Some(datum) = tokens.get("datum") {
+            if datum.contains("nad27") {
+                return None;
+            }
+        }
+
+        let lat_1 = tokens.get("lat_1").and_then(|v| v.parse::<f64>().ok());
+        let lat_2 = tokens.get("lat_2").and_then(|v| v.parse::<f64>().ok());
+        let lat_0 = tokens.get("lat_0").and_then(|v| v.parse::<f64>().ok());
+        let lon_0 = tokens.get("lon_0").and_then(|v| v.parse::<f64>().ok());
+        let x_0 = tokens.get("x_0").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let y_0 = tokens.get("y_0").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
 
         let l2_val = lat_2.or(lat_1);
         let l0_val = lat_0.unwrap_or(0.0);
@@ -165,6 +171,12 @@ impl AlbersConicFast {
             }
             _ => None,
         }
+    }
+
+    /// Parse PROJ string parameters for an Albers Equal Area projection (+proj=aea)
+    pub fn from_proj_string(src: &str) -> Option<Self> {
+        let tokens = tokenize_proj_string(src);
+        Self::from_proj_tokens(&tokens)
     }
 
     /// Analytical inverse transformation from projected (x, y) to (lon, lat) in WGS84 degrees
@@ -242,72 +254,11 @@ impl CrsTransformer {
         let effective_epsg = epsg.or(parsed_epsg);
 
         if let Some(code) = effective_epsg {
-            match code {
-                4326 | 4269 => return Ok(Self::Wgs84Identity),
-                3857 | 900913 | 3785 => return Ok(Self::WebMercatorFast),
-                5070 => return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070())),
-                3338 => {
-                    return Ok(Self::AlbersConic(AlbersConicFast::new(
-                        55.0, 65.0, 50.0, -154.0,
-                    )))
-                }
-                32601..=32660 => {
-                    let zone = code - 32600;
-                    let p_str = format!("+proj=utm +zone={} +datum=WGS84 +units=m +no_defs", zone);
-                    return Self::from_proj_string(&p_str);
-                }
-                32701..=32760 => {
-                    let zone = code - 32700;
-                    let p_str = format!(
-                        "+proj=utm +zone={} +south +datum=WGS84 +units=m +no_defs",
-                        zone
-                    );
-                    return Self::from_proj_string(&p_str);
-                }
-                3413 => {
-                    let p_str = "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                    return Self::from_proj_string(p_str);
-                }
-                3031 => {
-                    let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                    return Self::from_proj_string(p_str);
-                }
-                _ => {
-                    let p_str = format!("+init=epsg:{}", code);
-                    if let Ok(transformer) = Self::from_proj_string(&p_str) {
-                        return Ok(transformer);
-                    }
-                    return Err(RasterH3Error::UnsupportedEpsg {
-                        code,
-                        detail: format!("Unsupported or unrecognized EPSG code: {}", code),
-                    });
-                }
-            }
+            return Self::from_epsg_code(code);
         }
 
         if let Some(s) = proj_str {
-            let trimmed = s.trim();
-            let lower = trimmed.to_lowercase();
-            if lower.contains("longlat")
-                || lower.contains("latlong")
-                || lower == "epsg:4326"
-                || lower == "4326"
-            {
-                return Ok(Self::Wgs84Identity);
-            }
-            if lower.contains("3857")
-                || lower.contains("900913")
-                || (lower.contains("proj=merc") && lower.contains("a=6378137"))
-            {
-                return Ok(Self::WebMercatorFast);
-            }
-            if let Some(albers) = AlbersConicFast::from_proj_string(trimmed) {
-                return Ok(Self::AlbersConic(albers));
-            }
-            if lower.contains("5070") {
-                return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070()));
-            }
-            return Self::from_proj_string(trimmed);
+            return Self::from_proj_string(s);
         }
 
         Err(RasterH3Error::CrsNotDetected(
@@ -315,28 +266,167 @@ impl CrsTransformer {
         ))
     }
 
+    /// Resolve an EPSG code to a fast-path or Proj4 transformer.
+    pub fn from_epsg_code(code: u32) -> Result<Self> {
+        match code {
+            4326 | 4269 => Ok(Self::Wgs84Identity),
+            3857 | 900913 | 3785 => Ok(Self::WebMercatorFast),
+            5070 => Ok(Self::AlbersConic(AlbersConicFast::epsg_5070())),
+            3338 => Ok(Self::AlbersConic(AlbersConicFast::new(
+                55.0, 65.0, 50.0, -154.0,
+            ))),
+            32601..=32660 => {
+                let zone = code - 32600;
+                let p_str = format!("+proj=utm +zone={} +datum=WGS84 +units=m +no_defs", zone);
+                Self::from_proj_string(&p_str)
+            }
+            32701..=32760 => {
+                let zone = code - 32700;
+                let p_str = format!(
+                    "+proj=utm +zone={} +south +datum=WGS84 +units=m +no_defs",
+                    zone
+                );
+                Self::from_proj_string(&p_str)
+            }
+            3413 => {
+                let p_str = "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+                Self::from_proj_string(p_str)
+            }
+            3031 => {
+                let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+                Self::from_proj_string(p_str)
+            }
+            _ => {
+                let p_str = format!("+init=epsg:{}", code);
+                let from = Proj::from_proj_string(&p_str).map_err(|_| {
+                    RasterH3Error::UnsupportedEpsg {
+                        code,
+                        detail: format!("Unsupported or unrecognized EPSG code: {}", code),
+                    }
+                })?;
+                let to = Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| {
+                    RasterH3Error::CrsError(format!(
+                        "Failed to initialize WGS84 target projection: {:?}",
+                        e
+                    ))
+                })?;
+                Ok(Self::Proj4 { from, to })
+            }
+        }
+    }
+
     /// Construct from arbitrary PROJ string to WGS84
     pub fn from_proj_string(src_proj: &str) -> Result<Self> {
         let trimmed = src_proj.trim();
-        let lower = trimmed.to_lowercase();
-        if lower.contains("longlat")
-            || lower.contains("latlong")
-            || lower == "epsg:4326"
-            || lower == "4326"
+
+        // Plain EPSG:NNNN or bare integer check
+        let parsed_epsg = if let Some(rest) = trimmed
+            .strip_prefix("EPSG:")
+            .or_else(|| trimmed.strip_prefix("epsg:"))
         {
-            return Ok(Self::Wgs84Identity);
+            rest.trim().parse::<u32>().ok()
+        } else if trimmed.chars().all(|c| c.is_ascii_digit()) && !trimmed.is_empty() {
+            trimmed.parse::<u32>().ok()
+        } else {
+            None
+        };
+
+        if let Some(code) = parsed_epsg {
+            return Self::from_epsg_code(code);
         }
-        if lower.contains("3857")
-            || lower.contains("900913")
-            || (lower.contains("proj=merc") && lower.contains("a=6378137"))
-        {
-            return Ok(Self::WebMercatorFast);
+
+        let tokens = tokenize_proj_string(trimmed);
+
+        // +init=epsg:NNNN -> treat as EPSG code
+        if let Some(init_val) = tokens.get("init") {
+            if let Some(code_str) = init_val.strip_prefix("epsg:") {
+                if let Ok(code) = code_str.parse::<u32>() {
+                    return Self::from_epsg_code(code);
+                }
+            }
         }
-        if let Some(albers) = AlbersConicFast::from_proj_string(trimmed) {
-            return Ok(Self::AlbersConic(albers));
-        }
-        if lower.contains("5070") {
-            return Ok(Self::AlbersConic(AlbersConicFast::epsg_5070()));
+
+        if let Some(proj) = tokens.get("proj") {
+            match proj.as_str() {
+                "longlat" | "latlong" => {
+                    let valid_datum = match tokens.get("datum").map(|s| s.as_str()) {
+                        None | Some("wgs84") | Some("grs80") | Some("nad83") => true,
+                        _ => false,
+                    };
+                    let valid_ellps = match tokens.get("ellps").map(|s| s.as_str()) {
+                        None | Some("wgs84") | Some("grs80") => true,
+                        _ => false,
+                    };
+                    let valid_a = tokens
+                        .get("a")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map_or(true, |a| (a - WGS84_A).abs() < 1.0);
+                    let valid_rf = tokens
+                        .get("rf")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map_or(true, |rf| (rf - 298.257).abs() < 0.01);
+
+                    if valid_datum && valid_ellps && valid_a && valid_rf {
+                        return Ok(Self::Wgs84Identity);
+                    }
+                }
+                "merc" => {
+                    let a_val = tokens.get("a").and_then(|v| v.parse::<f64>().ok());
+                    let b_val = tokens.get("b").and_then(|v| v.parse::<f64>().ok());
+                    let rf_val = tokens.get("rf");
+                    let f_val = tokens.get("f");
+                    let ellps_val = tokens.get("ellps").map(|s| s.as_str());
+
+                    let a_is_6378137 = a_val.map_or(false, |a| (a - 6378137.0).abs() < 1e-3);
+                    let b_is_6378137 = b_val.map_or(false, |b| (b - 6378137.0).abs() < 1e-3);
+                    let absent_rf_f_b = rf_val.is_none() && f_val.is_none() && b_val.is_none();
+                    let ellps_sphere_or_absent = match ellps_val {
+                        None | Some("sphere") => true,
+                        _ => false,
+                    };
+
+                    let is_sphere_6378137 =
+                        a_is_6378137 && (b_is_6378137 || (absent_rf_f_b && ellps_sphere_or_absent));
+
+                    let lon_0 = tokens
+                        .get("lon_0")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let x_0 = tokens
+                        .get("x_0")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let y_0 = tokens
+                        .get("y_0")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let k = tokens
+                        .get("k")
+                        .or_else(|| tokens.get("k_0"))
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(1.0);
+                    let lat_ts = tokens
+                        .get("lat_ts")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+
+                    let is_standard_merc = lon_0.abs() < 1e-6
+                        && x_0.abs() < 1e-6
+                        && y_0.abs() < 1e-6
+                        && (k - 1.0).abs() < 1e-6
+                        && lat_ts.abs() < 1e-6;
+
+                    if is_sphere_6378137 && is_standard_merc {
+                        return Ok(Self::WebMercatorFast);
+                    }
+                }
+                "aea" => {
+                    if let Some(albers) = AlbersConicFast::from_proj_tokens(&tokens) {
+                        return Ok(Self::AlbersConic(albers));
+                    }
+                }
+                _ => {}
+            }
         }
 
         let from = Proj::from_proj_string(src_proj).map_err(|e| {
@@ -918,5 +1008,52 @@ mod tests {
         assert_eq!(bounds[3], 90.0, "Polar chunk must report max_lat = 90.0");
         assert_eq!(bounds[0], -180.0, "Polar chunk must span full longitude [-180, 180]");
         assert_eq!(bounds[2], 180.0, "Polar chunk must span full longitude [-180, 180]");
+    }
+
+    #[test]
+    fn test_tokenized_crs_detection_utm_with_5070_in_param() {
+        let proj_str = "+proj=utm +zone=17 +x_0=5070000 +datum=WGS84 +units=m +no_defs";
+        let tf = CrsTransformer::from_crs_or_epsg(None, Some(proj_str)).unwrap();
+        match tf {
+            CrsTransformer::Proj4 { .. } => {}
+            _ => panic!("Expected Proj4 transformer, got non-Proj4 for UTM with +x_0=5070000"),
+        }
+    }
+
+    #[test]
+    fn test_ellipsoidal_mercator_routes_to_proj4() {
+        // cs2cs -f "%.10f" "+proj=merc +a=6378137 +rf=298.257223563 +lon_0=0" +to "+proj=longlat +datum=WGS84 +no_defs" <<< "1113194.9079 6800125.4544"
+        // Output: 9.9999999997 52.1864260950 0.0000000000
+        let proj_str = "+proj=merc +a=6378137 +rf=298.257223563 +lon_0=0";
+        let tf = CrsTransformer::from_proj_string(proj_str).unwrap();
+        match tf {
+            CrsTransformer::Proj4 { .. } => {}
+            _ => panic!("Expected Proj4 transformer for ellipsoidal Mercator"),
+        }
+
+        let (lon, lat) = tf.transform_point(1113194.9079, 6800125.4544).unwrap();
+        let golden_lon = 9.9999999997;
+        let golden_lat = 52.1864260950;
+
+        // Ground distance tolerance <= 0.01 m
+        let deg_to_rad = std::f64::consts::PI / 180.0;
+        let dlat_m = (lat - golden_lat) * deg_to_rad * 6378137.0;
+        let dlon_m = (lon - golden_lon) * deg_to_rad * 6378137.0 * (golden_lat * deg_to_rad).cos();
+        let dist_m = (dlat_m * dlat_m + dlon_m * dlon_m).sqrt();
+        assert!(
+            dist_m <= 0.01,
+            "Transformed point ({}, {}) differs from golden cs2cs ({}, {}) by {} m (> 0.01 m)",
+            lon, lat, golden_lon, golden_lat, dist_m
+        );
+    }
+
+    #[test]
+    fn test_spherical_mercator_with_nadgrids_null_is_fast_path() {
+        let proj_str = "+proj=merc +a=6378137 +b=6378137 +k=1 +lon_0=0 +nadgrids=@null";
+        let tf = CrsTransformer::from_proj_string(proj_str).unwrap();
+        match tf {
+            CrsTransformer::WebMercatorFast => {}
+            _ => panic!("Expected WebMercatorFast transformer for spherical Mercator"),
+        }
     }
 }
