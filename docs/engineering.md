@@ -289,4 +289,37 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | `mod.rs` | Module declarations and public re-exports (`process_parquet_to_pmtiles`, `RowGroupExtent`, `scan_row_group_h3_extent`). |
 | `parquet_tiler.rs` | Parquet-to-PMTiles v3 transcoding engine (`process_parquet_to_pmtiles`). Reads pre-aggregated H3 records from Parquet files, pre-scans row group extents, and transcodes them into multi-zoom PMTiles archives using streaming latitude eviction to bound memory. |
 
+---
+
+## 13. Geodetic Tolerances and Semantics
+
+This section outlines fundamental geodetic assumptions, error budgets, and numerical precision considerations across the `raster_h3` processing pipeline.
+
+### Pixel Counts vs. Physical Ground Area
+The `count` and `sum` statistics emitted by all aggregators represent discrete counts of sampled raster pixels (or fractional sample weights when supersampling is enabled), **not physical surface areas** in square meters:
+- **EPSG:4326 (Plate Carrée / WGS84)**: Rasters with constant degree cell spacing exhibit a $\cos \phi$ ground area distortion (where $\phi$ is latitude). A $0.01^\circ \times 0.01^\circ$ pixel covers $\approx 1.23\text{ km}^2$ at the equator but only $\approx 0.61\text{ km}^2$ at $60^\circ\text{ N}$. Aggregated `sum` values on EPSG:4326 inputs reflect pixel sums rather than true surface integrals.
+- **EPSG:3857 (Web Mercator)**: Conformal planar grid cells expand by $1 / \cos \phi$ in linear dimensions, causing pixel ground area to scale as $\cos^2 \phi$ relative to projected planar area.
+- *Recommendation*: Workflows requiring rigorous surface flux integration (e.g. biomass totals, volumetric rainfall, solar irradiance) must either apply ellipsoidal area scaling factors ($A \approx R^2 \cos \phi \, \Delta\lambda \, \Delta\phi$) or supply inputs in an equal-area projection such as EPSG:5070 (CONUS Albers Equal Area Conic) or EPSG:6933 (EASE-Grid 2.0).
+
+### NoData at Cell Boundaries Under Supersampling
+When sub-pixel supersampling patterns (such as RGSS 4-point or 16-point grid) are enabled, each sub-sample point evaluates whether the underlying pixel value is valid or NoData:
+- If a pixel intersecting an H3 hexagon boundary contains NoData, all sub-samples originating from that pixel are discarded.
+- Because validity is evaluated at pixel level rather than through exact polygon-clipping intersection between the hexagonal boundary and valid data masks, the effective sample weights near NoData boundaries are not area-consistent across partially masked border pixels. Cells touching masked borders will reflect sample weights proportional to valid pixel encounters rather than true geometric intersection area.
+
+### Floating-Point Associativity and Parallel Merge Order
+Aggregators utilize multi-core chunk parallelism (`init_local`) where independent worker threads accumulate local statistics using Welford's online algorithm and merge them into the global scanline horizon:
+- Floating-point addition is non-associative in IEEE-754 arithmetic ($(a + b) + c \ne a + (b + c)$).
+- Because chunks complete in non-deterministic order depending on operating system thread scheduling and I/O latency, minor least-significant-bit (ULP) differences can arise in cumulative statistics (`mean`, `variance` / $M_2$, and `sum`) across repeated runs on the same input dataset.
+
+### Accepted Geodetic Tolerances and Datum Policy
+- **NAD83 vs. WGS84 Continental Offset**: `EPSG:4269` (NAD83) and `EPSG:5070` (CONUS Albers, which uses the GRS80 ellipsoid with NAD83) are processed via fast analytical paths that treat coordinates as equivalent to WGS84 without applying datum shift grids. This accepts the continental plate difference between NAD83 and WGS84 (approximately ~1–2 meters across North America), reflecting the fact that pure-Rust `proj4rs` does not embed high-resolution national datum shift grids (NADCON5 / HARN).
+- **PROJ Tooling Parity**: Analytical fast paths (`WebMercatorFast`, `AlbersConicFast`) match reference PROJ (`cs2cs` 9.8.1) coordinate inversions to within $\le 0.01\text{ m}$. Arbitrary projections delegated to pure-Rust `proj4rs` match PROJ within millimeter-to-centimeter precision on identical ellipsoids.
+- **Strict Rejection of Non-Zero Datum Shifts**: PROJ definition strings containing non-zero Helmert datum shift parameters (`+towgs84` with non-zero parameters) or mandatory non-null datum grids (`+nadgrids` other than `@null`) are rejected with an explicit `RasterH3Error::CrsError` to prevent silent geodetic inaccuracies.
+
+### Recommendation on High Resolutions (Resolution ≥ 14) for Non-WGS84 Inputs
+- H3 Resolution 14 has an average hexagon edge length of $\approx 1.34\text{ m}$ (area $\approx 6.3\text{ m}^2$), and Resolution 15 has an edge length of $\approx 0.51\text{ m}$ (area $\approx 0.9\text{ m}^2$).
+- Because the geodetic frame uncertainty between NAD83 and WGS84 (~1–2 m) and projection interpolation approximations equal or exceed the entire physical diameter of Resolution 14 and 15 cells, performing raster hexification at `res >= 14` on non-WGS84 inputs is geodetically unsound without sub-meter surveyed datum controls. Users are strongly recommended to limit non-WGS84 ingestion to `res <= 13`, or reproject source rasters to native WGS84 using high-precision geodetic tools (e.g. `gdalwarp` with NADCON5 grids) before ingestion.
+
+---
+
 See [Rust API migration](refactor-migration.md) for configuration defaults, compatibility adapters, and updated safety contracts.
