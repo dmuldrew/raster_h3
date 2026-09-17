@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
@@ -129,6 +129,7 @@ pub struct RemoteChunkPrefetchQueue {
     condvar: Arc<Condvar>,
     next_job: Arc<AtomicUsize>,
     total_jobs: usize,
+    scheduled_chunks: FxHashSet<(usize, u32)>,
     error: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     _worker_handles: Vec<JoinHandle<()>>,
@@ -165,6 +166,9 @@ impl RemoteChunkPrefetchQueue {
         }
 
         let coalesced = coalesce_chunk_ranges(&locations, cfg.max_gap_bytes, cfg.max_range_bytes);
+        if coalesced.is_empty() {
+            return None;
+        }
         let sources = vec![Some(Arc::clone(remote_source))];
         Some(Self::spawn_internal(sources, coalesced, cfg))
     }
@@ -220,6 +224,9 @@ impl RemoteChunkPrefetchQueue {
         }
 
         let coalesced = coalesce_chunk_ranges(&locations, cfg.max_gap_bytes, cfg.max_range_bytes);
+        if coalesced.is_empty() {
+            return None;
+        }
         Some(Self::spawn_internal(sources, coalesced, cfg))
     }
 
@@ -229,6 +236,13 @@ impl RemoteChunkPrefetchQueue {
         config: RemotePrefetchConfig,
     ) -> Self {
         let total_jobs = ranges.len();
+        let mut scheduled_chunks = FxHashSet::default();
+        for range in &ranges {
+            for &(chunk_idx, _, _) in &range.chunk_slices {
+                scheduled_chunks.insert((range.tile_idx, chunk_idx));
+            }
+        }
+
         let ready_chunks = Arc::new(Mutex::new(FxHashMap::default()));
         let condvar = Arc::new(Condvar::new());
         let next_job = Arc::new(AtomicUsize::new(0));
@@ -253,62 +267,96 @@ impl RemoteChunkPrefetchQueue {
             let term = Arc::clone(&shutdown);
 
             let handle = thread::spawn(move || {
-                loop {
-                    if term.load(Ordering::Relaxed) {
-                        break;
+                struct HttpWorkerPanicGuard {
+                    err_holder: Arc<Mutex<Option<String>>>,
+                    cv: Arc<Condvar>,
+                }
+                impl Drop for HttpWorkerPanicGuard {
+                    fn drop(&mut self) {
+                        if thread::panicking() {
+                            if let Ok(mut err) = self.err_holder.lock() {
+                                if err.is_none() {
+                                    *err = Some("HTTP prefetch worker panicked".to_string());
+                                }
+                            }
+                            self.cv.notify_all();
+                        }
                     }
+                }
 
-                    // Backpressure throttling: pause if buffer is full
+                let _panic_guard = HttpWorkerPanicGuard {
+                    err_holder: Arc::clone(&err_holder),
+                    cv: Arc::clone(&cv),
+                };
+
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     loop {
                         if term.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let current_buffered = ready.lock().map(|m| m.len()).unwrap_or(0);
-                        if current_buffered < queue_capacity {
                             break;
                         }
-                        thread::sleep(Duration::from_millis(5));
-                    }
 
-                    let job = job_idx.fetch_add(1, Ordering::Relaxed);
-                    if job >= ranges.len() {
-                        break;
-                    }
-
-                    let range = &ranges[job];
-                    let source = match sources.get(range.tile_idx).and_then(|s| s.as_ref()) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-
-                    match source.fetch_range(range.start_offset, range.end_offset) {
-                        Ok(data) => {
-                            let data_len = data.len();
-                            let mut map = match ready.lock() {
-                                Ok(m) => m,
-                                Err(_) => break,
-                            };
-
-                            for &(chunk_idx, slice_start, slice_len) in &range.chunk_slices {
-                                if slice_start + slice_len <= data_len {
-                                    let chunk_payload = Arc::new(
-                                        data[slice_start..slice_start + slice_len].to_vec(),
-                                    );
-                                    map.insert((range.tile_idx, chunk_idx), chunk_payload);
-                                }
+                        // Backpressure throttling: pause if buffer is full
+                        loop {
+                            if term.load(Ordering::Relaxed) {
+                                return;
                             }
-                            cv.notify_all();
+                            let current_buffered = ready.lock().map(|m| m.len()).unwrap_or(0);
+                            if current_buffered < queue_capacity {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(5));
                         }
-                        Err(e) => {
-                            if let Ok(mut err) = err_holder.lock() {
-                                if err.is_none() {
-                                    *err = Some(e.to_string());
-                                }
-                            }
-                            cv.notify_all();
+
+                        let job = job_idx.fetch_add(1, Ordering::Relaxed);
+                        if job >= ranges.len() {
                             break;
                         }
+
+                        let range = &ranges[job];
+                        let source = match sources.get(range.tile_idx).and_then(|s| s.as_ref()) {
+                            Some(s) => s,
+                            None => continue,
+                        };
+
+                        match source.fetch_range(range.start_offset, range.end_offset) {
+                            Ok(data) => {
+                                let data_len = data.len();
+                                let mut map = match ready.lock() {
+                                    Ok(m) => m,
+                                    Err(_) => break,
+                                };
+
+                                for &(chunk_idx, slice_start, slice_len) in &range.chunk_slices {
+                                    if slice_start + slice_len <= data_len {
+                                        let chunk_payload = Arc::new(
+                                            data[slice_start..slice_start + slice_len].to_vec(),
+                                        );
+                                        map.insert((range.tile_idx, chunk_idx), chunk_payload);
+                                    }
+                                }
+                                cv.notify_all();
+                            }
+                            Err(e) => {
+                                if let Ok(mut err) = err_holder.lock() {
+                                    if err.is_none() {
+                                        *err = Some(e.to_string());
+                                    }
+                                }
+                                cv.notify_all();
+                                break;
+                            }
+                        }
                     }
+                }));
+
+                if let Err(payload) = res {
+                    let msg = crate::ffi::panic_payload_to_string(payload);
+                    if let Ok(mut err) = err_holder.lock() {
+                        if err.is_none() {
+                            *err = Some(format!("HTTP prefetch worker panicked: {msg}"));
+                        }
+                    }
+                    cv.notify_all();
                 }
             });
 
@@ -320,6 +368,7 @@ impl RemoteChunkPrefetchQueue {
             condvar,
             next_job,
             total_jobs,
+            scheduled_chunks,
             error,
             shutdown,
             _worker_handles: handles,
@@ -334,6 +383,10 @@ impl RemoteChunkPrefetchQueue {
         chunk_idx: u32,
     ) -> Result<Option<Arc<Vec<u8>>>> {
         let key = (tile_idx, chunk_idx);
+        if !self.scheduled_chunks.contains(&key) {
+            return Ok(None);
+        }
+
         let mut map = self.ready_chunks.lock().map_err(|_| {
             RasterH3Error::InvalidParameter("Prefetch queue mutex poisoned".to_string())
         })?;
@@ -367,8 +420,16 @@ impl RemoteChunkPrefetchQueue {
     /// Non-blocking check for a ready chunk payload
     pub fn try_get_chunk_payload(&self, tile_idx: usize, chunk_idx: u32) -> Option<Arc<Vec<u8>>> {
         let key = (tile_idx, chunk_idx);
+        if !self.scheduled_chunks.contains(&key) {
+            return None;
+        }
         let mut map = self.ready_chunks.lock().ok()?;
         map.remove(&key)
+    }
+
+    /// Returns true if the specified chunk was scheduled for remote prefetching
+    pub fn is_chunk_scheduled(&self, tile_idx: usize, chunk_idx: u32) -> bool {
+        self.scheduled_chunks.contains(&(tile_idx, chunk_idx))
     }
 
     /// Total jobs planned for this queue
@@ -507,5 +568,63 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].tile_idx, 0);
         assert_eq!(ranges[1].tile_idx, 1);
+    }
+
+    #[test]
+    fn test_coalesce_skips_zero_byte_chunks() {
+        let chunks = vec![
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 0,
+                offset: 1000,
+                length: 0, // Sparse/empty chunk
+            },
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 1,
+                offset: 1000,
+                length: 4000,
+            },
+            ChunkLocation {
+                tile_idx: 0,
+                chunk_idx: 2,
+                offset: 5000,
+                length: 0, // Trailing empty chunk
+            },
+        ];
+
+        let ranges = coalesce_chunk_ranges(&chunks, 32768, 2 * 1024 * 1024);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].chunk_slices.len(), 1);
+        assert_eq!(ranges[0].chunk_slices[0], (1, 0, 4000));
+    }
+
+    #[test]
+    fn test_unscheduled_chunk_fast_path_returns_none() {
+        let ranges = vec![CoalescedRange {
+            tile_idx: 0,
+            start_offset: 1000,
+            end_offset: 4999,
+            chunk_slices: vec![(1, 0, 4000)],
+        }];
+
+        let queue = RemoteChunkPrefetchQueue::spawn_internal(
+            vec![None], // No network source needed for unscheduled query
+            ranges,
+            RemotePrefetchConfig::default(),
+        );
+
+        // Chunk 1 is scheduled
+        assert!(queue.is_chunk_scheduled(0, 1));
+        // Chunk 0 (e.g. zero-length sparse chunk) was not scheduled
+        assert!(!queue.is_chunk_scheduled(0, 0));
+        // Local tile chunk on tile 1 was not scheduled
+        assert!(!queue.is_chunk_scheduled(1, 0));
+
+        // get_chunk_payload must return Ok(None) immediately without blocking
+        assert_eq!(queue.get_chunk_payload(0, 0).unwrap(), None);
+        assert_eq!(queue.get_chunk_payload(1, 0).unwrap(), None);
+        assert_eq!(queue.try_get_chunk_payload(0, 0), None);
+        assert_eq!(queue.try_get_chunk_payload(1, 0), None);
     }
 }

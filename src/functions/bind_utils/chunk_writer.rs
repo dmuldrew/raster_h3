@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_chunk_writer_capacity_bounds() {
-        let mut writer = ChunkWriter::with_vector_size(std::ptr::null_mut(), 100);
+        let writer = ChunkWriter::with_vector_size(std::ptr::null_mut(), 100);
         assert_eq!(writer.vector_size, 100);
 
         unsafe {
