@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use h3o::{CellIndex, LatLng, Resolution};
 use tempfile::TempDir;
@@ -17,10 +18,12 @@ use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;
 
 use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
+use raster_h3::aggregator::sampling::SamplingPattern;
 use raster_h3::crs::transformer::CrsTransformer;
 use raster_h3::encoding::{cell_to_wkb, WkbBuf, WKB_BUF_LEN};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 use raster_h3::raster::geotransform::GeoTransform;
+use raster_h3::raster::mosaic::{MosaicReader, OverlapRule};
 
 // ---------------------------------------------------------------------------------------------
 // 1. Golden points vs PROJ
@@ -275,6 +278,70 @@ fn write_geotiff(path: &Path, width: u32, height: u32, gt: &GeoTransform, geokey
     image.write_data(&data).expect("write data");
 }
 
+/// Write a Gray32Float GeoTIFF with constant fill value.
+fn write_geotiff_constant(
+    path: &Path,
+    width: u32,
+    height: u32,
+    gt: &GeoTransform,
+    geokeys: &[u16],
+    fill: f32,
+) {
+    assert_eq!(gt.b, 0.0);
+    assert_eq!(gt.d, 0.0);
+    let file = File::create(path).expect("create tif");
+    let mut encoder = TiffEncoder::new(file).expect("encoder");
+    let mut image = encoder
+        .new_image::<colortype::Gray32Float>(width, height)
+        .expect("image");
+    image.rows_per_strip(1).expect("rows_per_strip");
+
+    let tiepoint = [0.0, 0.0, 0.0, gt.c0, gt.f0, 0.0];
+    let scale = [gt.a, -gt.e, 0.0];
+    image
+        .encoder()
+        .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+        .unwrap();
+    image
+        .encoder()
+        .write_tag(Tag::ModelPixelScaleTag, &scale[..])
+        .unwrap();
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(34735), geokeys)
+        .unwrap();
+
+    let data: Vec<f32> = vec![fill; (width * height) as usize];
+    image.write_data(&data).expect("write data");
+}
+
+/// Brute-force reference with sub-pixel sampling: places each sub-sample at
+/// `(col + sp.dx, row + sp.dy)` through `gt.pixel_to_coord` and accumulates `sp.weight`.
+fn reference_counts_with_sampling(
+    tf: &CrsTransformer,
+    gt: &GeoTransform,
+    width: u32,
+    height: u32,
+    resolutions: &[u8],
+    sampling: &SamplingPattern,
+) -> HashMap<(u8, u64), f64> {
+    let mut out: HashMap<(u8, u64), f64> = HashMap::new();
+    for row in 0..height as usize {
+        for col in 0..width as usize {
+            for sp in &sampling.points {
+                let (x, y) = gt.pixel_to_coord(col as f64 + sp.dx, row as f64 + sp.dy);
+                let (lon, lat) = tf.transform_point(x, y).expect("reference transform");
+                let ll = LatLng::new(lat, lon).expect("finite lat/lon");
+                for &r in resolutions {
+                    let cell: u64 = ll.to_cell(Resolution::try_from(r).unwrap()).into();
+                    *out.entry((r, cell)).or_insert(0.0) += sp.weight;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Brute-force reference: every pixel center → CRS → WGS84 → H3, counted per (res, cell).
 fn reference_counts(
     tf: &CrsTransformer,
@@ -283,39 +350,29 @@ fn reference_counts(
     height: u32,
     resolutions: &[u8],
 ) -> HashMap<(u8, u64), f64> {
-    let mut out: HashMap<(u8, u64), f64> = HashMap::new();
-    for row in 0..height as usize {
-        for col in 0..width as usize {
-            let (x, y) = gt.pixel_center_to_coord(col, row);
-            let (lon, lat) = tf.transform_point(x, y).expect("reference transform");
-            let ll = LatLng::new(lat, lon).expect("finite lat/lon");
-            for &r in resolutions {
-                let cell: u64 = ll.to_cell(Resolution::try_from(r).unwrap()).into();
-                *out.entry((r, cell)).or_insert(0.0) += 1.0;
-            }
-        }
-    }
-    out
+    reference_counts_with_sampling(tf, gt, width, height, resolutions, &SamplingPattern::center())
 }
 
-/// Stream the raster and assert:
+/// Stream the raster with a specified sampling pattern and assert:
 ///  * no (resolution, h3_index) is emitted twice,
-///  * total count per resolution == width × height,
-///  * the emitted (cell → count) map equals the brute-force reference exactly.
-fn assert_coverage_and_no_duplicates(
+///  * total weight per resolution == width × height (tolerance 1e-6),
+///  * the emitted (cell → count) map equals the brute-force reference to 1e-9 per cell.
+fn assert_coverage_and_no_duplicates_with_sampling(
     tif: &Path,
     crs: &str,
     gt: &GeoTransform,
     width: u32,
     height: u32,
     resolutions: &[u8],
+    sampling: &SamplingPattern,
 ) {
     let tf = CrsTransformer::from_crs_or_epsg(None, Some(crs)).unwrap();
-    let expected = reference_counts(&tf, gt, width, height, resolutions);
+    let expected = reference_counts_with_sampling(&tf, gt, width, height, resolutions, sampling);
 
     let reader = GeoTiffStreamReader::open(tif).unwrap();
     let mut config = MultiResolutionConfig::new(resolutions.to_vec());
     config.custom_crs = Some(crs.to_string());
+    config.sampling = sampling.clone();
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
 
     let mut emitted: HashMap<(u8, u64), f64> = HashMap::new();
@@ -347,7 +404,7 @@ fn assert_coverage_and_no_duplicates(
             .sum();
         assert!(
             (total - n_pixels).abs() < 1e-6,
-            "{crs}: res {r} pixel count {total} != {n_pixels}"
+            "{crs}: res {r} total weight {total} != {n_pixels}"
         );
     }
 
@@ -366,12 +423,35 @@ fn assert_coverage_and_no_duplicates(
             )
         });
         assert!(
-            (got - ref_count).abs() < 1e-6,
+            (got - ref_count).abs() < 1e-9,
             "{crs}: res {} cell {:x} count {got} != reference {ref_count}",
             key.0,
             key.1
         );
     }
+}
+
+/// Stream the raster and assert:
+///  * no (resolution, h3_index) is emitted twice,
+///  * total count per resolution == width × height,
+///  * the emitted (cell → count) map equals the brute-force reference exactly.
+fn assert_coverage_and_no_duplicates(
+    tif: &Path,
+    crs: &str,
+    gt: &GeoTransform,
+    width: u32,
+    height: u32,
+    resolutions: &[u8],
+) {
+    assert_coverage_and_no_duplicates_with_sampling(
+        tif,
+        crs,
+        gt,
+        width,
+        height,
+        resolutions,
+        &SamplingPattern::center(),
+    );
 }
 
 /// Reference southern extent of a cell: H3 edges are gnomonic (great-circle) arcs, so sample
@@ -536,6 +616,272 @@ fn coverage_polar_stereographic_raster_containing_pole() {
     assert_eq!(b[3], 90.0, "pole chunk must report max_lat = 90");
 
     assert_coverage_and_no_duplicates(&tif, "EPSG:3413", &gt, width, height, &[3, 4, 5]);
+}
+
+#[test]
+fn coverage_supersampling_wgs84() {
+    let temp = TempDir::new().unwrap();
+    let tif = temp.path().join("supersample_4326.tif");
+    let (width, height) = (60u32, 60u32);
+    let gt = GeoTransform {
+        c0: -122.5,
+        a: 0.01,
+        b: 0.0,
+        f0: 38.0,
+        d: 0.0,
+        e: -0.01,
+    };
+    write_geotiff(&tif, width, height, &gt, &geographic_geokeys(4326));
+
+    // RGSS (4-point)
+    assert_coverage_and_no_duplicates_with_sampling(
+        &tif,
+        "EPSG:4326",
+        &gt,
+        width,
+        height,
+        &[7, 8],
+        &SamplingPattern::rgss(),
+    );
+
+    // 16-point grid
+    assert_coverage_and_no_duplicates_with_sampling(
+        &tif,
+        "EPSG:4326",
+        &gt,
+        width,
+        height,
+        &[7, 8],
+        &SamplingPattern::sixteen_point(),
+    );
+}
+
+#[test]
+fn coverage_supersampling_polar_stereographic_epsg3413() {
+    let temp = TempDir::new().unwrap();
+    let tif = temp.path().join("supersample_3413.tif");
+    let (width, height) = (50u32, 50u32);
+    let gt = GeoTransform {
+        c0: -30_000.0,
+        a: 1000.0,
+        b: 0.0,
+        f0: 30_000.0,
+        d: 0.0,
+        e: -1000.0,
+    };
+    write_geotiff(&tif, width, height, &gt, &projected_geokeys(3413));
+
+    // RGSS (4-point)
+    assert_coverage_and_no_duplicates_with_sampling(
+        &tif,
+        "EPSG:3413",
+        &gt,
+        width,
+        height,
+        &[3, 4],
+        &SamplingPattern::rgss(),
+    );
+
+    // 16-point grid
+    assert_coverage_and_no_duplicates_with_sampling(
+        &tif,
+        "EPSG:3413",
+        &gt,
+        width,
+        height,
+        &[3, 4],
+        &SamplingPattern::sixteen_point(),
+    );
+}
+
+#[test]
+fn coverage_mosaic_overlap_wgs84() {
+    let temp = TempDir::new().unwrap();
+    let p1 = temp.path().join("tile1_4326.tif");
+    let p2 = temp.path().join("tile2_4326.tif");
+
+    // Two WGS84 tiles overlapping by 20% in latitude (10 of 50 px) and 20% in longitude (10 of 50 px).
+    // Using a dyadic pixel step (1/64 = 0.015625) guarantees exact IEEE-754 floating-point representation
+    // with zero round-off discrepancy across adjacent tile coordinate offsets.
+    let (width, height) = (50u32, 50u32);
+    let step = 1.0 / 64.0;
+    let gt1 = GeoTransform {
+        c0: 10.0,
+        a: step,
+        b: 0.0,
+        f0: 50.0,
+        d: 0.0,
+        e: -step,
+    };
+    let gt2 = GeoTransform {
+        c0: 10.0 + 40.0 * step, // offset 40 px in X -> overlap is 10 px = 20%
+        a: step,
+        b: 0.0,
+        f0: 50.0 - 40.0 * step, // offset 40 px in Y -> overlap is 10 px = 20%
+        d: 0.0,
+        e: -step,
+    };
+
+    write_geotiff_constant(&p1, width, height, &gt1, &geographic_geokeys(4326), 10.0);
+    write_geotiff_constant(&p2, width, height, &gt2, &geographic_geokeys(4326), 30.0);
+
+    let paths = vec![p1, p2];
+    // |union| = 50*50 + 50*50 - 10*10 = 4900 pixels
+    let union_pixels = 4900.0;
+
+    // 1. Cutline (Voronoi bisector)
+    {
+        let mosaic =
+            Arc::new(MosaicReader::open(&paths, None, None, OverlapRule::Cutline).unwrap());
+        let mut config = MultiResolutionConfig::new(vec![8]);
+        config.overlap_rule = OverlapRule::Cutline;
+        let mut streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).unwrap();
+
+        let mut emitted: HashMap<u64, f64> = HashMap::new();
+        while !streamer.is_finished() {
+            let batch = streamer.fetch_next_batch(512).unwrap();
+            if batch.is_empty() && streamer.is_finished() {
+                break;
+            }
+            for rec in batch {
+                assert!(
+                    emitted.insert(rec.h3_index, rec.accumulator.count).is_none(),
+                    "Cutline: duplicate cell emission {:x}",
+                    rec.h3_index
+                );
+            }
+        }
+        let total: f64 = emitted.values().sum();
+        assert!(
+            (total - union_pixels).abs() < 1e-6,
+            "Cutline must count every pixel in union exactly once: got {total}, expected {union_pixels}"
+        );
+    }
+
+    // 2. First (Tile 1 takes precedence in overlap)
+    {
+        let mosaic = Arc::new(MosaicReader::open(&paths, None, None, OverlapRule::First).unwrap());
+        let mut config = MultiResolutionConfig::new(vec![8]);
+        config.overlap_rule = OverlapRule::First;
+        let mut streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).unwrap();
+
+        let mut emitted: HashMap<u64, (f64, f64)> = HashMap::new();
+        while !streamer.is_finished() {
+            let batch = streamer.fetch_next_batch(512).unwrap();
+            if batch.is_empty() && streamer.is_finished() {
+                break;
+            }
+            for rec in batch {
+                assert!(
+                    emitted
+                        .insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.mean()))
+                        .is_none(),
+                    "First: duplicate cell emission {:x}",
+                    rec.h3_index
+                );
+            }
+        }
+        let total: f64 = emitted.values().map(|(c, _)| *c).sum();
+        assert!(
+            (total - union_pixels).abs() < 1e-6,
+            "First must count every pixel in union exactly once: got {total}, expected {union_pixels}"
+        );
+
+        // In overlap region (cols 40..50, rows 40..50 of Tile 1), Tile 1 takes precedence -> mean = 10.0
+        let (ov_lon, ov_lat) = gt1.pixel_center_to_coord(45, 45);
+        let overlap_cell: u64 = LatLng::new(ov_lat, ov_lon)
+            .unwrap()
+            .to_cell(Resolution::Eight)
+            .into();
+        let (_, mean) = emitted
+            .get(&overlap_cell)
+            .expect("overlap cell must be present");
+        assert!(
+            (mean - 10.0).abs() < 1e-6,
+            "First: overlap region cell should have Tile 1 value (10.0), got {mean}"
+        );
+    }
+
+    // 3. Average (Accumulate all observations across tiles into target H3 cell)
+    {
+        let mosaic =
+            Arc::new(MosaicReader::open(&paths, None, None, OverlapRule::Average).unwrap());
+        let mut config = MultiResolutionConfig::new(vec![8]);
+        config.overlap_rule = OverlapRule::Average;
+        let mut streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).unwrap();
+
+        let mut emitted: HashMap<u64, (f64, f64)> = HashMap::new();
+        while !streamer.is_finished() {
+            let batch = streamer.fetch_next_batch(512).unwrap();
+            if batch.is_empty() && streamer.is_finished() {
+                break;
+            }
+            for rec in batch {
+                assert!(
+                    emitted
+                        .insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.mean()))
+                        .is_none(),
+                    "Average: duplicate cell emission {:x}",
+                    rec.h3_index
+                );
+            }
+        }
+
+        // Semantics note:
+        // As defined in `src/raster/mosaic.rs` (line 464) and tested in `tests/test_mosaic_and_overlap.rs`,
+        // `OverlapRule::Average` does not discard duplicate coverage pixels at chunk level; it accumulates
+        // all observations from both tiles into the H3 cell accumulators.
+        // Thus, total accumulated observations across both tiles equals 50*50 + 50*50 = 5000.
+        let total_accumulated: f64 = emitted.values().map(|(c, _)| *c).sum();
+        let expected_accumulated = (width * height * 2) as f64;
+        assert!(
+            (total_accumulated - expected_accumulated).abs() < 1e-6,
+            "Average must accumulate all tile observations: got {total_accumulated}, expected {expected_accumulated}"
+        );
+
+        // A cell strictly in the interior of the overlap region receives equal contributions
+        // from Tile 1 (10.0) and Tile 2 (30.0) -> mean = 20.0
+        let (ov_lon, ov_lat) = gt1.pixel_center_to_coord(45, 45);
+        let overlap_cell: u64 = LatLng::new(ov_lat, ov_lon)
+            .unwrap()
+            .to_cell(Resolution::Eight)
+            .into();
+        let (_, mean) = emitted
+            .get(&overlap_cell)
+            .expect("overlap cell must be present");
+        assert!(
+            (mean - 20.0).abs() < 1e-6,
+            "Average: overlap cell should have averaged value (20.0), got {mean}"
+        );
+
+        // A cell strictly in Tile 1 non-overlap -> mean = 10.0
+        let (t1_lon, t1_lat) = gt1.pixel_center_to_coord(15, 15);
+        let tile1_cell: u64 = LatLng::new(t1_lat, t1_lon)
+            .unwrap()
+            .to_cell(Resolution::Eight)
+            .into();
+        let (_, mean1) = emitted
+            .get(&tile1_cell)
+            .expect("tile 1 non-overlap cell must be present");
+        assert!(
+            (mean1 - 10.0).abs() < 1e-6,
+            "Average: tile 1 non-overlap cell should have value 10.0, got {mean1}"
+        );
+
+        // A cell strictly in Tile 2 non-overlap -> mean = 30.0
+        let (t2_lon, t2_lat) = gt2.pixel_center_to_coord(35, 35);
+        let tile2_cell: u64 = LatLng::new(t2_lat, t2_lon)
+            .unwrap()
+            .to_cell(Resolution::Eight)
+            .into();
+        let (_, mean2) = emitted
+            .get(&tile2_cell)
+            .expect("tile 2 non-overlap cell must be present");
+        assert!(
+            (mean2 - 30.0).abs() < 1e-6,
+            "Average: tile 2 non-overlap cell should have value 30.0, got {mean2}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
