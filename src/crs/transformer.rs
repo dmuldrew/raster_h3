@@ -624,8 +624,30 @@ impl CrsTransformer {
 
         match self {
             Self::Wgs84Identity | Self::WebMercatorFast => {
-                // Parallels are linear in (col, row) or strictly monotonic in y.
-                // Corners are mathematically exact extrema.
+                if gt.b != 0.0 || gt.d != 0.0 {
+                    let edges = [
+                        (p0, p1, 16usize),
+                        (p1, p2, 16usize),
+                        (p2, p3, 16usize),
+                        (p3, p0, 16usize),
+                    ];
+                    for ((x1, y1), (x2, y2), steps) in edges {
+                        let dx = x2 - x1;
+                        let dy = y2 - y1;
+                        for step in 1..steps {
+                            let t = step as f64 / steps as f64;
+                            let px = x1 + t * dx;
+                            let py = y1 + t * dy;
+                            if let Ok((lon, lat)) = self.transform_point(px, py) {
+                                let w_lon = wrap_lon(lon);
+                                min_lon = min_lon.min(w_lon);
+                                max_lon = max_lon.max(w_lon);
+                                min_lat = min_lat.min(lat);
+                                max_lat = max_lat.max(lat);
+                            }
+                        }
+                    }
+                }
             }
             Self::AlbersConic(albers) => {
                 // Parallels are circular arcs centered at the cone apex (x_0, y_0 + rho0).
@@ -1059,6 +1081,35 @@ mod tests {
         let bounds = tf.transform_rect_bounds(&gt_rot, 0.0, 0.0, 1000.0, 1000.0);
         assert!(bounds[3] > bounds[1]);
         assert!(bounds[2] > bounds[0]);
+    }
+
+    #[test]
+    fn test_transform_rect_bounds_rotated_wgs84() {
+        let tf = CrsTransformer::Wgs84Identity;
+        // 45-degree rotated geotransform
+        let angle = std::f64::consts::FRAC_PI_4;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let gt_rot = GeoTransform {
+            c0: 0.0,
+            a: cos_a,
+            b: -sin_a,
+            f0: 45.0,
+            d: sin_a,
+            e: cos_a,
+        };
+
+        // For a 45°-rotated WGS84 grid, corner max of baseline corners
+        let p0 = gt_rot.pixel_to_coord(0.0, 0.0);
+        let p3 = gt_rot.pixel_to_coord(0.0, 10.0);
+        let corner_max = p0.1.max(p3.1);
+
+        let bounds = tf.transform_rect_bounds(&gt_rot, 0.0, 0.0, 10.0, 10.0);
+        let max_lat = bounds[3];
+        let mid_lat = max_lat;
+
+        assert!((bounds[3] - mid_lat).abs() < 1e-9);
+        assert!(bounds[3] > corner_max);
     }
 
     #[test]
