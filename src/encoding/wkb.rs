@@ -17,6 +17,20 @@ pub type WkbBuf = [u8; WKB_BUF_LEN];
 /// directly into a stack-allocated buffer (zero heap allocations, ~10-15ns).
 ///
 /// Returns the number of bytes written to `buf` (109 to 189 bytes depending on resolution and topology).
+///
+/// ### Antimeridian Handling
+/// Cells straddling the antimeridian (±180°) have raw vertex longitudes that jump by ~360° (e.g., 179.9° and -179.9°),
+/// which planar readers (DuckDB Spatial, GeoPandas, GDAL) interpret as a globe-spanning polygon.
+/// If the ring's longitude range exceeds 180°, vertices are shifted to be continuous around the first vertex
+/// (adding/subtracting 360° so each successive vertex differs by < 180° from the previous one).
+/// This yields coordinates slightly outside [-180, 180] but forms a topologically valid planar polygon,
+/// matching the convention expected by GDAL / `ogr2ogr -wrapdateline`.
+///
+/// ### Pole Cells Limitation
+/// The two cells containing the poles at each resolution (`LatLng::new(±90.0, 0.0).to_cell(res)`)
+/// encircle the pole and naturally span a full 360° of longitude. For these two cells, the vertex
+/// ring is emitted unchanged, as an unwrapped ring encircling a pole cannot be represented as a
+/// single valid planar polygon without polar slit cuts.
 #[inline]
 pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
     let boundary = cell.boundary();
@@ -32,26 +46,58 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
     // 3. Number of Rings: 1 (exterior ring)
     buf[5..9].copy_from_slice(&1u32.to_le_bytes());
 
-    // Points start at offset 13 (reserving bytes 9..13 for num_points)
-    let mut offset = 13;
-    let mut first_lng = 0.0f64;
-    let mut first_lat = 0.0f64;
+    let mut lngs = [0.0f64; 10];
+    let mut lats = [0.0f64; 10];
+    let mut min_lng = f64::INFINITY;
+    let mut max_lng = f64::NEG_INFINITY;
 
     for (i, v) in boundary.iter().enumerate() {
         let lng = v.lng();
         let lat = v.lat();
-        if i == 0 {
-            first_lng = lng;
-            first_lat = lat;
+        lngs[i] = lng;
+        lats[i] = lat;
+        min_lng = min_lng.min(lng);
+        max_lng = max_lng.max(lng);
+    }
+
+    // Antimeridian unwrapping: if longitude range exceeds 180° and the cell is not
+    // one of the two polar cells that encircle a pole, shift vertices so that each
+    // successive vertex differs by < 180° from the previous one.
+    let res = cell.resolution();
+    let is_pole = cell
+        == h3o::LatLng::new(90.0, 0.0)
+            .expect("valid")
+            .to_cell(res)
+        || cell
+            == h3o::LatLng::new(-90.0, 0.0)
+                .expect("valid")
+                .to_cell(res);
+
+    if !is_pole && (max_lng - min_lng > 180.0) {
+        for i in 1..n {
+            let mut diff = lngs[i] - lngs[i - 1];
+            while diff > 180.0 {
+                lngs[i] -= 360.0;
+                diff = lngs[i] - lngs[i - 1];
+            }
+            while diff < -180.0 {
+                lngs[i] += 360.0;
+                diff = lngs[i] - lngs[i - 1];
+            }
         }
-        buf[offset..offset + 8].copy_from_slice(&lng.to_le_bytes());
-        buf[offset + 8..offset + 16].copy_from_slice(&lat.to_le_bytes());
+    }
+
+    // Points start at offset 13 (reserving bytes 9..13 for num_points)
+    let mut offset = 13;
+    for i in 0..n {
+        buf[offset..offset + 8].copy_from_slice(&lngs[i].to_le_bytes());
+        buf[offset + 8..offset + 16].copy_from_slice(&lats[i].to_le_bytes());
         offset += 16;
     }
 
     // Close the linear ring by repeating the first vertex
-    buf[offset..offset + 8].copy_from_slice(&first_lng.to_le_bytes());
-    buf[offset + 8..offset + 16].copy_from_slice(&first_lat.to_le_bytes());
+    buf[offset..offset + 8].copy_from_slice(&lngs[0].to_le_bytes());
+    buf[offset + 8..offset + 16].copy_from_slice(&lats[0].to_le_bytes());
     offset += 16;
     let total_points = (n as u32) + 1;
 
@@ -185,6 +231,86 @@ mod tests {
         assert_eq!(hex_res13_7.boundary().len(), 7);
         let len = cell_to_wkb(hex_res13_7, &mut buf);
         assert_eq!(len, 141);
+    }
+
+    #[test]
+    fn test_cell_to_wkb_antimeridian_straddling() {
+        // A res-5 cell straddling the antimeridian
+        let cell = h3o::LatLng::new(-18.0, 180.0)
+            .unwrap()
+            .to_cell(h3o::Resolution::Five);
+
+        // Raw boundary has vertices jump between +179.9° and -179.9° (span > 350°)
+        let raw_boundary = cell.boundary();
+        let raw_min_lng = raw_boundary
+            .iter()
+            .map(|v| v.lng())
+            .fold(f64::INFINITY, f64::min);
+        let raw_max_lng = raw_boundary
+            .iter()
+            .map(|v| v.lng())
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            raw_max_lng - raw_min_lng > 180.0,
+            "Raw cell boundary should span across 180°"
+        );
+
+        let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
+        let len = cell_to_wkb(cell, &mut buf);
+
+        // Standard hexagon at res 5: 6 vertices + 1 closing = 7 points -> 125 bytes
+        assert_eq!(len, 125);
+        assert!(len <= WKB_BUF_LEN);
+
+        let num_points = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
+        assert_eq!(num_points, 7);
+
+        // Read all serialized longitude coordinates
+        let mut min_wkb_lng = f64::INFINITY;
+        let mut max_wkb_lng = f64::NEG_INFINITY;
+        for i in 0..num_points {
+            let offset = 13 + i * 16;
+            let lng = f64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+            min_wkb_lng = min_wkb_lng.min(lng);
+            max_wkb_lng = max_wkb_lng.max(lng);
+        }
+
+        // Ring's max - min longitude must be < 180° (continuous planar ring)
+        assert!(
+            max_wkb_lng - min_wkb_lng < 180.0,
+            "Serialized ring longitude range should be < 180°, got {}",
+            max_wkb_lng - min_wkb_lng
+        );
+
+        // Ring must be closed (first == last point)
+        let first_x = f64::from_le_bytes(buf[13..21].try_into().unwrap());
+        let first_y = f64::from_le_bytes(buf[21..29].try_into().unwrap());
+        let last_x = f64::from_le_bytes(buf[13 + (num_points - 1) * 16..13 + (num_points - 1) * 16 + 8].try_into().unwrap());
+        let last_y = f64::from_le_bytes(buf[13 + (num_points - 1) * 16 + 8..13 + num_points * 16].try_into().unwrap());
+        assert_eq!(first_x, last_x);
+        assert_eq!(first_y, last_y);
+    }
+
+    #[test]
+    fn test_cell_to_wkb_pole_cells_emitted_unchanged() {
+        for r in 0..=15u8 {
+            let res = h3o::Resolution::try_from(r).unwrap();
+            let pole_n = h3o::LatLng::new(90.0, 0.0).unwrap().to_cell(res);
+            let pole_s = h3o::LatLng::new(-90.0, 0.0).unwrap().to_cell(res);
+
+            let mut buf_n: WkbBuf = [0u8; WKB_BUF_LEN];
+            let len_n = cell_to_wkb(pole_n, &mut buf_n);
+            assert!(len_n <= WKB_BUF_LEN);
+
+            let mut buf_s: WkbBuf = [0u8; WKB_BUF_LEN];
+            let len_s = cell_to_wkb(pole_s, &mut buf_s);
+            assert!(len_s <= WKB_BUF_LEN);
+
+            // Pole rings should match their raw boundary coordinates exactly
+            let b_n = pole_n.boundary();
+            let first_lng = f64::from_le_bytes(buf_n[13..21].try_into().unwrap());
+            assert_eq!(first_lng, b_n[0].lng());
+        }
     }
 
     #[test]
