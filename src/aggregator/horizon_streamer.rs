@@ -55,44 +55,13 @@ pub fn chunk_intersects_bbox(
 ) -> bool {
     let [b_min_lon, b_min_lat, b_max_lon, b_max_lat] = *bbox;
 
-    let corners = [
-        (chunk.col_offset as usize, chunk.row_offset as usize),
-        (
-            (chunk.col_offset + chunk.width) as usize,
-            chunk.row_offset as usize,
-        ),
-        (
-            chunk.col_offset as usize,
-            (chunk.row_offset + chunk.height) as usize,
-        ),
-        (
-            (chunk.col_offset + chunk.width) as usize,
-            (chunk.row_offset + chunk.height) as usize,
-        ),
-    ];
-
-    let mut c_min_lon = f64::INFINITY;
-    let mut c_max_lon = f64::NEG_INFINITY;
-    let mut c_min_lat = f64::INFINITY;
-    let mut c_max_lat = f64::NEG_INFINITY;
-
-    for (c, r) in corners {
-        let (x, y) = gt.pixel_to_coord(c as f64, r as f64);
-        if let Ok((lon, lat)) = transformer.transform_point(x, y) {
-            if lon < c_min_lon {
-                c_min_lon = lon;
-            }
-            if lon > c_max_lon {
-                c_max_lon = lon;
-            }
-            if lat < c_min_lat {
-                c_min_lat = lat;
-            }
-            if lat > c_max_lat {
-                c_max_lat = lat;
-            }
-        }
-    }
+    let [c_min_lon, c_min_lat, c_max_lon, c_max_lat] = transformer.transform_rect_bounds(
+        gt,
+        chunk.col_offset as f64,
+        chunk.row_offset as f64,
+        chunk.width as f64,
+        chunk.height as f64,
+    );
 
     if !c_min_lon.is_finite() {
         return true;

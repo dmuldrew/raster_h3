@@ -177,8 +177,8 @@ pub fn zooms_for_h3_res(res: u8, min_res: u8) -> Vec<u8> {
 /// Estimate maximum radius (in WGS84 degrees) of an H3 hexagon at resolution res
 pub fn max_hex_radius_deg(res: u8) -> f64 {
     match res {
-        0 => 12.0,
-        1 => 4.5,
+        0 => 12.5,
+        1 => 5.0,
         2 => 1.7,
         3 => 0.65,
         4 => 0.25,

@@ -271,34 +271,17 @@ impl TileDescriptor {
         let h = reader.metadata.height as f64;
         let gt = &reader.metadata.geotransform;
 
-        let corners = [
-            gt.pixel_to_coord(0.0, 0.0),
-            gt.pixel_to_coord(w, 0.0),
-            gt.pixel_to_coord(w, h),
-            gt.pixel_to_coord(0.0, h),
-        ];
-
-        let mut min_lon = f64::INFINITY;
-        let mut min_lat = f64::INFINITY;
-        let mut max_lon = f64::NEG_INFINITY;
-        let mut max_lat = f64::NEG_INFINITY;
-
-        for (x, y) in corners {
-            if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
-            }
-        }
-
-        let centroid_wgs84 = ((min_lon + max_lon) * 0.5, (min_lat + max_lat) * 0.5);
+        let bounds_wgs84 = crs_transformer.transform_rect_bounds(gt, 0.0, 0.0, w, h);
+        let centroid_wgs84 = (
+            (bounds_wgs84[0] + bounds_wgs84[2]) * 0.5,
+            (bounds_wgs84[1] + bounds_wgs84[3]) * 0.5,
+        );
 
         Ok(Self {
             tile_idx,
             file_path: reader.file_path.clone(),
             reader,
-            bounds_wgs84: [min_lon, min_lat, max_lon, max_lat],
+            bounds_wgs84,
             centroid_wgs84,
             crs_transformer,
         })
@@ -365,45 +348,19 @@ impl MosaicReader {
                 }
             }
 
-            let corners = [
-                gt.pixel_to_coord(
-                    chunk_bounds.col_offset as f64,
-                    chunk_bounds.row_offset as f64,
-                ),
-                gt.pixel_to_coord(
-                    (chunk_bounds.col_offset + chunk_bounds.width) as f64,
-                    chunk_bounds.row_offset as f64,
-                ),
-                gt.pixel_to_coord(
-                    (chunk_bounds.col_offset + chunk_bounds.width) as f64,
-                    (chunk_bounds.row_offset + chunk_bounds.height) as f64,
-                ),
-                gt.pixel_to_coord(
-                    chunk_bounds.col_offset as f64,
-                    (chunk_bounds.row_offset + chunk_bounds.height) as f64,
-                ),
-            ];
-
-            let mut north_lat = f64::NEG_INFINITY;
-            let mut south_lat = f64::INFINITY;
-
-            for (x, y) in corners {
-                if let Ok((_lon, lat)) = crs_trans.transform_point(x, y) {
-                    north_lat = north_lat.max(lat);
-                    south_lat = south_lat.min(lat);
-                }
-            }
-
-            if north_lat == f64::NEG_INFINITY {
-                north_lat = 0.0;
-                south_lat = 0.0;
-            }
+            let bounds = crs_trans.transform_rect_bounds(
+                gt,
+                chunk_bounds.col_offset as f64,
+                chunk_bounds.row_offset as f64,
+                chunk_bounds.width as f64,
+                chunk_bounds.height as f64,
+            );
 
             chunk_refs.push(MosaicChunkRef {
                 tile_idx: 0,
                 chunk_idx,
-                north_lat,
-                south_lat,
+                north_lat: bounds[3],
+                south_lat: bounds[1],
                 has_overlap: false,
             });
         }
@@ -491,45 +448,17 @@ impl MosaicReader {
                     }
                 }
 
-                let corners = [
-                    gt.pixel_to_coord(
-                        chunk_bounds.col_offset as f64,
-                        chunk_bounds.row_offset as f64,
-                    ),
-                    gt.pixel_to_coord(
-                        (chunk_bounds.col_offset + chunk_bounds.width) as f64,
-                        chunk_bounds.row_offset as f64,
-                    ),
-                    gt.pixel_to_coord(
-                        (chunk_bounds.col_offset + chunk_bounds.width) as f64,
-                        (chunk_bounds.row_offset + chunk_bounds.height) as f64,
-                    ),
-                    gt.pixel_to_coord(
-                        chunk_bounds.col_offset as f64,
-                        (chunk_bounds.row_offset + chunk_bounds.height) as f64,
-                    ),
-                ];
-
-                let mut c_min_lon = f64::INFINITY;
-                let mut c_min_lat = f64::INFINITY;
-                let mut c_max_lon = f64::NEG_INFINITY;
-                let mut c_max_lat = f64::NEG_INFINITY;
-
-                for (x, y) in corners {
-                    if let Ok((lon, lat)) = crs_trans.transform_point(x, y) {
-                        c_min_lon = c_min_lon.min(lon);
-                        c_max_lon = c_max_lon.max(lon);
-                        c_min_lat = c_min_lat.min(lat);
-                        c_max_lat = c_max_lat.max(lat);
-                    }
-                }
-
-                if c_max_lat == f64::NEG_INFINITY {
-                    c_min_lon = 0.0;
-                    c_max_lon = 0.0;
-                    c_min_lat = 0.0;
-                    c_max_lat = 0.0;
-                }
+                let bounds = crs_trans.transform_rect_bounds(
+                    gt,
+                    chunk_bounds.col_offset as f64,
+                    chunk_bounds.row_offset as f64,
+                    chunk_bounds.width as f64,
+                    chunk_bounds.height as f64,
+                );
+                let c_min_lon = bounds[0];
+                let c_min_lat = bounds[1];
+                let c_max_lon = bounds[2];
+                let c_max_lat = bounds[3];
 
                 let mut has_overlap = false;
                 if tiles.len() > 1 && overlap_rule != OverlapRule::Average {
