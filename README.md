@@ -24,7 +24,7 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 - [License](#license)
 
 **📖 Deep Dives:**
-[Engineering Details](docs/engineering.md) · [Super-Sampling](docs/super-sampling.md) · [CRS & Projections](docs/crs-and-projection.md) · [Multi-Resolution Pyramids](docs/multi-resolution.md) · [PMTiles v3](docs/pmtiles.md) · [Architecture Comparison](docs/architecture-comparison.md) · [API Reference](docs/api-reference.md)
+[Engineering Details](docs/engineering.md) · [Optimal Raster Formats](docs/optimal-raster-format.md) · [Super-Sampling](docs/super-sampling.md) · [CRS & Projections](docs/crs-and-projection.md) · [Multi-Resolution Pyramids](docs/multi-resolution.md) · [PMTiles v3](docs/pmtiles.md) · [Architecture Comparison](docs/architecture-comparison.md) · [API Reference](docs/api-reference.md)
 
 ---
 
@@ -74,6 +74,8 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 ### Latitude "Cruise Control" (Eliminating 99.8% of Math)
 
 Every pixel in a row shares the same latitude. Rather than running spherical trigonometry millions of times, `raster_h3` computes latitude once per row and steps across with simple arithmetic — eliminating 99.8% of coordinate projection math.
+
+> ⚡ **Performance Tip**: Ingesting rasters formatted as tiled WGS84 Cloud-Optimized GeoTIFFs (COGs) achieves an additional **4.5×–6× speedup** by eliminating spherical trigonometry entirely. See [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
 
 ### Hexagon Lookahead & Run-Skipping
 
@@ -280,6 +282,9 @@ SELECT * FROM h3_raster_continuous_aggregate(
     resolution := 9
 );
 ```
+
+> 💡 **Tip**: For optimal remote streaming and maximum local throughput, source rasters should be formatted as tiled WGS84 COGs with $512 \times 512$ blocks. See [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
+
 
 ### Multi-File Mosaics
 ```sql
@@ -516,6 +521,8 @@ SELECT * FROM h3_raster_continuous_aggregate(
 );
 ```
 
+For supported projection families, see [Supported CRS](docs/crs-and-projection.md). To convert your dataset into zero-trig native WGS84 for maximum throughput, see [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
+
 ### Antimeridian Crossing
 
 For datasets spanning ±180° longitude, `raster_h3` automatically wraps coordinates. For ROI bounding box filters across the antimeridian, split into two queries (e.g., `[170.0, 180.0]` and `[-180.0, -170.0]`).
@@ -527,6 +534,9 @@ Natively decodes TIFF 6.0 and BigTIFF (>4 GB) with: Raw, Deflate (Zlib), LZW, Pa
 ```bash
 gdal_translate -co COMPRESS=DEFLATE input.tif output.tif
 ```
+
+For maximum ingestion throughput (up to 6× faster) and optimal L2 cache residency, see the recommended GDAL conversion recipes in the [Optimal Raster Format Deep Dive](docs/optimal-raster-format.md).
+
 
 ### Container Memory Mapping
 
