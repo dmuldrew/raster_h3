@@ -23,6 +23,7 @@ pub struct ChunkWriter {
 }
 
 impl ChunkWriter {
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     #[inline(always)]
     pub fn new(chunk: duckdb_data_chunk) -> Self {
         let column_count = if chunk.is_null() {
@@ -37,6 +38,7 @@ impl ChunkWriter {
         }
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     #[inline(always)]
     pub fn with_vector_size(chunk: duckdb_data_chunk, vector_size: usize) -> Self {
         let column_count = if chunk.is_null() {

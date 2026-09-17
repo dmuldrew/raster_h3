@@ -1892,8 +1892,8 @@ fn test_categorical_simd_uniformity_types_and_spans() {
     check_uniformity::<i32>(-100_000, 100_000);
     check_uniformity::<u64>(1_000_000_000, 2_000_000_000);
     check_uniformity::<i64>(-1_000_000_000, 1_000_000_000);
-    check_uniformity::<f32>(3.14, 2.71);
-    check_uniformity::<f64>(1.414213, 1.73205);
+    check_uniformity::<f32>(3.25, 2.75);
+    check_uniformity::<f64>(1.45, 1.75);
 
     // Float +0.0 and -0.0 equivalence
     let zeros_f32 = vec![0.0f32, -0.0f32, 0.0f32, -0.0f32];
