@@ -1,0 +1,50 @@
+# Cursor AI ignore file (.cursorignore)
+# Files and directories ignored here are excluded from Cursor indexing and AI context.
+
+# --- Git & System ---
+.git/
+.DS_Store
+Thumbs.db
+
+# --- Rust & Cargo Build Artifacts ---
+target/
+build/
+dist/
+debug/
+**/debug/
+**/*.rs.bk
+*.pdb
+*.duckdb_extension
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# --- Dependency Lockfiles ---
+# Excluded to avoid consuming large token budgets during codebase indexing
+Cargo.lock
+
+# --- Geospatial & Large Datasets ---
+data/
+*.tif
+*.tiff
+*.pmtiles
+*.parquet
+*.geoparquet
+*.gpkg
+*.cog
+
+# --- Python & Server Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# --- Logs & Temp Files ---
+*.log
+*.tmp
+*.temp

@@ -1,6 +1,35 @@
-target/
+# Version control & configuration
 .git/
 .gitignore
+.cursorignore
 .dockerignore
+
+# Rust & Cargo build artifacts
+target/
+build/
+dist/
+debug/
+
+# Datasets (60+ GB) and generated formats
+data/
 *.tif
 *.tiff
+*.parquet
+*.geoparquet
+*.pmtiles
+*.duckdb_extension
+
+# Non-build directories & assets
+pmtiles_viewer/
+assets/
+docs/
+
+# Python & OS
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.DS_Store
+Thumbs.db
