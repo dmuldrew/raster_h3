@@ -100,7 +100,6 @@ Pre-compiled binaries are published for all major platforms:
 | **`osx_arm64`** | macOS Apple Silicon (M1/M2/M3/M4) | `raster_h3-osx_arm64.duckdb_extension.gz` |
 | **`osx_amd64`** | macOS Intel x86_64 | `raster_h3-osx_amd64.duckdb_extension.gz` |
 | **`linux_amd64`** | Ubuntu, Debian, CentOS, Fedora (glibc) | `raster_h3-linux_amd64.duckdb_extension.gz` |
-| **`linux_amd64_musl`** | Alpine Linux, musl-based containers | `raster_h3-linux_amd64_musl.duckdb_extension.gz` |
 | **`linux_arm64`** | AWS Graviton, Raspberry Pi 4/5, AArch64 | `raster_h3-linux_arm64.duckdb_extension.gz` |
 | **`windows_amd64`** | Windows 10/11, Windows Server (x64) | `raster_h3-windows_amd64.duckdb_extension.gz` |
 

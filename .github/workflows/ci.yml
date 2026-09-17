@@ -24,11 +24,6 @@ jobs:
             platform: linux_amd64
             lib_file: libraster_h3.so
             cli_arch: linux-amd64
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            platform: linux_amd64_musl
-            lib_file: libraster_h3.so
-            cli_arch: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux_arm64
@@ -54,12 +49,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl-tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -74,11 +63,6 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           echo "RUSTFLAGS=-C link-arg=-undefined -C link-arg=dynamic_lookup" >> $GITHUB_ENV
-
-      - name: Configure Musl Target Flags
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=-crt-static" >> $GITHUB_ENV
 
       - name: Setup DuckDB Import Library (Windows MSVC)
         if: runner.os == 'Windows'
@@ -100,10 +84,6 @@ jobs:
         run: cargo test --release
 
       - name: Build Dynamic Library & Binaries
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=-crt-static
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package DuckDB Extension (Uncompressed & Gzipped)
