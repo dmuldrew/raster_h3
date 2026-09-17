@@ -1,3 +1,4 @@
+use crate::error::Result;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -23,9 +24,13 @@ impl<R> ConcurrentRecordQueue<R> {
     }
 
     /// Retrieve next batch from pre-batched queue (~10ns lock) or refill from streamer under lock
-    pub fn pop_or_refill<S, F>(&self, streamer: &Mutex<S>, mut drain_into: F) -> Option<Vec<R>>
+    pub fn pop_or_refill<S, F>(
+        &self,
+        streamer: &Mutex<S>,
+        mut drain_into: F,
+    ) -> Result<Option<Vec<R>>>
     where
-        F: FnMut(&mut S, usize, &mut dyn FnMut(usize, R)) -> usize,
+        F: FnMut(&mut S, usize, &mut dyn FnMut(usize, R)) -> Result<usize>,
     {
         // Fast path: check ready_batches
         let mut ready_q = match self.ready_batches.lock() {
@@ -34,10 +39,10 @@ impl<R> ConcurrentRecordQueue<R> {
         };
 
         if let Some(b) = ready_q.pop_front() {
-            return Some(b);
+            return Ok(Some(b));
         }
         if self.is_finished.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
         }
         drop(ready_q);
 
@@ -53,10 +58,10 @@ impl<R> ConcurrentRecordQueue<R> {
         };
 
         if let Some(b) = ready_q.pop_front() {
-            return Some(b);
+            return Ok(Some(b));
         }
         if self.is_finished.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
         }
 
         const BATCH_SIZE: usize = 2048;
@@ -65,7 +70,7 @@ impl<R> ConcurrentRecordQueue<R> {
         let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
         let mut my_batch = None;
 
-        drain_into(&mut *streamer_guard, REFILL_SIZE, &mut |_i, rec| {
+        let result = drain_into(&mut *streamer_guard, REFILL_SIZE, &mut |_i, rec| {
             current_chunk.push(rec);
             if current_chunk.len() == BATCH_SIZE {
                 if my_batch.is_none() {
@@ -81,6 +86,10 @@ impl<R> ConcurrentRecordQueue<R> {
                 }
             }
         });
+        if let Err(error) = result {
+            ready_q.clear();
+            return Err(error);
+        }
 
         if !current_chunk.is_empty() {
             if my_batch.is_none() {
@@ -94,6 +103,6 @@ impl<R> ConcurrentRecordQueue<R> {
             self.is_finished.store(true, Ordering::Release);
         }
 
-        my_batch
+        Ok(my_batch)
     }
 }

@@ -19,7 +19,7 @@ fn drain_streamer_to_map(
     let mut streamer = MultiScanHorizonStreamer::new(reader, config).unwrap();
     let mut map = HashMap::new();
     while !streamer.is_finished() {
-        for record in streamer.fetch_next_batch(128) {
+        for record in streamer.fetch_next_batch(128).unwrap() {
             map.entry(record.h3_index)
                 .and_modify(|acc: &mut H3Accumulator| acc.merge(&record.accumulator))
                 .or_insert(record.accumulator);
@@ -136,7 +136,7 @@ fn test_multithreaded_streamer_high_contention_stress() -> Result<()> {
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
-                        guard.fetch_next_batch(128)
+                        guard.fetch_next_batch(128).unwrap()
                     };
                     if batch.is_empty() {
                         break;

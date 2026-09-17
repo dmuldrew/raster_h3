@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.
+- Return complete remote byte reads across cache blocks and use a cached full-file HTTP response for large reads.
+- Preserve supersamples that fall inside a bounding box when their pixel center falls outside it.
+- Reject compact multi-resolution requests that would emit both a requested parent cell and a compacted child-cell parent.
+- Validate HTTP partial-content status, range offsets, total size, and body length before accepting remote COG bytes.
+- Preserve finite Float32 values when the NoData marker is NaN, including span statistics and variance.
+- Apply full affine coordinates to rotated/sheared raster centers and subpixel samples, including WGS84 and Web Mercator. Disable north-up scanline shortcuts for these rasters.
+- Mix all 64 bits of H3 indices when choosing aggregation shards, preventing resolutions 0–13 from collapsing into a single shard. Added distribution tests across resolutions 0–15 and local neighborhoods, plus continuous/categorical merge and eviction checks with one and four Rayon threads.
+- Propagate chunk decoding and remote prefetch errors through continuous/categorical streamers, DuckDB table functions, and Parquet/PMTiles exporters. Failed streams continue returning an error on subsequent reads instead of reporting successful EOF.
+- Deliver prefetch initialization failures even when earlier chunk slots are still empty.
+- Replace approximate nearest-centroid subpixel assignment and core-span checks with direct H3 indexing.
+- Publish Parquet exports only after successful completion, preserving an existing destination on stream failure.
+
 ### Added
 - **Single-Pass Multi-Resolution Fusion**:
   - Concurrent multi-resolution aggregation (e.g. H3 Res 8 + Res 9) in a single unified scanline pass over each row slice.
@@ -61,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Supports OGC GeoParquet 1.1 metadata, compact format, and configurable compression (`snappy`, `zstd`, `gzip`, `lz4`, `brotli`).
 
 ### Changed
+- **Rust API change:** `fetch_next_batch`, `drain_completed_into`, and `advance_until_completed` now return `Result`; callers must propagate or handle failures (for example, `streamer.fetch_next_batch(2048)?`). The `ParquetStreamer` and record-queue interfaces also propagate `Result`.
+- Removed the approximate `H3NeighborDiskCache` and `can_use_neighbor_cache` helpers and their unused per-row geometry fields. Boundary-heavy supersampling may be slower with exact indexing; center-sampled scanline aggregation retains its existing fast path.
 - **Strict CRS Validation on GeoTIFF Ingestion**:
   - Eliminated silent fallback to `Wgs84Identity` when GeoTIFF metadata lacks embedded CRS definitions or uses unrecognized projection codes.
   - Ingestion now fails immediately with `RasterH3Error::CrsError` instructing the user to supply `crs` or `source_crs` explicitly (e.g. `crs := 'EPSG:4326'`, `crs := 'EPSG:5070'`).

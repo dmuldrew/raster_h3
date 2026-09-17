@@ -1,7 +1,8 @@
 use crate::aggregator::accumulator::H3Accumulator;
+use crate::aggregator::nodata::{NativeNoData, PixelValidity};
 
 /// Trait for types that support high-throughput SIMD / multi-lane scanline span accumulation.
-pub trait SimdSpanAccumulate: Copy + PartialEq + Send + Sync + 'static {
+pub trait SimdSpanAccumulate: NativeNoData {
     /// Vectorized accumulation of a contiguous horizontal span into an H3Accumulator.
     fn accumulate_span(slice: &[Self], nodata: Option<Self>) -> H3Accumulator;
 
@@ -24,15 +25,7 @@ impl SimdSpanAccumulate for f32 {
 
     #[inline(always)]
     fn is_valid(self, nodata: Option<Self>) -> bool {
-        if !self.is_finite() {
-            return false;
-        }
-        if let Some(nd) = nodata {
-            if self == nd || (self - nd).abs() < 1e-6 {
-                return false;
-            }
-        }
-        true
+        PixelValidity::new(nodata).is_valid(self)
     }
 
     fn accumulate_span(slice: &[Self], nodata: Option<Self>) -> H3Accumulator {
@@ -42,6 +35,8 @@ impl SimdSpanAccumulate for f32 {
 
         match nodata {
             None => accumulate_span_f32_no_nodata(slice),
+            // Non-finite values are already excluded by the no-marker path.
+            Some(nd) if !nd.is_finite() => accumulate_span_f32_no_nodata(slice),
             Some(nd) => accumulate_span_f32_with_nodata(slice, nd),
         }
     }
@@ -476,15 +471,7 @@ impl SimdSpanAccumulate for f64 {
 
     #[inline(always)]
     fn is_valid(self, nodata: Option<Self>) -> bool {
-        if !self.is_finite() {
-            return false;
-        }
-        if let Some(nd) = nodata {
-            if self == nd || (self - nd).abs() < 1e-6 {
-                return false;
-            }
-        }
-        true
+        PixelValidity::new(nodata).is_valid(self)
     }
 
     fn accumulate_span(slice: &[Self], nodata: Option<Self>) -> H3Accumulator {
@@ -637,10 +624,7 @@ macro_rules! impl_simd_span_integer {
 
             #[inline(always)]
             fn is_valid(self, nodata: Option<Self>) -> bool {
-                match nodata {
-                    Some(nd) => self != nd,
-                    None => true,
-                }
+                PixelValidity::new(nodata).is_valid(self)
             }
 
             fn accumulate_span(slice: &[Self], nodata: Option<Self>) -> H3Accumulator {
@@ -841,3 +825,44 @@ impl_simd_span_integer!(i8);
 impl_simd_span_integer!(i16);
 impl_simd_span_integer!(i32);
 impl_simd_span_integer!(i64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonfinite_nodata_matches_scalar_validity() {
+        // Exercise vector lanes, the scalar tail, and the variance pass.
+        let values = [
+            1.0f32,
+            2.0,
+            f32::NAN,
+            4.0,
+            f32::INFINITY,
+            6.0,
+            f32::NEG_INFINITY,
+            8.0,
+            9.0,
+            f32::NAN,
+            11.0,
+        ];
+        for marker in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -9999.0, 4.0] {
+            for len in 0..=values.len() {
+                let mut expected = H3Accumulator::default();
+                for &v in &values[..len] {
+                    if v.is_valid(Some(marker)) {
+                        expected.update(v as f64);
+                    }
+                }
+                let actual = f32::accumulate_span(&values[..len], Some(marker));
+                assert_eq!(actual.count, expected.count);
+                assert_eq!(actual.sum, expected.sum);
+                if expected.count > 0.0 {
+                    assert_eq!(actual.min, expected.min);
+                    assert_eq!(actual.max, expected.max);
+                    assert!((actual.m2 - expected.m2).abs() < 1e-10);
+                }
+            }
+        }
+    }
+}

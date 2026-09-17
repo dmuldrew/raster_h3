@@ -20,6 +20,7 @@ struct OrderedQueueState<T> {
     slots: Vec<Option<T>>,
     next_read: usize,
     closed: bool,
+    terminal_item: Option<T>,
 }
 
 /// High-throughput, zero-allocation bounded ring buffer that delivers parallel background chunk
@@ -46,6 +47,7 @@ impl<T> OrderedPrefetchQueue<T> {
                 slots,
                 next_read: 0,
                 closed: false,
+                terminal_item: None,
             }),
             not_empty: Condvar::new(),
             not_full: Condvar::new(),
@@ -78,6 +80,18 @@ impl<T> OrderedPrefetchQueue<T> {
         self.not_full.notify_all();
     }
 
+    /// Deliver a terminal error even if earlier jobs have not filled their slots.
+    /// Closing alone could otherwise hide the error behind a missing earlier job.
+    pub fn fail(&self, item: T) {
+        let mut guard = self.state.lock().unwrap();
+        if !guard.closed {
+            guard.terminal_item = Some(item);
+            guard.closed = true;
+        }
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+
     /// Pull next batch of ready chunks directly into `batch`. Drains contiguous sequence-ordered chunks
     /// under a single mutex lock.
     pub fn drain_into(&self, batch: &mut Vec<T>, min_batch: usize, max_batch: usize) -> usize {
@@ -93,6 +107,12 @@ impl<T> OrderedPrefetchQueue<T> {
             && !guard.closed
         {
             guard = self.not_empty.wait(guard).unwrap();
+        }
+
+        if let Some(item) = guard.terminal_item.take() {
+            guard.next_read = self.total_jobs;
+            batch.push(item);
+            return batch.len() - initial_len;
         }
 
         if guard.next_read >= self.total_jobs
@@ -132,6 +152,11 @@ impl<T> OrderedPrefetchQueue<T> {
                     break;
                 }
             }
+        }
+
+        if let Some(item) = guard.terminal_item.take() {
+            guard.next_read = self.total_jobs;
+            batch.push(item);
         }
 
         if drained_any {
@@ -234,11 +259,7 @@ impl PrefetchedChunkReader {
                 let mut decoder = match worker_reader.open_decoder() {
                     Ok(d) => d,
                     Err(e) => {
-                        let job = worker_job_idx.fetch_add(1, Ordering::Relaxed);
-                        if job < worker_indices.len() {
-                            worker_queue.push(job, Err(e));
-                        }
-                        worker_queue.close();
+                        worker_queue.fail(Err(e));
                         return;
                     }
                 };
@@ -255,14 +276,18 @@ impl PrefetchedChunkReader {
                     };
                     let prefetched_bytes = worker_remote_queue
                         .as_ref()
-                        .and_then(|q| q.get_chunk_payload(0, chunk_idx).ok().flatten());
+                        .map(|q| q.get_chunk_payload(0, chunk_idx))
+                        .transpose()
+                        .map(Option::flatten);
 
-                    let item = decoder
-                        .read_chunk_with_payload(
-                            chunk_idx,
-                            prefetched_bytes.as_ref().map(|v| v.as_slice()),
-                            recycled_buf,
-                        )
+                    let item = prefetched_bytes
+                        .and_then(|payload| {
+                            decoder.read_chunk_with_payload(
+                                chunk_idx,
+                                payload.as_ref().map(|v| v.as_slice()),
+                                recycled_buf,
+                            )
+                        })
                         .map(|(bounds, data)| (chunk_idx, bounds, data));
 
                     if !worker_queue.push(job_id, item) {
@@ -394,8 +419,7 @@ impl PrefetchedMosaicReader {
                         match worker_mosaic.tiles[tile_idx].reader.open_decoder() {
                             Ok(d) => decoders[tile_idx] = Some(d),
                             Err(e) => {
-                                worker_queue.push(job_id, Err(e));
-                                worker_queue.close();
+                                worker_queue.fail(Err(e));
                                 return;
                             }
                         }
@@ -408,14 +432,18 @@ impl PrefetchedMosaicReader {
                     };
                     let prefetched_bytes = worker_remote_queue
                         .as_ref()
-                        .and_then(|q| q.get_chunk_payload(tile_idx, chunk_idx).ok().flatten());
+                        .map(|q| q.get_chunk_payload(tile_idx, chunk_idx))
+                        .transpose()
+                        .map(Option::flatten);
 
-                    let item = decoder
-                        .read_chunk_with_payload(
-                            chunk_idx,
-                            prefetched_bytes.as_ref().map(|v| v.as_slice()),
-                            recycled_buf,
-                        )
+                    let item = prefetched_bytes
+                        .and_then(|payload| {
+                            decoder.read_chunk_with_payload(
+                                chunk_idx,
+                                payload.as_ref().map(|v| v.as_slice()),
+                                recycled_buf,
+                            )
+                        })
                         .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap));
 
                     if !worker_queue.push(job_id, item) {
@@ -467,6 +495,27 @@ impl PrefetchedMosaicReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_error_does_not_wait_for_missing_earlier_jobs() {
+        let queue = Arc::new(OrderedPrefetchQueue::new(16, 100));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let consumer_queue = Arc::clone(&queue);
+        let consumer = thread::spawn(move || {
+            let mut batch = Vec::new();
+            consumer_queue.drain_into(&mut batch, 16, 32);
+            tx.send(batch).unwrap();
+        });
+        queue.push(5, Ok::<_, &str>(5));
+        queue.fail(Err("decoder could not open"));
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Also unblock the consumer if this regresses, so a failed test leaves no waiter.
+        queue.close();
+        consumer.join().unwrap();
+        assert_eq!(result.unwrap(), vec![Err("decoder could not open")]);
+        assert!(queue.next().is_none());
+        assert!(!queue.push(0, Ok(0)));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;

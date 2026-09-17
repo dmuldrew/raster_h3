@@ -18,7 +18,7 @@ const GAMMA: f64 = (1.0 + QUANTILE_ALPHA) / (1.0 - QUANTILE_ALPHA);
 
 /// Precomputed 1.0 / ln(gamma) for fast bucket indexing
 const LOG_GAMMA_INV: f64 = 1.0 / 0.02000066671111664; // ln(1.01 / 0.99)
-const LN_2_DIV_LN_GAMMA: f64 = 0.6931471805599453 * LOG_GAMMA_INV; // ~34.65620409893907
+const LN_2_DIV_LN_GAMMA: f64 = std::f64::consts::LN_2 * LOG_GAMMA_INV; // ~34.65620409893907
 const TWO_LOG_GAMMA_INV: f64 = 2.0 * LOG_GAMMA_INV; // ~99.99666655554445
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 

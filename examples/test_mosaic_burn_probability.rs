@@ -92,20 +92,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut max_burn_prob_by_res = [0.0f64; 16];
 
     loop {
-        let n = streamer.drain_completed_into(4096, |_hex_id, rec| {
-            let res = rec.resolution as usize;
-            if res < 16 {
-                hex_count_by_res[res] += 1;
-                pixel_count_by_res[res] += rec.accumulator.count;
-                let mean = rec.accumulator.mean();
-                if mean > 0.0 {
-                    non_zero_burn_cells[res] += 1;
+        let n = streamer
+            .drain_completed_into(4096, |_hex_id, rec| {
+                let res = rec.resolution as usize;
+                if res < 16 {
+                    hex_count_by_res[res] += 1;
+                    pixel_count_by_res[res] += rec.accumulator.count;
+                    let mean = rec.accumulator.mean();
+                    if mean > 0.0 {
+                        non_zero_burn_cells[res] += 1;
+                    }
+                    if mean > max_burn_prob_by_res[res] {
+                        max_burn_prob_by_res[res] = mean;
+                    }
                 }
-                if mean > max_burn_prob_by_res[res] {
-                    max_burn_prob_by_res[res] = mean;
-                }
-            }
-        });
+            })
+            .unwrap();
         if n == 0 {
             break;
         }

@@ -383,9 +383,17 @@ impl PmtilesWriter {
         header.extend_from_slice(&((center_lon * 1e7) as i32).to_le_bytes());
         header.extend_from_slice(&((center_lat * 1e7) as i32).to_le_bytes());
 
-        // Write complete archive
-        let file = File::create(path)?;
-        let mut writer = io::BufWriter::with_capacity(1024 * 1024, file);
+        // Write complete archive atomically via temporary file in target directory
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        let mut writer = io::BufWriter::with_capacity(1024 * 1024, temp_file);
         writer.write_all(&header)?;
         writer.write_all(&root_dir_bytes)?;
         writer.write_all(&metadata_bytes)?;
@@ -414,6 +422,12 @@ impl PmtilesWriter {
         }
 
         writer.flush()?;
+        let temp_file = writer
+            .into_inner()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        temp_file
+            .persist(path)
+            .map_err(|e| io::Error::new(e.error.kind(), e.error.to_string()))?;
         Ok(())
     }
 }

@@ -44,7 +44,7 @@ fn test_streaming_throughput_and_memory_bounding() {
     let mut total_cells = 0;
 
     loop {
-        let batch = streamer.fetch_next_batch(64);
+        let batch = streamer.fetch_next_batch(64).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -99,7 +99,7 @@ fn test_multi_resolution_conservation_and_scaling() {
         let mut res_cells = 0;
 
         loop {
-            let batch = streamer.fetch_next_batch(32);
+            let batch = streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -159,7 +159,7 @@ fn test_categorical_streaming_performance_scaling() {
     let mut total_cells = 0;
 
     loop {
-        let batch = streamer.fetch_next_batch(32);
+        let batch = streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -211,7 +211,7 @@ fn test_subpixel_sampling_scaling_and_conservation() {
         let mut cells = 0;
 
         loop {
-            let batch = streamer.fetch_next_batch(32);
+            let batch = streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }

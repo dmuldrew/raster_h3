@@ -38,7 +38,7 @@ fn main() {
     let mut full_pixel_count = 0.0f64;
 
     loop {
-        let batch = streamer_full.fetch_next_batch(4096);
+        let batch = streamer_full.fetch_next_batch(4096).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -74,7 +74,7 @@ fn main() {
     let mut filtered_pixel_count = 0.0f64;
 
     loop {
-        let batch = streamer_filtered.fetch_next_batch(4096);
+        let batch = streamer_filtered.fetch_next_batch(4096).unwrap();
         if batch.is_empty() {
             break;
         }

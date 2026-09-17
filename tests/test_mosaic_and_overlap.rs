@@ -130,7 +130,7 @@ fn test_mosaic_adjacent_tiles_conservation() {
     let mut streamer =
         MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init streamer");
 
-    let records = streamer.fetch_next_batch(100_000);
+    let records = streamer.fetch_next_batch(100_000).unwrap();
     assert!(!records.is_empty(), "Should produce records from mosaic");
 
     // All pixels are 42, so mean must be 42 across all hexagons
@@ -174,7 +174,7 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         config.overlap_rule = OverlapRule::Cutline;
         let mut streamer =
             MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init cutline");
-        let records = streamer.fetch_next_batch(100_000);
+        let records = streamer.fetch_next_batch(100_000).unwrap();
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         // Combined span: [-122.45, -122.39] = 60 pixels wide by 40 tall = 2400 unique ground pixels
@@ -193,7 +193,7 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         config.overlap_rule = OverlapRule::First;
         let mut streamer =
             MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init first");
-        let records = streamer.fetch_next_batch(100_000);
+        let records = streamer.fetch_next_batch(100_000).unwrap();
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         assert_eq!(
@@ -210,7 +210,7 @@ fn test_mosaic_overlap_cutline_vs_first_vs_average() {
         let mut config = MultiResolutionConfig::new(vec![9]);
         config.overlap_rule = OverlapRule::Average;
         let mut streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).expect("init avg");
-        let records = streamer.fetch_next_batch(100_000);
+        let records = streamer.fetch_next_batch(100_000).unwrap();
 
         let total_pixels: f64 = records.iter().map(|r| r.accumulator.count).sum();
         // 40*40 + 40*40 = 3200 accumulated observations
@@ -243,7 +243,7 @@ fn test_categorical_mosaic_with_overlap() {
     let mut streamer =
         MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config).expect("init cat streamer");
 
-    let records = streamer.fetch_next_batch(10_000);
+    let records = streamer.fetch_next_batch(10_000).unwrap();
     assert!(
         !records.is_empty(),
         "Categorical mosaic should yield records"

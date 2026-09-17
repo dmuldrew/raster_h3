@@ -816,3 +816,31 @@ fn test_cell_to_tile_coordinate_mapping() {
     assert_eq!(tx7 >> 2, tx5, "Z7 tile x shifted by 2 must match Z5 tile x");
     assert_eq!(ty7 >> 2, ty5, "Z7 tile y shifted by 2 must match Z5 tile y");
 }
+
+#[test]
+fn test_pmtiles_writer_finish_with_bare_filename() {
+    use raster_h3::pmtiles::writer::PmtilesWriter;
+    use std::fs;
+    use std::path::Path;
+
+    let bare_filename = "test_bare_output_archive.pmtiles";
+    let _ = fs::remove_file(bare_filename);
+
+    let mut writer =
+        PmtilesWriter::new(0, 1, [-180.0, -90.0, 180.0, 90.0], "{}".to_string()).unwrap();
+    writer.add_tile(0, 0, 0, b"fake_mvt_payload").unwrap();
+
+    let finish_res = writer.finish(Path::new(bare_filename));
+    assert!(
+        finish_res.is_ok(),
+        "finish with bare filename must succeed: {:?}",
+        finish_res.err()
+    );
+
+    let path = Path::new(bare_filename);
+    assert!(path.exists(), "PMTiles archive must exist at bare path");
+    assert!(path.metadata().unwrap().len() > 127);
+
+    // Clean up
+    let _ = fs::remove_file(bare_filename);
+}

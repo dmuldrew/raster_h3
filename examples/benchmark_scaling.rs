@@ -118,7 +118,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
     let mut max_in_flight_cells = 0usize;
 
     loop {
-        let batch = streamer.fetch_next_batch(2048);
+        let batch = streamer.fetch_next_batch(2048).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -246,7 +246,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
     let cat_start = Instant::now();
     let mut cat_cells = 0;
     loop {
-        let batch = cat_streamer.fetch_next_batch(2048);
+        let batch = cat_streamer.fetch_next_batch(2048).unwrap();
         if batch.is_empty() {
             break;
         }

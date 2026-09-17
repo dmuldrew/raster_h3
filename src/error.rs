@@ -9,6 +9,10 @@ use thiserror::Error;
 /// Comprehensive error enumeration for the `raster_h3` crate.
 #[derive(Error, Debug)]
 pub enum RasterH3Error {
+    /// A terminal failure while reading or aggregating a raster stream.
+    #[error("Raster stream failed: {0}")]
+    StreamFailed(String),
+
     /// File system I/O failures (open, read, mmap).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -149,10 +149,12 @@ fn main() {
     let mut cfl_hexes = 0usize;
     let mut cfl_pixels = 0.0f64;
     loop {
-        let n = streamer_cfl.drain_completed_into(2048, |_i, rec| {
-            cfl_hexes += 1;
-            cfl_pixels += rec.accumulator.count;
-        });
+        let n = streamer_cfl
+            .drain_completed_into(2048, |_i, rec| {
+                cfl_hexes += 1;
+                cfl_pixels += rec.accumulator.count;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -172,10 +174,12 @@ fn main() {
     let mut lf_hexes = 0usize;
     let mut lf_pixels = 0.0f64;
     loop {
-        let n = streamer_lf.drain_completed_into(2048, |_i, rec| {
-            lf_hexes += 1;
-            lf_pixels += rec.accumulator.total_count;
-        });
+        let n = streamer_lf
+            .drain_completed_into(2048, |_i, rec| {
+                lf_hexes += 1;
+                lf_pixels += rec.accumulator.total_count;
+            })
+            .unwrap();
         if n == 0 {
             break;
         }

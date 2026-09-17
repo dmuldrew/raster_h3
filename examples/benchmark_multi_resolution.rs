@@ -94,7 +94,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -117,7 +117,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -149,7 +149,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -180,7 +180,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -203,7 +203,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -232,7 +232,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -262,7 +262,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -284,7 +284,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }
@@ -312,7 +312,7 @@ fn benchmark_dataset(path: &Path, label: &str) {
         let start = Instant::now();
         let mut count = 0;
         loop {
-            let b = streamer.fetch_next_batch(32);
+            let b = streamer.fetch_next_batch(32).unwrap();
             if b.is_empty() {
                 break;
             }

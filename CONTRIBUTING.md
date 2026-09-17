@@ -42,13 +42,14 @@ src/
 │   ├── h3_scanline.rs       # Scanline lookahead & jump-guess traversal
 │   ├── horizon_streamer.rs  # Southernmost scanline horizon eviction engine
 │   ├── multi_horizon/       # Multi-resolution concurrent horizon aggregator
-│   │   ├── config.rs        # Configuration & quantile/spectral formula targets
+│   │   ├── config.rs        # Configuration & quantile targets
 │   │   ├── continuous.rs    # Continuous numeric chunk aggregation
 │   │   ├── continuous_streamer.rs # Multi-resolution continuous horizon streamer
 │   │   ├── categorical.rs   # Categorical landcover chunk aggregation
 │   │   ├── categorical_streamer.rs # Multi-resolution categorical horizon streamer
 │   │   ├── controller.rs    # Resolution controller & batch horizon sizing
 │   │   ├── sharded_map.rs   # Fixed-array sharded accumulator map
+│   │   ├── spectral.rs      # On-the-fly spectral formulas (NDVI, NDWI, NBR, EVI)
 │   │   └── walker.rs        # Generic ScanlineEngine trait & unified scanline_walk
 │   ├── nodata.rs            # NodataCast trait, dispatch_decoding! macro, all-nodata checks
 │   ├── quantiles.rs         # DDSketch-inspired streaming QuantileSketch (P50, P90, IQR)
@@ -64,6 +65,10 @@ src/
 ├── crs/                     # Geodetic reprojection layer
 │   ├── mod.rs
 │   └── transformer.rs       # 3-tier CRS reprojection (Identity → Analytical → PROJ4)
+├── encoding/                # Shared zero-allocation encoding & geometry serialization
+│   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter & parser
+│   ├── wkb.rs               # Stack-allocated OGC WKB 2D Polygon hexagon geometry serialization
+│   └── mod.rs
 ├── ffi/                     # DuckDB C-FFI bindings
 │   ├── duckdb_c.rs          # Low-level DuckDB C API types & function pointers
 │   ├── spatial_detect.rs    # DuckDB Spatial extension detection & geometry interop
@@ -78,24 +83,23 @@ src/
 │   │   ├── registration.rs  # Named/positional parameter registration helpers
 │   │   └── mod.rs
 │   ├── categorical_table_function.rs  # h3_raster_categorical_aggregate registration
-│   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter
 │   ├── parquet_table_function.rs      # h3_raster_to_parquet registration
 │   ├── pmtiles_table_function.rs      # h3_raster_to_pmtiles registration
 │   ├── scalar.rs            # Scalar helper functions (h3_to_string, string_to_h3, etc.)
 │   ├── table_function.rs    # h3_raster_continuous_aggregate registration
-│   ├── wkb.rs               # OGC WKB 2D Polygon hexagon geometry serialization
-│   └── mod.rs
+│   └── mod.rs               # Re-exports fast_hex and wkb from crate::encoding
 ├── parquet/                 # Native OGC GeoParquet 1.1 streaming exporter
-│   ├── writer.rs            # Double-buffered row-group writer & WKB geometry emitter
+│   ├── geoparquet_metadata.rs # Specification-compliant GeoParquet 1.1 JSON metadata builder
+│   ├── pipeline.rs          # Double-buffered channel streaming pipeline & row-group buffers
+│   ├── writer.rs            # High-level H3ParquetWriter facade & columnar schema buffers
 │   └── mod.rs
 ├── pmtiles/                 # Native PMTiles v3 & Mapbox Vector Tile (MVT) generation
 │   ├── features.rs          # H3 feature property extraction & JSON encoding
 │   ├── mvt.rs               # Pure-Rust Protobuf MVT vector tile encoder
-│   ├── parquet_tiler.rs     # Parquet-to-PMTiles conversion pipeline
 │   ├── pyramid.rs           # Multi-resolution zoom-level pyramid builder
 │   ├── tiler.rs             # Multi-resolution pyramid tiling & Hilbert indexer
 │   ├── writer.rs            # PMTiles v3 container writer & header serializer
-│   └── mod.rs
+│   └── mod.rs               # Re-exports parquet_tiler from crate::transcode
 ├── raster/                  # GeoTIFF, COG, and Mosaic streaming
 │   ├── geotiff.rs           # Streaming chunk reader with SIMD Deflate & fast LZW
 │   ├── geotransform.rs      # Affine geotransform & coordinate mapping
@@ -105,6 +109,9 @@ src/
 │   ├── predictor.rs         # Horizontal & floating-point TIFF predictor decoders
 │   ├── prefetch.rs          # Lock-free buffer pool (Injector) & OrderedPrefetchQueue
 │   ├── remote_prefetch.rs   # Asynchronous range request prefetch queue for COGs
+│   └── mod.rs
+├── transcode/               # Cross-format dataset transcoding pipelines
+│   ├── parquet_tiler.rs     # Parquet-to-PMTiles conversion with streaming horizon eviction
 │   └── mod.rs
 ├── error.rs                 # Error types & conversions
 └── lib.rs                   # Extension entry point & registration

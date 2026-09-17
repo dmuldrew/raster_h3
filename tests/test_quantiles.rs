@@ -257,7 +257,7 @@ fn test_multi_scan_streamer_with_quantiles_enabled() {
 
     let mut total_records = 0;
     loop {
-        let batch = streamer.fetch_next_batch(2048);
+        let batch = streamer.fetch_next_batch(2048).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -305,7 +305,7 @@ fn test_multi_scan_streamer_with_quantiles_disabled_zero_cost() {
 
     let mut total_records = 0;
     loop {
-        let batch = streamer.fetch_next_batch(2048);
+        let batch = streamer.fetch_next_batch(2048).unwrap();
         if batch.is_empty() {
             break;
         }

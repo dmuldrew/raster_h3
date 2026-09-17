@@ -185,7 +185,7 @@ impl<'a> DecoderSource<'a> {
                 Ok(ChunkPayload::Borrowed(&mmap[off..off + len]))
             }
             DecoderSource::Remote(remote) => {
-                let bytes = remote.read_range(offset, len)?;
+                let bytes = remote.read_exact_range(offset, len)?;
                 Ok(ChunkPayload::Owned(bytes))
             }
         }

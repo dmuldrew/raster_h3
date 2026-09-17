@@ -28,7 +28,9 @@ fn main() {
     let mut s1 = MultiScanHorizonStreamer::new(r1, &cfg_base).unwrap();
     let mut hexes_base = 0;
     loop {
-        let n = s1.drain_completed_into(4096, |_, _| hexes_base += 1);
+        let n = s1
+            .drain_completed_into(4096, |_, _| hexes_base += 1)
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -48,12 +50,14 @@ fn main() {
     let mut hexes_compact = 0;
     let mut res7_hexes = 0;
     loop {
-        let n = s2.drain_completed_into(4096, |_, rec| {
-            hexes_compact += 1;
-            if rec.resolution == 7 {
-                res7_hexes += 1;
-            }
-        });
+        let n = s2
+            .drain_completed_into(4096, |_, rec| {
+                hexes_compact += 1;
+                if rec.resolution == 7 {
+                    res7_hexes += 1;
+                }
+            })
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -71,7 +75,9 @@ fn main() {
     let mut s3 = MultiScanHorizonStreamer::new(r3, &cfg_pushdown).unwrap();
     let mut hexes_pushdown = 0;
     loop {
-        let n = s3.drain_completed_into(4096, |_, _| hexes_pushdown += 1);
+        let n = s3
+            .drain_completed_into(4096, |_, _| hexes_pushdown += 1)
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -94,7 +100,9 @@ fn main() {
     let mut s_lf1 = MultiCategoricalHorizonStreamer::new(r_lf1, &cfg_lf_base).unwrap();
     let mut hexes_lf_base = 0;
     loop {
-        let n = s_lf1.drain_completed_into(4096, |_, _| hexes_lf_base += 1);
+        let n = s_lf1
+            .drain_completed_into(4096, |_, _| hexes_lf_base += 1)
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -116,12 +124,14 @@ fn main() {
     let mut hexes_lf_compact = 0;
     let mut res7_lf = 0;
     loop {
-        let n = s_lf2.drain_completed_into(4096, |_, rec| {
-            hexes_lf_compact += 1;
-            if rec.resolution == 7 {
-                res7_lf += 1;
-            }
-        });
+        let n = s_lf2
+            .drain_completed_into(4096, |_, rec| {
+                hexes_lf_compact += 1;
+                if rec.resolution == 7 {
+                    res7_lf += 1;
+                }
+            })
+            .unwrap();
         if n == 0 {
             break;
         }

@@ -42,7 +42,7 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
     multi_res_map.insert(9, HashMap::new());
 
     loop {
-        let batch = multi_streamer.fetch_next_batch(32);
+        let batch = multi_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -66,7 +66,7 @@ fn test_multi_resolution_direct_ground_truth_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -139,7 +139,7 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
     multi_cat_map.insert(8, HashMap::new());
 
     loop {
-        let batch = multi_cat_streamer.fetch_next_batch(32);
+        let batch = multi_cat_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -162,7 +162,7 @@ fn test_multi_resolution_categorical_direct_ground_truth_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -255,7 +255,7 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
     multi_res_map.insert(9, HashMap::new());
 
     loop {
-        let batch = multi_streamer.fetch_next_batch(32);
+        let batch = multi_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -280,7 +280,7 @@ fn test_multi_resolution_fusion_supersampling_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -358,7 +358,7 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
     multi_cat_map.insert(9, HashMap::new());
 
     loop {
-        let batch = multi_cat_streamer.fetch_next_batch(32);
+        let batch = multi_cat_streamer.fetch_next_batch(32).unwrap();
         if batch.is_empty() {
             break;
         }
@@ -382,7 +382,7 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
         let mut total_single_mass = 0.0;
 
         loop {
-            let batch = single_streamer.fetch_next_batch(32);
+            let batch = single_streamer.fetch_next_batch(32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -546,4 +546,16 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
         }
         current_rg_rows += 1;
     }
+}
+#[test]
+fn constructors_validate_compaction_configuration() {
+    let file = create_test_geotiff(2, 2);
+    let mut config = MultiResolutionConfig::new(vec![7, 8]);
+    // Exercise the new option, independently of the legacy adapter.
+    config.compact_h3_children = true;
+    assert!(config.validate().is_err());
+    let reader = GeoTiffStreamReader::open(file.path().to_str().unwrap()).unwrap();
+    assert!(MultiScanHorizonStreamer::new(reader, &config).is_err());
+    let reader = GeoTiffStreamReader::open(file.path().to_str().unwrap()).unwrap();
+    assert!(MultiCategoricalHorizonStreamer::new(reader, &config).is_err());
 }

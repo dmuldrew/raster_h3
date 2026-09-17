@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
 
-use crate::functions::fast_hex::parse_hex_u64;
+use crate::encoding::parse_hex_u64;
 use crate::pmtiles::features::{
     build_pmtiles_metadata, PmtilesExportSummary, TilePyramidAccumulator,
 };

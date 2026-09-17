@@ -143,7 +143,10 @@ impl BindHelper {
     }
 
     /// Add a custom logical type column (e.g. GEOMETRY)
-    pub fn add_custom_result_column(&self, name: &str, logical_type: duckdb_logical_type) {
+    ///
+    /// # Safety
+    /// `logical_type` must be a live DuckDB logical type for the duration of this call.
+    pub unsafe fn add_custom_result_column(&self, name: &str, logical_type: duckdb_logical_type) {
         unsafe {
             let col_name = to_c_string(name);
             duckdb_bind_add_result_column(self.info, col_name.as_ptr(), logical_type);

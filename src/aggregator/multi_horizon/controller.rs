@@ -1,17 +1,36 @@
 //! Generic Multi-Resolution Scanline Horizon Streamer Controller
 //!
-//! Consolidates chunk prefetch draining, Rayon multi-core chunk dispatch, 32-way shard
-//! partitioning, lock-free thread result merging, decompression buffer recycling,
-//! southernmost latitude horizon progression, and 7-cell hierarchical compaction.
+//! # Architecture & Responsibilities
+//! - **Chunk Prefetch & Dispatch**: Coordinates chunk draining from background prefetchers
+//!   and Rayon multi-core parallel chunk-row execution.
+//! - **Shard Aggregation**: 32-way partitioned lock-free maps for accumulating cell values.
+//! - **Horizon Progression**: Tracks the southernmost latitude reached by scanlines.
+//! - **Eviction & Compaction**: Delegates record buffering and lifecycle to [`OutputBuffer`]
+//!   and [`StreamLifecycle`], and 7-cell compaction to [`HierarchicalCompactor`].
+//!
+//! # Invariants for Horizon Eviction and Compaction Ordering
+//! 1. **Sharded Eviction**: As the scanline horizon advances southwards (`lat_horizon`),
+//!    sharded maps identify all cells whose northern extent lies entirely north of `lat_horizon`.
+//!    Because chunks are ordered strictly north-to-south, no subsequent chunk can ever contribute
+//!    pixels to these cells. They are evicted from the active shard maps.
+//! 2. **Compaction Ingestion**: Evicted cells are fed into [`HierarchicalCompactor`]. If all 7
+//!    aperture-7 children for a parent cell arrive, the parent accumulator is merged and emitted
+//!    at resolution `R - 1`.
+//! 3. **Compactor Horizon Eviction**: Pending parents whose southernmost latitude (`compute_cell_south_lat`)
+//!    is strictly north of `lat_horizon` are evicted. Because no further chunks can reach any child
+//!    within that parent's footprint, incomplete parents (< 7 children) cannot receive more children.
+//!    They are decomposed back into child records and emitted into [`OutputBuffer`].
+//! 4. **Latched Failures**: Any error encountered during chunk prefetching, decoding, or
+//!    aggregation is latched in [`StreamLifecycle`]. The error state is irreversible, ensuring
+//!    downstream consumers never mistake a failure for EOF.
 
 use fxhash::FxBuildHasher;
-use h3o::{CellIndex, Resolution};
+use h3o::Resolution;
 use rayon::prelude::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tiff::decoder::DecodingResult;
 
-use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
@@ -21,7 +40,9 @@ use crate::raster::mosaic::MosaicReader;
 use crate::raster::prefetch::PrefetchedMosaicReader;
 use crate::raster::RasterChunk;
 
+use super::compaction::HierarchicalCompactor;
 use super::config::MultiResolutionConfig;
+use super::lifecycle::{OutputBuffer, StreamLifecycle};
 use super::sharded_map::{get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS};
 
 /// Kernel trait parameterizing data type-specific chunk processing, aggregation, and filtering
@@ -39,6 +60,7 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
     fn make_record(&self, resolution: u8, cell_u64: u64, acc: Self::Accumulator) -> Self::Record;
 
     /// Execute chunk processing kernel into thread-local hash maps
+    #[allow(clippy::too_many_arguments)]
     fn process_chunk(
         &self,
         chunk_bounds: &RasterChunk,
@@ -56,6 +78,33 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
     ) -> bool;
 }
 
+/// Unified abstraction for streaming raster aggregators producing completed records.
+///
+/// Serves as the standard record source interface for serialization sinks
+/// (e.g. Parquet exporters, PMTiles tilers, DuckDB table functions).
+pub trait RecordStreamer {
+    type Record;
+
+    /// Drain up to `max_rows` completed records directly into a consumer closure
+    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
+    where
+        F: FnMut(usize, Self::Record);
+
+    /// Current southernmost latitude reached by the scanline horizon
+    fn current_lat_horizon(&self) -> f64;
+
+    /// Check if the stream has finished processing all raster chunks and drained all records
+    fn is_finished(&self) -> bool;
+
+    /// Target H3 resolution levels
+    fn resolution_u8s(&self) -> &[u8];
+
+    /// Optional spatial bounding box in WGS84 [min_lon, min_lat, max_lon, max_lat]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        None
+    }
+}
+
 /// Generic single-pass streaming aggregator across multiple H3 resolutions
 pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     pub kernel: K,
@@ -67,13 +116,12 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     pub bbox: Option<[f64; 4]>,
     pub sampling: SamplingPattern,
     pub resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
-    pub completed_buffer: VecDeque<K::Record>,
-    pub is_finished: bool,
+    compactor: HierarchicalCompactor<K>,
+    output_buffer: OutputBuffer<K::Record>,
+    lifecycle: StreamLifecycle,
     pub current_lat_horizon: f64,
     pub profile_stats: [u64; 4],
     pub processed_chunk_count: usize,
-    pub compact: bool,
-    pub pending_compact: HashMap<u64, (K::Accumulator, Vec<(u64, K::Accumulator)>), FxBuildHasher>,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -97,11 +145,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         config: &MultiResolutionConfig,
         kernel: K,
     ) -> Result<Self> {
-        if config.resolutions.is_empty() {
-            return Err(RasterH3Error::InvalidParameter(
-                "Resolutions list cannot be empty".to_string(),
-            ));
-        }
+        config.validate()?;
+        let should_compact = config.should_compact_h3_children();
 
         let mut resolutions = Vec::with_capacity(config.resolutions.len());
         let mut resolution_u8s = Vec::with_capacity(config.resolutions.len());
@@ -116,8 +161,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let prefetcher = PrefetchedMosaicReader::spawn(Arc::clone(&mosaic), 1024);
         let num_res = resolutions.len();
         let resolution_shards = (0..num_res).map(|_| ShardedResolutionMap::new()).collect();
-        let compact = config.compact;
-        let pending_compact = HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default());
+        let compactor = HierarchicalCompactor::new(should_compact);
 
         Ok(Self {
             kernel,
@@ -129,13 +173,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             bbox: config.bbox,
             sampling: config.sampling.clone(),
             resolution_shards,
-            completed_buffer: VecDeque::with_capacity(2048),
-            is_finished: false,
+            compactor,
+            output_buffer: OutputBuffer::with_capacity(2048),
+            lifecycle: StreamLifecycle::new(),
             current_lat_horizon: f64::INFINITY,
             profile_stats: [0; 4],
             processed_chunk_count: 0,
-            compact,
-            pending_compact,
         })
     }
 
@@ -154,54 +197,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         &self.resolution_u8s
     }
 
-    /// Push an accumulated cell into completed buffer or hierarchical compaction cache
-    fn push_record(&mut self, res_u8: u8, cell_u64: u64, acc: K::Accumulator) {
-        if !self.kernel.passes_filter(&acc) {
-            return;
-        }
-
-        if self.compact {
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                if let Some(parent_res) = cell.resolution().pred() {
-                    if let Some(parent) = cell.parent(parent_res) {
-                        let parent_u64: u64 = parent.into();
-                        let entry = self.pending_compact.entry(parent_u64).or_insert_with(|| {
-                            (self.kernel.new_parent_accumulator(), Vec::with_capacity(7))
-                        });
-                        entry.0.merge(&acc);
-                        entry.1.push((cell_u64, acc));
-
-                        if entry.1.len() == 7 {
-                            let (parent_acc, _) = self.pending_compact.remove(&parent_u64).unwrap();
-                            let p_res_u8: u8 = parent_res.into();
-                            self.completed_buffer.push_back(
-                                self.kernel.make_record(p_res_u8, parent_u64, parent_acc),
-                            );
-                            return;
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        self.completed_buffer
-            .push_back(self.kernel.make_record(res_u8, cell_u64, acc));
-    }
-
-    /// Flush remaining pending compaction cells at stream termination
-    fn flush_pending_compact(&mut self) {
-        for (_, (_, children)) in self.pending_compact.drain() {
-            for (cell_u64, acc) in children {
-                let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                    cell.resolution().into()
-                } else {
-                    8
-                };
-                self.completed_buffer
-                    .push_back(self.kernel.make_record(res_u8, cell_u64, acc));
-            }
-        }
+    /// Whether hierarchical child-to-parent compaction is active
+    pub fn is_compact_enabled(&self) -> bool {
+        self.compactor.is_enabled()
     }
 
     /// Evict completed cells across all resolutions that lie north of the given latitude horizon
@@ -211,41 +209,35 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             let res_u8 = self.resolution_u8s[res_idx];
             let newly_evicted = self.resolution_shards[res_idx].evict_completed(lat_horizon);
             for (cell_u64, acc) in newly_evicted {
-                self.push_record(res_u8, cell_u64, acc);
+                self.compactor.push_cell(
+                    &self.kernel,
+                    res_u8,
+                    cell_u64,
+                    acc,
+                    &mut self.output_buffer,
+                );
             }
         }
 
-        if self.compact && !self.pending_compact.is_empty() {
-            let mut to_flush = Vec::new();
-            for (&parent_u64, _) in self.pending_compact.iter() {
-                let parent_south = compute_cell_south_lat(parent_u64);
-                if parent_south > lat_horizon {
-                    to_flush.push(parent_u64);
-                }
-            }
-            for p in to_flush {
-                if let Some((_, children)) = self.pending_compact.remove(&p) {
-                    for (cell_u64, acc) in children {
-                        let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                            cell.resolution().into()
-                        } else {
-                            8
-                        };
-                        self.completed_buffer
-                            .push_back(self.kernel.make_record(res_u8, cell_u64, acc));
-                    }
-                }
-            }
-        }
+        self.compactor
+            .evict_above_horizon(&self.kernel, lat_horizon, &mut self.output_buffer);
     }
 
     /// Advance scanline horizon until at least `min_rows` completed records are available or finished
-    pub fn advance_until_completed(&mut self, min_rows: usize) {
+    #[allow(clippy::type_complexity)]
+    pub fn advance_until_completed(&mut self, min_rows: usize) -> Result<()> {
+        if let Some(reason) = self.lifecycle.failure_reason() {
+            return Err(RasterH3Error::StreamFailed(reason.to_string()));
+        }
+        if self.lifecycle.is_finished() {
+            return Ok(());
+        }
+
         let batch_size = (rayon::current_num_threads() * 8).clamp(64, 256);
         let min_batch = (rayon::current_num_threads() * 2).clamp(16, 64);
         let mut chunk_items = Vec::with_capacity(batch_size);
 
-        while self.completed_buffer.len() < min_rows && !self.is_finished {
+        while self.output_buffer.len() < min_rows && !self.lifecycle.is_finished() {
             chunk_items.clear();
             let t0 = std::time::Instant::now();
             if let Some(ref prefetcher) = self.prefetcher {
@@ -253,18 +245,37 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
             self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
 
+            // Reject the whole batch before merging or emitting any of its records.
+            if let Some(error) = chunk_items.iter().find_map(|item| item.as_ref().err()) {
+                return Err(self.fail(error.to_string()));
+            }
+
             if chunk_items.is_empty() {
-                self.is_finished = true;
+                if self.processed_chunk_count != self.mosaic.chunk_refs.len() {
+                    return Err(self.fail(format!(
+                        "Prefetch ended after {} of {} chunks",
+                        self.processed_chunk_count,
+                        self.mosaic.chunk_refs.len()
+                    )));
+                }
+                self.lifecycle.mark_finished();
                 self.current_lat_horizon = f64::NEG_INFINITY;
                 let num_res = self.resolutions.len();
                 for res_idx in 0..num_res {
                     let res_u8 = self.resolution_u8s[res_idx];
                     let remaining = self.resolution_shards[res_idx].drain_all();
                     for (cell_u64, acc) in remaining {
-                        self.push_record(res_u8, cell_u64, acc);
+                        self.compactor.push_cell(
+                            &self.kernel,
+                            res_u8,
+                            cell_u64,
+                            acc,
+                            &mut self.output_buffer,
+                        );
                     }
                 }
-                self.flush_pending_compact();
+                self.compactor
+                    .flush_all(&self.kernel, &mut self.output_buffer);
                 break;
             }
 
@@ -343,7 +354,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                                 std::mem::replace(decoding_result, DecodingResult::U8(Vec::new())),
                             )
                         }
-                        Err(_) => (Vec::new(), DecodingResult::U8(Vec::new())),
+                        Err(_) => unreachable!("chunk errors were checked before dispatch"),
                     },
                 )
                 .collect();
@@ -376,46 +387,77 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Latch failures so subsequent reads cannot mistake a failed stream for EOF.
+    fn fail(&mut self, reason: String) -> RasterH3Error {
+        self.prefetcher.take();
+        self.output_buffer.clear();
+        self.compactor.clear();
+        self.resolution_shards.clear();
+        self.lifecycle.latch_failure(reason)
     }
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
-    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Vec<K::Record> {
-        self.advance_until_completed(max_rows);
-        let num_to_take = max_rows.min(self.completed_buffer.len());
-        let mut batch = Vec::with_capacity(num_to_take);
-        for _ in 0..num_to_take {
-            if let Some(record) = self.completed_buffer.pop_front() {
-                batch.push(record);
-            }
-        }
-        batch
+    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<K::Record>> {
+        self.advance_until_completed(max_rows)?;
+        Ok(self.output_buffer.take_batch(max_rows))
     }
 
     /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
-    pub fn drain_completed_into<F>(&mut self, max_rows: usize, mut consumer: F) -> usize
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
     where
         F: FnMut(usize, K::Record),
     {
-        self.advance_until_completed(max_rows);
-        let num_to_take = max_rows.min(self.completed_buffer.len());
-        for i in 0..num_to_take {
-            if let Some(record) = self.completed_buffer.pop_front() {
-                consumer(i, record);
-            }
-        }
-        num_to_take
+        self.advance_until_completed(max_rows)?;
+        Ok(self.output_buffer.drain_into(max_rows, consumer))
     }
 
     /// Return total active in-flight cells across all resolutions
     pub fn active_cell_count(&self) -> usize {
-        self.resolution_shards
+        let shard_count: usize = self
+            .resolution_shards
             .iter()
             .map(|s| s.active_cell_count())
-            .sum()
+            .sum();
+        shard_count + self.compactor.len()
     }
 
     /// Check if stream is fully drained and finished
     pub fn is_finished(&self) -> bool {
-        self.is_finished && self.completed_buffer.is_empty()
+        self.lifecycle.is_finished() && self.output_buffer.is_empty()
+    }
+}
+
+impl<K: HorizonStreamKernel> RecordStreamer for MultiHorizonStreamer<K> {
+    type Record = K::Record;
+
+    #[inline(always)]
+    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
+    where
+        F: FnMut(usize, Self::Record),
+    {
+        self.drain_completed_into(max_rows, consumer)
+    }
+
+    #[inline(always)]
+    fn current_lat_horizon(&self) -> f64 {
+        self.current_lat_horizon
+    }
+
+    #[inline(always)]
+    fn is_finished(&self) -> bool {
+        self.is_finished()
+    }
+
+    #[inline(always)]
+    fn resolution_u8s(&self) -> &[u8] {
+        &self.resolution_u8s
+    }
+
+    #[inline(always)]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        Some(self.mosaic.mosaic_bounds_wgs84)
     }
 }

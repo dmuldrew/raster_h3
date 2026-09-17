@@ -44,13 +44,13 @@ pub use accumulator::H3Accumulator;
 /// Categorical accumulator tracking class frequencies and uniformity metrics for an H3 cell.
 pub use categorical::{CategoricalAccumulator, CategoricalUniformity};
 /// Scanline lookahead buffer and spatial neighbor caching for H3 indexing.
-pub use h3_scanline::{can_use_neighbor_cache, H3NeighborDiskCache, H3ScanlineLookahead};
+pub use h3_scanline::H3ScanlineLookahead;
 /// Horizon eviction tracking structures and spatial bounding box helpers.
 pub use horizon_streamer::{chunk_intersects_bbox, compute_cell_south_lat, HexEvictionEntry};
 /// Multi-resolution horizon streamers, output records, and configuration.
 pub use multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
-    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
+    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget, RecordStreamer,
 };
 /// NoData detection, chunk skipping checks, and sentinel value casting.
 pub use nodata::{is_chunk_all_nodata, is_decoding_result_all_nodata, NodataCast};

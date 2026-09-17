@@ -1,3 +1,5 @@
+//! Well-Known Binary (WKB) geometry serialization for H3 cells.
+
 use h3o::CellIndex;
 
 /// Convert an H3 cell into an OGC standard 2D Polygon Well-Known Binary (WKB) representation

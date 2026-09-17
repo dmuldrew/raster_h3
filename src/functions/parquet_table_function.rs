@@ -172,6 +172,7 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
     config.bbox = bind_data.bbox;
 
     let parquet_config = ParquetExportConfig {
+        omit_redundant_columns: bind_data.compact,
         compact: bind_data.compact,
         compression: bind_data.compression,
         row_group_size: bind_data.row_group_size,

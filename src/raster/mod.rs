@@ -11,7 +11,10 @@ pub use geotiff::{
     ChunkDecoder, ChunkLayout, ChunkPayload, GeoTiffMetadata, GeoTiffStreamReader, RasterSource,
 };
 pub use geotransform::GeoTransform;
-pub use http_range::{is_remote_url, normalize_url, HttpRangeReader, RemoteHttpSource};
+pub use http_range::{
+    is_remote_url, normalize_url, ByteCache, HttpRangeReader, HttpTransport, ProbeResult,
+    RemoteHttpSource,
+};
 pub use metadata::{extract_crs, extract_geotransform, extract_nodata, parse_wkt_or_ascii_to_proj};
 pub use mosaic::{
     glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor,

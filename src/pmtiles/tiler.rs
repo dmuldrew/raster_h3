@@ -16,7 +16,7 @@ use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
 use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
-    MultiResolutionConfig, MultiScanHorizonStreamer,
+    MultiResolutionConfig, MultiScanHorizonStreamer, RecordStreamer,
 };
 use crate::pmtiles::mvt::{
     FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter,
@@ -80,6 +80,39 @@ struct ContinuousStreamBatch {
 struct CategoricalStreamBatch {
     records: Vec<MultiCategoricalRecord>,
     lat_horizon: f64,
+}
+
+/// RAII channel wrapper ensuring the background producer thread is unconditionally joined upon scope exit.
+struct ProducerChannel<R, T> {
+    rx: Option<std::sync::mpsc::Receiver<R>>,
+    handle: Option<std::thread::JoinHandle<T>>,
+}
+
+impl<R, T> ProducerChannel<R, T> {
+    fn new(rx: std::sync::mpsc::Receiver<R>, handle: std::thread::JoinHandle<T>) -> Self {
+        Self {
+            rx: Some(rx),
+            handle: Some(handle),
+        }
+    }
+
+    fn recv(&self) -> Result<R, std::sync::mpsc::RecvError> {
+        self.rx.as_ref().unwrap().recv()
+    }
+
+    fn join_producer(&mut self) -> std::thread::Result<T> {
+        self.rx.take();
+        self.handle.take().expect("producer already joined").join()
+    }
+}
+
+impl<R, T> Drop for ProducerChannel<R, T> {
+    fn drop(&mut self) {
+        self.rx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Evict all tiles whose southernmost reach is strictly north of lat_horizon,
@@ -256,19 +289,25 @@ impl H3PmtilesTiler {
         })
     }
     /// Stream continuous raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
-    pub fn generate_from_continuous_streamer<P: AsRef<Path>>(
-        streamer: MultiScanHorizonStreamer,
+    pub fn generate_from_continuous_streamer<S, P: AsRef<Path>>(
+        streamer: S,
         output_path: P,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: RecordStreamer<Record = MultiContinuousRecord> + Send + 'static,
+    {
         Self::generate_from_continuous_streamer_with_properties(streamer, output_path, None)
     }
 
     /// Stream continuous raster data from GeoTIFF across target resolutions and write PMTiles v3 archive with selective property filtering
-    pub fn generate_from_continuous_streamer_with_properties<P: AsRef<Path>>(
-        mut streamer: MultiScanHorizonStreamer,
+    pub fn generate_from_continuous_streamer_with_properties<S, P: AsRef<Path>>(
+        mut streamer: S,
         output_path: P,
         properties: Option<&str>,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: RecordStreamer<Record = MultiContinuousRecord> + Send + 'static,
+    {
         let property_filter = properties
             .map(PropertyFilter::parse)
             .unwrap_or_else(PropertyFilter::all);
@@ -317,27 +356,31 @@ impl H3PmtilesTiler {
         )?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<ContinuousStreamBatch>(4);
-        let producer_handle = std::thread::spawn(move || loop {
-            let mut records = Vec::with_capacity(8192);
-            streamer.drain_completed_into(8192, |_i, record| {
-                records.push(record);
-            });
-            if records.is_empty() {
-                break;
+        let producer_handle = std::thread::spawn(move || -> crate::error::Result<()> {
+            loop {
+                let mut records = Vec::with_capacity(8192);
+                streamer.drain_completed_into(8192, |_i, record| {
+                    records.push(record);
+                })?;
+                if records.is_empty() {
+                    break;
+                }
+                let lat_horizon = streamer.current_lat_horizon();
+                if tx
+                    .send(ContinuousStreamBatch {
+                        records,
+                        lat_horizon,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let lat_horizon = streamer.current_lat_horizon();
-            if tx
-                .send(ContinuousStreamBatch {
-                    records,
-                    lat_horizon,
-                })
-                .is_err()
-            {
-                break;
-            }
+            Ok(())
         });
+        let mut producer_channel = ProducerChannel::new(rx, producer_handle);
 
-        while let Ok(batch) = rx.recv() {
+        while let Ok(batch) = producer_channel.recv() {
             let prepared_batch: Vec<PreparedContinuousHex> = batch
                 .records
                 .into_par_iter()
@@ -527,8 +570,9 @@ impl H3PmtilesTiler {
             accumulator.evict_and_write_tiles(batch.lat_horizon, &mut writer)?;
         }
 
-        if let Err(e) = producer_handle.join() {
-            return Err(format!("Producer thread panicked: {:?}", e).into());
+        match producer_channel.join_producer() {
+            Ok(result) => result?,
+            Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
         accumulator.flush_all(&mut writer)?;
@@ -628,19 +672,25 @@ impl H3PmtilesTiler {
     }
 
     /// Stream categorical raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
-    pub fn generate_from_categorical_streamer<P: AsRef<Path>>(
-        streamer: MultiCategoricalHorizonStreamer,
+    pub fn generate_from_categorical_streamer<S, P: AsRef<Path>>(
+        streamer: S,
         output_path: P,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: RecordStreamer<Record = MultiCategoricalRecord> + Send + 'static,
+    {
         Self::generate_from_categorical_streamer_with_properties(streamer, output_path, None)
     }
 
     /// Stream categorical raster data from GeoTIFF across target resolutions and write PMTiles v3 archive with selective property filtering
-    pub fn generate_from_categorical_streamer_with_properties<P: AsRef<Path>>(
-        mut streamer: MultiCategoricalHorizonStreamer,
+    pub fn generate_from_categorical_streamer_with_properties<S, P: AsRef<Path>>(
+        mut streamer: S,
         output_path: P,
         properties: Option<&str>,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: RecordStreamer<Record = MultiCategoricalRecord> + Send + 'static,
+    {
         let property_filter = properties
             .map(PropertyFilter::parse)
             .unwrap_or_else(PropertyFilter::all);
@@ -700,27 +750,31 @@ impl H3PmtilesTiler {
         )?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<CategoricalStreamBatch>(4);
-        let producer_handle = std::thread::spawn(move || loop {
-            let mut records = Vec::with_capacity(8192);
-            streamer.drain_completed_into(8192, |_i, record| {
-                records.push(record);
-            });
-            if records.is_empty() {
-                break;
+        let producer_handle = std::thread::spawn(move || -> crate::error::Result<()> {
+            loop {
+                let mut records = Vec::with_capacity(8192);
+                streamer.drain_completed_into(8192, |_i, record| {
+                    records.push(record);
+                })?;
+                if records.is_empty() {
+                    break;
+                }
+                let lat_horizon = streamer.current_lat_horizon();
+                if tx
+                    .send(CategoricalStreamBatch {
+                        records,
+                        lat_horizon,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let lat_horizon = streamer.current_lat_horizon();
-            if tx
-                .send(CategoricalStreamBatch {
-                    records,
-                    lat_horizon,
-                })
-                .is_err()
-            {
-                break;
-            }
+            Ok(())
         });
+        let mut producer_channel = ProducerChannel::new(rx, producer_handle);
 
-        while let Ok(batch) = rx.recv() {
+        while let Ok(batch) = producer_channel.recv() {
             let prepared_batch: Vec<PreparedCategoricalHex> = batch
                 .records
                 .into_par_iter()
@@ -919,8 +973,9 @@ impl H3PmtilesTiler {
             accumulator.evict_and_write_tiles(batch.lat_horizon, &mut writer)?;
         }
 
-        if let Err(e) = producer_handle.join() {
-            return Err(format!("Producer thread panicked: {:?}", e).into());
+        match producer_channel.join_producer() {
+            Ok(result) => result?,
+            Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
         accumulator.flush_all(&mut writer)?;
@@ -1158,10 +1213,6 @@ impl H3PmtilesTiler {
         pmtiles_path: P2,
         h3_column_name: Option<&str>,
     ) -> Result<PmtilesExportSummary, Box<dyn std::error::Error + Send + Sync>> {
-        crate::pmtiles::parquet_tiler::process_parquet_to_pmtiles(
-            parquet_path,
-            pmtiles_path,
-            h3_column_name,
-        )
+        crate::transcode::process_parquet_to_pmtiles(parquet_path, pmtiles_path, h3_column_name)
     }
 }
