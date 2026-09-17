@@ -52,13 +52,24 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
 
 /// Generic C-compatible deallocator for `Box<T>` allocated data pointers
 pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
-    if !data.is_null() {
-        drop(Box::from_raw(data as *mut T));
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !data.is_null() {
+            drop(Box::from_raw(data as *mut T));
+        }
+    }));
 }
 
-/// Attach boxed global init state to DuckDB table function lifecycle with type-safe destructor
-pub unsafe fn set_table_function_init_data<T>(info: duckdb_init_info, data: T) {
+/// Attach boxed global init state to DuckDB table function lifecycle with type-safe destructor and Send + Sync enforcement
+pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(info: duckdb_init_info, data: T) {
+    duckdb_init_set_init_data(
+        info,
+        Box::into_raw(Box::new(data)) as *mut c_void,
+        Some(delete_boxed::<T>),
+    );
+}
+
+/// Attach boxed thread-local init state to DuckDB table function lifecycle with Send enforcement
+pub unsafe fn set_table_function_local_init_data<T: Send + 'static>(info: duckdb_init_info, data: T) {
     duckdb_init_set_init_data(
         info,
         Box::into_raw(Box::new(data)) as *mut c_void,
@@ -120,12 +131,10 @@ impl TableFunctionLocalData {
 
 /// Standard thread-local initialization callback for DuckDB table functions
 pub unsafe extern "C" fn init_table_function_local(info: duckdb_init_info) {
-    let local_data = Box::new(TableFunctionLocalData::default());
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(local_data) as *mut c_void,
-        Some(delete_boxed::<TableFunctionLocalData>),
-    );
+    crate::ffi::ffi_init_guard(info, || {
+        let local_data = TableFunctionLocalData::default();
+        set_table_function_local_init_data(info, local_data);
+    });
 }
 
 /// Extract projected column indices requested by DuckDB projection pushdown
@@ -137,3 +146,17 @@ pub unsafe fn extract_projected_columns(info: duckdb_init_info) -> Vec<usize> {
     }
     projected_columns
 }
+
+// Compile-time verification that all global state types are Send + Sync and local state is Send
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
+
+    let _ = assert_send_sync::<crate::functions::table_function::RasterH3GlobalData>;
+    let _ = assert_send_sync::<crate::functions::categorical_table_function::RasterH3CategoricalGlobalData>;
+    let _ = assert_send_sync::<crate::functions::parquet_table_function::ParquetGlobalData>;
+    let _ = assert_send_sync::<crate::functions::pmtiles_table_function::PmtilesGlobalData>;
+    let _ = assert_send_sync::<crate::functions::pmtiles_table_function::ParquetPmtilesGlobalData>;
+
+    let _ = assert_send::<TableFunctionLocalData>;
+};

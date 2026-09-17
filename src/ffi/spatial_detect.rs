@@ -45,38 +45,34 @@ extern "system" {
     ) -> *mut std::ffi::c_void;
 }
 
-/// Checks if the runtime DuckDB library version is at least (req_major, req_minor)
-pub fn is_duckdb_version_at_least(req_major: u32, req_minor: u32) -> bool {
+/// Dynamically looks up a symbol from DuckDB's runtime environment
+pub unsafe fn dlsym_duckdb_symbol(symbol: &[u8]) -> *mut std::ffi::c_void {
     #[cfg(unix)]
-    unsafe {
-        let sym = dlsym(
-            RTLD_DEFAULT,
-            b"duckdb_library_version\0".as_ptr() as *const _,
-        );
-        if !sym.is_null() {
-            let func: unsafe extern "C" fn() -> *const std::os::raw::c_char =
-                std::mem::transmute(sym);
-            let ptr = func();
-            if !ptr.is_null() {
-                let ver_str = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
-                return parse_version_string(&ver_str, req_major, req_minor);
-            }
-        }
+    {
+        dlsym(RTLD_DEFAULT, symbol.as_ptr() as *const _)
     }
     #[cfg(windows)]
-    unsafe {
+    {
         let mut handle = GetModuleHandleA(std::ptr::null());
         let mut sym = if !handle.is_null() {
-            GetProcAddress(handle, b"duckdb_library_version\0".as_ptr() as *const _)
+            GetProcAddress(handle, symbol.as_ptr() as *const _)
         } else {
             std::ptr::null_mut()
         };
         if sym.is_null() {
             handle = GetModuleHandleA(b"duckdb.dll\0".as_ptr() as *const _);
             if !handle.is_null() {
-                sym = GetProcAddress(handle, b"duckdb_library_version\0".as_ptr() as *const _);
+                sym = GetProcAddress(handle, symbol.as_ptr() as *const _);
             }
         }
+        sym
+    }
+}
+
+/// Checks if the runtime DuckDB library version is at least (req_major, req_minor)
+pub fn is_duckdb_version_at_least(req_major: u32, req_minor: u32) -> bool {
+    unsafe {
+        let sym = dlsym_duckdb_symbol(b"duckdb_library_version\0");
         if !sym.is_null() {
             let func: unsafe extern "C" fn() -> *const std::os::raw::c_char =
                 std::mem::transmute(sym);

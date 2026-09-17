@@ -88,13 +88,20 @@ impl Default for duckdb_result {
 
 #[repr(C)]
 pub struct duckdb_extension_access {
-    pub get_api: Option<
-        unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *mut c_void,
-    >,
+    pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
     pub get_database:
         Option<unsafe extern "C" fn(info: duckdb_extension_info) -> *mut duckdb_database>,
-    pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
+    pub get_api: Option<
+        unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *const c_void,
+    >,
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<duckdb_extension_access>() == 3 * std::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(duckdb_extension_access, set_error) == 0);
+    assert!(core::mem::offset_of!(duckdb_extension_access, get_database) == std::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(duckdb_extension_access, get_api) == 2 * std::mem::size_of::<usize>());
+};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -264,6 +271,17 @@ extern "C" {
         str_len: idx_t,
     );
 
+    // Validity mask
+    pub fn duckdb_vector_get_validity(vector: duckdb_vector) -> *mut u64;
+    pub fn duckdb_vector_ensure_validity_writable(vector: duckdb_vector);
+    pub fn duckdb_validity_row_is_valid(validity: *mut u64, row: idx_t) -> bool;
+    pub fn duckdb_validity_set_row_valid(validity: *mut u64, row: idx_t);
+    pub fn duckdb_validity_set_row_invalid(validity: *mut u64, row: idx_t);
+    pub fn duckdb_validity_set_row_validity(validity: *mut u64, row: idx_t, valid: bool);
+
+    // Vector size
+    pub fn duckdb_vector_size() -> idx_t;
+
     // Values
     pub fn duckdb_get_varchar(val: duckdb_value) -> *mut c_char;
     pub fn duckdb_get_int64(val: duckdb_value) -> i64;
@@ -311,11 +329,84 @@ extern "C" {
     pub fn duckdb_result_error(result: *mut duckdb_result) -> *const c_char;
 }
 
+/// Check if a specific row in a validity mask is valid.
+/// If `validity` is NULL, all rows in DuckDB are considered valid.
+#[inline(always)]
+pub unsafe fn duckdb_validity_is_valid(validity: *mut u64, row: idx_t) -> bool {
+    if validity.is_null() {
+        true
+    } else {
+        duckdb_validity_row_is_valid(validity, row)
+    }
+}
+
+/// Mark a specific row in a vector as invalid (NULL).
+#[inline(always)]
+pub unsafe fn duckdb_vector_set_row_invalid(vector: duckdb_vector, row: idx_t) {
+    if vector.is_null() {
+        return;
+    }
+    duckdb_vector_ensure_validity_writable(vector);
+    let validity = duckdb_vector_get_validity(vector);
+    if !validity.is_null() {
+        duckdb_validity_set_row_invalid(validity, row);
+    }
+}
+
+/// Dynamic lookup or fallback for duckdb_vector_size, allowing safe execution
+/// inside DuckDB processes and safe testing outside of DuckDB.
+pub fn get_vector_size() -> usize {
+    unsafe {
+        let sym = crate::ffi::spatial_detect::dlsym_duckdb_symbol(b"duckdb_vector_size\0");
+        if !sym.is_null() {
+            let func: unsafe extern "C" fn() -> idx_t = std::mem::transmute(sym);
+            let sz = func() as usize;
+            if sz > 0 {
+                return sz;
+            }
+        }
+    }
+    2048
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn test_duckdb_extension_access_layout_and_offsets() {
+        assert_eq!(
+            std::mem::size_of::<duckdb_extension_access>(),
+            3 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(duckdb_extension_access, set_error),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(duckdb_extension_access, get_database),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(duckdb_extension_access, get_api),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn test_duckdb_validity_null_pointer_is_valid() {
+        // If validity is NULL, all rows are treated as valid
+        assert!(unsafe { duckdb_validity_is_valid(std::ptr::null_mut(), 0) });
+        assert!(unsafe { duckdb_validity_is_valid(std::ptr::null_mut(), 100) });
+    }
+
+    #[test]
+    fn test_get_vector_size_fallback() {
+        let sz = get_vector_size();
+        assert!(sz > 0);
+    }
 
     #[test]
     fn test_duckdb_string_t_memory_layout_and_alignment() {

@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::ffi::get_vector_size;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -7,6 +8,7 @@ use std::sync::Mutex;
 pub struct ConcurrentRecordQueue<R> {
     pub ready_batches: Mutex<VecDeque<Vec<R>>>,
     pub is_finished: AtomicBool,
+    pub batch_size: usize,
 }
 
 impl<R> Default for ConcurrentRecordQueue<R> {
@@ -17,9 +19,14 @@ impl<R> Default for ConcurrentRecordQueue<R> {
 
 impl<R> ConcurrentRecordQueue<R> {
     pub fn new() -> Self {
+        Self::with_batch_size(get_vector_size())
+    }
+
+    pub fn with_batch_size(batch_size: usize) -> Self {
         Self {
             ready_batches: Mutex::new(VecDeque::new()),
             is_finished: AtomicBool::new(false),
+            batch_size: batch_size.max(1),
         }
     }
 
@@ -64,24 +71,24 @@ impl<R> ConcurrentRecordQueue<R> {
             return Ok(None);
         }
 
-        const BATCH_SIZE: usize = 2048;
-        const REFILL_SIZE: usize = BATCH_SIZE * 4;
+        let batch_size = self.batch_size;
+        let refill_size = batch_size * 4;
 
-        let mut current_chunk = Vec::with_capacity(BATCH_SIZE);
+        let mut current_chunk = Vec::with_capacity(batch_size);
         let mut my_batch = None;
 
-        let result = drain_into(&mut *streamer_guard, REFILL_SIZE, &mut |_i, rec| {
+        let result = drain_into(&mut *streamer_guard, refill_size, &mut |_i, rec| {
             current_chunk.push(rec);
-            if current_chunk.len() == BATCH_SIZE {
+            if current_chunk.len() == batch_size {
                 if my_batch.is_none() {
                     my_batch = Some(std::mem::replace(
                         &mut current_chunk,
-                        Vec::with_capacity(BATCH_SIZE),
+                        Vec::with_capacity(batch_size),
                     ));
                 } else {
                     ready_q.push_back(std::mem::replace(
                         &mut current_chunk,
-                        Vec::with_capacity(BATCH_SIZE),
+                        Vec::with_capacity(batch_size),
                     ));
                 }
             }
