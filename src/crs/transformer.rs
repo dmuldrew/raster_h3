@@ -63,6 +63,27 @@ pub(crate) fn tokenize_proj_string(src: &str) -> std::collections::HashMap<Strin
     map
 }
 
+/// Helper to check if a +towgs84 parameter list is effectively all-zero (e.g., "0,0,0" or "0,0,0,0,0,0,0").
+fn is_all_zero_towgs84(val: &str) -> bool {
+    let mut count = 0;
+    for part in val.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.parse::<f64>() {
+            Ok(num) => {
+                if num != 0.0 {
+                    return false;
+                }
+                count += 1;
+            }
+            Err(_) => return false,
+        }
+    }
+    count > 0
+}
+
 impl AlbersConicFast {
     /// Initialize with standard 2 parallels and origin (in degrees) on GRS80/WGS84 spheroid
     pub fn new(lat1_deg: f64, lat2_deg: f64, lat0_deg: f64, lon0_deg: f64) -> Self {
@@ -143,16 +164,63 @@ impl AlbersConicFast {
             return None;
         }
 
-        // Fall back to proj4rs for non-GRS80/WGS84 ellipsoids requiring datum transforms
-        if let Some(ellps) = tokens.get("ellps") {
-            if ellps.contains("clrk66") || ellps.contains("nad27") || ellps.contains("bessel") {
+        // Must NOT have nadgrids (unless @null or empty)
+        if let Some(nadgrids) = tokens.get("nadgrids") {
+            if nadgrids != "@null" && !nadgrids.is_empty() {
                 return None;
             }
         }
-        if let Some(datum) = tokens.get("datum") {
-            if datum.contains("nad27") {
+
+        // Must NOT have towgs84 (unless all-zero)
+        if let Some(towgs84) = tokens.get("towgs84") {
+            if !is_all_zero_towgs84(towgs84) {
                 return None;
             }
+        }
+
+        // Accept the fast path only when the ellipsoid is GRS80 or WGS84
+        // (by ellps=, datum=NAD83|WGS84, or a≈6378137 && rf≈298.257).
+        let ellps = tokens.get("ellps").map(|s| s.as_str());
+        let datum = tokens.get("datum").map(|s| s.as_str());
+
+        let a_val = tokens.get("a").and_then(|v| v.parse::<f64>().ok());
+        let rf_val = tokens
+            .get("rf")
+            .and_then(|v| v.parse::<f64>().ok())
+            .or_else(|| tokens.get("f").and_then(|v| v.parse::<f64>().ok()).map(|f| 1.0 / f));
+
+        // If an explicit incompatible ellps or datum is present, reject fast path
+        if let Some(e) = ellps {
+            if e != "grs80" && e != "wgs84" {
+                return None;
+            }
+        }
+        if let Some(d) = datum {
+            if d != "nad83" && d != "wgs84" {
+                return None;
+            }
+        }
+
+        let is_grs80_or_wgs84_ellps = match ellps {
+            Some("grs80") | Some("wgs84") => true,
+            _ => false,
+        };
+
+        let is_grs80_or_wgs84_datum = match datum {
+            Some("nad83") | Some("wgs84") => true,
+            _ => false,
+        };
+
+        let is_grs80_or_wgs84_params = match (a_val, rf_val) {
+            (Some(a), Some(rf)) => (a - 6378137.0).abs() < 1.0 && (rf - 298.257).abs() < 0.02,
+            _ => false,
+        };
+
+        let is_valid_ellipsoid =
+            is_grs80_or_wgs84_ellps || is_grs80_or_wgs84_datum || is_grs80_or_wgs84_params;
+
+        if !is_valid_ellipsoid {
+            return None;
         }
 
         let lat_1 = tokens.get("lat_1").and_then(|v| v.parse::<f64>().ok());
@@ -269,6 +337,10 @@ impl CrsTransformer {
     /// Resolve an EPSG code to a fast-path or Proj4 transformer.
     pub fn from_epsg_code(code: u32) -> Result<Self> {
         match code {
+            // EPSG:4326 is WGS84 native.
+            // EPSG:4269 is NAD83 (GRS80 ellipsoid). Treated as Wgs84Identity, accepting the
+            // ~1–2 m continental difference between NAD83 and WGS84 as proj4rs does not
+            // support grid-shift datum transformations.
             4326 | 4269 => Ok(Self::Wgs84Identity),
             3857 | 900913 | 3785 => Ok(Self::WebMercatorFast),
             5070 => Ok(Self::AlbersConic(AlbersConicFast::epsg_5070())),
@@ -336,6 +408,24 @@ impl CrsTransformer {
         }
 
         let tokens = tokenize_proj_string(trimmed);
+
+        // Reject datum transformations on ANY projection (proj4rs has no grid-shift or datum-shift support)
+        if let Some(towgs84) = tokens.get("towgs84") {
+            if !is_all_zero_towgs84(towgs84) {
+                return Err(RasterH3Error::CrsError(format!(
+                    "Datum transformations via Helmert shifts (+towgs84={}) are not supported",
+                    towgs84
+                )));
+            }
+        }
+        if let Some(nadgrids) = tokens.get("nadgrids") {
+            if nadgrids != "@null" && !nadgrids.is_empty() {
+                return Err(RasterH3Error::CrsError(format!(
+                    "Datum transformations via grid shifts (+nadgrids={}) are not supported",
+                    nadgrids
+                )));
+            }
+        }
 
         // +init=epsg:NNNN -> treat as EPSG code
         if let Some(init_val) = tokens.get("init") {
@@ -1054,6 +1144,57 @@ mod tests {
         match tf {
             CrsTransformer::WebMercatorFast => {}
             _ => panic!("Expected WebMercatorFast transformer for spherical Mercator"),
+        }
+    }
+
+    #[test]
+    fn test_albers_intl_ellipsoid_routes_to_proj4() {
+        // cs2cs -f "%.10f" "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=intl +units=m +no_defs" +to "+proj=longlat +ellps=intl +no_defs" <<< "1000000.0 2000000.0"
+        // Golden cs2cs output: -84.0779390722 40.4478144304 0.0000000000
+        let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=intl +units=m +no_defs";
+        let tf = CrsTransformer::from_proj_string(proj_str).unwrap();
+        match tf {
+            CrsTransformer::Proj4 { .. } => {}
+            _ => panic!("Expected Proj4 transformer for Albers on non-GRS80/WGS84 ellipsoid (intl)"),
+        }
+
+        let (lon, lat) = tf.transform_point(1000000.0, 2000000.0).unwrap();
+        let golden_lon = -84.0779390722;
+        let golden_lat = 40.4478144304;
+
+        // Ground distance tolerance <= 0.01 m on International 1924 ellipsoid (a = 6378388.0)
+        let a_intl = 6378388.0;
+        let deg_to_rad = std::f64::consts::PI / 180.0;
+        let dlat_m = (lat - golden_lat) * deg_to_rad * a_intl;
+        let dlon_m = (lon - golden_lon) * deg_to_rad * a_intl * (golden_lat * deg_to_rad).cos();
+        let dist_m = (dlat_m * dlat_m + dlon_m * dlon_m).sqrt();
+        assert!(
+            dist_m <= 0.01,
+            "Transformed point ({}, {}) differs from golden cs2cs ({}, {}) by {} m (> 0.01 m)",
+            lon, lat, golden_lon, golden_lat, dist_m
+        );
+    }
+
+    #[test]
+    fn test_albers_grs80_with_zero_towgs84_is_fast_path() {
+        let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0 +units=m +no_defs";
+        let tf = CrsTransformer::from_proj_string(proj_str).unwrap();
+        match tf {
+            CrsTransformer::AlbersConic(_) => {}
+            _ => panic!("Expected AlbersConic fast path for GRS80 with all-zero towgs84"),
+        }
+    }
+
+    #[test]
+    fn test_albers_with_nonzero_towgs84_is_error() {
+        let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +towgs84=-8,160,176 +units=m +no_defs";
+        let res = CrsTransformer::from_proj_string(proj_str);
+        assert!(res.is_err(), "Expected error for nonzero +towgs84 parameters");
+        match res.err().unwrap() {
+            RasterH3Error::CrsError(msg) => {
+                assert!(msg.contains("towgs84") || msg.contains("Helmert"));
+            }
+            other => panic!("Expected RasterH3Error::CrsError, got {:?}", other),
         }
     }
 }
