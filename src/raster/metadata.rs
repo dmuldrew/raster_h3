@@ -409,7 +409,7 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
-            let mut image = encoder
+            let image = encoder
                 .new_image::<colortype::Gray32Float>(2, 2)
                 .unwrap();
             let data = vec![1.0f32; 4];
