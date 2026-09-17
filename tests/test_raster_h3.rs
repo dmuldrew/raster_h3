@@ -820,17 +820,31 @@ fn test_nonexistent_file_path_error() {
 
 #[test]
 fn test_plain_tiff_without_geokeys() {
-    let (_temp_file, path) = TestGeoTiffBuilder::new(10, 10)
+    // 1. TIFF with no georeferencing tags at all MUST fail to open
+    let (_unref_file, unref_path) = TestGeoTiffBuilder::new(10, 10)
         .georeferenced(false)
+        .create_constant_tempfile(42.0f32);
+
+    let unref_err = GeoTiffStreamReader::open(&unref_path);
+    assert!(unref_err.is_err());
+    match unref_err {
+        Err(RasterH3Error::InvalidParameter(msg)) => {
+            assert!(msg.contains("no georeferencing tags"));
+        }
+        _ => panic!("Expected RasterH3Error::InvalidParameter for unreferenced TIFF"),
+    }
+
+    // 2. TIFF with georeferencing tags but WITHOUT geokeys (no detected CRS)
+    let (_temp_file, path) = TestGeoTiffBuilder::new(10, 10)
+        .with_geokeys(false)
         .create_constant_tempfile(42.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     // Non-georeferenced images have no detected CRS
     assert_eq!(reader.metadata.epsg, None);
     assert_eq!(reader.metadata.proj_string, None);
-    assert_eq!(reader.metadata.geotransform, GeoTransform::default());
 
-    // 1. Without specifying custom_crs, streamer initialization MUST fail with a CRS error
+    // 2a. Without specifying custom_crs, streamer initialization MUST fail with a CRS error
     let unspec_config = MultiResolutionConfig::single(4);
     let err_res = MultiScanHorizonStreamer::new(reader.clone(), &unspec_config);
     assert!(err_res.is_err());

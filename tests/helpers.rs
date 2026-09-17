@@ -26,6 +26,7 @@ pub struct TestGeoTiffBuilder {
     pub pixel_size_y: f64,
     pub epsg: u16,
     pub georeferenced: bool,
+    pub with_geokeys: bool,
     pub gdal_nodata: Option<String>,
 }
 
@@ -40,6 +41,7 @@ impl Default for TestGeoTiffBuilder {
             pixel_size_y: 0.0005,
             epsg: 4326,
             georeferenced: true,
+            with_geokeys: true,
             gdal_nodata: None,
         }
     }
@@ -154,6 +156,11 @@ impl TestGeoTiffBuilder {
         self
     }
 
+    pub fn with_geokeys(mut self, enabled: bool) -> Self {
+        self.with_geokeys = enabled;
+        self
+    }
+
     pub fn gdal_nodata(mut self, nodata_str: impl Into<String>) -> Self {
         self.gdal_nodata = Some(nodata_str.into());
         self
@@ -198,7 +205,7 @@ impl TestGeoTiffBuilder {
         } else {
             None
         };
-        let gk = if self.georeferenced {
+        let gk = if self.georeferenced && self.with_geokeys {
             Some(&geokeys[..])
         } else {
             None

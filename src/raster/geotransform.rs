@@ -50,7 +50,7 @@ impl GeoTransform {
         tiepoint: &[f64], // [i, j, k, x, y, z]
         scale: &[f64],    // [scale_x, scale_y, scale_z]
     ) -> Option<Self> {
-        if tiepoint.len() < 6 || scale.len() < 2 {
+        if tiepoint.len() < 6 || scale.len() < 2 || scale[0] == 0.0 || scale[1] == 0.0 {
             return None;
         }
 

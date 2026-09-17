@@ -11,7 +11,7 @@ use tiff::decoder::DecodingResult;
 use tiff::encoder::colortype;
 use tiff::encoder::compression::Deflate;
 use tiff::encoder::TiffEncoder;
-use tiff::tags::{CompressionMethod, Predictor};
+use tiff::tags::{CompressionMethod, Predictor, Tag};
 
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
@@ -207,6 +207,14 @@ fn test_deflate_striped_u8_parity() {
             )
             .unwrap();
         img.rows_per_strip(16).unwrap();
+        let tiepoint = [0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0];
+        let pixel_scale = [0.001f64, 0.001, 0.0];
+        img.encoder()
+            .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+            .unwrap();
+        img.encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &pixel_scale[..])
+            .unwrap();
         img.write_data(&ground_truth).unwrap();
     }
 
@@ -259,6 +267,14 @@ fn test_deflate_striped_f32_parity_and_streaming() {
             )
             .unwrap();
         img.rows_per_strip(8).unwrap();
+        let tiepoint = [0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0];
+        let pixel_scale = [0.001f64, 0.001, 0.0];
+        img.encoder()
+            .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+            .unwrap();
+        img.encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &pixel_scale[..])
+            .unwrap();
         img.write_data(&ground_truth).unwrap();
     }
 

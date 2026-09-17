@@ -8,7 +8,7 @@ use std::io::{Read, Seek};
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
 
-use crate::error::Result;
+use crate::error::{RasterH3Error, Result};
 use crate::raster::geotransform::GeoTransform;
 
 /// Helper: GeoKey 1025 GTRasterTypeGeoKey: 1 = RasterPixelIsArea (default), 2 = RasterPixelIsPoint
@@ -30,7 +30,9 @@ pub fn extract_geotransform<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<
         if let Some(gt) = GeoTransform::from_model_transformation(&matrix) {
             gt
         } else {
-            GeoTransform::default()
+            return Err(RasterH3Error::InvalidParameter(
+                "GeoTIFF has no georeferencing tags (ModelTransformationTag or ModelTiepointTag+ModelPixelScaleTag); cannot map pixels to coordinates".into(),
+            ));
         }
     } else {
         let tiepoint_res = decoder
@@ -44,10 +46,14 @@ pub fn extract_geotransform<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<
             if let Some(gt) = GeoTransform::from_tiepoint_and_scale(&tiepoint, &scale) {
                 gt
             } else {
-                GeoTransform::default()
+                return Err(RasterH3Error::InvalidParameter(
+                    "GeoTIFF has no georeferencing tags (ModelTransformationTag or ModelTiepointTag+ModelPixelScaleTag); cannot map pixels to coordinates".into(),
+                ));
             }
         } else {
-            GeoTransform::default()
+            return Err(RasterH3Error::InvalidParameter(
+                "GeoTIFF has no georeferencing tags (ModelTransformationTag or ModelTiepointTag+ModelPixelScaleTag); cannot map pixels to coordinates".into(),
+            ));
         }
     };
 
@@ -393,5 +399,68 @@ mod tests {
         let (cx, cy) = gt.pixel_center_to_coord(0, 0);
         assert_eq!(cx, 100.0);
         assert_eq!(cy, 200.0);
+    }
+
+    #[test]
+    fn test_extract_geotransform_missing_tags_error() {
+        use std::io::Cursor;
+        use tiff::encoder::{colortype, TiffEncoder};
+
+        let mut buffer = Vec::new();
+        {
+            let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
+            let mut image = encoder
+                .new_image::<colortype::Gray32Float>(2, 2)
+                .unwrap();
+            let data = vec![1.0f32; 4];
+            image.write_data(&data).unwrap();
+        }
+
+        let mut decoder = Decoder::new(Cursor::new(buffer)).unwrap();
+        let res = extract_geotransform(&mut decoder);
+        assert!(res.is_err(), "Expected error when georeferencing tags are missing");
+        match res.err().unwrap() {
+            RasterH3Error::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("no georeferencing tags"),
+                    "Expected 'no georeferencing tags', got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extract_geotransform_degenerate_zero_scale_error() {
+        use std::io::Cursor;
+        use tiff::encoder::{colortype, TiffEncoder};
+
+        let mut buffer = Vec::new();
+        {
+            let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
+            let mut image = encoder
+                .new_image::<colortype::Gray32Float>(2, 2)
+                .unwrap();
+
+            let tiepoint = [0.0, 0.0, 0.0, 100.0, 200.0, 0.0];
+            let pixel_scale = [0.0, 0.0, 0.0]; // degenerate scale == 0
+
+            image
+                .encoder()
+                .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(Tag::ModelPixelScaleTag, &pixel_scale[..])
+                .unwrap();
+
+            let data = vec![1.0f32; 4];
+            image.write_data(&data).unwrap();
+        }
+
+        let mut decoder = Decoder::new(Cursor::new(buffer)).unwrap();
+        let res = extract_geotransform(&mut decoder);
+        assert!(res.is_err(), "Expected error when scale is zero");
     }
 }
