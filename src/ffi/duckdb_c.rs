@@ -28,17 +28,20 @@ pub enum DuckDBType {
     Varchar = 17,
     Blob = 18,
     Decimal = 19,
-    Enum = 20,
-    List = 21,
-    Struct = 22,
-    Map = 23,
-    Array = 24,
-    Uuid = 25,
-    Union = 26,
-    Bit = 27,
-    TimeTz = 28,
-    TimestampTz = 29,
+    TimestampS = 20,
+    TimestampMs = 21,
+    TimestampNs = 22,
+    Enum = 23,
+    List = 24,
+    Struct = 25,
+    Map = 26,
+    Uuid = 27,
+    Union = 28,
+    Bit = 29,
+    TimeTz = 30,
+    TimestampTz = 31,
     UHugeInt = 32,
+    Array = 33,
     Geometry = 40,
 }
 
@@ -131,6 +134,13 @@ impl duckdb_string_t {
         self.inlined.length
     }
 
+    /// Borrows the string data as a Rust string slice.
+    ///
+    /// # Safety
+    /// The caller must ensure that the underlying DuckDB vector is live and
+    /// valid for the duration of the returned reference. For external strings
+    /// (length > 12), `pointer.ptr` must point to at least `length` initialized
+    /// UTF-8 bytes.
     #[inline(always)]
     pub unsafe fn as_str(&self) -> &str {
         let len = self.length() as usize;
@@ -252,6 +262,7 @@ extern "C" {
     pub fn duckdb_function_get_init_data(info: duckdb_function_info) -> *mut c_void;
     pub fn duckdb_function_get_local_init_data(info: duckdb_function_info) -> *mut c_void;
     pub fn duckdb_function_set_error(info: duckdb_function_info, error: *const c_char);
+    pub fn duckdb_scalar_function_set_error(info: duckdb_function_info, error: *const c_char);
 
     // Data chunks & Vectors
     pub fn duckdb_data_chunk_get_column_count(chunk: duckdb_data_chunk) -> idx_t;
@@ -560,5 +571,44 @@ mod tests {
         assert!(res.deprecated_columns.is_null());
         assert!(res.deprecated_error_message.is_null());
         assert!(res.internal_data.is_null());
+    }
+
+    #[test]
+    fn test_duckdb_type_discriminants_official_abi() {
+        assert_eq!(DuckDBType::Invalid as u32, 0);
+        assert_eq!(DuckDBType::Boolean as u32, 1);
+        assert_eq!(DuckDBType::TinyInt as u32, 2);
+        assert_eq!(DuckDBType::SmallInt as u32, 3);
+        assert_eq!(DuckDBType::Integer as u32, 4);
+        assert_eq!(DuckDBType::BigInt as u32, 5);
+        assert_eq!(DuckDBType::UTinyInt as u32, 6);
+        assert_eq!(DuckDBType::USmallInt as u32, 7);
+        assert_eq!(DuckDBType::UInteger as u32, 8);
+        assert_eq!(DuckDBType::UBigInt as u32, 9);
+        assert_eq!(DuckDBType::Float as u32, 10);
+        assert_eq!(DuckDBType::Double as u32, 11);
+        assert_eq!(DuckDBType::Timestamp as u32, 12);
+        assert_eq!(DuckDBType::Date as u32, 13);
+        assert_eq!(DuckDBType::Time as u32, 14);
+        assert_eq!(DuckDBType::Interval as u32, 15);
+        assert_eq!(DuckDBType::HugeInt as u32, 16);
+        assert_eq!(DuckDBType::Varchar as u32, 17);
+        assert_eq!(DuckDBType::Blob as u32, 18);
+        assert_eq!(DuckDBType::Decimal as u32, 19);
+        assert_eq!(DuckDBType::TimestampS as u32, 20);
+        assert_eq!(DuckDBType::TimestampMs as u32, 21);
+        assert_eq!(DuckDBType::TimestampNs as u32, 22);
+        assert_eq!(DuckDBType::Enum as u32, 23);
+        assert_eq!(DuckDBType::List as u32, 24);
+        assert_eq!(DuckDBType::Struct as u32, 25);
+        assert_eq!(DuckDBType::Map as u32, 26);
+        assert_eq!(DuckDBType::Uuid as u32, 27);
+        assert_eq!(DuckDBType::Union as u32, 28);
+        assert_eq!(DuckDBType::Bit as u32, 29);
+        assert_eq!(DuckDBType::TimeTz as u32, 30);
+        assert_eq!(DuckDBType::TimestampTz as u32, 31);
+        assert_eq!(DuckDBType::UHugeInt as u32, 32);
+        assert_eq!(DuckDBType::Array as u32, 33);
+        assert_eq!(DuckDBType::Geometry as u32, 40);
     }
 }

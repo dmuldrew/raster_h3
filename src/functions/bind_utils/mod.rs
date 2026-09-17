@@ -11,7 +11,7 @@ pub mod parsing;
 pub mod record_queue;
 pub mod registration;
 
-pub use bind_helper::{BindHelper, CommonRasterBindParams, CommonRasterParams};
+pub use bind_helper::{BindHelper, CommonRasterBindParams, CommonRasterParams, OwnedValue};
 pub use chunk_writer::ChunkWriter;
 pub use lifecycle::{
     delete_boxed, estimate_raster_cardinality, extract_projected_columns,

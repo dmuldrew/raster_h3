@@ -436,12 +436,20 @@ impl RemoteChunkPrefetchQueue {
     pub fn total_jobs(&self) -> usize {
         self.total_jobs
     }
+
+    /// Explicitly signal cancellation, unblocking any waiting consumers or workers.
+    pub fn cancel(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
 }
 
 impl Drop for RemoteChunkPrefetchQueue {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.condvar.notify_all();
+        self.cancel();
+        for handle in self._worker_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 

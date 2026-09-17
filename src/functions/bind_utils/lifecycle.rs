@@ -52,11 +52,17 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
 
 /// Generic C-compatible deallocator for `Box<T>` allocated data pointers
 pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !data.is_null() {
-            drop(Box::from_raw(data as *mut T));
+            drop(Box::from_raw(data.cast::<T>()));
         }
-    }));
+    })) {
+        if let Err(secondary) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+        {
+            std::mem::forget(secondary);
+        }
+    }
 }
 
 /// Attach boxed global init state to DuckDB table function lifecycle with type-safe destructor and Send + Sync enforcement

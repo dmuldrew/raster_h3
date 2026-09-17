@@ -104,6 +104,23 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_boxed_panicking_drop_containment() {
+        struct PanickingDrop;
+        impl Drop for PanickingDrop {
+            fn drop(&mut self) {
+                panic!("intentional drop panic");
+            }
+        }
+
+        let boxed = Box::new(PanickingDrop);
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe {
+            // Must catch panic and not abort
+            delete_boxed::<PanickingDrop>(raw);
+        }
+    }
+
+    #[test]
     fn test_concurrent_record_queue_pop_and_refill() {
         let queue = ConcurrentRecordQueue::<u64>::new();
         let streamer = Mutex::new(vec![10u64, 20, 30, 40, 50]);

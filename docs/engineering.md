@@ -237,12 +237,20 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 
 | File | Responsibility |
 | :--- | :--- |
-| `bind_helper.rs` | Safe, ergonomic wrapper (`BindHelper`) around DuckDB's `duckdb_bind_info` C structure for extracting positional/named arguments and defining returned column types. |
-| `chunk_writer.rs` | Safe wrapper (`ChunkWriter`) around DuckDB's `duckdb_data_chunk` for direct, bounds-checked, auto-vectorized writing into output columnar vectors. |
-| `lifecycle.rs` | Table function initialization lifecycle helpers. Provides cardinality estimation (`estimate_raster_cardinality`) based on raster bounds and H3 cell areas, column projection detection, thread-local scratch buffer allocation, and memory cleanup. |
+| `bind_helper.rs` | Safe, ergonomic wrapper (`BindHelper`) around DuckDB's `duckdb_bind_info` C structure for extracting positional/named arguments with RAII parameter value lifecycle management (`OwnedValue`) and defining returned column types. |
+| `chunk_writer.rs` | Column- and row-bounds-checked wrapper (`ChunkWriter`) around DuckDB's `duckdb_data_chunk` for auto-vectorized writing into output columnar vectors. Validates row indices against vector capacity and column indices against chunk column count; callers uphold physical vector type invariants. |
+| `lifecycle.rs` | Table function initialization lifecycle helpers. Provides cardinality estimation (`estimate_raster_cardinality`) based on raster bounds and H3 cell areas, column projection detection, thread-local scratch buffer allocation, and double-panic-contained memory deallocation (`delete_boxed`). |
 | `parsing.rs` | Parses user-supplied SQL parameters — H3 resolution lists (comma/whitespace separated, sorted, deduplicated, ≤ 15) and bounding box coordinate strings `[min_lon, min_lat, max_lon, max_lat]`. |
 | `record_queue.rs` | Multi-threaded concurrent batch queue (`ConcurrentRecordQueue`) bridging the background multi-resolution horizon aggregator to DuckDB execution threads via `pop_or_refill`. |
 | `registration.rs` | Parameter registration helpers (`add_positional_parameter`, `add_named_parameter`, `register_common_raster_named_parameters`) with automated DuckDB logical type lifecycle management. |
+
+#### FFI Safety, Panic Containment & Leak-Free Cancellation
+
+- **Complete FFI Panic Containment**: All C-ABI callbacks (`raster_h3_init`, `raster_h3_init_c_api`, bind, init, scan, scalar, and `delete_boxed`) are enclosed in `catch_unwind` guards. Escaping panics across `extern "C"` boundaries are strictly forbidden.
+- **Secondary Panic Containment**: Any secondary panic that arises during error reporting, payload string formatting, or payload destructor disposal is caught within nested panic guards. Secondary panic payloads are forgotten via `std::mem::forget(secondary)` to avoid triggering an immediate process abort, falling back to static C string error indicators.
+- **Scalar Error Setter ABI Compliance**: Scalar functions invoke `duckdb_scalar_function_set_error` rather than table function error setters, maintaining strict C ABI compatibility with DuckDB's internal `ScalarFunctionData` structures.
+- **Leak-Free Cancellation & Synchronous Worker Reaping**: When queries terminate early (e.g. `LIMIT` reached or client-side cancellation), DuckDB invokes registered state destructors. Dropping `PrefetchedMosaicReader` / `PrefetchedChunkReader` immediately closes prefetch queues, signals remote prefetch cancellation, and synchronously joins all background decode and HTTP worker threads before releasing mosaic buffers and memory.
+- **Parameter Value Ownership**: All `duckdb_value` allocations returned by DuckDB parameter inspection APIs are managed by the `OwnedValue` RAII guard, ensuring immediate release via `duckdb_destroy_value`.
 
 ---
 

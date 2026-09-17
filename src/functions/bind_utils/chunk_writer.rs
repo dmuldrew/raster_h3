@@ -2,38 +2,57 @@ use std::ffi::CString;
 
 use crate::encoding::{fast_hex_u64, h3_index_to_wkb};
 use crate::ffi::{
-    duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size, duckdb_vector,
-    duckdb_vector_assign_string_element, duckdb_vector_assign_string_element_len,
-    duckdb_vector_get_data, duckdb_vector_set_row_invalid, get_vector_size, idx_t,
+    duckdb_data_chunk, duckdb_data_chunk_get_column_count, duckdb_data_chunk_get_vector,
+    duckdb_data_chunk_set_size, duckdb_vector, duckdb_vector_assign_string_element,
+    duckdb_vector_assign_string_element_len, duckdb_vector_get_data, duckdb_vector_set_row_invalid,
+    get_vector_size, idx_t,
 };
 
-/// Safe, ergonomic wrapper around DuckDB's output `duckdb_data_chunk`
+/// Ergonomic wrapper around DuckDB's output `duckdb_data_chunk` with row and column bounds checking.
+///
+/// # Safety Notes
+/// While `ChunkWriter` validates vector row indices against `vector_size` and column indices against
+/// chunk column capacity, write methods remain `unsafe`: the caller must guarantee that the target
+/// column matches the expected physical type `T` and that vectors are not concurrently accessed.
 pub struct ChunkWriter {
     pub chunk: duckdb_data_chunk,
     pub vector_size: usize,
+    pub column_count: usize,
 }
 
 impl ChunkWriter {
     #[inline(always)]
     pub fn new(chunk: duckdb_data_chunk) -> Self {
+        let column_count = if chunk.is_null() {
+            0
+        } else {
+            unsafe { duckdb_data_chunk_get_column_count(chunk) as usize }
+        };
         Self {
             chunk,
             vector_size: get_vector_size(),
+            column_count,
         }
     }
 
     #[inline(always)]
     pub fn with_vector_size(chunk: duckdb_data_chunk, vector_size: usize) -> Self {
+        let column_count = if chunk.is_null() {
+            0
+        } else {
+            unsafe { duckdb_data_chunk_get_column_count(chunk) as usize }
+        };
         Self {
             chunk,
             vector_size: vector_size.max(1),
+            column_count,
         }
     }
 
-    /// Retrieve the underlying vector for a specific column index
+    /// Retrieve the underlying vector for a specific column index, bounds-checked against column count
     #[inline(always)]
     pub unsafe fn get_vector(&self, col_idx: usize) -> duckdb_vector {
-        if self.chunk.is_null() {
+        if self.chunk.is_null() || col_idx >= self.column_count {
             return std::ptr::null_mut();
         }
         duckdb_data_chunk_get_vector(self.chunk, col_idx as idx_t)
@@ -287,6 +306,25 @@ mod tests {
             // Out of bounds row index is safely rejected
             writer.set_int64(0, 200, 42);
             writer.set_null(0, 200);
+        }
+    }
+
+    #[test]
+    fn test_chunk_writer_column_bounds() {
+        let writer = ChunkWriter::new(std::ptr::null_mut());
+        assert_eq!(writer.column_count, 0);
+
+        unsafe {
+            // Out of bounds column index returns null vector safely
+            let v = writer.get_vector(5);
+            assert!(v.is_null());
+
+            // Out of bounds writes are safely ignored
+            writer.set_int64(10, 0, 42);
+            writer.set_uint64(10, 0, 42);
+            writer.set_double(10, 0, 42.0);
+            writer.set_string(10, 0, "test");
+            writer.set_null(10, 0);
         }
     }
 }

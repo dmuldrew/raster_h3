@@ -5,13 +5,26 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::{
     duckdb_bind_add_result_column, duckdb_bind_get_named_parameter, duckdb_bind_get_parameter,
     duckdb_bind_get_parameter_count, duckdb_bind_info, duckdb_bind_set_error,
-    duckdb_create_logical_type, duckdb_destroy_logical_type, duckdb_get_bool, duckdb_get_double,
-    duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_logical_type, duckdb_value,
-    from_duckdb_string, to_c_string, DuckDBType,
+    duckdb_create_logical_type, duckdb_destroy_logical_type, duckdb_destroy_value, duckdb_get_bool,
+    duckdb_get_double, duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_logical_type,
+    duckdb_value, from_duckdb_string, to_c_string, DuckDBType,
 };
 use crate::raster::mosaic::OverlapRule;
 
 use super::parsing::{parse_bbox_str, parse_resolutions_str};
+
+/// RAII guard ensuring DuckDB allocated value handle is destroyed
+pub struct OwnedValue(pub duckdb_value);
+
+impl Drop for OwnedValue {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                duckdb_destroy_value(&mut self.0);
+            }
+        }
+    }
+}
 
 /// Ergonomic, safe wrapper around DuckDB's `duckdb_bind_info`
 pub struct BindHelper {
@@ -30,6 +43,20 @@ impl BindHelper {
         unsafe { duckdb_bind_get_parameter_count(self.info) as usize }
     }
 
+    /// Get a positional parameter value by index wrapped in an RAII `OwnedValue`
+    #[inline(always)]
+    pub fn get_owned_parameter(&self, index: usize) -> Option<OwnedValue> {
+        if index >= self.parameter_count() {
+            return None;
+        }
+        let val = unsafe { duckdb_bind_get_parameter(self.info, index as u64) };
+        if val.is_null() {
+            None
+        } else {
+            Some(OwnedValue(val))
+        }
+    }
+
     /// Get a positional parameter value by index
     #[inline(always)]
     pub fn get_parameter(&self, index: usize) -> duckdb_value {
@@ -38,38 +65,32 @@ impl BindHelper {
 
     /// Extract a positional VARCHAR parameter as a Rust `String`
     pub fn get_string_param(&self, index: usize) -> Option<String> {
-        if index >= self.parameter_count() {
-            return None;
-        }
-        let val = self.get_parameter(index);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { from_duckdb_string(duckdb_get_varchar(val)) }
+        let val = self.get_owned_parameter(index)?;
+        unsafe { from_duckdb_string(duckdb_get_varchar(val.0)) }
     }
 
     /// Extract a positional BIGINT parameter as `i64`
     pub fn get_int_param(&self, index: usize) -> Option<i64> {
-        if index >= self.parameter_count() {
-            return None;
-        }
-        let val = self.get_parameter(index);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { Some(duckdb_get_int64(val)) }
+        let val = self.get_owned_parameter(index)?;
+        unsafe { Some(duckdb_get_int64(val.0)) }
     }
 
     /// Extract a positional DOUBLE parameter as `f64`
     pub fn get_double_param(&self, index: usize) -> Option<f64> {
-        if index >= self.parameter_count() {
-            return None;
-        }
-        let val = self.get_parameter(index);
+        let val = self.get_owned_parameter(index)?;
+        unsafe { Some(duckdb_get_double(val.0)) }
+    }
+
+    /// Get a named parameter by name wrapped in an RAII `OwnedValue`
+    #[inline(always)]
+    pub fn get_owned_named_parameter(&self, name: &str) -> Option<OwnedValue> {
+        let c_name = to_c_string(name);
+        let val = unsafe { duckdb_bind_get_named_parameter(self.info, c_name.as_ptr()) };
         if val.is_null() {
-            return None;
+            None
+        } else {
+            Some(OwnedValue(val))
         }
-        unsafe { Some(duckdb_get_double(val)) }
     }
 
     /// Get a named parameter by name
@@ -80,47 +101,32 @@ impl BindHelper {
 
     /// Extract a named VARCHAR parameter as `String`
     pub fn get_named_string(&self, name: &str) -> Option<String> {
-        let val = self.get_named_parameter(name);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { from_duckdb_string(duckdb_get_varchar(val)) }
+        let val = self.get_owned_named_parameter(name)?;
+        unsafe { from_duckdb_string(duckdb_get_varchar(val.0)) }
     }
 
     /// Extract a named BIGINT parameter as `i64`
     pub fn get_named_int(&self, name: &str) -> Option<i64> {
-        let val = self.get_named_parameter(name);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { Some(duckdb_get_int64(val)) }
+        let val = self.get_owned_named_parameter(name)?;
+        unsafe { Some(duckdb_get_int64(val.0)) }
     }
 
     /// Extract a named UBIGINT parameter as `u64`
     pub fn get_named_uint(&self, name: &str) -> Option<u64> {
-        let val = self.get_named_parameter(name);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { Some(duckdb_get_uint64(val)) }
+        let val = self.get_owned_named_parameter(name)?;
+        unsafe { Some(duckdb_get_uint64(val.0)) }
     }
 
     /// Extract a named DOUBLE parameter as `f64`
     pub fn get_named_double(&self, name: &str) -> Option<f64> {
-        let val = self.get_named_parameter(name);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { Some(duckdb_get_double(val)) }
+        let val = self.get_owned_named_parameter(name)?;
+        unsafe { Some(duckdb_get_double(val.0)) }
     }
 
     /// Extract a named BOOLEAN parameter as `bool`
     pub fn get_named_bool(&self, name: &str) -> Option<bool> {
-        let val = self.get_named_parameter(name);
-        if val.is_null() {
-            return None;
-        }
-        unsafe { Some(duckdb_get_bool(val)) }
+        let val = self.get_owned_named_parameter(name)?;
+        unsafe { Some(duckdb_get_bool(val.0)) }
     }
 
     /// Set an error message on the bind context and halt execution
@@ -369,5 +375,17 @@ impl CommonRasterParams {
             params.compact = default_compact;
         }
         Some(params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_owned_value_null_safety() {
+        let val = OwnedValue(std::ptr::null_mut());
+        // Dropping null value must not panic or segfault
+        drop(val);
     }
 }

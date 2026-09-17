@@ -95,6 +95,12 @@ impl<T> OrderedPrefetchQueue<T> {
         self.not_full.notify_all();
     }
 
+    /// Check whether the queue has been closed (e.g. cancelled early).
+    pub fn is_closed(&self) -> bool {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.closed
+    }
+
     /// Deliver a terminal error even if earlier jobs have not filled their slots.
     /// Closing alone could otherwise hide the error behind a missing earlier job.
     pub fn fail(&self, item: T) {
@@ -204,6 +210,12 @@ pub struct PrefetchedChunkReader {
 impl Drop for PrefetchedChunkReader {
     fn drop(&mut self) {
         self.queue.close();
+        if let Some(ref rq) = self._remote_queue {
+            rq.cancel();
+        }
+        for handle in self._worker_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -290,6 +302,9 @@ impl PrefetchedChunkReader {
                     };
 
                     loop {
+                        if worker_queue.is_closed() {
+                            break;
+                        }
                         let job_id = worker_job_idx.fetch_add(1, Ordering::Relaxed);
                         if job_id >= worker_indices.len() {
                             break;
@@ -381,6 +396,12 @@ pub struct PrefetchedMosaicReader {
 impl Drop for PrefetchedMosaicReader {
     fn drop(&mut self) {
         self.queue.close();
+        if let Some(ref rq) = self._remote_queue {
+            rq.cancel();
+        }
+        for handle in self._worker_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -449,6 +470,9 @@ impl PrefetchedMosaicReader {
                         (0..worker_mosaic.tiles.len()).map(|_| None).collect();
 
                     loop {
+                        if worker_queue.is_closed() {
+                            break;
+                        }
                         let job_id = worker_job_idx.fetch_add(1, Ordering::Relaxed);
                         if job_id >= worker_mosaic.chunk_refs.len() {
                             break;
