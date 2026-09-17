@@ -1,7 +1,9 @@
 use h3o::{CellIndex, LatLng, Resolution};
 use std::ffi::c_char;
 
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64};
+use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf};
+#[cfg(test)]
+use crate::encoding::WKB_BUF_LEN;
 use crate::ffi::*;
 
 // =========================================================================
@@ -362,7 +364,7 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_u64(
     output: duckdb_vector,
 ) {
     ffi_scalar_guard(info, || {
-        unary_to_str_kernel(input, output, |cell_u64: u64, buf: &mut [u8; 128]| {
+        unary_to_str_kernel(input, output, |cell_u64: u64, buf: &mut WkbBuf| {
             h3_index_to_wkb(cell_u64, buf).map(|len| &buf[..len])
         });
     });
@@ -375,7 +377,7 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_str(
     output: duckdb_vector,
 ) {
     ffi_scalar_guard(info, || {
-        unary_str_to_str_kernel(input, output, |s, buf: &mut [u8; 128]| {
+        unary_str_to_str_kernel(input, output, |s, buf: &mut WkbBuf| {
             parse_hex_u64(s)
                 .and_then(|u| h3_index_to_wkb(u, buf))
                 .map(|len| &buf[..len])
@@ -693,7 +695,7 @@ mod tests {
     #[test]
     fn test_h3_to_wkb_logic() {
         let valid_u64 = 0x8828308281fffffu64;
-        let mut buf = [0u8; 128];
+        let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
         let len = h3_index_to_wkb(valid_u64, &mut buf).expect("valid wkb");
         assert_eq!(len, 125);
         assert_eq!(buf[0], 1); // little endian

@@ -7,7 +7,7 @@ use raster_h3::ffi::{
     is_duckdb_version_at_least, is_geometry_available, parse_version_string, set_spatial_loaded,
 };
 use raster_h3::functions::fast_hex::parse_hex_u64;
-use raster_h3::functions::wkb::h3_index_to_wkb;
+use raster_h3::functions::wkb::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 
 #[test]
 fn test_duckdb_version_parsing_logic() {
@@ -39,8 +39,8 @@ fn test_spatial_loaded_toggle() {
 fn test_wkb_and_geometry_byte_equivalence() {
     // SF Bay area cell (Res 8)
     let cell_u64 = 0x8828308281fffffu64;
-    let mut wkb_buf = [0u8; 128];
-    let mut geom_buf = [0u8; 128];
+    let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
+    let mut geom_buf: WkbBuf = [0u8; WKB_BUF_LEN];
 
     let wkb_len = h3_index_to_wkb(cell_u64, &mut wkb_buf).expect("valid cell wkb");
     let geom_len = h3_index_to_wkb(cell_u64, &mut geom_buf).expect("valid cell geom");
@@ -64,8 +64,8 @@ fn test_scalar_geometry_from_hex_string() {
     let cell_u64 = parse_hex_u64(hex_str).expect("parse valid hex");
     assert_eq!(cell_u64, 0x8828308281fffffu64);
 
-    let mut buf_from_str = [0u8; 128];
-    let mut buf_from_u64 = [0u8; 128];
+    let mut buf_from_str: WkbBuf = [0u8; WKB_BUF_LEN];
+    let mut buf_from_u64: WkbBuf = [0u8; WKB_BUF_LEN];
 
     let len_str = h3_index_to_wkb(cell_u64, &mut buf_from_str).unwrap();
     let len_u64 = h3_index_to_wkb(0x8828308281fffffu64, &mut buf_from_u64).unwrap();
@@ -109,7 +109,7 @@ fn test_categorical_geometry_column_indices() {
 
 #[test]
 fn test_invalid_h3_geometry_emission() {
-    let mut buf = [0u8; 128];
+    let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
     // Index 0 is invalid H3 index
     assert!(h3_index_to_wkb(0, &mut buf).is_none());
     // All 1s is invalid H3 index
@@ -124,7 +124,7 @@ fn test_all_resolutions_geometry_emission() {
         let cell = lat_lng.to_cell(h3o::Resolution::try_from(res as u8).unwrap());
         let cell_u64: u64 = cell.into();
 
-        let mut buf = [0u8; 128];
+        let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
         let len = h3_index_to_wkb(cell_u64, &mut buf).expect("valid wkb for resolution");
         assert_eq!(len, 125);
         assert_eq!(buf[0], 1); // Little endian
@@ -132,4 +132,26 @@ fn test_all_resolutions_geometry_emission() {
         assert_eq!(u32::from_le_bytes(buf[5..9].try_into().unwrap()), 1); // 1 ring
         assert_eq!(u32::from_le_bytes(buf[9..13].try_into().unwrap()), 7); // 7 points
     }
+}
+
+#[test]
+fn test_class_iii_pentagon_and_edge_crossing_hexagons() {
+    let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
+
+    // Res 7 pentagon (10 vertices -> 189 bytes)
+    let pentagon_res7 = 0x870800000ffffffu64;
+    let p_len = h3_index_to_wkb(pentagon_res7, &mut buf).expect("valid res 7 pentagon");
+    assert_eq!(p_len, 189);
+    assert_eq!(u32::from_le_bytes(buf[9..13].try_into().unwrap()), 11);
+
+    // Res 7 hexagon crossing icosahedron edge (8 vertices -> 157 bytes)
+    let hex_res7_8 = 0x87e06dac8ffffffu64;
+    let h_len = h3_index_to_wkb(hex_res7_8, &mut buf).expect("valid res 7 hexagon");
+    assert_eq!(h_len, 157);
+    assert_eq!(u32::from_le_bytes(buf[9..13].try_into().unwrap()), 9);
+
+    // Also check cell_to_wkb directly
+    let cell_res7_8 = h3o::CellIndex::try_from(hex_res7_8).unwrap();
+    let direct_len = cell_to_wkb(cell_res7_8, &mut buf);
+    assert_eq!(direct_len, 157);
 }

@@ -106,7 +106,7 @@ pub unsafe fn open_mosaic_or_set_error(
 pub struct TableFunctionLocalData {
     pub thread_id: usize,
     pub hex_buf: [u8; 16],
-    pub wkb_buf: [u8; 128],
+    pub wkb_buf: crate::encoding::WkbBuf,
 }
 
 impl Default for TableFunctionLocalData {
@@ -114,7 +114,7 @@ impl Default for TableFunctionLocalData {
         Self {
             thread_id: 0,
             hex_buf: [0u8; 16],
-            wkb_buf: [0u8; 128],
+            wkb_buf: [0u8; crate::encoding::WKB_BUF_LEN],
         }
     }
 }
@@ -125,8 +125,8 @@ impl TableFunctionLocalData {
     pub unsafe fn get_scratch_buffers<'a>(
         ptr: *mut TableFunctionLocalData,
         fallback_hex: &'a mut [u8; 16],
-        fallback_wkb: &'a mut [u8; 128],
-    ) -> (&'a mut [u8; 16], &'a mut [u8; 128]) {
+        fallback_wkb: &'a mut crate::encoding::WkbBuf,
+    ) -> (&'a mut [u8; 16], &'a mut crate::encoding::WkbBuf) {
         if !ptr.is_null() {
             (&mut (*ptr).hex_buf, &mut (*ptr).wkb_buf)
         } else {

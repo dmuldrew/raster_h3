@@ -1558,12 +1558,12 @@ fn test_categorical_accumulator_high_cardinality_shannon_entropy() {
 
 #[test]
 fn test_wkb_ogc_compliance() {
-    use raster_h3::functions::{cell_to_wkb, h3_index_to_wkb};
+    use raster_h3::functions::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 
     let coord = LatLng::new(21.3069, -157.8583).unwrap(); // Honolulu
     let cell = coord.to_cell(Resolution::Eight);
 
-    let mut buf = [0u8; 128];
+    let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
     let len = cell_to_wkb(cell, &mut buf);
     assert_eq!(len, 125, "Hexagon WKB must be exactly 125 bytes");
 
@@ -1594,10 +1594,24 @@ fn test_wkb_ogc_compliance() {
     assert!(p0_y > 21.0 && p0_y < 22.0);
 
     // Also verify h3_index_to_wkb matches
-    let mut buf2 = [0u8; 128];
+    let mut buf2: WkbBuf = [0u8; WKB_BUF_LEN];
     let len2 = h3_index_to_wkb(cell.into(), &mut buf2).expect("valid cell u64");
     assert_eq!(len, len2);
     assert_eq!(&buf[..len], &buf2[..len2]);
+
+    // Verify Class III (odd) resolution pentagon: 10 vertices -> 189 bytes
+    let pentagon_res7 = h3o::CellIndex::try_from(0x870800000ffffffu64).unwrap();
+    let p_len = cell_to_wkb(pentagon_res7, &mut buf);
+    assert_eq!(p_len, 189);
+    let p_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    assert_eq!(p_points, 11);
+
+    // Verify Class III icosahedron-straddling hexagon: 8 vertices -> 157 bytes
+    let hex_res7_8 = h3o::CellIndex::try_from(0x87e06dac8ffffffu64).unwrap();
+    let h_len = cell_to_wkb(hex_res7_8, &mut buf);
+    assert_eq!(h_len, 157);
+    let h_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    assert_eq!(h_points, 9);
 }
 
 #[test]

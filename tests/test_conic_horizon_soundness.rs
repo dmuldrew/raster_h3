@@ -234,19 +234,47 @@ fn test_max_hex_radius_headroom_all_resolutions() {
         }
     }
 
-    // Res 0 should have ample headroom (> 12.0)
-    assert!(max_hex_radius_deg(0) >= 12.5);
-    // Res 1 should have ample headroom (> 4.5)
-    assert!(max_hex_radius_deg(1) >= 5.0);
+    // Res 0-5 should have ample headroom
+    assert!(max_hex_radius_deg(0) >= 13.5);
+    assert!(max_hex_radius_deg(1) >= 5.2);
+    assert!(max_hex_radius_deg(2) >= 1.95);
+    assert!(max_hex_radius_deg(3) >= 0.74);
+    assert!(max_hex_radius_deg(4) >= 0.28);
+    assert!(max_hex_radius_deg(5) >= 0.106);
 
-    // Cell south latitude lower bound check
+    // Cell south latitude exact boundary check
     let cell_res0 = h3o::LatLng::new(60.0, 0.0)
         .unwrap()
         .to_cell(h3o::Resolution::Zero);
     let center_lat = h3o::LatLng::from(cell_res0).lat();
     let south_lat0 = compute_cell_south_lat(cell_res0.into());
-    assert!(
-        (south_lat0 - (center_lat - 12.5)).abs() < 1e-6,
-        "South lat must equal center lat minus 12.5"
-    );
+    assert!(south_lat0 < center_lat, "South lat must be south of center lat");
+    for v in cell_res0.boundary().iter() {
+        assert!(south_lat0 <= v.lat(), "South lat must bound all boundary vertices");
+    }
+
+    // Verify worst-case cells identified in the geodetic correctness audit:
+    // Res 2: 820407fffffffff (measured reach 1.8045°, old radius 1.7° under-reached by 11.6km)
+    let cell_res2 = 0x820407fffffffffu64;
+    let s_lat2 = compute_cell_south_lat(cell_res2);
+    let c_lat2 = h3o::LatLng::from(h3o::CellIndex::try_from(cell_res2).unwrap()).lat();
+    let span2 = c_lat2 - s_lat2;
+    assert!(span2 > 1.7, "Empirical reach must exceed old 1.7° limit");
+    assert!(span2 <= max_hex_radius_deg(2), "Span must be safely bounded by updated radius 1.95°");
+
+    // Res 3: 833201fffffffff (measured reach 0.6820°, old radius 0.65° under-reached by 3.6km)
+    let cell_res3 = 0x833201fffffffffu64;
+    let s_lat3 = compute_cell_south_lat(cell_res3);
+    let c_lat3 = h3o::LatLng::from(h3o::CellIndex::try_from(cell_res3).unwrap()).lat();
+    let span3 = c_lat3 - s_lat3;
+    assert!(span3 > 0.65, "Empirical reach must exceed old 0.65° limit");
+    assert!(span3 <= max_hex_radius_deg(3), "Span must be safely bounded by updated radius 0.74°");
+
+    // Res 4: 8404001ffffffff (measured reach 0.2579°, old radius 0.25° under-reached by 875m)
+    let cell_res4 = 0x8404001ffffffffu64;
+    let s_lat4 = compute_cell_south_lat(cell_res4);
+    let c_lat4 = h3o::LatLng::from(h3o::CellIndex::try_from(cell_res4).unwrap()).lat();
+    let span4 = c_lat4 - s_lat4;
+    assert!(span4 > 0.25, "Empirical reach must exceed old 0.25° limit");
+    assert!(span4 <= max_hex_radius_deg(4), "Span must be safely bounded by updated radius 0.28°");
 }

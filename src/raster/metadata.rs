@@ -11,31 +11,59 @@ use tiff::tags::Tag;
 use crate::error::Result;
 use crate::raster::geotransform::GeoTransform;
 
-/// Extract affine geotransform from TIFF ModelTransformationTag or ModelTiepointTag / ModelPixelScaleTag
+/// Helper: GeoKey 1025 GTRasterTypeGeoKey: 1 = RasterPixelIsArea (default), 2 = RasterPixelIsPoint
+#[inline]
+fn raster_type_is_point(keys: &[u16]) -> bool {
+    keys.chunks_exact(4)
+        .skip(1)
+        .any(|k| k[0] == 1025 && k[1] == 0 && k[3] == 2)
+}
+
+/// Extract affine geotransform from TIFF ModelTransformationTag or ModelTiepointTag / ModelPixelScaleTag.
+/// If GeoKey 1025 (`GTRasterTypeGeoKey`) indicates `RasterPixelIsPoint` (2), the origin is shifted
+/// by `-0.5 * (a + b)` and `-0.5 * (d + e)` to conform to GDAL's `PixelIsArea` convention.
 pub fn extract_geotransform<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<GeoTransform> {
     let matrix_res = decoder
         .get_tag_f64_vec(Tag::ModelTransformationTag)
         .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(34264)));
-    if let Ok(matrix) = matrix_res {
+    let mut gt = if let Ok(matrix) = matrix_res {
         if let Some(gt) = GeoTransform::from_model_transformation(&matrix) {
-            return Ok(gt);
+            gt
+        } else {
+            GeoTransform::default()
+        }
+    } else {
+        let tiepoint_res = decoder
+            .get_tag_f64_vec(Tag::ModelTiepointTag)
+            .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(33922)));
+        let scale_res = decoder
+            .get_tag_f64_vec(Tag::ModelPixelScaleTag)
+            .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(33550)));
+
+        if let (Ok(tiepoint), Ok(scale)) = (tiepoint_res, scale_res) {
+            if let Some(gt) = GeoTransform::from_tiepoint_and_scale(&tiepoint, &scale) {
+                gt
+            } else {
+                GeoTransform::default()
+            }
+        } else {
+            GeoTransform::default()
+        }
+    };
+
+    // GeoKey 1025 GTRasterTypeGeoKey: 1 = PixelIsArea (default), 2 = PixelIsPoint
+    let keys_res = decoder
+        .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
+        .or_else(|_| decoder.get_tag_u16_vec(Tag::Unknown(34735)));
+    if let Ok(keys) = keys_res {
+        if raster_type_is_point(&keys) {
+            // Tiepoint refers to the pixel center: move the origin to the pixel corner.
+            gt.c0 -= 0.5 * (gt.a + gt.b);
+            gt.f0 -= 0.5 * (gt.d + gt.e);
         }
     }
 
-    let tiepoint_res = decoder
-        .get_tag_f64_vec(Tag::ModelTiepointTag)
-        .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(33922)));
-    let scale_res = decoder
-        .get_tag_f64_vec(Tag::ModelPixelScaleTag)
-        .or_else(|_| decoder.get_tag_f64_vec(Tag::Unknown(33550)));
-
-    if let (Ok(tiepoint), Ok(scale)) = (tiepoint_res, scale_res) {
-        if let Some(gt) = GeoTransform::from_tiepoint_and_scale(&tiepoint, &scale) {
-            return Ok(gt);
-        }
-    }
-
-    Ok(GeoTransform::default())
+    Ok(gt)
 }
 
 /// Extract NoData value from tag 42113 / GdalNodata
@@ -294,5 +322,76 @@ mod tests {
         assert!(proj.contains("+k=0.9996"));
         assert!(proj.contains("+x_0=500000"));
         assert!(proj.contains("+datum=WGS84"));
+    }
+
+    #[test]
+    fn test_raster_type_is_point_detection() {
+        // Standard header + key 1025 = 2 (RasterPixelIsPoint)
+        let keys_point = [1, 1, 0, 1, 1025, 0, 1, 2];
+        assert!(raster_type_is_point(&keys_point));
+
+        // Key 1025 = 1 (RasterPixelIsArea)
+        let keys_area = [1, 1, 0, 1, 1025, 0, 1, 1];
+        assert!(!raster_type_is_point(&keys_area));
+
+        // Different key
+        let keys_other = [1, 1, 0, 1, 1024, 0, 1, 1];
+        assert!(!raster_type_is_point(&keys_other));
+    }
+
+    #[test]
+    fn test_extract_geotransform_pixel_is_point() {
+        use std::io::Cursor;
+        use tiff::encoder::{colortype, TiffEncoder};
+
+        let mut buffer = Vec::new();
+        {
+            let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
+            let mut image = encoder
+                .new_image::<colortype::Gray32Float>(2, 2)
+                .unwrap();
+
+            // Tiepoint: I=0, J=0, K=0, X=100.0, Y=200.0, Z=0.0
+            let tiepoint = [0.0, 0.0, 0.0, 100.0, 200.0, 0.0];
+            let pixel_scale = [10.0, 10.0, 0.0];
+
+            // GTRasterTypeGeoKey (1025) = 2 (RasterPixelIsPoint)
+            let geokeys: [u16; 8] = [1, 1, 0, 1, 1025, 0, 1, 2];
+
+            image
+                .encoder()
+                .write_tag(Tag::ModelTiepointTag, &tiepoint[..])
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(Tag::ModelPixelScaleTag, &pixel_scale[..])
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(Tag::Unknown(34735), &geokeys[..])
+                .unwrap();
+
+            let data = vec![1.0f32; 4];
+            image.write_data(&data).unwrap();
+        }
+
+        let mut decoder = Decoder::new(Cursor::new(buffer)).unwrap();
+        let gt = extract_geotransform(&mut decoder).unwrap();
+
+        // Scale: a = 10.0, e = -10.0
+        assert_eq!(gt.a, 10.0);
+        assert_eq!(gt.e, -10.0);
+
+        // In PixelIsPoint: original tiepoint (100, 200) was at pixel center (0.5, 0.5)
+        // With origin shifted by -0.5*(a+b) and -0.5*(d+e):
+        // c0 = 100.0 - 0.5*10.0 = 95.0
+        // f0 = 200.0 - 0.5*(-10.0) = 205.0
+        assert_eq!(gt.c0, 95.0);
+        assert_eq!(gt.f0, 205.0);
+
+        // Crucial invariant: pixel_center_to_coord(0, 0) MUST map to the tiepoint (100.0, 200.0)!
+        let (cx, cy) = gt.pixel_center_to_coord(0, 0);
+        assert_eq!(cx, 100.0);
+        assert_eq!(cy, 200.0);
     }
 }

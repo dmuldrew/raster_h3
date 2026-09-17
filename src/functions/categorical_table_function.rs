@@ -6,6 +6,7 @@ use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiResolutionConfig,
 };
 use crate::aggregator::remap::CategoryRemapper;
+use crate::encoding::{WkbBuf, WKB_BUF_LEN};
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{ffi_bind_guard, ffi_init_guard, ffi_scan_guard, get_vector_size, to_c_string};
 use crate::functions::bind_utils::{
@@ -261,7 +262,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
 
                 let mut fallback_hex_buf = [0u8; 16];
-                let mut fallback_wkb_buf = [0u8; 128];
+                let mut fallback_wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
                 let (hex_buf, wkb_buf) = TableFunctionLocalData::get_scratch_buffers(
                     local_data_ptr,
                     &mut fallback_hex_buf,
@@ -456,7 +457,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
 
                 let mut fallback_hex_buf = [0u8; 16];
-                let mut fallback_wkb_buf = [0u8; 128];
+                let mut fallback_wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
                 let (hex_buf, wkb_buf) = TableFunctionLocalData::get_scratch_buffers(
                     local_data_ptr,
                     &mut fallback_hex_buf,

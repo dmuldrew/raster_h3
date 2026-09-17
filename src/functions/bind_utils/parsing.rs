@@ -100,7 +100,7 @@ mod tests {
         let local = TableFunctionLocalData::default();
         assert_eq!(local.thread_id, 0);
         assert_eq!(local.hex_buf.len(), 16);
-        assert_eq!(local.wkb_buf.len(), 128);
+        assert_eq!(local.wkb_buf.len(), crate::encoding::WKB_BUF_LEN);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::ffi::CString;
 
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb};
+use crate::encoding::{fast_hex_u64, h3_index_to_wkb, WkbBuf};
+#[cfg(test)]
+use crate::encoding::WKB_BUF_LEN;
 use crate::ffi::{
     duckdb_data_chunk, duckdb_data_chunk_get_column_count, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size, duckdb_vector, duckdb_vector_assign_string_element,
@@ -232,7 +234,7 @@ impl ChunkWriter {
         out_idx_wkb: Option<usize>,
         out_idx_geom: Option<usize>,
         cells: I,
-        wkb_buf: &mut [u8; 128],
+        wkb_buf: &mut WkbBuf,
     ) where
         I: IntoIterator<Item = &'a u64>,
     {
@@ -292,7 +294,7 @@ mod tests {
             writer.fill_column(0, 5, [1.0, 2.0, 3.0]);
             let mut hex_buf = [0u8; 16];
             writer.write_hex_column(0, &[0x8828308281fffffu64], &mut hex_buf);
-            let mut wkb_buf = [0u8; 128];
+            let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
             writer.write_wkb_and_geom_columns(Some(0), Some(1), &[0x8828308281fffffu64], &mut wkb_buf);
         }
     }

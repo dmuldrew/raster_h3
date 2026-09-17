@@ -18,7 +18,7 @@ use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
-use crate::encoding::{cell_to_wkb, fast_hex_u64};
+use crate::encoding::{cell_to_wkb, fast_hex_u64, WkbBuf, WKB_BUF_LEN};
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 use super::pipeline::{
@@ -130,7 +130,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
 
         if self.geoparquet {
             if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                let mut wkb_buf = [0u8; 128];
+                let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
                 let len = cell_to_wkb(cell, &mut wkb_buf);
                 self.geometries.push(ByteArray::from(&wkb_buf[..len]));
             } else {
@@ -356,7 +356,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
 
         if self.geoparquet {
             if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                let mut wkb_buf = [0u8; 128];
+                let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
                 let len = cell_to_wkb(cell, &mut wkb_buf);
                 self.geometries.push(ByteArray::from(&wkb_buf[..len]));
             } else {

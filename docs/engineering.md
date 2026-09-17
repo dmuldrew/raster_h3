@@ -24,7 +24,7 @@ This document details the core engineering innovations and architectural princip
 | 11 | **Lock-Free Work-Stealing Buffer Pool** | Work-stealing buffer injector (`crossbeam_deque::Injector`) eliminates buffer allocation churn across 15,840+ chunks. |
 | 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate OS thread context switches with zero-allocation batch drains. |
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Asynchronous HTTP/S3 range prefetching and multi-file Voronoi cutline mosaic blending with zero double-counting. |
-| 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of 125-byte WKB polygon geometries with embedded PROJJSON `OGC:CRS84` metadata. |
+| 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of stack-allocated WKB polygon geometries (109–189 bytes) with embedded PROJJSON `OGC:CRS84` metadata. |
 
 ## 1. Southernmost Scan-Line Horizon Eviction
 Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
@@ -90,10 +90,10 @@ Large geospatial datasets are frequently distributed across tiled collections of
   - `'first'`: Applies the Painter's Algorithm, giving strict precedence to earlier tiles in the file list.
   - `'average'`: Computes multi-observation running averages across overlapping pixels.
 
-## 11. Native OGC GeoParquet 1.1 Exporter (125-Byte WKB Hexagons & PROJJSON)
+## 11. Native OGC GeoParquet 1.1 Exporter (Stack-Allocated WKB Hexagons & PROJJSON)
 Exporting aggregated hexagonal grids to standard GIS formats traditionally required multi-step ETL pipelines involving intermediate shapefiles, GeoJSON scratch disks, and GDAL conversions:
 - **Direct SQL Parquet Export**: `h3_raster_to_parquet` streams aggregated hexagons directly into highly compressed Apache Parquet files with zero intermediate files.
-- **125-Byte Stack WKB Polygon Serialization**: Converts 64-bit integer H3 cell indices directly into standard OGC 2D Polygon Well-Known Binary (WKB) bytes on the stack in ~10–15 nanoseconds *(measured on Apple M-series workstation)* (1 byte endianness + 4 bytes geometry type + 4 bytes ring count + 4 bytes point count + 7 vertices $\times$ 16 bytes = 125 bytes; 109 bytes for pentagons).
+- **Stack WKB Polygon Serialization**: Converts 64-bit integer H3 cell indices directly into standard OGC 2D Polygon Well-Known Binary (WKB) bytes in a 192-byte stack buffer in ~10–15 nanoseconds *(measured on Apple M-series workstation)*. Layout: 1 byte endianness + 4 bytes geometry type + 4 bytes ring count + 4 bytes point count + (n+1) closed-ring vertices $\times$ 16 bytes. Class II (even) resolutions yield 125 bytes (hexagon) / 109 bytes (pentagon); Class III (odd) resolutions add icosahedron-edge crossing vertices, giving 141–157 bytes for edge-straddling hexagons and 189 bytes for 10-vertex pentagons.
 - **Official GeoParquet 1.1 Compliance**: Emits compliant OGC GeoParquet 1.1 JSON metadata in the Parquet `FileMetaData`, including official PROJJSON `OGC:CRS84` datum ensemble specifications, planar edge definitions, and per-column bounding boxes. Compatible out-of-the-box with DuckDB Spatial (`ST_Read`), Apache Sedona, GeoPandas, GDAL, QGIS, and BigQuery.
 
 ## 12. Source Module Architecture & File Responsibilities
@@ -127,7 +127,7 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | :--- | :--- |
 | `mod.rs` | Module declarations and public re-exports (`fast_hex_u64`, `parse_hex_u64`, `cell_to_wkb`, `h3_index_to_wkb`). |
 | `fast_hex.rs` | Zero-allocation hexadecimal formatting (`fast_hex_u64`) and parsing (`parse_hex_u64`) between 64-bit integer H3 cell IDs and lowercase hexadecimal ASCII strings using a 16-byte stack lookup table. |
-| `wkb.rs` | Stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`). Converts H3 cell boundaries directly into 125-byte (hexagon) or 109-byte (pentagon) WKB buffers in ~10–15 ns with zero heap allocations. |
+| `wkb.rs` | Stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`). Converts H3 cell boundaries directly into a 192-byte stack buffer (`WkbBuf`) in ~10–15 ns with zero heap allocations, accommodating 5-to-6 vertex Class II cells as well as Class III (odd) resolutions with up to 10 boundary vertices (189 bytes) and icosahedron-edge crossings (141–157 bytes). |
 
 ---
 

@@ -13,6 +13,12 @@ use proj4rs::proj::Proj;
 const WGS84_A: f64 = 6378137.0; // WGS84 semi-major axis in meters
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
+/// Normalize longitude to [-180.0, 180.0) degrees
+#[inline]
+pub fn wrap_lon(lon: f64) -> f64 {
+    (lon + 180.0).rem_euclid(360.0) - 180.0
+}
+
 /// Precomputed constants for analytical, closed-form inverse Albers Equal Area Conic projection
 #[derive(Debug, Clone, Copy)]
 pub struct AlbersConicFast {
@@ -258,6 +264,14 @@ impl CrsTransformer {
                     );
                     return Self::from_proj_string(&p_str);
                 }
+                3413 => {
+                    let p_str = "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+                    return Self::from_proj_string(p_str);
+                }
+                3031 => {
+                    let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+                    return Self::from_proj_string(p_str);
+                }
                 _ => {
                     let p_str = format!("+init=epsg:{}", code);
                     if let Ok(transformer) = Self::from_proj_string(&p_str) {
@@ -420,8 +434,9 @@ impl CrsTransformer {
 
         for &(x, y) in &corners {
             if let Ok((lon, lat)) = self.transform_point(x, y) {
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
+                let w_lon = wrap_lon(lon);
+                min_lon = min_lon.min(w_lon);
+                max_lon = max_lon.max(w_lon);
                 min_lat = min_lat.min(lat);
                 max_lat = max_lat.max(lat);
             }
@@ -448,8 +463,9 @@ impl CrsTransformer {
                             let cx = x1 + t * dx;
                             let cy = y1 + t * dy;
                             if let Ok((lon, lat)) = self.transform_point(cx, cy) {
-                                min_lon = min_lon.min(lon);
-                                max_lon = max_lon.max(lon);
+                                let w_lon = wrap_lon(lon);
+                                min_lon = min_lon.min(w_lon);
+                                max_lon = max_lon.max(w_lon);
                                 min_lat = min_lat.min(lat);
                                 max_lat = max_lat.max(lat);
                             }
@@ -473,26 +489,73 @@ impl CrsTransformer {
                         let px = x1 + t * dx;
                         let py = y1 + t * dy;
                         if let Ok((lon, lat)) = self.transform_point(px, py) {
-                            min_lon = min_lon.min(lon);
-                            max_lon = max_lon.max(lon);
+                            let w_lon = wrap_lon(lon);
+                            min_lon = min_lon.min(w_lon);
+                            max_lon = max_lon.max(w_lon);
                             min_lat = min_lat.min(lat);
                             max_lat = max_lat.max(lat);
                         }
                     }
                 }
 
+                // Densify interior with a 5x5 grid (including exact center at i=3, j=3)
+                // to detect interior extrema (e.g., polar stereographic or LAEA projections)
+                for i in 1..=5 {
+                    let tx = i as f64 / 6.0;
+                    for j in 1..=5 {
+                        let ty = j as f64 / 6.0;
+                        let px = p0.0 * (1.0 - tx) * (1.0 - ty)
+                            + p1.0 * tx * (1.0 - ty)
+                            + p2.0 * tx * ty
+                            + p3.0 * (1.0 - tx) * ty;
+                        let py = p0.1 * (1.0 - tx) * (1.0 - ty)
+                            + p1.1 * tx * (1.0 - ty)
+                            + p2.1 * tx * ty
+                            + p3.1 * (1.0 - tx) * ty;
+                        if let Ok((lon, lat)) = self.transform_point(px, py) {
+                            let w_lon = wrap_lon(lon);
+                            min_lon = min_lon.min(w_lon);
+                            max_lon = max_lon.max(w_lon);
+                            min_lat = min_lat.min(lat);
+                            max_lat = max_lat.max(lat);
+                        }
+                    }
+                }
+
+                // If any probe approaches the pole (within ~55km / 0.5°), clamp to full polar bounds
+                if max_lat >= 89.5 {
+                    max_lat = 90.0;
+                    min_lon = -180.0;
+                    max_lon = 180.0;
+                }
+                if min_lat <= -89.5 {
+                    min_lat = -90.0;
+                    min_lon = -180.0;
+                    max_lon = 180.0;
+                }
+
                 // Add 0.0005° (~55m) safety margin to max_lat/min_lat for Proj4 projections
-                if max_lat.is_finite() {
+                if max_lat.is_finite() && max_lat < 90.0 {
                     max_lat = (max_lat + 0.0005).min(90.0);
                 }
-                if min_lat.is_finite() {
+                if min_lat.is_finite() && min_lat > -90.0 {
                     min_lat = (min_lat - 0.0005).max(-90.0);
                 }
             }
         }
 
+        // Handle rasters spanning across the antimeridian
+        if max_lon - min_lon > 180.0 {
+            min_lon = -180.0;
+            max_lon = 180.0;
+        }
+
         if max_lat == f64::NEG_INFINITY {
-            [0.0, 0.0, 0.0, 0.0]
+            // Every probe failed to project. Return the whole globe rather than a
+            // plausible-looking `[0,0,0,0]`: this keeps bbox pruning conservative and
+            // sorts the chunk first in the north-to-south horizon order, so no cell can
+            // be evicted before the chunk is processed.
+            [-180.0, -90.0, 180.0, 90.0]
         } else {
             [min_lon, min_lat, max_lon, max_lat]
         }
@@ -816,5 +879,44 @@ mod tests {
         let bounds = tf.transform_rect_bounds(&gt_rot, 0.0, 0.0, 1000.0, 1000.0);
         assert!(bounds[3] > bounds[1]);
         assert!(bounds[2] > bounds[0]);
+    }
+
+    #[test]
+    fn test_transform_rect_bounds_antimeridian_wrap() {
+        let tf = CrsTransformer::Wgs84Identity;
+        // Raster crossing antimeridian: col 0 at 175°, width 10° -> col 10 at 185° (-175°)
+        let gt = GeoTransform {
+            c0: 175.0,
+            a: 1.0,
+            b: 0.0,
+            f0: 10.0,
+            d: 0.0,
+            e: -1.0,
+        };
+        let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 10.0, 10.0);
+        // Span across 180° exceeds 180° when wrapped (from -175° to 175° naive span is 350°),
+        // so bounds must report [-180, 0, 180, 10]
+        assert_eq!(bounds[0], -180.0);
+        assert_eq!(bounds[2], 180.0);
+    }
+
+    #[test]
+    fn test_transform_rect_bounds_polar_stereographic() {
+        // EPSG:3413 NSIDC Sea Ice Polar Stereographic North
+        let tf = CrsTransformer::from_crs_or_epsg(Some(3413), None).unwrap();
+        // A chunk containing the North Pole at (0, 0) in projected coords
+        let gt = GeoTransform {
+            c0: -50000.0,
+            a: 1000.0,
+            b: 0.0,
+            f0: 50000.0,
+            d: 0.0,
+            e: -1000.0,
+        };
+        let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 100.0, 100.0);
+        // Pole (lat = 90.0) is interior to this chunk. transform_rect_bounds must capture max_lat = 90.0
+        assert_eq!(bounds[3], 90.0, "Polar chunk must report max_lat = 90.0");
+        assert_eq!(bounds[0], -180.0, "Polar chunk must span full longitude [-180, 180]");
+        assert_eq!(bounds[2], 180.0, "Polar chunk must span full longitude [-180, 180]");
     }
 }
