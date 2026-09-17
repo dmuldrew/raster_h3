@@ -265,7 +265,8 @@ pub unsafe extern "C" fn parquet_pmtiles_scan(
 ) {
     ffi_scan_guard(info, output, || {
         let bind_data = &*(duckdb_function_get_bind_data(info) as *const ParquetPmtilesBindData);
-        let global_data = &*(duckdb_function_get_init_data(info) as *const ParquetPmtilesGlobalData);
+        let global_data =
+            &*(duckdb_function_get_init_data(info) as *const ParquetPmtilesGlobalData);
 
         if global_data.executed.swap(true, Ordering::SeqCst) {
             duckdb_data_chunk_set_size(output, 0);

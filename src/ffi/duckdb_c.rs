@@ -102,8 +102,13 @@ pub struct duckdb_extension_access {
 const _: () = {
     assert!(std::mem::size_of::<duckdb_extension_access>() == 3 * std::mem::size_of::<usize>());
     assert!(core::mem::offset_of!(duckdb_extension_access, set_error) == 0);
-    assert!(core::mem::offset_of!(duckdb_extension_access, get_database) == std::mem::size_of::<usize>());
-    assert!(core::mem::offset_of!(duckdb_extension_access, get_api) == 2 * std::mem::size_of::<usize>());
+    assert!(
+        core::mem::offset_of!(duckdb_extension_access, get_database)
+            == std::mem::size_of::<usize>()
+    );
+    assert!(
+        core::mem::offset_of!(duckdb_extension_access, get_api) == 2 * std::mem::size_of::<usize>()
+    );
 };
 
 #[repr(C)]
@@ -392,10 +397,7 @@ mod tests {
             std::mem::size_of::<duckdb_extension_access>(),
             3 * std::mem::size_of::<usize>()
         );
-        assert_eq!(
-            core::mem::offset_of!(duckdb_extension_access, set_error),
-            0
-        );
+        assert_eq!(core::mem::offset_of!(duckdb_extension_access, set_error), 0);
         assert_eq!(
             core::mem::offset_of!(duckdb_extension_access, get_database),
             std::mem::size_of::<usize>()

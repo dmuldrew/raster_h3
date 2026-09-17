@@ -353,9 +353,7 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
-            let mut image = encoder
-                .new_image::<colortype::Gray32Float>(2, 2)
-                .unwrap();
+            let mut image = encoder.new_image::<colortype::Gray32Float>(2, 2).unwrap();
 
             // Tiepoint: I=0, J=0, K=0, X=100.0, Y=200.0, Z=0.0
             let tiepoint = [0.0, 0.0, 0.0, 100.0, 200.0, 0.0];
@@ -409,16 +407,17 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
-            let image = encoder
-                .new_image::<colortype::Gray32Float>(2, 2)
-                .unwrap();
+            let image = encoder.new_image::<colortype::Gray32Float>(2, 2).unwrap();
             let data = vec![1.0f32; 4];
             image.write_data(&data).unwrap();
         }
 
         let mut decoder = Decoder::new(Cursor::new(buffer)).unwrap();
         let res = extract_geotransform(&mut decoder);
-        assert!(res.is_err(), "Expected error when georeferencing tags are missing");
+        assert!(
+            res.is_err(),
+            "Expected error when georeferencing tags are missing"
+        );
         match res.err().unwrap() {
             RasterH3Error::InvalidParameter(msg) => {
                 assert!(
@@ -439,9 +438,7 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
-            let mut image = encoder
-                .new_image::<colortype::Gray32Float>(2, 2)
-                .unwrap();
+            let mut image = encoder.new_image::<colortype::Gray32Float>(2, 2).unwrap();
 
             let tiepoint = [0.0, 0.0, 0.0, 100.0, 200.0, 0.0];
             let pixel_scale = [0.0, 0.0, 0.0]; // degenerate scale == 0

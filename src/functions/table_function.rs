@@ -290,9 +290,15 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                     batch_len,
                     batch.iter().map(|r| r.accumulator.count),
                 ),
-                5 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.min)),
-                6 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.max)),
-                7 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.sum)),
+                5 => {
+                    writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.min))
+                }
+                6 => {
+                    writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.max))
+                }
+                7 => {
+                    writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.accumulator.sum))
+                }
                 8 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.resolution)),
                 9 => {
                     out_idx_wkb = Some(out_idx);

@@ -6,8 +6,8 @@ use crate::ffi::{
     duckdb_bind_add_result_column, duckdb_bind_get_named_parameter, duckdb_bind_get_parameter,
     duckdb_bind_get_parameter_count, duckdb_bind_info, duckdb_bind_set_error,
     duckdb_create_logical_type, duckdb_destroy_logical_type, duckdb_destroy_value, duckdb_get_bool,
-    duckdb_get_double, duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar, duckdb_logical_type,
-    duckdb_value, from_duckdb_string, to_c_string, DuckDBType,
+    duckdb_get_double, duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar,
+    duckdb_logical_type, duckdb_value, from_duckdb_string, to_c_string, DuckDBType,
 };
 use crate::raster::mosaic::OverlapRule;
 

@@ -145,7 +145,8 @@ pub unsafe extern "C" fn raster_h3_init_c_api(
                 crate::ffi::safe_eprintln("[raster_h3] raster_h3_init_c_api panicked", &msg);
                 if !access.is_null() {
                     if let Some(set_err) = (*access).set_error {
-                        let err_c = to_c_string(&format!("raster_h3 extension init panicked: {msg}"));
+                        let err_c =
+                            to_c_string(&format!("raster_h3 extension init panicked: {msg}"));
                         set_err(info, err_c.as_ptr());
                     }
                 }

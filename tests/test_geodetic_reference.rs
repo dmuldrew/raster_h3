@@ -350,7 +350,14 @@ fn reference_counts(
     height: u32,
     resolutions: &[u8],
 ) -> HashMap<(u8, u64), f64> {
-    reference_counts_with_sampling(tf, gt, width, height, resolutions, &SamplingPattern::center())
+    reference_counts_with_sampling(
+        tf,
+        gt,
+        width,
+        height,
+        resolutions,
+        &SamplingPattern::center(),
+    )
 }
 
 /// Stream the raster with a specified sampling pattern and assert:
@@ -745,7 +752,9 @@ fn coverage_mosaic_overlap_wgs84() {
             }
             for rec in batch {
                 assert!(
-                    emitted.insert(rec.h3_index, rec.accumulator.count).is_none(),
+                    emitted
+                        .insert(rec.h3_index, rec.accumulator.count)
+                        .is_none(),
                     "Cutline: duplicate cell emission {:x}",
                     rec.h3_index
                 );
@@ -774,7 +783,10 @@ fn coverage_mosaic_overlap_wgs84() {
             for rec in batch {
                 assert!(
                     emitted
-                        .insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.mean()))
+                        .insert(
+                            rec.h3_index,
+                            (rec.accumulator.count, rec.accumulator.mean())
+                        )
                         .is_none(),
                     "First: duplicate cell emission {:x}",
                     rec.h3_index
@@ -819,7 +831,10 @@ fn coverage_mosaic_overlap_wgs84() {
             for rec in batch {
                 assert!(
                     emitted
-                        .insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.mean()))
+                        .insert(
+                            rec.h3_index,
+                            (rec.accumulator.count, rec.accumulator.mean())
+                        )
                         .is_none(),
                     "Average: duplicate cell emission {:x}",
                     rec.h3_index

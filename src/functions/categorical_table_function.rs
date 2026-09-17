@@ -187,8 +187,11 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         let streamer = match MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config) {
             Ok(s) => s,
             Err(e) => {
-                let err_msg = CString::new(format!("Failed to initialize categorical streamer: {}", e))
-                    .unwrap_or_else(|_| CString::new("Failed to init categorical streamer").unwrap());
+                let err_msg =
+                    CString::new(format!("Failed to initialize categorical streamer: {}", e))
+                        .unwrap_or_else(|_| {
+                            CString::new("Failed to init categorical streamer").unwrap()
+                        });
                 duckdb_init_set_error(info, err_msg.as_ptr());
                 return;
             }
@@ -298,10 +301,14 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 // 13: geom GEOMETRY (if emit_geom)
                 for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                     match orig_col {
-                        0 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index)),
-                        1 => {
-                            writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf)
+                        0 => {
+                            writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index))
                         }
+                        1 => writer.write_hex_column(
+                            out_idx,
+                            batch.iter().map(|r| &r.h3_index),
+                            hex_buf,
+                        ),
                         2 => out_maj_cls = Some(out_idx),
                         3 => out_maj_frac = Some(out_idx),
                         4 => out_maj_cnt = Some(out_idx),
@@ -318,7 +325,11 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                                 writer.set_string_bytes(out_idx, i, hist_buf.as_bytes());
                             }
                         }
-                        8 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.resolution)),
+                        8 => writer.fill_column(
+                            out_idx,
+                            batch_len,
+                            batch.iter().map(|r| r.resolution),
+                        ),
                         9 => out_shannon = Some(out_idx),
                         10 => out_entropy = Some(out_idx),
                         11 => out_distinct = Some(out_idx),
@@ -483,16 +494,34 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 // 12: geom GEOMETRY (if emit_geom)
                 for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                     match orig_col {
-                        0 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.cell_u64)),
-                        1 => {
-                            writer.write_hex_column(out_idx, rows.iter().map(|r| &r.cell_u64), hex_buf)
+                        0 => {
+                            writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.cell_u64))
                         }
-                        2 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.category)),
+                        1 => writer.write_hex_column(
+                            out_idx,
+                            rows.iter().map(|r| &r.cell_u64),
+                            hex_buf,
+                        ),
+                        2 => {
+                            writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.category))
+                        }
                         3 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.count)),
-                        4 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.fraction)),
-                        5 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.total_count)),
-                        6 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.resolution)),
-                        7 | 8 => writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.entropy)),
+                        4 => {
+                            writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.fraction))
+                        }
+                        5 => writer.fill_column(
+                            out_idx,
+                            num_taken,
+                            rows.iter().map(|r| r.total_count),
+                        ),
+                        6 => writer.fill_column(
+                            out_idx,
+                            num_taken,
+                            rows.iter().map(|r| r.resolution),
+                        ),
+                        7 | 8 => {
+                            writer.fill_column(out_idx, num_taken, rows.iter().map(|r| r.entropy))
+                        }
                         9 | 10 => writer.fill_column(
                             out_idx,
                             num_taken,

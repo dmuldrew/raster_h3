@@ -66,7 +66,10 @@ pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
 }
 
 /// Attach boxed global init state to DuckDB table function lifecycle with type-safe destructor and Send + Sync enforcement
-pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(info: duckdb_init_info, data: T) {
+pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(
+    info: duckdb_init_info,
+    data: T,
+) {
     duckdb_init_set_init_data(
         info,
         Box::into_raw(Box::new(data)) as *mut c_void,
@@ -75,7 +78,10 @@ pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(info: duckd
 }
 
 /// Attach boxed thread-local init state to DuckDB table function lifecycle with Send enforcement
-pub unsafe fn set_table_function_local_init_data<T: Send + 'static>(info: duckdb_init_info, data: T) {
+pub unsafe fn set_table_function_local_init_data<T: Send + 'static>(
+    info: duckdb_init_info,
+    data: T,
+) {
     duckdb_init_set_init_data(
         info,
         Box::into_raw(Box::new(data)) as *mut c_void,
@@ -159,7 +165,9 @@ const _: () = {
     fn assert_send<T: Send>() {}
 
     let _ = assert_send_sync::<crate::functions::table_function::RasterH3GlobalData>;
-    let _ = assert_send_sync::<crate::functions::categorical_table_function::RasterH3CategoricalGlobalData>;
+    let _ = assert_send_sync::<
+        crate::functions::categorical_table_function::RasterH3CategoricalGlobalData,
+    >;
     let _ = assert_send_sync::<crate::functions::parquet_table_function::ParquetGlobalData>;
     let _ = assert_send_sync::<crate::functions::pmtiles_table_function::PmtilesGlobalData>;
     let _ = assert_send_sync::<crate::functions::pmtiles_table_function::ParquetPmtilesGlobalData>;

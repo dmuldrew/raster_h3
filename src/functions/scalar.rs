@@ -1,9 +1,9 @@
 use h3o::{CellIndex, LatLng, Resolution};
 use std::ffi::c_char;
 
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf};
 #[cfg(test)]
 use crate::encoding::WKB_BUF_LEN;
+use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf};
 use crate::ffi::*;
 
 // =========================================================================

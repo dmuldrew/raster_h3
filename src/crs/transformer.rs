@@ -187,7 +187,12 @@ impl AlbersConicFast {
         let rf_val = tokens
             .get("rf")
             .and_then(|v| v.parse::<f64>().ok())
-            .or_else(|| tokens.get("f").and_then(|v| v.parse::<f64>().ok()).map(|f| 1.0 / f));
+            .or_else(|| {
+                tokens
+                    .get("f")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|f| 1.0 / f)
+            });
 
         // If an explicit incompatible ellps or datum is present, reject fast path
         if let Some(e) = ellps {
@@ -227,8 +232,14 @@ impl AlbersConicFast {
         let lat_2 = tokens.get("lat_2").and_then(|v| v.parse::<f64>().ok());
         let lat_0 = tokens.get("lat_0").and_then(|v| v.parse::<f64>().ok());
         let lon_0 = tokens.get("lon_0").and_then(|v| v.parse::<f64>().ok());
-        let x_0 = tokens.get("x_0").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        let y_0 = tokens.get("y_0").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let x_0 = tokens
+            .get("x_0")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let y_0 = tokens
+            .get("y_0")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
 
         let l2_val = lat_2.or(lat_1);
         let l0_val = lat_0.unwrap_or(0.0);
@@ -370,18 +381,18 @@ impl CrsTransformer {
             }
             _ => {
                 let p_str = format!("+init=epsg:{}", code);
-                let from = Proj::from_proj_string(&p_str).map_err(|_| {
-                    RasterH3Error::UnsupportedEpsg {
+                let from =
+                    Proj::from_proj_string(&p_str).map_err(|_| RasterH3Error::UnsupportedEpsg {
                         code,
                         detail: format!("Unsupported or unrecognized EPSG code: {}", code),
-                    }
-                })?;
-                let to = Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| {
-                    RasterH3Error::CrsError(format!(
-                        "Failed to initialize WGS84 target projection: {:?}",
-                        e
-                    ))
-                })?;
+                    })?;
+                let to =
+                    Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| {
+                        RasterH3Error::CrsError(format!(
+                            "Failed to initialize WGS84 target projection: {:?}",
+                            e
+                        ))
+                    })?;
                 Ok(Self::Proj4 { from, to })
             }
         }
@@ -1147,8 +1158,14 @@ mod tests {
         let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 100.0, 100.0);
         // Pole (lat = 90.0) is interior to this chunk. transform_rect_bounds must capture max_lat = 90.0
         assert_eq!(bounds[3], 90.0, "Polar chunk must report max_lat = 90.0");
-        assert_eq!(bounds[0], -180.0, "Polar chunk must span full longitude [-180, 180]");
-        assert_eq!(bounds[2], 180.0, "Polar chunk must span full longitude [-180, 180]");
+        assert_eq!(
+            bounds[0], -180.0,
+            "Polar chunk must span full longitude [-180, 180]"
+        );
+        assert_eq!(
+            bounds[2], 180.0,
+            "Polar chunk must span full longitude [-180, 180]"
+        );
     }
 
     #[test]
@@ -1184,7 +1201,11 @@ mod tests {
         assert!(
             dist_m <= 0.01,
             "Transformed point ({}, {}) differs from golden cs2cs ({}, {}) by {} m (> 0.01 m)",
-            lon, lat, golden_lon, golden_lat, dist_m
+            lon,
+            lat,
+            golden_lon,
+            golden_lat,
+            dist_m
         );
     }
 
@@ -1206,7 +1227,9 @@ mod tests {
         let tf = CrsTransformer::from_proj_string(proj_str).unwrap();
         match tf {
             CrsTransformer::Proj4 { .. } => {}
-            _ => panic!("Expected Proj4 transformer for Albers on non-GRS80/WGS84 ellipsoid (intl)"),
+            _ => {
+                panic!("Expected Proj4 transformer for Albers on non-GRS80/WGS84 ellipsoid (intl)")
+            }
         }
 
         let (lon, lat) = tf.transform_point(1000000.0, 2000000.0).unwrap();
@@ -1222,7 +1245,11 @@ mod tests {
         assert!(
             dist_m <= 0.01,
             "Transformed point ({}, {}) differs from golden cs2cs ({}, {}) by {} m (> 0.01 m)",
-            lon, lat, golden_lon, golden_lat, dist_m
+            lon,
+            lat,
+            golden_lon,
+            golden_lat,
+            dist_m
         );
     }
 
@@ -1240,7 +1267,10 @@ mod tests {
     fn test_albers_with_nonzero_towgs84_is_error() {
         let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +towgs84=-8,160,176 +units=m +no_defs";
         let res = CrsTransformer::from_proj_string(proj_str);
-        assert!(res.is_err(), "Expected error for nonzero +towgs84 parameters");
+        assert!(
+            res.is_err(),
+            "Expected error for nonzero +towgs84 parameters"
+        );
         match res.err().unwrap() {
             RasterH3Error::CrsError(msg) => {
                 assert!(msg.contains("towgs84") || msg.contains("Helmert"));

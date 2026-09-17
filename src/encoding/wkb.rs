@@ -64,14 +64,8 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
     // one of the two polar cells that encircle a pole, shift vertices so that each
     // successive vertex differs by < 180° from the previous one.
     let res = cell.resolution();
-    let is_pole = cell
-        == h3o::LatLng::new(90.0, 0.0)
-            .expect("valid")
-            .to_cell(res)
-        || cell
-            == h3o::LatLng::new(-90.0, 0.0)
-                .expect("valid")
-                .to_cell(res);
+    let is_pole = cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(res)
+        || cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
 
     if !is_pole && (max_lng - min_lng > 180.0) {
         for i in 1..n {
@@ -191,7 +185,8 @@ mod tests {
     #[test]
     fn test_cell_to_wkb_class_iii_pentagon_and_hexagons() {
         // Res 7 pentagon: 10 vertices -> 11 ring points -> 189 bytes
-        let pentagon_res7 = CellIndex::try_from(0x870800000ffffffu64).expect("valid res 7 pentagon");
+        let pentagon_res7 =
+            CellIndex::try_from(0x870800000ffffffu64).expect("valid res 7 pentagon");
         assert!(pentagon_res7.is_pentagon());
         assert_eq!(pentagon_res7.boundary().len(), 10);
         let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
@@ -285,8 +280,16 @@ mod tests {
         // Ring must be closed (first == last point)
         let first_x = f64::from_le_bytes(buf[13..21].try_into().unwrap());
         let first_y = f64::from_le_bytes(buf[21..29].try_into().unwrap());
-        let last_x = f64::from_le_bytes(buf[13 + (num_points - 1) * 16..13 + (num_points - 1) * 16 + 8].try_into().unwrap());
-        let last_y = f64::from_le_bytes(buf[13 + (num_points - 1) * 16 + 8..13 + num_points * 16].try_into().unwrap());
+        let last_x = f64::from_le_bytes(
+            buf[13 + (num_points - 1) * 16..13 + (num_points - 1) * 16 + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let last_y = f64::from_le_bytes(
+            buf[13 + (num_points - 1) * 16 + 8..13 + num_points * 16]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(first_x, last_x);
         assert_eq!(first_y, last_y);
     }

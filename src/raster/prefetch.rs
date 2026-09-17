@@ -127,7 +127,10 @@ impl<T> OrderedPrefetchQueue<T> {
             && guard.slots[guard.next_read % self.capacity].is_none()
             && !guard.closed
         {
-            guard = self.not_empty.wait(guard).unwrap_or_else(|e| e.into_inner());
+            guard = self
+                .not_empty
+                .wait(guard)
+                .unwrap_or_else(|e| e.into_inner());
         }
 
         if let Some(item) = guard.terminal_item.take() {
@@ -161,7 +164,10 @@ impl<T> OrderedPrefetchQueue<T> {
                 && guard.slots[guard.next_read % self.capacity].is_none()
                 && !guard.closed
             {
-                guard = self.not_empty.wait(guard).unwrap_or_else(|e| e.into_inner());
+                guard = self
+                    .not_empty
+                    .wait(guard)
+                    .unwrap_or_else(|e| e.into_inner());
             }
             if guard.next_read < self.total_jobs {
                 let slot_idx = guard.next_read % self.capacity;

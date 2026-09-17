@@ -36,7 +36,8 @@ pub fn safe_panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> S
     }));
 
     // Dispose of the payload within a catch boundary; if payload's Drop panics, forget secondary payload
-    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+    {
         std::mem::forget(secondary);
     }
 
@@ -166,7 +167,10 @@ mod tests {
             panic!("{}", format!("test formatted panic {}", 42));
         })
         .unwrap_err();
-        assert_eq!(panic_payload_to_string(err_string), "test formatted panic 42");
+        assert_eq!(
+            panic_payload_to_string(err_string),
+            "test formatted panic 42"
+        );
     }
 
     #[test]

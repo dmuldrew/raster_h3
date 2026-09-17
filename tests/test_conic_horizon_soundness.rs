@@ -76,14 +76,7 @@ fn test_albers_strip_north_lat_captures_central_meridian() {
     // Straddling the central meridian (x = 0): x from -2,000,000 to +2,000,000
     // Pixel size: 400m
     create_albers_conus_geotiff(
-        &tif_path,
-        10000,
-        2,
-        -2000000.0,
-        3200000.0,
-        400.0,
-        400.0,
-        1.0,
+        &tif_path, 10000, 2, -2000000.0, 3200000.0, 400.0, 400.0, 1.0,
     );
 
     let reader = GeoTiffStreamReader::open(&tif_path).unwrap();
@@ -97,7 +90,10 @@ fn test_albers_strip_north_lat_captures_central_meridian() {
     let (_, lat_cm) = tf.transform_point(0.0, 3200000.0).unwrap();
 
     let corner_max = lat_west.max(lat_east);
-    assert!(lat_cm > corner_max + 2.0, "Central meridian must be > 2° higher than corners");
+    assert!(
+        lat_cm > corner_max + 2.0,
+        "Central meridian must be > 2° higher than corners"
+    );
 
     // Chunk 0 is the top strip. Its north_lat must match the central meridian latitude:
     let chunk0 = &mosaic.chunk_refs[0];
@@ -169,14 +165,7 @@ fn test_albers_multi_horizon_streaming_no_duplicate_cells() {
     // Create a 4-strip Albers raster (1000 x 4), width 1000 pixels at 1km = 1000 km wide
     // Centered at central meridian: x from -500,000 to +500,000, y from 2,500,000 to 2,496,000
     create_albers_conus_geotiff(
-        &tif_path,
-        1000,
-        4,
-        -500000.0,
-        2500000.0,
-        1000.0,
-        1000.0,
-        10.0,
+        &tif_path, 1000, 4, -500000.0, 2500000.0, 1000.0, 1000.0, 10.0,
     );
 
     let reader = GeoTiffStreamReader::open(&tif_path).unwrap();
@@ -248,9 +237,15 @@ fn test_max_hex_radius_headroom_all_resolutions() {
         .to_cell(h3o::Resolution::Zero);
     let center_lat = h3o::LatLng::from(cell_res0).lat();
     let south_lat0 = compute_cell_south_lat(cell_res0.into());
-    assert!(south_lat0 < center_lat, "South lat must be south of center lat");
+    assert!(
+        south_lat0 < center_lat,
+        "South lat must be south of center lat"
+    );
     for v in cell_res0.boundary().iter() {
-        assert!(south_lat0 <= v.lat(), "South lat must bound all boundary vertices");
+        assert!(
+            south_lat0 <= v.lat(),
+            "South lat must bound all boundary vertices"
+        );
     }
 
     // Verify worst-case cells identified in the geodetic correctness audit:
@@ -260,7 +255,10 @@ fn test_max_hex_radius_headroom_all_resolutions() {
     let c_lat2 = h3o::LatLng::from(h3o::CellIndex::try_from(cell_res2).unwrap()).lat();
     let span2 = c_lat2 - s_lat2;
     assert!(span2 > 1.7, "Empirical reach must exceed old 1.7° limit");
-    assert!(span2 <= max_hex_radius_deg(2), "Span must be safely bounded by updated radius 1.95°");
+    assert!(
+        span2 <= max_hex_radius_deg(2),
+        "Span must be safely bounded by updated radius 1.95°"
+    );
 
     // Res 3: 833201fffffffff (measured reach 0.6820°, old radius 0.65° under-reached by 3.6km)
     let cell_res3 = 0x833201fffffffffu64;
@@ -268,7 +266,10 @@ fn test_max_hex_radius_headroom_all_resolutions() {
     let c_lat3 = h3o::LatLng::from(h3o::CellIndex::try_from(cell_res3).unwrap()).lat();
     let span3 = c_lat3 - s_lat3;
     assert!(span3 > 0.65, "Empirical reach must exceed old 0.65° limit");
-    assert!(span3 <= max_hex_radius_deg(3), "Span must be safely bounded by updated radius 0.74°");
+    assert!(
+        span3 <= max_hex_radius_deg(3),
+        "Span must be safely bounded by updated radius 0.74°"
+    );
 
     // Res 4: 8404001ffffffff (measured reach 0.2579°, old radius 0.25° under-reached by 875m)
     let cell_res4 = 0x8404001ffffffffu64;
@@ -276,5 +277,8 @@ fn test_max_hex_radius_headroom_all_resolutions() {
     let c_lat4 = h3o::LatLng::from(h3o::CellIndex::try_from(cell_res4).unwrap()).lat();
     let span4 = c_lat4 - s_lat4;
     assert!(span4 > 0.25, "Empirical reach must exceed old 0.25° limit");
-    assert!(span4 <= max_hex_radius_deg(4), "Span must be safely bounded by updated radius 0.28°");
+    assert!(
+        span4 <= max_hex_radius_deg(4),
+        "Span must be safely bounded by updated radius 0.28°"
+    );
 }

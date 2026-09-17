@@ -184,14 +184,17 @@ fn test_mixed_local_remote_mosaic_prefetching_completes_without_deadlock() {
     let remote_url = format!("{}/tile_r00_c01.tif", server.url_base);
 
     // Build mixed local/remote mosaic: tile 0 is local, tile 1 is remote
-    let sources = vec![
-        tile0_path,
-        PathBuf::from(remote_url),
-    ];
+    let sources = vec![tile0_path, PathBuf::from(remote_url)];
     let mosaic = MosaicReader::open(&sources, None, None, OverlapRule::Cutline).unwrap();
     assert_eq!(mosaic.tiles.len(), 2);
-    assert!(mosaic.tiles[0].reader.remote_source().is_none(), "tile 0 must be local");
-    assert!(mosaic.tiles[1].reader.remote_source().is_some(), "tile 1 must be remote");
+    assert!(
+        mosaic.tiles[0].reader.remote_source().is_none(),
+        "tile 0 must be local"
+    );
+    assert!(
+        mosaic.tiles[1].reader.remote_source().is_some(),
+        "tile 1 must be remote"
+    );
 
     // Check remote prefetch queue scheduled chunk tracking
     let remote_queue = RemoteChunkPrefetchQueue::spawn_mosaic(&mosaic, None).unwrap();
@@ -200,7 +203,12 @@ fn test_mixed_local_remote_mosaic_prefetching_completes_without_deadlock() {
             // Local tile chunks must NOT be scheduled in remote queue
             assert!(!remote_queue.is_chunk_scheduled(0, chunk_ref.chunk_idx));
             // get_chunk_payload must return Ok(None) immediately without blocking
-            assert_eq!(remote_queue.get_chunk_payload(0, chunk_ref.chunk_idx).unwrap(), None);
+            assert_eq!(
+                remote_queue
+                    .get_chunk_payload(0, chunk_ref.chunk_idx)
+                    .unwrap(),
+                None
+            );
         } else {
             // Remote tile chunks must be scheduled in remote queue
             assert!(remote_queue.is_chunk_scheduled(1, chunk_ref.chunk_idx));
@@ -231,7 +239,10 @@ fn test_mixed_local_remote_mosaic_prefetching_completes_without_deadlock() {
         }
     }
 
-    assert!(total_drained > 0, "Prefetched mosaic reader must yield chunks");
+    assert!(
+        total_drained > 0,
+        "Prefetched mosaic reader must yield chunks"
+    );
     assert!(tile0_chunks > 0, "Must decompress local chunks");
     assert!(tile1_chunks > 0, "Must decompress remote chunks");
     println!(
@@ -256,9 +267,9 @@ fn test_ordered_prefetch_queue_worker_panic_latches_error() {
 
         if let Err(payload) = res {
             let msg = raster_h3::ffi::panic_payload_to_string(payload);
-            q.fail(Err(raster_h3::error::RasterH3Error::InvalidParameter(format!(
-                "Decode worker panicked: {msg}"
-            ))));
+            q.fail(Err(raster_h3::error::RasterH3Error::InvalidParameter(
+                format!("Decode worker panicked: {msg}"),
+            )));
         }
     });
 
@@ -268,7 +279,10 @@ fn test_ordered_prefetch_queue_worker_panic_latches_error() {
     let mut batch = Vec::new();
     let count = queue.drain_into(&mut batch, 1, 10);
     assert_eq!(count, 1, "Terminal error must be delivered immediately");
-    assert!(batch[0].is_err(), "First delivered item on failure must be the latched error");
+    assert!(
+        batch[0].is_err(),
+        "First delivered item on failure must be the latched error"
+    );
     let err_str = batch[0].as_ref().unwrap_err().to_string();
     assert!(
         err_str.contains("unexpected decoder decompression failure"),
@@ -278,13 +292,13 @@ fn test_ordered_prefetch_queue_worker_panic_latches_error() {
 
 #[test]
 fn test_prefetched_chunk_reader_corrupt_chunk_unblocks_without_hanging() {
+    use raster_h3::raster::geotiff::GeoTiffStreamReader;
+    use raster_h3::raster::prefetch::PrefetchedChunkReader;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom};
     use tempfile::NamedTempFile;
     use tiff::encoder::{colortype, compression::Deflate, TiffEncoder};
     use tiff::tags::Tag;
-    use raster_h3::raster::geotiff::GeoTiffStreamReader;
-    use raster_h3::raster::prefetch::PrefetchedChunkReader;
 
     let file = NamedTempFile::new().unwrap();
     {
@@ -345,6 +359,12 @@ fn test_prefetched_chunk_reader_corrupt_chunk_unblocks_without_hanging() {
         }
     }
 
-    assert!(had_error, "PrefetchedChunkReader must report corruption error");
-    assert_eq!(chunks_read, 2, "Chunks 0 and 1 must be read before chunk 2 failure");
+    assert!(
+        had_error,
+        "PrefetchedChunkReader must report corruption error"
+    );
+    assert_eq!(
+        chunks_read, 2,
+        "Chunks 0 and 1 must be read before chunk 2 failure"
+    );
 }
