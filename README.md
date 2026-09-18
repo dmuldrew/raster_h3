@@ -58,19 +58,15 @@ Joining raster values (elevation, temperature, land cover) with business entitie
 
 ### The Solution: Uber H3 Discrete Global Grid System
 
-The [Uber H3 Spatial Index](https://h3geo.org/) is an open-source [Discrete Global Grid System (DGGS)](https://en.wikipedia.org/wiki/Discrete_global_grid) that partitions the entire planet into an invariant, hierarchical hexagonal mesh across 16 resolution levels (Resolution 0 to 15):
+The **Uber H3 Spatial Index** divides the Earth into a hierarchical grid of invariant hexagons across 16 resolution levels. Unlike square grids, hexagons have identical distances to all six neighbors and minimal area distortion across global latitudes.
 
-* **Why Hexagons?** Unlike square pixel grids where diagonal neighbors are $\sqrt{2} \times$ farther away than orthogonal neighbors, hexagons have **identical distance to all 6 adjacent neighbors**. This eliminates directional bias for spatial neighborhood queries, radius buffers, and spatial diffusion modeling.
-* **Minimal Area & Shape Distortion**: H3 projects a spherical icosahedron onto Earth's surface using [gnomonic projections](https://h3geo.org/docs/core-library/overview#gnomonic-projection), preserving near-uniform cell area across global latitudes without the extreme polar distortion of Web Mercator.
-* **Hierarchical Aperture-7 Nesting**: Each H3 cell decomposes into 7 finer child cells at the next resolution level, with cell areas decreasing by $\sim 7\times$ at each step—from [Resolution 0](https://h3geo.org/docs/core-library/restable/) (continental scale, ~4.3M km²) down to Resolution 15 (~0.9 m²).
-* **64-Bit Integer Addressing**: Every hexagon on Earth is uniquely addressed by a compact 64-bit unsigned integer (`UBIGINT` / 15-character hex string) that can be indexed, partitioned, and joined in standard SQL databases via simple equality joins: `JOIN ON r.h3_index = v.h3_index`.
+Aggregating rasters into H3 solves four fundamental challenges of working with raw imagery:
+* **Normalizes Disparate Resolutions & Projections**: Rasters arrive with differing pixel sizes (10m Sentinel, 30m Landsat, 1km climate grids) and incompatible local projections. H3 maps them all into a single, standardized global grid without manual grid resampling.
+* **Drastic 50×–100× Data Reduction**: An H3 Resolution 8 cell aggregates roughly 800 thirty-meter pixels into a single summary row, shrinking a multi-gigabyte raster by orders of magnitude on disk.
+* **Preserves Rich Surface Distributions**: Rather than losing nuance to a simple average, the engine captures the full distribution per cell—including mean, variance/ruggedness, and min/max for continuous terrain, plus class purity and Shannon entropy (landscape fragmentation) for categorical maps.
+* **Unlocks Relational SQL Joins**: Every hexagon is addressed by a compact 64-bit integer (`UBIGINT` / hex string). Once pixels become H3 cells, rigid 2D raster matrices become standard relational tables joinable directly with tabular business data: `JOIN ON r.h3_index = v.h3_index`.
 
-> 📚 **Learn More About H3**:
-> - [Official H3 Documentation & Guides](https://h3geo.org/docs/)
-> - [H3 Core Principles & Coordinate Systems](https://h3geo.org/docs/core-library/overview)
-> - [H3 Resolution Reference Table (Cell Areas & Edge Lengths)](https://h3geo.org/docs/core-library/restable/)
-> - [Uber Engineering Blog: H3 Hexagonal Hierarchical Spatial Index](https://www.uber.com/blog/h3/)
-> - [DuckDB H3 Community Extension](https://community-extensions.duckdb.org/extensions/h3.html)
+For more details on the grid system and its mathematical design, see the [official H3 documentation](https://h3geo.org/docs/) and the [Uber engineering blog](https://www.uber.com/blog/h3/).
 
 ### Raster Meets Table: A Worked Example
 
