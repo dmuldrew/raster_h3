@@ -18,13 +18,14 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 - [SQL Usage & Practical Recipes](#sql-usage--practical-recipes)
 - [Core Engineering Innovations](#core-engineering-innovations)
 - [Architecture Diagram](#architecture-diagram)
+- [Source Module Architecture](docs/module-architecture.md)
 - [Core Dependencies](#core-dependencies--architectural-contributions)
 - [Troubleshooting & Common Pitfalls](#troubleshooting--common-pitfalls)
 - [Building & Testing Locally](#building--testing-locally)
 - [License](#license)
 
 **📖 Deep Dives:**
-[Engineering Details](docs/engineering.md) · [Optimal Raster Formats](docs/optimal-raster-format.md) · [Super-Sampling](docs/super-sampling.md) · [CRS & Projections](docs/crs-and-projection.md) · [Multi-Resolution Pyramids](docs/multi-resolution.md) · [PMTiles v3](docs/pmtiles.md) · [Architecture Comparison](docs/architecture-comparison.md) · [API Reference](docs/api-reference.md)
+[Engineering Details](docs/engineering.md) · [Module Architecture](docs/module-architecture.md) · [Optimal Raster Formats](docs/optimal-raster-format.md) · [Super-Sampling](docs/super-sampling.md) · [CRS & Projections](docs/crs-and-projection.md) · [Multi-Resolution Pyramids](docs/multi-resolution.md) · [PMTiles v3](docs/pmtiles.md) · [Architecture Comparison](docs/architecture-comparison.md) · [API Reference](docs/api-reference.md)
 
 ---
 
@@ -407,7 +408,8 @@ print(res)
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
 | 14 | **Native OGC GeoParquet 1.1 Exporter** | 125-byte WKB polygons with embedded PROJJSON metadata |
 
-> 📖 **Detailed explanations** of each innovation — See [docs/engineering.md](docs/engineering.md)
+> 📖 **Detailed explanations** of each innovation — See [docs/engineering.md](docs/engineering.md)  
+> 🗺️ **Source Module Architecture** — File-by-file breakdown of crate internals mapped to these principles: [docs/module-architecture.md](docs/module-architecture.md)
 
 ---
 
@@ -470,6 +472,8 @@ flowchart TD
         CHUNK_OUT --> TF
     end
 ```
+
+> 🗺️ **Looking for source file responsibilities?** See the complete [Source Module Architecture](docs/module-architecture.md) for a guide to every file in `src/`.
 
 ---
 
