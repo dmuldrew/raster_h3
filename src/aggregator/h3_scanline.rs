@@ -3,6 +3,13 @@ use h3o::{LatLng, Resolution};
 pub struct H3ScanlineLookahead {
     prev_hex_width: usize,
     current_hex_span: usize,
+    /// Cap exponential probe growth to a quarter of the previous cell width.
+    ///
+    /// A scanline is not a geodesic, so it can leave and re-enter a coarse H3 cell
+    /// (sagitta ≈ κL²/8, kilometres at res ≤ 3). Capping the probe step keeps a single
+    /// probe from jumping over such a re-entry, which would break the monotone
+    /// assumption of the binary search.
+    cap_probe_step: bool,
 }
 
 impl Default for H3ScanlineLookahead {
@@ -10,6 +17,7 @@ impl Default for H3ScanlineLookahead {
         Self {
             prev_hex_width: 32,
             current_hex_span: 0,
+            cap_probe_step: false,
         }
     }
 }
@@ -20,6 +28,7 @@ impl H3ScanlineLookahead {
         Self {
             prev_hex_width: width.max(1),
             current_hex_span: 0,
+            cap_probe_step: false,
         }
     }
 
@@ -33,7 +42,19 @@ impl H3ScanlineLookahead {
             9 => 5,
             _ => 2,
         };
-        Self::with_initial_width(initial_width)
+        let mut s = Self::with_initial_width(initial_width);
+        s.cap_probe_step = r_u8 <= 3;
+        s
+    }
+
+    /// Maximum exponential probe step for the current lookahead state.
+    #[inline(always)]
+    fn probe_step_cap(&self) -> usize {
+        if self.cap_probe_step {
+            (self.prev_hex_width / 4).max(1)
+        } else {
+            usize::MAX
+        }
     }
 
     #[inline(always)]
@@ -43,7 +64,9 @@ impl H3ScanlineLookahead {
 
     #[inline(always)]
     pub fn get_or_compute_cell(&mut self, lat: f64, lon: f64, res: Resolution) -> Option<u64> {
-        if let Ok(ll) = LatLng::new(lat, lon) {
+        if !(-90.0..=90.0).contains(&lat) {
+            None
+        } else if let Ok(ll) = LatLng::new(lat, lon) {
             Some(ll.to_cell(res).into())
         } else {
             None
@@ -86,7 +109,7 @@ impl H3ScanlineLookahead {
             if let Ok(ll) = LatLng::new(lat_row, guess_lon) {
                 let guess_cell: u64 = ll.to_cell(res).into();
                 if guess_cell == run_cell {
-                    let step = (guess_c - c).max(1);
+                    let step = (guess_c - c).max(1).min(self.probe_step_cap());
                     let new_guess_c = (guess_c + step).min(row_width);
                     if new_guess_c == guess_c {
                         break;
@@ -156,7 +179,7 @@ impl H3ScanlineLookahead {
         while guess_c < row_width {
             if let Some(guess_cell) = coord_to_cell(guess_x, y_row) {
                 if guess_cell == run_cell {
-                    let step = (guess_c - c).max(1);
+                    let step = (guess_c - c).max(1).min(self.probe_step_cap());
                     let new_guess_c = (guess_c + step).min(row_width);
                     if new_guess_c == guess_c {
                         break;

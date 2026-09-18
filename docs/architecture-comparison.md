@@ -76,6 +76,6 @@ Tests were executed on an 8-core ARM64 workstation with 16 GB unified memory run
 | **Active Peak RAM Usage** | < 15 MB | **< 15 MB** | **Bounded O(Scan Front)** | Strictly flat memory profile |
 
 ### Engineering Analysis:
-1. **Zero Allocation Churn**: By recycling decompression buffers via `crossbeam_deque::Injector`, thousands of chunk allocations and OS page mappings are completely eliminated during sustained streaming.
-2. **Context-Switch Elimination**: Connecting background decompression workers directly to the aggregator ring buffer in `OrderedPrefetchQueue<T>` cuts OS thread wakeups and latency jitter.
+1. **Minimized Allocation Churn**: By recycling decompression buffers via `DecodingBufferPool`, repetitive buffer allocations and OS page mappings are minimized during sustained streaming while strictly bounding retained idle memory.
+2. **Context-Switch Reduction**: Connecting background decompression workers directly to the aggregator ring buffer in `OrderedPrefetchQueue<T>` eliminates intermediate collector threads, cutting thread context switches and latency jitter.
 3. **Hardware Saturation**: Ingestion speeds approach the raw memory-bandwidth and hardware decompression limits of NVMe storage and modern SIMD vector engines, ensuring zero database CPU waste.

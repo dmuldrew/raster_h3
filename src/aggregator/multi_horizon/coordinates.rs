@@ -78,13 +78,28 @@ impl<'a> CoordinateTransformer<'a> {
     }
 }
 
-/// Check if a WGS84 point `(lon, lat)` falls within an optional bounding box `[min_lon, min_lat, max_lon, max_lat]`
+/// Normalize longitude into [-180.0, 180.0) degrees
+#[inline]
+pub fn wrap_lon(lon: f64) -> f64 {
+    (lon + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// Check if a WGS84 point `(lon, lat)` falls within an optional bounding box `[min_lon, min_lat, max_lon, max_lat]`.
+/// Handles longitude wrapping and antimeridian-crossing bounding boxes (`min_lon > max_lon`).
 #[inline(always)]
 pub fn is_point_in_bbox(lon: f64, lat: f64, bbox: Option<[f64; 4]>) -> bool {
-    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-        lon >= b_min_lon && lon <= b_max_lon && lat >= b_min_lat && lat <= b_max_lat
+    let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox else {
+        return true;
+    };
+    if lat < b_min_lat || lat > b_max_lat {
+        return false;
+    }
+    let lon = wrap_lon(lon);
+    if b_min_lon <= b_max_lon {
+        (lon >= b_min_lon && lon <= b_max_lon) || (lon == -180.0 && b_max_lon >= 180.0)
     } else {
-        true
+        // Bounding box crosses the antimeridian (e.g. Fiji [178, -20, -178, -15])
+        lon >= b_min_lon || lon <= b_max_lon
     }
 }
 
@@ -100,6 +115,8 @@ pub fn resolve_subpixel_cell(
 ) -> Option<u64> {
     if d_x == 0.0 && d_y == 0.0 {
         Some(run_cell)
+    } else if !(-90.0..=90.0).contains(&lat) {
+        None
     } else {
         LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
     }

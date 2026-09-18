@@ -820,17 +820,31 @@ fn test_nonexistent_file_path_error() {
 
 #[test]
 fn test_plain_tiff_without_geokeys() {
-    let (_temp_file, path) = TestGeoTiffBuilder::new(10, 10)
+    // 1. TIFF with no georeferencing tags at all MUST fail to open
+    let (_unref_file, unref_path) = TestGeoTiffBuilder::new(10, 10)
         .georeferenced(false)
+        .create_constant_tempfile(42.0f32);
+
+    let unref_err = GeoTiffStreamReader::open(&unref_path);
+    assert!(unref_err.is_err());
+    match unref_err {
+        Err(RasterH3Error::InvalidParameter(msg)) => {
+            assert!(msg.contains("no georeferencing tags"));
+        }
+        _ => panic!("Expected RasterH3Error::InvalidParameter for unreferenced TIFF"),
+    }
+
+    // 2. TIFF with georeferencing tags but WITHOUT geokeys (no detected CRS)
+    let (_temp_file, path) = TestGeoTiffBuilder::new(10, 10)
+        .with_geokeys(false)
         .create_constant_tempfile(42.0f32);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     // Non-georeferenced images have no detected CRS
     assert_eq!(reader.metadata.epsg, None);
     assert_eq!(reader.metadata.proj_string, None);
-    assert_eq!(reader.metadata.geotransform, GeoTransform::default());
 
-    // 1. Without specifying custom_crs, streamer initialization MUST fail with a CRS error
+    // 2a. Without specifying custom_crs, streamer initialization MUST fail with a CRS error
     let unspec_config = MultiResolutionConfig::single(4);
     let err_res = MultiScanHorizonStreamer::new(reader.clone(), &unspec_config);
     assert!(err_res.is_err());
@@ -1558,12 +1572,12 @@ fn test_categorical_accumulator_high_cardinality_shannon_entropy() {
 
 #[test]
 fn test_wkb_ogc_compliance() {
-    use raster_h3::functions::{cell_to_wkb, h3_index_to_wkb};
+    use raster_h3::functions::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 
     let coord = LatLng::new(21.3069, -157.8583).unwrap(); // Honolulu
     let cell = coord.to_cell(Resolution::Eight);
 
-    let mut buf = [0u8; 128];
+    let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
     let len = cell_to_wkb(cell, &mut buf);
     assert_eq!(len, 125, "Hexagon WKB must be exactly 125 bytes");
 
@@ -1594,10 +1608,24 @@ fn test_wkb_ogc_compliance() {
     assert!(p0_y > 21.0 && p0_y < 22.0);
 
     // Also verify h3_index_to_wkb matches
-    let mut buf2 = [0u8; 128];
+    let mut buf2: WkbBuf = [0u8; WKB_BUF_LEN];
     let len2 = h3_index_to_wkb(cell.into(), &mut buf2).expect("valid cell u64");
     assert_eq!(len, len2);
     assert_eq!(&buf[..len], &buf2[..len2]);
+
+    // Verify Class III (odd) resolution pentagon: 10 vertices -> 189 bytes
+    let pentagon_res7 = h3o::CellIndex::try_from(0x870800000ffffffu64).unwrap();
+    let p_len = cell_to_wkb(pentagon_res7, &mut buf);
+    assert_eq!(p_len, 189);
+    let p_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    assert_eq!(p_points, 11);
+
+    // Verify Class III icosahedron-straddling hexagon: 8 vertices -> 157 bytes
+    let hex_res7_8 = h3o::CellIndex::try_from(0x87e06dac8ffffffu64).unwrap();
+    let h_len = cell_to_wkb(hex_res7_8, &mut buf);
+    assert_eq!(h_len, 157);
+    let h_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
+    assert_eq!(h_points, 9);
 }
 
 #[test]
@@ -1864,8 +1892,8 @@ fn test_categorical_simd_uniformity_types_and_spans() {
     check_uniformity::<i32>(-100_000, 100_000);
     check_uniformity::<u64>(1_000_000_000, 2_000_000_000);
     check_uniformity::<i64>(-1_000_000_000, 1_000_000_000);
-    check_uniformity::<f32>(3.14, 2.71);
-    check_uniformity::<f64>(1.414213, 1.73205);
+    check_uniformity::<f32>(3.25, 2.75);
+    check_uniformity::<f64>(1.45, 1.75);
 
     // Float +0.0 and -0.0 equivalence
     let zeros_f32 = vec![0.0f32, -0.0f32, 0.0f32, -0.0f32];

@@ -28,17 +28,20 @@ pub enum DuckDBType {
     Varchar = 17,
     Blob = 18,
     Decimal = 19,
-    Enum = 20,
-    List = 21,
-    Struct = 22,
-    Map = 23,
-    Array = 24,
-    Uuid = 25,
-    Union = 26,
-    Bit = 27,
-    TimeTz = 28,
-    TimestampTz = 29,
+    TimestampS = 20,
+    TimestampMs = 21,
+    TimestampNs = 22,
+    Enum = 23,
+    List = 24,
+    Struct = 25,
+    Map = 26,
+    Uuid = 27,
+    Union = 28,
+    Bit = 29,
+    TimeTz = 30,
+    TimestampTz = 31,
     UHugeInt = 32,
+    Array = 33,
     Geometry = 40,
 }
 
@@ -88,13 +91,25 @@ impl Default for duckdb_result {
 
 #[repr(C)]
 pub struct duckdb_extension_access {
-    pub get_api: Option<
-        unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *mut c_void,
-    >,
+    pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
     pub get_database:
         Option<unsafe extern "C" fn(info: duckdb_extension_info) -> *mut duckdb_database>,
-    pub set_error: Option<unsafe extern "C" fn(info: duckdb_extension_info, error: *const c_char)>,
+    pub get_api: Option<
+        unsafe extern "C" fn(info: duckdb_extension_info, version: *const c_char) -> *const c_void,
+    >,
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<duckdb_extension_access>() == 3 * std::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(duckdb_extension_access, set_error) == 0);
+    assert!(
+        core::mem::offset_of!(duckdb_extension_access, get_database)
+            == std::mem::size_of::<usize>()
+    );
+    assert!(
+        core::mem::offset_of!(duckdb_extension_access, get_api) == 2 * std::mem::size_of::<usize>()
+    );
+};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -124,6 +139,13 @@ impl duckdb_string_t {
         self.inlined.length
     }
 
+    /// Borrows the string data as a Rust string slice.
+    ///
+    /// # Safety
+    /// The caller must ensure that the underlying DuckDB vector is live and
+    /// valid for the duration of the returned reference. For external strings
+    /// (length > 12), `pointer.ptr` must point to at least `length` initialized
+    /// UTF-8 bytes.
     #[inline(always)]
     pub unsafe fn as_str(&self) -> &str {
         let len = self.length() as usize;
@@ -245,6 +267,7 @@ extern "C" {
     pub fn duckdb_function_get_init_data(info: duckdb_function_info) -> *mut c_void;
     pub fn duckdb_function_get_local_init_data(info: duckdb_function_info) -> *mut c_void;
     pub fn duckdb_function_set_error(info: duckdb_function_info, error: *const c_char);
+    pub fn duckdb_scalar_function_set_error(info: duckdb_function_info, error: *const c_char);
 
     // Data chunks & Vectors
     pub fn duckdb_data_chunk_get_column_count(chunk: duckdb_data_chunk) -> idx_t;
@@ -263,6 +286,17 @@ extern "C" {
         str: *const c_char,
         str_len: idx_t,
     );
+
+    // Validity mask
+    pub fn duckdb_vector_get_validity(vector: duckdb_vector) -> *mut u64;
+    pub fn duckdb_vector_ensure_validity_writable(vector: duckdb_vector);
+    pub fn duckdb_validity_row_is_valid(validity: *mut u64, row: idx_t) -> bool;
+    pub fn duckdb_validity_set_row_valid(validity: *mut u64, row: idx_t);
+    pub fn duckdb_validity_set_row_invalid(validity: *mut u64, row: idx_t);
+    pub fn duckdb_validity_set_row_validity(validity: *mut u64, row: idx_t, valid: bool);
+
+    // Vector size
+    pub fn duckdb_vector_size() -> idx_t;
 
     // Values
     pub fn duckdb_get_varchar(val: duckdb_value) -> *mut c_char;
@@ -311,11 +345,81 @@ extern "C" {
     pub fn duckdb_result_error(result: *mut duckdb_result) -> *const c_char;
 }
 
+/// Check if a specific row in a validity mask is valid.
+/// If `validity` is NULL, all rows in DuckDB are considered valid.
+#[inline(always)]
+pub unsafe fn duckdb_validity_is_valid(validity: *mut u64, row: idx_t) -> bool {
+    if validity.is_null() {
+        true
+    } else {
+        duckdb_validity_row_is_valid(validity, row)
+    }
+}
+
+/// Mark a specific row in a vector as invalid (NULL).
+#[inline(always)]
+pub unsafe fn duckdb_vector_set_row_invalid(vector: duckdb_vector, row: idx_t) {
+    if vector.is_null() {
+        return;
+    }
+    duckdb_vector_ensure_validity_writable(vector);
+    let validity = duckdb_vector_get_validity(vector);
+    if !validity.is_null() {
+        duckdb_validity_set_row_invalid(validity, row);
+    }
+}
+
+/// Dynamic lookup or fallback for duckdb_vector_size, allowing safe execution
+/// inside DuckDB processes and safe testing outside of DuckDB.
+pub fn get_vector_size() -> usize {
+    unsafe {
+        let sym = crate::ffi::spatial_detect::dlsym_duckdb_symbol(b"duckdb_vector_size\0");
+        if !sym.is_null() {
+            let func: unsafe extern "C" fn() -> idx_t = std::mem::transmute(sym);
+            let sz = func() as usize;
+            if sz > 0 {
+                return sz;
+            }
+        }
+    }
+    2048
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn test_duckdb_extension_access_layout_and_offsets() {
+        assert_eq!(
+            std::mem::size_of::<duckdb_extension_access>(),
+            3 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(core::mem::offset_of!(duckdb_extension_access, set_error), 0);
+        assert_eq!(
+            core::mem::offset_of!(duckdb_extension_access, get_database),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(duckdb_extension_access, get_api),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn test_duckdb_validity_null_pointer_is_valid() {
+        // If validity is NULL, all rows are treated as valid
+        assert!(unsafe { duckdb_validity_is_valid(std::ptr::null_mut(), 0) });
+        assert!(unsafe { duckdb_validity_is_valid(std::ptr::null_mut(), 100) });
+    }
+
+    #[test]
+    fn test_get_vector_size_fallback() {
+        let sz = get_vector_size();
+        assert!(sz > 0);
+    }
 
     #[test]
     fn test_duckdb_string_t_memory_layout_and_alignment() {
@@ -469,5 +573,44 @@ mod tests {
         assert!(res.deprecated_columns.is_null());
         assert!(res.deprecated_error_message.is_null());
         assert!(res.internal_data.is_null());
+    }
+
+    #[test]
+    fn test_duckdb_type_discriminants_official_abi() {
+        assert_eq!(DuckDBType::Invalid as u32, 0);
+        assert_eq!(DuckDBType::Boolean as u32, 1);
+        assert_eq!(DuckDBType::TinyInt as u32, 2);
+        assert_eq!(DuckDBType::SmallInt as u32, 3);
+        assert_eq!(DuckDBType::Integer as u32, 4);
+        assert_eq!(DuckDBType::BigInt as u32, 5);
+        assert_eq!(DuckDBType::UTinyInt as u32, 6);
+        assert_eq!(DuckDBType::USmallInt as u32, 7);
+        assert_eq!(DuckDBType::UInteger as u32, 8);
+        assert_eq!(DuckDBType::UBigInt as u32, 9);
+        assert_eq!(DuckDBType::Float as u32, 10);
+        assert_eq!(DuckDBType::Double as u32, 11);
+        assert_eq!(DuckDBType::Timestamp as u32, 12);
+        assert_eq!(DuckDBType::Date as u32, 13);
+        assert_eq!(DuckDBType::Time as u32, 14);
+        assert_eq!(DuckDBType::Interval as u32, 15);
+        assert_eq!(DuckDBType::HugeInt as u32, 16);
+        assert_eq!(DuckDBType::Varchar as u32, 17);
+        assert_eq!(DuckDBType::Blob as u32, 18);
+        assert_eq!(DuckDBType::Decimal as u32, 19);
+        assert_eq!(DuckDBType::TimestampS as u32, 20);
+        assert_eq!(DuckDBType::TimestampMs as u32, 21);
+        assert_eq!(DuckDBType::TimestampNs as u32, 22);
+        assert_eq!(DuckDBType::Enum as u32, 23);
+        assert_eq!(DuckDBType::List as u32, 24);
+        assert_eq!(DuckDBType::Struct as u32, 25);
+        assert_eq!(DuckDBType::Map as u32, 26);
+        assert_eq!(DuckDBType::Uuid as u32, 27);
+        assert_eq!(DuckDBType::Union as u32, 28);
+        assert_eq!(DuckDBType::Bit as u32, 29);
+        assert_eq!(DuckDBType::TimeTz as u32, 30);
+        assert_eq!(DuckDBType::TimestampTz as u32, 31);
+        assert_eq!(DuckDBType::UHugeInt as u32, 32);
+        assert_eq!(DuckDBType::Array as u32, 33);
+        assert_eq!(DuckDBType::Geometry as u32, 40);
     }
 }

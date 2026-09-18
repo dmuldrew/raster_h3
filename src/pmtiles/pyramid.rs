@@ -85,11 +85,11 @@ pub fn cell_tile_range_mercator(
 
 /// Compute boundary vertices for an H3 cell directly into a stack-allocated array (zero heap allocations)
 #[inline(always)]
-pub fn cell_boundary_mercator(cell: CellIndex) -> ([MercatorPoint; 8], usize) {
-    let mut arr = [MercatorPoint { x: 0.0, y: 0.0 }; 8];
+pub fn cell_boundary_mercator(cell: CellIndex) -> ([MercatorPoint; 10], usize) {
+    let mut arr = [MercatorPoint { x: 0.0, y: 0.0 }; 10];
     let mut count = 0;
     for v in cell.boundary().iter() {
-        if count < 8 {
+        if count < 10 {
             arr[count] = MercatorPoint::from_lat_lng(v.lat(), v.lng());
             count += 1;
         }
@@ -174,15 +174,16 @@ pub fn zooms_for_h3_res(res: u8, min_res: u8) -> Vec<u8> {
     }
 }
 
-/// Estimate maximum radius (in WGS84 degrees) of an H3 hexagon at resolution res
+/// Estimate maximum radius (in WGS84 degrees) of an H3 hexagon at resolution res.
+/// Provides >= 8% headroom over empirical max(center_lat - true_south_lat) for h3o.
 pub fn max_hex_radius_deg(res: u8) -> f64 {
     match res {
-        0 => 12.0,
-        1 => 4.5,
-        2 => 1.7,
-        3 => 0.65,
-        4 => 0.25,
-        5 => 0.10,
+        0 => 13.5,
+        1 => 5.2,
+        2 => 1.95,
+        3 => 0.74,
+        4 => 0.28,
+        5 => 0.106,
         6 => 0.04,
         7 => 0.015,
         8 => 0.006,

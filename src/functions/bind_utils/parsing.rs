@@ -100,7 +100,24 @@ mod tests {
         let local = TableFunctionLocalData::default();
         assert_eq!(local.thread_id, 0);
         assert_eq!(local.hex_buf.len(), 16);
-        assert_eq!(local.wkb_buf.len(), 128);
+        assert_eq!(local.wkb_buf.len(), crate::encoding::WKB_BUF_LEN);
+    }
+
+    #[test]
+    fn test_delete_boxed_panicking_drop_containment() {
+        struct PanickingDrop;
+        impl Drop for PanickingDrop {
+            fn drop(&mut self) {
+                panic!("intentional drop panic");
+            }
+        }
+
+        let boxed = Box::new(PanickingDrop);
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe {
+            // Must catch panic and not abort
+            delete_boxed::<PanickingDrop>(raw);
+        }
     }
 
     #[test]

@@ -122,18 +122,14 @@ fn main() {
     let mut center_wgs84 = None;
 
     if let Ok(ref transformer) = transformer_res {
-        let p_tl = transformer.transform_point(tl_x, tl_y);
-        let p_tr = transformer.transform_point(tr_x, tr_y);
-        let p_br = transformer.transform_point(br_x, br_y);
-        let p_bl = transformer.transform_point(bl_x, bl_y);
-        let p_c = transformer.transform_point(c_proj_x, c_proj_y);
-
-        if let (Ok(tl), Ok(tr), Ok(br), Ok(bl), Ok(c)) = (p_tl, p_tr, p_br, p_bl, p_c) {
-            let min_lon = tl.0.min(tr.0).min(br.0).min(bl.0);
-            let max_lon = tl.0.max(tr.0).max(br.0).max(bl.0);
-            let min_lat = tl.1.min(tr.1).min(br.1).min(bl.1);
-            let max_lat = tl.1.max(tr.1).max(br.1).max(bl.1);
-            wgs84_bounds = Some([min_lon, min_lat, max_lon, max_lat]);
+        wgs84_bounds = Some(transformer.transform_rect_bounds(
+            gt,
+            0.0,
+            0.0,
+            meta.width as f64,
+            meta.height as f64,
+        ));
+        if let Ok(c) = transformer.transform_point(c_proj_x, c_proj_y) {
             center_wgs84 = Some((c.1, c.0)); // (lat, lon)
         }
     }

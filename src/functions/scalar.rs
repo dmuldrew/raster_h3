@@ -1,7 +1,9 @@
 use h3o::{CellIndex, LatLng, Resolution};
 use std::ffi::c_char;
 
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64};
+#[cfg(test)]
+use crate::encoding::WKB_BUF_LEN;
+use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf};
 use crate::ffi::*;
 
 // =========================================================================
@@ -14,12 +16,29 @@ unsafe fn unary_scalar_kernel<T: Copy, R: Copy, F: Fn(T) -> R>(
     output: duckdb_vector,
     op: F,
 ) {
+    if input.is_null() || output.is_null() {
+        return;
+    }
     let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
     let v_in = duckdb_data_chunk_get_vector(input, 0);
+    if v_in.is_null() {
+        return;
+    }
     let p_in = duckdb_vector_get_data(v_in) as *const T;
     let p_out = duckdb_vector_get_data(output) as *mut R;
+    if p_in.is_null() || p_out.is_null() {
+        return;
+    }
+    let val_in = duckdb_vector_get_validity(v_in);
 
     for i in 0..count {
+        if !duckdb_validity_is_valid(val_in, i) {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
         let in_val = *p_in.add(i as usize);
         *p_out.add(i as usize) = op(in_val);
     }
@@ -31,12 +50,29 @@ unsafe fn unary_str_to_scalar_kernel<R: Copy, F: Fn(&str) -> R>(
     output: duckdb_vector,
     op: F,
 ) {
+    if input.is_null() || output.is_null() {
+        return;
+    }
     let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
     let v_in = duckdb_data_chunk_get_vector(input, 0);
+    if v_in.is_null() {
+        return;
+    }
     let p_out = duckdb_vector_get_data(output) as *mut R;
     let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
+    if p_out.is_null() || str_ptr.is_null() {
+        return;
+    }
+    let val_in = duckdb_vector_get_validity(v_in);
 
     for i in 0..count {
+        if !duckdb_validity_is_valid(val_in, i) {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
         let d_str = &*str_ptr.add(i as usize);
         *p_out.add(i as usize) = op(d_str.as_str());
     }
@@ -48,12 +84,29 @@ unsafe fn unary_to_str_kernel<T: Copy, const N: usize, F: Fn(T, &mut [u8; N]) ->
     output: duckdb_vector,
     op: F,
 ) {
+    if input.is_null() || output.is_null() {
+        return;
+    }
     let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
     let v_in = duckdb_data_chunk_get_vector(input, 0);
+    if v_in.is_null() {
+        return;
+    }
     let p_in = duckdb_vector_get_data(v_in) as *const T;
+    if p_in.is_null() {
+        return;
+    }
+    let val_in = duckdb_vector_get_validity(v_in);
     let mut buf = [0u8; N];
 
     for i in 0..count {
+        if !duckdb_validity_is_valid(val_in, i) {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
         let in_val = *p_in.add(i as usize);
         if let Some(bytes) = op(in_val, &mut buf) {
             duckdb_vector_assign_string_element_len(
@@ -63,7 +116,7 @@ unsafe fn unary_to_str_kernel<T: Copy, const N: usize, F: Fn(T, &mut [u8; N]) ->
                 bytes.len() as idx_t,
             );
         } else {
-            duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
+            duckdb_vector_set_row_invalid(output, i);
         }
     }
 }
@@ -76,12 +129,29 @@ unsafe fn unary_str_to_str_kernel<const N: usize, F>(
 ) where
     F: for<'a> Fn(&str, &'a mut [u8; N]) -> Option<&'a [u8]>,
 {
+    if input.is_null() || output.is_null() {
+        return;
+    }
     let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
     let v_in = duckdb_data_chunk_get_vector(input, 0);
+    if v_in.is_null() {
+        return;
+    }
     let str_ptr = duckdb_vector_get_data(v_in) as *const duckdb_string_t;
+    if str_ptr.is_null() {
+        return;
+    }
+    let val_in = duckdb_vector_get_validity(v_in);
     let mut buf = [0u8; N];
 
     for i in 0..count {
+        if !duckdb_validity_is_valid(val_in, i) {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
         let d_str = &*str_ptr.add(i as usize);
         if let Some(bytes) = op(d_str.as_str(), &mut buf) {
             duckdb_vector_assign_string_element_len(
@@ -91,7 +161,7 @@ unsafe fn unary_str_to_str_kernel<const N: usize, F>(
                 bytes.len() as idx_t,
             );
         } else {
-            duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
+            duckdb_vector_set_row_invalid(output, i);
         }
     }
 }
@@ -102,14 +172,32 @@ unsafe fn binary_scalar_kernel<T1: Copy, T2: Copy, R: Copy, F: Fn(T1, T2) -> R>(
     output: duckdb_vector,
     op: F,
 ) {
+    if input.is_null() || output.is_null() {
+        return;
+    }
     let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
     let v1 = duckdb_data_chunk_get_vector(input, 0);
     let v2 = duckdb_data_chunk_get_vector(input, 1);
+    if v1.is_null() || v2.is_null() {
+        return;
+    }
     let p1 = duckdb_vector_get_data(v1) as *const T1;
     let p2 = duckdb_vector_get_data(v2) as *const T2;
     let p_out = duckdb_vector_get_data(output) as *mut R;
+    if p1.is_null() || p2.is_null() || p_out.is_null() {
+        return;
+    }
+    let val1 = duckdb_vector_get_validity(v1);
+    let val2 = duckdb_vector_get_validity(v2);
 
     for i in 0..count {
+        if !duckdb_validity_is_valid(val1, i) || !duckdb_validity_is_valid(val2, i) {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
         let v1_val = *p1.add(i as usize);
         let v2_val = *p2.add(i as usize);
         *p_out.add(i as usize) = op(v1_val, v2_val);
@@ -124,14 +212,32 @@ unsafe fn binary_str_scalar_to_str_kernel<T2: Copy, const N: usize, F>(
 ) where
     F: for<'a> Fn(&str, T2, &'a mut [u8; N]) -> Option<&'a [u8]>,
 {
+    if input.is_null() || output.is_null() {
+        return;
+    }
     let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
     let v1 = duckdb_data_chunk_get_vector(input, 0);
     let v2 = duckdb_data_chunk_get_vector(input, 1);
+    if v1.is_null() || v2.is_null() {
+        return;
+    }
     let str_ptr = duckdb_vector_get_data(v1) as *const duckdb_string_t;
     let p2 = duckdb_vector_get_data(v2) as *const T2;
+    if str_ptr.is_null() || p2.is_null() {
+        return;
+    }
+    let val1 = duckdb_vector_get_validity(v1);
+    let val2 = duckdb_vector_get_validity(v2);
     let mut buf = [0u8; N];
 
     for i in 0..count {
+        if !duckdb_validity_is_valid(val1, i) || !duckdb_validity_is_valid(val2, i) {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
         let d_str = &*str_ptr.add(i as usize);
         let v2_val = *p2.add(i as usize);
         if let Some(bytes) = op(d_str.as_str(), v2_val, &mut buf) {
@@ -142,7 +248,7 @@ unsafe fn binary_str_scalar_to_str_kernel<T2: Copy, const N: usize, F>(
                 bytes.len() as idx_t,
             );
         } else {
-            duckdb_vector_assign_string_element_len(output, i, std::ptr::null(), 0);
+            duckdb_vector_set_row_invalid(output, i);
         }
     }
 }
@@ -153,111 +259,129 @@ unsafe fn binary_str_scalar_to_str_kernel<T2: Copy, const N: usize, F>(
 
 /// Scalar function: h3_to_string(UBIGINT) -> VARCHAR (Zero-allocation)
 pub unsafe extern "C" fn scalar_h3_to_string(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_to_str_kernel(input, output, |cell_u64, buf: &mut [u8; 16]| {
-        Some(fast_hex_u64(cell_u64, buf))
+    ffi_scalar_guard(info, || {
+        unary_to_str_kernel(input, output, |cell_u64, buf: &mut [u8; 16]| {
+            Some(fast_hex_u64(cell_u64, buf))
+        });
     });
 }
 
 /// Scalar function: string_to_h3(VARCHAR) -> UBIGINT (Zero-allocation hex parsing)
 pub unsafe extern "C" fn scalar_string_to_h3(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_str_to_scalar_kernel(input, output, |s| parse_hex_u64(s).unwrap_or(0));
+    ffi_scalar_guard(info, || {
+        unary_str_to_scalar_kernel(input, output, |s| parse_hex_u64(s).unwrap_or(0));
+    });
 }
 
 /// Scalar function: h3_to_lat(UBIGINT) -> DOUBLE
 pub unsafe extern "C" fn scalar_h3_to_lat(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_scalar_kernel(input, output, |cell_u64: u64| {
-        CellIndex::try_from(cell_u64)
-            .map(|c| LatLng::from(c).lat())
-            .unwrap_or(f64::NAN)
+    ffi_scalar_guard(info, || {
+        unary_scalar_kernel(input, output, |cell_u64: u64| {
+            CellIndex::try_from(cell_u64)
+                .map(|c| LatLng::from(c).lat())
+                .unwrap_or(f64::NAN)
+        });
     });
 }
 
 /// Scalar function: h3_to_lng(UBIGINT) -> DOUBLE
 pub unsafe extern "C" fn scalar_h3_to_lng(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_scalar_kernel(input, output, |cell_u64: u64| {
-        CellIndex::try_from(cell_u64)
-            .map(|c| LatLng::from(c).lng())
-            .unwrap_or(f64::NAN)
+    ffi_scalar_guard(info, || {
+        unary_scalar_kernel(input, output, |cell_u64: u64| {
+            CellIndex::try_from(cell_u64)
+                .map(|c| LatLng::from(c).lng())
+                .unwrap_or(f64::NAN)
+        });
     });
 }
 
 /// Scalar function: h3_get_resolution(UBIGINT) -> BIGINT (1-cycle bitshift)
 pub unsafe extern "C" fn scalar_h3_get_resolution(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_scalar_kernel(input, output, |cell_u64: u64| {
-        let res = (cell_u64 >> 52) & 0x0F;
-        if res <= 15 && cell_u64 != 0 {
-            res as i64
-        } else {
-            -1
-        }
+    ffi_scalar_guard(info, || {
+        unary_scalar_kernel(input, output, |cell_u64: u64| {
+            let res = (cell_u64 >> 52) & 0x0F;
+            if res <= 15 && cell_u64 != 0 {
+                res as i64
+            } else {
+                -1
+            }
+        });
     });
 }
 
 /// Scalar function: h3_is_valid(UBIGINT) -> BOOLEAN
 pub unsafe extern "C" fn scalar_h3_is_valid_u64(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_scalar_kernel(input, output, |cell_u64: u64| {
-        CellIndex::try_from(cell_u64).is_ok()
+    ffi_scalar_guard(info, || {
+        unary_scalar_kernel(input, output, |cell_u64: u64| {
+            CellIndex::try_from(cell_u64).is_ok()
+        });
     });
 }
 
 /// Scalar function: h3_is_valid(VARCHAR) -> BOOLEAN
 pub unsafe extern "C" fn scalar_h3_is_valid_str(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_str_to_scalar_kernel(input, output, |s| {
-        parse_hex_u64(s)
-            .map(|u| CellIndex::try_from(u).is_ok())
-            .unwrap_or(false)
+    ffi_scalar_guard(info, || {
+        unary_str_to_scalar_kernel(input, output, |s| {
+            parse_hex_u64(s)
+                .map(|u| CellIndex::try_from(u).is_ok())
+                .unwrap_or(false)
+        });
     });
 }
 
 /// Scalar function: h3_to_wkb(UBIGINT) -> BLOB (Zero-allocation WKB polygon encoder)
 pub unsafe extern "C" fn scalar_h3_to_wkb_u64(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_to_str_kernel(input, output, |cell_u64: u64, buf: &mut [u8; 128]| {
-        h3_index_to_wkb(cell_u64, buf).map(|len| &buf[..len])
+    ffi_scalar_guard(info, || {
+        unary_to_str_kernel(input, output, |cell_u64: u64, buf: &mut WkbBuf| {
+            h3_index_to_wkb(cell_u64, buf).map(|len| &buf[..len])
+        });
     });
 }
 
 /// Scalar function: h3_to_wkb(VARCHAR) -> BLOB (Zero-allocation WKB polygon encoder)
 pub unsafe extern "C" fn scalar_h3_to_wkb_str(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    unary_str_to_str_kernel(input, output, |s, buf: &mut [u8; 128]| {
-        parse_hex_u64(s)
-            .and_then(|u| h3_index_to_wkb(u, buf))
-            .map(|len| &buf[..len])
+    ffi_scalar_guard(info, || {
+        unary_str_to_str_kernel(input, output, |s, buf: &mut WkbBuf| {
+            parse_hex_u64(s)
+                .and_then(|u| h3_index_to_wkb(u, buf))
+                .map(|len| &buf[..len])
+        });
     });
 }
 
@@ -267,7 +391,9 @@ pub unsafe extern "C" fn scalar_h3_to_geometry_u64(
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    scalar_h3_to_wkb_u64(info, input, output);
+    ffi_scalar_guard(info, || {
+        scalar_h3_to_wkb_u64(info, input, output);
+    });
 }
 
 /// Scalar function: h3_to_geometry(VARCHAR) -> GEOMETRY (Zero-allocation WKB polygon encoder)
@@ -276,53 +402,59 @@ pub unsafe extern "C" fn scalar_h3_to_geometry_str(
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    scalar_h3_to_wkb_str(info, input, output);
+    ffi_scalar_guard(info, || {
+        scalar_h3_to_wkb_str(info, input, output);
+    });
 }
 
 /// Scalar function: h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
 pub unsafe extern "C" fn scalar_h3_cell_to_parent_u64(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    binary_scalar_kernel(input, output, |cell_u64: u64, parent_res_i64: i64| {
-        if let Ok(cell) = CellIndex::try_from(cell_u64) {
-            if (0..=15).contains(&parent_res_i64) {
-                if let Ok(target_res) = Resolution::try_from(parent_res_i64 as u8) {
-                    if let Some(parent) = cell.parent(target_res) {
-                        return parent.into();
+    ffi_scalar_guard(info, || {
+        binary_scalar_kernel(input, output, |cell_u64: u64, parent_res_i64: i64| {
+            if let Ok(cell) = CellIndex::try_from(cell_u64) {
+                if (0..=15).contains(&parent_res_i64) {
+                    if let Ok(target_res) = Resolution::try_from(parent_res_i64 as u8) {
+                        if let Some(parent) = cell.parent(target_res) {
+                            return parent.into();
+                        }
                     }
                 }
             }
-        }
-        0
+            0
+        });
     });
 }
 
 /// Scalar function: h3_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR
 pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    binary_str_scalar_to_str_kernel(
-        input,
-        output,
-        |s, parent_res_i64: i64, buf: &mut [u8; 16]| {
-            let cell_opt = parse_hex_u64(s).and_then(|u| CellIndex::try_from(u).ok());
-            let res_opt = if (0..=15).contains(&parent_res_i64) {
-                Resolution::try_from(parent_res_i64 as u8).ok()
-            } else {
-                None
-            };
-            if let (Some(cell), Some(target_res)) = (cell_opt, res_opt) {
-                if let Some(parent) = cell.parent(target_res) {
-                    return Some(fast_hex_u64(parent.into(), buf));
+    ffi_scalar_guard(info, || {
+        binary_str_scalar_to_str_kernel(
+            input,
+            output,
+            |s, parent_res_i64: i64, buf: &mut [u8; 16]| {
+                let cell_opt = parse_hex_u64(s).and_then(|u| CellIndex::try_from(u).ok());
+                let res_opt = if (0..=15).contains(&parent_res_i64) {
+                    Resolution::try_from(parent_res_i64 as u8).ok()
+                } else {
+                    None
+                };
+                if let (Some(cell), Some(target_res)) = (cell_opt, res_opt) {
+                    if let Some(parent) = cell.parent(target_res) {
+                        return Some(fast_hex_u64(parent.into(), buf));
+                    }
                 }
-            }
-            None
-        },
-    );
+                None
+            },
+        );
+    });
 }
 
 #[inline]
@@ -563,7 +695,7 @@ mod tests {
     #[test]
     fn test_h3_to_wkb_logic() {
         let valid_u64 = 0x8828308281fffffu64;
-        let mut buf = [0u8; 128];
+        let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
         let len = h3_index_to_wkb(valid_u64, &mut buf).expect("valid wkb");
         assert_eq!(len, 125);
         assert_eq!(buf[0], 1); // little endian

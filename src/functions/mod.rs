@@ -39,7 +39,7 @@ pub mod table_function;
 pub use crate::encoding::wkb;
 
 /// Well-Known Binary (WKB) geometry encoding utilities for H3 cells.
-pub use crate::encoding::{cell_to_wkb, h3_index_to_wkb};
+pub use crate::encoding::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 /// Fast hexadecimal encoding and decoding utilities for H3 cell index `u64` values.
 pub use crate::encoding::{fast_hex_u64, parse_hex_u64};
 /// Shared parameter parsing, bind state, chunk writing, and lifecycle utilities.

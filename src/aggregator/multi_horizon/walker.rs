@@ -838,6 +838,18 @@ mod tests {
         assert!(!is_point_in_bbox(-122.6, 37.75, bbox));
         assert!(!is_point_in_bbox(-122.25, 38.1, bbox));
         assert!(is_point_in_bbox(0.0, 0.0, None));
+
+        // Antimeridian-crossing bbox (e.g. Fiji [178.0, -20.0, -178.0, -15.0])
+        let fiji_bbox = Some([178.0, -20.0, -178.0, -15.0]);
+        assert!(is_point_in_bbox(179.0, -18.0, fiji_bbox));
+        assert!(is_point_in_bbox(-179.0, -18.0, fiji_bbox));
+        // Unnormalized longitude wrapping (181.0 -> -179.0)
+        assert!(is_point_in_bbox(181.0, -18.0, fiji_bbox));
+        // Outside longitude
+        assert!(!is_point_in_bbox(175.0, -18.0, fiji_bbox));
+        assert!(!is_point_in_bbox(-175.0, -18.0, fiji_bbox));
+        // Outside latitude
+        assert!(!is_point_in_bbox(179.0, -21.0, fiji_bbox));
     }
 
     #[test]
@@ -846,6 +858,10 @@ mod tests {
         let res = Resolution::try_from(8).unwrap();
         let cell = resolve_subpixel_cell(run_cell, 37.75, -122.25, 0.0, 0.0, res);
         assert_eq!(cell, Some(run_cell));
+
+        // Out-of-range latitude must return None rather than wrapping across pole
+        let cell_out_of_bounds = resolve_subpixel_cell(run_cell, 95.0, 0.0, 0.1, 0.1, res);
+        assert_eq!(cell_out_of_bounds, None);
     }
 
     #[test]

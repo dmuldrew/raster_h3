@@ -21,10 +21,10 @@ This document details the core engineering innovations and architectural princip
 | 8 | **Zero-Allocation Fast Hex Formatting** | Formats 64-bit integer H3 indices into lowercase hexadecimal ASCII bytes using a 16-byte stack LUT. |
 | 9 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data from disk. |
 | 10 | **Native DuckDB Parallelism (`init_local`)** | Dynamically distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
-| 11 | **Lock-Free Work-Stealing Buffer Pool** | Work-stealing buffer injector (`crossbeam_deque::Injector`) eliminates buffer allocation churn across 15,840+ chunks. |
-| 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate OS thread context switches with zero-allocation batch drains. |
+| 11 | **Bounded Lock-Free Buffer Pool** | Bounded buffer pool with retry-on-contention stealing minimizes buffer allocation churn and strictly caps the number of idle buffers. |
+| 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate collector threads with batch draining and backpressure. |
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Asynchronous HTTP/S3 range prefetching and multi-file Voronoi cutline mosaic blending with zero double-counting. |
-| 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of 125-byte WKB polygon geometries with embedded PROJJSON `OGC:CRS84` metadata. |
+| 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of stack-allocated WKB polygon geometries (109–189 bytes) with embedded PROJJSON `OGC:CRS84` metadata. |
 
 ## 1. Southernmost Scan-Line Horizon Eviction
 Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
@@ -63,17 +63,28 @@ DuckDB's vectorized execution engine parallelizes custom table functions across 
 - **Work-Stealing Chunk Distribution**: Input GeoTIFF strips or COG tiles are managed as a shared, lock-free task queue. Fast threads that finish their assigned chunks immediately steal remaining chunks from the pool, preventing worker stragglers caused by uneven spatial density or ocean tiles.
 - **Accurate Cardinality Estimation**: `estimate_raster_cardinality()` provides DuckDB's cost-based query optimizer with exact row count bounds based on raster bounding boxes and H3 resolution area formulas, enabling optimal hash join planning and vector pipeline scheduling.
 
-## 7. Lock-Free Work-Stealing Buffer Pool (crossbeam_deque::Injector)
+## 7. Bounded Lock-Free Buffer Recycling Pool (DecodingBufferPool)
 High-resolution continental datasets (such as CONUS 30m) require decompressing tens of thousands of tiles (e.g. 15,840+ chunks). Continuously allocating, reallocating, and freeing multi-megabyte decompression buffers causes heavy memory fragmentation, allocator lock contention, and kernel `brk`/`mmap` syscall overhead:
-- **Global Work-Stealing Injector**: `PrefetchedChunkReader` uses `crossbeam_deque::Injector<DecodingResult>` as a concurrent, lock-free buffer recycling pool.
-- **Zero-Allocation Reuse**: When a background decompression thread prepares to decode a chunk, it attempts to steal an existing buffer from the pool (`buffer_pool.steal()`). Only if the pool is empty does it allocate fresh memory.
-- **Recycle on Eviction**: Once the downstream consumer finishes processing a chunk's pixels and advances past the scanline horizon, the allocated buffer is sanitized and recycled back into the injector via `recycle_buffer()`, delivering sustained hardware-saturating throughput with zero heap allocation churn.
+- **Bounded Lock-Free Recycling**: `PrefetchedChunkReader` and `PrefetchedMosaicReader` use `DecodingBufferPool` (wrapping `crossbeam_deque::Injector<DecodingResult>` with an atomic retention counter) as a concurrent, lock-free buffer recycling pool.
+- **Contention-Resilient Acquisition**: When a background decompression thread prepares to decode a chunk, it attempts to acquire an existing buffer from the pool (`buffer_pool.pop()`). If concurrent steals collide (`crossbeam_deque::Steal::Retry`), the worker spins briefly rather than falsely falling back to fresh memory allocation. Only if the pool is genuinely empty (`Steal::Empty`) does it allocate fresh storage.
+- **Strict Retention Bound & Minimized Allocation Churn**: Once the downstream consumer finishes processing a chunk batch, allocated buffers are returned to the pool via `recycle_batch()`. If the pool has reached its configured capacity, excess buffers are immediately dropped. The limit counts buffers, not bytes: differently sized chunks can retain different amounts of storage. Reuse minimizes allocation churn but does not guarantee zero allocations.
 
 ## 8. Single-Hop Bounded In-Order Prefetcher (OrderedPrefetchQueue<T>)
 Traditional background prefetchers often suffer from thread thrashing: either unbounded queues that risk out-of-memory (OOM) bloat, or intermediate "collector" threads that copy data through multiple OS synchronization channels:
 - **Direct Worker-to-Consumer Deposit**: `OrderedPrefetchQueue<T>` connects decompression workers directly to the aggregator through a fixed-capacity ring buffer indexed by `job_id % capacity`.
-- **Single-Hop Zero Context Switches**: Workers calculate and decompress chunks concurrently, depositing their result directly into their assigned ring buffer slot. The aggregator drains contiguous, sequence-ordered chunks in bulk using `drain_into()`, acquiring the queue lock only once per batch.
-- **Strict Backpressure**: If background workers outpace the aggregator by more than `capacity` chunks, they block on a condition variable until the consumer drains slots, ensuring that memory usage remains strictly bounded regardless of file size.
+- **Single-Hop Thread Architecture**: Workers calculate and decompress chunks concurrently, depositing their result directly into their assigned ring buffer slot without intermediate collector threads. The aggregator drains contiguous, sequence-ordered chunks in bulk using `drain_into()`, using one queue guard per batch; condition-variable waits release and reacquire the mutex.
+- **Strict Backpressure & Deadlock-Free Draining**: If background workers outpace the aggregator by more than `capacity` chunks, they block on a condition variable (`not_full`) until the consumer drains slots. When draining batches that exceed ring capacity, `drain_into()` publishes freed slots before sleeping on incomplete batches, avoiding a circular wait between producers and the consumer. Consumers pull ready chunks via `next_chunk_batch(max_batch)` or bulk batch drains.
+
+
+### Downstream backpressure and memory limits
+
+`ChunkWriter` bounds writes to DuckDB's output vectors; it does not throttle or schedule decompression. Continuous and wide categorical scan callbacks pull from `ConcurrentRecordQueue::pop_or_refill()` before writing. A refill requests at most four vector-sized batches from the streamer, returns one, and retains at most three. With no further scan calls, no further refills occur. The prefetch ring then fills and each decompression worker eventually blocks in `push()`, after finishing its current decode. An already-running scan may finish its current refill before stalling.
+
+For a single prefetcher, let **C** be ring capacity, **W** decoder workers, **B** the consumer's chunk batch size, and **P** idle-pool capacity. Decoded buffer ownership is bounded by **C + W + B + P** buffers along this path (including a worker's completed buffer waiting to be deposited). This is a count bound, not a fixed byte budget. If each buffer's allocated capacity is at most **S** bytes, those buffers occupy at most **(C + W + B + P) × S** bytes, excluding allocator overhead and decoder scratch storage.
+
+Whole-query memory also includes raster metadata and job lists, compressed remote payloads, decoder scratch buffers, aggregation maps, compaction state, output records, and DuckDB execution state. `OutputBuffer::with_capacity(2048)` reserves initial space; it is not a hard limit. Horizon eviction and EOF flushing can emit more records than the requested row count. Long categorical output additionally expands each cell into one row per category and can overshoot its refill threshold. Therefore these queue bounds do **not** establish a fixed whole-query RAM limit or a universal zero-churn guarantee.
+
+Regression coverage includes an explicit producer-wait handshake for oversized batch drains and a 15,840-item test connecting the real record and prefetch queues. The latter pauses record consumption, observes the producer blocked at the expected capacity boundary, and checks ordered completion after resuming. It uses one synthetic record per chunk; it is not a live DuckDB/TIFF memory benchmark.
 
 ## 9. Cloud-Native Remote COG & S3 Streaming (Range Coalescing)
 `raster_h3` streams Cloud-Optimized GeoTIFFs (COGs) directly from HTTP/HTTPS endpoints or AWS S3 buckets without copying the entire multi-gigabyte file to local disk:
@@ -90,10 +101,10 @@ Large geospatial datasets are frequently distributed across tiled collections of
   - `'first'`: Applies the Painter's Algorithm, giving strict precedence to earlier tiles in the file list.
   - `'average'`: Computes multi-observation running averages across overlapping pixels.
 
-## 11. Native OGC GeoParquet 1.1 Exporter (125-Byte WKB Hexagons & PROJJSON)
+## 11. Native OGC GeoParquet 1.1 Exporter (Stack-Allocated WKB Hexagons & PROJJSON)
 Exporting aggregated hexagonal grids to standard GIS formats traditionally required multi-step ETL pipelines involving intermediate shapefiles, GeoJSON scratch disks, and GDAL conversions:
 - **Direct SQL Parquet Export**: `h3_raster_to_parquet` streams aggregated hexagons directly into highly compressed Apache Parquet files with zero intermediate files.
-- **125-Byte Stack WKB Polygon Serialization**: Converts 64-bit integer H3 cell indices directly into standard OGC 2D Polygon Well-Known Binary (WKB) bytes on the stack in ~10–15 nanoseconds *(measured on Apple M-series workstation)* (1 byte endianness + 4 bytes geometry type + 4 bytes ring count + 4 bytes point count + 7 vertices $\times$ 16 bytes = 125 bytes; 109 bytes for pentagons).
+- **Stack WKB Polygon Serialization**: Converts 64-bit integer H3 cell indices directly into standard OGC 2D Polygon Well-Known Binary (WKB) bytes in a 192-byte stack buffer in ~10–15 nanoseconds *(measured on Apple M-series workstation)*. Layout: 1 byte endianness + 4 bytes geometry type + 4 bytes ring count + 4 bytes point count + (n+1) closed-ring vertices $\times$ 16 bytes. Class II (even) resolutions yield 125 bytes (hexagon) / 109 bytes (pentagon); Class III (odd) resolutions add icosahedron-edge crossing vertices, giving 141–157 bytes for edge-straddling hexagons and 189 bytes for 10-vertex pentagons.
 - **Official GeoParquet 1.1 Compliance**: Emits compliant OGC GeoParquet 1.1 JSON metadata in the Parquet `FileMetaData`, including official PROJJSON `OGC:CRS84` datum ensemble specifications, planar edge definitions, and per-column bounding boxes. Compatible out-of-the-box with DuckDB Spatial (`ST_Read`), Apache Sedona, GeoPandas, GDAL, QGIS, and BigQuery.
 
 ## 12. Source Module Architecture & File Responsibilities
@@ -127,7 +138,7 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | :--- | :--- |
 | `mod.rs` | Module declarations and public re-exports (`fast_hex_u64`, `parse_hex_u64`, `cell_to_wkb`, `h3_index_to_wkb`). |
 | `fast_hex.rs` | Zero-allocation hexadecimal formatting (`fast_hex_u64`) and parsing (`parse_hex_u64`) between 64-bit integer H3 cell IDs and lowercase hexadecimal ASCII strings using a 16-byte stack lookup table. |
-| `wkb.rs` | Stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`). Converts H3 cell boundaries directly into 125-byte (hexagon) or 109-byte (pentagon) WKB buffers in ~10–15 ns with zero heap allocations. |
+| `wkb.rs` | Stack-allocated OGC 2D Polygon WKB serialization (`cell_to_wkb`, `h3_index_to_wkb`). Converts H3 cell boundaries directly into a 192-byte stack buffer (`WkbBuf`) in ~10–15 ns with zero heap allocations, accommodating 5-to-6 vertex Class II cells as well as Class III (odd) resolutions with up to 10 boundary vertices (189 bytes) and icosahedron-edge crossings (141–157 bytes). |
 
 ---
 
@@ -237,12 +248,20 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 
 | File | Responsibility |
 | :--- | :--- |
-| `bind_helper.rs` | Safe, ergonomic wrapper (`BindHelper`) around DuckDB's `duckdb_bind_info` C structure for extracting positional/named arguments and defining returned column types. |
-| `chunk_writer.rs` | Safe wrapper (`ChunkWriter`) around DuckDB's `duckdb_data_chunk` for direct, bounds-checked, auto-vectorized writing into output columnar vectors. |
-| `lifecycle.rs` | Table function initialization lifecycle helpers. Provides cardinality estimation (`estimate_raster_cardinality`) based on raster bounds and H3 cell areas, column projection detection, thread-local scratch buffer allocation, and memory cleanup. |
+| `bind_helper.rs` | Safe, ergonomic wrapper (`BindHelper`) around DuckDB's `duckdb_bind_info` C structure for extracting positional/named arguments with RAII parameter value lifecycle management (`OwnedValue`) and defining returned column types. |
+| `chunk_writer.rs` | Column- and row-bounds-checked wrapper (`ChunkWriter`) around DuckDB's `duckdb_data_chunk` for auto-vectorized writing into output columnar vectors. Validates row indices against vector capacity and column indices against chunk column count; callers uphold physical vector type invariants. |
+| `lifecycle.rs` | Table function initialization lifecycle helpers. Provides cardinality estimation (`estimate_raster_cardinality`) based on raster bounds and H3 cell areas, column projection detection, thread-local scratch buffer allocation, and double-panic-contained memory deallocation (`delete_boxed`). |
 | `parsing.rs` | Parses user-supplied SQL parameters — H3 resolution lists (comma/whitespace separated, sorted, deduplicated, ≤ 15) and bounding box coordinate strings `[min_lon, min_lat, max_lon, max_lat]`. |
 | `record_queue.rs` | Multi-threaded concurrent batch queue (`ConcurrentRecordQueue`) bridging the background multi-resolution horizon aggregator to DuckDB execution threads via `pop_or_refill`. |
 | `registration.rs` | Parameter registration helpers (`add_positional_parameter`, `add_named_parameter`, `register_common_raster_named_parameters`) with automated DuckDB logical type lifecycle management. |
+
+#### FFI Safety, Panic Containment & Leak-Free Cancellation
+
+- **Complete FFI Panic Containment**: All C-ABI callbacks (`raster_h3_init`, `raster_h3_init_c_api`, bind, init, scan, scalar, and `delete_boxed`) are enclosed in `catch_unwind` guards. Escaping panics across `extern "C"` boundaries are strictly forbidden.
+- **Secondary Panic Containment**: Any secondary panic that arises during error reporting, payload string formatting, or payload destructor disposal is caught within nested panic guards. Secondary panic payloads are forgotten via `std::mem::forget(secondary)` to avoid triggering an immediate process abort, falling back to static C string error indicators.
+- **Scalar Error Setter ABI Compliance**: Scalar functions invoke `duckdb_scalar_function_set_error` rather than table function error setters, maintaining strict C ABI compatibility with DuckDB's internal `ScalarFunctionData` structures.
+- **Leak-Free Cancellation & Synchronous Worker Reaping**: When queries terminate early (e.g. `LIMIT` reached or client-side cancellation), DuckDB invokes registered state destructors. Dropping `PrefetchedMosaicReader` / `PrefetchedChunkReader` immediately closes prefetch queues, signals remote prefetch cancellation, and synchronously joins all background decode and HTTP worker threads before releasing mosaic buffers and memory.
+- **Parameter Value Ownership**: All `duckdb_value` allocations returned by DuckDB parameter inspection APIs are managed by the `OwnedValue` RAII guard, ensuring immediate release via `duckdb_destroy_value`.
 
 ---
 
@@ -280,5 +299,38 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | :--- | :--- |
 | `mod.rs` | Module declarations and public re-exports (`process_parquet_to_pmtiles`, `RowGroupExtent`, `scan_row_group_h3_extent`). |
 | `parquet_tiler.rs` | Parquet-to-PMTiles v3 transcoding engine (`process_parquet_to_pmtiles`). Reads pre-aggregated H3 records from Parquet files, pre-scans row group extents, and transcodes them into multi-zoom PMTiles archives using streaming latitude eviction to bound memory. |
+
+---
+
+## 13. Geodetic Tolerances and Semantics
+
+This section outlines fundamental geodetic assumptions, error budgets, and numerical precision considerations across the `raster_h3` processing pipeline.
+
+### Pixel Counts vs. Physical Ground Area
+The `count` and `sum` statistics emitted by all aggregators represent discrete counts of sampled raster pixels (or fractional sample weights when supersampling is enabled), **not physical surface areas** in square meters:
+- **EPSG:4326 (Plate Carrée / WGS84)**: Rasters with constant degree cell spacing exhibit a $\cos \phi$ ground area distortion (where $\phi$ is latitude). A $0.01^\circ \times 0.01^\circ$ pixel covers $\approx 1.23\text{ km}^2$ at the equator but only $\approx 0.61\text{ km}^2$ at $60^\circ\text{ N}$. Aggregated `sum` values on EPSG:4326 inputs reflect pixel sums rather than true surface integrals.
+- **EPSG:3857 (Web Mercator)**: Conformal planar grid cells expand by $1 / \cos \phi$ in linear dimensions, causing pixel ground area to scale as $\cos^2 \phi$ relative to projected planar area.
+- *Recommendation*: Workflows requiring rigorous surface flux integration (e.g. biomass totals, volumetric rainfall, solar irradiance) must either apply ellipsoidal area scaling factors ($A \approx R^2 \cos \phi \, \Delta\lambda \, \Delta\phi$) or supply inputs in an equal-area projection such as EPSG:5070 (CONUS Albers Equal Area Conic) or EPSG:6933 (EASE-Grid 2.0).
+
+### NoData at Cell Boundaries Under Supersampling
+When sub-pixel supersampling patterns (such as RGSS 4-point or 16-point grid) are enabled, each sub-sample point evaluates whether the underlying pixel value is valid or NoData:
+- If a pixel intersecting an H3 hexagon boundary contains NoData, all sub-samples originating from that pixel are discarded.
+- Because validity is evaluated at pixel level rather than through exact polygon-clipping intersection between the hexagonal boundary and valid data masks, the effective sample weights near NoData boundaries are not area-consistent across partially masked border pixels. Cells touching masked borders will reflect sample weights proportional to valid pixel encounters rather than true geometric intersection area.
+
+### Floating-Point Associativity and Parallel Merge Order
+Aggregators utilize multi-core chunk parallelism (`init_local`) where independent worker threads accumulate local statistics using Welford's online algorithm and merge them into the global scanline horizon:
+- Floating-point addition is non-associative in IEEE-754 arithmetic ($(a + b) + c \ne a + (b + c)$).
+- Because chunks complete in non-deterministic order depending on operating system thread scheduling and I/O latency, minor least-significant-bit (ULP) differences can arise in cumulative statistics (`mean`, `variance` / $M_2$, and `sum`) across repeated runs on the same input dataset.
+
+### Accepted Geodetic Tolerances and Datum Policy
+- **NAD83 vs. WGS84 Continental Offset**: `EPSG:4269` (NAD83) and `EPSG:5070` (CONUS Albers, which uses the GRS80 ellipsoid with NAD83) are processed via fast analytical paths that treat coordinates as equivalent to WGS84 without applying datum shift grids. This accepts the continental plate difference between NAD83 and WGS84 (approximately ~1–2 meters across North America), reflecting the fact that pure-Rust `proj4rs` does not embed high-resolution national datum shift grids (NADCON5 / HARN).
+- **PROJ Tooling Parity**: Analytical fast paths (`WebMercatorFast`, `AlbersConicFast`) match reference PROJ (`cs2cs` 9.8.1) coordinate inversions to within $\le 0.01\text{ m}$. Arbitrary projections delegated to pure-Rust `proj4rs` match PROJ within millimeter-to-centimeter precision on identical ellipsoids.
+- **Strict Rejection of Non-Zero Datum Shifts**: PROJ definition strings containing non-zero Helmert datum shift parameters (`+towgs84` with non-zero parameters) or mandatory non-null datum grids (`+nadgrids` other than `@null`) are rejected with an explicit `RasterH3Error::CrsError` to prevent silent geodetic inaccuracies.
+
+### Recommendation on High Resolutions (Resolution ≥ 14) for Non-WGS84 Inputs
+- H3 Resolution 14 has an average hexagon edge length of $\approx 1.34\text{ m}$ (area $\approx 6.3\text{ m}^2$), and Resolution 15 has an edge length of $\approx 0.51\text{ m}$ (area $\approx 0.9\text{ m}^2$).
+- Because the geodetic frame uncertainty between NAD83 and WGS84 (~1–2 m) and projection interpolation approximations equal or exceed the entire physical diameter of Resolution 14 and 15 cells, performing raster hexification at `res >= 14` on non-WGS84 inputs is geodetically unsound without sub-meter surveyed datum controls. Users are strongly recommended to limit non-WGS84 ingestion to `res <= 13`, or reproject source rasters to native WGS84 using high-precision geodetic tools (e.g. `gdalwarp` with NADCON5 grids) before ingestion.
+
+---
 
 See [Rust API migration](refactor-migration.md) for configuration defaults, compatibility adapters, and updated safety contracts.

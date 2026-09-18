@@ -7,4 +7,4 @@ pub mod fast_hex;
 pub mod wkb;
 
 pub use fast_hex::{fast_hex_u64, parse_hex_u64};
-pub use wkb::{cell_to_wkb, h3_index_to_wkb};
+pub use wkb::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};

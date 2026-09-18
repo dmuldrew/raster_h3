@@ -11,7 +11,8 @@ use std::time::Instant;
 use crate::aggregator::multi_horizon::MultiResolutionConfig;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::ffi::duckdb_c::*;
-use crate::ffi::to_c_string;
+use crate::ffi::{ffi_bind_guard, ffi_init_guard, ffi_scan_guard, to_c_string};
+use crate::functions::bind_utils::lifecycle::set_table_function_init_data;
 use crate::functions::bind_utils::{
     add_named_parameter, add_positional_parameter, delete_boxed, BindHelper, ChunkWriter,
 };
@@ -48,136 +49,140 @@ unsafe fn add_pmtiles_summary_columns(bind: &BindHelper) {
 
 /// Bind callback: parses input arguments and defines output table schema
 pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
-    let bind = BindHelper::new(info);
+    ffi_bind_guard(info, || {
+        let bind = BindHelper::new(info);
 
-    if bind.parameter_count() < 2 {
-        bind.set_error(
-            "h3_raster_to_pmtiles requires at least 2 arguments: file_path and output_pmtiles",
+        if bind.parameter_count() < 2 {
+            bind.set_error(
+                "h3_raster_to_pmtiles requires at least 2 arguments: file_path and output_pmtiles",
+            );
+            return;
+        }
+
+        // 0: file_path (VARCHAR)
+        let file_path = match bind.get_string_param(0) {
+            Some(s) => s,
+            None => {
+                bind.set_error("Invalid file_path parameter");
+                return;
+            }
+        };
+
+        // 1: output_pmtiles (VARCHAR)
+        let output_pmtiles = match bind.get_string_param(1) {
+            Some(s) => s,
+            None => {
+                bind.set_error("Invalid output_pmtiles parameter");
+                return;
+            }
+        };
+
+        let resolutions = bind.parse_resolutions(8, None);
+        let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
+        let custom_nodata = bind.get_named_double("nodata");
+        let sampling = bind.parse_sampling();
+        let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
+        let properties = bind.get_named_string("properties");
+
+        add_pmtiles_summary_columns(&bind);
+
+        let bind_data = Box::new(PmtilesBindData {
+            file_path,
+            output_pmtiles,
+            resolutions,
+            band,
+            custom_nodata,
+            sampling,
+            is_categorical,
+            properties,
+        });
+        duckdb_bind_set_bind_data(
+            info,
+            Box::into_raw(bind_data) as *mut c_void,
+            Some(delete_boxed::<PmtilesBindData>),
         );
-        return;
-    }
-
-    // 0: file_path (VARCHAR)
-    let file_path = match bind.get_string_param(0) {
-        Some(s) => s,
-        None => {
-            bind.set_error("Invalid file_path parameter");
-            return;
-        }
-    };
-
-    // 1: output_pmtiles (VARCHAR)
-    let output_pmtiles = match bind.get_string_param(1) {
-        Some(s) => s,
-        None => {
-            bind.set_error("Invalid output_pmtiles parameter");
-            return;
-        }
-    };
-
-    let resolutions = bind.parse_resolutions(8, None);
-    let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
-    let custom_nodata = bind.get_named_double("nodata");
-    let sampling = bind.parse_sampling();
-    let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
-    let properties = bind.get_named_string("properties");
-
-    add_pmtiles_summary_columns(&bind);
-
-    let bind_data = Box::new(PmtilesBindData {
-        file_path,
-        output_pmtiles,
-        resolutions,
-        band,
-        custom_nodata,
-        sampling,
-        is_categorical,
-        properties,
     });
-    duckdb_bind_set_bind_data(
-        info,
-        Box::into_raw(bind_data) as *mut c_void,
-        Some(delete_boxed::<PmtilesBindData>),
-    );
 }
 
 /// Init callback
 pub unsafe extern "C" fn pmtiles_init(info: duckdb_init_info) {
-    let global_data = Box::new(PmtilesGlobalData {
-        executed: AtomicBool::new(false),
+    ffi_init_guard(info, || {
+        set_table_function_init_data(
+            info,
+            PmtilesGlobalData {
+                executed: AtomicBool::new(false),
+            },
+        );
     });
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(global_data) as *mut c_void,
-        Some(delete_boxed::<PmtilesGlobalData>),
-    );
 }
 
 /// Scan callback: runs GeoTIFF-to-PMTiles conversion and streams the single summary row
 pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
-    let bind_data = &*(duckdb_function_get_bind_data(info) as *const PmtilesBindData);
-    let global_data = &*(duckdb_function_get_init_data(info) as *const PmtilesGlobalData);
+    ffi_scan_guard(info, output, || {
+        let bind_data = &*(duckdb_function_get_bind_data(info) as *const PmtilesBindData);
+        let global_data = &*(duckdb_function_get_init_data(info) as *const PmtilesGlobalData);
 
-    if global_data.executed.swap(true, Ordering::SeqCst) {
-        duckdb_data_chunk_set_size(output, 0);
-        return;
-    }
-
-    let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
-    config.band = bind_data.band;
-    config.custom_nodata = bind_data.custom_nodata;
-    config.sampling = bind_data.sampling.clone();
-    config.properties = bind_data.properties.clone();
-
-    let start = Instant::now();
-    let result = if bind_data.is_categorical {
-        H3PmtilesTiler::process_categorical_geotiff_to_pmtiles(
-            &bind_data.file_path,
-            &bind_data.output_pmtiles,
-            config,
-        )
-    } else {
-        H3PmtilesTiler::process_geotiff_to_pmtiles(
-            &bind_data.file_path,
-            &bind_data.output_pmtiles,
-            config,
-        )
-    };
-    let elapsed = start.elapsed();
-
-    let (total_hexagons, size_bytes, status) = match result {
-        Ok(count) => {
-            let sz = File::open(&bind_data.output_pmtiles)
-                .and_then(|f| f.metadata())
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            (count as i64, sz, "SUCCESS".to_string())
+        if global_data.executed.swap(true, Ordering::SeqCst) {
+            duckdb_data_chunk_set_size(output, 0);
+            return;
         }
-        Err(e) => (0i64, 0i64, format!("ERROR: {}", e)),
-    };
 
-    let mut min_z = 255u8;
-    let mut max_z = 0u8;
-    for &r in &bind_data.resolutions {
-        let z = h3_res_to_zoom(r);
-        if z < min_z {
-            min_z = z;
-        }
-        if z > max_z {
-            max_z = z;
-        }
-    }
+        let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
+        config.band = bind_data.band;
+        config.custom_nodata = bind_data.custom_nodata;
+        config.sampling = bind_data.sampling.clone();
+        config.properties = bind_data.properties.clone();
 
-    // Populate the 1 output summary row
-    let writer = ChunkWriter::new(output);
-    writer.set_int64(0, 0, total_hexagons);
-    writer.set_int64(1, 0, size_bytes);
-    writer.set_int64(2, 0, min_z as i64);
-    writer.set_int64(3, 0, max_z as i64);
-    writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
-    writer.set_string(5, 0, &bind_data.output_pmtiles);
-    writer.set_string(6, 0, &status);
-    writer.set_size(1);
+        let start = Instant::now();
+        let result = if bind_data.is_categorical {
+            H3PmtilesTiler::process_categorical_geotiff_to_pmtiles(
+                &bind_data.file_path,
+                &bind_data.output_pmtiles,
+                config,
+            )
+        } else {
+            H3PmtilesTiler::process_geotiff_to_pmtiles(
+                &bind_data.file_path,
+                &bind_data.output_pmtiles,
+                config,
+            )
+        };
+        let elapsed = start.elapsed();
+
+        let (total_hexagons, size_bytes, status) = match result {
+            Ok(count) => {
+                let sz = File::open(&bind_data.output_pmtiles)
+                    .and_then(|f| f.metadata())
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0);
+                (count as i64, sz, "SUCCESS".to_string())
+            }
+            Err(e) => (0i64, 0i64, format!("ERROR: {}", e)),
+        };
+
+        let mut min_z = 255u8;
+        let mut max_z = 0u8;
+        for &r in &bind_data.resolutions {
+            let z = h3_res_to_zoom(r);
+            if z < min_z {
+                min_z = z;
+            }
+            if z > max_z {
+                max_z = z;
+            }
+        }
+
+        // Populate the 1 output summary row
+        let writer = ChunkWriter::new(output);
+        writer.set_int64(0, 0, total_hexagons);
+        writer.set_int64(1, 0, size_bytes);
+        writer.set_int64(2, 0, min_z as i64);
+        writer.set_int64(3, 0, max_z as i64);
+        writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
+        writer.set_string(5, 0, &bind_data.output_pmtiles);
+        writer.set_string(6, 0, &status);
+        writer.set_size(1);
+    });
 }
 
 /// Bind data parsed during SQL query planning for Parquet to PMTiles
@@ -194,61 +199,63 @@ pub struct ParquetPmtilesGlobalData {
 
 /// Bind callback: parses input arguments for `h3_parquet_to_pmtiles`
 pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
-    let bind = BindHelper::new(info);
+    ffi_bind_guard(info, || {
+        let bind = BindHelper::new(info);
 
-    if bind.parameter_count() < 2 {
-        bind.set_error(
-            "h3_parquet_to_pmtiles requires at least 2 arguments: parquet_path and output_pmtiles",
+        if bind.parameter_count() < 2 {
+            bind.set_error(
+                "h3_parquet_to_pmtiles requires at least 2 arguments: parquet_path and output_pmtiles",
+            );
+            return;
+        }
+
+        // 0: parquet_path (VARCHAR)
+        let parquet_path = match bind.get_string_param(0) {
+            Some(s) => s,
+            None => {
+                bind.set_error("Invalid parquet_path parameter");
+                return;
+            }
+        };
+
+        // 1: output_pmtiles (VARCHAR)
+        let output_pmtiles = match bind.get_string_param(1) {
+            Some(s) => s,
+            None => {
+                bind.set_error("Invalid output_pmtiles parameter");
+                return;
+            }
+        };
+
+        let h3_column = bind
+            .get_named_string("h3_column")
+            .or_else(|| bind.get_named_string("h3_col"));
+
+        add_pmtiles_summary_columns(&bind);
+
+        let bind_data = Box::new(ParquetPmtilesBindData {
+            parquet_path,
+            output_pmtiles,
+            h3_column,
+        });
+        duckdb_bind_set_bind_data(
+            info,
+            Box::into_raw(bind_data) as *mut c_void,
+            Some(delete_boxed::<ParquetPmtilesBindData>),
         );
-        return;
-    }
-
-    // 0: parquet_path (VARCHAR)
-    let parquet_path = match bind.get_string_param(0) {
-        Some(s) => s,
-        None => {
-            bind.set_error("Invalid parquet_path parameter");
-            return;
-        }
-    };
-
-    // 1: output_pmtiles (VARCHAR)
-    let output_pmtiles = match bind.get_string_param(1) {
-        Some(s) => s,
-        None => {
-            bind.set_error("Invalid output_pmtiles parameter");
-            return;
-        }
-    };
-
-    let h3_column = bind
-        .get_named_string("h3_column")
-        .or_else(|| bind.get_named_string("h3_col"));
-
-    add_pmtiles_summary_columns(&bind);
-
-    let bind_data = Box::new(ParquetPmtilesBindData {
-        parquet_path,
-        output_pmtiles,
-        h3_column,
     });
-    duckdb_bind_set_bind_data(
-        info,
-        Box::into_raw(bind_data) as *mut c_void,
-        Some(delete_boxed::<ParquetPmtilesBindData>),
-    );
 }
 
 /// Init callback for `h3_parquet_to_pmtiles`
 pub unsafe extern "C" fn parquet_pmtiles_init(info: duckdb_init_info) {
-    let global_data = Box::new(ParquetPmtilesGlobalData {
-        executed: AtomicBool::new(false),
+    ffi_init_guard(info, || {
+        set_table_function_init_data(
+            info,
+            ParquetPmtilesGlobalData {
+                executed: AtomicBool::new(false),
+            },
+        );
     });
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(global_data) as *mut c_void,
-        Some(delete_boxed::<ParquetPmtilesGlobalData>),
-    );
 }
 
 /// Scan callback: runs Parquet-to-PMTiles conversion and streams the single summary row
@@ -256,49 +263,52 @@ pub unsafe extern "C" fn parquet_pmtiles_scan(
     info: duckdb_function_info,
     output: duckdb_data_chunk,
 ) {
-    let bind_data = &*(duckdb_function_get_bind_data(info) as *const ParquetPmtilesBindData);
-    let global_data = &*(duckdb_function_get_init_data(info) as *const ParquetPmtilesGlobalData);
+    ffi_scan_guard(info, output, || {
+        let bind_data = &*(duckdb_function_get_bind_data(info) as *const ParquetPmtilesBindData);
+        let global_data =
+            &*(duckdb_function_get_init_data(info) as *const ParquetPmtilesGlobalData);
 
-    if global_data.executed.swap(true, Ordering::SeqCst) {
-        duckdb_data_chunk_set_size(output, 0);
-        return;
-    }
-
-    let start = Instant::now();
-    let result = H3PmtilesTiler::process_parquet_to_pmtiles(
-        &bind_data.parquet_path,
-        &bind_data.output_pmtiles,
-        bind_data.h3_column.as_deref(),
-    );
-    let elapsed = start.elapsed();
-
-    let (total_hexagons, min_z, max_z, size_bytes, status) = match result {
-        Ok(summary) => {
-            let sz = File::open(&bind_data.output_pmtiles)
-                .and_then(|f| f.metadata())
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            (
-                summary.valid_features as i64,
-                summary.min_zoom as i64,
-                summary.max_zoom as i64,
-                sz,
-                "SUCCESS".to_string(),
-            )
+        if global_data.executed.swap(true, Ordering::SeqCst) {
+            duckdb_data_chunk_set_size(output, 0);
+            return;
         }
-        Err(e) => (0i64, 0i64, 0i64, 0i64, format!("ERROR: {}", e)),
-    };
 
-    // Populate the 1 output summary row
-    let writer = ChunkWriter::new(output);
-    writer.set_int64(0, 0, total_hexagons);
-    writer.set_int64(1, 0, size_bytes);
-    writer.set_int64(2, 0, min_z);
-    writer.set_int64(3, 0, max_z);
-    writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
-    writer.set_string(5, 0, &bind_data.output_pmtiles);
-    writer.set_string(6, 0, &status);
-    writer.set_size(1);
+        let start = Instant::now();
+        let result = H3PmtilesTiler::process_parquet_to_pmtiles(
+            &bind_data.parquet_path,
+            &bind_data.output_pmtiles,
+            bind_data.h3_column.as_deref(),
+        );
+        let elapsed = start.elapsed();
+
+        let (total_hexagons, min_z, max_z, size_bytes, status) = match result {
+            Ok(summary) => {
+                let sz = File::open(&bind_data.output_pmtiles)
+                    .and_then(|f| f.metadata())
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0);
+                (
+                    summary.valid_features as i64,
+                    summary.min_zoom as i64,
+                    summary.max_zoom as i64,
+                    sz,
+                    "SUCCESS".to_string(),
+                )
+            }
+            Err(e) => (0i64, 0i64, 0i64, 0i64, format!("ERROR: {}", e)),
+        };
+
+        // Populate the 1 output summary row
+        let writer = ChunkWriter::new(output);
+        writer.set_int64(0, 0, total_hexagons);
+        writer.set_int64(1, 0, size_bytes);
+        writer.set_int64(2, 0, min_z);
+        writer.set_int64(3, 0, max_z);
+        writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
+        writer.set_string(5, 0, &bind_data.output_pmtiles);
+        writer.set_string(6, 0, &status);
+        writer.set_size(1);
+    });
 }
 
 /// Register `h3_raster_to_pmtiles` and `h3_parquet_to_pmtiles` Table Functions with DuckDB
