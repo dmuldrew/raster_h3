@@ -4,7 +4,7 @@
 //! and determines which subpixel samples are strictly interior (core) versus boundary.
 //! Does not update statistics, mutate accumulators, or manage streaming state.
 
-use h3o::{LatLng, Resolution};
+use h3o::Resolution;
 
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::crs::transformer::CrsTransformer;
@@ -27,12 +27,27 @@ impl H3SpanOptimizer {
         c: usize,
         lon_curr: f64,
         ctx: &RowGeometryContext,
-        crs_transformer: &CrsTransformer,
+        _crs_transformer: &CrsTransformer,
         res: Resolution,
         run_cell: u64,
-        bbox: Option<[f64; 4]>,
+        _bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
-        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
+        let r_u8 = res as u8;
+        // Lookahead span shortcuts require:
+        // 1. Unrotated North-up WGS84 or Web Mercator (ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator))
+        // 2. Resolution >= 4 (coarse cells res 0..=3 have large sagitta across cell extent)
+        // 3. Moderate latitude |lat| < 70° (polar parallels have high curvature)
+        // 4. Away from antimeridian boundaries (|lon| <= 175° and lon does not wrap)
+        // Projected and rotated grids are non-convex or sheared; fall back to exact per-sample lookup.
+        let is_eligible = ctx.is_north_up
+            && (ctx.is_wgs84 || ctx.is_web_mercator)
+            && r_u8 >= 4
+            && row_coords.lat_row.abs() < 70.0
+            && lon_curr.abs() <= 175.0
+            && (lon_curr + (row_coords.row_c_end.saturating_sub(c)) as f64 * ctx.d_lon_step).abs()
+                <= 175.0;
+
+        if is_eligible {
             row_cache.find_span_end(
                 c,
                 row_coords.row_c_end,
@@ -42,27 +57,6 @@ impl H3SpanOptimizer {
                 res,
                 run_cell,
             )
-        } else if ctx.is_north_up {
-            row_cache.find_span_end_projected(
-                c,
-                row_coords.row_c_end,
-                row_coords.x_start,
-                row_coords.y_row,
-                ctx.dx_step,
-                |x, y| match crs_transformer.transform_point(x, y) {
-                    Ok((p_lon, p_lat)) => {
-                        if is_point_in_bbox(p_lon, p_lat, bbox) {
-                            LatLng::new(p_lat, p_lon)
-                                .ok()
-                                .map(|ll| ll.to_cell(res).into())
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None,
-                },
-                run_cell,
-            )
         } else {
             (c + 1, None)
         }
@@ -70,8 +64,6 @@ impl H3SpanOptimizer {
 
     /// Identify the inner core column range `(core_start, core_end)` where all subpixel sample points
     /// land strictly inside `run_cell`.
-    ///
-    /// For north-up projected CRS (e.g. UTM, Albers), tests exact coordinates matching sample evaluation.
     #[inline(always)]
     pub fn find_core_span<FCheck>(
         row_coords: &RowCoordinates,
@@ -90,8 +82,13 @@ impl H3SpanOptimizer {
     where
         FCheck: FnMut(f64, f64) -> bool,
     {
-        // Rotated rasters need full affine per sample; skip span skipping.
-        if !ctx.is_north_up {
+        // Core span optimization requires unrotated North-up WGS84/Mercator with moderate latitude.
+        // Projected and rotated rasters need full per-sample evaluation.
+        let is_eligible = ctx.is_north_up
+            && (ctx.is_wgs84 || ctx.is_web_mercator)
+            && row_coords.lat_row.abs() < 70.0;
+
+        if !is_eligible {
             return (c, c);
         }
 
@@ -102,7 +99,6 @@ impl H3SpanOptimizer {
                     row_coords.lat_row + (py - 0.5) * gt.e,
                 )
             } else {
-                // North-up projected: compute exact CRS coordinates for core check!
                 let (x, y) = gt.pixel_to_coord(
                     (chunk.col_offset as f64) + px,
                     (row_coords.row_idx as f64) + py,

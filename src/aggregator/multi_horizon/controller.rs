@@ -120,6 +120,8 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     output_buffer: OutputBuffer<K::Record>,
     lifecycle: StreamLifecycle,
     pub current_lat_horizon: f64,
+    pub can_evict_early: bool,
+    pub suffix_max_north_lat: Vec<f64>,
     pub profile_stats: [u64; 4],
     pub processed_chunk_count: usize,
 }
@@ -163,6 +165,33 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let resolution_shards = (0..num_res).map(|_| ShardedResolutionMap::new()).collect();
         let compactor = HierarchicalCompactor::new(should_compact);
 
+        // Early eviction watermark requires:
+        // 1. All mosaic tiles must use geographic WGS84 or Web Mercator fast paths.
+        // 2. Scanline row traversal must be North-to-South (gt.e < 0.0).
+        // 3. No column-induced latitude tilt (gt.d == 0.0), ensuring rows are constant latitude.
+        // For general projected CRSs (UTM, Albers, Proj4), rotated grids (d != 0), or South-to-North (e > 0),
+        // early eviction is conservatively disabled to prevent premature eviction and split aggregates.
+        let can_evict_early = mosaic.tiles.iter().all(|tile| {
+            let is_geographic_or_mercator = matches!(
+                tile.crs_transformer,
+                crate::crs::transformer::CrsTransformer::Wgs84Identity
+                    | crate::crs::transformer::CrsTransformer::WebMercatorFast
+            );
+            let gt = &tile.reader.metadata.geotransform;
+            is_geographic_or_mercator && gt.e < 0.0 && gt.d == 0.0
+        });
+
+        // Compute suffix-maximum north latitudes across all remaining chunks:
+        // suffix_max_north_lat[k] = max_{j=k}^{total_chunks-1} (chunk_refs[j].north_lat)
+        let n_chunks = mosaic.chunk_refs.len();
+        let mut suffix_max_north_lat = vec![f64::NEG_INFINITY; n_chunks + 1];
+        let mut running_max = f64::NEG_INFINITY;
+        for k in (0..n_chunks).rev() {
+            // Include small 1e-12° margin to conservatively bound floating-point rounding
+            running_max = running_max.max(mosaic.chunk_refs[k].north_lat + 1e-12);
+            suffix_max_north_lat[k] = running_max;
+        }
+
         Ok(Self {
             kernel,
             prefetcher: Some(prefetcher),
@@ -177,6 +206,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             output_buffer: OutputBuffer::with_capacity(2048),
             lifecycle: StreamLifecycle::new(),
             current_lat_horizon: f64::INFINITY,
+            can_evict_early,
+            suffix_max_north_lat,
             profile_stats: [0; 4],
             processed_chunk_count: 0,
         })
@@ -376,9 +407,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
             self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
 
-            if self.processed_chunk_count < self.mosaic.chunk_refs.len() {
-                let next_chunk = &self.mosaic.chunk_refs[self.processed_chunk_count];
-                let safe_lat = next_chunk.north_lat;
+            if self.can_evict_early && self.processed_chunk_count < self.mosaic.chunk_refs.len() {
+                let safe_lat = self.suffix_max_north_lat[self.processed_chunk_count];
                 if safe_lat < self.current_lat_horizon {
                     let t3 = std::time::Instant::now();
                     self.current_lat_horizon = safe_lat;

@@ -274,7 +274,19 @@ impl H3ScanlineLookahead {
         }
 
         if core_start < core_end {
-            (core_start, core_end)
+            // Certify that every intermediate pixel in [core_start, core_end) is strictly core
+            let mut all_certified = true;
+            for k in core_start..core_end {
+                if !is_pixel_core(k) {
+                    all_certified = false;
+                    break;
+                }
+            }
+            if all_certified {
+                (core_start, core_end)
+            } else {
+                (span_end, span_end)
+            }
         } else {
             (span_end, span_end)
         }

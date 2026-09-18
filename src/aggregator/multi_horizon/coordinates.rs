@@ -32,7 +32,7 @@ impl<'a> CoordinateTransformer<'a> {
     pub fn new(gt: &'a GeoTransform, crs_transformer: &'a CrsTransformer) -> Self {
         let is_wgs84 = matches!(crs_transformer, CrsTransformer::Wgs84Identity);
         let is_web_mercator = matches!(crs_transformer, CrsTransformer::WebMercatorFast);
-        let is_north_up = gt.b == 0.0 && gt.d == 0.0;
+        let is_north_up = gt.b == 0.0 && gt.d == 0.0 && gt.e < 0.0 && gt.a > 0.0;
         let dx_step = gt.a;
 
         let d_lon_step = if is_wgs84 {
@@ -158,7 +158,7 @@ impl RowGeometryContext {
             (chunk.width as usize).max(1)
         };
         let actual_rows = (slice_len / stride).min(chunk.height as usize);
-        let is_north_up = gt.b == 0.0 && gt.d == 0.0;
+        let is_north_up = gt.b == 0.0 && gt.d == 0.0 && gt.e < 0.0 && gt.a > 0.0;
         let dx_step = gt.a;
 
         Self {

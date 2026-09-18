@@ -44,8 +44,22 @@ impl AccumulatorMerge for CategoricalAccumulator {
 
 /// A 32-way hash-partitioned active map and eviction heap for a single H3 resolution.
 ///
-/// Encapsulates lock-free parallel merging of thread-local worker maps, parallel eviction
-/// of hexagons past the latitude horizon, and parallel H3 index sorting.
+/// # Concurrency Architecture
+///
+/// Rather than using simultaneous concurrent insertion and eviction with mutexes or atomics,
+/// `ShardedResolutionMap` operates through **exclusive execution phases with parallel shard ownership**:
+///
+/// 1. **Worker Aggregation Phase**: Worker threads process raster chunks in parallel, partitioning
+///    their outputs into 32 thread-local shard buffers with zero cross-thread coordination.
+/// 2. **Merge Phase (`merge_thread_results`)**: Takes `&mut self`. Rayon mutably iterates over the
+///    32 disjoint shards in parallel (`par_iter_mut`), with each shard sequentially merging chunk
+///    results assigned to its shard index. Disjoint shard ownership guarantees zero race conditions
+///    and eliminates lock contention.
+/// 3. **Eviction Phase (`evict_completed`)**: Takes `&mut self`. Only after all worker results for
+///    completed chunks have been merged does the controller advance the watermark and evict cells
+///    past `lat_horizon` across shards in parallel.
+/// 4. **Drain Phase (`drain_all`)**: Takes `&mut self` at EOF, draining all remaining active cells
+///    across all shards in parallel.
 pub struct ShardedResolutionMap<A: AccumulatorMerge> {
     pub shards: Vec<HashMap<u64, A, FxBuildHasher>>,
     pub eviction: Vec<BinaryHeap<HexEvictionEntry>>,
@@ -66,9 +80,11 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
         Self { shards, eviction }
     }
 
-    /// Merge partial chunk results from parallel worker threads into the 32 shards with zero lock contention.
+    /// Merge partial chunk results from parallel worker threads into the 32 shards.
     ///
-    /// Each Rayon worker thread merges into a distinct shard concurrently.
+    /// Executes an exclusive merge phase using Rayon parallel mutable iteration over disjoint shards.
+    /// Each Rayon task exclusively owns and mutates one shard map and eviction heap, merging
+    /// contributions sequentially within that shard.
     pub fn merge_thread_results<T: Sync>(
         &mut self,
         parallel_results: &[(Vec<[Vec<(u64, A)>; NUM_SHARDS]>, T)],
