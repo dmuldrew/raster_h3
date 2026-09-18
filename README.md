@@ -88,6 +88,7 @@ FROM h3_raster_categorical_aggregate(
 );
 
 -- 2. Polyfill vector census tracts into H3 cells & compute population density
+-- (h3_polygon_wkt_to_cells matches hexagons whose centroids fall inside each polygon)
 CREATE TABLE census_tracts_h3 AS
 SELECT 
     tract_name,
@@ -117,8 +118,7 @@ ORDER BY t.canopy_purity ASC;
 
 > No Python. No GDAL. No intermediate files. The raster *becomes* a queryable table source.
 
-> 💡 **Engineering Tip: Sizing H3 Resolutions to Polygon Boundaries**  
-> H3's `polygonToCells` selects hexagons whose centroids fall strictly within the polygon boundary. For dense urban tracts smaller than an H3 Resolution 8 cell (~74 ha), use **Resolution 9** (~10.5 ha) or fall back to the tract centroid (`h3_latlng_to_cell(ST_Centroid(geom), 8)`) so that compact boundary polygons are never omitted from the join.
+*(Note: `h3_polygon_wkt_to_cells` indexes hexagons whose centroids fall within the polygon boundary. Choose a resolution fine enough—such as Res 8 or 9 for tracts—so boundaries contain multiple cell centers).*
 
 ### Why Intermediate H3 Aggregations Change Everything
 
