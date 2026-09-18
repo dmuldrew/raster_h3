@@ -19,7 +19,9 @@ pub use metadata::{extract_crs, extract_geotransform, extract_nodata, parse_wkt_
 pub use mosaic::{
     glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor,
 };
-pub use prefetch::{MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader};
+pub use prefetch::{
+    DecodingBufferPool, MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader,
+};
 pub use remote_prefetch::{
     coalesce_chunk_ranges, ChunkLocation, CoalescedRange, RemoteChunkPrefetchQueue,
     RemotePrefetchConfig,

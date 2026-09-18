@@ -36,6 +36,8 @@ struct OrderedQueueState<T> {
     next_read: usize,
     closed: bool,
     terminal_item: Option<T>,
+    #[cfg(test)]
+    blocked_job: Option<usize>,
 }
 
 /// High-throughput, zero-allocation bounded ring buffer that delivers parallel background chunk
@@ -46,6 +48,8 @@ pub struct OrderedPrefetchQueue<T> {
     state: Mutex<OrderedQueueState<T>>,
     not_empty: Condvar,
     not_full: Condvar,
+    #[cfg(test)]
+    producer_blocked: Condvar,
 }
 
 impl<T> OrderedPrefetchQueue<T> {
@@ -63,9 +67,13 @@ impl<T> OrderedPrefetchQueue<T> {
                 next_read: 0,
                 closed: false,
                 terminal_item: None,
+                #[cfg(test)]
+                blocked_job: None,
             }),
             not_empty: Condvar::new(),
             not_full: Condvar::new(),
+            #[cfg(test)]
+            producer_blocked: Condvar::new(),
         }
     }
 
@@ -74,7 +82,16 @@ impl<T> OrderedPrefetchQueue<T> {
     pub fn push(&self, job_id: usize, item: T) -> bool {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while job_id >= guard.next_read + self.capacity && !guard.closed {
+            #[cfg(test)]
+            {
+                guard.blocked_job = Some(job_id);
+                self.producer_blocked.notify_all();
+            }
             guard = self.not_full.wait(guard).unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            {
+                guard.blocked_job = None;
+            }
         }
         if guard.closed {
             return false;
@@ -85,6 +102,20 @@ impl<T> OrderedPrefetchQueue<T> {
             self.not_empty.notify_all();
         }
         true
+    }
+
+    /// Test handshake for single-producer schedules. The observer cannot acquire
+    /// state until the producer atomically releases it in `not_full.wait()`.
+    #[cfg(test)]
+    pub(crate) fn wait_for_blocked_job(&self, job_id: usize) -> bool {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .producer_blocked
+            .wait_timeout_while(guard, std::time::Duration::from_secs(2), |state| {
+                state.blocked_job != Some(job_id)
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        guard.blocked_job == Some(job_id)
     }
 
     /// Signal that prefetching is closed, unblocking all waiting workers and consumers.
@@ -164,6 +195,8 @@ impl<T> OrderedPrefetchQueue<T> {
                 && guard.slots[guard.next_read % self.capacity].is_none()
                 && !guard.closed
             {
+                // Publish capacity released during this drain before sleeping.
+                self.not_full.notify_all();
                 guard = self
                     .not_empty
                     .wait(guard)
@@ -204,11 +237,87 @@ impl<T> OrderedPrefetchQueue<T> {
     }
 }
 
+/// Bounded lock-free buffer pool for reusable chunk decoding buffers.
+/// Uses `crossbeam_deque::Injector` with retry-on-contention stealing
+/// and an atomic count to cap maximum idle buffer retention.
+pub struct DecodingBufferPool {
+    pool: Injector<DecodingResult>,
+    count: AtomicUsize,
+    capacity: usize,
+}
+
+impl DecodingBufferPool {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            pool: Injector::new(),
+            count: AtomicUsize::new(0),
+            capacity: capacity.max(16),
+        }
+    }
+
+    /// Try to acquire a reusable buffer from the pool, retrying if concurrent steals collide.
+    pub fn pop(&self) -> Option<DecodingResult> {
+        loop {
+            match self.pool.steal() {
+                crossbeam_deque::Steal::Success(buf) => {
+                    let _ = self
+                        .count
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            Some(c.saturating_sub(1))
+                        });
+                    return Some(buf);
+                }
+                crossbeam_deque::Steal::Empty => return None,
+                crossbeam_deque::Steal::Retry => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Push a buffer back into the pool. If the pool has reached capacity,
+    /// the buffer is dropped to bound retained memory.
+    pub fn push(&self, buf: DecodingResult) {
+        let mut current = self.count.load(Ordering::Relaxed);
+        loop {
+            if current >= self.capacity {
+                // Pool is full; drop buffer to enforce bounded memory retention.
+                return;
+            }
+            match self.count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.pool.push(buf);
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Return the number of currently available recycled buffers in the pool.
+    pub fn len(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Return true if the pool contains no idle buffers.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the maximum capacity of idle buffers retained in the pool.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 /// Asynchronous double-buffered chunk prefetcher that reuses persistent decoders
 /// across one or more background threads with lock-free buffer pooling and bounded in-order delivery.
 pub struct PrefetchedChunkReader {
     queue: Arc<OrderedPrefetchQueue<PrefetchItem>>,
-    buffer_pool: Arc<Injector<DecodingResult>>,
+    buffer_pool: Arc<DecodingBufferPool>,
     _remote_queue: Option<Arc<RemoteChunkPrefetchQueue>>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
@@ -264,7 +373,7 @@ impl PrefetchedChunkReader {
             buffer_capacity.max(16),
             total_jobs,
         ));
-        let buffer_pool = Arc::new(Injector::new());
+        let buffer_pool = Arc::new(DecodingBufferPool::new(buffer_capacity.max(16)));
 
         if total_jobs == 0 {
             return Self {
@@ -316,10 +425,7 @@ impl PrefetchedChunkReader {
                             break;
                         }
                         let chunk_idx = worker_indices[job_id];
-                        let recycled_buf = match worker_buffer_pool.steal() {
-                            crossbeam_deque::Steal::Success(b) => Some(b),
-                            _ => None,
-                        };
+                        let recycled_buf = worker_buffer_pool.pop();
                         let prefetched_bytes = worker_remote_queue
                             .as_ref()
                             .map(|q| q.get_chunk_payload(0, chunk_idx))
@@ -385,7 +491,7 @@ impl PrefetchedChunkReader {
     /// Pull next batch of ready chunks (pulls up to `max_batch` chunks or until EOF)
     pub fn next_chunk_batch(&self, max_batch: usize) -> Vec<PrefetchItem> {
         let mut batch = Vec::with_capacity(max_batch);
-        self.drain_chunk_batch_into(&mut batch, max_batch, max_batch);
+        self.drain_chunk_batch_into(&mut batch, 1, max_batch);
         batch
     }
 }
@@ -394,7 +500,7 @@ impl PrefetchedChunkReader {
 /// with lock-free buffer pooling and single-hop bounded in-order queueing.
 pub struct PrefetchedMosaicReader {
     queue: Arc<OrderedPrefetchQueue<MosaicPrefetchItem>>,
-    buffer_pool: Arc<Injector<DecodingResult>>,
+    buffer_pool: Arc<DecodingBufferPool>,
     _remote_queue: Option<Arc<RemoteChunkPrefetchQueue>>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
@@ -439,7 +545,7 @@ impl PrefetchedMosaicReader {
             buffer_capacity.max(16),
             total_jobs,
         ));
-        let buffer_pool = Arc::new(Injector::new());
+        let buffer_pool = Arc::new(DecodingBufferPool::new(buffer_capacity.max(16)));
 
         if total_jobs == 0 {
             return Self {
@@ -499,10 +605,7 @@ impl PrefetchedMosaicReader {
                         }
                         let decoder = decoders[tile_idx].as_mut().unwrap();
 
-                        let recycled_buf = match worker_buffer_pool.steal() {
-                            crossbeam_deque::Steal::Success(b) => Some(b),
-                            _ => None,
-                        };
+                        let recycled_buf = worker_buffer_pool.pop();
                         let prefetched_bytes = worker_remote_queue
                             .as_ref()
                             .map(|q| q.get_chunk_payload(tile_idx, chunk_idx))
@@ -568,7 +671,7 @@ impl PrefetchedMosaicReader {
     /// Pull next batch of ready chunks (pulls up to `max_batch` chunks or until EOF)
     pub fn next_chunk_batch(&self, max_batch: usize) -> Vec<MosaicPrefetchItem> {
         let mut batch = Vec::with_capacity(max_batch);
-        self.drain_chunk_batch_into(&mut batch, max_batch, max_batch);
+        self.drain_chunk_batch_into(&mut batch, 1, max_batch);
         batch
     }
 }
@@ -926,5 +1029,125 @@ mod tests {
             batch[0],
             Err("Decode worker panicked: intentional test panic in decode worker".to_string())
         );
+    }
+
+    #[test]
+    fn test_ordered_prefetch_queue_drain_exceeding_capacity_deadlock_prevention() {
+        // Reproduce the missing-wakeup schedule:
+        // Capacity is 16; jobs 0-15 occupy the ring.
+        // Producer attempts job 16 and sleeps on not_full.
+        // Consumer calls drain_into(..., 17, 17), removes 16 items, then sleeps on not_empty.
+        // Producer must be notified to publish job 16 without deadlocking.
+        let capacity = 16;
+        let total_jobs = 20;
+        let queue = Arc::new(OrderedPrefetchQueue::new(capacity, total_jobs));
+
+        // Deterministically saturate the ring with jobs 0..15 on the current thread
+        for i in 0..capacity {
+            assert!(queue.push(i, i));
+        }
+
+        let p_queue = Arc::clone(&queue);
+        let producer = thread::spawn(move || {
+            for i in capacity..total_jobs {
+                if !p_queue.push(i, i) {
+                    break;
+                }
+            }
+        });
+
+        // Observe the actual condition-variable wait, not elapsed wall time.
+        let blocked = queue.wait_for_blocked_job(capacity);
+        if !blocked {
+            queue.close();
+            producer.join().unwrap();
+            panic!("producer did not block at ring capacity");
+        }
+
+        // Consumer calls drain_into in a thread with timeout protection against regression hangs
+        let (tx_drain, rx_drain) = std::sync::mpsc::channel();
+        let c_queue = Arc::clone(&queue);
+        let consumer = thread::spawn(move || {
+            let mut batch = Vec::new();
+            let count = c_queue.drain_into(&mut batch, 17, 17);
+            tx_drain.send((count, batch)).unwrap();
+        });
+
+        let drain_res = rx_drain.recv_timeout(Duration::from_secs(2));
+
+        // Cleanup: unblock any waiters in case of regression so test suite never hangs
+        queue.close();
+
+        consumer.join().unwrap();
+        producer.join().unwrap();
+        let (drained, batch) = drain_res.expect("drain_into deadlocked while waiting for job 16");
+        assert_eq!(drained, 17);
+        assert_eq!(batch.len(), 17);
+        for (i, &val) in batch.iter().enumerate() {
+            assert_eq!(val, i);
+        }
+    }
+
+    #[test]
+    fn test_decoding_buffer_pool_bounded_retention() {
+        let pool = DecodingBufferPool::new(16);
+        assert_eq!(pool.capacity(), 16);
+        assert_eq!(pool.len(), 0);
+        assert!(pool.is_empty());
+
+        // Push 64 buffers into pool
+        for i in 0..64 {
+            pool.push(DecodingResult::U8(vec![i as u8; 128]));
+        }
+
+        // Pool must strictly cap retention at 16 buffers, discarding the remaining 48
+        assert_eq!(pool.len(), 16);
+        assert!(!pool.is_empty());
+
+        // Pop all 16 buffers
+        for _ in 0..16 {
+            assert!(pool.pop().is_some());
+        }
+
+        assert_eq!(pool.len(), 0);
+        assert!(pool.is_empty());
+        assert!(pool.pop().is_none());
+    }
+
+    #[test]
+    fn test_decoding_buffer_pool_concurrent_contention_and_retry() {
+        let pool = Arc::new(DecodingBufferPool::new(16));
+        let num_threads = 8;
+        let iters_per_thread = 2000;
+
+        for _ in 0..16 {
+            pool.push(DecodingResult::U8(vec![0u8; 256]));
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..num_threads {
+            let p = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                for _ in 0..iters_per_thread {
+                    let buf = p
+                        .pop()
+                        .unwrap_or_else(|| DecodingResult::U8(vec![1u8; 256]));
+                    match buf {
+                        DecodingResult::U8(mut v) => {
+                            v[0] = v[0].wrapping_add(1);
+                            p.push(DecodingResult::U8(v));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Retained count must never exceed capacity
+        assert!(pool.len() <= 16);
     }
 }

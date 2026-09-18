@@ -21,8 +21,8 @@ This document details the core engineering innovations and architectural princip
 | 8 | **Zero-Allocation Fast Hex Formatting** | Formats 64-bit integer H3 indices into lowercase hexadecimal ASCII bytes using a 16-byte stack LUT. |
 | 9 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data from disk. |
 | 10 | **Native DuckDB Parallelism (`init_local`)** | Dynamically distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
-| 11 | **Lock-Free Work-Stealing Buffer Pool** | Work-stealing buffer injector (`crossbeam_deque::Injector`) eliminates buffer allocation churn across 15,840+ chunks. |
-| 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate OS thread context switches with zero-allocation batch drains. |
+| 11 | **Bounded Lock-Free Buffer Pool** | Bounded buffer pool with retry-on-contention stealing minimizes buffer allocation churn and strictly caps the number of idle buffers. |
+| 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate collector threads with batch draining and backpressure. |
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Asynchronous HTTP/S3 range prefetching and multi-file Voronoi cutline mosaic blending with zero double-counting. |
 | 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of stack-allocated WKB polygon geometries (109–189 bytes) with embedded PROJJSON `OGC:CRS84` metadata. |
 
@@ -63,17 +63,28 @@ DuckDB's vectorized execution engine parallelizes custom table functions across 
 - **Work-Stealing Chunk Distribution**: Input GeoTIFF strips or COG tiles are managed as a shared, lock-free task queue. Fast threads that finish their assigned chunks immediately steal remaining chunks from the pool, preventing worker stragglers caused by uneven spatial density or ocean tiles.
 - **Accurate Cardinality Estimation**: `estimate_raster_cardinality()` provides DuckDB's cost-based query optimizer with exact row count bounds based on raster bounding boxes and H3 resolution area formulas, enabling optimal hash join planning and vector pipeline scheduling.
 
-## 7. Lock-Free Work-Stealing Buffer Pool (crossbeam_deque::Injector)
+## 7. Bounded Lock-Free Buffer Recycling Pool (DecodingBufferPool)
 High-resolution continental datasets (such as CONUS 30m) require decompressing tens of thousands of tiles (e.g. 15,840+ chunks). Continuously allocating, reallocating, and freeing multi-megabyte decompression buffers causes heavy memory fragmentation, allocator lock contention, and kernel `brk`/`mmap` syscall overhead:
-- **Global Work-Stealing Injector**: `PrefetchedChunkReader` uses `crossbeam_deque::Injector<DecodingResult>` as a concurrent, lock-free buffer recycling pool.
-- **Zero-Allocation Reuse**: When a background decompression thread prepares to decode a chunk, it attempts to steal an existing buffer from the pool (`buffer_pool.steal()`). Only if the pool is empty does it allocate fresh memory.
-- **Recycle on Eviction**: Once the downstream consumer finishes processing a chunk's pixels and advances past the scanline horizon, the allocated buffer is sanitized and recycled back into the injector via `recycle_buffer()`, delivering sustained hardware-saturating throughput with zero heap allocation churn.
+- **Bounded Lock-Free Recycling**: `PrefetchedChunkReader` and `PrefetchedMosaicReader` use `DecodingBufferPool` (wrapping `crossbeam_deque::Injector<DecodingResult>` with an atomic retention counter) as a concurrent, lock-free buffer recycling pool.
+- **Contention-Resilient Acquisition**: When a background decompression thread prepares to decode a chunk, it attempts to acquire an existing buffer from the pool (`buffer_pool.pop()`). If concurrent steals collide (`crossbeam_deque::Steal::Retry`), the worker spins briefly rather than falsely falling back to fresh memory allocation. Only if the pool is genuinely empty (`Steal::Empty`) does it allocate fresh storage.
+- **Strict Retention Bound & Minimized Allocation Churn**: Once the downstream consumer finishes processing a chunk batch, allocated buffers are returned to the pool via `recycle_batch()`. If the pool has reached its configured capacity, excess buffers are immediately dropped. The limit counts buffers, not bytes: differently sized chunks can retain different amounts of storage. Reuse minimizes allocation churn but does not guarantee zero allocations.
 
 ## 8. Single-Hop Bounded In-Order Prefetcher (OrderedPrefetchQueue<T>)
 Traditional background prefetchers often suffer from thread thrashing: either unbounded queues that risk out-of-memory (OOM) bloat, or intermediate "collector" threads that copy data through multiple OS synchronization channels:
 - **Direct Worker-to-Consumer Deposit**: `OrderedPrefetchQueue<T>` connects decompression workers directly to the aggregator through a fixed-capacity ring buffer indexed by `job_id % capacity`.
-- **Single-Hop Zero Context Switches**: Workers calculate and decompress chunks concurrently, depositing their result directly into their assigned ring buffer slot. The aggregator drains contiguous, sequence-ordered chunks in bulk using `drain_into()`, acquiring the queue lock only once per batch.
-- **Strict Backpressure**: If background workers outpace the aggregator by more than `capacity` chunks, they block on a condition variable until the consumer drains slots, ensuring that memory usage remains strictly bounded regardless of file size.
+- **Single-Hop Thread Architecture**: Workers calculate and decompress chunks concurrently, depositing their result directly into their assigned ring buffer slot without intermediate collector threads. The aggregator drains contiguous, sequence-ordered chunks in bulk using `drain_into()`, using one queue guard per batch; condition-variable waits release and reacquire the mutex.
+- **Strict Backpressure & Deadlock-Free Draining**: If background workers outpace the aggregator by more than `capacity` chunks, they block on a condition variable (`not_full`) until the consumer drains slots. When draining batches that exceed ring capacity, `drain_into()` publishes freed slots before sleeping on incomplete batches, avoiding a circular wait between producers and the consumer. Consumers pull ready chunks via `next_chunk_batch(max_batch)` or bulk batch drains.
+
+
+### Downstream backpressure and memory limits
+
+`ChunkWriter` bounds writes to DuckDB's output vectors; it does not throttle or schedule decompression. Continuous and wide categorical scan callbacks pull from `ConcurrentRecordQueue::pop_or_refill()` before writing. A refill requests at most four vector-sized batches from the streamer, returns one, and retains at most three. With no further scan calls, no further refills occur. The prefetch ring then fills and each decompression worker eventually blocks in `push()`, after finishing its current decode. An already-running scan may finish its current refill before stalling.
+
+For a single prefetcher, let **C** be ring capacity, **W** decoder workers, **B** the consumer's chunk batch size, and **P** idle-pool capacity. Decoded buffer ownership is bounded by **C + W + B + P** buffers along this path (including a worker's completed buffer waiting to be deposited). This is a count bound, not a fixed byte budget. If each buffer's allocated capacity is at most **S** bytes, those buffers occupy at most **(C + W + B + P) × S** bytes, excluding allocator overhead and decoder scratch storage.
+
+Whole-query memory also includes raster metadata and job lists, compressed remote payloads, decoder scratch buffers, aggregation maps, compaction state, output records, and DuckDB execution state. `OutputBuffer::with_capacity(2048)` reserves initial space; it is not a hard limit. Horizon eviction and EOF flushing can emit more records than the requested row count. Long categorical output additionally expands each cell into one row per category and can overshoot its refill threshold. Therefore these queue bounds do **not** establish a fixed whole-query RAM limit or a universal zero-churn guarantee.
+
+Regression coverage includes an explicit producer-wait handshake for oversized batch drains and a 15,840-item test connecting the real record and prefetch queues. The latter pauses record consumption, observes the producer blocked at the expected capacity boundary, and checks ordered completion after resuming. It uses one synthetic record per chunk; it is not a live DuckDB/TIFF memory benchmark.
 
 ## 9. Cloud-Native Remote COG & S3 Streaming (Range Coalescing)
 `raster_h3` streams Cloud-Optimized GeoTIFFs (COGs) directly from HTTP/HTTPS endpoints or AWS S3 buckets without copying the entire multi-gigabyte file to local disk:

@@ -11,6 +11,9 @@ use crate::ffi::{
 };
 
 /// Ergonomic wrapper around DuckDB's output `duckdb_data_chunk` with row and column bounds checking.
+/// This writer does not schedule or throttle upstream work. Scan callbacks pull
+/// records on demand before constructing it; pausing those calls propagates
+/// backpressure through the record queue to the bounded prefetch queue.
 ///
 /// # Safety Notes
 /// While `ChunkWriter` validates vector row indices against `vector_size` and column indices against
