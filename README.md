@@ -58,33 +58,45 @@ Joining raster values (elevation, temperature, land cover) with business entitie
 
 ### The Solution: Uber H3 Discrete Global Grid System
 
-The **Uber H3 Index** divides the Earth into a hierarchical hexagonal grid with uniform neighbor adjacency and minimal area distortion. By converting raster pixels into H3 cell indices (`UBIGINT` / `VARCHAR`), spatial grids become standard relational tables joinable via `JOIN ON r.h3_index = v.h3_index`.
+The [Uber H3 Spatial Index](https://h3geo.org/) is an open-source [Discrete Global Grid System (DGGS)](https://en.wikipedia.org/wiki/Discrete_global_grid) that partitions the entire planet into an invariant, hierarchical hexagonal mesh across 16 resolution levels (Resolution 0 to 15):
+
+* **Why Hexagons?** Unlike square pixel grids where diagonal neighbors are $\sqrt{2} \times$ farther away than orthogonal neighbors, hexagons have **identical distance to all 6 adjacent neighbors**. This eliminates directional bias for spatial neighborhood queries, radius buffers, and spatial diffusion modeling.
+* **Minimal Area & Shape Distortion**: H3 projects a spherical icosahedron onto Earth's surface using [gnomonic projections](https://h3geo.org/docs/core-library/overview#gnomonic-projection), preserving near-uniform cell area across global latitudes without the extreme polar distortion of Web Mercator.
+* **Hierarchical Aperture-7 Nesting**: Each H3 cell decomposes into 7 finer child cells at the next resolution level, with cell areas decreasing by $\sim 7\times$ at each step—from [Resolution 0](https://h3geo.org/docs/core-library/restable/) (continental scale, ~4.3M km²) down to Resolution 15 (~0.9 m²).
+* **64-Bit Integer Addressing**: Every hexagon on Earth is uniquely addressed by a compact 64-bit unsigned integer (`UBIGINT` / 15-character hex string) that can be indexed, partitioned, and joined in standard SQL databases via simple equality joins: `JOIN ON r.h3_index = v.h3_index`.
+
+> 📚 **Learn More About H3**:
+> - [Official H3 Documentation & Guides](https://h3geo.org/docs/)
+> - [H3 Core Principles & Coordinate Systems](https://h3geo.org/docs/core-library/overview)
+> - [H3 Resolution Reference Table (Cell Areas & Edge Lengths)](https://h3geo.org/docs/core-library/restable/)
+> - [Uber Engineering Blog: H3 Hexagonal Hierarchical Spatial Index](https://www.uber.com/blog/h3/)
+> - [DuckDB H3 Community Extension](https://community-extensions.duckdb.org/extensions/h3.html)
 
 ### Raster Meets Table: A Worked Example
 
 A city planning department has two datasets:
 
 1. **A land cover raster** — a 30-meter NLCD GeoTIFF classifying every pixel as forest, grassland, impervious surface, water, etc.
-2. **A census demographics table** — 4,200 census tract boundary polygons (GeoJSON / GeoParquet) with population, median income, and percent children under 5.
+2. **A census demographics table** — 4,200 census tract boundary polygons (GeoJSON / GeoParquet) with total population and median income.
 
-**The question**: *Which low-income neighborhoods have the least tree canopy coverage?*
+**The question**: *Which low-income, densely populated neighborhoods have the least tree canopy coverage?*
 
 Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid:
 
 ```sql
--- 1. Aggregate the 30m land cover raster into the same H3 grid (< 15 MB RAM, seconds)
+-- 1. Aggregate the 30m land cover raster into H3 hexagons (< 15 MB RAM, seconds)
 CREATE TABLE canopy_h3 AS
 SELECT h3_index, majority_class, majority_fraction AS canopy_purity
 FROM h3_raster_categorical_aggregate(
     'nlcd_landcover_2021.tif', resolution := 8
 );
 
--- 2. Polyfill vector census tract polygons into H3 cells (using DuckDB Spatial & H3)
+-- 2. Polyfill vector census tracts into H3 cells & compute population density
 CREATE TABLE census_tracts_h3 AS
 SELECT 
     tract_name,
     median_income,
-    pct_children_under_5,
+    round(total_population / (ST_Area(geom) / 1000000.0), 0) AS pop_density_per_sqkm,
     unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8)) AS h3_index
 FROM ST_Read('census_tracts.geojson');
 
@@ -92,15 +104,16 @@ FROM ST_Read('census_tracts.geojson');
 SELECT
     c.tract_name,
     c.median_income,
-    c.pct_children_under_5,
+    c.pop_density_per_sqkm,
     t.majority_class AS dominant_landcover,
     t.canopy_purity
 FROM census_tracts_h3 AS c
 JOIN canopy_h3 AS t 
-ON c.h3_index = t.h3_index
+  ON c.h3_index = t.h3_index
 WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
   AND t.canopy_purity  < 0.30        -- Less than 30% tree canopy
   AND c.median_income  < 45000       -- Low-income tracts
+  AND c.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
 ORDER BY t.canopy_purity ASC;
 ```
 
