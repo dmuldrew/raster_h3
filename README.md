@@ -16,7 +16,7 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 - [How It Works](#how-it-works)
 - [Installation & Docker Quickstart](#installation--docker-quickstart)
 - [SQL Usage & Practical Recipes](#sql-usage--practical-recipes)
-- [Core Engineering Innovations](#core-engineering-innovations)
+- [Core Engineering Architecture](#core-engineering-architecture)
 - [Architecture Diagram](#architecture-diagram)
 - [Source Module Architecture](docs/module-architecture.md)
 - [Core Dependencies](#core-dependencies--architectural-contributions)
@@ -387,7 +387,7 @@ print(res)
 
 ---
 
-## Core Engineering Innovations
+## Core Engineering Architecture
 
 `raster_h3` achieves near-hardware-limit throughput through these architectural principles:
 
@@ -408,7 +408,7 @@ print(res)
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
 | 14 | **Native OGC GeoParquet 1.1 Exporter** | 125-byte WKB polygons with embedded PROJJSON metadata |
 
-> 📖 **Detailed explanations** of each innovation — See [docs/engineering.md](docs/engineering.md)  
+> 📖 **Detailed explanations** of each architectural pillar — See [docs/engineering.md](docs/engineering.md)  
 > 🗺️ **Source Module Architecture** — File-by-file breakdown of crate internals mapped to these principles: [docs/module-architecture.md](docs/module-architecture.md)
 
 ---

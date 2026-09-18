@@ -1,8 +1,8 @@
 # Source Module Architecture & File Responsibilities
 
-[← Back to Engineering Innovations](engineering.md) · [← Back to README](../README.md)
+[← Back to README](../README.md)
 
-This document details the responsibility of every source file in [`src/`](https://github.com/dmuldrew/raster_h3/tree/main/src), organized by module. Each module maps to one or more of the core engineering innovations described in [Core Engineering Innovations](engineering.md).
+This document details the responsibility of every source file in [`src/`](https://github.com/dmuldrew/raster_h3/tree/main/src), organized by module.
 
 ---
 
@@ -15,7 +15,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/crs/`](https://github.com/dmuldrew/raster_h3/tree/main/src/crs) — Coordinate Reference System Detection & Reprojection
-*Maps to: [Engineering Innovations §3 Row-Constant Latitude Hoisting](engineering.md#3-row-constant-latitude-hoisting--coordinate-hierarchy)*
 
 | File | Responsibility |
 | :--- | :--- |
@@ -25,7 +24,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/encoding/`](https://github.com/dmuldrew/raster_h3/tree/main/src/encoding) — Zero-Allocation Hex & WKB Geometry Serialization
-*Maps to: [Engineering Innovations §8 Zero-Allocation Fast Hex Formatting](engineering.md#8-zero-allocation-fast-hex-formatting), [Engineering Innovations §14 Native OGC GeoParquet 1.1 Exporter](engineering.md#14-native-ogc-geoparquet-11-exporter-stack-allocated-wkb-hexagons--projjson)*
 
 | File | Responsibility |
 | :--- | :--- |
@@ -36,7 +34,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/ffi/`](https://github.com/dmuldrew/raster_h3/tree/main/src/ffi) — DuckDB C-API Foreign Function Interface
-*Maps to: [Engineering Innovations §10 Native DuckDB Parallelism](engineering.md#10-dynamic-work-stealing-parallelism--duckdb-init_local-pipeline)*
 
 | File | Responsibility |
 | :--- | :--- |
@@ -46,7 +43,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/raster/`](https://github.com/dmuldrew/raster_h3/tree/main/src/raster) — GeoTIFF I/O, Cloud Streaming & Mosaic Ingestion
-*Maps to: [Engineering Innovations §7 Zero-Copy memmap2](engineering.md#7-zero-copy-memmap2--async-prefetching), [Engineering Innovations §11 Bounded Buffer Pool](engineering.md#11-bounded-lock-free-buffer-recycling-pool-decodingbufferpool), [Engineering Innovations §12 Single-Hop Bounded Prefetcher](engineering.md#12-single-hop-bounded-in-order-prefetcher-orderedprefetchqueuet), [Engineering Innovations §13 Cloud-Native COG & Mosaic Ingestion](engineering.md#13-cloud-native-cog--mosaic-ingestion)*
 
 | File | Responsibility |
 | :--- | :--- |
@@ -63,7 +59,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/aggregator/`](https://github.com/dmuldrew/raster_h3/tree/main/src/aggregator) — Statistical Accumulation & Scanline Horizon Engine
-*Maps to: [Engineering Innovations §1 Horizon Eviction](engineering.md#1-southernmost-scan-line-horizon-eviction), [Engineering Innovations §2 Scanline Lookahead](engineering.md#2-h3-scanline-lookahead-algorithm), [Engineering Innovations §4 Linear Longitude Stepping](engineering.md#4-linear-longitude-stepping), [Engineering Innovations §5 In-Register Run Accumulation](engineering.md#5-in-register-run-accumulation), [Engineering Innovations §6 Branchless Min/Max](engineering.md#6-branchless-hardware-minmax), [Engineering Innovations §9 ROI Chunk Pruning](engineering.md#9-roi-bounding-box-chunk-pruning)*
 
 #### Core Accumulation & Pixel Processing
 
@@ -113,7 +108,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/functions/`](https://github.com/dmuldrew/raster_h3/tree/main/src/functions) — DuckDB SQL Function Bindings & Execution
-*Maps to: [Engineering Innovations §8 Fast Hex Formatting](engineering.md#8-zero-allocation-fast-hex-formatting), [Engineering Innovations §10 DuckDB init_local Pipeline](engineering.md#10-dynamic-work-stealing-parallelism--duckdb-init_local-pipeline), [Engineering Innovations §14 GeoParquet Exporter](engineering.md#14-native-ogc-geoparquet-11-exporter-stack-allocated-wkb-hexagons--projjson)*
 
 #### Table Functions
 
@@ -159,7 +153,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/parquet/`](https://github.com/dmuldrew/raster_h3/tree/main/src/parquet) — Native Streaming GeoParquet Writer
-*Maps to: [Engineering Innovations §14 Native OGC GeoParquet 1.1 Exporter](engineering.md#14-native-ogc-geoparquet-11-exporter-stack-allocated-wkb-hexagons--projjson)*
 
 | File | Responsibility |
 | :--- | :--- |
@@ -171,7 +164,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/pmtiles/`](https://github.com/dmuldrew/raster_h3/tree/main/src/pmtiles) — PMTiles v3 & MVT Vector Tile Generation
-*Maps to: [Engineering Innovations §10 Native DuckDB Parallelism](engineering.md#10-dynamic-work-stealing-parallelism--duckdb-init_local-pipeline)*
 
 | File | Responsibility |
 | :--- | :--- |
@@ -186,7 +178,6 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 ---
 
 ### [`src/transcode/`](https://github.com/dmuldrew/raster_h3/tree/main/src/transcode) — Cross-Format Dataset Transcoding
-*Maps to: [Engineering Innovations §1 Horizon Eviction](engineering.md#1-southernmost-scan-line-horizon-eviction), [Engineering Innovations §10 Native DuckDB Parallelism](engineering.md#10-dynamic-work-stealing-parallelism--duckdb-init_local-pipeline)*
 
 | File | Responsibility |
 | :--- | :--- |
