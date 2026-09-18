@@ -96,8 +96,10 @@ CREATE TABLE census_tracts_h3 AS
 SELECT 
     tract_name,
     median_income,
-    round(total_population / (ST_Area(geom) / 1000000.0), 0) AS pop_density_per_sqkm,
-    unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8)) AS h3_index
+    round(total_population / (ST_Area(geom) / 1000000.0), 0) 
+        AS pop_density_per_sqkm,
+    unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8))
+        AS h3_index
 FROM ST_Read('census_tracts.geojson');
 
 -- 3. JOIN raster results with census tracts on the shared H3 index
@@ -117,7 +119,7 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
-> No Python. No GDAL. No intermediate files. The raster *is* the table.
+> No Python. No GDAL. No intermediate files. The raster *becomes* a queryable table source.
 
 ### Why Intermediate H3 Aggregations Change Everything
 
