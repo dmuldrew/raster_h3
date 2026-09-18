@@ -72,7 +72,14 @@ A city planning department has two datasets:
 Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid:
 
 ```sql
--- 1. Polyfill vector census tract polygons into H3 cells (using DuckDB Spatial & H3)
+-- 1. Aggregate the 30m land cover raster into the same H3 grid (< 15 MB RAM, seconds)
+CREATE TABLE canopy_h3 AS
+SELECT h3_index, majority_class, majority_fraction AS canopy_purity
+FROM h3_raster_categorical_aggregate(
+    'nlcd_landcover_2021.tif', resolution := 8
+);
+
+-- 2. Polyfill vector census tract polygons into H3 cells (using DuckDB Spatial & H3)
 CREATE TABLE census_tracts_h3 AS
 SELECT 
     tract_name,
@@ -81,22 +88,16 @@ SELECT
     unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8)) AS h3_index
 FROM ST_Read('census_tracts.geojson');
 
--- 2. Aggregate the 30m land cover raster into the same H3 grid (< 15 MB RAM, seconds)
-CREATE TABLE canopy_h3 AS
-SELECT h3_index, majority_class, majority_fraction AS canopy_purity
-FROM h3_raster_categorical_aggregate(
-    'nlcd_landcover_2021.tif', resolution := 8
-);
-
 -- 3. JOIN raster results with census tracts on the shared H3 index
 SELECT
     c.tract_name,
     c.median_income,
     c.pct_children_under_5,
-    t.majority_class        AS dominant_landcover,
+    t.majority_class AS dominant_landcover,
     t.canopy_purity
-FROM census_tracts_h3 c
-JOIN canopy_h3         t ON c.h3_index = t.h3_index
+FROM census_tracts_h3 AS c
+JOIN canopy_h3 AS t 
+ON c.h3_index = t.h3_index
 WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
   AND t.canopy_purity  < 0.30        -- Less than 30% tree canopy
   AND c.median_income  < 45000       -- Low-income tracts
