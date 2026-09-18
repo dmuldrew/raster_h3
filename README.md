@@ -65,31 +65,30 @@ The **Uber H3 Index** divides the Earth into a hierarchical hexagonal grid with 
 A city planning department has two datasets:
 
 1. **A land cover raster** — a 30-meter NLCD GeoTIFF classifying every pixel as forest, grassland, impervious surface, water, etc.
-2. **A census demographics table** — 4,200 census tracts with population, median income, and percent children under 5 (with centroid latitude/longitude or boundary geometry).
+2. **A census demographics table** — 4,200 census tract boundary polygons (GeoJSON / GeoParquet) with population, median income, and percent children under 5.
 
 **The question**: *Which low-income neighborhoods have the least tree canopy coverage?*
 
-Without a shared spatial index, answering this requires a multi-tool ETL pipeline, gigabytes of intermediate GeoJSON, and hours of processing. With `raster_h3`, it's a standard SQL JOIN:
+Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid:
 
 ```sql
--- 1. Index vector census tracts to H3 (using DuckDB's H3 extension)
+-- 1. Polyfill vector census tract polygons into H3 cells (using DuckDB Spatial & H3)
 CREATE TABLE census_tracts_h3 AS
 SELECT 
     tract_name,
     median_income,
     pct_children_under_5,
-    h3_latlng_to_cell(centroid_lat, centroid_lon, 8) AS h3_index
-    -- Or for polygon boundaries: unnest(h3_polygon_wkt_to_cells(geom, 8)) AS h3_index
-FROM read_csv('census_tracts.csv');
+    unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8)) AS h3_index
+FROM ST_Read('census_tracts.geojson');
 
--- 2. Aggregate the land cover raster into the same H3 grid (< 15 MB RAM, seconds)
+-- 2. Aggregate the 30m land cover raster into the same H3 grid (< 15 MB RAM, seconds)
 CREATE TABLE canopy_h3 AS
 SELECT h3_index, majority_class, majority_fraction AS canopy_purity
 FROM h3_raster_categorical_aggregate(
     'nlcd_landcover_2021.tif', resolution := 8
 );
 
--- 3. JOIN raster results with the census table on the shared H3 index
+-- 3. JOIN raster results with census tracts on the shared H3 index
 SELECT
     c.tract_name,
     c.median_income,
@@ -106,7 +105,23 @@ ORDER BY t.canopy_purity ASC;
 
 > No Python. No GDAL. No intermediate files. The raster *is* the table.
 
-The H3 index is the bridge — once both raster summaries and your vector/tabular data share the same hexagonal index, any SQL JOIN connects them.
+### Why Intermediate H3 Aggregations Change Everything
+
+Materializing both raster and vector datasets into intermediate H3 tables (or Parquet files) provides fundamental architectural advantages over traditional GIS workflows:
+
+#### 1. Benefits for Vector Datasets
+* **Polyfill Once, Eliminate Geometry Math**: Administrative boundaries (census tracts, voting precincts, parcel lots) often contain thousands of vertices. Evaluating spatial containment (`ST_Contains`, `ST_Intersects`) across millions of records is computationally brutal. Polyfilling vector polygons into H3 cells once eliminates all downstream polygonal math.
+* **Decoupled Update Cycles**: Demographic tables, property boundaries, and customer records update frequently (daily, monthly, or annually), while foundational rasters (elevation DEMs, land cover) change rarely. Pre-indexing vectors into H3 lets you incorporate updated vector tables with a 50ms hash join—without re-reading a 50 GB raster.
+* **Standardizing Irregular Shapes (MAUP Mitigation)**: Census tracts and zip codes vary radically in area—a rural tract can be 1,000× larger than an urban one, severely distorting statistical comparisons. Polyfilling vectors into uniform H3 hexagons discretizes irregular boundaries into equal-area spatial units.
+
+#### 2. Benefits for Raster Ingestion
+* **Scan Once, Query Everywhere**: Decompressing and processing an 8–50 GB GeoTIFF (billions of pixels) is an intensive operation you only want to do once. Once aggregated into `canopy_h3` or exported to Parquet, downstream analyses query in milliseconds without touching raw raster pixels again.
+* **Drastic Storage Reduction**: A multi-gigabyte raster compresses into a compact, columnar H3 table that is 50×–100× smaller on disk. You can easily version-control it, store it in your cloud data lake (S3/R2), or query it via DuckDB, Snowflake, or BigQuery.
+
+#### 3. Benefits for Spatial Joining & Visualization
+* **$O(1)$ Hash Joins vs $O(N \times M)$ Geometry Math**: Converting both raster pixels and vector polygons to 64-bit integer H3 cells replaces expensive topological intersection algorithms with hardware-speed **integer equality hash joins** (`JOIN ON c.h3_index = t.h3_index`).
+* **Universal Lingua Franca**: Any number of disparate rasters (elevation, temperature, canopy) and vector layers (demographics, parcels, sensor points) can be joined together in a single multi-way SQL query—eliminating projection mismatches, resolution differences, and resampling errors.
+* **Direct PMTiles from Vector Parquet**: Intermediate H3 vector tables stored in Parquet can be transcoded directly into multi-zoom web map pyramids via `h3_parquet_to_pmtiles` without Tippecanoe, GDAL, or GeoJSON scratch files.
 
 ### From Query to Web Map in One Step
 
