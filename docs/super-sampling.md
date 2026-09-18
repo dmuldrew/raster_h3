@@ -51,7 +51,7 @@ The scanline walker separates raster rows into:
 
 Because the RGSS envelope is compact and interior pixels bypass individual sample indexing, **a $4\times$ increase in sampling density incurs only a $\sim 2.1\times$ runtime difference rather than a $4\times$ penalty**.
 
-### 4. Selection Heuristic
+### 3. Selection Heuristic
 
 ```
 Is raster pixel resolution significantly smaller than H3 cell? (e.g. 10m pixels into Res 7/8)

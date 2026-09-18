@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document details the core architectural principles and implementation details that enable `raster_h3` to achieve hardware-saturating throughput during raster-to-H3 aggregation while maintaining a strictly bounded memory footprint.
+This document details the architectural principles that enable `raster_h3` to aggregate multi-gigabyte rasters into H3 hexagonal grids at hardware-saturating throughput while keeping memory strictly bounded below 15 MB.
 
 > [!NOTE]
 > Performance benchmarks, timing metrics, and micro-architectural numbers cited in this document reflect native release builds evaluated on an Apple M-series workstation (8 performance cores, 16 GB Unified Memory) and modern x86_64 processors with AVX2/SSE2 support.
