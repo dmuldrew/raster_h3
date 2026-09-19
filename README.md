@@ -8,6 +8,12 @@ A native DuckDB extension written in pure Rust that aggregates multi-gigabyte ge
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
+| Output | Use Case | One-Liner |
+| :--- | :--- | :--- |
+| **DuckDB Table** | SQL analytics, JOINs, aggregation | `SELECT * FROM h3_raster_continuous_aggregate(...)` |
+| **PMTiles v3** | Web maps — zero servers, one file | `SELECT * FROM h3_raster_to_pmtiles(...)` |
+| **GeoParquet 1.1** | GIS interchange (QGIS, GeoPandas, BigQuery) | `SELECT * FROM h3_raster_to_parquet(..., geoparquet := true)` |
+
 ---
 
 ## 📖 Table of Contents
@@ -16,15 +22,26 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 - [How It Works](#how-it-works)
 - [Installation & Docker Quickstart](#installation--docker-quickstart)
 - [SQL Usage & Practical Recipes](#sql-usage--practical-recipes)
-- [Core Engineering Innovations](#core-engineering-innovations)
+- [Core Engineering Architecture](#core-engineering-architecture)
 - [Architecture Diagram](#architecture-diagram)
+- [Source Module Architecture](docs/module-architecture.md)
 - [Core Dependencies](#core-dependencies--architectural-contributions)
 - [Troubleshooting & Common Pitfalls](#troubleshooting--common-pitfalls)
 - [Building & Testing Locally](#building--testing-locally)
 - [License](#license)
 
 **📖 Deep Dives:**
-[Engineering Details](docs/engineering.md) · [Optimal Raster Formats](docs/optimal-raster-format.md) · [Super-Sampling](docs/super-sampling.md) · [CRS & Projections](docs/crs-and-projection.md) · [Multi-Resolution Pyramids](docs/multi-resolution.md) · [PMTiles v3](docs/pmtiles.md) · [Architecture Comparison](docs/architecture-comparison.md) · [API Reference](docs/api-reference.md)
+
+| Document | What It Covers |
+| :--- | :--- |
+| [Engineering Architecture](docs/engineering.md) | 14 pillars enabling < 15 MB RAM, hardware-saturating throughput |
+| [Module Architecture](docs/module-architecture.md) | File-by-file source code map with GitHub links |
+| [PMTiles & Multi-Resolution](docs/pmtiles.md) | Multi-resolution pyramids, zoom mapping, zero-server web maps |
+| [Optimal Raster Formats](docs/optimal-raster-format.md) | Why tiled WGS84 COGs are 4.5–6× faster, GDAL recipes |
+| [Super-Sampling](docs/super-sampling.md) | RGSS, Hex, Gaussian boundary anti-aliasing presets |
+| [CRS & Projections](docs/crs-and-projection.md) | Supported projections, detection, 3-tier transform hierarchy |
+| [Architecture Comparison](docs/architecture-comparison.md) | Benchmarks vs Python/PostGIS/GDAL, environment trade-offs |
+| [API Reference](docs/api-reference.md) | Complete SQL function signatures, parameters, output schemas |
 
 ---
 
@@ -41,17 +58,115 @@ Joining raster values (elevation, temperature, land cover) with business entitie
 
 ### The Solution: Uber H3 Discrete Global Grid System
 
-The **Uber H3 Index** divides the Earth into a hierarchical hexagonal grid with uniform neighbor adjacency and minimal area distortion. By converting raster pixels into H3 cell indices (`UBIGINT` / `VARCHAR`), spatial grids become standard relational tables joinable via `JOIN ON r.h3_index = v.h3_index`.
+The **Uber H3 Spatial Index** divides the Earth into a hierarchical grid of invariant hexagons across 16 resolution levels. Unlike square grids, hexagons have identical distances to all six neighbors and minimal area distortion across global latitudes.
 
-### Project Goals
+Aggregating rasters into H3 solves four fundamental challenges of working with raw imagery:
+* **Normalizes Disparate Resolutions & Projections**: Rasters arrive with differing pixel sizes (10m Sentinel, 30m Landsat, 1km climate grids) and incompatible local projections. H3 maps them all into a single, standardized global grid without manual grid resampling.
+* **Drastic 50×–100× Data Reduction**: An H3 Resolution 8 cell aggregates roughly 800 thirty-meter pixels into a single summary row, shrinking a multi-gigabyte raster by orders of magnitude on disk.
+* **Preserves Rich Surface Distributions**: Rather than losing nuance to a simple average, the engine captures the full distribution per cell—including mean, variance/ruggedness, and min/max for continuous terrain, plus class purity and Shannon entropy (landscape fragmentation) for categorical maps.
+* **Unlocks Relational SQL Joins**: Every hexagon is addressed by a compact 64-bit integer (`UBIGINT` / hex string). Once pixels become H3 cells, rigid 2D raster matrices become standard relational tables joinable directly with tabular business data: `JOIN ON r.h3_index = v.h3_index`.
 
-- **Zero Python / Zero GDAL C++ Dependencies** — Pure Rust compiled into a single native dynamic library (`.dylib`, `.so`, `.dll`).
-- **Bounded Constant Memory** — O(Scan Front) < 15 MB RAM regardless of file size.
-- **Hardware-Saturating Multi-Core Throughput** — Maximizes CPU throughput across all available cores via Rayon work-stealing and DuckDB thread distribution.
-- **Native PMTiles v3 Export** — Single-file vector tile archives with zero intermediate files, zero `tippecanoe`, and strict H3 validity enforcement.
-- **Native OGC GeoParquet 1.1 Export** — 125-byte closed WKB polygon geometries with embedded PROJJSON metadata.
-- **Cloud-Native COG & S3 Streaming** — Async chunk-range prefetching and request coalescing for remote rasters.
-- **Sub-Pixel Super-Sampling** — RGSS, Hexagonal, Gaussian PSF, and 8-Rooks anti-aliasing for exact boundary aggregation.
+For more details on the grid system and its mathematical design, see the [official H3 documentation](https://h3geo.org/docs/) and the [Uber engineering blog](https://www.uber.com/blog/h3/).
+
+### Raster Meets Table: A Worked Example
+
+A city planning department has two datasets:
+
+1. **A land cover raster** — a 30-meter NLCD GeoTIFF classifying every pixel as forest, grassland, impervious surface, water, etc.
+2. **A census demographics table** — 4,200 census tract boundary polygons (GeoJSON / GeoParquet) with total population and median income.
+
+**The question**: *Which low-income, densely populated neighborhoods have the least tree canopy coverage?*
+
+Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid:
+
+```sql
+-- 1. Aggregate the 30m land cover raster into H3 hexagons (< 15 MB RAM, seconds)
+CREATE TABLE canopy_h3 AS
+SELECT h3_index, majority_class, majority_fraction AS canopy_purity
+FROM h3_raster_categorical_aggregate(
+    'nlcd_landcover_2021.tif', resolution := 8
+);
+
+-- 2. Polyfill vector census tracts into H3 cells & compute population density
+-- (h3_polygon_wkt_to_cells matches hexagons whose centroids fall inside each polygon)
+-- For dense urban tracts smaller than an H3 Resolution 8 cell (~74 ha),
+-- use Resolution 9 (~10.5 ha) or fall back to the tract centroid
+-- (h3_latlng_to_cell(ST_Centroid(geom), 8)) so that compact boundary polygons
+-- are never omitted from the join.
+
+CREATE TABLE census_tracts_h3 AS
+SELECT 
+    tract_name,
+    median_income,
+    round(total_population / (ST_Area(geom) / 1000000.0), 0) 
+        AS pop_density_per_sqkm,
+    unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8))
+        AS h3_index
+FROM ST_Read('census_tracts.geojson');
+
+-- 3. JOIN raster results with census tracts on the shared H3 index
+SELECT
+    c.tract_name,
+    c.median_income,
+    c.pop_density_per_sqkm,
+    t.majority_class AS dominant_landcover,
+    t.canopy_purity
+FROM census_tracts_h3 AS c
+JOIN canopy_h3 AS t 
+  ON c.h3_index = t.h3_index
+WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
+  AND t.canopy_purity  < 0.30        -- Less than 30% tree canopy
+  AND c.median_income  < 45000       -- Low-income tracts
+  AND c.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
+ORDER BY t.canopy_purity ASC;
+```
+
+> No Python. No GDAL. No intermediate files. The raster *becomes* a queryable table source.
+
+### Why Intermediate H3 Aggregations Change Everything
+
+Materializing both raster and vector datasets into intermediate H3 tables (or Parquet files) provides fundamental architectural advantages over traditional GIS workflows:
+
+#### 1. Benefits for Vector Datasets
+* **Polyfill Once, Eliminate Geometry Math**: Administrative boundaries (census tracts, voting precincts, parcel lots) often contain thousands of vertices. Evaluating spatial containment (`ST_Contains`, `ST_Intersects`) across millions of records is computationally brutal. Polyfilling vector polygons into H3 cells once eliminates all downstream polygonal math.
+* **Decoupled Update Cycles**: Demographic tables, property boundaries, and customer records update frequently (daily, monthly, or annually), while foundational rasters (elevation DEMs, land cover) change rarely. Pre-indexing vectors into H3 lets you incorporate updated vector tables with a 50ms hash join—without re-reading a 50 GB raster.
+* **Standardizing Irregular Shapes (MAUP Mitigation)**: Census tracts and zip codes vary radically in area—a rural tract can be 1,000× larger than an urban one, severely distorting statistical comparisons. Polyfilling vectors into uniform H3 hexagons discretizes irregular boundaries into equal-area spatial units.
+
+#### 2. Benefits for Raster Ingestion
+* **Scan Once, Query Everywhere**: Decompressing and processing an 8–50 GB GeoTIFF (billions of pixels) is an intensive operation you only want to do once. Once aggregated into `canopy_h3` or exported to Parquet, downstream analyses query in milliseconds without touching raw raster pixels again.
+* **Drastic Storage Reduction**: A multi-gigabyte raster compresses into a compact, columnar H3 table that is 50×–100× smaller on disk. You can easily version-control it, store it in your cloud data lake (S3/R2), or query it via DuckDB, Snowflake, or BigQuery.
+
+#### 3. Benefits for Spatial Joining & Visualization
+* **$O(1)$ Hash Joins vs $O(N \times M)$ Geometry Math**: Converting both raster pixels and vector polygons to 64-bit integer H3 cells replaces expensive topological intersection algorithms with hardware-speed **integer equality hash joins** (`JOIN ON c.h3_index = t.h3_index`).
+* **Universal Lingua Franca**: Any number of disparate rasters (elevation, temperature, canopy) and vector layers (demographics, parcels, sensor points) can be joined together in a single multi-way SQL query—eliminating projection mismatches, resolution differences, and resampling errors.
+* **Direct PMTiles from Vector Parquet**: Intermediate H3 vector tables stored in Parquet can be transcoded directly into multi-zoom web map pyramids via `h3_parquet_to_pmtiles` without Tippecanoe, GDAL, or GeoJSON scratch files.
+
+### From Query to Web Map in One Step
+
+`raster_h3` can export results directly to a **PMTiles v3** single-file vector tile archive — a multi-resolution pyramid ready for MapLibre, Kepler.gl, or Felt with zero intermediate files and zero tile servers:
+
+```sql
+SELECT * FROM h3_raster_to_pmtiles(
+    'nlcd_landcover_2021.tif', 'landcover_canopy.pmtiles',
+    min_resolution := 5, max_resolution := 8, categorical := true
+);
+-- Upload landcover_canopy.pmtiles to S3, R2, or GitHub Pages.
+-- Open in MapLibre GL JS — done. Zoom from state-level to city-block.
+```
+
+A web map needs tiles at every zoom level — from hemispheric overview down to street-level detail. `raster_h3` builds this entire multi-resolution pyramid in a single pass over the raster, aggregating pixels simultaneously across all requested H3 resolutions. See [PMTiles & Multi-Resolution](docs/pmtiles.md) for the full deep dive.
+
+### Design Principles
+
+| Principle | What It Means |
+| :--- | :--- |
+| **Pure Rust, Zero Dependencies** | Single `.dylib` / `.so` / `.dll` — no Python, no GDAL C++ |
+| **Bounded < 15 MB RAM** | Streams one scanline at a time, regardless of file size |
+| **Hardware-Saturating Throughput** | Work-stealing parallelism across all CPU cores |
+| **Native PMTiles v3 Export** | Single-file web maps — zero Tippecanoe, zero tile servers |
+| **Native GeoParquet 1.1 Export** | Stack-allocated WKB polygons with PROJJSON metadata |
+| **Cloud-Native Streaming** | HTTP/S3 COG range prefetching — no local copies needed |
+| **Sub-Pixel Super-Sampling** | RGSS, Hex, Gaussian, 8-Rooks boundary anti-aliasing |
 
 ---
 
@@ -71,6 +186,10 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 
 `raster_h3` reads the image like a document scanner — one thin row at a time from North to South. When a row passes the southernmost boundary of a hexagon, that hexagon is sealed and streamed directly into query results. Memory stays bounded at < 15 MB whether the raster is 10 MB or 500 GB.
 
+### Direct Web-Ready Map Tiles
+
+Generates single-file **PMTiles v3** vector pyramids ready for MapLibre GL, Kepler.gl, or Felt in a single query — no Tippecanoe, no GeoJSON scratch files, no tile servers. Upload the `.pmtiles` file to Amazon S3, Cloudflare R2, or GitHub Pages and open it in MapLibre with zero backend infrastructure.
+
 ### Latitude "Cruise Control" (Eliminating 99.8% of Math)
 
 Every pixel in a row shares the same latitude. Rather than running spherical trigonometry millions of times, `raster_h3` computes latitude once per row and steps across with simple arithmetic — eliminating 99.8% of coordinate projection math.
@@ -84,10 +203,6 @@ When entering a hexagon, the algorithm estimates its span from previous hexagons
 ### In-Database Streaming (No Intermediate Files)
 
 `raster_h3` runs directly inside DuckDB, streaming results into your SQL queries, joins, and Parquet exports — zero intermediate files.
-
-### Direct Web-Ready Map Tiles
-
-Generates single-file **PMTiles v3** vector pyramids ready for MapLibre GL, Kepler.gl, or Felt — no Tippecanoe, no GeoJSON scratch files, no tile servers.
 
 ---
 
@@ -386,7 +501,7 @@ print(res)
 
 ---
 
-## Core Engineering Innovations
+## Core Engineering Architecture
 
 `raster_h3` achieves near-hardware-limit throughput through these architectural principles:
 
@@ -407,7 +522,8 @@ print(res)
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
 | 14 | **Native OGC GeoParquet 1.1 Exporter** | 125-byte WKB polygons with embedded PROJJSON metadata |
 
-> 📖 **Detailed explanations** of each innovation — See [docs/engineering.md](docs/engineering.md)
+> 📖 **Detailed explanations** of each architectural pillar — See [docs/engineering.md](docs/engineering.md)  
+> 🗺️ **Source Module Architecture** — File-by-file breakdown of crate internals mapped to these principles: [docs/module-architecture.md](docs/module-architecture.md)
 
 ---
 
@@ -470,6 +586,8 @@ flowchart TD
         CHUNK_OUT --> TF
     end
 ```
+
+> 🗺️ **Looking for source file responsibilities?** See the complete [Source Module Architecture](docs/module-architecture.md) for a guide to every file in `src/`.
 
 ---
 
