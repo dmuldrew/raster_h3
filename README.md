@@ -88,11 +88,8 @@ FROM h3_raster_categorical_aggregate(
 );
 
 -- 2. Polyfill vector census tracts into H3 cells & compute population density
--- (h3_polygon_wkt_to_cells matches hexagons whose centroids fall inside each polygon)
--- For dense urban tracts smaller than an H3 Resolution 8 cell (~74 ha),
--- use Resolution 9 (~10.5 ha) or fall back to the tract centroid
--- (h3_latlng_to_cell(ST_Centroid(geom), 8)) so that compact boundary polygons
--- are never omitted from the join.
+-- h3_polygon_wkt_to_cells indexes hexagons whose centroids fall inside the polygon;
+-- for small tracts, use Res 9 or fall back to h3_latlng_to_cell(ST_Centroid(geom), 8).
 
 CREATE TABLE census_tracts_h3 AS
 SELECT 
