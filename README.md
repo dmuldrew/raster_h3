@@ -181,25 +181,35 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 
 ### The Moving Scanner Front (Constant Memory)
 
-`raster_h3` reads the image like a document scanner — one thin row at a time from North to South. When a row passes the southernmost boundary of a hexagon, that hexagon is sealed and streamed directly into query results. Memory stays bounded at < 15 MB whether the raster is 10 MB or 500 GB.
+`raster_h3` streams the raster like a document scanner — one thin row at a time from North to South:
+- **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
+- **Strictly Bounded Memory**: Active memory never exceeds **< 15 MB RAM**, whether the raster is 10 MB or 500 GB.
 
 ### Direct Web-Ready Map Tiles
 
-Generates single-file **PMTiles v3** vector pyramids ready for MapLibre GL, Kepler.gl, or Felt in a single query — no Tippecanoe, no GeoJSON scratch files, no tile servers. Upload the `.pmtiles` file to Amazon S3, Cloudflare R2, or GitHub Pages and open it in MapLibre with zero backend infrastructure.
+Generates single-file **PMTiles v3** vector pyramids directly inside DuckDB in a single query:
+- **Zero Intermediate Tooling**: Eliminates C++ Tippecanoe, GeoJSON scratch files, and dedicated tile server infrastructure.
+- **Serverless Map Delivery**: Upload the `.pmtiles` archive directly to Amazon S3, Cloudflare R2, or GitHub Pages and render with zero backend infrastructure.
 
 ### Latitude "Cruise Control" (Eliminating 99.8% of Math)
 
-Every pixel in a row shares the same latitude. Rather than running spherical trigonometry millions of times, `raster_h3` computes latitude once per row and steps across with simple arithmetic — eliminating 99.8% of coordinate projection math.
+Every pixel in a row shares the exact same latitude coordinate on standard North-Up rasters:
+- **Row-Constant Hoisting**: Evaluates transcendental projection functions (`atan`, `exp`, PROJ) once per row rather than per pixel.
+- **Linear Longitude Stepping**: Steps column coordinates across the row via 1-cycle arithmetic (`lon += delta_lon`), eliminating 99.8% of projection math.
 
 > ⚡ **Performance Tip**: Ingesting rasters formatted as tiled WGS84 Cloud-Optimized GeoTIFFs (COGs) achieves an additional **4.5×–6× speedup** by eliminating spherical trigonometry entirely. See [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
 
 ### Hexagon Lookahead & Run-Skipping
 
-When entering a hexagon, the algorithm estimates its span from previous hexagons and verifies the destination. Convexity guarantees that all intermediate pixels belong to the same cell. Boundary crossings are resolved via binary search in O(log N) steps, reducing expensive trig from ~30 to ~6 operations per hexagon.
+Instead of computing H3 coordinates for every pixel, `raster_h3` estimates each hexagon's width and jumps ahead:
+- **Convex Run-Skipping**: Because hexagons are convex shapes, all intermediate pixels between the start and destination are guaranteed to share the same cell and are aggregated in bulk with zero H3 math.
+- **Binary Search Boundaries**: Cell boundaries are resolved via binary search, reducing expensive spherical trigonometry from $N$ to $O(\log_2 N)$ operations per hexagon (e.g., from ~30 down to ~6 calculations for 30m rasters at H3 Resolution 8).
 
 ### In-Database Streaming (No Intermediate Files)
 
-`raster_h3` runs directly inside DuckDB, streaming results into your SQL queries, joins, and Parquet exports — zero intermediate files.
+`raster_h3` executes natively inside DuckDB's vectorized query engine:
+- **Zero Disk Scratch**: Streams aggregated cells directly into your SQL queries, analytical joins, and Parquet exports without writing intermediate files to disk.
+- **Unified Pipeline**: Replaces multi-step pipelines (GDAL → CSV/Shapefile → Database Loader) with a single SQL query.
 
 ---
 
