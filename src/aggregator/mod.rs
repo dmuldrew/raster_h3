@@ -1,9 +1,8 @@
 //! Core H3 hexagonal aggregation engines for raster data.
 //!
 //! This module implements the core H3 hexagonal aggregation engines. It uses a
-//! "southernmost scan-line horizon eviction" architecture that maintains only
-//! the active scan front in memory (~15 MB), enabling constant-memory streaming
-//! of multi-gigabyte rasters.
+//! conservative horizon eviction with budgeted spilling of partial aggregation
+//! state. TIFF decoding and downstream consumers have separate memory costs.
 //!
 //! # Architecture & Key Submodules
 //!

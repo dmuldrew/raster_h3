@@ -314,6 +314,20 @@ impl BindHelper {
         let sampling = self.parse_sampling();
         let bbox = self.parse_bbox();
         let compact = self.get_named_bool("compact").unwrap_or(false);
+        let aggregation_budget_bytes = self
+            .get_named_int("aggregation_budget_bytes")
+            .unwrap_or(8 * 1024 * 1024);
+        let prefetch_chunks = self.get_named_int("prefetch_chunks").unwrap_or(16);
+        let decode_workers = self.get_named_int("decode_workers").unwrap_or(4);
+        if aggregation_budget_bytes < resolutions.len().max(1) as i64 * 65536
+            || prefetch_chunks < 16
+            || decode_workers < 1
+        {
+            self.set_error("aggregation_budget_bytes requires >=65536 per resolution; prefetch_chunks >=16; decode_workers >=1");
+            return None;
+        }
+        let spill_directory = self.get_named_string("spill_directory").map(PathBuf::from);
+
         let overlap_rule = self.parse_overlap_rule();
         let emit_geom = self
             .get_named_bool("geom")
@@ -328,6 +342,10 @@ impl BindHelper {
         };
 
         Some(CommonRasterParams {
+            aggregation_budget_bytes: aggregation_budget_bytes as usize,
+            spill_directory,
+            prefetch_chunks: prefetch_chunks as usize,
+            decode_workers: decode_workers as usize,
             file_path,
             resolved_paths,
             resolutions,
@@ -351,6 +369,10 @@ impl BindHelper {
 /// Standard parameters common to all raster aggregation table functions
 #[derive(Debug, Clone)]
 pub struct CommonRasterParams {
+    pub aggregation_budget_bytes: usize,
+    pub spill_directory: Option<PathBuf>,
+    pub prefetch_chunks: usize,
+    pub decode_workers: usize,
     pub file_path: String,
     pub resolved_paths: Vec<PathBuf>,
     pub resolutions: Vec<u8>,

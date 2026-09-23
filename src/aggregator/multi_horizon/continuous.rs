@@ -239,11 +239,7 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
         } else {
             acc.update_weighted(sample, weight);
         }
-        if self.track_quantiles {
-            if let Some(ref mut q) = acc.quantiles {
-                q.update(sample, weight);
-            }
-        }
+        // update/update_weighted already update the optional quantile sketch.
     }
 }
 

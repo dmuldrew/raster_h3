@@ -208,6 +208,9 @@ impl SamplingPattern {
     #[inline(always)]
     pub fn is_single_point(&self) -> bool {
         self.points.len() == 1
+            && self.points[0].dx == 0.5
+            && self.points[0].dy == 0.5
+            && self.points[0].weight == 1.0
     }
 
     /// Returns (min_dx, max_dx) across all sample points in pattern

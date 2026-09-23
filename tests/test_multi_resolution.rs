@@ -403,7 +403,12 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
                 "Total count mismatch at cell {:x}",
                 cell_u64
             );
-            assert_eq!(multi_rec.accumulator.majority(), single_acc.majority());
+            let (multi_class, multi_weight, multi_fraction) = multi_rec.accumulator.majority();
+            let (single_class, single_weight, single_fraction) = single_acc.majority();
+            assert_eq!(multi_class, single_class);
+            // Bounded windows change merge association for fractional weights.
+            assert!((multi_weight - single_weight).abs() < 1e-9);
+            assert!((multi_fraction - single_fraction).abs() < 1e-12);
             single_acc.for_each_class(|cat, cnt| {
                 assert!(
                     (multi_rec.accumulator.get_class_count(cat) - cnt).abs() < 1e-6,

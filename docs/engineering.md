@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document details the core engineering innovations and architectural principles that enable `raster_h3` to achieve hardware-saturating throughput during raster-to-H3 aggregation while maintaining a strictly bounded memory footprint.
+This document details the core engineering innovations and architectural principles that enable `raster_h3` to achieve hardware-saturating throughput during raster-to-H3 aggregation with conservative horizon eviction and budgeted external aggregation.
 
 > [!NOTE]
 > Performance benchmarks, timing metrics, and micro-architectural numbers cited in this document reflect native release builds evaluated on an Apple M-series workstation (8 performance cores, 16 GB Unified Memory) and modern x86_64 processors with AVX2/SSE2 support.
@@ -11,9 +11,9 @@ This document details the core engineering innovations and architectural princip
 
 | # | Engineering Pillar | Description & Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | Conditional O(scan-front width) memory by evicting completed hexagons when their analytic southern bound clears the scanline horizon (for unrotated North-to-South WGS84/Mercator rasters). |
-| 2 | **H3 Scanline Lookahead Algorithm** | Bounded scanline lookahead with full intermediate pixel certification in proven regimes (unrotated WGS84/Mercator, res ≥ 4, |lat| < 70°), falling back to exact per-sample lookup elsewhere. |
-| 3 | **Row-Constant Latitude Hoisting** | Hoists transcendental projection transforms once per row for unrotated North-Up WGS84/Mercator rasters; projected CRSs (UTM, Conic) and rotated rasters evaluate exact coordinates per sample. |
+| 1 | **Conservative Horizon Eviction & Spill Runs** | Geometric completion where certified; bounded active aggregation with sorted temporary runs when necessary. |
+| 2 | **Certified Scanline Runs** | Checks every pixel center before batching a run; supersampling evaluates the actual sample positions. |
+| 3 | **Row-Constant Latitude Hoisting** | Reuses latitude for eligible WGS84/Mercator centers; general projected and rotated samples use full transforms. |
 | 4 | **Linear Longitude Stepping** | Advances column coordinates via single 1-cycle additions (lon += delta_lon). |
 | 5 | **In-Register Run Accumulation** | Contiguous pixels within the same H3 cell update running statistics in CPU registers, eliminating ~98% of hash table lookups. |
 | 6 | **Branchless Hardware Min/Max** | Replaces conditional branches with `minsd`/`maxsd` instructions with zero branch mispredictions. |
@@ -26,41 +26,61 @@ This document details the core engineering innovations and architectural princip
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Asynchronous HTTP/S3 range prefetching and multi-file Voronoi cutline mosaic blending with zero double-counting. |
 | 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of stack-allocated WKB polygon geometries (109–189 bytes) with embedded PROJJSON `OGC:CRS84` metadata. |
 
-## 1. Southernmost Scan-Line Horizon Eviction
-Streaming aggregation maintains a strictly bounded memory footprint by evicting cells that can receive no further pixel contributions. Safe early eviction requires satisfying two simultaneous invariants:
+## 1. Conservative Horizon Eviction and Budgeted Aggregation
 
-1. **Lower Bound Invariant**: $\text{computed\_south\_lat} \le \text{true minimum latitude of cell}$.
-   The cell's bounding latitude is computed analytically across all great-circle boundary segments rather than via heuristic interior sampling. For each boundary edge with unit normal $\mathbf{N} = \mathbf{A} \times \mathbf{B}$, the stationary latitude point $\mathbf{V}_{\min} = (N_z N_x, N_z N_y, -(N_x^2 + N_y^2))$ is checked for minor-arc containment. If contained, the analytic extremum $z_{\min} = -\sqrt{(N_x^2 + N_y^2)/\|\mathbf{N}\|^2}$ is converted via $\arcsin$ with machine-precision condition-number error bounds $\epsilon = 10^{-12} + 5\epsilon_{\text{mach}} \cdot \text{cond}$.
-2. **Horizon Invariant**: $\text{lat\_horizon} \ge \text{latitude of every unmerged sample}$.
-   The eviction horizon must strictly upper-bound the latitude of all remaining unmerged samples across all unprocessed raster chunks.
+Input streaming alone does not bound aggregation memory. A chunk-at-a-time reader can still accumulate every unique H3 cell in a map. The controller therefore combines geometric completion with an external aggregation fallback.
 
-**Eviction Condition**: An active hexagon is safely evictable if and only if:
-$$\text{computed\_south\_lat} > \text{lat\_horizon}$$
+Early finalization uses two bounds:
 
-### Supported Fast Paths vs. Conservative Fallback
-- **Supported Fast Path ($O(\text{scan-front width})$ memory)**: When all raster inputs are unrotated North-to-South grids ($b = 0$, $d = 0$, $e < 0$, $a > 0$) in cylindrical coordinate systems (WGS84 EPSG:4326 or Web Mercator EPSG:3857), scanlines monotonically descend in latitude. The maximum latitude across all future chunks is strictly bounded by the northernmost extent of the remaining chunk suffix. Cells clearing the horizon are immediately evicted into DuckDB output vectors, yielding conditional $O(\text{scan-front width})$ memory.
-- **Conservative Fallback ($O(\text{total unique cells})$ memory)**: For rasters with South-to-North ordering ($e > 0$), affine rotation or shear ($d \ne 0$ or $b \ne 0$), or non-linear projected CRSs (such as UTM or Albers Equal Area Conic), scanline rows or chunk boundaries do not follow parallels of latitude, and sample latitudes vary non-monotonically. In these regimes, establishing an early horizon upper-bounding all future samples is non-trivial. The engine sets `can_evict_early = false` and holds the eviction watermark at $\infty$, safely deferring all eviction until end-of-file (EOF) `drain_all()`. This completely prevents dropped samples and split duplicate cells while requiring memory proportional to the total number of unique cells in the dataset.
+1. `computed_south_lat <= minimum latitude of the cell's spherical polygon`.
+2. `eviction_horizon >= latitude of every sample in unprocessed chunks`.
 
-## 2. H3 Scanline Lookahead & Precondition Validation
-To optimize inner-loop throughput on large homogeneous rasters, `raster_h3` employs an adaptive scanline span discovery algorithm (`H3ScanlineLookahead` and `H3SpanOptimizer`). Because scanlines are not geodesics on the sphere and unconstrained Euclidean convexity does not apply across spherical H3 cell boundaries or pentagons, shortcuts are restricted to proven geometric regimes:
+`computed_south_lat > eviction_horizon` is a **sufficient**, not necessary, condition for finalization. Every worker wave is joined and merged or persisted before the chunk is counted as processed. Calls from an existing Rayon worker execute the bounded windows locally to avoid nested work-stealing deadlocks when callers hold a shared streamer mutex. The suffix maximum includes all remaining chunks; no worker-completion order is used as a geographic certificate.
 
-1. **Certified Geometric Regimes**: Lookahead jumping and core span skipping are strictly enabled only when all of the following preconditions hold:
-   - Unrotated WGS84 (`EPSG:4326`) or Web Mercator (`EPSG:3857`) grids ($b = 0$, $d = 0$).
-   - Moderate latitudes ($|\text{lat}| < 70^\circ$).
-   - Far from the antimeridian ($|\text{lon}| \le 175^\circ$ without wrapping).
-   - Fine H3 resolutions ($res \ge 4$).
-2. **Intermediate Pixel Certification**: When skipping interior core pixels (`find_core_span`), the engine does not merely evaluate the span endpoints. It certifies that **every intermediate pixel** in the span has all four corners contained within the target cell. If any corner of any intermediate pixel fails, the core span is rejected and all pixels in the span are evaluated individually.
-3. **Exact Per-Sample Fallback**: Projected CRSs (UTM, Albers), rotated or sheared grids, high-latitude regions, antimeridian crossings, and coarse resolutions ($res < 4$) bypass lookahead shortcuts and fall back to exact per-sample CRS transformation and direct `LatLng::to_cell` evaluation.
+### Cell and chunk bounds
 
-## 3. Row-Constant Latitude Hoisting & Coordinate Hierarchy
-- **Unrotated Cylindrical Grids Only**: In unrotated North-Up WGS84 (`EPSG:4326`) and Web Mercator (`EPSG:3857`) rasters ($b = 0$, $d = 0$), raster rows align exactly with lines of constant geodetic latitude. For center-pixel sampling on these grids, transcendental projection equations (`atan`, `exp`) are evaluated **once per row**, and column coordinates advance via linear 1-cycle additions (`lon += delta_lon`).
-- **Projected & Rotated Grids**: In projected CRSs (UTM, Albers Conic) and rotated grids ($d \ne 0$), grid rows are curves or diagonals across lines of latitude; latitude varies continuously across every column. These grids evaluate exact coordinate reprojection per sample.
-- **Sub-Pixel Sampling**: Sub-pixel sampling patterns (e.g. RGSS, 5-point quincunx) introduce vertical offsets $dy$. While center coordinates may be hoisted on unrotated cylindrical rasters, each sub-pixel sample evaluates its distinct $(x + dx, y + dy)$ coordinate.
+`compute_cell_south_lat` uses a conservative edge-length envelope rather than a numerically sensitive stationary-point test. Latitude is 1-Lipschitz in angular distance. Every point on a minor great-circle edge is within half its length of one endpoint. A meridian/parallel path bounds that length above by `abs(delta_lat) + abs(wrapped_delta_lon)` in degrees. Subtracting half this upper bound from the lower endpoint bounds the edge from below. Northern edges attain their minimum at an endpoint; the south-pole-containing cell is handled separately. Basic floating-point arithmetic is rounded outward. This is a bound on the boundary supplied by h3o, not an independent guarantee of upstream library or datum accuracy.
 
-The transformer uses a **three-tier performance hierarchy**:
-- 🟢 **Identity** (`EPSG:4326`, `EPSG:4269`): 0 cycles — coordinates pass through unchanged.
-- 🟡 **Analytical** (`EPSG:3857`, `EPSG:900913`): ~5 cycles — closed-form inverse Mercator.
-- 🔵 **PROJ4** (UTM, Conic, Polar via `proj4rs`): Pure-Rust reprojection pipeline evaluated once per row.
+For WGS84, latitude is affine in pixel coordinates. For Web Mercator, latitude is monotone in affine projected Y. In both cases a chunk's four corners bound every sample within its pixel rectangle, **including rotation, shear, reversed columns and south-to-north rows**. Input chunks are already sorted by northern extent. The controller independently computes conservative eviction bounds instead of trusting sampled projection bounds.
+
+UTM, Albers and general PROJ chunks currently receive an unknown (`+infinity`) eviction bound. Their contributions use the same budgeted aggregation machinery. Sampled projection bounds remain useful for scheduling but are not used as eviction certificates. Future projection-specific certified bounds can enable earlier output without changing spill correctness.
+
+### Aggregation budget and spill lifecycle
+
+`MultiResolutionConfig::aggregation_budget_bytes` defaults to **8 MiB**. Continuous and categorical SQL table functions expose `aggregation_budget_bytes`, `spill_directory`, `prefetch_chunks` and `decode_workers` as named parameters. Rust exporters use the same configuration defaults.
+
+- Half the aggregation budget is divided across resolution maps as spill thresholds. Allocation estimates include hash-table capacity, eviction heaps, quantile bins and categorical overflow maps. A threshold can be crossed by one insertion or table resize before spilling; this is not a byte-exact allocator/RSS cap.
+- Worker aggregation processes bounded row windows in joined parallel waves instead of retaining an entire strip's unique-cell map. Window size is derived from the budget, resolution count and sampling count, with at most eight tasks per wave and 1,024 pixels per task. A minimum one-pixel window and large band/sample counts are irreducible scratch costs.
+- Under pressure, a resolution's active map becomes a sorted temporary run and releases its bucket and heap allocations. From that point, **all of that resolution's remaining contributions are deferred** until its persisted partial states have been merged. A spilled partial is never presented as a completed cell.
+- Runs are combined using binary-carry levels and two-way streaming merges. At most 64 run levels are retained per resolution; only two input readers and one writer participate in an individual merge. Run metadata is bounded independently of the unique-cell count. Temporary files close and are removed on completion, failure or cancellation.
+- The binary codec preserves Welford state, all quantile bins, categorical counts and f64 bit patterns. It does not use the public serde representation, which omits quantile state. Disk errors and truncated runs latch a stream failure, never successful EOF.
+- A single accumulator larger than one eighth of the per-resolution budget is rejected with an explicit error. Increase the budget for unusually large histograms/sketches. Returning a full accumulator makes its size an unavoidable lower bound on memory.
+- EOF results are read incrementally. When no spill occurred, the bounded active map is consumed in memory without a temporary file. Output buffering stops at 2,048 records or one quarter of the aggregation budget in estimated record/state bytes, whichever is reached first; a compaction group can add up to seven records. Categorical long-format expansion downstream has its own additional cost.
+- Compaction consumes sorted complete cells, keeping at most one parent group. It handles six-child pentagons and seven-child hexagons. It does not assume the parent's geographic polygon encloses all logical children. Compaction output is deferred to EOF even when no spill is required.
+
+The public downstream horizon remains conservative while completed output or persisted partials are outstanding. A downstream tiler must not flush ahead of deferred cells.
+
+### What the budget does not cover
+
+The budget controls aggregation growth; it is **not a whole-process memory limit or a universal “500 GB in <15 MB RAM” promise**. Total memory also includes decoded TIFF chunks, compressed input, metadata/job arrays (including one f64 suffix bound per chunk), decoder scratch space, allocator overhead, downstream output and DuckDB execution state.
+
+The controller defaults to a 16-chunk decoded ring, a 16-buffer idle pool, four decoder workers and one consumer-owned decoded chunk. If decoded capacity is at most S bytes, this path owns at most `(16 + 16 + 4 + 1) * S` bytes of decoded buffers, excluding bounded window copies and decoder scratch. Large individual TIFF strips can therefore dominate RAM even though aggregation spills. `prefetch_chunks` and `decode_workers` control these counts. A future byte-budgeted decoder would be needed for a strict whole-pipeline byte limit.
+
+Tests force repeated spills with small budgets and compare against exhaustive per-sample aggregation, including quantiles, variance, category histograms, multi-resolution output, early rotated-grid eviction, compaction, cleanup and I/O failure. These are correctness tests, not a 500 GB RSS or throughput benchmark.
+
+## 2. Certified Scanline Runs
+
+`H3ScanlineLookahead` now checks **every intermediate center** before reusing a cell assignment. The old exponential endpoint probes and binary search relied on interval membership that was not established for spherical cells intersected by projected scanlines. Resolution and latitude cutoffs do not establish that property.
+
+For eligible row-constant grids, adjacent certified centers still form a run whose values can be accumulated together. Projected or rotated paths use individual center transformations. Supersampling evaluates the actual sample positions: four matching corners do not certify a curved spherical footprint, so the corner-only core shortcut returns an empty interval.
+
+This deliberately trades some H3 lookup throughput for correctness. No universal 4x trig reduction or unchanged-throughput claim is made.
+
+## 3. Row-Constant Latitude Hoisting
+
+Unrotated WGS84 and Web Mercator grids have row-constant latitude. Eligible center processing reuses that latitude and steps longitude linearly. Rotation, conic projections and UTM generally require individual coordinate transformations; projected subsamples use their full affine coordinates and inverse projection.
+
+The CRS hierarchy remains identity (WGS84/NAD83 policy), analytical inverse projection (Mercator/Albers), and `proj4rs` fallback. The latter two are not universally evaluated once per row. Projection and datum accuracy remain separate from aggregation completeness.
 
 ## 4. Linear Longitude Stepping & In-Register Run Accumulation
 Once a row's latitude is evaluated, the physical coordinates of pixels within that horizontal scanline step across longitude uniformly:
@@ -97,7 +117,7 @@ Traditional background prefetchers often suffer from thread thrashing: either un
 
 For a single prefetcher, let **C** be ring capacity, **W** decoder workers, **B** the consumer's chunk batch size, and **P** idle-pool capacity. Decoded buffer ownership is bounded by **C + W + B + P** buffers along this path (including a worker's completed buffer waiting to be deposited). This is a count bound, not a fixed byte budget. If each buffer's allocated capacity is at most **S** bytes, those buffers occupy at most **(C + W + B + P) × S** bytes, excluding allocator overhead and decoder scratch storage.
 
-Whole-query memory also includes raster metadata and job lists, compressed remote payloads, decoder scratch buffers, aggregation maps, compaction state, output records, and DuckDB execution state. `OutputBuffer::with_capacity(2048)` reserves initial space; it is not a hard limit. Horizon eviction and EOF flushing can emit more records than the requested row count. Long categorical output additionally expands each cell into one row per category and can overshoot its refill threshold. Therefore these queue bounds do **not** establish a fixed whole-query RAM limit or a universal zero-churn guarantee.
+Whole-query memory also includes raster metadata and job lists, compressed remote payloads, decoder scratch buffers, aggregation maps, output records, and DuckDB execution state. The controller now bounds its output batch as described in §1; `OutputBuffer` itself is an unconstrained container. Long categorical output additionally expands each cell into one row per category and can overshoot its refill threshold. These queue bounds do **not** establish a fixed whole-query RAM limit or a universal zero-churn guarantee.
 
 Regression coverage includes an explicit producer-wait handshake for oversized batch drains and a 15,840-item test connecting the real record and prefetch queues. The latter pauses record consumption, observes the producer blocked at the expected capacity boundary, and checks ordered completion after resuming. It uses one synthetic record per chunk; it is not a live DuckDB/TIFF memory benchmark.
 
@@ -209,6 +229,7 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | `config.rs` | Query-level configuration (`MultiResolutionConfig`) — resolution arrays, sub-pixel sampling patterns, spectral index formulas (`SpectralFormula` for NDVI/NDWI/NBR/EVI computation), streaming quantile targets (`QuantileTarget`), value filters, and category remapping settings. |
 | `lifecycle.rs` | Stream lifecycle state machine (`StreamLifecycle`) with latched three-state transitions (`Running` → `Finished` / `Failed`). Ensures stream failures are never mistaken for normal EOF. Includes `OutputBuffer` for record queue buffering. |
 | `sharded_map.rs` | 32-way partitioned hash map (`ShardedResolutionMap`) using `SplitMix64` on H3 cell indices to distribute accumulator entries across shards. Coordinates exclusive execution phases (parallel chunk workers into thread-local buffers, sequential/disjoint shard merge, and watermark advancement with horizon eviction) to guarantee thread safety without mutexes or atomics on accumulator state. |
+| `spill.rs` | Lossless binary accumulator codecs, bounded two-way external merging and temporary run lifecycle. |
 | `compaction.rs` | Hierarchical aperture-7 child-to-parent compaction (`HierarchicalCompactor`). Merges 7 fine child cells at resolution R into a single coarse parent cell at resolution R−1 during horizon eviction, with state management for incomplete parents. |
 | `continuous.rs` | Continuous chunk payload processing (`MultiContinuousRecord`). Drives pixel-by-pixel H3 cell statistics accumulation across multiple resolution levels with strict tile ownership resolution for overlapping mosaic chunks. |
 | `continuous_streamer.rs` | Continuous raster horizon streamer (`ContinuousKernel`, `MultiScanHorizonStreamer`). Implements single-pass streaming aggregation across multiple H3 resolutions for raw raster bands and spectral index formulas. |

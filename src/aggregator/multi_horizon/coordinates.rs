@@ -407,3 +407,43 @@ impl RowCoordinates {
         )
     }
 }
+
+/// Conservative upper bound for every sample within a chunk's pixel rectangle.
+/// WGS84 latitude is affine; Mercator latitude is monotone in affine Y. Therefore
+/// corners suffice for any rotation/shear and either row direction. General
+/// projection bounds from `transform_rect_bounds` are sampled and are NOT used
+/// as an eviction certificate. Unknown bounds retain cells for budgeted spilling.
+pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTransformer) -> f64 {
+    if !matches!(
+        crs,
+        CrsTransformer::Wgs84Identity | CrsTransformer::WebMercatorFast
+    ) {
+        return f64::INFINITY;
+    }
+    if [gt.a, gt.b, gt.c0, gt.d, gt.e, gt.f0]
+        .iter()
+        .any(|v| !v.is_finite())
+    {
+        return f64::INFINITY;
+    }
+    let mut upper = f64::NEG_INFINITY;
+    for col in [
+        chunk.col_offset as f64,
+        chunk.col_offset as f64 + chunk.width as f64,
+    ] {
+        for row in [
+            chunk.row_offset as f64,
+            chunk.row_offset as f64 + chunk.height as f64,
+        ] {
+            let (x, y) = gt.pixel_to_coord(col, row);
+            let Ok((_, lat)) = crs.transform_point(x, y) else {
+                return f64::INFINITY;
+            };
+            if !lat.is_finite() {
+                return f64::INFINITY;
+            }
+            upper = upper.max(lat.next_up());
+        }
+    }
+    upper
+}

@@ -157,6 +157,15 @@ impl QuantileTarget {
 /// Configuration for multi-resolution aggregation
 #[derive(Debug, Clone)]
 pub struct MultiResolutionConfig {
+    /// Active aggregation budget in bytes (not a whole-process RSS limit).
+    /// Includes table capacity and dynamic accumulator state; oversized individual states fail.
+    pub aggregation_budget_bytes: usize,
+    /// Optional directory for automatically cleaned-up temporary aggregation runs.
+    pub spill_directory: Option<std::path::PathBuf>,
+    /// Decoded chunk ring and idle pool capacity (minimum 16).
+    pub prefetch_chunks: usize,
+    /// Maximum simultaneously decoding workers.
+    pub decode_workers: usize,
     /// Sorted list of target H3 resolution levels.
     pub resolutions: Vec<u8>,
     /// 1-indexed raster band to extract.
@@ -197,6 +206,10 @@ impl MultiResolutionConfig {
     /// Create a new multi-resolution configuration
     pub fn new(resolutions: Vec<u8>) -> Self {
         Self {
+            aggregation_budget_bytes: 8 * 1024 * 1024,
+            spill_directory: None,
+            prefetch_chunks: 16,
+            decode_workers: 4,
             resolutions,
             band: 1,
             custom_nodata: None,
@@ -242,9 +255,39 @@ impl MultiResolutionConfig {
     /// and duplicate records from the requested parent resolution (7). Therefore, adjacent
     /// resolutions cannot be combined with hierarchical compaction.
     pub fn validate(&self) -> Result<()> {
+        if self.aggregation_budget_bytes < self.resolutions.len().max(1) * 64 * 1024 {
+            return Err(RasterH3Error::InvalidParameter(
+                "aggregation budget must provide at least 64 KiB per resolution".into(),
+            ));
+        }
+        if self.prefetch_chunks < 16 || self.decode_workers == 0 {
+            return Err(RasterH3Error::InvalidParameter(
+                "prefetch_chunks must be >=16 and decode_workers >=1".into(),
+            ));
+        }
+        if self.sampling.points.is_empty()
+            || self.sampling.points.iter().any(|p| {
+                !p.dx.is_finite()
+                    || !p.dy.is_finite()
+                    || !(0.0..=1.0).contains(&p.dx)
+                    || !(0.0..=1.0).contains(&p.dy)
+                    || !p.weight.is_finite()
+                    || p.weight <= 0.0
+            })
+        {
+            return Err(RasterH3Error::InvalidParameter(
+                "samples require finite offsets in [0,1] and positive finite weights".into(),
+            ));
+        }
         if self.resolutions.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
                 "Resolutions list cannot be empty".to_string(),
+            ));
+        }
+        let unique: std::collections::HashSet<_> = self.resolutions.iter().collect();
+        if unique.len() != self.resolutions.len() {
+            return Err(RasterH3Error::InvalidParameter(
+                "duplicate H3 resolutions".into(),
             ));
         }
         for &r in &self.resolutions {

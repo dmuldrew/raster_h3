@@ -194,6 +194,16 @@ impl MultiScanHorizonStreamer {
         self.inner.resolution_u8s()
     }
 
+    /// Number of partial aggregation runs persisted under memory pressure.
+    pub fn spill_run_count(&self) -> u64 {
+        self.inner.spill_run_count()
+    }
+
+    /// Peak active-map allocation estimate (not whole-process memory).
+    pub fn peak_active_bytes(&self) -> usize {
+        self.inner.peak_active_bytes()
+    }
+
     /// Return total active in-flight cells across all resolutions
     #[inline(always)]
     pub fn active_cell_count(&self) -> usize {

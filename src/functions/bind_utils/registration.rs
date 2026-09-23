@@ -25,6 +25,10 @@ pub unsafe fn add_named_parameter(
 
 /// Register standard named parameters shared across all raster aggregation functions
 pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_function) {
+    add_named_parameter(func, "aggregation_budget_bytes", DuckDBType::BigInt);
+    add_named_parameter(func, "spill_directory", DuckDBType::Varchar);
+    add_named_parameter(func, "prefetch_chunks", DuckDBType::BigInt);
+    add_named_parameter(func, "decode_workers", DuckDBType::BigInt);
     add_named_parameter(func, "resolution", DuckDBType::BigInt);
     add_named_parameter(func, "resolutions", DuckDBType::Varchar);
     add_named_parameter(func, "min_resolution", DuckDBType::BigInt);

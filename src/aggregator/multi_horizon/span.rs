@@ -11,7 +11,7 @@ use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
 
-use super::coordinates::{is_point_in_bbox, RowCoordinates, RowGeometryContext};
+use super::coordinates::{RowCoordinates, RowGeometryContext};
 
 /// Optimizer for identifying H3 cell spans and subpixel core intervals on a raster scanline.
 pub struct H3SpanOptimizer;
@@ -30,22 +30,10 @@ impl H3SpanOptimizer {
         _crs_transformer: &CrsTransformer,
         res: Resolution,
         run_cell: u64,
-        _bbox: Option<[f64; 4]>,
+        bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
-        let r_u8 = res as u8;
-        // Lookahead span shortcuts require:
-        // 1. Unrotated North-up WGS84 or Web Mercator (ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator))
-        // 2. Resolution >= 4 (coarse cells res 0..=3 have large sagitta across cell extent)
-        // 3. Moderate latitude |lat| < 70° (polar parallels have high curvature)
-        // 4. Away from antimeridian boundaries (|lon| <= 175° and lon does not wrap)
-        // Projected and rotated grids are non-convex or sheared; fall back to exact per-sample lookup.
-        let is_eligible = ctx.is_north_up
-            && (ctx.is_wgs84 || ctx.is_web_mercator)
-            && r_u8 >= 4
-            && row_coords.lat_row.abs() < 70.0
-            && lon_curr.abs() <= 175.0
-            && (lon_curr + (row_coords.row_c_end.saturating_sub(c)) as f64 * ctx.d_lon_step).abs()
-                <= 175.0;
+        let is_eligible =
+            ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) && bbox.is_none();
 
         if is_eligible {
             row_cache.find_span_end(
@@ -62,56 +50,26 @@ impl H3SpanOptimizer {
         }
     }
 
-    /// Identify the inner core column range `(core_start, core_end)` where all subpixel sample points
-    /// land strictly inside `run_cell`.
+    /// The corner-only API cannot certify curved spherical interiors. Return
+    /// an empty core so the walker evaluates every actual subsample.
     #[inline(always)]
     pub fn find_core_span<FCheck>(
-        row_coords: &RowCoordinates,
-        row_cache: &H3ScanlineLookahead,
-        chunk: &RasterChunk,
+        _row_coords: &RowCoordinates,
+        _row_cache: &H3ScanlineLookahead,
+        _chunk: &RasterChunk,
         c: usize,
-        span_end: usize,
-        dx_bounds: (f64, f64),
-        dy_bounds: (f64, f64),
-        ctx: &RowGeometryContext,
-        gt: &GeoTransform,
-        crs_transformer: &CrsTransformer,
-        bbox: Option<[f64; 4]>,
-        mut is_in_cell: FCheck,
+        _span_end: usize,
+        _dx_bounds: (f64, f64),
+        _dy_bounds: (f64, f64),
+        _ctx: &RowGeometryContext,
+        _gt: &GeoTransform,
+        _crs_transformer: &CrsTransformer,
+        _bbox: Option<[f64; 4]>,
+        _is_in_cell: FCheck,
     ) -> (usize, usize)
     where
         FCheck: FnMut(f64, f64) -> bool,
     {
-        // Core span optimization requires unrotated North-up WGS84/Mercator with moderate latitude.
-        // Projected and rotated rasters need full per-sample evaluation.
-        let is_eligible = ctx.is_north_up
-            && (ctx.is_wgs84 || ctx.is_web_mercator)
-            && row_coords.lat_row.abs() < 70.0;
-
-        if !is_eligible {
-            return (c, c);
-        }
-
-        row_cache.find_core_span(c, span_end, dx_bounds, dy_bounds, |px, py| {
-            let (lon, lat) = if ctx.is_wgs84 {
-                (
-                    row_coords.lon_start + (px - 0.5) * ctx.d_lon_step,
-                    row_coords.lat_row + (py - 0.5) * gt.e,
-                )
-            } else {
-                let (x, y) = gt.pixel_to_coord(
-                    (chunk.col_offset as f64) + px,
-                    (row_coords.row_idx as f64) + py,
-                );
-                match crs_transformer.transform_point(x, y) {
-                    Ok(coords) => coords,
-                    Err(_) => return false,
-                }
-            };
-            if !is_point_in_bbox(lon, lat, bbox) {
-                return false;
-            }
-            is_in_cell(lat, lon)
-        })
+        (c, c)
     }
 }

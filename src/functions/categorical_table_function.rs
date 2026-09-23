@@ -172,6 +172,10 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         let projected_columns = extract_projected_columns(info);
 
         let mut config = MultiResolutionConfig::new(bind_data.common.resolutions.clone());
+        config.aggregation_budget_bytes = bind_data.common.aggregation_budget_bytes;
+        config.spill_directory = bind_data.common.spill_directory.clone();
+        config.prefetch_chunks = bind_data.common.prefetch_chunks;
+        config.decode_workers = bind_data.common.decode_workers;
         config.overlap_rule = bind_data.common.overlap_rule;
         config.custom_crs = bind_data.common.source_crs.clone();
         config.custom_nodata = bind_data.common.nodata;
