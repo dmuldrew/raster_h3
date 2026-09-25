@@ -3,7 +3,6 @@ use h3o::{LatLng, Resolution};
 pub struct H3ScanlineLookahead {
     prev_hex_width: usize,
     current_hex_span: usize,
-    cap_probe_step: bool,
 }
 
 impl Default for H3ScanlineLookahead {
@@ -11,7 +10,6 @@ impl Default for H3ScanlineLookahead {
         Self {
             prev_hex_width: 32,
             current_hex_span: 0,
-            cap_probe_step: false,
         }
     }
 }
@@ -22,7 +20,6 @@ impl H3ScanlineLookahead {
         Self {
             prev_hex_width: width.max(1),
             current_hex_span: 0,
-            cap_probe_step: false,
         }
     }
 
@@ -36,19 +33,7 @@ impl H3ScanlineLookahead {
             9 => 5,
             _ => 2,
         };
-        let mut s = Self::with_initial_width(initial_width);
-        s.cap_probe_step = r_u8 <= 3;
-        s
-    }
-
-    /// Maximum exponential probe step for the current lookahead state.
-    #[inline(always)]
-    fn probe_step_cap(&self) -> usize {
-        if self.cap_probe_step {
-            (self.prev_hex_width / 4).max(1)
-        } else {
-            usize::MAX
-        }
+        Self::with_initial_width(initial_width)
     }
 
     #[inline(always)]
@@ -91,63 +76,17 @@ impl H3ScanlineLookahead {
         res: Resolution,
         run_cell: u64,
     ) -> (usize, Option<u64>) {
-        let remaining_guess = self
-            .prev_hex_width
-            .saturating_sub(self.current_hex_span)
-            .max(1);
-        let mut guess_c = (c + remaining_guess).min(row_width);
-        let mut guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
-        let mut last_cell_at_right: Option<u64> = None;
-
-        while guess_c < row_width {
-            if let Ok(ll) = LatLng::new(lat_row, guess_lon) {
-                let guess_cell: u64 = ll.to_cell(res).into();
-                if guess_cell == run_cell {
-                    let step = (guess_c - c).max(1).min(self.probe_step_cap());
-                    let new_guess_c = (guess_c + step).min(row_width);
-                    if new_guess_c == guess_c {
-                        break;
-                    }
-                    guess_c = new_guess_c;
-                    guess_lon = lon_curr + ((guess_c - c) as f64) * d_lon_step;
-                } else {
-                    last_cell_at_right = Some(guess_cell);
-                    break;
-                }
-            } else {
-                break;
+        for next in c + 1..row_width {
+            let cell =
+                self.get_or_compute_cell(lat_row, lon_curr + (next - c) as f64 * d_lon_step, res);
+            if cell != Some(run_cell) {
+                return (next, cell);
             }
         }
-
-        let mut left = c + 1;
-        let mut right = guess_c;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let mid_lon = (lon_curr + d_lon_step) + ((mid - (c + 1)) as f64) * d_lon_step;
-            if let Ok(ll) = LatLng::new(lat_row, mid_lon) {
-                let cell: u64 = ll.to_cell(res).into();
-                if cell == run_cell {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                    last_cell_at_right = Some(cell);
-                }
-            } else {
-                right = mid;
-                last_cell_at_right = None;
-            }
-        }
-        (
-            left,
-            if left < row_width {
-                last_cell_at_right
-            } else {
-                None
-            },
-        )
+        (row_width, None)
     }
 
-    /// Determine the end of the current H3 cell span for projected coordinates using exponential probe + binary search
+    /// Determine the end of the current H3 cell span for projected coordinates by checking every intermediate center
     #[inline(always)]
     pub fn find_span_end_projected<F>(
         &mut self,
@@ -162,58 +101,13 @@ impl H3ScanlineLookahead {
     where
         F: FnMut(f64, f64) -> Option<u64>,
     {
-        let remaining_guess = self
-            .prev_hex_width
-            .saturating_sub(self.current_hex_span)
-            .max(1);
-        let mut guess_c = (c + remaining_guess).min(row_width);
-        let mut guess_x = x_start + (guess_c as f64) * dx_step;
-        let mut last_cell_at_right: Option<u64> = None;
-
-        while guess_c < row_width {
-            if let Some(guess_cell) = coord_to_cell(guess_x, y_row) {
-                if guess_cell == run_cell {
-                    let step = (guess_c - c).max(1).min(self.probe_step_cap());
-                    let new_guess_c = (guess_c + step).min(row_width);
-                    if new_guess_c == guess_c {
-                        break;
-                    }
-                    guess_c = new_guess_c;
-                    guess_x = x_start + (guess_c as f64) * dx_step;
-                } else {
-                    last_cell_at_right = Some(guess_cell);
-                    break;
-                }
-            } else {
-                break;
+        for next in c + 1..row_width {
+            let cell = coord_to_cell(x_start + next as f64 * dx_step, y_row);
+            if cell != Some(run_cell) {
+                return (next, cell);
             }
         }
-
-        let mut left = c + 1;
-        let mut right = guess_c;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let mid_x = x_start + (mid as f64) * dx_step;
-            if let Some(cell) = coord_to_cell(mid_x, y_row) {
-                if cell == run_cell {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                    last_cell_at_right = Some(cell);
-                }
-            } else {
-                right = mid;
-                last_cell_at_right = None;
-            }
-        }
-        (
-            left,
-            if left < row_width {
-                last_cell_at_right
-            } else {
-                None
-            },
-        )
+        (row_width, None)
     }
 
     /// Find the sub-pixel core interval `[core_start, core_end)` within `[c, span_end)`
@@ -237,6 +131,11 @@ impl H3ScanlineLookahead {
             return (span_end, span_end);
         }
 
+        // Four corners cannot certify a curved H3 boundary's interior.
+        // This legacy rectangle API can only certify degenerate point samples.
+        if dx_bounds.0 != dx_bounds.1 || dy_bounds.0 != dy_bounds.1 {
+            return (span_end, span_end);
+        }
         let (min_dx, max_dx) = dx_bounds;
         let (min_dy, max_dy) = dy_bounds;
 

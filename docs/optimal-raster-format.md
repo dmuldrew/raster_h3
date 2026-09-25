@@ -6,6 +6,20 @@ While `raster_h3` can ingest arbitrary GeoTIFF files in any projected Coordinate
 
 By formatting your rasters into an optimal layout, you can achieve **up to 4.5×–6× faster ingestion** while reducing storage footprints.
 
+## Streaming eligibility and memory
+
+Parallel aggregation and early output have separate eligibility checks:
+
+- Whole decoded chunks run in parallel when a conservative sample-cardinality estimate fits the worker allowance. Larger chunks use bounded parallel windows. This applies to all supported projections.
+- WGS84 and Web Mercator support early latitude eviction using affine/monotone corner bounds, including rotated grids. Unknown projected bounds keep the horizon conservative; projected inputs still aggregate and spill normally.
+- Albers, UTM, and other Proj4 inputs currently defer output until EOF unless a later mosaic suffix contains only certified chunks. Projection-specific certificates are required before enabling early eviction for those projections.
+- Either compaction flag disables early eviction. Complete cells are merged and compacted in sorted order at EOF.
+- Center spans check every center. Supersampled core spans check every actual sample and require total sampling weight one; corner-only containment is not sufficient.
+
+The aggregation budget is not a process RSS limit: decoded TIFF chunks, prefetch buffers, and metadata remain outside it. Worker allowances scale with resolution count and sampling density. Oversized individual accumulator states or sampling patterns return an error asking for a larger budget. Spilling and queued records constrain the delivery watermark, so downstream tile writers cannot finalize ahead of pending output.
+
+These checks preserve parallel processing and safe incremental output for eligible data; they do not promise a particular throughput or reuse the historical throughput figures as validation of the current implementation.
+
 ---
 
 ## Performance Comparison: Layout & Projection Impact

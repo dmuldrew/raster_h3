@@ -1,11 +1,4 @@
-//! Tests for certified layered hybrid early horizon eviction on projected rasters.
-//!
-//! Validates that UTM (EPSG:32610) and Albers Equal Area Conic (EPSG:5070) rasters:
-//! 1. Activate early horizon eviction (`can_evict_early == true`).
-//! 2. Emit completed H3 cells incrementally before EOF.
-//! 3. Incur zero disk spills at default aggregation budgets.
-//! 4. Produce 100% mathematically identical results to reference aggregation.
-//! 5. Never emit duplicate cells or underestimate latitude bounds.
+//! Projected rasters aggregate exactly while uncertified bounds disable early eviction.
 
 use std::collections::HashMap;
 use tiff::encoder::{colortype, TiffEncoder};
@@ -20,10 +13,17 @@ use raster_h3::aggregator::{H3Accumulator, SamplingPattern};
 use raster_h3::crs::transformer::CrsTransformer;
 use raster_h3::raster::{geotiff::GeoTiffStreamReader, geotransform::GeoTransform, RasterChunk};
 
-fn create_projected_fixture(epsg: u16, width: u32, height: u32, rows_per_strip: u32) -> tempfile::NamedTempFile {
+fn create_projected_fixture(
+    epsg: u16,
+    width: u32,
+    height: u32,
+    rows_per_strip: u32,
+) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut encoder = TiffEncoder::new(std::fs::File::create(file.path()).unwrap()).unwrap();
-    let mut image = encoder.new_image::<colortype::Gray32Float>(width, height).unwrap();
+    let mut image = encoder
+        .new_image::<colortype::Gray32Float>(width, height)
+        .unwrap();
     image.rows_per_strip(rows_per_strip).unwrap();
     image
         .encoder()
@@ -57,7 +57,7 @@ fn create_projected_fixture(epsg: u16, width: u32, height: u32, rows_per_strip: 
 }
 
 #[test]
-fn utm_raster_evicts_early_before_eof_without_spills() {
+fn utm_raster_defers_uncertified_eviction() {
     let file = create_projected_fixture(32610, 128, 96, 8); // 12 strips
     let reader = GeoTiffStreamReader::open(file.path()).unwrap();
     let gt = reader.metadata.geotransform;
@@ -75,14 +75,17 @@ fn utm_raster_evicts_early_before_eof_without_spills() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(stream.can_evict_early, "UTM raster must enable early horizon eviction");
+    assert!(!stream.can_evict_early);
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
-    assert!(!first_batch.is_empty(), "First batch should yield completed records");
     assert!(
-        stream.processed_chunk_count < stream.mosaic.chunk_refs.len(),
-        "UTM raster must emit completed cells before EOF (early eviction active)"
+        !first_batch.is_empty(),
+        "First batch should yield completed records"
+    );
+    assert!(
+        stream.processed_chunk_count == stream.mosaic.chunk_refs.len(),
+        "Uncertified projected output must wait until EOF"
     );
 
     for rec in first_batch {
@@ -105,7 +108,11 @@ fn utm_raster_evicts_early_before_eof_without_spills() {
         }
     }
 
-    assert_eq!(stream.spill_run_count(), 0, "No disk spills should occur on streaming UTM raster");
+    assert_eq!(
+        stream.spill_run_count(),
+        0,
+        "No disk spills should occur on streaming UTM raster"
+    );
     assert!(stream.is_finished());
 
     // Compute ground-truth reference in memory
@@ -120,10 +127,17 @@ fn utm_raster_evicts_early_before_eof_without_spills() {
         }
     }
 
-    assert_eq!(actual.len(), expected.len(), "Cell counts must match exactly");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "Cell counts must match exactly"
+    );
     let actual_sum: f64 = actual.values().map(|a| a.sum).sum();
     let expected_sum: f64 = expected.values().map(|a| a.sum).sum();
-    assert!((actual_sum - expected_sum).abs() < 1e-4, "Total sums must match");
+    assert!(
+        (actual_sum - expected_sum).abs() < 1e-4,
+        "Total sums must match"
+    );
 
     for (key, actual_acc) in &actual {
         let expected_acc = &expected[key];
@@ -135,7 +149,7 @@ fn utm_raster_evicts_early_before_eof_without_spills() {
 }
 
 #[test]
-fn albers_conic_raster_evicts_early_before_eof_without_spills() {
+fn albers_raster_defers_uncertified_eviction() {
     let file = create_projected_fixture(5070, 128, 96, 8); // 12 strips
     let reader = GeoTiffStreamReader::open(file.path()).unwrap();
     let gt = reader.metadata.geotransform;
@@ -153,14 +167,17 @@ fn albers_conic_raster_evicts_early_before_eof_without_spills() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(stream.can_evict_early, "Albers raster must enable early horizon eviction");
+    assert!(!stream.can_evict_early);
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
-    assert!(!first_batch.is_empty(), "First batch should yield completed records");
     assert!(
-        stream.processed_chunk_count < stream.mosaic.chunk_refs.len(),
-        "Albers raster must emit completed cells before EOF (early eviction active)"
+        !first_batch.is_empty(),
+        "First batch should yield completed records"
+    );
+    assert!(
+        stream.processed_chunk_count == stream.mosaic.chunk_refs.len(),
+        "Uncertified projected output must wait until EOF"
     );
 
     for rec in first_batch {
@@ -183,7 +200,11 @@ fn albers_conic_raster_evicts_early_before_eof_without_spills() {
         }
     }
 
-    assert_eq!(stream.spill_run_count(), 0, "No disk spills should occur on streaming Albers raster");
+    assert_eq!(
+        stream.spill_run_count(),
+        0,
+        "No disk spills should occur on streaming Albers raster"
+    );
     assert!(stream.is_finished());
 
     // Compute ground-truth reference in memory
@@ -198,10 +219,17 @@ fn albers_conic_raster_evicts_early_before_eof_without_spills() {
         }
     }
 
-    assert_eq!(actual.len(), expected.len(), "Cell counts must match exactly");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "Cell counts must match exactly"
+    );
     let actual_sum: f64 = actual.values().map(|a| a.sum).sum();
     let expected_sum: f64 = expected.values().map(|a| a.sum).sum();
-    assert!((actual_sum - expected_sum).abs() < 1e-4, "Total sums must match");
+    assert!(
+        (actual_sum - expected_sum).abs() < 1e-4,
+        "Total sums must match"
+    );
 
     for (key, actual_acc) in &actual {
         let expected_acc = &expected[key];
@@ -243,7 +271,7 @@ fn eviction_north_bound_is_sound_over_curvature() {
         };
 
         let upper = eviction_north_bound(&chunk, &gt, &crs);
-        assert!(upper.is_finite(), "Eviction bound must be finite for EPSG {}", epsg);
+        assert_eq!(upper, f64::INFINITY);
 
         // Dense sampling over the entire chunk area and perimeter
         for r in 20..68 {
@@ -254,10 +282,38 @@ fn eviction_north_bound_is_sound_over_curvature() {
                     assert!(
                         lat <= upper,
                         "Sample latitude {} exceeded certified upper bound {} for EPSG {}",
-                        lat, upper, epsg
+                        lat,
+                        upper,
+                        epsg
                     );
                 }
             }
         }
     }
+}
+
+#[test]
+fn off_grid_pole_cannot_supply_a_finite_eviction_certificate() {
+    let crs = CrsTransformer::from_crs_or_epsg(
+        None,
+        Some("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=0 +datum=WGS84 +units=m"),
+    )
+    .unwrap();
+    let gt = GeoTransform {
+        c0: -550000.0,
+        f0: 550000.0,
+        a: 10000.0,
+        e: -10000.0,
+        b: 0.0,
+        d: 0.0,
+    };
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 120,
+        height: 120,
+    };
+    // Even the former combined padding misses the pole between interior probes.
+    assert!(crs.transform_rect_bounds(&gt, 0.0, 0.0, 120.0, 120.0)[3] + 0.005 < 90.0);
+    assert_eq!(eviction_north_bound(&chunk, &gt, &crs), f64::INFINITY);
 }

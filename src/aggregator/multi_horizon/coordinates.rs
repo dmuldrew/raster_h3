@@ -382,6 +382,7 @@ impl RowCoordinates {
         span_end: usize,
         dx_bounds: (f64, f64),
         dy_bounds: (f64, f64),
+        sampling: &SamplingPattern,
         ctx: &RowGeometryContext,
         gt: &GeoTransform,
         crs_transformer: &CrsTransformer,
@@ -399,6 +400,7 @@ impl RowCoordinates {
             span_end,
             dx_bounds,
             dy_bounds,
+            sampling,
             ctx,
             gt,
             crs_transformer,
@@ -408,16 +410,11 @@ impl RowCoordinates {
     }
 }
 
-/// Conservative upper bound for every sample within a chunk's pixel rectangle.
-///
-/// Uses a layered hybrid approach:
-/// - WGS84 & Web Mercator: Affine / monotone properties guarantee the 4 corners contain
-///   the supremum of latitude.
-/// - Albers Equal Area Conic: Closed-form calculus computes the exact critical point
-///   along each edge minimizing distance to the cone apex, guaranteeing bounds[3] is the exact supremum.
-/// - Proj4 (UTM, State Plane, LCC, etc.): Boundary and interior densification in `transform_rect_bounds`
-///   combined with a +0.005° (~550m) conservative headroom buffer guarantees a sound upper bound
-///   across any inter-sample parallel curvature.
+/// Upper latitude bound for every sample in a chunk's pixel rectangle.
+/// Affine latitude (WGS84) and monotone northing (Web Mercator) attain
+/// their maxima at corners, including rotated/reversed affine grids.
+/// Other projections require domain-specific certificates; sampled bounds
+/// and fixed padding must never drive irreversible eviction.
 pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTransformer) -> f64 {
     if [gt.a, gt.b, gt.c0, gt.d, gt.e, gt.f0]
         .iter()
@@ -449,35 +446,6 @@ pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTra
             }
             upper
         }
-        CrsTransformer::AlbersConic(_) => {
-            let bounds = crs.transform_rect_bounds(
-                gt,
-                chunk.col_offset as f64,
-                chunk.row_offset as f64,
-                chunk.width as f64,
-                chunk.height as f64,
-            );
-            if !bounds[3].is_finite() {
-                f64::INFINITY
-            } else {
-                bounds[3].next_up()
-            }
-        }
-        CrsTransformer::Proj4 { .. } => {
-            let bounds = crs.transform_rect_bounds(
-                gt,
-                chunk.col_offset as f64,
-                chunk.row_offset as f64,
-                chunk.width as f64,
-                chunk.height as f64,
-            );
-            if !bounds[3].is_finite() {
-                f64::INFINITY
-            } else {
-                // Add 0.005° (~550m) conservative safety headroom to guarantee sound upper bound
-                // across any inter-sample parallel curvature for arbitrary Proj4 projections.
-                (bounds[3] + 0.005).min(90.0)
-            }
-        }
+        CrsTransformer::AlbersConic(_) | CrsTransformer::Proj4 { .. } => f64::INFINITY,
     }
 }

@@ -11,7 +11,8 @@ use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
 
-use super::coordinates::{is_point_in_bbox, RowCoordinates, RowGeometryContext};
+use super::coordinates::{RowCoordinates, RowGeometryContext};
+use crate::aggregator::sampling::SamplingPattern;
 
 /// Optimizer for identifying H3 cell spans and subpixel core intervals on a raster scanline.
 pub struct H3SpanOptimizer;
@@ -33,12 +34,8 @@ impl H3SpanOptimizer {
         _bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
         let r_u8 = res as u8;
-        // Lookahead span shortcuts require:
-        // 1. Unrotated North-up WGS84 or Web Mercator (ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator))
-        // 2. Resolution >= 4 (coarse cells res 0..=3 have large sagitta across cell extent)
-        // 3. Moderate latitude |lat| < 70° (polar parallels have high curvature)
-        // 4. Away from antimeridian boundaries (|lon| <= 175° and lon does not wrap)
-        // Projected and rotated grids are non-convex or sheared; fall back to exact per-sample lookup.
+        // Exact center runs currently use the constant-latitude fast transforms.
+        // Geographic cutoffs are performance policy, not a containment proof.
         let is_eligible = ctx.is_north_up
             && (ctx.is_wgs84 || ctx.is_web_mercator)
             && r_u8 >= 4
@@ -67,12 +64,13 @@ impl H3SpanOptimizer {
     #[inline(always)]
     pub fn find_core_span<FCheck>(
         row_coords: &RowCoordinates,
-        row_cache: &H3ScanlineLookahead,
+        _row_cache: &H3ScanlineLookahead,
         chunk: &RasterChunk,
         c: usize,
         span_end: usize,
-        dx_bounds: (f64, f64),
-        dy_bounds: (f64, f64),
+        _dx_bounds: (f64, f64),
+        _dy_bounds: (f64, f64),
+        sampling: &SamplingPattern,
         ctx: &RowGeometryContext,
         gt: &GeoTransform,
         crs_transformer: &CrsTransformer,
@@ -82,36 +80,37 @@ impl H3SpanOptimizer {
     where
         FCheck: FnMut(f64, f64) -> bool,
     {
-        // Core span optimization requires unrotated North-up WGS84/Mercator with moderate latitude.
-        // Projected and rotated rasters need full per-sample evaluation.
-        let is_eligible = ctx.is_north_up
-            && (ctx.is_wgs84 || ctx.is_web_mercator)
-            && row_coords.lat_row.abs() < 70.0;
-
-        if !is_eligible {
+        // Bulk accumulation assumes total sample weight exactly one. Certify
+        // actual samples, never the four corners of their bounding rectangle.
+        if !ctx.is_north_up
+            || !(ctx.is_wgs84 || ctx.is_web_mercator)
+            || sampling.points.iter().map(|p| p.weight).sum::<f64>() != 1.0
+            || span_end.saturating_sub(c) <= 2
+        {
             return (c, c);
         }
-
-        row_cache.find_core_span(c, span_end, dx_bounds, dy_bounds, |px, py| {
-            let (lon, lat) = if ctx.is_wgs84 {
-                (
-                    row_coords.lon_start + (px - 0.5) * ctx.d_lon_step,
-                    row_coords.lat_row + (py - 0.5) * gt.e,
-                )
-            } else {
-                let (x, y) = gt.pixel_to_coord(
-                    (chunk.col_offset as f64) + px,
-                    (row_coords.row_idx as f64) + py,
-                );
-                match crs_transformer.transform_point(x, y) {
-                    Ok(coords) => coords,
-                    Err(_) => return false,
-                }
-            };
-            if !is_point_in_bbox(lon, lat, bbox) {
-                return false;
+        let start = c + 1;
+        let end = span_end - 1;
+        for k in start..end {
+            let mut count = 0;
+            let mut certified = true;
+            row_coords.for_each_subpixel(
+                k,
+                ctx,
+                gt,
+                crs_transformer,
+                chunk.col_offset as usize,
+                sampling,
+                bbox,
+                |lon, lat, _, _, _| {
+                    count += 1;
+                    certified &= (-90.0..=90.0).contains(&lat) && is_in_cell(lat, lon);
+                },
+            );
+            if !certified || count != sampling.points.len() {
+                return (c, c);
             }
-            is_in_cell(lat, lon)
-        })
+        }
+        (start, end)
     }
 }

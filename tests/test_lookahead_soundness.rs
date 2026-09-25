@@ -30,22 +30,20 @@ fn test_core_span_certifies_all_intermediate_pixels() {
 
     // 1. All pixels in [0, 10) have all corners in cell:
     // Should certify core span [1, 9).
-    let (core_s, core_e) =
-        lookahead.find_core_span(0, 10, (-0.5, 0.5), (-0.5, 0.5), |_px, _py| true);
+    let (core_s, core_e) = lookahead.find_core_span(0, 10, (0.5, 0.5), (0.5, 0.5), |_px, _py| true);
     assert_eq!(core_s, 1);
     assert_eq!(core_e, 9);
 
     // 2. Endpoints (pixel 1 and pixel 8) are core, but intermediate pixel 5 fails:
     // With intermediate pixel failing, certification must fail and fall back to (10, 10).
     let (rejected_s, rejected_e) =
-        lookahead.find_core_span(0, 10, (-0.5, 0.5), (-0.5, 0.5), |px, _py| {
+        lookahead.find_core_span(0, 10, (0.5, 0.5), (0.5, 0.5), |px, _py| {
             // Pixel 5 fails corner check
             !(4.5..=5.5).contains(&px)
         });
     assert_eq!(rejected_s, 10);
     assert_eq!(rejected_e, 10);
 }
-
 
 #[test]
 fn test_coarse_resolutions_match_exhaustive_reference() {
@@ -270,5 +268,126 @@ fn test_projected_utm_with_supersampling_matches_exhaustive_reference() {
             .unwrap_or_else(|| panic!("UTM: missing cell {cell:#x}"));
         assert!((act_acc.count - exp_acc.count).abs() < 1e-5);
         assert!((act_acc.sum - exp_acc.sum).abs() < 1e-3);
+    }
+}
+
+#[test]
+fn parallel_reentry_does_not_skip_intermediate_centers() {
+    let lat = 16.1562026173316724;
+    let lon = 55.0770743428963456;
+    let step = 0.0002684976445079;
+    let res = Resolution::Four;
+    let run = u64::from(LatLng::new(lat, lon).unwrap().to_cell(res));
+    let mut cache = H3ScanlineLookahead::for_resolution(res);
+    let (end, next) = cache.find_span_end(0, 64, lon, lat, step, res, run);
+    assert_eq!(end, 5);
+    assert_ne!(next, Some(run));
+    for c in 0..end {
+        assert_eq!(
+            u64::from(
+                LatLng::new(lat, lon + c as f64 * step)
+                    .unwrap()
+                    .to_cell(res)
+            ),
+            run
+        );
+    }
+}
+
+#[test]
+fn four_corners_do_not_certify_a_curved_boundary() {
+    let lat = 16.1562026280927249;
+    let lon0 = 55.0684824182720902;
+    let step = 0.0085919246242540;
+    let cell = |x: f64, y: f64| {
+        u64::from(
+            LatLng::new(lat + (0.5 - y) * 1e-10, lon0 + x * step)
+                .unwrap()
+                .to_cell(Resolution::Four),
+        )
+    };
+    let run = cell(0.5, 0.5);
+    assert_ne!(cell(1.5, 0.5), run);
+    for x in [1.0 + 1.0 / 6.0, 1.0 + 5.0 / 6.0] {
+        for y in [1.0 / 6.0, 5.0 / 6.0] {
+            assert_eq!(cell(x, y), run);
+        }
+    }
+    let cache = H3ScanlineLookahead::for_resolution(Resolution::Four);
+    assert_eq!(
+        cache.find_core_span(
+            0,
+            4,
+            (1.0 / 6.0, 5.0 / 6.0),
+            (1.0 / 6.0, 5.0 / 6.0),
+            |x, y| cell(x, y) == run
+        ),
+        (4, 4)
+    );
+}
+
+#[test]
+fn enabled_span_paths_match_exhaustive_geodetic_reference() {
+    for (width, lat, lon0, dx, sampling) in [
+        (
+            64,
+            16.1562026173316724,
+            55.0770743428963456 - 0.0002684976445079 / 2.0,
+            0.0002684976445079,
+            SamplingPattern::center(),
+        ),
+        (
+            4,
+            16.1562026280927249,
+            55.0684824182720902,
+            0.0085919246242540,
+            SamplingPattern::five_point(),
+        ),
+    ] {
+        let (_file, path) = TestGeoTiffBuilder::new(width, 1)
+            .origin(lon0, lat + 0.5e-10)
+            .pixel_size_xy(dx, 1e-10)
+            .epsg(4326)
+            .create_f32_tempfile(|c, _| (c + 1) as f32);
+        for resolutions in [vec![4], vec![4, 5]] {
+            let reader = GeoTiffStreamReader::open(&path).unwrap();
+            let gt = reader.metadata.geotransform;
+            let mut config = MultiResolutionConfig::new(resolutions.clone());
+            config.sampling = sampling.clone();
+            let mut expected = HashMap::<(u8, u64), H3Accumulator>::new();
+            for c in 0..width {
+                for sp in &sampling.points {
+                    let (lon, lat) = gt.pixel_to_coord(c as f64 + sp.dx, sp.dy);
+                    for &res in &resolutions {
+                        let key = (
+                            res,
+                            u64::from(
+                                LatLng::new(lat, lon)
+                                    .unwrap()
+                                    .to_cell(Resolution::try_from(res).unwrap()),
+                            ),
+                        );
+                        expected
+                            .entry(key)
+                            .or_default()
+                            .update_weighted((c + 1) as f64, sp.weight);
+                    }
+                }
+            }
+            let mut stream = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+            let mut actual = HashMap::new();
+            while !stream.is_finished() {
+                for rec in stream.fetch_next_batch(1).unwrap() {
+                    assert!(actual
+                        .insert((rec.resolution, rec.h3_index), rec.accumulator)
+                        .is_none());
+                }
+            }
+            assert_eq!(actual.len(), expected.len());
+            for (key, acc) in actual {
+                assert!((acc.count - expected[&key].count).abs() < 1e-10);
+                assert!((acc.sum - expected[&key].sum).abs() < 1e-10);
+            }
+        }
     }
 }

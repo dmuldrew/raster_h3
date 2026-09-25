@@ -16,10 +16,14 @@ use tiff::{
 };
 
 fn fixture(epsg: u16) -> tempfile::NamedTempFile {
+    fixture_with_strip_height(epsg, 4)
+}
+
+fn fixture_with_strip_height(epsg: u16, rows: u32) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut encoder = TiffEncoder::new(std::fs::File::create(file.path()).unwrap()).unwrap();
     let mut image = encoder.new_image::<colortype::Gray32Float>(96, 64).unwrap();
-    image.rows_per_strip(4).unwrap();
+    image.rows_per_strip(rows).unwrap();
     image
         .encoder()
         .write_tag(Tag::ModelPixelScaleTag, &[80.0, 80.0, 0.0][..])
@@ -190,7 +194,7 @@ fn affine_chunk_bounds_include_every_sample_for_either_direction() {
         e: -80.0,
     };
     let upper = eviction_north_bound(&chunk, &gt, &crs);
-    assert!(upper.is_finite());
+    assert_eq!(upper, f64::INFINITY);
     for r in 29..46 {
         for c in 13..32 {
             for sp in SamplingPattern::rgss().points {
@@ -284,13 +288,27 @@ fn rotated_and_reversed_grids_emit_before_eof_without_duplicates() {
 fn sorted_compaction_agrees_with_and_without_spilling() {
     let file = fixture(32610);
     let mut reference = None;
-    for budget in [8 * 1024 * 1024, 65536] {
+    for (budget, legacy) in [
+        (8 * 1024 * 1024, false),
+        (65536, false),
+        (8 * 1024 * 1024, true),
+        (65536, true),
+    ] {
         let mut config = MultiResolutionConfig::single(9);
         config.aggregation_budget_bytes = budget;
-        config.compact_h3_children = true;
-        let mut stream =
-            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(file.path()).unwrap(), &config)
-                .unwrap();
+        config.compact_h3_children = !legacy;
+        config.compact = legacy;
+        config.custom_crs = Some("EPSG:4326".into());
+        let mut reader = GeoTiffStreamReader::open(file.path()).unwrap();
+        reader.metadata.geotransform = GeoTransform {
+            c0: -122.0,
+            f0: 37.0,
+            a: 0.0008,
+            e: -0.0008,
+            b: 0.0,
+            d: 0.0,
+        };
+        let mut stream = MultiScanHorizonStreamer::new(reader, &config).unwrap();
         let mut actual = HashMap::new();
         loop {
             let batch = stream.fetch_next_batch(1).unwrap();
@@ -318,6 +336,92 @@ fn sorted_compaction_agrees_with_and_without_spilling() {
             }
         } else {
             reference = Some(actual);
+        }
+    }
+}
+
+#[test]
+fn large_strip_high_resolution_respects_active_budget() {
+    let file = fixture_with_strip_height(32610, 64);
+    let mut config = MultiResolutionConfig::new(vec![12, 13]);
+    config.aggregation_budget_bytes = 128 * 1024;
+    config.sampling = SamplingPattern::rgss();
+    config.quantiles = vec![QuantileTarget::Percentile(0.5, "p50".into())];
+    let mut stream =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(file.path()).unwrap(), &config)
+            .unwrap();
+    let mut counts = [0.0, 0.0];
+    let mut keys = std::collections::HashSet::new();
+    while !stream.is_finished() {
+        for rec in stream.fetch_next_batch(7).unwrap() {
+            assert!(keys.insert((rec.resolution, rec.h3_index)));
+            counts[(rec.resolution - 12) as usize] += rec.accumulator.count;
+        }
+    }
+    assert_eq!(counts, [6144.0, 6144.0]);
+    assert!(stream.spill_run_count() > 1);
+    assert!(
+        stream.peak_active_bytes() <= config.aggregation_budget_bytes,
+        "peak {} exceeds {}",
+        stream.peak_active_bytes(),
+        config.aggregation_budget_bytes
+    );
+}
+
+#[test]
+fn delivered_horizon_never_passes_future_records() {
+    use raster_h3::aggregator::horizon_streamer::compute_cell_south_lat;
+    for budget in [65536, 64 * 1024 * 1024] {
+        for epsg in ["EPSG:4326", "EPSG:3857"] {
+            let file = fixture(32610);
+            let mut reader = GeoTiffStreamReader::open(file.path()).unwrap();
+            reader.metadata.geotransform = if epsg == "EPSG:4326" {
+                GeoTransform {
+                    c0: -122.0,
+                    f0: 37.0,
+                    a: 0.002,
+                    e: -0.002,
+                    b: 0.0,
+                    d: 0.0,
+                }
+            } else {
+                GeoTransform {
+                    c0: -13580977.0,
+                    f0: 4439106.0,
+                    a: 200.0,
+                    e: -200.0,
+                    b: 0.0,
+                    d: 0.0,
+                }
+            };
+            let mut config = MultiResolutionConfig::single(9);
+            config.custom_crs = Some(epsg.into());
+            config.aggregation_budget_bytes = budget;
+            let mut stream = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+            let mut previous = f64::INFINITY;
+            let mut saw_finite = false;
+            let mut records = 0;
+            while !stream.is_finished() {
+                for rec in stream.fetch_next_batch(1).unwrap() {
+                    assert!(
+                        compute_cell_south_lat(rec.h3_index) <= previous,
+                        "record arrived north of the published delivery horizon"
+                    );
+                    records += 1;
+                }
+                let next = stream.current_lat_horizon();
+                assert!(next <= previous);
+                saw_finite |= next.is_finite();
+                previous = next;
+            }
+            assert!(records > 0);
+            assert_eq!(previous, f64::NEG_INFINITY);
+            if budget > 65536 {
+                assert!(
+                    saw_finite,
+                    "certified input should stream a finite watermark"
+                );
+            }
         }
     }
 }

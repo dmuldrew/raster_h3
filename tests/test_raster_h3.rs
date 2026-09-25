@@ -1259,7 +1259,8 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
                 .or_insert(record.accumulator);
         }
     }
-    assert_eq!(map.len(), 30959);
+    // Exhaustive per-pixel reference using the decoded (cropped) tile stride.
+    assert_eq!(map.len(), 30_958);
 
     let mut total_samples = 0.0;
     let mut total_sum = 0.0;
@@ -1268,7 +1269,7 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
         total_sum += acc.sum;
     }
 
-    assert!(total_samples > 20_000_000.0);
+    assert_eq!(total_samples, 28_373_991.0);
     assert!(total_sum > 100_000_000.0);
 }
 
@@ -1312,23 +1313,24 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
         }
     }
 
-    // Ground truth asserts for LF2024_FBFM40_HI.tif
-    assert_eq!(r7_count, 39_412, "Res 7 pyramid cell count mismatch");
-    assert_eq!(r8_count, 273_615, "Res 8 pyramid cell count mismatch");
+    // Exhaustive per-pixel reference for LF2024_FBFM40_HI.tif, including
+    // cropped edge tiles. The former padded stride dropped/misplaced edge pixels.
+    assert_eq!(r7_count, 39_426, "Res 7 pyramid cell count mismatch");
+    assert_eq!(r8_count, 273_840, "Res 8 pyramid cell count mismatch");
     assert_eq!(
         r7_count + r8_count,
-        313_027,
+        313_266,
         "Total dual pyramid cell count mismatch"
     );
     assert_eq!(
-        total_pixels as u64, 256_542_384,
+        total_pixels as u64, 256_851_000,
         "Total pixel count mismatch on Hawaii categorical scan"
     );
 
     // Verify top 3 landcover classes
     assert_eq!(
         *r8_class_distribution.get(&-9999).unwrap_or(&0),
-        243_696,
+        243_921,
         "Class -9999 (NoData) hex count mismatch"
     );
     assert_eq!(
