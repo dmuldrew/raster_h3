@@ -181,10 +181,24 @@ fn affine_chunk_bounds_include_every_sample_for_either_direction() {
         }
     }
     let crs = CrsTransformer::from_crs_or_epsg(Some(32610), None).unwrap();
-    assert_eq!(
-        eviction_north_bound(&chunk, &GeoTransform::default(), &crs),
-        f64::INFINITY
-    );
+    let gt = GeoTransform {
+        c0: 500000.0,
+        f0: 4180000.0,
+        a: 80.0,
+        b: 0.0,
+        d: 0.0,
+        e: -80.0,
+    };
+    let upper = eviction_north_bound(&chunk, &gt, &crs);
+    assert!(upper.is_finite());
+    for r in 29..46 {
+        for c in 13..32 {
+            for sp in SamplingPattern::rgss().points {
+                let (x, y) = gt.pixel_to_coord(c as f64 + sp.dx, r as f64 + sp.dy);
+                assert!(crs.transform_point(x, y).unwrap().1 <= upper);
+            }
+        }
+    }
 }
 
 #[test]
@@ -193,6 +207,8 @@ fn spill_io_failure_is_latched() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = MultiResolutionConfig::single(9);
     config.aggregation_budget_bytes = 65536;
+    config.quantiles = vec![QuantileTarget::Percentile(0.5, "p50".into())];
+    config.sampling = SamplingPattern::rgss();
     config.spill_directory = Some(dir.path().join("missing-directory"));
     let mut stream =
         MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(file.path()).unwrap(), &config)

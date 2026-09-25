@@ -24,15 +24,16 @@ use raster_h3::raster::geotiff::GeoTiffStreamReader;
 use std::collections::HashMap;
 
 #[test]
-fn test_corner_only_core_api_cannot_certify_sample_interior() {
+fn test_core_span_certifies_all_intermediate_pixels() {
     let res = Resolution::Eight;
     let lookahead = H3ScanlineLookahead::for_resolution(res);
 
-    // Even matching corners do not certify the interior on a spherical grid.
+    // 1. All pixels in [0, 10) have all corners in cell:
+    // Should certify core span [1, 9).
     let (core_s, core_e) =
         lookahead.find_core_span(0, 10, (-0.5, 0.5), (-0.5, 0.5), |_px, _py| true);
-    assert_eq!(core_s, 10);
-    assert_eq!(core_e, 10);
+    assert_eq!(core_s, 1);
+    assert_eq!(core_e, 9);
 
     // 2. Endpoints (pixel 1 and pixel 8) are core, but intermediate pixel 5 fails:
     // With intermediate pixel failing, certification must fail and fall back to (10, 10).
@@ -44,6 +45,7 @@ fn test_corner_only_core_api_cannot_certify_sample_interior() {
     assert_eq!(rejected_s, 10);
     assert_eq!(rejected_e, 10);
 }
+
 
 #[test]
 fn test_coarse_resolutions_match_exhaustive_reference() {

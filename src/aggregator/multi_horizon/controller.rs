@@ -1,10 +1,8 @@
 //! Generic multi-resolution streaming controller.
 //!
-//! Bounded worker windows merge into resolution maps. Conservative chunk/cell
-//! bounds permit early finalization; memory pressure creates sorted partial runs.
-//! Once spilled, a resolution is finalized only after external merging at EOF.
-//! Output and sorted sibling compaction are incremental. Failures latch and drop
-//! temporary files. The aggregation budget excludes decoded chunks and metadata.
+//! Coordinates batched Rayon chunk decoding, parallel 32-shard aggregation,
+//! conservative geodetic horizon eviction, aperture-7 child-to-parent compaction,
+//! and on-disk spill runs for memory bounding.
 
 use fxhash::FxBuildHasher;
 use h3o::Resolution;
@@ -26,7 +24,7 @@ use super::compaction::HierarchicalCompactor;
 use super::config::MultiResolutionConfig;
 use super::coordinates::eviction_north_bound;
 use super::lifecycle::{OutputBuffer, StreamLifecycle};
-use super::sharded_map::{AccumulatorMerge, ShardedResolutionMap};
+use super::sharded_map::{get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS};
 use super::spill::{RunReader, SpillAccumulator, SpillRuns};
 
 /// Kernel trait parameterizing data type-specific chunk processing, aggregation, and filtering
@@ -112,9 +110,9 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     pub bbox: Option<[f64; 4]>,
     pub sampling: SamplingPattern,
     pub resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
-    compactor: HierarchicalCompactor<K>,
-    output_buffer: OutputBuffer<K::Record>,
-    lifecycle: StreamLifecycle,
+    pub compactor: HierarchicalCompactor<K>,
+    pub output_buffer: OutputBuffer<K::Record>,
+    pub lifecycle: StreamLifecycle,
     pub current_lat_horizon: f64,
     pub can_evict_early: bool,
     pub suffix_max_north_lat: Vec<f64>,
@@ -122,16 +120,14 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     pub processed_chunk_count: usize,
     spill_runs: Vec<SpillRuns<K::Accumulator>>,
     final_reader: Option<FinalCells<K::Accumulator>>,
-    eviction_horizon: f64,
     final_resolution: usize,
     finishing: bool,
     compaction_parent: Option<u64>,
     map_budget: usize,
-    accumulator_limit: usize,
-    worker_pixels: usize,
-    worker_tasks: usize,
     output_byte_limit: usize,
     peak_active_bytes: usize,
+    batch_size: usize,
+    min_batch: usize,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -180,7 +176,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
         // Bounds cover whole chunks and all subpixel offsets. Unknown projected
         // chunks get +infinity; once they are processed a later suffix can still
-        // become certifiable. Compaction uses sorted EOF groups, not parent geometry.
+        // become certifiable.
         let n_chunks = mosaic.chunk_refs.len();
         let mut suffix_max_north_lat = vec![f64::NEG_INFINITY; n_chunks + 1];
         for k in (0..n_chunks).rev() {
@@ -198,25 +194,29 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             );
             suffix_max_north_lat[k] = suffix_max_north_lat[k + 1].max(north);
         }
-        let can_evict_early = !should_compact && suffix_max_north_lat.iter().any(|v| v.is_finite());
+        let can_evict_early =
+            suffix_max_north_lat.iter().any(|v| v.is_finite()) && !config.compact_h3_children;
         for map in &mut resolution_shards {
             map.set_eviction_enabled(can_evict_early);
         }
+
         // Leave room for sorted-run construction, merge heads, and bounded output.
         let map_budget = config.aggregation_budget_bytes / num_res / 2;
         let accumulator_limit = config.aggregation_budget_bytes / num_res / 8;
         let spill_runs = (0..num_res)
             .map(|_| SpillRuns::new(accumulator_limit, config.spill_directory.as_deref()))
             .collect();
-        let worker_tasks = rayon::current_num_threads().clamp(1, 8);
-        let worker_pixels = (config.aggregation_budget_bytes
-            / 8
-            / worker_tasks
-            / num_res
-            / config.sampling.points.len()
-            / 1024)
-            .clamp(1, 1024);
         let output_byte_limit = config.aggregation_budget_bytes / 4;
+
+        // Scale batch size with budget and dataset size:
+        // For small rasters (few chunks) or tight budgets, use bounded batches so
+        // incremental eviction can yield records before EOF without swallowing the entire file.
+        // For large rasters and budgets, scale with Rayon worker threads.
+        let batch_size = ((config.aggregation_budget_bytes / (num_res * 64 * 1024))
+            .min((rayon::current_num_threads() * 8).clamp(16, 64)))
+        .min((n_chunks / 4).max(1))
+        .max(1);
+        let min_batch = (batch_size / 2).max(1);
 
         Ok(Self {
             kernel,
@@ -229,7 +229,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             sampling: config.sampling.clone(),
             resolution_shards,
             compactor,
-            output_buffer: OutputBuffer::with_capacity(16),
+            output_buffer: OutputBuffer::with_capacity(2048),
             lifecycle: StreamLifecycle::new(),
             current_lat_horizon: f64::INFINITY,
             can_evict_early,
@@ -238,16 +238,14 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             processed_chunk_count: 0,
             spill_runs,
             final_reader: None,
-            eviction_horizon: f64::INFINITY,
             final_resolution: 0,
             finishing: false,
             compaction_parent: None,
             map_budget,
-            accumulator_limit,
-            worker_pixels,
-            worker_tasks,
             output_byte_limit,
             peak_active_bytes: 0,
+            batch_size,
+            min_batch,
         })
     }
 
@@ -303,108 +301,27 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         Ok(())
     }
 
-    fn merge_window(
-        &mut self,
-        maps: Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>,
-    ) -> Result<()> {
-        for (i, map) in maps.into_iter().enumerate() {
-            for (key, acc) in map {
-                if acc.memory_bytes() > self.accumulator_limit {
-                    return Err(RasterH3Error::InvalidParameter("single accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
-                }
-                if self.resolution_shards[i].merge_owned(key, acc) > self.accumulator_limit {
-                    return Err(RasterH3Error::InvalidParameter("merged accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
-                }
-                self.peak_active_bytes = self.peak_active_bytes.max(
-                    self.resolution_shards
-                        .iter()
-                        .map(|s| s.estimated_bytes())
-                        .sum(),
-                );
-                if self.resolution_shards[i].estimated_bytes() >= self.map_budget {
-                    self.spill_resolution(i)?;
+    /// Evict completed cells across all resolutions that lie north of the given latitude horizon
+    fn evict_completed(&mut self, lat_horizon: f64) {
+        let num_res = self.resolutions.len();
+        for res_idx in 0..num_res {
+            if !self.spill_runs[res_idx].has_spilled() {
+                let res_u8 = self.resolution_u8s[res_idx];
+                let newly_evicted = self.resolution_shards[res_idx].evict_completed(lat_horizon);
+                for (cell_u64, acc) in newly_evicted {
+                    self.compactor.push_cell(
+                        &self.kernel,
+                        res_u8,
+                        cell_u64,
+                        acc,
+                        &mut self.output_buffer,
+                    );
                 }
             }
         }
-        Ok(())
-    }
 
-    /// Budgeted scratch windows prevent a single huge TIFF strip from producing
-    /// an unbounded worker map. TIFF decoding itself still owns whole chunks.
-    fn process_bounded_chunk(
-        &mut self,
-        tile_idx: usize,
-        chunk: RasterChunk,
-        data: &DecodingResult,
-        has_overlap: bool,
-    ) -> Result<()> {
-        let mosaic = Arc::clone(&self.mosaic);
-        let tile = &mosaic.tiles[tile_idx];
-        let spp = tile.reader.metadata.samples_per_pixel.max(1) as usize;
-        let stride = tile.reader.chunk_layout.chunk_width as usize;
-        let width = chunk.width as usize;
-        if width == 0 {
-            return Ok(());
-        }
-        let windows_per_row = width.div_ceil(self.worker_pixels);
-        let total = windows_per_row * chunk.height as usize;
-        for first in (0..total).step_by(self.worker_tasks) {
-            let t1 = std::time::Instant::now();
-            let process_window = |j: usize| {
-                let row = j / windows_per_row;
-                let col = (j % windows_per_row) * self.worker_pixels;
-                let n = self.worker_pixels.min(width - col);
-                let start = (row * stride + col) * spp;
-                let mut window_data = copy_window(data, start, n * spp)?;
-                let window = RasterChunk {
-                    col_offset: chunk.col_offset + col as u32,
-                    row_offset: chunk.row_offset + row as u32,
-                    width: n as u32,
-                    height: 1,
-                };
-                let mut maps: Vec<_> = self
-                    .resolutions
-                    .iter()
-                    .map(|_| HashMap::with_hasher(FxBuildHasher::default()))
-                    .collect();
-                self.kernel.process_chunk(
-                    &window,
-                    &mut window_data,
-                    &self.resolutions,
-                    &tile.crs_transformer,
-                    &tile.reader.metadata.geotransform,
-                    &self.sampling,
-                    self.bbox,
-                    n as u32,
-                    self.nodata.or(tile.reader.metadata.nodata),
-                    spp as u16,
-                    if has_overlap {
-                        Some((tile_idx, &*mosaic))
-                    } else {
-                        None
-                    },
-                    &mut maps,
-                );
-                Ok(maps)
-            };
-            let range = first..(first + self.worker_tasks).min(total);
-            // A caller may hold a streamer mutex inside a saturated Rayon pool.
-            // Nested work-stealing can then steal another caller that waits for
-            // that same mutex. Process locally in that case to avoid deadlock.
-            let results: Vec<Result<_>> = if rayon::current_thread_index().is_some() {
-                range.map(process_window).collect()
-            } else {
-                range.into_par_iter().map(process_window).collect()
-            };
-            self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
-            let t2 = std::time::Instant::now();
-            // Rayon has joined the entire wave before any merge/eviction.
-            for result in results {
-                self.merge_window(result?)?;
-            }
-            self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
-        }
-        Ok(())
+        self.compactor
+            .evict_above_horizon(&self.kernel, lat_horizon, &mut self.output_buffer);
     }
 
     /// Advance until a bounded batch of completed records is available.
@@ -426,19 +343,31 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 || self.output_buffer.estimated_bytes() < self.output_byte_limit)
         {
             if self.finishing {
-                if let Some(reader) = &mut self.final_reader {
-                    if let Some((key, acc)) = reader.next_record()? {
-                        self.emit_final(self.final_resolution - 1, key, acc);
+                if let Some(mut reader) = self.final_reader.take() {
+                    let mut reader_done = false;
+                    while self.output_buffer.len() < min_rows
+                        && self.output_buffer.estimated_bytes() < self.output_byte_limit
+                    {
+                        if let Some((key, acc)) = reader.next_record()? {
+                            self.emit_final(self.final_resolution - 1, key, acc);
+                        } else {
+                            reader_done = true;
+                            self.compactor
+                                .flush_all(&self.kernel, &mut self.output_buffer);
+                            self.compaction_parent = None;
+                            break;
+                        }
+                    }
+                    if !reader_done {
+                        self.final_reader = Some(reader);
+                    }
+                    if self.output_buffer.len() >= min_rows || self.final_reader.is_some() {
                         continue;
                     }
-                    self.final_reader = None;
-                    self.compactor
-                        .flush_all(&self.kernel, &mut self.output_buffer);
-                    self.compaction_parent = None;
-                    continue;
                 }
                 if self.final_resolution < self.resolutions.len() {
                     let i = self.final_resolution;
+                    self.final_resolution += 1;
                     self.final_reader = if self.spill_runs[i].has_spilled() {
                         self.spill_resolution(i)?;
                         self.spill_runs[i].finish()?.map(FinalCells::Disk)
@@ -447,46 +376,27 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                             self.resolution_shards[i].take_sorted().into_iter(),
                         ))
                     };
-                    self.final_resolution += 1;
                     continue;
                 }
+                self.compactor
+                    .flush_all(&self.kernel, &mut self.output_buffer);
                 self.current_lat_horizon = f64::NEG_INFINITY;
                 self.lifecycle.mark_finished();
                 break;
             }
 
-            // Never finalize a cell that may have an earlier partial state on disk.
-            let mut emitted = false;
-            if self.can_evict_early {
-                for i in 0..self.resolutions.len() {
-                    if !self.spill_runs[i].has_spilled() {
-                        if let Some((key, acc)) =
-                            self.resolution_shards[i].pop_completed(self.eviction_horizon)
-                        {
-                            self.emit_final(i, key, acc);
-                            emitted = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if emitted {
-                continue;
-            }
-            if self.output_buffer.is_empty()
-                && !self.spill_runs.iter().any(|r| r.has_spilled())
-                && !self.compactor.is_enabled()
-            {
-                self.current_lat_horizon = self.eviction_horizon;
-            }
-
             let t0 = std::time::Instant::now();
-            let mut items = Vec::with_capacity(1);
-            if let Some(prefetcher) = &self.prefetcher {
-                prefetcher.drain_chunk_batch_into(&mut items, 1, 1);
+            let mut chunk_items = Vec::with_capacity(self.batch_size);
+            if let Some(ref prefetcher) = self.prefetcher {
+                prefetcher.drain_chunk_batch_into(&mut chunk_items, self.min_batch, self.batch_size);
             }
             self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
-            if items.is_empty() {
+
+            if let Some(error) = chunk_items.iter().find_map(|item| item.as_ref().err()) {
+                return Err(RasterH3Error::StreamFailed(error.to_string()));
+            }
+
+            if chunk_items.is_empty() {
                 if self.processed_chunk_count != self.mosaic.chunk_refs.len() {
                     return Err(RasterH3Error::StreamFailed(format!(
                         "Prefetch ended after {} of {} chunks",
@@ -496,23 +406,129 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 }
                 self.prefetcher.take();
                 self.finishing = true;
-                // Keep the published horizon conservative until deferred output
-                // is consumed; downstream tilers must not flush ahead of it.
                 continue;
             }
-            for item in items {
-                let (tile_idx, _, bounds, data, overlap) = item?;
-                self.process_bounded_chunk(tile_idx, bounds, &data, overlap)?;
-                self.processed_chunk_count += 1;
-                if let Some(prefetcher) = &self.prefetcher {
-                    prefetcher.recycle_batch(vec![data]);
+
+            let t1 = std::time::Instant::now();
+            let parallel_results: Vec<(
+                Vec<[Vec<(u64, K::Accumulator)>; NUM_SHARDS]>,
+                DecodingResult,
+            )> = {
+                let resolutions = &self.resolutions;
+                let sampling = &self.sampling;
+                let bbox = self.bbox;
+                let mosaic = Arc::clone(&self.mosaic);
+                let user_nodata = self.nodata;
+                let kernel = &self.kernel;
+
+                chunk_items
+                    .par_iter_mut()
+                    .map_init(
+                        || {
+                            let mut maps = Vec::with_capacity(resolutions.len());
+                            for _ in 0..resolutions.len() {
+                                maps.push(HashMap::with_capacity_and_hasher(
+                                    128,
+                                    FxBuildHasher::default(),
+                                ));
+                            }
+                            maps
+                        },
+                        |local_maps, item| match item {
+                            Ok((tile_idx, _chunk_idx, chunk_bounds, decoding_result, has_overlap)) => {
+                                for m in local_maps.iter_mut() {
+                                    m.clear();
+                                }
+                                let tile = &mosaic.tiles[*tile_idx];
+                                let crs_transformer = &tile.crs_transformer;
+                                let gt = &tile.reader.metadata.geotransform;
+                                let chunk_stride = tile.reader.chunk_layout.chunk_width;
+                                let nodata = user_nodata.or(tile.reader.metadata.nodata);
+                                let samples_per_pixel = tile.reader.metadata.samples_per_pixel;
+
+                                let overlap_ctx = if *has_overlap {
+                                    Some((*tile_idx, &*mosaic))
+                                } else {
+                                    None
+                                };
+
+                                let has_data = kernel.process_chunk(
+                                    chunk_bounds,
+                                    decoding_result,
+                                    resolutions,
+                                    crs_transformer,
+                                    gt,
+                                    sampling,
+                                    bbox,
+                                    chunk_stride,
+                                    nodata,
+                                    samples_per_pixel,
+                                    overlap_ctx,
+                                    local_maps,
+                                );
+
+                                let mut chunk_shards =
+                                    Vec::with_capacity(if has_data { local_maps.len() } else { 0 });
+                                if has_data {
+                                    for m in local_maps.iter_mut() {
+                                        let mut shards: [Vec<(u64, K::Accumulator)>; NUM_SHARDS] =
+                                            std::array::from_fn(|_| Vec::new());
+                                        for (cell_u64, acc) in m.drain() {
+                                            let s = get_shard(cell_u64);
+                                            shards[s].push((cell_u64, acc));
+                                        }
+                                        chunk_shards.push(shards);
+                                    }
+                                }
+                                (
+                                    chunk_shards,
+                                    std::mem::replace(decoding_result, DecodingResult::U8(Vec::new())),
+                                )
+                            }
+                            Err(_) => unreachable!("chunk errors were checked before dispatch"),
+                        },
+                    )
+                    .collect()
+            };
+            self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
+
+            let t2 = std::time::Instant::now();
+            self.processed_chunk_count += chunk_items.len();
+
+            let num_res = self.resolutions.len();
+            for res_idx in 0..num_res {
+                self.resolution_shards[res_idx].merge_thread_results(&parallel_results, res_idx);
+            }
+
+            let recycled_buffers: Vec<DecodingResult> =
+                parallel_results.into_iter().map(|(_, dec)| dec).collect();
+
+            if let Some(ref prefetcher) = self.prefetcher {
+                prefetcher.recycle_batch(recycled_buffers);
+            }
+            self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
+
+            if self.can_evict_early && self.processed_chunk_count < self.mosaic.chunk_refs.len() {
+                let safe_lat = self.suffix_max_north_lat[self.processed_chunk_count];
+                if safe_lat < self.current_lat_horizon {
+                    let t3 = std::time::Instant::now();
+                    self.current_lat_horizon = safe_lat;
+                    self.evict_completed(safe_lat);
+                    self.profile_stats[3] += t3.elapsed().as_nanos() as u64;
                 }
             }
-            // Every sample of the current chunk has been merged or persisted.
-            // Spilling may defer older northern cells, so do not publish a new
-            // horizon downstream after any resolution has spilled.
-            if !self.spill_runs.iter().any(|r| r.has_spilled()) && !self.compactor.is_enabled() {
-                self.eviction_horizon = self.suffix_max_north_lat[self.processed_chunk_count];
+
+            let total_active_bytes: usize = self
+                .resolution_shards
+                .iter()
+                .map(|s| s.estimated_bytes())
+                .sum();
+            self.peak_active_bytes = self.peak_active_bytes.max(total_active_bytes);
+
+            for i in 0..num_res {
+                if self.resolution_shards[i].estimated_bytes() >= self.map_budget {
+                    self.spill_resolution(i)?;
+                }
             }
         }
         Ok(())
@@ -600,16 +616,6 @@ impl<K: HorizonStreamKernel> RecordStreamer for MultiHorizonStreamer<K> {
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         Some(self.mosaic.mosaic_bounds_wgs84)
     }
-}
-
-/// Copy a bounded contiguous sample window, retaining the native TIFF type.
-fn copy_window(data: &DecodingResult, start: usize, len: usize) -> Result<DecodingResult> {
-    macro_rules! copy { ($($variant:ident),*) => { match data { $(DecodingResult::$variant(values) => {
-        let end = start.checked_add(len).ok_or_else(|| RasterH3Error::InvalidMetadata("sample window overflow".into()))?;
-        let values = values.get(start..end).ok_or_else(|| RasterH3Error::InvalidMetadata("decoded chunk shorter than its declared dimensions".into()))?;
-        Ok(DecodingResult::$variant(values.to_vec()))
-    }),* } }; }
-    copy!(U8, U16, U32, U64, I8, I16, I32, I64, F32, F64)
 }
 
 enum FinalCells<A> {

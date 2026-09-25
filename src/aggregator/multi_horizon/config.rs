@@ -206,7 +206,7 @@ impl MultiResolutionConfig {
     /// Create a new multi-resolution configuration
     pub fn new(resolutions: Vec<u8>) -> Self {
         Self {
-            aggregation_budget_bytes: 8 * 1024 * 1024,
+            aggregation_budget_bytes: 64 * 1024 * 1024,
             spill_directory: None,
             prefetch_chunks: 16,
             decode_workers: 4,
