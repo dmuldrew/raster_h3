@@ -160,6 +160,9 @@ pub struct MultiResolutionConfig {
     /// Active aggregation budget in bytes (not a whole-process RSS limit).
     /// Includes table capacity and dynamic accumulator state; oversized individual states fail.
     pub aggregation_budget_bytes: usize,
+    /// Search monotone, exactly checked prefixes using exponential/binary search.
+    /// False selects the sequential baseline; neither mode skips unchecked centers.
+    pub certified_lookahead: bool,
     /// Optional directory for automatically cleaned-up temporary aggregation runs.
     pub spill_directory: Option<std::path::PathBuf>,
     /// Decoded chunk ring and idle pool capacity (minimum 16).
@@ -207,6 +210,7 @@ impl MultiResolutionConfig {
     pub fn new(resolutions: Vec<u8>) -> Self {
         Self {
             aggregation_budget_bytes: 64 * 1024 * 1024,
+            certified_lookahead: true,
             spill_directory: None,
             prefetch_chunks: 16,
             decode_workers: 4,

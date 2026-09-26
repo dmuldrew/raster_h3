@@ -34,7 +34,7 @@ impl H3SpanOptimizer {
         _bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
         let r_u8 = res as u8;
-        // Exact center runs currently use the constant-latitude fast transforms.
+        // Certified prefix search (or its sequential baseline) uses constant-latitude transforms.
         // Geographic cutoffs are performance policy, not a containment proof.
         let is_eligible = ctx.is_north_up
             && (ctx.is_wgs84 || ctx.is_web_mercator)

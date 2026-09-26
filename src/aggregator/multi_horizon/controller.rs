@@ -171,6 +171,7 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     peak_active_bytes: usize,
     worker_maps: Vec<Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>>,
     pub metrics: super::profile::StreamProfile,
+    certified_lookahead: bool,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -307,6 +308,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         .collect()
                 })
                 .collect(),
+            certified_lookahead: config.certified_lookahead,
             metrics: super::profile::StreamProfile {
                 worker_map_sets: worker_tasks as u64,
                 ..Default::default()
@@ -469,7 +471,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 )| {
                     let (tile_idx, chunk, samples, stride, overlap) = job;
                     let tile = &self.mosaic.tiles[*tile_idx];
-                    let scope = super::profile::WorkerScope::new();
+                    let scope = super::profile::WorkerScope::new(self.certified_lookahead);
                     let start = std::time::Instant::now();
                     self.kernel.process_window(
                         chunk,

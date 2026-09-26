@@ -391,3 +391,106 @@ fn enabled_span_paths_match_exhaustive_geodetic_reference() {
         }
     }
 }
+
+#[test]
+fn certified_prefixes_match_exact_indexing_near_vertices_and_cutoffs() {
+    for res in [Resolution::Four, Resolution::Eight, Resolution::Twelve] {
+        for (lat, lon) in [
+            (0.0, 0.0),
+            (69.999, 174.999),
+            (-69.999, -174.999),
+            (80.0, 179.999),
+        ] {
+            let seed = LatLng::new(lat, lon).unwrap().to_cell(res);
+            for vertex in seed.boundary().iter() {
+                for delta in [-1e-10, 0.0, 1e-10] {
+                    for step in [-0.0001, 0.0001] {
+                        let lat = vertex.lat() + delta;
+                        let lon = vertex.lng();
+                        let run = u64::from(LatLng::new(lat, lon).unwrap().to_cell(res));
+                        let exact = |c: usize| {
+                            Some(u64::from(
+                                LatLng::new(lat, lon + c as f64 * step)
+                                    .unwrap()
+                                    .to_cell(res),
+                            ))
+                        };
+                        let end = (1..129).find(|&c| exact(c) != Some(run)).unwrap_or(129);
+                        for width in [1, 2, 7, 64, usize::MAX] {
+                            let mut cache = H3ScanlineLookahead::with_initial_width(width);
+                            assert_eq!(
+                                cache.find_span_end(0, 129, lon, lat, step, res, run),
+                                (end, if end < 129 { exact(end) } else { None })
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn certified_and_sequential_streams_have_identical_output_and_index_work() {
+    for epsg in [4326, 3857] {
+        let (lon, lat, scale) = if epsg == 4326 {
+            (-122.5, 37.85, 0.0001)
+        } else {
+            (-13636637.6, 4558128.0, 10.0)
+        };
+        let (_file, path) = TestGeoTiffBuilder::new(257, 17)
+            .origin(lon, lat)
+            .pixel_size(scale)
+            .epsg(epsg)
+            .create_f32_tempfile(|c, r| ((c + 3 * r) % 31) as f32);
+        for sampling in [
+            SamplingPattern::center(),
+            SamplingPattern::rgss(),
+            SamplingPattern::five_point(),
+        ] {
+            let mut reference = None;
+            #[cfg(feature = "stream-profile")]
+            let mut reference_calls = None;
+            for enabled in [false, true] {
+                let mut config = MultiResolutionConfig::new(vec![7, 8]);
+                config.sampling = sampling.clone();
+                config.certified_lookahead = enabled;
+                let mut stream = MultiScanHorizonStreamer::new(
+                    GeoTiffStreamReader::open(&path).unwrap(),
+                    &config,
+                )
+                .unwrap();
+                let mut result = std::collections::BTreeMap::new();
+                loop {
+                    let batch = stream.fetch_next_batch(19).unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for r in batch {
+                        assert!(result
+                            .insert(
+                                (r.resolution, r.h3_index),
+                                (r.accumulator.count, r.accumulator.sum)
+                            )
+                            .is_none());
+                    }
+                }
+                if let Some(ref expected) = reference {
+                    assert_eq!(&result, expected);
+                } else {
+                    reference = Some(result);
+                }
+                #[cfg(feature = "stream-profile")]
+                {
+                    let profile = &stream.metrics.worker;
+                    assert_eq!(profile.prefix_tests > 0, enabled);
+                    if let Some(calls) = reference_calls {
+                        assert_eq!(profile.h3_calls, calls);
+                    } else {
+                        reference_calls = Some(profile.h3_calls);
+                    }
+                }
+            }
+        }
+    }
+}

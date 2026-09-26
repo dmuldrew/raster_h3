@@ -67,21 +67,58 @@ The conservative worker allowance, spill behavior, and serialized merging remain
 This removes pixel-window copies and repeated map-container construction; it does
 not remove per-pixel H3 indexing or establish a particular throughput target.
 
-## Lookahead status
+## Certified prefix search
 
-Exponential/binary endpoint lookahead remains disabled. The regression with an
-H3 cell leave-and-reenter along a constant-latitude row demonstrates why endpoint
-agreement cannot certify a prefix. A spherical polygon containment test with an
-arbitrary inward margin would still require a justified error bound relating it
-to the floating-point H3 indexing implementation. No such bound has been
-established here, so there is no newly enabled geometric certificate or no-op
-configuration switch claiming otherwise. Center spans and subpixel cores retain
-exact intermediate-sample checks.
+`MultiResolutionConfig::certified_lookahead` defaults to true. It selects
+exponential probing and binary refinement over a **whole-prefix predicate**,
+not endpoint membership. Set it to false for the previous sequential search.
+The benchmark's optional third argument selects `certified` (default) or
+`sequential`, for example:
 
-The remaining optimization requires a whole-prefix certificate, including every
-actual sampling offset, conservative arithmetic error handling, supported face
-and projection domains, and exact fallback whenever containment is inconclusive.
-A sampled or empirical margin is insufficient for the requested soundness claim.
+```sh
+RAYON_NUM_THREADS=8 cargo run --release --example benchmark_streaming -- 512 3 certified
+RAYON_NUM_THREADS=8 cargo run --release --example benchmark_streaming -- 512 3 sequential
+```
+
+The current certificate is exact and discrete: it checks each newly covered
+pixel center using the same H3 call and coordinate expression as the sequential
+baseline. It caches the verified exclusive end and the first failure. Binary
+refinement consults that cache without re-indexing pixels. The first different
+cell is returned to the walker for reuse. Invalid coordinates are cached as a
+failure, distinctly from an unchecked prefix. Storage is O(1), with no window
+allocation or unbounded lookup table.
+
+**Proof.** Let `m` be the first pixel whose exact H3 assignment differs from the
+run's starting cell, or the row end if there is no such pixel. A prefix with
+exclusive end `e` is valid exactly when `e <= m`. The cache starts immediately
+after the already-indexed starting pixel. It advances only after checking the
+next pixel; at the first failure it stops permanently. Thus a shorter cached
+prefix is true, and a prefix past that failure is false, even if the row later
+re-enters the starting cell. Exponential probing brackets the transition;
+binary refinement maintains a valid lower end and invalid upper end and returns
+`m`. No bound on spherical curvature or floating-point boundary reconstruction
+is required. The coordinate/indexing operations being certified are the actual
+operations used by the sequential implementation.
+
+Production eligibility remains north-up WGS84/Web Mercator, resolution >= 4,
+|latitude| < 70 degrees and longitude extent within +/-175 degrees. Other inputs
+retain exact per-sample processing. Core spans independently check every actual
+subpixel sample and require unit total sample weight; center certification never
+substitutes for that check.
+
+**Performance limit:** this is not a geometric skipping certificate. A span of
+length n still takes O(n) H3 calls, with O(log n) cheap prefix queries. It can add
+search overhead relative to the sequential loop; no reduction in H3 work or
+throughput improvement is claimed. `stream-profile` exposes `prefix_tests`, and
+the integration test checks that both modes perform identical H3-call counts.
+A logarithmic-H3-work fast path would still require a justified geometric and
+numerical containment certificate. An arbitrary inward margin is not one.
+
+Tests exhaust every 11-pixel membership pattern (including repeated re-entry)
+with seven probe widths, plus invalid coordinates and overflow-sized indices.
+Geodetic tests cover the known re-entry counterexample, vertex perturbations,
+both longitude directions, high latitudes/antimeridian proximity, and streaming
+parity for center, RGSS and five-point sampling in both supported projections.
 
 ## Local comparison, 2026-09-26
 

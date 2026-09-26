@@ -13,6 +13,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     let size: u32 = args.get(1).map(|s| s.parse()).transpose()?.unwrap_or(512);
     let repeats: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(3);
+    let certified = match args.get(3).map(String::as_str).unwrap_or("certified") {
+        "certified" => true,
+        "sequential" => false,
+        _ => return Err("search mode must be certified or sequential".into()),
+    };
     assert!(size > 0 && repeats > 0);
     // Drive streaming outside Rayon: nesting in pool.install selects its serial
     // fallback. Set RAYON_NUM_THREADS before starting this process instead.
@@ -65,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for repeat in 0..repeats {
                         let mut config = MultiResolutionConfig::single(resolution);
                         config.sampling = sampling.clone();
+                        config.certified_lookahead = certified;
                         config.aggregation_budget_bytes = budget;
                         let reader = GeoTiffStreamReader::open(file.path())?;
                         let start = Instant::now();
@@ -102,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "sampling":sampling_name, "budget":budget, "repeat":repeat,
                                 "threads":rayon::current_num_threads(),
                                 "instrumented":cfg!(feature="stream-profile"),
+                                "certified_search":certified,
                                 "seconds":seconds, "mpx_per_second":(size as f64 * size as f64)/seconds/1e6,
                                 "cells":records.len(), "decode_baseline_ns":decode_ns.to_string(),
                                 "spill_runs":stream.spill_run_count(), "spill_bytes":stream.spill_bytes_written(),

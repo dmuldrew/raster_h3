@@ -2,12 +2,12 @@
 //! timers; normal builds compile hot-path measurement out entirely.
 use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
-#[cfg(feature = "stream-profile")]
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Default, Debug, Serialize)]
 pub struct WorkerProfile {
     pub h3_calls: u64,
+    pub prefix_tests: u64,
     pub h3_ns: u64,
     pub transform_calls: u64,
     pub transform_ns: u64,
@@ -16,6 +16,7 @@ pub struct WorkerProfile {
 impl WorkerProfile {
     pub fn merge(&mut self, other: Self) {
         self.h3_calls += other.h3_calls;
+        self.prefix_tests += other.prefix_tests;
         self.h3_ns += other.h3_ns;
         self.transform_calls += other.transform_calls;
         self.transform_ns += other.transform_ns;
@@ -23,17 +24,20 @@ impl WorkerProfile {
     }
 }
 thread_local! {
+    static LOOKAHEAD: Cell<bool> = const { Cell::new(true) };
     #[cfg(feature="stream-profile")]
     static PROFILE: Cell<WorkerProfile> = Cell::new(WorkerProfile::default());
 }
 /// Restore counters even if a kernel panics or recursively calls another stream.
 pub struct WorkerScope {
+    old_lookahead: bool,
     #[cfg(feature = "stream-profile")]
     old_profile: WorkerProfile,
 }
 impl WorkerScope {
-    pub fn new() -> Self {
+    pub fn new(lookahead: bool) -> Self {
         Self {
+            old_lookahead: LOOKAHEAD.with(|v| v.replace(lookahead)),
             #[cfg(feature = "stream-profile")]
             old_profile: PROFILE.with(|v| v.replace(WorkerProfile::default())),
         }
@@ -51,6 +55,7 @@ impl WorkerScope {
 }
 impl Drop for WorkerScope {
     fn drop(&mut self) {
+        LOOKAHEAD.with(|v| v.set(self.old_lookahead));
         #[cfg(feature = "stream-profile")]
         PROFILE.with(|v| v.set(self.old_profile));
     }
@@ -111,4 +116,18 @@ pub struct StreamProfile {
     pub peak_worker_bytes: usize,
     pub decoded_bytes: u64,
     pub prefetch_wait_ns: u64,
+}
+
+pub fn lookahead_enabled() -> bool {
+    LOOKAHEAD.with(Cell::get)
+}
+
+#[inline(always)]
+pub fn prefix_test() {
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.prefix_tests += 1;
+        v.set(p);
+    });
 }
