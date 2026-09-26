@@ -59,14 +59,14 @@ impl<'a> CoordinateTransformer<'a> {
     #[inline(always)]
     pub fn pixel_to_wgs84(&self, px: f64, py: f64) -> Result<(f64, f64)> {
         let (x, y) = self.gt.pixel_to_coord(px, py);
-        self.crs_transformer.transform_point(x, y)
+        super::profile::transform(self.crs_transformer, x, y)
     }
 
     /// Transform a pixel center `(col, row)` to WGS84 `(lon, lat)`
     #[inline(always)]
     pub fn pixel_center_to_wgs84(&self, col: usize, row: usize) -> Result<(f64, f64)> {
         let (x, y) = self.gt.pixel_center_to_coord(col, row);
-        self.crs_transformer.transform_point(x, y)
+        super::profile::transform(self.crs_transformer, x, y)
     }
 
     /// Transform a subpixel sample point at `(col, row)` with offset `sp` to WGS84 `(lon, lat)`
@@ -118,7 +118,9 @@ pub fn resolve_subpixel_cell(
     } else if !(-90.0..=90.0).contains(&lat) {
         None
     } else {
-        LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
+        LatLng::new(lat, lon)
+            .ok()
+            .map(|ll| crate::aggregator::multi_horizon::profile::index(ll, res).into())
     }
 }
 
@@ -208,7 +210,7 @@ impl RowCoordinates {
             let lon = (x_start / WGS84_A) * RAD_TO_DEG;
             (lon, lat)
         } else {
-            match crs_transformer.transform_point(x_start, y_row) {
+            match super::profile::transform(crs_transformer, x_start, y_row) {
                 Ok(coords) => coords,
                 Err(_) => return None,
             }
@@ -295,10 +297,10 @@ impl RowCoordinates {
         if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
             Some((lon_curr, self.lat_row))
         } else if ctx.is_north_up {
-            crs_transformer.transform_point(x_curr, self.y_row).ok()
+            super::profile::transform(crs_transformer, x_curr, self.y_row).ok()
         } else {
             let (x, y) = gt.pixel_center_to_coord(col_offset + c, self.row_idx);
-            crs_transformer.transform_point(x, y).ok()
+            super::profile::transform(crs_transformer, x, y).ok()
         }
     }
 

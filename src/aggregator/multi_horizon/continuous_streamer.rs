@@ -110,6 +110,40 @@ impl HorizonStreamKernel for ContinuousKernel {
             local_maps,
         )
     }
+    #[inline(always)]
+    fn process_window(
+        &self,
+        chunk_bounds: &RasterChunk,
+        decoding_result: super::borrowed::BorrowedSamples<'_>,
+        resolutions: &[Resolution],
+        crs_transformer: &CrsTransformer,
+        gt: &GeoTransform,
+        sampling: &SamplingPattern,
+        bbox: Option<[f64; 4]>,
+        chunk_stride: u32,
+        nodata: Option<f64>,
+        samples_per_pixel: u16,
+        overlap_ctx: Option<(usize, &MosaicReader)>,
+        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+    ) -> bool {
+        super::continuous::process_continuous_borrowed_into(
+            chunk_bounds,
+            decoding_result,
+            resolutions,
+            crs_transformer,
+            gt,
+            sampling,
+            bbox,
+            chunk_stride,
+            nodata,
+            samples_per_pixel,
+            self.band,
+            self.spectral_formula,
+            overlap_ctx,
+            self.track_quantiles,
+            local_maps,
+        )
+    }
 }
 
 /// Single-pass streaming aggregator across multiple H3 resolutions (Continuous Data)

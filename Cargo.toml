@@ -15,6 +15,10 @@ exclude = ["data/*", "assets/*", "pmtiles_viewer/debug/*", "tests/data/*"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+stream-profile = []
+
 [dependencies]
 # Fast pure-Rust H3 indexing library
 h3o = "0.6"

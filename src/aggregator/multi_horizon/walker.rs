@@ -347,8 +347,9 @@ fn walk_single_res_row<T, Acc, E>(
                     crs_transformer,
                     bbox,
                     |lat, lon| {
-                        LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
-                            == Some(run_cell)
+                        LatLng::new(lat, lon).ok().map(|ll| {
+                            crate::aggregator::multi_horizon::profile::index(ll, res).into()
+                        }) == Some(run_cell)
                     },
                 );
 
@@ -593,10 +594,9 @@ fn walk_multi_res_row<T, Acc, E>(
                             crs_transformer,
                             bbox,
                             |test_lat, test_lon| {
-                                LatLng::new(test_lat, test_lon)
-                                    .ok()
-                                    .map(|ll| ll.to_cell(res).into())
-                                    == Some(buf.run_cells[i])
+                                LatLng::new(test_lat, test_lon).ok().map(|ll| {
+                                    crate::aggregator::multi_horizon::profile::index(ll, res).into()
+                                }) == Some(buf.run_cells[i])
                             },
                         );
                         buf.core_starts[i] = c_start;

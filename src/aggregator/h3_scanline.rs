@@ -46,7 +46,7 @@ impl H3ScanlineLookahead {
         if !(-90.0..=90.0).contains(&lat) {
             None
         } else if let Ok(ll) = LatLng::new(lat, lon) {
-            Some(ll.to_cell(res).into())
+            Some(crate::aggregator::multi_horizon::profile::index(ll, res).into())
         } else {
             None
         }

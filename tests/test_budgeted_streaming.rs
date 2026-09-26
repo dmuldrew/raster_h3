@@ -359,6 +359,15 @@ fn large_strip_high_resolution_respects_active_budget() {
         }
     }
     assert_eq!(counts, [6144.0, 6144.0]);
+    assert!(stream.metrics.jobs > stream.metrics.worker_map_sets);
+    assert!(stream.metrics.peak_worker_bytes <= config.aggregation_budget_bytes / 4);
+    assert!(stream.spill_bytes_written() > 0);
+    #[cfg(feature = "stream-profile")]
+    {
+        assert_eq!(stream.metrics.worker.copied_bytes, 0);
+        assert!(stream.metrics.worker.h3_calls > 0);
+    }
+
     assert!(stream.spill_run_count() > 1);
     assert!(
         stream.peak_active_bytes() <= config.aggregation_budget_bytes,

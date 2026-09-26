@@ -2,6 +2,7 @@
 //! conservative horizon eviction, and budgeted external aggregation.
 //! The aggregation budget does not limit TIFF decoder or whole-process memory.
 
+pub mod borrowed;
 pub mod categorical;
 pub mod categorical_streamer;
 pub mod compaction;
@@ -12,6 +13,7 @@ pub mod controller;
 pub mod coordinates;
 pub mod lifecycle;
 pub mod overlap_walker;
+pub mod profile;
 pub mod sharded_map;
 pub mod span;
 pub mod spectral;

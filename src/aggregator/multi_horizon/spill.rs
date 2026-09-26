@@ -179,6 +179,7 @@ pub struct SpillRuns<A> {
     limit: usize,
     directory: Option<std::path::PathBuf>,
     pub runs_written: u64,
+    pub bytes_written: u64,
     _acc: PhantomData<A>,
 }
 impl<A: SpillAccumulator> SpillRuns<A> {
@@ -188,6 +189,7 @@ impl<A: SpillAccumulator> SpillRuns<A> {
             limit,
             directory: directory.map(Path::to_owned),
             runs_written: 0,
+            bytes_written: 0,
             _acc: PhantomData,
         }
     }
@@ -221,6 +223,7 @@ impl<A: SpillAccumulator> SpillRuns<A> {
             return Ok(());
         }
         let file = out.into_inner().map_err(|e| e.into_error())?;
+        self.bytes_written += file.metadata()?.len();
         let mut run = Run { file, len };
         self.runs_written += 1;
         let mut level = 0;
@@ -241,7 +244,7 @@ impl<A: SpillAccumulator> SpillRuns<A> {
         }
         Ok(())
     }
-    fn merge(&self, left: Run, right: Run) -> io::Result<Run> {
+    fn merge(&mut self, left: Run, right: Run) -> io::Result<Run> {
         let mut left = RunReader::<A>::new(left, self.limit)?;
         let mut right = RunReader::<A>::new(right, self.limit)?;
         let mut a = left.next_record()?;
@@ -274,10 +277,9 @@ impl<A: SpillAccumulator> SpillRuns<A> {
             len += 1;
         }
         out.flush()?;
-        Ok(Run {
-            file: out.into_inner().map_err(|e| e.into_error())?,
-            len,
-        })
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        self.bytes_written += file.metadata()?.len();
+        Ok(Run { file, len })
     }
     pub fn finish(&mut self) -> io::Result<Option<RunReader<A>>> {
         let mut combined = None;

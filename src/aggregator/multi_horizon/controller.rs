@@ -72,6 +72,41 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
         overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool;
+
+    /// Borrowed window override. Built-in kernels never allocate a pixel copy.
+    #[allow(clippy::too_many_arguments)]
+    fn process_window(
+        &self,
+        chunk_bounds: &RasterChunk,
+        decoding_result: super::borrowed::BorrowedSamples<'_>,
+        resolutions: &[Resolution],
+        crs_transformer: &CrsTransformer,
+        gt: &GeoTransform,
+        sampling: &SamplingPattern,
+        bbox: Option<[f64; 4]>,
+        chunk_stride: u32,
+        nodata: Option<f64>,
+        samples_per_pixel: u16,
+        overlap_ctx: Option<(usize, &MosaicReader)>,
+        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+    ) -> bool {
+        super::profile::copied(decoding_result.bytes());
+        let mut owned = decoding_result.to_owned();
+        self.process_chunk(
+            chunk_bounds,
+            &mut owned,
+            resolutions,
+            crs_transformer,
+            gt,
+            sampling,
+            bbox,
+            chunk_stride,
+            nodata,
+            samples_per_pixel,
+            overlap_ctx,
+            local_maps,
+        )
+    }
 }
 
 /// Unified abstraction for streaming raster aggregators producing completed records.
@@ -134,6 +169,8 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     batch_size: usize,
     output_byte_limit: usize,
     peak_active_bytes: usize,
+    worker_maps: Vec<Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>>,
+    pub metrics: super::profile::StreamProfile,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -263,6 +300,17 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             batch_size,
             output_byte_limit,
             peak_active_bytes: 0,
+            worker_maps: (0..worker_tasks)
+                .map(|_| {
+                    (0..num_res)
+                        .map(|_| HashMap::with_hasher(FxBuildHasher::default()))
+                        .collect()
+                })
+                .collect(),
+            metrics: super::profile::StreamProfile {
+                worker_map_sets: worker_tasks as u64,
+                ..Default::default()
+            },
         })
     }
 
@@ -314,20 +362,22 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     }
 
     fn spill_resolution(&mut self, index: usize) -> Result<()> {
+        let started = std::time::Instant::now();
         let records = self.resolution_shards[index].take_sorted();
         if !records.is_empty() {
             self.spill_runs[index].push_sorted(records)?;
             self.resolution_shards[index].set_eviction_enabled(false);
         }
+        self.metrics.spill_ns += started.elapsed().as_nanos() as u64;
         Ok(())
     }
 
     fn merge_window(
         &mut self,
-        maps: Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>,
+        maps: &mut [HashMap<u64, K::Accumulator, FxBuildHasher>],
     ) -> Result<()> {
-        for (i, map) in maps.into_iter().enumerate() {
-            for (key, acc) in map {
+        for (i, map) in maps.iter_mut().enumerate() {
+            for (key, acc) in map.drain() {
                 if acc.memory_bytes() > self.accumulator_limit {
                     return Err(RasterH3Error::InvalidParameter("single accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
                 }
@@ -348,164 +398,141 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         Ok(())
     }
 
-    /// Budgeted scratch windows prevent a single huge TIFF strip from producing
-    /// an unbounded worker map. TIFF decoding itself still owns whole chunks.
-    fn process_bounded_chunk(
-        &mut self,
-        tile_idx: usize,
-        chunk: RasterChunk,
-        data: &DecodingResult,
-        has_overlap: bool,
-    ) -> Result<()> {
-        let mosaic = Arc::clone(&self.mosaic);
-        let tile = &mosaic.tiles[tile_idx];
-        let spp = tile.reader.metadata.samples_per_pixel.max(1) as usize;
-        // ChunkDecoder crops edge tiles to their actual width.
-        let stride = chunk.width as usize;
-        let width = chunk.width as usize;
-        if width == 0 {
-            return Ok(());
-        }
-        let windows_per_row = width.div_ceil(self.worker_pixels);
-        let total = windows_per_row * chunk.height as usize;
-        for first in (0..total).step_by(self.worker_tasks) {
-            let t1 = std::time::Instant::now();
-            let process_window = |j: usize| {
-                let row = j / windows_per_row;
-                let col = (j % windows_per_row) * self.worker_pixels;
-                let n = self.worker_pixels.min(width - col);
-                let start = (row * stride + col) * spp;
-                let mut window_data = copy_window(data, start, n * spp)?;
-                let window = RasterChunk {
-                    col_offset: chunk.col_offset + col as u32,
-                    row_offset: chunk.row_offset + row as u32,
-                    width: n as u32,
-                    height: 1,
-                };
-                let mut maps: Vec<_> = self
-                    .resolutions
-                    .iter()
-                    .map(|_| HashMap::with_hasher(FxBuildHasher::default()))
-                    .collect();
-                self.kernel.process_chunk(
-                    &window,
-                    &mut window_data,
-                    &self.resolutions,
-                    &tile.crs_transformer,
-                    &tile.reader.metadata.geotransform,
-                    &self.sampling,
-                    self.bbox,
-                    n as u32,
-                    self.nodata.or(tile.reader.metadata.nodata),
-                    spp as u16,
-                    if has_overlap {
-                        Some((tile_idx, &*mosaic))
-                    } else {
-                        None
-                    },
-                    &mut maps,
-                );
-                Ok(maps)
-            };
-            let range = first..(first + self.worker_tasks).min(total);
-            // A caller may hold a streamer mutex inside a saturated Rayon pool.
-            // Nested work-stealing can then steal another caller that waits for
-            // that same mutex. Process locally in that case to avoid deadlock.
-            let results: Vec<Result<_>> = if rayon::current_thread_index().is_some() {
-                range.map(process_window).collect()
-            } else {
-                range.into_par_iter().map(process_window).collect()
-            };
-            self.profile_stats[1] += t1.elapsed().as_nanos() as u64;
-            let t2 = std::time::Instant::now();
-            // Rayon has joined the entire wave before any merge/eviction.
-            for result in results {
-                self.merge_window(result?)?;
-            }
-            self.profile_stats[2] += t2.elapsed().as_nanos() as u64;
-        }
-        Ok(())
-    }
-
-    /// Whole chunks bypass scratch copies only when the entire wave fits the
-    /// worker allowance. Larger strips use bounded parallel windows instead.
+    /// Schedule bounded rectangles borrowing decoded storage. When a full row
+    /// fits, combine rows into one job; otherwise use horizontal row segments.
+    /// Each wave owns at most worker_tasks maps, reused after owned merging.
     fn process_batch(
         &mut self,
         items: &mut [crate::raster::prefetch::MosaicPrefetchItem],
     ) -> Result<()> {
-        let per_sample = 1024usize.max(std::mem::size_of::<K::Accumulator>().saturating_mul(8));
-        let per_pixel = per_sample
-            .saturating_mul(self.resolutions.len())
-            .saturating_mul(self.sampling.points.len());
-        let mut start = 0;
-        while start < items.len() {
-            let mut end = start;
-            let mut bytes = 0usize;
-            while end < items.len() {
-                let (_, _, chunk, _, _) = items[end]
-                    .as_ref()
-                    .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
-                let estimate = (chunk.width as usize)
-                    .saturating_mul(chunk.height as usize)
-                    .saturating_mul(per_pixel);
-                if estimate > self.worker_budget.saturating_sub(bytes) {
-                    break;
-                }
-                bytes += estimate;
-                end += 1;
-            }
-            if end == start {
-                let (tile, _, chunk, data, overlap) = items[start]
-                    .as_ref()
-                    .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
-                self.process_bounded_chunk(*tile, *chunk, data, *overlap)?;
-                start += 1;
-                continue;
-            }
-            let t = std::time::Instant::now();
-            let process = |item: &mut crate::raster::prefetch::MosaicPrefetchItem| {
-                let (tile_idx, _, chunk, data, overlap) = item.as_mut().expect("validated batch");
-                let tile = &self.mosaic.tiles[*tile_idx];
-                let mut maps: Vec<_> = self
-                    .resolutions
-                    .iter()
-                    .map(|_| HashMap::with_hasher(FxBuildHasher::default()))
-                    .collect();
-                self.kernel.process_chunk(
-                    chunk,
-                    data,
-                    &self.resolutions,
-                    &tile.crs_transformer,
-                    &tile.reader.metadata.geotransform,
-                    &self.sampling,
-                    self.bbox,
-                    chunk.width,
-                    self.nodata.or(tile.reader.metadata.nodata),
-                    tile.reader.metadata.samples_per_pixel,
-                    if *overlap {
-                        Some((*tile_idx, &*self.mosaic))
+        use super::borrowed::BorrowedSamples;
+        let mut maps = std::mem::take(&mut self.worker_maps);
+        let result = (|| {
+            let mut index = 0;
+            let (mut row, mut col) = (0usize, 0usize);
+            let mut jobs = Vec::with_capacity(self.worker_tasks);
+            let mut results = Vec::with_capacity(self.worker_tasks);
+            while index < items.len() {
+                jobs.clear();
+                while jobs.len() < self.worker_tasks && index < items.len() {
+                    let (tile_idx, _, chunk, data, overlap) = items[index]
+                        .as_ref()
+                        .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+                    let width = chunk.width as usize;
+                    let height = chunk.height as usize;
+                    if row >= height || width == 0 {
+                        index += 1;
+                        row = 0;
+                        col = 0;
+                        continue;
+                    }
+                    let spp = self.mosaic.tiles[*tile_idx]
+                        .reader
+                        .metadata
+                        .samples_per_pixel
+                        .max(1) as usize;
+                    if row == 0 && col == 0 {
+                        self.metrics.decoded_bytes += BorrowedSamples::from(data).bytes() as u64;
+                    }
+                    let (w, h) = if width <= self.worker_pixels {
+                        (width, (self.worker_pixels / width).min(height - row))
                     } else {
-                        None
-                    },
-                    &mut maps,
-                );
-                maps
-            };
-            // Avoid nested Rayon work stealing under caller-owned streamer locks.
-            let results: Vec<_> = if rayon::current_thread_index().is_some() {
-                items[start..end].iter_mut().map(process).collect()
-            } else {
-                items[start..end].par_iter_mut().map(process).collect()
-            };
-            self.profile_stats[1] += t.elapsed().as_nanos() as u64;
-            let t = std::time::Instant::now();
-            for maps in results {
-                self.merge_window(maps)?;
+                        (self.worker_pixels.min(width - col), 1)
+                    };
+                    let start = (row * width + col) * spp;
+                    let len = ((h - 1) * width + w) * spp;
+                    let samples = BorrowedSamples::from(data).window(start, len)?;
+                    let bounds = RasterChunk {
+                        col_offset: chunk.col_offset + col as u32,
+                        row_offset: chunk.row_offset + row as u32,
+                        width: w as u32,
+                        height: h as u32,
+                    };
+                    jobs.push((*tile_idx, bounds, samples, width as u32, *overlap));
+                    if w == width {
+                        row += h;
+                    } else {
+                        col += w;
+                        if col == width {
+                            col = 0;
+                            row += 1;
+                        }
+                    }
+                }
+                if jobs.is_empty() {
+                    continue;
+                }
+                let t = std::time::Instant::now();
+                let process = |(job, maps): (
+                    &(usize, RasterChunk, BorrowedSamples<'_>, u32, bool),
+                    &mut Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>,
+                )| {
+                    let (tile_idx, chunk, samples, stride, overlap) = job;
+                    let tile = &self.mosaic.tiles[*tile_idx];
+                    let scope = super::profile::WorkerScope::new();
+                    let start = std::time::Instant::now();
+                    self.kernel.process_window(
+                        chunk,
+                        *samples,
+                        &self.resolutions,
+                        &tile.crs_transformer,
+                        &tile.reader.metadata.geotransform,
+                        &self.sampling,
+                        self.bbox,
+                        *stride,
+                        self.nodata.or(tile.reader.metadata.nodata),
+                        tile.reader.metadata.samples_per_pixel,
+                        if *overlap {
+                            Some((*tile_idx, &*self.mosaic))
+                        } else {
+                            None
+                        },
+                        maps,
+                    );
+                    (scope.snapshot(), start.elapsed().as_nanos() as u64)
+                };
+                results.clear();
+                if rayon::current_thread_index().is_some() {
+                    results.extend(jobs.iter().zip(maps.iter_mut()).map(process));
+                } else {
+                    jobs.par_iter()
+                        .zip(maps.par_iter_mut())
+                        .map(process)
+                        .collect_into_vec(&mut results);
+                }
+                self.profile_stats[1] += t.elapsed().as_nanos() as u64;
+                for (profile, ns) in results.drain(..) {
+                    self.metrics.worker.merge(profile);
+                    self.metrics.worker_ns += ns;
+                    self.metrics.jobs += 1;
+                }
+                let bytes: usize = maps
+                    .iter()
+                    .flatten()
+                    .map(|m| {
+                        super::spill::table_bytes::<u64, K::Accumulator>(m.capacity())
+                            + m.values().map(|a| a.heap_bytes()).sum::<usize>()
+                    })
+                    .sum();
+                self.metrics.peak_worker_bytes = self.metrics.peak_worker_bytes.max(bytes);
+                let t = std::time::Instant::now();
+                for m in &mut maps {
+                    self.merge_window(m)?;
+                }
+                let ns = t.elapsed().as_nanos() as u64;
+                self.profile_stats[2] += ns;
+                self.metrics.merge_ns += ns;
+                // Retained buckets are part of worker storage, not free capacity.
+                if bytes > self.worker_budget {
+                    for map in maps.iter_mut().flatten() {
+                        map.shrink_to_fit();
+                    }
+                }
             }
-            self.profile_stats[2] += t.elapsed().as_nanos() as u64;
-            start = end;
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.worker_maps = maps;
+        result
     }
 
     /// Advance until a bounded batch of completed records is available.
@@ -542,7 +569,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     let i = self.final_resolution;
                     self.final_reader = if self.spill_runs[i].has_spilled() {
                         self.spill_resolution(i)?;
-                        self.spill_runs[i].finish()?.map(FinalCells::Disk)
+                        {
+                            let start = std::time::Instant::now();
+                            let reader = self.spill_runs[i].finish()?.map(FinalCells::Disk);
+                            self.metrics.spill_ns += start.elapsed().as_nanos() as u64;
+                            reader
+                        }
                     } else {
                         Some(FinalCells::Memory(
                             self.resolution_shards[i].take_sorted().into_iter(),
@@ -585,7 +617,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             if let Some(prefetcher) = &self.prefetcher {
                 prefetcher.drain_chunk_batch_into(&mut items, 1, self.batch_size);
             }
-            self.profile_stats[0] += t0.elapsed().as_nanos() as u64;
+            let elapsed = t0.elapsed().as_nanos() as u64;
+            self.profile_stats[0] += elapsed;
+            self.metrics.prefetch_wait_ns += elapsed;
             if items.is_empty() {
                 if self.processed_chunk_count != self.mosaic.chunk_refs.len() {
                     return Err(RasterH3Error::StreamFailed(format!(
@@ -625,6 +659,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         self.output_buffer.clear();
         self.compactor.clear();
         self.resolution_shards.clear();
+        self.worker_maps.clear();
         self.spill_runs.clear();
         self.final_reader = None;
         self.lifecycle.latch_failure(reason)
@@ -643,6 +678,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     {
         self.advance_until_completed(max_rows)?;
         Ok(self.output_buffer.drain_into(max_rows, consumer))
+    }
+
+    /// Bytes written to spill files, including intermediate merge outputs.
+    pub fn spill_bytes_written(&self) -> u64 {
+        self.spill_runs.iter().map(|r| r.bytes_written).sum()
     }
 
     /// Number of partial sorted runs written, excluding intermediate merge files.
@@ -705,16 +745,6 @@ impl<K: HorizonStreamKernel> RecordStreamer for MultiHorizonStreamer<K> {
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         Some(self.mosaic.mosaic_bounds_wgs84)
     }
-}
-
-/// Copy a bounded contiguous sample window, retaining the native TIFF type.
-fn copy_window(data: &DecodingResult, start: usize, len: usize) -> Result<DecodingResult> {
-    macro_rules! copy { ($($variant:ident),*) => { match data { $(DecodingResult::$variant(values) => {
-        let end = start.checked_add(len).ok_or_else(|| RasterH3Error::InvalidMetadata("sample window overflow".into()))?;
-        let values = values.get(start..end).ok_or_else(|| RasterH3Error::InvalidMetadata(format!("decoded chunk shorter than its declared dimensions: window {start}..{end}, decoded {} samples", values.len())))?;
-        Ok(DecodingResult::$variant(values.to_vec()))
-    }),* } }; }
-    copy!(U8, U16, U32, U64, I8, I16, I32, I64, F32, F64)
 }
 
 enum FinalCells<A> {
