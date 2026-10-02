@@ -1,7 +1,7 @@
 //! Web Mercator tile pyramid coordinate math and bounding boxes for PMTiles v3.
 
 use crate::pmtiles::mvt::MercatorPoint;
-use h3o::{CellIndex, LatLng};
+use crate::h3::{CellIndex, LatLng};
 
 /// Convert WGS84 (lon, lat) to Web Mercator tile coordinates (x, y) at zoom z
 pub fn lon_lat_to_tile_xy(lon: f64, lat: f64, z: u8) -> (u32, u32) {

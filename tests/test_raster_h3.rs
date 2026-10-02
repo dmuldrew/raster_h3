@@ -9,7 +9,7 @@ use helpers::{create_constant_f32_geotiff, TestGeoTiffBuilder};
 use std::path::Path;
 use tempfile::NamedTempFile;
 
-use h3o::{LatLng, Resolution};
+use raster_h3::h3::{LatLng, Resolution};
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
@@ -128,8 +128,8 @@ fn test_fast_hex_formatting() {
 
 #[test]
 fn test_bitshift_resolution() {
-    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
+    let lat_lng = raster_h3::h3::LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = lat_lng.to_cell(raster_h3::h3::Resolution::Eight);
     let cell_u64: u64 = cell.into();
 
     let res_bitshift = (cell_u64 >> 52) & 0x0F;
@@ -149,8 +149,8 @@ fn test_is_chunk_all_nodata() {
 
 #[test]
 fn test_compute_cell_south_lat() {
-    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
+    let lat_lng = raster_h3::h3::LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = lat_lng.to_cell(raster_h3::h3::Resolution::Eight);
     let cell_u64: u64 = cell.into();
 
     // Now returns center lat as a fast proxy (always >= true south vertex lat)
@@ -1259,7 +1259,8 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
                 .or_insert(record.accumulator);
         }
     }
-    assert_eq!(map.len(), 30959);
+    // Exhaustive per-pixel reference using the decoded (cropped) tile stride.
+    assert_eq!(map.len(), 30_958);
 
     let mut total_samples = 0.0;
     let mut total_sum = 0.0;
@@ -1268,7 +1269,7 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
         total_sum += acc.sum;
     }
 
-    assert!(total_samples > 20_000_000.0);
+    assert_eq!(total_samples, 28_373_991.0);
     assert!(total_sum > 100_000_000.0);
 }
 
@@ -1312,23 +1313,24 @@ fn test_parallel_categorical_aggregation_hawaii_dataset() {
         }
     }
 
-    // Ground truth asserts for LF2024_FBFM40_HI.tif
-    assert_eq!(r7_count, 39_412, "Res 7 pyramid cell count mismatch");
-    assert_eq!(r8_count, 273_615, "Res 8 pyramid cell count mismatch");
+    // Exhaustive per-pixel reference for LF2024_FBFM40_HI.tif, including
+    // cropped edge tiles. The former padded stride dropped/misplaced edge pixels.
+    assert_eq!(r7_count, 39_426, "Res 7 pyramid cell count mismatch");
+    assert_eq!(r8_count, 273_840, "Res 8 pyramid cell count mismatch");
     assert_eq!(
         r7_count + r8_count,
-        313_027,
+        313_266,
         "Total dual pyramid cell count mismatch"
     );
     assert_eq!(
-        total_pixels as u64, 256_542_384,
+        total_pixels as u64, 256_851_000,
         "Total pixel count mismatch on Hawaii categorical scan"
     );
 
     // Verify top 3 landcover classes
     assert_eq!(
         *r8_class_distribution.get(&-9999).unwrap_or(&0),
-        243_696,
+        243_921,
         "Class -9999 (NoData) hex count mismatch"
     );
     assert_eq!(
@@ -1614,14 +1616,14 @@ fn test_wkb_ogc_compliance() {
     assert_eq!(&buf[..len], &buf2[..len2]);
 
     // Verify Class III (odd) resolution pentagon: 10 vertices -> 189 bytes
-    let pentagon_res7 = h3o::CellIndex::try_from(0x870800000ffffffu64).unwrap();
+    let pentagon_res7 = raster_h3::h3::CellIndex::try_from(0x870800000ffffffu64).unwrap();
     let p_len = cell_to_wkb(pentagon_res7, &mut buf);
     assert_eq!(p_len, 189);
     let p_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
     assert_eq!(p_points, 11);
 
     // Verify Class III icosahedron-straddling hexagon: 8 vertices -> 157 bytes
-    let hex_res7_8 = h3o::CellIndex::try_from(0x87e06dac8ffffffu64).unwrap();
+    let hex_res7_8 = raster_h3::h3::CellIndex::try_from(0x87e06dac8ffffffu64).unwrap();
     let h_len = cell_to_wkb(hex_res7_8, &mut buf);
     assert_eq!(h_len, 157);
     let h_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());

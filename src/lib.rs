@@ -24,6 +24,8 @@
 //! - The [`pmtiles`] module provides direct PMTiles v3 vector tile export with MVT encoding.
 //! - The [`parquet`] module provides native Parquet/GeoParquet streaming export.
 
+extern crate alloc;
+
 /// Scanline accumulation and statistical aggregation of raster pixels into H3 hexagonal cells.
 pub mod aggregator;
 /// Coordinate reference system (CRS) detection, parsing, and reprojection.
@@ -44,6 +46,11 @@ pub mod pmtiles;
 pub mod raster;
 /// Cross-format dataset transcoding pipelines (e.g. Parquet to PMTiles).
 pub mod transcode;
+/// In-tree H3 geospatial indexing system.
+pub mod h3;
+
+pub use crate::h3::{CellIndex, LatLng, Resolution};
+pub use crate::h3 as h3o;
 
 use std::ffi::c_char;
 use std::ptr;

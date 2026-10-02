@@ -1,4 +1,4 @@
-use h3o::{CellIndex, LatLng, Resolution};
+use crate::h3::{CellIndex, LatLng, Resolution};
 use std::ffi::c_char;
 
 #[cfg(test)]
@@ -708,16 +708,16 @@ mod tests {
     fn test_h3_cell_to_parent_logic() {
         let valid_u64 = 0x8828308281fffffu64; // Res 8
         let cell = CellIndex::try_from(valid_u64).unwrap();
-        assert_eq!(cell.resolution(), h3o::Resolution::Eight);
+        assert_eq!(cell.resolution(), crate::h3::Resolution::Eight);
 
-        let parent_res7 = cell.parent(h3o::Resolution::Seven).unwrap();
-        assert_eq!(parent_res7.resolution(), h3o::Resolution::Seven);
+        let parent_res7 = cell.parent(crate::h3::Resolution::Seven).unwrap();
+        assert_eq!(parent_res7.resolution(), crate::h3::Resolution::Seven);
 
-        let parent_res6 = cell.parent(h3o::Resolution::Six).unwrap();
-        assert_eq!(parent_res6.resolution(), h3o::Resolution::Six);
+        let parent_res6 = cell.parent(crate::h3::Resolution::Six).unwrap();
+        assert_eq!(parent_res6.resolution(), crate::h3::Resolution::Six);
 
         // Child cannot have parent at higher resolution
-        assert!(cell.parent(h3o::Resolution::Nine).is_none());
+        assert!(cell.parent(crate::h3::Resolution::Nine).is_none());
     }
 
     #[test]

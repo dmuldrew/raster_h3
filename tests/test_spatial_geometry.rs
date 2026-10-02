@@ -120,8 +120,8 @@ fn test_invalid_h3_geometry_emission() {
 fn test_all_resolutions_geometry_emission() {
     // Verify valid WKB geometry emission across all resolutions from 0 to 15
     for res in 0..=15 {
-        let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
-        let cell = lat_lng.to_cell(h3o::Resolution::try_from(res as u8).unwrap());
+        let lat_lng = raster_h3::h3::LatLng::new(37.7749, -122.4194).unwrap();
+        let cell = lat_lng.to_cell(raster_h3::h3::Resolution::try_from(res as u8).unwrap());
         let cell_u64: u64 = cell.into();
 
         let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
@@ -151,7 +151,7 @@ fn test_class_iii_pentagon_and_edge_crossing_hexagons() {
     assert_eq!(u32::from_le_bytes(buf[9..13].try_into().unwrap()), 9);
 
     // Also check cell_to_wkb directly
-    let cell_res7_8 = h3o::CellIndex::try_from(hex_res7_8).unwrap();
+    let cell_res7_8 = raster_h3::h3::CellIndex::try_from(hex_res7_8).unwrap();
     let direct_len = cell_to_wkb(cell_res7_8, &mut buf);
     assert_eq!(direct_len, 157);
 }

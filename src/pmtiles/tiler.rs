@@ -4,7 +4,7 @@
 //! and packages the resulting vector hexagons directly into a single PMTiles v3 archive.
 
 use fxhash::FxBuildHasher;
-use h3o::{CellIndex, LatLng, Resolution};
+use crate::h3::{CellIndex, LatLng, Resolution};
 use rayon::prelude::*;
 use serde_json::json;
 use std::borrow::Cow;

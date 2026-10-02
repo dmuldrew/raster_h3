@@ -1,43 +1,13 @@
-//! Hierarchical H3 child-to-parent compaction component.
+//! One-level logical H3 child-to-parent compaction.
 //!
-//! # Architecture & Correctness Invariants
-//!
-//! The H3 discrete global grid system supports hierarchical aggregation where 7 aperture-7
-//! child cells at resolution `R` compose a single parent cell at resolution `R - 1`.
-//!
-//! 1. **Disambiguation from Column Omission**:
-//!    - **Hierarchical Compaction** (`compact_h3_children` / `compact`): Merges 7 fine-resolution
-//!      child cells into a coarser parent hexagon during scanline streaming.
-//!    - **Column Omission** (`omit_redundant_columns` / `compact` in Parquet): Omits redundant
-//!      metadata columns from Parquet serialization.
-//!    - These two concepts are completely decoupled in this module.
-//!
-//! 2. **Adjacent Resolution Rejection**:
-//!    - If a multi-resolution query requests both child `R` and parent `R - 1` (e.g. `[7, 8]`),
-//!      hierarchical compaction MUST NOT be enabled because full child sets at `R` would produce
-//!      coarser `R - 1` cells that duplicate cells already produced by the explicit `R - 1`
-//!      aggregation layer. This invariant is validated when constructing [`MultiHorizonStreamer`].
-//!
-//! 3. **Completeness Invariant**:
-//!    - A parent cell at resolution `R - 1` is emitted if and only if all 7 children of that parent
-//!      are accumulated before the scanline horizon passes the parent's southernmost extent.
-//!    - When child count reaches 7, the merged parent accumulator is emitted at resolution `R - 1`,
-//!      and the pending state for that parent is dropped.
-//!
-//! 4. **Horizon Eviction Invariant**:
-//!    - Each parent's southernmost latitude (`compute_cell_south_lat(parent_u64)`) defines the
-//!      absolute lowest latitude of any point inside its 7 child cells.
-//!    - When the streaming scanline horizon `lat_horizon` drops strictly south of `parent_south_lat`,
-//!      no future raster chunks can intersect any remaining children of this parent.
-//!    - Any parent in pending storage with fewer than 7 children when evicted cannot be completed.
-//!      The compactor decomposes it and emits its individual child records at resolution `R`.
-//!
-//! 5. **Terminal Flush**:
-//!    - At EOF, all remaining incomplete parents are flushed, decomposing their accumulated
-//!      partial sets back into child records.
+//! The streaming controller feeds complete cells in H3 order and flushes when
+//! the logical parent changes. Siblings are contiguous at a fixed resolution,
+//! bounding pending storage to one group (seven hexagon or six pentagon children).
+//! This avoids assuming that geographic parent polygons contain logical children.
+//! Legacy horizon-based methods remain available but are not used by the controller.
 
 use fxhash::FxBuildHasher;
-use h3o::CellIndex;
+use crate::h3::CellIndex;
 use std::collections::HashMap;
 
 use super::controller::HorizonStreamKernel;
@@ -57,7 +27,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            pending: HashMap::with_capacity_and_hasher(1024, FxBuildHasher::default()),
+            pending: HashMap::with_hasher(FxBuildHasher::default()),
         }
     }
 
@@ -112,10 +82,10 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
                         entry.0.merge(&acc);
                         entry.1.push((cell_u64, acc));
 
-                        if entry.1.len() == 7 {
+                        if entry.1.len() == parent.children(cell.resolution()).count() {
                             let (parent_acc, _) = self.pending.remove(&parent_u64).unwrap();
                             let p_res_u8: u8 = parent_res.into();
-                            output.push(kernel.make_record(p_res_u8, parent_u64, parent_acc));
+                            kernel.buffer_record(p_res_u8, parent_u64, parent_acc, output);
                             return;
                         }
                         return;
@@ -124,7 +94,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
             }
         }
 
-        output.push(kernel.make_record(res_u8, cell_u64, acc));
+        kernel.buffer_record(res_u8, cell_u64, acc, output);
     }
 
     /// Evict pending parents that lie strictly north of the scanline latitude horizon.
@@ -144,7 +114,19 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
 
         let mut to_flush = Vec::new();
         for &parent_u64 in self.pending.keys() {
-            let parent_south = compute_cell_south_lat(parent_u64);
+            // Logical children protrude outside a parent's geographic polygon.
+            // Bound their union instead of treating the parent polygon as a cover.
+            let parent_south = CellIndex::try_from(parent_u64)
+                .ok()
+                .and_then(|parent| {
+                    parent.resolution().succ().map(|res| {
+                        parent
+                            .children(res)
+                            .map(|child| compute_cell_south_lat(child.into()))
+                            .fold(f64::INFINITY, f64::min)
+                    })
+                })
+                .unwrap_or(-90.0);
             if parent_south > lat_horizon {
                 to_flush.push(parent_u64);
             }
@@ -158,7 +140,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
                     } else {
                         8
                     };
-                    output.push(kernel.make_record(res_u8, cell_u64, acc));
+                    kernel.buffer_record(res_u8, cell_u64, acc, output);
                 }
             }
         }
@@ -173,7 +155,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
                 } else {
                     8
                 };
-                output.push(kernel.make_record(res_u8, cell_u64, acc));
+                kernel.buffer_record(res_u8, cell_u64, acc, output);
             }
         }
     }

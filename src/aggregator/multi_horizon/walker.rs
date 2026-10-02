@@ -4,7 +4,7 @@
 //! and scanline span accumulation across both continuous (Welford) and categorical engines.
 
 use fxhash::FxBuildHasher;
-use h3o::{LatLng, Resolution};
+use crate::h3::{LatLng, Resolution};
 use std::collections::HashMap;
 
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;
@@ -341,13 +341,15 @@ fn walk_single_res_row<T, Acc, E>(
                     span_end,
                     dx_bounds,
                     dy_bounds,
+                    sampling,
                     geom_ctx,
                     gt,
                     crs_transformer,
                     bbox,
                     |lat, lon| {
-                        LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
-                            == Some(run_cell)
+                        LatLng::new(lat, lon).ok().map(|ll| {
+                            crate::aggregator::multi_horizon::profile::index(ll, res).into()
+                        }) == Some(run_cell)
                     },
                 );
 
@@ -586,15 +588,15 @@ fn walk_multi_res_row<T, Acc, E>(
                             span_end,
                             dx_bounds,
                             dy_bounds,
+                            sampling,
                             geom_ctx,
                             gt,
                             crs_transformer,
                             bbox,
                             |test_lat, test_lon| {
-                                LatLng::new(test_lat, test_lon)
-                                    .ok()
-                                    .map(|ll| ll.to_cell(res).into())
-                                    == Some(buf.run_cells[i])
+                                LatLng::new(test_lat, test_lon).ok().map(|ll| {
+                                    crate::aggregator::multi_horizon::profile::index(ll, res).into()
+                                }) == Some(buf.run_cells[i])
                             },
                         );
                         buf.core_starts[i] = c_start;

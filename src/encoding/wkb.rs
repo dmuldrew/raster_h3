@@ -1,6 +1,6 @@
 //! Well-Known Binary (WKB) geometry serialization for H3 cells.
 
-use h3o::CellIndex;
+use crate::h3::CellIndex;
 
 /// Maximum capacity in bytes for a stack-allocated H3 WKB polygon.
 /// Standard: 1 (endian) + 4 (type) + 4 (rings) + 4 (num_points) + 16 * (num_vertices + 1)
@@ -64,8 +64,8 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
     // one of the two polar cells that encircle a pole, shift vertices so that each
     // successive vertex differs by < 180° from the previous one.
     let res = cell.resolution();
-    let is_pole = cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(res)
-        || cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
+    let is_pole = cell == crate::h3::LatLng::new(90.0, 0.0).expect("valid").to_cell(res)
+        || cell == crate::h3::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
 
     if !is_pole && (max_lng - min_lng > 180.0) {
         for i in 1..n {
@@ -116,8 +116,8 @@ mod tests {
     #[test]
     fn test_cell_to_wkb_hexagon() {
         // San Francisco cell at res 8
-        let coord = h3o::LatLng::new(37.7749, -122.4194).expect("valid latlng");
-        let cell = coord.to_cell(h3o::Resolution::Eight);
+        let coord = crate::h3::LatLng::new(37.7749, -122.4194).expect("valid latlng");
+        let cell = coord.to_cell(crate::h3::Resolution::Eight);
         assert!(!cell.is_pentagon());
 
         let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
@@ -231,9 +231,9 @@ mod tests {
     #[test]
     fn test_cell_to_wkb_antimeridian_straddling() {
         // A res-5 cell straddling the antimeridian
-        let cell = h3o::LatLng::new(-18.0, 180.0)
+        let cell = crate::h3::LatLng::new(-18.0, 180.0)
             .unwrap()
-            .to_cell(h3o::Resolution::Five);
+            .to_cell(crate::h3::Resolution::Five);
 
         // Raw boundary has vertices jump between +179.9° and -179.9° (span > 350°)
         let raw_boundary = cell.boundary();
@@ -297,9 +297,9 @@ mod tests {
     #[test]
     fn test_cell_to_wkb_pole_cells_emitted_unchanged() {
         for r in 0..=15u8 {
-            let res = h3o::Resolution::try_from(r).unwrap();
-            let pole_n = h3o::LatLng::new(90.0, 0.0).unwrap().to_cell(res);
-            let pole_s = h3o::LatLng::new(-90.0, 0.0).unwrap().to_cell(res);
+            let res = crate::h3::Resolution::try_from(r).unwrap();
+            let pole_n = crate::h3::LatLng::new(90.0, 0.0).unwrap().to_cell(res);
+            let pole_s = crate::h3::LatLng::new(-90.0, 0.0).unwrap().to_cell(res);
 
             let mut buf_n: WkbBuf = [0u8; WKB_BUF_LEN];
             let len_n = cell_to_wkb(pole_n, &mut buf_n);

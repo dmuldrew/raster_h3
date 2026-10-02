@@ -7,7 +7,7 @@ mod helpers;
 
 #[test]
 fn web_mercator_samples_match_exact_projection() {
-    use h3o::{LatLng, Resolution};
+    use raster_h3::h3::{LatLng, Resolution};
     use raster_h3::crs::transformer::CrsTransformer;
     use std::collections::HashMap;
 
@@ -390,7 +390,7 @@ fn test_projected_utm_jacobian_supersampling_conservation() {
 
 #[test]
 fn test_projected_utm_gradient_exact_cell_assignment() {
-    use h3o::{LatLng, Resolution};
+    use raster_h3::h3::{LatLng, Resolution};
     use raster_h3::crs::transformer::CrsTransformer;
     use std::collections::HashMap;
 

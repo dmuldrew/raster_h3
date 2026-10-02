@@ -735,3 +735,41 @@ fn test_deflate_buffer_auto_resizing_hardening() {
         panic!("Expected F32 DecodingResult");
     }
 }
+
+#[test]
+fn cropped_edge_tiles_match_reference_in_both_streaming_paths() {
+    use raster_h3::h3::{LatLng, Resolution};
+    use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
+    use std::collections::HashMap;
+    let file = NamedTempFile::new().unwrap();
+    let (width, height) = (29u32, 23u32);
+    let data: Vec<f32> = (0..width * height).map(|v| (v % 19 + 1) as f32).collect();
+    write_tiled_deflate_geotiff(file.path(), width, height, 16, 16, 1, &data);
+    for budget in [65536, 64 * 1024 * 1024] {
+        let reader = GeoTiffStreamReader::open(file.path()).unwrap();
+        let gt = reader.metadata.geotransform;
+        let mut expected = HashMap::<u64, (f64, f64)>::new();
+        for r in 0..height {
+            for c in 0..width {
+                let (lon, lat) = gt.pixel_center_to_coord(c as usize, r as usize);
+                let key = u64::from(LatLng::new(lat, lon).unwrap().to_cell(Resolution::Ten));
+                let acc = expected.entry(key).or_default();
+                acc.0 += 1.0;
+                acc.1 += data[(r * width + c) as usize] as f64;
+            }
+        }
+        let mut config = MultiResolutionConfig::single(10);
+        config.custom_crs = Some("EPSG:4326".into());
+        config.aggregation_budget_bytes = budget;
+        let mut stream = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut actual = HashMap::new();
+        while !stream.is_finished() {
+            for rec in stream.fetch_next_batch(3).unwrap() {
+                assert!(actual
+                    .insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.sum))
+                    .is_none());
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+}

@@ -15,9 +15,16 @@ exclude = ["data/*", "assets/*", "pmtiles_viewer/debug/*", "tests/data/*"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+stream-profile = []
+
 [dependencies]
-# Fast pure-Rust H3 indexing library
-h3o = "0.6"
+# Dependencies for in-tree H3 indexing engine
+h3o-bit = "0.1"
+either = "1.0"
+float_eq = "1.0"
+ahash = { version = "0.8", default-features = false, features = ["std", "compile-time-rng"] }
 
 # Data parallelism across raster chunks
 rayon = "1.10"

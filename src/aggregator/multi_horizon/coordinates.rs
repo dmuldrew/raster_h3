@@ -4,7 +4,7 @@
 //! explicit fast paths for north-up WGS84 and Web Mercator grids, exact per-sample
 //! projected CRS transformation, and row-level spatial geometry contexts.
 
-use h3o::{LatLng, Resolution};
+use crate::h3::{LatLng, Resolution};
 
 use crate::aggregator::sampling::{SamplePoint, SamplingPattern};
 use crate::crs::transformer::CrsTransformer;
@@ -32,7 +32,7 @@ impl<'a> CoordinateTransformer<'a> {
     pub fn new(gt: &'a GeoTransform, crs_transformer: &'a CrsTransformer) -> Self {
         let is_wgs84 = matches!(crs_transformer, CrsTransformer::Wgs84Identity);
         let is_web_mercator = matches!(crs_transformer, CrsTransformer::WebMercatorFast);
-        let is_north_up = gt.b == 0.0 && gt.d == 0.0;
+        let is_north_up = gt.b == 0.0 && gt.d == 0.0 && gt.e < 0.0 && gt.a > 0.0;
         let dx_step = gt.a;
 
         let d_lon_step = if is_wgs84 {
@@ -59,14 +59,14 @@ impl<'a> CoordinateTransformer<'a> {
     #[inline(always)]
     pub fn pixel_to_wgs84(&self, px: f64, py: f64) -> Result<(f64, f64)> {
         let (x, y) = self.gt.pixel_to_coord(px, py);
-        self.crs_transformer.transform_point(x, y)
+        super::profile::transform(self.crs_transformer, x, y)
     }
 
     /// Transform a pixel center `(col, row)` to WGS84 `(lon, lat)`
     #[inline(always)]
     pub fn pixel_center_to_wgs84(&self, col: usize, row: usize) -> Result<(f64, f64)> {
         let (x, y) = self.gt.pixel_center_to_coord(col, row);
-        self.crs_transformer.transform_point(x, y)
+        super::profile::transform(self.crs_transformer, x, y)
     }
 
     /// Transform a subpixel sample point at `(col, row)` with offset `sp` to WGS84 `(lon, lat)`
@@ -118,7 +118,9 @@ pub fn resolve_subpixel_cell(
     } else if !(-90.0..=90.0).contains(&lat) {
         None
     } else {
-        LatLng::new(lat, lon).ok().map(|ll| ll.to_cell(res).into())
+        LatLng::new(lat, lon)
+            .ok()
+            .map(|ll| crate::aggregator::multi_horizon::profile::index(ll, res).into())
     }
 }
 
@@ -158,7 +160,7 @@ impl RowGeometryContext {
             (chunk.width as usize).max(1)
         };
         let actual_rows = (slice_len / stride).min(chunk.height as usize);
-        let is_north_up = gt.b == 0.0 && gt.d == 0.0;
+        let is_north_up = gt.b == 0.0 && gt.d == 0.0 && gt.e < 0.0 && gt.a > 0.0;
         let dx_step = gt.a;
 
         Self {
@@ -208,7 +210,7 @@ impl RowCoordinates {
             let lon = (x_start / WGS84_A) * RAD_TO_DEG;
             (lon, lat)
         } else {
-            match crs_transformer.transform_point(x_start, y_row) {
+            match super::profile::transform(crs_transformer, x_start, y_row) {
                 Ok(coords) => coords,
                 Err(_) => return None,
             }
@@ -295,10 +297,10 @@ impl RowCoordinates {
         if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
             Some((lon_curr, self.lat_row))
         } else if ctx.is_north_up {
-            crs_transformer.transform_point(x_curr, self.y_row).ok()
+            super::profile::transform(crs_transformer, x_curr, self.y_row).ok()
         } else {
             let (x, y) = gt.pixel_center_to_coord(col_offset + c, self.row_idx);
-            crs_transformer.transform_point(x, y).ok()
+            super::profile::transform(crs_transformer, x, y).ok()
         }
     }
 
@@ -382,6 +384,7 @@ impl RowCoordinates {
         span_end: usize,
         dx_bounds: (f64, f64),
         dy_bounds: (f64, f64),
+        sampling: &SamplingPattern,
         ctx: &RowGeometryContext,
         gt: &GeoTransform,
         crs_transformer: &CrsTransformer,
@@ -399,11 +402,52 @@ impl RowCoordinates {
             span_end,
             dx_bounds,
             dy_bounds,
+            sampling,
             ctx,
             gt,
             crs_transformer,
             bbox,
             is_in_cell,
         )
+    }
+}
+
+/// Upper latitude bound for every sample in a chunk's pixel rectangle.
+/// Affine latitude (WGS84) and monotone northing (Web Mercator) attain
+/// their maxima at corners, including rotated/reversed affine grids.
+/// Other projections require domain-specific certificates; sampled bounds
+/// and fixed padding must never drive irreversible eviction.
+pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTransformer) -> f64 {
+    if [gt.a, gt.b, gt.c0, gt.d, gt.e, gt.f0]
+        .iter()
+        .any(|v| !v.is_finite())
+    {
+        return f64::INFINITY;
+    }
+
+    match crs {
+        CrsTransformer::Wgs84Identity | CrsTransformer::WebMercatorFast => {
+            let mut upper = f64::NEG_INFINITY;
+            for col in [
+                chunk.col_offset as f64,
+                chunk.col_offset as f64 + chunk.width as f64,
+            ] {
+                for row in [
+                    chunk.row_offset as f64,
+                    chunk.row_offset as f64 + chunk.height as f64,
+                ] {
+                    let (x, y) = gt.pixel_to_coord(col, row);
+                    let Ok((_, lat)) = crs.transform_point(x, y) else {
+                        return f64::INFINITY;
+                    };
+                    if !lat.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    upper = upper.max(lat.next_up());
+                }
+            }
+            upper
+        }
+        CrsTransformer::AlbersConic(_) | CrsTransformer::Proj4 { .. } => f64::INFINITY,
     }
 }

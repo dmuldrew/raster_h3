@@ -354,6 +354,68 @@ impl<'a> ChunkDecoder<'a> {
             .chunk_layout
             .get_chunk_bounds(chunk_index, self.width, self.height);
 
+        // Check for sparse / unallocated chunk (e.g. in Cloud-Optimized GeoTIFFs where ocean/empty tiles have offset 0 or bytes 0)
+        let is_sparse = if let Some(bytes) = provided_bytes {
+            bytes.is_empty()
+        } else if let Some(ref info) = self.chunk_info {
+            let idx = chunk_index as usize;
+            let offset = info.chunk_offsets.get(idx).copied().unwrap_or(0);
+            let byte_count = info.chunk_bytes.get(idx).copied().unwrap_or(0);
+            offset == 0 || byte_count == 0
+        } else {
+            false
+        };
+
+        if is_sparse {
+            let spp = self.samples_per_pixel.max(1) as usize;
+            let total_samples = (chunk_bounds.width as usize) * (chunk_bounds.height as usize) * spp;
+            if let Some(mut buf) = target_buffer {
+                macro_rules! clear_and_resize {
+                    ($buf:expr, $( ($variant:ident, $default:expr) ),* $(,)?) => {
+                        match $buf {
+                            $(
+                                DecodingResult::$variant(ref mut v) => {
+                                    v.clear();
+                                    v.resize(total_samples, $default);
+                                }
+                            )*
+                        }
+                    };
+                }
+                clear_and_resize!(
+                    buf,
+                    (U8, 0),
+                    (U16, 0),
+                    (U32, 0),
+                    (U64, 0),
+                    (I8, 0),
+                    (I16, 0),
+                    (I32, 0),
+                    (I64, 0),
+                    (F32, f32::NAN),
+                    (F64, f64::NAN),
+                );
+                return Ok((chunk_bounds, buf));
+            } else if let Some(ref info) = self.chunk_info {
+                let res = match (info.sample_format, info.bits_per_sample) {
+                    (SampleFormat::Uint, 8) => DecodingResult::U8(vec![0; total_samples]),
+                    (SampleFormat::Uint, 16) => DecodingResult::U16(vec![0; total_samples]),
+                    (SampleFormat::Uint, 32) => DecodingResult::U32(vec![0; total_samples]),
+                    (SampleFormat::Uint, 64) => DecodingResult::U64(vec![0; total_samples]),
+                    (SampleFormat::Int, 8) => DecodingResult::I8(vec![0; total_samples]),
+                    (SampleFormat::Int, 16) => DecodingResult::I16(vec![0; total_samples]),
+                    (SampleFormat::Int, 32) => DecodingResult::I32(vec![0; total_samples]),
+                    (SampleFormat::Int, 64) => DecodingResult::I64(vec![0; total_samples]),
+                    (SampleFormat::IEEEFP, 32) => DecodingResult::F32(vec![f32::NAN; total_samples]),
+                    (SampleFormat::IEEEFP, 64) => DecodingResult::F64(vec![f64::NAN; total_samples]),
+                    _ => DecodingResult::F32(vec![f32::NAN; total_samples]),
+                };
+                return Ok((chunk_bounds, res));
+            } else {
+                return Ok((chunk_bounds, DecodingResult::F32(vec![f32::NAN; total_samples])));
+            }
+        }
+
         let fast_res = if let Some(bytes) = provided_bytes {
             self.decompress_chunk_fast_bytes(chunk_index, bytes, target_buffer.as_mut())
         } else if let Some(ref info) = self.chunk_info {

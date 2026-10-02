@@ -4,7 +4,7 @@
 //! standard MVT protocol buffer byte streams without intermediate GIS allocations.
 
 use fxhash::FxHashSet;
-use h3o::LatLng;
+use crate::h3::LatLng;
 use std::borrow::Cow;
 
 /// Normalized Web Mercator point with coordinates in [0.0, 1.0]

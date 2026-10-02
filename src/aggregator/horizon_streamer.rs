@@ -1,4 +1,4 @@
-use h3o::CellIndex;
+use crate::h3::CellIndex;
 
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
@@ -28,55 +28,66 @@ impl PartialOrd for HexEvictionEntry {
     }
 }
 
+/// Conservative lower latitude bound for the spherical polygon returned by h3o.
+///
+/// Latitude is 1-Lipschitz in angular distance. Every point on a minor great-circle
+/// edge is at most half that edge's length from one endpoint. The path consisting
+/// of a meridian followed by a parallel has length at most |delta_lat|+|delta_lon|,
+/// so `min(endpoint_latitudes) - (|delta_lat|+|delta_lon|)/2` is a lower bound.
+/// Unlike a stationary-point test this needs no ill-conditioned cross product,
+/// inverse trigonometry, or floating-point arc-membership decision. Bounds are
+/// deliberately loose; spilling handles any additional retained cells.
+///
+/// Basic arithmetic is rounded outward with next_up/next_down. This bound is
+/// relative to h3o's supplied spherical boundary, not a survey/datum accuracy claim.
+/// Northern edges have their minimum at an endpoint. The south pole must be
+/// checked separately because it can be in the polygon interior.
+static SOUTH_POLE_CELLS: std::sync::OnceLock<[CellIndex; 16]> = std::sync::OnceLock::new();
+
 #[inline]
-fn unit_xyz(ll: h3o::LatLng) -> [f64; 3] {
-    let (la, lo) = (ll.lat_radians(), ll.lng_radians());
-    [la.cos() * lo.cos(), la.cos() * lo.sin(), la.sin()]
+fn is_south_pole_cell(cell: CellIndex) -> bool {
+    let cells = SOUTH_POLE_CELLS.get_or_init(|| {
+        core::array::from_fn(|r| {
+            crate::h3::LatLng::new(-90.0, 0.0)
+                .unwrap()
+                .to_cell(crate::h3::Resolution::try_from(r as u8).unwrap())
+        })
+    });
+    cells[u8::from(cell.resolution()) as usize] == cell
 }
 
-/// Compute the exact southernmost latitude for an H3 cell.
-///
-/// H3 cell edges are gnomonic great-circle arcs. In the northern hemisphere, an edge's minimum
-/// latitude is strictly attained at one of its vertex endpoints. In the southern hemisphere,
-/// the geodesic arc bulges poleward (southward), so the minimum latitude can occur along the
-/// interior of an edge. We densify edges with southern vertices across 8 interior points
-/// to capture the true minimum latitude, with a 1e-9° (~0.1 mm) safety margin.
 pub fn compute_cell_south_lat(cell_u64: u64) -> f64 {
     let Ok(cell) = CellIndex::try_from(cell_u64) else {
-        return f64::NEG_INFINITY;
+        return -90.0;
     };
-    // A cell containing the south pole reaches -90° in its interior, well south of any
-    // boundary vertex. Relevant for EPSG:3031 / south-polar rasters.
-    if let Ok(pole) = h3o::LatLng::new(-90.0, 0.0) {
-        if pole.to_cell(cell.resolution()) == cell {
+    if is_south_pole_cell(cell) {
+        return -90.0;
+    }
+    let boundary = cell.boundary();
+    if boundary.is_empty() {
+        return -90.0;
+    }
+    let mut south = 90.0_f64;
+    for i in 0..boundary.len() {
+        let p = boundary[i];
+        let q = boundary[(i + 1) % boundary.len()];
+        let mut edge_south = p.lat().min(q.lat()).next_down();
+        if p.lat() <= 0.0 || q.lat() <= 0.0 {
+            // Longitude differences are bounded above by both the direct and wrapped routes.
+            let direct_lo = (p.lng() - q.lng()).abs();
+            let direct_hi = direct_lo.next_up();
+            let wrapped_hi = (360.0_f64 - direct_lo.next_down()).next_up();
+            let delta_lon = direct_hi.min(wrapped_hi);
+            let delta_lat = (p.lat() - q.lat()).abs().next_up();
+            let half_length = ((delta_lat + delta_lon).next_up() * 0.5).next_up();
+            edge_south = (edge_south - half_length).next_down();
+        }
+        if !edge_south.is_finite() {
             return -90.0;
         }
+        south = south.min(edge_south);
     }
-    let b = cell.boundary();
-    let n = b.len();
-    if n == 0 {
-        return f64::NEG_INFINITY;
-    }
-    let mut min_lat = f64::INFINITY;
-    for i in 0..n {
-        let (p, q) = (b[i], b[(i + 1) % n]);
-        min_lat = min_lat.min(p.lat());
-        // Southern hemisphere: a geodesic between two vertices bulges poleward (southward).
-        if p.lat() < 0.0 || q.lat() < 0.0 {
-            let (p3, q3) = (unit_xyz(p), unit_xyz(q));
-            for k in 1..8 {
-                let t = k as f64 / 8.0;
-                let v = [
-                    p3[0] * (1.0 - t) + q3[0] * t,
-                    p3[1] * (1.0 - t) + q3[1] * t,
-                    p3[2] * (1.0 - t) + q3[2] * t,
-                ];
-                let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                min_lat = min_lat.min((v[2] / norm).asin().to_degrees());
-            }
-        }
-    }
-    min_lat - 1e-9
+    south.max(-90.0)
 }
 
 pub use crate::aggregator::nodata::{

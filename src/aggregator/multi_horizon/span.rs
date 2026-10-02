@@ -4,14 +4,15 @@
 //! and determines which subpixel samples are strictly interior (core) versus boundary.
 //! Does not update statistics, mutate accumulators, or manage streaming state.
 
-use h3o::{LatLng, Resolution};
+use crate::h3::Resolution;
 
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
 
-use super::coordinates::{is_point_in_bbox, RowCoordinates, RowGeometryContext};
+use super::coordinates::{RowCoordinates, RowGeometryContext};
+use crate::aggregator::sampling::SamplingPattern;
 
 /// Optimizer for identifying H3 cell spans and subpixel core intervals on a raster scanline.
 pub struct H3SpanOptimizer;
@@ -27,12 +28,23 @@ impl H3SpanOptimizer {
         c: usize,
         lon_curr: f64,
         ctx: &RowGeometryContext,
-        crs_transformer: &CrsTransformer,
+        _crs_transformer: &CrsTransformer,
         res: Resolution,
         run_cell: u64,
-        bbox: Option<[f64; 4]>,
+        _bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
-        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
+        let r_u8 = res as u8;
+        // Certified prefix search (or its sequential baseline) uses constant-latitude transforms.
+        // Geographic cutoffs are performance policy, not a containment proof.
+        let is_eligible = ctx.is_north_up
+            && (ctx.is_wgs84 || ctx.is_web_mercator)
+            && r_u8 >= 4
+            && row_coords.lat_row.abs() < 70.0
+            && lon_curr.abs() <= 175.0
+            && (lon_curr + (row_coords.row_c_end.saturating_sub(c)) as f64 * ctx.d_lon_step).abs()
+                <= 175.0;
+
+        if is_eligible {
             row_cache.find_span_end(
                 c,
                 row_coords.row_c_end,
@@ -42,27 +54,6 @@ impl H3SpanOptimizer {
                 res,
                 run_cell,
             )
-        } else if ctx.is_north_up {
-            row_cache.find_span_end_projected(
-                c,
-                row_coords.row_c_end,
-                row_coords.x_start,
-                row_coords.y_row,
-                ctx.dx_step,
-                |x, y| match crs_transformer.transform_point(x, y) {
-                    Ok((p_lon, p_lat)) => {
-                        if is_point_in_bbox(p_lon, p_lat, bbox) {
-                            LatLng::new(p_lat, p_lon)
-                                .ok()
-                                .map(|ll| ll.to_cell(res).into())
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None,
-                },
-                run_cell,
-            )
         } else {
             (c + 1, None)
         }
@@ -70,8 +61,6 @@ impl H3SpanOptimizer {
 
     /// Identify the inner core column range `(core_start, core_end)` where all subpixel sample points
     /// land strictly inside `run_cell`.
-    ///
-    /// For north-up projected CRS (e.g. UTM, Albers), tests exact coordinates matching sample evaluation.
     #[inline(always)]
     pub fn find_core_span<FCheck>(
         row_coords: &RowCoordinates,
@@ -79,8 +68,9 @@ impl H3SpanOptimizer {
         chunk: &RasterChunk,
         c: usize,
         span_end: usize,
-        dx_bounds: (f64, f64),
-        dy_bounds: (f64, f64),
+        _dx_bounds: (f64, f64),
+        _dy_bounds: (f64, f64),
+        sampling: &SamplingPattern,
         ctx: &RowGeometryContext,
         gt: &GeoTransform,
         crs_transformer: &CrsTransformer,
@@ -90,32 +80,81 @@ impl H3SpanOptimizer {
     where
         FCheck: FnMut(f64, f64) -> bool,
     {
-        // Rotated rasters need full affine per sample; skip span skipping.
-        if !ctx.is_north_up {
+        // Bulk accumulation assumes total sample weight exactly one. Certify
+        // actual samples, never the four corners of their bounding rectangle.
+        if !ctx.is_north_up
+            || !(ctx.is_wgs84 || ctx.is_web_mercator)
+            || sampling.points.iter().map(|p| p.weight).sum::<f64>() != 1.0
+            || span_end.saturating_sub(c) <= 2
+        {
             return (c, c);
         }
-
-        row_cache.find_core_span(c, span_end, dx_bounds, dy_bounds, |px, py| {
-            let (lon, lat) = if ctx.is_wgs84 {
-                (
-                    row_coords.lon_start + (px - 0.5) * ctx.d_lon_step,
-                    row_coords.lat_row + (py - 0.5) * gt.e,
-                )
-            } else {
-                // North-up projected: compute exact CRS coordinates for core check!
-                let (x, y) = gt.pixel_to_coord(
-                    (chunk.col_offset as f64) + px,
-                    (row_coords.row_idx as f64) + py,
-                );
-                match crs_transformer.transform_point(x, y) {
-                    Ok(coords) => coords,
-                    Err(_) => return false,
+        let start = c + 1;
+        let end = span_end - 1;
+        let geometric = if row_cache.verifies_geometry() {
+            let mut first = Vec::with_capacity(sampling.points.len());
+            row_coords.for_each_subpixel(
+                start,
+                ctx,
+                gt,
+                crs_transformer,
+                chunk.col_offset as usize,
+                sampling,
+                bbox,
+                |lon, lat, _, _, _| first.push((lon, lat)),
+            );
+            let mut count = 0;
+            let mut contained = first.len() == sampling.points.len();
+            row_coords.for_each_subpixel(
+                end - 1,
+                ctx,
+                gt,
+                crs_transformer,
+                chunk.col_offset as usize,
+                sampling,
+                bbox,
+                |lon, lat, _, _, _| {
+                    contained &= first.get(count).is_some_and(|&(lon0, lat0)| {
+                        lat0.to_bits() == lat.to_bits()
+                            && row_cache.geometry_parallel(lat, lon0, lon)
+                    });
+                    count += 1;
+                },
+            );
+            contained && count == sampling.points.len()
+        } else {
+            false
+        };
+        for k in start..end {
+            let mut count = 0;
+            let mut certified = true;
+            row_coords.for_each_subpixel(
+                k,
+                ctx,
+                gt,
+                crs_transformer,
+                chunk.col_offset as usize,
+                sampling,
+                bbox,
+                |lon, lat, _, _, _| {
+                    count += 1;
+                    certified &= (-90.0..=90.0).contains(&lat) && is_in_cell(lat, lon);
+                },
+            );
+            if !certified || count != sampling.points.len() {
+                if geometric {
+                    super::profile::geometry_result(
+                        false,
+                        (end - start) * sampling.points.len(),
+                        false,
+                    );
                 }
-            };
-            if !is_point_in_bbox(lon, lat, bbox) {
-                return false;
+                return (c, c);
             }
-            is_in_cell(lat, lon)
-        })
+        }
+        if geometric {
+            super::profile::geometry_result(false, (end - start) * sampling.points.len(), true);
+        }
+        (start, end)
     }
 }

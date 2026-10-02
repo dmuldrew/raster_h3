@@ -4,7 +4,7 @@
 //! multi-zoom PMTiles v3 vector hexagon archive with streaming latitude
 //! horizon eviction to maintain a bounded memory footprint.
 
-use h3o::{CellIndex, LatLng};
+use crate::h3::{CellIndex, LatLng};
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use serde_json::json;
 use std::borrow::Cow;
