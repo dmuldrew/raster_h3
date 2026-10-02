@@ -4,7 +4,7 @@
 //! and scanline span accumulation across both continuous (Welford) and categorical engines.
 
 use fxhash::FxBuildHasher;
-use crate::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use std::collections::HashMap;
 
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;

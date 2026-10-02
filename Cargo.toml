@@ -20,11 +20,8 @@ default = []
 stream-profile = []
 
 [dependencies]
-# Dependencies for in-tree H3 indexing engine
-h3o-bit = "0.1"
-either = "1.0"
-float_eq = "1.0"
-ahash = { version = "0.8", default-features = false, features = ["std", "compile-time-rng"] }
+# Fast pure-Rust H3 indexing library
+h3o = "0.6"
 
 # Data parallelism across raster chunks
 rayon = "1.10"

@@ -7,7 +7,7 @@
 //! Legacy horizon-based methods remain available but are not used by the controller.
 
 use fxhash::FxBuildHasher;
-use crate::h3::CellIndex;
+use h3o::CellIndex;
 use std::collections::HashMap;
 
 use super::controller::HorizonStreamKernel;

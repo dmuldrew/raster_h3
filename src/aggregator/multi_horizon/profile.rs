@@ -1,6 +1,6 @@
 //! Per-worker instrumentation. Enable `stream-profile` for counters and stage
 //! timers; normal builds compile hot-path measurement out entirely.
-use crate::h3::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
 use std::cell::Cell;
 
@@ -47,7 +47,6 @@ impl WorkerProfile {
     }
 }
 thread_local! {
-    static NATIVE_CACHE: Cell<Option<crate::h3::certificate::CachedIndexer>> = const { Cell::new(None) };
     static VERIFY_GEOMETRY: Cell<bool> = const { Cell::new(false) };
     static LOOKAHEAD: Cell<bool> = const { Cell::new(true) };
     static SPAN_SKIP: Cell<bool> = const { Cell::new(false) };
@@ -56,7 +55,6 @@ thread_local! {
 }
 /// Restore counters even if a kernel panics or recursively calls another stream.
 pub struct WorkerScope {
-    old_native_cache: Option<crate::h3::certificate::CachedIndexer>,
     old_lookahead: bool,
     old_verify_geometry: bool,
     old_span_skip: bool,
@@ -76,13 +74,10 @@ impl WorkerScope {
     pub fn with_all_options(
         lookahead: bool,
         verify: bool,
-        cache_native: bool,
+        _cache_native: bool,
         span_skip: bool,
     ) -> Self {
         Self {
-            old_native_cache: NATIVE_CACHE.with(|v| {
-                v.replace(cache_native.then(crate::h3::certificate::CachedIndexer::default))
-            }),
             old_verify_geometry: VERIFY_GEOMETRY.with(|v| v.replace(verify)),
             old_lookahead: LOOKAHEAD.with(|v| v.replace(lookahead)),
             old_span_skip: SPAN_SKIP.with(|v| v.replace(span_skip)),
@@ -103,7 +98,6 @@ impl WorkerScope {
 }
 impl Drop for WorkerScope {
     fn drop(&mut self) {
-        NATIVE_CACHE.with(|v| v.set(self.old_native_cache));
         LOOKAHEAD.with(|v| v.set(self.old_lookahead));
         VERIFY_GEOMETRY.with(|v| v.set(self.old_verify_geometry));
         SPAN_SKIP.with(|v| v.set(self.old_span_skip));
@@ -115,40 +109,7 @@ impl Drop for WorkerScope {
 pub fn index(ll: LatLng, res: Resolution) -> CellIndex {
     #[cfg(feature = "stream-profile")]
     let start = std::time::Instant::now();
-    let (result, reused) = NATIVE_CACHE.with(|v| {
-        if let Some(mut cache) = v.get() {
-            let result = cache.index(ll, res);
-            v.set(Some(cache));
-            result
-        } else {
-            (ll.to_cell(res), false)
-        }
-    });
-    let _ = reused;
-    #[cfg(feature = "stream-profile")]
-    PROFILE.with(|v| {
-        let mut p = v.get();
-        p.h3_calls += 1;
-        p.native_projection_calls += 1;
-        p.native_cache_hits += u64::from(reused);
-        p.h3_ns += start.elapsed().as_nanos() as u64;
-        v.set(p);
-    });
-    result
-}
-
-/// A guarded request still projects its actual input. Keep these requests in
-/// h3_calls so profiling cannot mistake avoided quantization for skipped work
-/// in the geographic projection stage.
-#[inline(always)]
-pub fn index_guarded(
-    ll: LatLng,
-    res: Resolution,
-    guarded: &mut crate::h3::certificate::GuardedCellIndexer,
-) -> (CellIndex, bool) {
-    #[cfg(feature = "stream-profile")]
-    let start = std::time::Instant::now();
-    let result = guarded.index(ll, res);
+    let result = ll.to_cell(res);
     #[cfg(feature = "stream-profile")]
     PROFILE.with(|v| {
         let mut p = v.get();

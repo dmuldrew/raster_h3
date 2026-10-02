@@ -347,6 +347,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3o"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0de3592e1f699692aa0525c42ff7879ec3ee7e36329af20967bc910a1cdc39c7"
+dependencies = [
+ "ahash",
+ "either",
+ "float_eq",
+ "h3o-bit",
+ "libm",
+]
+
+[[package]]
 name = "h3o-bit"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,13 +823,10 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "raster_h3"
 version = "0.2.0"
 dependencies = [
- "ahash",
  "crossbeam-deque",
- "either",
  "flate2",
- "float_eq",
  "fxhash",
- "h3o-bit",
+ "h3o",
  "libc",
  "libdeflater",
  "memmap2",

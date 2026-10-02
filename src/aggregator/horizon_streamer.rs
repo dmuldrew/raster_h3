@@ -1,4 +1,4 @@
-use crate::h3::CellIndex;
+use h3o::{CellIndex, LatLng, Resolution};
 
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
@@ -48,9 +48,9 @@ static SOUTH_POLE_CELLS: std::sync::OnceLock<[CellIndex; 16]> = std::sync::OnceL
 fn is_south_pole_cell(cell: CellIndex) -> bool {
     let cells = SOUTH_POLE_CELLS.get_or_init(|| {
         core::array::from_fn(|r| {
-            crate::h3::LatLng::new(-90.0, 0.0)
+            LatLng::new(-90.0, 0.0)
                 .unwrap()
-                .to_cell(crate::h3::Resolution::try_from(r as u8).unwrap())
+                .to_cell(Resolution::try_from(r as u8).unwrap())
         })
     });
     cells[u8::from(cell.resolution()) as usize] == cell

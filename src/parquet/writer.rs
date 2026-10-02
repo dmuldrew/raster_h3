@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use crate::h3::{CellIndex, LatLng};
+use h3o::{CellIndex, LatLng};
 use parquet::basic::Compression;
 use parquet::data_type::ByteArray;
 use parquet::file::writer::SerializedFileWriter;

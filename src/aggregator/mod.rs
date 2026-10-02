@@ -22,8 +22,6 @@
 pub mod accumulator;
 /// Frequency tracking and summary metrics for categorical raster data.
 pub mod categorical;
-/// Edge models for cell geometry verification.
-pub mod h3_edge_certificate;
 /// Scanline lookahead buffering and H3 spatial neighbor traversal caching.
 pub mod h3_scanline;
 /// Southernmost scan-line horizon eviction engine for single-resolution streaming.

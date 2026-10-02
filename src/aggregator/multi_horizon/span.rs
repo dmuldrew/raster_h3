@@ -4,7 +4,7 @@
 //! and determines which subpixel samples are strictly interior (core) versus boundary.
 //! Does not update statistics, mutate accumulators, or manage streaming state.
 
-use crate::h3::Resolution;
+use h3o::Resolution;
 
 use crate::aggregator::h3_scanline::H3ScanlineLookahead;
 use crate::crs::transformer::CrsTransformer;
@@ -64,7 +64,7 @@ impl H3SpanOptimizer {
     #[inline(always)]
     pub fn find_core_span<FCheck>(
         row_coords: &RowCoordinates,
-        row_cache: &H3ScanlineLookahead,
+        _row_cache: &H3ScanlineLookahead,
         chunk: &RasterChunk,
         c: usize,
         span_end: usize,
@@ -91,40 +91,6 @@ impl H3SpanOptimizer {
         }
         let start = c + 1;
         let end = span_end - 1;
-        let geometric = if row_cache.verifies_geometry() {
-            let mut first = Vec::with_capacity(sampling.points.len());
-            row_coords.for_each_subpixel(
-                start,
-                ctx,
-                gt,
-                crs_transformer,
-                chunk.col_offset as usize,
-                sampling,
-                bbox,
-                |lon, lat, _, _, _| first.push((lon, lat)),
-            );
-            let mut count = 0;
-            let mut contained = first.len() == sampling.points.len();
-            row_coords.for_each_subpixel(
-                end - 1,
-                ctx,
-                gt,
-                crs_transformer,
-                chunk.col_offset as usize,
-                sampling,
-                bbox,
-                |lon, lat, _, _, _| {
-                    contained &= first.get(count).is_some_and(|&(lon0, lat0)| {
-                        lat0.to_bits() == lat.to_bits()
-                            && row_cache.geometry_parallel(lat, lon0, lon)
-                    });
-                    count += 1;
-                },
-            );
-            contained && count == sampling.points.len()
-        } else {
-            false
-        };
         for k in start..end {
             let mut count = 0;
             let mut certified = true;
@@ -142,18 +108,8 @@ impl H3SpanOptimizer {
                 },
             );
             if !certified || count != sampling.points.len() {
-                if geometric {
-                    super::profile::geometry_result(
-                        false,
-                        (end - start) * sampling.points.len(),
-                        false,
-                    );
-                }
                 return (c, c);
             }
-        }
-        if geometric {
-            super::profile::geometry_result(false, (end - start) * sampling.points.len(), true);
         }
         (start, end)
     }

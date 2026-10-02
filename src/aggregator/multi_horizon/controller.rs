@@ -7,7 +7,7 @@
 //! temporary files. The aggregation budget excludes decoded chunks and metadata.
 
 use fxhash::FxBuildHasher;
-use crate::h3::Resolution;
+use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -350,7 +350,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// compaction retains at most one parent's children, including pentagons.
     fn emit_final(&mut self, res_idx: usize, key: u64, acc: K::Accumulator) {
         if self.compactor.is_enabled() {
-            let parent = crate::h3::CellIndex::try_from(key)
+            let parent = CellIndex::try_from(key)
                 .ok()
                 .and_then(|cell| cell.resolution().pred().and_then(|r| cell.parent(r)))
                 .map(u64::from);

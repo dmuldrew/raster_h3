@@ -4,7 +4,7 @@
 //! for discrete integer / land cover categories and classification maps.
 
 use fxhash::FxBuildHasher;
-use crate::h3::Resolution;
+use h3o::Resolution;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;

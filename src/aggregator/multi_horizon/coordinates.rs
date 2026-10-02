@@ -4,7 +4,7 @@
 //! explicit fast paths for north-up WGS84 and Web Mercator grids, exact per-sample
 //! projected CRS transformation, and row-level spatial geometry contexts.
 
-use crate::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 
 use crate::aggregator::sampling::{SamplePoint, SamplingPattern};
 use crate::crs::transformer::CrsTransformer;

@@ -2,7 +2,7 @@
 //!
 //! Evaluates per-pixel mosaic tile ownership when chunks overlap multiple tiles.
 
-use crate::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 
 use super::coordinates::{is_point_in_bbox, CoordinateTransformer};
 use crate::aggregator::sampling::SamplingPattern;

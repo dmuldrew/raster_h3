@@ -235,8 +235,8 @@ impl BindHelper {
             .get_named_uint("h3_cell")
             .or_else(|| self.get_named_int("h3_cell").map(|v| v as u64))
         {
-            if let Ok(cell) = crate::h3::CellIndex::try_from(cell_u64) {
-                let ll: crate::h3::LatLng = cell.into();
+            if let Ok(cell) = h3o::CellIndex::try_from(cell_u64) {
+                let ll: h3o::LatLng = cell.into();
                 let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
                 return Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
             }
@@ -244,8 +244,8 @@ impl BindHelper {
 
         // 4. H3 hex string
         if let Some(hex_str) = self.get_named_string("h3_hex") {
-            if let Ok(cell) = hex_str.trim().parse::<crate::h3::CellIndex>() {
-                let ll: crate::h3::LatLng = cell.into();
+            if let Ok(cell) = hex_str.trim().parse::<h3o::CellIndex>() {
+                let ll: h3o::LatLng = cell.into();
                 let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
                 return Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
             }

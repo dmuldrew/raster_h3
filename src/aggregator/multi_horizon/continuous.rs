@@ -1,5 +1,5 @@
 use fxhash::FxBuildHasher;
-use crate::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 

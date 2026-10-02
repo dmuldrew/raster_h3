@@ -7,7 +7,7 @@
 //! Usage:
 //!   cargo run --bin inspect_tif -- \<path_or_url\> \[options\]
 
-use raster_h3::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
