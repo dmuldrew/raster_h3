@@ -10,11 +10,11 @@ use tiff::decoder::DecodingResult;
 use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;
 
+use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::multi_horizon::{
     continuous_streamer::ContinuousKernel, MultiHorizonStreamer, MultiResolutionConfig,
     MultiScanHorizonStreamer,
 };
-use raster_h3::h3::{LatLng, Resolution};
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 #[test]
@@ -225,7 +225,7 @@ fn test_low_budget_triggers_spill_runs_and_matches_reference() {
         stream.spill_run_count()
     );
 
-    // Verify bitwise exact equality with ground-truth reference
+    // Verify exact counts and sums within the stated floating-point tolerance
     assert_eq!(
         actual.len(),
         expected.len(),

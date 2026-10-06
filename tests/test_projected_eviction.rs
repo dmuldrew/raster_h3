@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;
 
+use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::multi_horizon::coordinates::eviction_north_bound;
 use raster_h3::aggregator::multi_horizon::{
     continuous_streamer::ContinuousKernel, MultiHorizonStreamer, MultiResolutionConfig,
 };
 use raster_h3::aggregator::{H3Accumulator, SamplingPattern};
 use raster_h3::crs::transformer::CrsTransformer;
-use raster_h3::h3::{LatLng, Resolution};
 use raster_h3::raster::{geotiff::GeoTiffStreamReader, geotransform::GeoTransform, RasterChunk};
 
 fn create_projected_fixture(

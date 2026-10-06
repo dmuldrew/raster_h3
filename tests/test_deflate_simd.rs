@@ -738,7 +738,7 @@ fn test_deflate_buffer_auto_resizing_hardening() {
 
 #[test]
 fn cropped_edge_tiles_match_reference_in_both_streaming_paths() {
-    use raster_h3::h3::{LatLng, Resolution};
+    use h3o::{LatLng, Resolution};
     use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
     use std::collections::HashMap;
     let file = NamedTempFile::new().unwrap();

@@ -8,21 +8,6 @@ use std::cell::Cell;
 #[derive(Clone, Copy, Default, Debug, Serialize)]
 pub struct WorkerProfile {
     pub h3_calls: u64,
-    /// Native geographic projections executed, including guarded requests.
-    pub native_projection_calls: u64,
-    /// Integer index constructions avoided; projections still execute.
-    pub native_cache_hits: u64,
-    pub prefix_tests: u64,
-    /// Scanline searches with at least one projected-rectangle certificate hit.
-    pub span_skips: u64,
-    /// Native quantizations and integer index constructions avoided. Every one
-    /// of these pixels still executes its native geographic projection.
-    pub skipped_pixels: u64,
-    pub geometry_queries: u64,
-    pub geometry_accepts: u64,
-    pub geometry_proposed_center_pixels: u64,
-    pub geometry_proposed_core_samples: u64,
-    pub geometry_mismatches: u64,
     pub h3_ns: u64,
     pub transform_calls: u64,
     pub transform_ns: u64,
@@ -31,16 +16,6 @@ pub struct WorkerProfile {
 impl WorkerProfile {
     pub fn merge(&mut self, other: Self) {
         self.h3_calls += other.h3_calls;
-        self.native_projection_calls += other.native_projection_calls;
-        self.native_cache_hits += other.native_cache_hits;
-        self.prefix_tests += other.prefix_tests;
-        self.span_skips += other.span_skips;
-        self.skipped_pixels += other.skipped_pixels;
-        self.geometry_queries += other.geometry_queries;
-        self.geometry_accepts += other.geometry_accepts;
-        self.geometry_proposed_center_pixels += other.geometry_proposed_center_pixels;
-        self.geometry_proposed_core_samples += other.geometry_proposed_core_samples;
-        self.geometry_mismatches += other.geometry_mismatches;
         self.h3_ns += other.h3_ns;
         self.transform_calls += other.transform_calls;
         self.transform_ns += other.transform_ns;
@@ -90,7 +65,6 @@ pub fn index(ll: LatLng, res: Resolution) -> CellIndex {
     PROFILE.with(|v| {
         let mut p = v.get();
         p.h3_calls += 1;
-        p.native_projection_calls += 1;
         p.h3_ns += start.elapsed().as_nanos() as u64;
         v.set(p);
     });

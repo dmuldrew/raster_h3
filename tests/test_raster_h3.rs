@@ -9,7 +9,7 @@ use helpers::{create_constant_f32_geotiff, TestGeoTiffBuilder};
 use std::path::Path;
 use tempfile::NamedTempFile;
 
-use raster_h3::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
@@ -128,8 +128,8 @@ fn test_fast_hex_formatting() {
 
 #[test]
 fn test_bitshift_resolution() {
-    let lat_lng = raster_h3::h3::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = lat_lng.to_cell(raster_h3::h3::Resolution::Eight);
+    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
     let cell_u64: u64 = cell.into();
 
     let res_bitshift = (cell_u64 >> 52) & 0x0F;
@@ -149,8 +149,8 @@ fn test_is_chunk_all_nodata() {
 
 #[test]
 fn test_compute_cell_south_lat() {
-    let lat_lng = raster_h3::h3::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = lat_lng.to_cell(raster_h3::h3::Resolution::Eight);
+    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
     let cell_u64: u64 = cell.into();
 
     // Now returns center lat as a fast proxy (always >= true south vertex lat)
@@ -1238,138 +1238,153 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
     );
 }
 
-#[test]
-#[ignore = "requires external dataset data/CFL_HI.tif"]
-fn test_parallel_chunk_aggregation_hawaii_dataset() {
-    let tiff_path = Path::new("data/CFL_HI.tif");
-    if !tiff_path.exists() {
-        return;
-    }
-
-    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
-    let config = raster_h3::aggregator::multi_horizon::MultiResolutionConfig::new(vec![8]);
-    let mut streamer =
-        raster_h3::aggregator::multi_horizon::MultiScanHorizonStreamer::new(reader, &config)
-            .unwrap();
-    let mut map: std::collections::HashMap<u64, raster_h3::aggregator::accumulator::H3Accumulator> =
-        std::collections::HashMap::new();
-    while !streamer.is_finished() {
-        for record in streamer.fetch_next_batch(2048).unwrap() {
-            map.entry(record.h3_index)
-                .and_modify(|acc| acc.merge(&record.accumulator))
-                .or_insert(record.accumulator);
+// Independent aggregation reference: decoded pixels, full affine coordinates,
+// direct CRS transformation and H3 indexing; no walker, span, or eviction code.
+fn for_each_hawaii_reference_pixel(path: &Path, mut visit: impl FnMut(f64, f64, f64)) {
+    use tiff::decoder::DecodingResult;
+    let reader =
+        GeoTiffStreamReader::open(path).expect("Required external dataset missing or invalid");
+    assert_eq!(reader.metadata.samples_per_pixel, 1);
+    let crs = CrsTransformer::from_crs_or_epsg(
+        reader.metadata.epsg,
+        reader.metadata.proj_string.as_deref(),
+    )
+    .unwrap();
+    let gt = reader.metadata.geotransform;
+    let nodata = reader.metadata.nodata;
+    let mut decoder = reader.open_decoder().unwrap();
+    for index in 0..reader.chunk_layout.total_chunks {
+        if reader.is_sparse_chunk(index) {
+            continue;
+        }
+        let (chunk, decoded) = decoder.read_chunk(index).unwrap();
+        macro_rules! visit_pixels {
+            ($values:expr, $ty:ty) => {{
+                let values = $values;
+                let sentinel = nodata.map(|n| n as $ty);
+                assert_eq!(values.len(), (chunk.width * chunk.height) as usize);
+                for (i, raw) in values.into_iter().enumerate() {
+                    let value = raw as f64;
+                    if !value.is_finite() || sentinel == Some(raw) {
+                        continue;
+                    }
+                    let col = chunk.col_offset as usize + i % chunk.width as usize;
+                    let row = chunk.row_offset as usize + i / chunk.width as usize;
+                    let (x, y) = gt.pixel_center_to_coord(col, row);
+                    let (lon, lat) = crs.transform_point(x, y).unwrap();
+                    visit(lon, lat, value);
+                }
+            }};
+        }
+        match decoded {
+            DecodingResult::U8(v) => visit_pixels!(v, u8),
+            DecodingResult::U16(v) => visit_pixels!(v, u16),
+            DecodingResult::U32(v) => visit_pixels!(v, u32),
+            DecodingResult::U64(v) => visit_pixels!(v, u64),
+            DecodingResult::I8(v) => visit_pixels!(v, i8),
+            DecodingResult::I16(v) => visit_pixels!(v, i16),
+            DecodingResult::I32(v) => visit_pixels!(v, i32),
+            DecodingResult::I64(v) => visit_pixels!(v, i64),
+            DecodingResult::F32(v) => visit_pixels!(v, f32),
+            DecodingResult::F64(v) => visit_pixels!(v, f64),
         }
     }
-    // Exhaustive per-pixel reference using the decoded (cropped) tile stride.
-    assert_eq!(map.len(), 30_958);
-
-    let mut total_samples = 0.0;
-    let mut total_sum = 0.0;
-    for (_idx, acc) in &map {
-        total_samples += acc.count;
-        total_sum += acc.sum;
-    }
-
-    assert_eq!(total_samples, 28_373_991.0);
-    assert!(total_sum > 100_000_000.0);
 }
 
 #[test]
-#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
-fn test_parallel_categorical_aggregation_hawaii_dataset() {
-    use raster_h3::aggregator::multi_horizon::{
-        MultiCategoricalHorizonStreamer, MultiResolutionConfig,
-    };
+#[ignore = "requires external dataset data/CFL_HI.tif; run in release mode"]
+fn test_parallel_chunk_aggregation_hawaii_dataset() {
     use std::collections::HashMap;
-
-    let tiff_path = Path::new("data/LF2024_FBFM40_HI.tif");
-    if !tiff_path.exists() {
-        return;
-    }
-
-    // 1. Dual-pyramid multi-resolution scan (Res 7 + Res 8) in a single pass
-    let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
-    let config = MultiResolutionConfig::new(vec![7, 8]);
-    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
-
-    let mut r7_count = 0usize;
-    let mut r8_count = 0usize;
-    let mut total_pixels = 0.0f64;
-    let mut r8_class_distribution: HashMap<i64, usize> = HashMap::new();
-
-    loop {
-        let n = streamer
-            .drain_completed_into(2048, |_i, rec| {
-                if rec.resolution == 7 {
-                    r7_count += 1;
-                } else if rec.resolution == 8 {
-                    r8_count += 1;
-                    total_pixels += rec.accumulator.total_count;
-                    let (maj_cls, _, _) = rec.accumulator.majority();
-                    *r8_class_distribution.entry(maj_cls).or_insert(0usize) += 1;
-                }
-            })
-            .unwrap();
-        if n == 0 {
-            break;
+    let path = Path::new("data/CFL_HI.tif");
+    let mut expected = HashMap::<u64, (f64, f64, f64, f64)>::new();
+    for_each_hawaii_reference_pixel(path, |lon, lat, value| {
+        let cell = LatLng::new(lat, lon)
+            .unwrap()
+            .to_cell(Resolution::Eight)
+            .into();
+        let acc = expected.entry(cell).or_insert((0.0, 0.0, value, value));
+        acc.0 += 1.0;
+        acc.1 += value;
+        acc.2 = acc.2.min(value);
+        acc.3 = acc.3.max(value);
+    });
+    assert!(!expected.is_empty());
+    let config = MultiResolutionConfig::single(8);
+    let mut stream =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(path).unwrap(), &config).unwrap();
+    while !stream.is_finished() {
+        for record in stream.fetch_next_batch(2048).unwrap() {
+            let (count, sum, min, max) = expected
+                .remove(&record.h3_index)
+                .expect("Unexpected or duplicate cell");
+            let acc = record.accumulator;
+            assert_eq!(acc.count, count);
+            assert_eq!(acc.min, min);
+            assert_eq!(acc.max, max);
+            assert!((acc.sum - sum).abs() <= 1e-9 * sum.abs().max(1.0));
         }
     }
+    assert!(expected.is_empty(), "Missing cells");
+}
 
-    // Exhaustive per-pixel reference for LF2024_FBFM40_HI.tif, including
-    // cropped edge tiles. The former padded stride dropped/misplaced edge pixels.
-    assert_eq!(r7_count, 39_426, "Res 7 pyramid cell count mismatch");
-    assert_eq!(r8_count, 273_840, "Res 8 pyramid cell count mismatch");
-    assert_eq!(
-        r7_count + r8_count,
-        313_266,
-        "Total dual pyramid cell count mismatch"
-    );
-    assert_eq!(
-        total_pixels as u64, 256_851_000,
-        "Total pixel count mismatch on Hawaii categorical scan"
-    );
-
-    // Verify top 3 landcover classes
-    assert_eq!(
-        *r8_class_distribution.get(&-9999).unwrap_or(&0),
-        243_921,
-        "Class -9999 (NoData) hex count mismatch"
-    );
-    assert_eq!(
-        *r8_class_distribution.get(&98).unwrap_or(&0),
-        10_779,
-        "Class 98 hex count mismatch"
-    );
-    assert_eq!(
-        *r8_class_distribution.get(&163).unwrap_or(&0),
-        7_287,
-        "Class 163 hex count mismatch"
-    );
-
-    // 2. Spatial bounding box pushdown (Maui Island ROI)
-    let maui_bbox = [-156.70, 20.55, -155.95, 21.05];
-    let mut config_maui = MultiResolutionConfig::new(vec![8]);
-    config_maui.bbox = Some(maui_bbox);
-
-    let reader_maui = GeoTiffStreamReader::open(tiff_path).unwrap();
-    let mut streamer_maui =
-        MultiCategoricalHorizonStreamer::new(reader_maui, &config_maui).unwrap();
-    let mut maui_hexes = 0usize;
-
-    loop {
-        let n = streamer_maui
-            .drain_completed_into(2048, |_i, _rec| {
-                maui_hexes += 1;
-            })
-            .unwrap();
-        if n == 0 {
-            break;
+#[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif; run in release mode"]
+fn test_parallel_categorical_aggregation_hawaii_dataset() {
+    use std::collections::HashMap;
+    let path = Path::new("data/LF2024_FBFM40_HI.tif");
+    let maui = [-156.70, 20.55, -155.95, 21.05];
+    let mut expected = HashMap::<u64, HashMap<i64, f64>>::new();
+    let mut expected_maui = HashMap::<u64, HashMap<i64, f64>>::new();
+    for_each_hawaii_reference_pixel(path, |lon, lat, value| {
+        for res in [Resolution::Seven, Resolution::Eight] {
+            let cell = u64::from(LatLng::new(lat, lon).unwrap().to_cell(res));
+            *expected
+                .entry(cell)
+                .or_default()
+                .entry(value as i64)
+                .or_default() += 1.0;
+            if res == Resolution::Eight
+                && lon >= maui[0]
+                && lon <= maui[2]
+                && lat >= maui[1]
+                && lat <= maui[3]
+            {
+                *expected_maui
+                    .entry(cell)
+                    .or_default()
+                    .entry(value as i64)
+                    .or_default() += 1.0;
+            }
         }
+    });
+    for (mut reference, resolutions, bbox) in [
+        (expected, vec![7, 8], None),
+        (expected_maui, vec![8], Some(maui)),
+    ] {
+        assert!(!reference.is_empty());
+        let mut config = MultiResolutionConfig::new(resolutions);
+        config.bbox = bbox;
+        let mut stream =
+            MultiCategoricalHorizonStreamer::new(GeoTiffStreamReader::open(path).unwrap(), &config)
+                .unwrap();
+        while !stream.is_finished() {
+            for record in stream.fetch_next_batch(2048).unwrap() {
+                let histogram = reference
+                    .remove(&record.h3_index)
+                    .expect("Unexpected or duplicate cell");
+                let mut actual = HashMap::new();
+                record.accumulator.for_each_class(|class, count| {
+                    actual.insert(class, count);
+                });
+                assert_eq!(actual, histogram);
+                assert_eq!(
+                    record.accumulator.total_count,
+                    histogram.values().sum::<f64>()
+                );
+            }
+        }
+        assert!(reference.is_empty(), "Missing cells");
     }
-    assert_eq!(
-        maui_hexes, 5_230,
-        "Maui ROI spatial filter pushdown hexagon count mismatch"
-    );
 }
 
 #[test]
@@ -1618,14 +1633,14 @@ fn test_wkb_ogc_compliance() {
     assert_eq!(&buf[..len], &buf2[..len2]);
 
     // Verify Class III (odd) resolution pentagon: 10 vertices -> 189 bytes
-    let pentagon_res7 = raster_h3::h3::CellIndex::try_from(0x870800000ffffffu64).unwrap();
+    let pentagon_res7 = h3o::CellIndex::try_from(0x870800000ffffffu64).unwrap();
     let p_len = cell_to_wkb(pentagon_res7, &mut buf);
     assert_eq!(p_len, 189);
     let p_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());
     assert_eq!(p_points, 11);
 
     // Verify Class III icosahedron-straddling hexagon: 8 vertices -> 157 bytes
-    let hex_res7_8 = raster_h3::h3::CellIndex::try_from(0x87e06dac8ffffffu64).unwrap();
+    let hex_res7_8 = h3o::CellIndex::try_from(0x87e06dac8ffffffu64).unwrap();
     let h_len = cell_to_wkb(hex_res7_8, &mut buf);
     assert_eq!(h_len, 157);
     let h_points = u32::from_le_bytes(buf[9..13].try_into().unwrap());

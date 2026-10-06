@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use raster_h3::h3::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, LatLng, Resolution};
 use tempfile::TempDir;
 use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;

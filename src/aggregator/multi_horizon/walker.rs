@@ -7,7 +7,7 @@ use fxhash::FxBuildHasher;
 use h3o::{LatLng, Resolution};
 use std::collections::HashMap;
 
-use crate::aggregator::h3_scanline::H3ScanlineLookahead;
+use crate::aggregator::h3_scanline::cell_at;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
@@ -52,50 +52,18 @@ pub trait ScanlineEngine<T, Acc> {
     fn update_sample(&self, acc: &mut Acc, sample: Self::Sample, weight: f64);
 }
 
-/// Stateful cursor tracking current column and projected coordinate positions along a scanline.
+/// Column position only; coordinates are derived from absolute pixel positions.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanlineCursor {
     pub col: usize,
-    pub x_curr: f64,
-    pub lon_curr: f64,
-    pub dx_step: f64,
-    pub d_lon_step: f64,
-    pub is_north_up: bool,
-    pub is_geographic: bool,
 }
-
 impl ScanlineCursor {
-    #[inline(always)]
-    pub fn new(
-        col_start: usize,
-        x_start: f64,
-        lon_start: f64,
-        dx_step: f64,
-        d_lon_step: f64,
-        geom_ctx: &RowGeometryContext,
-    ) -> Self {
-        Self {
-            col: col_start,
-            x_curr: x_start + (col_start as f64) * dx_step,
-            lon_curr: lon_start + (col_start as f64) * d_lon_step,
-            dx_step,
-            d_lon_step,
-            is_north_up: geom_ctx.is_north_up,
-            is_geographic: geom_ctx.is_wgs84 || geom_ctx.is_web_mercator,
-        }
+    pub fn new(col: usize) -> Self {
+        Self { col }
     }
-
-    #[inline(always)]
     pub fn advance(&mut self, steps: usize) {
         self.col += steps;
-        if self.is_geographic {
-            self.lon_curr += (steps as f64) * self.d_lon_step;
-        } else if self.is_north_up {
-            self.x_curr += (steps as f64) * self.dx_step;
-        }
     }
-
-    #[inline(always)]
     pub fn step_one(&mut self) {
         self.advance(1);
     }
@@ -110,7 +78,6 @@ fn evaluate_subpixel_pixel<T, Acc, E>(
     run_cell: u64,
     res: Resolution,
     coords: &RowCoordinates,
-    geom_ctx: &RowGeometryContext,
     gt: &GeoTransform,
     crs_transformer: &CrsTransformer,
     col_offset: usize,
@@ -127,7 +94,6 @@ fn evaluate_subpixel_pixel<T, Acc, E>(
     if let Some(sample) = engine.get_sample(val_raw) {
         coords.for_each_subpixel(
             k,
-            geom_ctx,
             gt,
             crs_transformer,
             col_offset,
@@ -168,7 +134,6 @@ fn evaluate_subpixel_pixel_multi<T, Acc, E>(
     core_starts: &[usize],
     core_ends: &[usize],
     coords: &RowCoordinates,
-    geom_ctx: &RowGeometryContext,
     gt: &GeoTransform,
     crs_transformer: &CrsTransformer,
     col_offset: usize,
@@ -197,7 +162,6 @@ fn evaluate_subpixel_pixel_multi<T, Acc, E>(
         if any_subpixel {
             coords.for_each_subpixel(
                 k,
-                geom_ctx,
                 gt,
                 crs_transformer,
                 col_offset,
@@ -249,46 +213,30 @@ fn walk_single_res_row<T, Acc, E>(
     bbox: Option<[f64; 4]>,
     engine: &E,
     active_map: &mut HashMap<u64, Acc, FxBuildHasher>,
-    row_cache: &mut H3ScanlineLookahead,
 ) where
     T: Copy,
     Acc: Clone,
     E: ScanlineEngine<T, Acc>,
 {
-    row_cache.reset_row();
     let is_single_point = sampling.is_single_point();
 
     let mut run_cell: u64 = 0;
     let mut run_acc = engine.new_acc();
     let mut known_next_cell: Option<u64> = None;
 
-    let mut cursor = ScanlineCursor::new(
-        coords.row_c_start,
-        coords.x_start,
-        coords.lon_start,
-        geom_ctx.dx_step,
-        geom_ctx.d_lon_step,
-        geom_ctx,
-    );
+    let mut cursor = ScanlineCursor::new(coords.row_c_start);
 
     while cursor.col < coords.row_c_end {
         let c = cursor.col;
-        let (lon, lat) = match coords.pixel_center_lon_lat(
-            c,
-            cursor.x_curr,
-            cursor.lon_curr,
-            geom_ctx,
-            gt,
-            crs_transformer,
-            chunk.col_offset as usize,
-        ) {
-            Some(ll) => ll,
-            None => {
-                known_next_cell = None;
-                cursor.step_one();
-                continue;
-            }
-        };
+        let (lon, lat) =
+            match coords.pixel_center_lon_lat(c, gt, crs_transformer, chunk.col_offset as usize) {
+                Some(ll) => ll,
+                None => {
+                    known_next_cell = None;
+                    cursor.step_one();
+                    continue;
+                }
+            };
 
         if is_single_point
             && ((geom_ctx.is_north_up && !geom_ctx.is_wgs84 && !geom_ctx.is_web_mercator)
@@ -300,9 +248,7 @@ fn walk_single_res_row<T, Acc, E>(
             continue;
         }
 
-        let cell_opt = known_next_cell
-            .take()
-            .or_else(|| row_cache.get_or_compute_cell(lat, lon, res));
+        let cell_opt = known_next_cell.take().or_else(|| cell_at(lat, lon, res));
 
         if let Some(cell_u64) = cell_opt {
             if cell_u64 != run_cell {
@@ -314,14 +260,14 @@ fn walk_single_res_row<T, Acc, E>(
                 }
                 run_cell = cell_u64;
                 engine.clear_acc(&mut run_acc);
-                row_cache.on_cell_changed();
             }
 
             let (span_end, next_cell) = coords.find_span_end(
-                row_cache,
                 c,
-                cursor.lon_curr,
                 geom_ctx,
+                gt,
+                crs_transformer,
+                chunk.col_offset as usize,
                 res,
                 run_cell,
             );
@@ -353,7 +299,6 @@ fn walk_single_res_row<T, Acc, E>(
                         run_cell,
                         res,
                         coords,
-                        geom_ctx,
                         gt,
                         crs_transformer,
                         chunk.col_offset as usize,
@@ -377,7 +322,6 @@ fn walk_single_res_row<T, Acc, E>(
                         run_cell,
                         res,
                         coords,
-                        geom_ctx,
                         gt,
                         crs_transformer,
                         chunk.col_offset as usize,
@@ -391,7 +335,6 @@ fn walk_single_res_row<T, Acc, E>(
             }
 
             let num_stepped = span_end - c;
-            row_cache.advance_span(num_stepped);
             cursor.advance(num_stepped);
             known_next_cell = next_cell;
         } else {
@@ -409,7 +352,6 @@ fn walk_single_res_row<T, Acc, E>(
 
 /// Reusable state buffers for multi-resolution scanline processing across chunks.
 struct MultiResRowBuffers<Acc> {
-    row_caches: Vec<H3ScanlineLookahead>,
     span_ends: Vec<usize>,
     run_cells: Vec<u64>,
     run_accs: Vec<Acc>,
@@ -422,10 +364,6 @@ impl<Acc: Clone> MultiResRowBuffers<Acc> {
     fn new<T, E: ScanlineEngine<T, Acc>>(resolutions: &[Resolution], engine: &E) -> Self {
         let num_res = resolutions.len();
         Self {
-            row_caches: resolutions
-                .iter()
-                .map(|&res| H3ScanlineLookahead::for_resolution(res))
-                .collect(),
             span_ends: vec![0; num_res],
             run_cells: vec![0; num_res],
             run_accs: (0..num_res).map(|_| engine.new_acc()).collect(),
@@ -436,9 +374,8 @@ impl<Acc: Clone> MultiResRowBuffers<Acc> {
     }
 
     fn reset_for_row<T, E: ScanlineEngine<T, Acc>>(&mut self, row_c_start: usize, engine: &E) {
-        let num_res = self.row_caches.len();
+        let num_res = self.run_cells.len();
         for i in 0..num_res {
-            self.row_caches[i].reset_row();
             self.run_cells[i] = 0;
             engine.clear_acc(&mut self.run_accs[i]);
             self.known_next_cells[i] = None;
@@ -495,35 +432,21 @@ fn walk_multi_res_row<T, Acc, E>(
     buf.reset_for_row(coords.row_c_start, engine);
     let is_single_point = sampling.is_single_point();
 
-    let mut cursor = ScanlineCursor::new(
-        coords.row_c_start,
-        coords.x_start,
-        coords.lon_start,
-        geom_ctx.dx_step,
-        geom_ctx.d_lon_step,
-        geom_ctx,
-    );
+    let mut cursor = ScanlineCursor::new(coords.row_c_start);
 
     while cursor.col < coords.row_c_end {
         let c = cursor.col;
-        let (lon, lat) = match coords.pixel_center_lon_lat(
-            c,
-            cursor.x_curr,
-            cursor.lon_curr,
-            geom_ctx,
-            gt,
-            crs_transformer,
-            chunk.col_offset as usize,
-        ) {
-            Some(ll) => ll,
-            None => {
-                for i in 0..num_res {
-                    buf.flush_inactive_cell(i, c, engine, &mut chunk_maps[i]);
+        let (lon, lat) =
+            match coords.pixel_center_lon_lat(c, gt, crs_transformer, chunk.col_offset as usize) {
+                Some(ll) => ll,
+                None => {
+                    for i in 0..num_res {
+                        buf.flush_inactive_cell(i, c, engine, &mut chunk_maps[i]);
+                    }
+                    cursor.step_one();
+                    continue;
                 }
-                cursor.step_one();
-                continue;
-            }
-        };
+            };
 
         if is_single_point
             && ((geom_ctx.is_north_up && !geom_ctx.is_wgs84 && !geom_ctx.is_web_mercator)
@@ -542,7 +465,7 @@ fn walk_multi_res_row<T, Acc, E>(
                 let res = resolutions[i];
                 let cell_opt = buf.known_next_cells[i]
                     .take()
-                    .or_else(|| buf.row_caches[i].get_or_compute_cell(lat, lon, res));
+                    .or_else(|| cell_at(lat, lon, res));
 
                 if let Some(cell_u64) = cell_opt {
                     if cell_u64 != buf.run_cells[i] {
@@ -554,14 +477,14 @@ fn walk_multi_res_row<T, Acc, E>(
                             engine.clear_acc(&mut buf.run_accs[i]);
                         }
                         buf.run_cells[i] = cell_u64;
-                        buf.row_caches[i].on_cell_changed();
                     }
 
                     let (span_end, next_cell) = coords.find_span_end(
-                        &mut buf.row_caches[i],
                         c,
-                        cursor.lon_curr,
                         geom_ctx,
+                        gt,
+                        crs_transformer,
+                        chunk.col_offset as usize,
                         res,
                         buf.run_cells[i],
                     );
@@ -624,7 +547,6 @@ fn walk_multi_res_row<T, Acc, E>(
                         &buf.core_starts,
                         &buf.core_ends,
                         coords,
-                        geom_ctx,
                         gt,
                         crs_transformer,
                         chunk.col_offset as usize,
@@ -649,7 +571,6 @@ fn walk_multi_res_row<T, Acc, E>(
                         &buf.core_starts,
                         &buf.core_ends,
                         coords,
-                        geom_ctx,
                         gt,
                         crs_transformer,
                         chunk.col_offset as usize,
@@ -671,7 +592,6 @@ fn walk_multi_res_row<T, Acc, E>(
                         &buf.core_starts,
                         &buf.core_ends,
                         coords,
-                        geom_ctx,
                         gt,
                         crs_transformer,
                         chunk.col_offset as usize,
@@ -686,9 +606,6 @@ fn walk_multi_res_row<T, Acc, E>(
         }
 
         let num_stepped = step_end - c;
-        for i in 0..num_res {
-            buf.row_caches[i].advance_span(num_stepped);
-        }
         cursor.advance(num_stepped);
     }
 
@@ -731,7 +648,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
     let num_res = resolutions.len();
 
     if num_res == 1 {
-        let mut row_cache = H3ScanlineLookahead::for_resolution(resolutions[0]);
         for r in 0..actual_rows {
             let slice_row_start = r * stride;
             let row_width = (slice.len().saturating_sub(slice_row_start)).min(chunk.width as usize);
@@ -766,7 +682,6 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
                     bbox,
                     engine,
                     &mut chunk_maps[0],
-                    &mut row_cache,
                 );
             }
         }
@@ -854,17 +769,8 @@ mod tests {
 
     #[test]
     fn test_scanline_cursor_advancement() {
-        let mut cursor = ScanlineCursor {
-            col: 10,
-            x_curr: 100.0,
-            lon_curr: -122.0,
-            dx_step: 2.0,
-            d_lon_step: 0.01,
-            is_north_up: true,
-            is_geographic: true,
-        };
+        let mut cursor = ScanlineCursor::new(10);
         cursor.advance(5);
         assert_eq!(cursor.col, 15);
-        assert!((cursor.lon_curr - (-121.95)).abs() < 1e-10);
     }
 }

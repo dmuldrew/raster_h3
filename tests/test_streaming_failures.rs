@@ -218,9 +218,9 @@ fn parquet_failure_after_flushed_row_groups_is_not_published() {
                     i,
                     MultiContinuousRecord {
                         resolution: 8,
-                        h3_index: raster_h3::h3::LatLng::new(37.8, -122.4)
+                        h3_index: h3o::LatLng::new(37.8, -122.4)
                             .unwrap()
-                            .to_cell(raster_h3::h3::Resolution::Eight)
+                            .to_cell(h3o::Resolution::Eight)
                             .into(),
                         accumulator: H3Accumulator::new(42.0),
                     },

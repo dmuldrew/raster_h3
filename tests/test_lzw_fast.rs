@@ -17,10 +17,10 @@ use raster_h3::raster::geotiff::GeoTiffStreamReader;
 #[ignore = "requires external dataset data/CFL_HI.tif"]
 fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
     let path = "data/CFL_HI.tif";
-    if !Path::new(path).exists() {
-        eprintln!("Skipping test: {} does not exist", path);
-        return;
-    }
+    assert!(
+        Path::new(path).exists(),
+        "Required external dataset missing: {path}"
+    );
 
     let reader = GeoTiffStreamReader::open(path).expect("Failed to open CFL_HI.tif");
     let mmap = reader.mmap().expect("Failed to get mmap");
@@ -85,10 +85,10 @@ fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
 #[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
 fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
     let path = "data/LF2024_FBFM40_HI.tif";
-    if !Path::new(path).exists() {
-        eprintln!("Skipping test: {} does not exist", path);
-        return;
-    }
+    assert!(
+        Path::new(path).exists(),
+        "Required external dataset missing: {path}"
+    );
 
     let reader = GeoTiffStreamReader::open(path).expect("Failed to open LF2024_FBFM40_HI.tif");
     let mmap = reader.mmap().expect("Failed to get mmap");
@@ -142,10 +142,10 @@ fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
 #[test]
 fn test_lzw_read_chunk_into_buffer_recycling() {
     let path = "data/LF2024_FBFM40_HI.tif";
-    if !Path::new(path).exists() {
-        eprintln!("Skipping test: {} does not exist", path);
-        return;
-    }
+    assert!(
+        Path::new(path).exists(),
+        "Required external dataset missing: {path}"
+    );
 
     let reader = GeoTiffStreamReader::open(path).unwrap();
     let mut fast_decoder = reader.open_decoder().unwrap();

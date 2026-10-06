@@ -39,7 +39,7 @@ docs:
 
     ### Key Features:
     - **Zero Python / Zero GDAL C++ Dependencies**: 100% self-contained pure Rust engine.
-    - **Bounded Memory O(Scan Front) < 15 MB RAM**: Horizon eviction streams multi-gigabyte rasters in constant memory.
-    - **Scanline Lookahead Acceleration**: Hoisted row-constant latitude projection and exponential jump-guessing for hardware-saturating throughput.
+    - **Budgeted Aggregation**: Certified horizon eviction and disk spilling limit active accumulators; decoding and prefetch buffers use additional RAM.
+    - **Exact H3 Indexing**: Absolute pixel coordinates and sequential span discovery combine accumulation for consecutive equal-cell pixels.
     - **Native PMTiles v3 Vector Pyramids**: Emits serverless web-ready vector tile archives in a single SQL query.
     - **Sub-Pixel Area-Weighted Super-Sampling**: Supports 8 anti-aliasing patterns (RGSS, Hexagonal, Gaussian PSF, 8-Rooks) for exact boundary precision.

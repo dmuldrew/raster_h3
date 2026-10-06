@@ -22,9 +22,9 @@ use helpers::create_temp_geotiff;
 fn test_mvt_protobuf_encoding() {
     let mut layer = MvtLayer::new("h3_hexagons");
 
-    let v1 = raster_h3::h3::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = v1.to_cell(raster_h3::h3::Resolution::Seven);
-    let vertices: Vec<raster_h3::h3::LatLng> = cell.boundary().iter().copied().collect();
+    let v1 = h3o::LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = v1.to_cell(h3o::Resolution::Seven);
+    let vertices: Vec<h3o::LatLng> = cell.boundary().iter().copied().collect();
 
     let properties = vec![
         ("h3_index".into(), MvtValue::UInt(cell.into())),
@@ -393,7 +393,7 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
 
 #[test]
 fn test_parquet_to_pmtiles_multi_row_group_eviction() {
-    use raster_h3::h3::{LatLng, Resolution};
+    use h3o::{LatLng, Resolution};
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::parser::parse_message_type;
@@ -802,7 +802,7 @@ fn test_geotiff_to_pmtiles_selective_properties() {
 
 #[test]
 fn test_cell_to_tile_coordinate_mapping() {
-    use raster_h3::h3::{CellIndex, LatLng};
+    use h3o::{CellIndex, LatLng};
     use raster_h3::pmtiles::tiler::lon_lat_to_tile_xy;
 
     let cell_u64 = 0x83464efffffffffu64;

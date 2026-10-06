@@ -20,37 +20,13 @@ pub const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 pub struct CoordinateTransformer<'a> {
     pub gt: &'a GeoTransform,
     pub crs_transformer: &'a CrsTransformer,
-    pub is_wgs84: bool,
-    pub is_web_mercator: bool,
-    pub is_north_up: bool,
-    pub d_lon_step: f64,
-    pub dx_step: f64,
 }
 
 impl<'a> CoordinateTransformer<'a> {
-    /// Create a new CoordinateTransformer from a GeoTransform and CRS transformer
     pub fn new(gt: &'a GeoTransform, crs_transformer: &'a CrsTransformer) -> Self {
-        let is_wgs84 = matches!(crs_transformer, CrsTransformer::Wgs84Identity);
-        let is_web_mercator = matches!(crs_transformer, CrsTransformer::WebMercatorFast);
-        let is_north_up = gt.b == 0.0 && gt.d == 0.0 && gt.e < 0.0 && gt.a > 0.0;
-        let dx_step = gt.a;
-
-        let d_lon_step = if is_wgs84 {
-            gt.a
-        } else if is_web_mercator {
-            (gt.a / WGS84_A) * RAD_TO_DEG
-        } else {
-            0.0
-        };
-
         Self {
             gt,
             crs_transformer,
-            is_wgs84,
-            is_web_mercator,
-            is_north_up,
-            d_lon_step,
-            dx_step,
         }
     }
 
@@ -131,7 +107,6 @@ pub struct RowGeometryContext {
     pub is_web_mercator: bool,
     pub is_north_up: bool,
     pub d_lon_step: f64,
-    pub dx_step: f64,
     pub stride: usize,
     pub actual_rows: usize,
 }
@@ -161,14 +136,12 @@ impl RowGeometryContext {
         };
         let actual_rows = (slice_len / stride).min(chunk.height as usize);
         let is_north_up = gt.b == 0.0 && gt.d == 0.0 && gt.e < 0.0 && gt.a > 0.0;
-        let dx_step = gt.a;
 
         Self {
             is_wgs84,
             is_web_mercator,
             is_north_up,
             d_lon_step,
-            dx_step,
             stride,
             actual_rows,
         }
@@ -179,10 +152,6 @@ impl RowGeometryContext {
 #[derive(Debug, Clone, Copy)]
 pub struct RowCoordinates {
     pub row_idx: usize,
-    pub x_start: f64,
-    pub y_row: f64,
-    pub lon_start: f64,
-    pub lat_row: f64,
     pub row_c_start: usize,
     pub row_c_end: usize,
 }
@@ -273,10 +242,6 @@ impl RowCoordinates {
 
         Some(Self {
             row_idx,
-            x_start,
-            y_row,
-            lon_start,
-            lat_row,
             row_c_start,
             row_c_end,
         })
@@ -287,21 +252,13 @@ impl RowCoordinates {
     pub fn pixel_center_lon_lat(
         &self,
         c: usize,
-        x_curr: f64,
-        lon_curr: f64,
-        ctx: &RowGeometryContext,
         gt: &GeoTransform,
         crs_transformer: &CrsTransformer,
         col_offset: usize,
     ) -> Option<(f64, f64)> {
-        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
-            Some((lon_curr, self.lat_row))
-        } else if ctx.is_north_up {
-            super::profile::transform(crs_transformer, x_curr, self.y_row).ok()
-        } else {
-            let (x, y) = gt.pixel_center_to_coord(col_offset + c, self.row_idx);
-            super::profile::transform(crs_transformer, x, y).ok()
-        }
+        CoordinateTransformer::new(gt, crs_transformer)
+            .pixel_center_to_wgs84(col_offset + c, self.row_idx)
+            .ok()
     }
 
     /// Iterate over all subpixel sampling points for pixel at column `k`, invoking `f(lon, lat, d_x, d_y, weight)`.
@@ -310,7 +267,6 @@ impl RowCoordinates {
     pub fn for_each_subpixel<F>(
         &self,
         k: usize,
-        ctx: &RowGeometryContext,
         gt: &GeoTransform,
         crs_transformer: &CrsTransformer,
         col_offset: usize,
@@ -320,23 +276,6 @@ impl RowCoordinates {
     ) where
         F: FnMut(f64, f64, f64, f64, f64),
     {
-        if ctx.is_north_up && ctx.is_wgs84 {
-            let k_lon = self.lon_start + (k as f64) * ctx.d_lon_step;
-            let k_lat = self.lat_row;
-            for sp in &sampling.points {
-                let d_x = sp.dx - 0.5;
-                let d_y = sp.dy - 0.5;
-                let lon = k_lon + d_x * ctx.d_lon_step;
-                let lat = k_lat + d_y * gt.e;
-                if is_point_in_bbox(lon, lat, bbox) {
-                    f(lon, lat, d_x, d_y, sp.weight);
-                }
-            }
-            return;
-        }
-
-        // Projected (including Mercator) and rotated grids require the full
-        // affine transform and exact inverse projection at each sample.
         let transformer = CoordinateTransformer::new(gt, crs_transformer);
         for sp in &sampling.points {
             if let Ok((lon, lat)) = transformer.subpixel_to_wgs84(col_offset + k, self.row_idx, *sp)
@@ -348,19 +287,20 @@ impl RowCoordinates {
         }
     }
 
-    /// Delegate span end search to scanline lookahead cache across coordinate reference systems
+    /// Discover a contiguous run using the same coordinates as pixel assignment.
     #[inline(always)]
     pub fn find_span_end(
         &self,
-        row_cache: &mut crate::aggregator::h3_scanline::H3ScanlineLookahead,
         c: usize,
-        lon_curr: f64,
         ctx: &RowGeometryContext,
+        gt: &GeoTransform,
+        crs: &CrsTransformer,
+        col_offset: usize,
         res: Resolution,
         run_cell: u64,
     ) -> (usize, Option<u64>) {
         super::span::H3SpanOptimizer::find_span_end(
-            self, row_cache, c, lon_curr, ctx, res, run_cell,
+            self, c, ctx, gt, crs, col_offset, res, run_cell,
         )
     }
 

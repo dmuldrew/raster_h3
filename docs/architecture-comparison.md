@@ -9,9 +9,9 @@ This document compares the architectural design and performance characteristics 
 | Dimension | Python (`rasterio` + `h3-py` + `pyproj`) | PostGIS (`raster2pgsql` + `ST_H3_Polyfill`) | GDAL CLI (`gdal_polygonize` + `ogr2ogr`) | `raster_h3` (Native DuckDB) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Execution Environment** | Python interpreter with C-extension FFI | PostgreSQL database daemon | External CLI toolchain | **Embedded inside DuckDB query engine** |
-| **Memory Architecture** | Allocates full 2D coordinate meshgrids in RAM | Subject to PostgreSQL shared buffer limits | Allocates intermediate polygon geometries | **Bounded O(Scan Front) < 15 MB RAM** |
+| **Memory Architecture** | Allocates full 2D coordinate meshgrids in RAM | Subject to PostgreSQL shared buffer limits | Allocates intermediate polygon geometries | **Budgeted accumulators with disk spilling** |
 | **Coordinate Transforms** | Evaluated per pixel independently | Evaluated per geometry | Evaluated during polygonization | **Row-constant hoisting (1 transform / row)** |
-| **H3 Index Calculation** | Per-pixel C/FFI boundary crossings | Point-in-polygon spatial queries | Geometry intersection & rasterization | **Scanline lookahead + run accumulation** |
+| **H3 Index Calculation** | Per-pixel C/FFI boundary crossings | Point-in-polygon spatial queries | Geometry intersection & rasterization | **Exact indexing + run accumulation** |
 | **Intermediate Storage** | NumPy arrays or temporary scratch files | Database table storage & index bloat | Multi-gigabyte shapefiles / GeoJSON | **Zero intermediate files (direct stream)** |
 | **Multi-Resolution Sync** | Separate processing passes per resolution | Separate queries with parent rollups | Separate polygonization runs | **Single-pass multi-resolution streaming** |
 | **Web Tile Output** | Requires external `tippecanoe` + tile server | Requires MVT server (Martin/Tegola) | Requires tiling toolchain | **Direct in-memory PMTiles v3 export** |
@@ -61,7 +61,9 @@ This document compares the architectural design and performance characteristics 
 
 ## Real-World Performance Benchmarks: Option 25 Throughput & Scalability
 
-To evaluate hardware-saturating performance, benchmarks were conducted on full-scale 257-Megapixel regional rasters (State of Hawaii, 30-meter resolution):
+These historical throughput measurements have not been revalidated after the exact-indexing and memory-budget changes. They are not guarantees for the current implementation.
+
+Benchmarks were conducted on full-scale 257-Megapixel regional rasters (State of Hawaii, 30-meter resolution):
 - **Continuous Surface**: `CFL_HI.tif` ($16,384 \times 16,384$ pixels = 268.4M pixels), IEEE 754 Float32, LZW compression, 268 MB on disk.
 - **Categorical Surface**: `LF2024_FBFM40_HI.tif` ($16,384 \times 16,384$ pixels = 268.4M pixels), Int16, Deflate/Zlib compression, 40 LANDFIRE fuel models.
 
@@ -73,7 +75,7 @@ Tests were executed on an 8-core ARM64 workstation with 16 GB unified memory run
 | **Categorical Ingestion (Res 8, Wide Format)** | 3.14 s | **2.96 s** | **+5.7% faster** | **~90.7M pixels / sec** (~61,000 hex/s) |
 | **Dual-Pyramid Stream (Res 7 & 8 single pass)** | 4.32 s | **3.90 s** | **+9.7% faster** | **~68.8M pixels / sec** (~115,000 hex/s combined) |
 | **Shannon Landscape Entropy Calculation** | 0.38 s | **0.30 s** | **+21.1% faster** | **~894.7M pixels / sec** |
-| **Active Peak RAM Usage** | < 15 MB | **< 15 MB** | **Bounded O(Scan Front)** | Strictly flat memory profile |
+| **Active Peak RAM Usage** | Not revalidated | Not revalidated | Configuration dependent | Aggregation budget excludes decoding and prefetch overhead |
 
 ### Engineering Analysis:
 1. **Minimized Allocation Churn**: By recycling decompression buffers via `DecodingBufferPool`, repetitive buffer allocations and OS page mappings are minimized during sustained streaming while strictly bounding retained idle memory.

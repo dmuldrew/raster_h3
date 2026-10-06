@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document details the architectural principles that enable `raster_h3` to aggregate multi-gigabyte rasters into H3 hexagonal grids at hardware-saturating throughput while keeping memory strictly bounded below 15 MB.
+This document details the architectural principles that enable `raster_h3` to aggregate multi-gigabyte rasters into H3 hexagonal grids at hardware-saturating throughput with configurable aggregation memory budgets and disk spilling.
 
 > [!NOTE]
 > Performance benchmarks, timing metrics, and micro-architectural numbers cited in this document reflect native release builds evaluated on an Apple M-series workstation (8 performance cores, 16 GB Unified Memory) and modern x86_64 processors with AVX2/SSE2 support.
@@ -11,10 +11,10 @@ This document details the architectural principles that enable `raster_h3` to ag
 
 | # | Engineering Pillar | Description & Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | RAM stays < 15 MB regardless of file size by sealing completed hexagons as scanlines pass their southern vertices. |
-| 2 | **H3 Scanline Lookahead Algorithm** | Jumps ahead along the scanline using previous hexagon widths and binary searches boundary crossings, cutting spherical trig operations by 4x. |
-| 3 | **Row-Constant Latitude Hoisting** | Evaluates transcendental projection transforms (`atan`, `exp`, PROJ) once per row rather than per pixel. |
-| 4 | **Linear Longitude Stepping** | Advances column coordinates via single 1-cycle additions (lon += delta_lon). |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | Cells are sealed only when their certified south bound exceeds every remaining chunk’s north bound. |
+| 2 | **Sequential H3 Spans** | Exact indexing with shared accumulation for consecutive equal-cell pixels |
+| 3 | **CRS Transformation** | Identity, analytical, or Proj4 transformation at sample positions |
+| 4 | **Absolute Pixel Coordinates** | One affine coordinate formula for walking, spans, and samples |
 | 5 | **In-Register Run Accumulation** | Contiguous pixels within the same H3 cell update running statistics in CPU registers, eliminating ~98% of hash table lookups. |
 | 6 | **Branchless Hardware Min/Max** | Replaces conditional branches with `minsd`/`maxsd` instructions with zero branch mispredictions. |
 | 7 | **Zero-Copy `memmap2` & Async Prefetching** | Maps GeoTIFFs into userspace virtual memory with asynchronous background chunk decompression. |
@@ -27,30 +27,29 @@ This document details the architectural principles that enable `raster_h3` to ag
 | 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of stack-allocated WKB polygon geometries (109–189 bytes) with embedded PROJJSON `OGC:CRS84` metadata. |
 
 ## 1. Southernmost Scan-Line Horizon Eviction
-Because GeoTIFF raster scanlines are ordered North-to-South (decreasing latitude), any H3 hexagon whose southernmost vertex is north of the current scan line can **never receive another pixel**. 
-- Finished hexagons are immediately evicted from the hash map and streamed into DuckDB vector chunks.
-- Active memory remains strictly bounded to O(Scan Front Width) (**< 15 MB RAM**), allowing a standard laptop to seamlessly process a 500 GB global raster.
+A cell is complete only when its certified south-latitude bound exceeds the
+maximum certified north-latitude bound of all remaining chunks. This supports
+rotated grids and curved cell edges without assuming scanline order alone is
+sufficient. Unknown Proj4 bounds and Albers chunks that may contain the cone apex
+disable early eviction until the remaining suffix is certifiable or EOF.
 
-## 2. H3 Scanline Lookahead Algorithm
-To process pixels at maximum throughput, `raster_h3` avoids calculating exact spherical trigonometry (H3 coordinates) for every single pixel. Instead, it uses a **Scanline Lookahead** algorithm that exploits the geometric convexity of hexagons:
-1. **The Jump Guess**: As the scanline moves horizontally across the raster, it remembers the width (in pixels) of the previously processed hexagon. It guesses the current hexagon will be the same width and jumps ahead by that exact amount.
-2. **Convexity Proof**: If the pixel at the jump destination is the exact same H3 cell, convexity mathematically guarantees that **all pixels skipped between the start and the destination** are also inside that hexagon. The algorithm skips trig math for the entire block.
-3. **Binary Search Boundary Finding**: If the jump overshoots into an adjacent hexagon, the algorithm performs an efficient **Binary Search** between the current pixel and the overshot pixel. Because the boundary must lie between these two points, it finds the exact sub-pixel edge in O(log2(error distance)) steps.
+The aggregation budget defaults to 64 MiB. Disk spilling limits active
+accumulators; decoding, prefetching, output, and runtime overhead also use RAM.
 
-## 3. Row-Constant Latitude Hoisting & Coordinate Hierarchy
-On North-Up rasters (Web Mercator EPSG:3857, WGS84 EPSG:4326, UTM), latitude is identical across all pixels in a row.
-- Transcendental projection functions (`atan`, `exp`, PROJ forward transforms) are evaluated **once per row** instead of once per pixel.
-- Eliminates **99.8% of coordinate projection math**.
+## 2. Sequential H3 Span Discovery
+Every candidate pixel center is indexed directly. Consecutive equal-cell pixels
+share accumulation work. The first differing cell is reused by the next run;
+there is no width prediction, geometric jump, or binary search.
 
-The transformer uses a **three-tier performance hierarchy**:
-- 🟢 **Identity** (`EPSG:4326`, `EPSG:4269`): 0 cycles — coordinates pass through unchanged.
-- 🟡 **Analytical** (`EPSG:3857`, `EPSG:900913`): ~5 cycles — closed-form inverse Mercator.
-- 🔵 **PROJ4** (UTM, Conic, Polar via `proj4rs`): Pure-Rust reprojection pipeline evaluated once per row.
+## 3. Coordinate Transformation
+The CRS transformer selects identity, analytical Web Mercator/Albers, or Proj4
+transforms. Pixel centers and subpixel samples are transformed at their actual
+locations; projected rows are not assumed to have constant latitude.
 
-## 4. Linear Longitude Stepping
-Once a row's latitude is evaluated, the physical coordinates of pixels within that horizontal scanline step across longitude uniformly:
-- **1-Cycle Arithmetic**: Rather than computing an affine projection matrix multiplication `(c * X + d * Y + ...)`, column coordinates advance via a single hardware addition: `lng += delta_lng`.
-- **Inner Loop Vectorization**: Stepping coordinates with a uniform delta allows the compiler to unroll loops and generate SIMD auto-vectorized code paths across scanline pixel batches without transcendental trigonometry or matrix inversions.
+## 4. Absolute Pixel Positions
+Walking, span discovery, and supersampling use the full affine transform from
+absolute pixel positions. Coordinates do not accumulate through repeated
+longitude additions, so changing run lengths cannot alter pixel coordinates.
 
 ## 5. In-Register Run Accumulation
 Most pixels reside in the interior of an H3 cell. As long as contiguous pixels share the same cell index, running statistics are updated directly in CPU registers without memory access:

@@ -6,7 +6,7 @@
 
 use h3o::Resolution;
 
-use crate::aggregator::h3_scanline::H3ScanlineLookahead;
+use crate::aggregator::h3_scanline::{cell_at, span_end};
 use crate::crs::transformer::CrsTransformer;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
@@ -24,34 +24,20 @@ impl H3SpanOptimizer {
     #[inline(always)]
     pub fn find_span_end(
         row_coords: &RowCoordinates,
-        row_cache: &mut H3ScanlineLookahead,
         c: usize,
-        lon_curr: f64,
         ctx: &RowGeometryContext,
+        gt: &GeoTransform,
+        crs: &CrsTransformer,
+        col_offset: usize,
         res: Resolution,
         run_cell: u64,
     ) -> (usize, Option<u64>) {
-        let r_u8 = res as u8;
-        // Certified prefix search (or its sequential baseline) uses constant-latitude transforms.
-        // Geographic cutoffs are performance policy, not a containment proof.
-        let is_eligible = ctx.is_north_up
-            && (ctx.is_wgs84 || ctx.is_web_mercator)
-            && r_u8 >= 4
-            && row_coords.lat_row.abs() < 70.0
-            && lon_curr.abs() <= 175.0
-            && (lon_curr + (row_coords.row_c_end.saturating_sub(c)) as f64 * ctx.d_lon_step).abs()
-                <= 175.0;
-
-        if is_eligible {
-            row_cache.find_span_end(
-                c,
-                row_coords.row_c_end,
-                lon_curr,
-                row_coords.lat_row,
-                ctx.d_lon_step,
-                res,
-                run_cell,
-            )
+        if ctx.is_north_up && (ctx.is_wgs84 || ctx.is_web_mercator) {
+            span_end(c, row_coords.row_c_end, run_cell, |next| {
+                row_coords
+                    .pixel_center_lon_lat(next, gt, crs, col_offset)
+                    .and_then(|(lon, lat)| cell_at(lat, lon, res))
+            })
         } else {
             (c + 1, None)
         }
@@ -91,7 +77,6 @@ impl H3SpanOptimizer {
             let mut certified = true;
             row_coords.for_each_subpixel(
                 k,
-                ctx,
                 gt,
                 crs_transformer,
                 chunk.col_offset as usize,

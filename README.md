@@ -4,7 +4,18 @@
 [![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
 [![DuckDB Extension](https://img.shields.io/badge/DuckDB-Loadable_Extension-blue.svg)](https://duckdb.org)
 
-A native DuckDB extension written in pure Rust that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. All in bounded < 15 MB RAM.
+A native DuckDB extension written in pure Rust that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation uses a configurable memory budget with disk spilling.
+
+The default aggregation budget is 64 MiB, not a whole-process RAM limit. Decoding,
+prefetching, output buffers, and runtime overhead use additional memory. WGS84,
+Web Mercator, and certified Albers chunks can evict completed cells early.
+Arbitrary Proj4 chunks and Albers chunks that may contain the cone apex retain or
+spill cells until the remaining input permits certified eviction or EOF is reached.
+
+Rust API cleanup: use `h3o` directly instead of the former `raster_h3::h3` alias.
+The obsolete `H3ScanlineLookahead` type, unused sampling-bound helpers, and dormant
+profiling fields have been removed; downstream users of those APIs must update.
+
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
@@ -34,7 +45,7 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 
 | Document | What It Covers |
 | :--- | :--- |
-| [Engineering Architecture](docs/engineering.md) | 14 pillars enabling < 15 MB RAM, hardware-saturating throughput |
+| [Engineering Architecture](docs/engineering.md) | Streaming, memory budgets, disk spilling, and throughput |
 | [Module Architecture](docs/module-architecture.md) | File-by-file source code map with GitHub links |
 | [PMTiles & Multi-Resolution](docs/pmtiles.md) | Multi-resolution pyramids, zoom mapping, zero-server web maps |
 | [Optimal Raster Formats](docs/optimal-raster-format.md) | Why tiled WGS84 COGs are 4.5–6× faster, GDAL recipes |
@@ -80,7 +91,7 @@ A city planning department has two datasets:
 Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid:
 
 ```sql
--- 1. Aggregate the 30m land cover raster into H3 hexagons (< 15 MB RAM, seconds)
+-- 1. Aggregate the 30m land cover raster into H3 hexagons (with budgeted aggregation)
 CREATE TABLE canopy_h3 AS
 SELECT h3_index, majority_class, majority_fraction AS canopy_purity
 FROM h3_raster_categorical_aggregate(
@@ -158,7 +169,7 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 | Principle | What It Means |
 | :--- | :--- |
 | **Pure Rust, Zero Dependencies** | Single `.dylib` / `.so` / `.dll` — no Python, no GDAL C++ |
-| **Bounded < 15 MB RAM** | Streams one scanline at a time, regardless of file size |
+| **Budgeted aggregation** | Configurable accumulator budget with disk spilling; total RAM also includes decoding and prefetch buffers |
 | **Hardware-Saturating Throughput** | Work-stealing parallelism across all CPU cores |
 | **Native PMTiles v3 Export** | Single-file web maps — zero Tippecanoe, zero tile servers |
 | **Native GeoParquet 1.1 Export** | Stack-allocated WKB polygons with PROJJSON metadata |
@@ -173,9 +184,9 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 
 | Step | Traditional Approach | raster_h3 Approach |
 | :--- | :--- | :--- |
-| **Memory** | Load entire raster into RAM | Stream 1 thin row at a time (< 15 MB) |
+| **Memory** | Load entire raster into RAM | Budget active accumulators and spill to disk |
 | **Projection** | Recalculate spherical math per pixel | Row-constant hoisting: 1 transform per row |
-| **H3 Lookup** | Recompute cell ID per pixel | Scanline lookahead: jump-guess + binary search |
+| **H3 Lookup** | Recompute cell ID per pixel | Exact per-sample indexing with run accumulation |
 | **Eviction** | Hold all results until file completion | Evict finished hexagons immediately via horizon scan |
 | **Web Tiling** | C++ Tippecanoe + scratch files + tile servers | Generate `.pmtiles` archives in 1 step |
 
@@ -183,7 +194,7 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 
 `raster_h3` streams the raster like a document scanner — one thin row at a time from North to South:
 - **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
-- **Strictly Bounded Memory**: Active memory never exceeds **< 15 MB RAM**, whether the raster is 10 MB or 500 GB.
+- **Aggregation memory budget**: The default is 64 MiB for aggregation. This is not a total-process RAM limit; decoded chunks, prefetch buffers, output buffers, and other overhead also consume memory.
 
 ### Direct Web-Ready Map Tiles
 
@@ -191,25 +202,19 @@ Generates single-file **PMTiles v3** vector pyramids directly inside DuckDB in a
 - **Zero Intermediate Tooling**: Eliminates C++ Tippecanoe, GeoJSON scratch files, and dedicated tile server infrastructure.
 - **Serverless Map Delivery**: Upload the `.pmtiles` archive directly to Amazon S3, Cloudflare R2, or GitHub Pages and render with zero backend infrastructure.
 
-### Latitude "Cruise Control" (Eliminating 99.8% of Math)
+### Exact Coordinates and Sequential Spans
 
-Every pixel in a row shares the exact same latitude coordinate on standard North-Up rasters:
-- **Row-Constant Hoisting**: Evaluates transcendental projection functions (`atan`, `exp`, PROJ) once per row rather than per pixel.
-- **Linear Longitude Stepping**: Steps column coordinates across the row via 1-cycle arithmetic (`lon += delta_lon`), eliminating 99.8% of projection math.
+Pixel centers and subpixel samples use absolute raster coordinates followed by
+CRS transformation. Span discovery uses the same calculation as ordinary pixel
+assignment, avoiding accumulated coordinate drift. Each candidate is indexed
+with H3; contiguous equal-cell runs share accumulation work. Supersampling bulk
+accumulation checks every sample before combining a run.
 
-> ⚡ **Performance Tip**: Ingesting rasters formatted as tiled WGS84 Cloud-Optimized GeoTIFFs (COGs) achieves an additional **4.5×–6× speedup** by eliminating spherical trigonometry entirely. See [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
+### In-Database Streaming
 
-### Hexagon Lookahead & Run-Skipping
-
-Instead of computing H3 coordinates for every pixel, `raster_h3` estimates each hexagon's width and jumps ahead:
-- **Convex Run-Skipping**: Because hexagons are convex shapes, all intermediate pixels between the start and destination are guaranteed to share the same cell and are aggregated in bulk with zero H3 math.
-- **Binary Search Boundaries**: Cell boundaries are resolved via binary search, reducing expensive spherical trigonometry from $N$ to $O(\log_2 N)$ operations per hexagon (e.g., from ~30 down to ~6 calculations for 30m rasters at H3 Resolution 8).
-
-### In-Database Streaming (No Intermediate Files)
-
-`raster_h3` executes natively inside DuckDB's vectorized query engine:
-- **Zero Disk Scratch**: Streams aggregated cells directly into your SQL queries, analytical joins, and Parquet exports without writing intermediate files to disk.
-- **Unified Pipeline**: Replaces multi-step pipelines (GDAL → CSV/Shapefile → Database Loader) with a single SQL query.
+Aggregated cells feed DuckDB queries, joins, and exports directly. When active
+accumulators exceed their budget, temporary spill files hold partial results for
+merging. Projected inputs without certified bounds may defer output until EOF.
 
 ---
 
@@ -514,10 +519,10 @@ print(res)
 
 | # | Engineering Pillar | Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | RAM bounded < 15 MB regardless of file size |
-| 2 | **H3 Scanline Lookahead Algorithm** | 4× reduction in spherical trig operations |
-| 3 | **Row-Constant Latitude Hoisting** | Projection transforms evaluated once per row, not per pixel |
-| 4 | **Linear Longitude Stepping** | Column coordinates advance via single-cycle additions |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | Early eviction where certified; disk spilling otherwise |
+| 2 | **Sequential H3 Spans** | Exact indexing with shared accumulation for consecutive equal-cell pixels |
+| 3 | **CRS Transformation** | Identity, analytical, or Proj4 transformation at sample positions |
+| 4 | **Absolute Pixel Coordinates** | One affine coordinate formula for walking, spans, and samples |
 | 5 | **In-Register Run Accumulation** | ~98% fewer hash table lookups |
 | 6 | **Branchless Hardware Min/Max** | Zero branch misprediction penalties (`minsd`/`maxsd`) |
 | 7 | **Zero-Copy `memmap2` & Async Prefetching** | Direct virtual memory mapping with background decompression |
@@ -567,14 +572,14 @@ flowchart TD
             NODATA{"100% NoData Chunk?"}
             CHUNK --> NODATA
             NODATA -- "Yes" --> SKIP["Instant O(1) Skip"]
-            NODATA -- "No" --> HOIST["Row-Constant Latitude Hoist (1 transform / row)"]
-            HOIST --> STEP["Linear Longitude Step (lon += Δlon)"]
-            STEP --> LOOKAHEAD["H3 Scanline Lookahead (Jump-Guess + Binary Search)"]
+            NODATA -- "No" --> HOIST["Absolute Pixel Coordinates"]
+            HOIST --> STEP["CRS Transform at Sample Position"]
+            STEP --> LOOKAHEAD["Exact H3 Indexing and Sequential Spans"]
             LOOKAHEAD --> RUN["In-Register Run Accumulator (Registers)"]
         end
 
         subgraph HORIZON ["Southernmost Scan-Line Horizon Eviction"]
-            ACTIVE_MAP["FxHashMap&lt;u64, Accumulator&gt; (Active Front &lt; 15 MB)"]
+            ACTIVE_MAP["FxHashMap&lt;u64, Accumulator&gt; (Budgeted Active Front)"]
             PQUEUE["Priority Queue: HexEvictionEntry (Lat_south)"]
             RUN -->|"Flush Run Boundary"| ACTIVE_MAP
             RUN -->|"Register New Cell"| PQUEUE

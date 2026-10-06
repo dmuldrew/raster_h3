@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 
-use raster_h3::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::aggregator::categorical::CategoricalAccumulator;
 use raster_h3::aggregator::horizon_streamer::compute_cell_south_lat;

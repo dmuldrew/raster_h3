@@ -13,7 +13,7 @@
 
 mod helpers;
 
-use raster_h3::h3::{LatLng, Resolution};
+use h3o::{LatLng, Resolution};
 use helpers::TestGeoTiffBuilder;
 use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::aggregator::multi_horizon::{

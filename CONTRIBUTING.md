@@ -39,7 +39,7 @@ src/
 ├── aggregator/              # Core aggregation & scanline horizon streaming
 │   ├── accumulator.rs       # Welford online statistics (continuous)
 │   ├── categorical.rs       # Categorical frequency accumulator & streamer
-│   ├── h3_scanline.rs       # Scanline lookahead & jump-guess traversal
+│   ├── h3_scanline.rs       # Exact H3 indexing & sequential span discovery
 │   ├── horizon_streamer.rs  # Southernmost scanline horizon eviction engine
 │   ├── multi_horizon/       # Multi-resolution concurrent horizon aggregator
 │   │   ├── config.rs        # Configuration & quantile targets
@@ -212,7 +212,7 @@ The aggregation engines share the same I/O pipeline (`memmap2` → prefetch → 
 - **Categorical** (`CategoricalHorizonStreamer`): Uses `CategoricalAccumulator` with `HashMap<i64, f64>` frequency tracking
 - **Multi-Resolution Pyramids** (`MultiHorizonStreamer` / `pmtiles`): Single-pass concurrent aggregation across multiple H3 resolutions directly generating MVT protobuf tiles and PMTiles v3 archives.
 
-All engines use the Southernmost Scan-Line Horizon Eviction algorithm to maintain bounded memory (< 15 MB RAM).
+All engines use certified horizon eviction where available and a configurable aggregation budget with disk spilling. The default budget is 64 MiB; decoding and prefetching require additional RAM.
 
 ## License
 

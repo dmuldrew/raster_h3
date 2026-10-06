@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Use absolute pixel coordinates consistently for indexing, sequential span discovery, and supersampling; remove incremental coordinate stepping and obsolete width-prediction state.
+- Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
+- Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.
+- Document aggregation budgets, spill behavior, and uncertified projected eviction without unconditional process-memory or geometric-skip claims.
+
 ### Fixed
 - Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.
 - Return complete remote byte reads across cache blocks and use a cached full-file HTTP response for large reads.
