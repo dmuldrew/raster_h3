@@ -27,7 +27,13 @@ fn test_sparse_chunk_filled_with_nonzero_nodata() {
 
     // Strip 0 has valid data (values = 100). Strip 1 will be zeroed out in offset table.
     let data: Vec<u16> = (0..width * height)
-        .map(|idx| if idx < (width * rows_per_strip) { 100 } else { 200 })
+        .map(|idx| {
+            if idx < (width * rows_per_strip) {
+                100
+            } else {
+                200
+            }
+        })
         .collect();
 
     {
@@ -47,10 +53,7 @@ fn test_sparse_chunk_filled_with_nonzero_nodata() {
             .encoder()
             .write_tag(Tag::ModelPixelScaleTag, &pixel_scale[..])
             .unwrap();
-        image
-            .encoder()
-            .write_tag(Tag::GdalNodata, "32767")
-            .unwrap();
+        image.encoder().write_tag(Tag::GdalNodata, "32767").unwrap();
         image.write_data(&data).unwrap();
     }
 
@@ -94,28 +97,39 @@ fn test_sparse_chunk_filled_with_nonzero_nodata() {
         assert_eq!(v1.len(), (width * rows_per_strip) as usize);
         // CRITICAL CHECK: Sparse chunk must be filled with NoData (32767), NOT 0!
         for val in v1 {
-            assert_eq!(val, 32767, "Sparse chunk should be filled with NoData 32767");
+            assert_eq!(
+                val, 32767,
+                "Sparse chunk should be filled with NoData 32767"
+            );
         }
     } else {
         panic!("Expected U16");
     }
 
     // Aggregate with MultiScanHorizonStreamer: only strip 0 pixels should be aggregated
-    let mut config = MultiResolutionConfig::single(10);
-    config.custom_crs = Some("EPSG:4326".into());
-    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let mut total_count = 0.0;
-    while !streamer.is_finished() {
-        for record in streamer.fetch_next_batch(64).unwrap() {
-            total_count += record.accumulator.count;
+    assert!(!reader.is_sparse_chunk(0));
+    assert!(reader.is_sparse_chunk(1));
+    for custom_nodata in [None, Some(-9999.0), Some(0.0), Some(100.0)] {
+        let mut config = MultiResolutionConfig::single(10);
+        config.custom_crs = Some("EPSG:4326".into());
+        config.custom_nodata = custom_nodata;
+        let mut streamer = MultiScanHorizonStreamer::new(reader.clone(), &config).unwrap();
+        let mut total_count = 0.0;
+        while !streamer.is_finished() {
+            for record in streamer.fetch_next_batch(64).unwrap() {
+                total_count += record.accumulator.count;
+            }
         }
+        let expected = if custom_nodata == Some(100.0) {
+            0.0
+        } else {
+            128.0
+        };
+        assert_eq!(
+            total_count, expected,
+            "Sparse pixels must be absent with override {custom_nodata:?}"
+        );
     }
-
-    // Strip 0 has 16 * 8 = 128 pixels. Strip 1 was sparse nodata and must be skipped entirely.
-    assert_eq!(
-        total_count, 128.0,
-        "Only valid pixels in strip 0 should be aggregated, sparse strip 1 must be skipped"
-    );
 }
 
 #[test]
@@ -212,10 +226,18 @@ fn test_low_budget_triggers_spill_runs_and_matches_reference() {
     );
 
     // Verify bitwise exact equality with ground-truth reference
-    assert_eq!(actual.len(), expected.len(), "Total cell count must match exactly");
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "Total cell count must match exactly"
+    );
     for (key, (exp_count, exp_sum)) in &expected {
         let (act_count, act_sum) = actual.get(key).expect("Missing cell key");
-        assert_eq!(act_count, exp_count, "Pixel count mismatch on cell {:x}", key);
+        assert_eq!(
+            act_count, exp_count,
+            "Pixel count mismatch on cell {:x}",
+            key
+        );
         assert!(
             (act_sum - exp_sum).abs() < 1e-4,
             "Sum mismatch on cell {:x}: act={} vs exp={}",

@@ -369,7 +369,8 @@ impl<'a> ChunkDecoder<'a> {
 
         if is_sparse {
             let spp = self.samples_per_pixel.max(1) as usize;
-            let total_samples = (chunk_bounds.width as usize) * (chunk_bounds.height as usize) * spp;
+            let total_samples =
+                (chunk_bounds.width as usize) * (chunk_bounds.height as usize) * spp;
             if let Some(mut buf) = target_buffer {
                 match buf {
                     DecodingResult::U8(ref mut v) => {
@@ -869,6 +870,14 @@ impl<'a> ChunkDecoder<'a> {
 }
 
 impl GeoTiffStreamReader {
+    /// Unallocated TIFF chunks contain no observations, regardless of nodata overrides.
+    pub fn is_sparse_chunk(&self, chunk_index: u32) -> bool {
+        self.chunk_info.as_ref().is_some_and(|info| {
+            let index = chunk_index as usize;
+            info.chunk_offsets.get(index) == Some(&0) || info.chunk_bytes.get(index) == Some(&0)
+        })
+    }
+
     /// Backward-compatible accessor for memory-mapped buffer if the source is local
     pub fn mmap(&self) -> Option<&Arc<Mmap>> {
         match &self.source {

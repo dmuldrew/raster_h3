@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;
 
-use raster_h3::h3::{LatLng, Resolution};
 use raster_h3::aggregator::multi_horizon::coordinates::eviction_north_bound;
 use raster_h3::aggregator::multi_horizon::{
     continuous_streamer::ContinuousKernel, MultiHorizonStreamer, MultiResolutionConfig,
 };
 use raster_h3::aggregator::{H3Accumulator, SamplingPattern};
 use raster_h3::crs::transformer::CrsTransformer;
+use raster_h3::h3::{LatLng, Resolution};
 use raster_h3::raster::{geotiff::GeoTiffStreamReader, geotransform::GeoTransform, RasterChunk};
 
 fn create_projected_fixture(
@@ -57,7 +57,7 @@ fn create_projected_fixture(
 }
 
 #[test]
-fn utm_raster_evicts_early_soundly() {
+fn utm_raster_retains_cells_without_a_certificate() {
     let file = create_projected_fixture(32610, 128, 96, 8); // 12 strips
     let reader = GeoTiffStreamReader::open(file.path()).unwrap();
     let gt = reader.metadata.geotransform;
@@ -75,7 +75,7 @@ fn utm_raster_evicts_early_soundly() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(stream.can_evict_early);
+    assert!(!stream.can_evict_early);
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
@@ -84,8 +84,8 @@ fn utm_raster_evicts_early_soundly() {
         "First batch should yield completed records"
     );
     assert!(
-        stream.processed_chunk_count < stream.mosaic.chunk_refs.len(),
-        "Certified projected output should evict early before EOF"
+        stream.processed_chunk_count == stream.mosaic.chunk_refs.len(),
+        "Uncertified projected output must wait until EOF"
     );
 
     for rec in first_batch {
@@ -271,7 +271,11 @@ fn eviction_north_bound_is_sound_over_curvature() {
         };
 
         let upper = eviction_north_bound(&chunk, &gt, &crs);
-        assert!(upper.is_finite(), "Upper bound must be finite for EPSG {}", epsg);
+        if epsg == 32610 {
+            assert_eq!(upper, f64::INFINITY);
+        } else {
+            assert!(upper.is_finite(), "Analytical Albers bound must be finite");
+        }
 
         // Dense sampling over the entire chunk area and perimeter
         for r in 20..68 {
@@ -316,4 +320,66 @@ fn off_grid_pole_cannot_supply_a_finite_eviction_certificate() {
     // Even the former combined padding misses the pole between interior probes.
     assert!(crs.transform_rect_bounds(&gt, 0.0, 0.0, 120.0, 120.0)[3] + 0.005 < 90.0);
     assert_eq!(eviction_north_bound(&chunk, &gt, &crs), f64::INFINITY);
+}
+
+#[test]
+fn large_polar_chunk_cannot_hide_a_pole_inside_its_boundary() {
+    let crs = CrsTransformer::from_crs_or_epsg(
+        None,
+        Some("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=0 +datum=WGS84 +units=m"),
+    )
+    .unwrap();
+    let gt = GeoTransform {
+        c0: -2000000.0,
+        f0: 2000000.0,
+        a: 10000.0,
+        e: -10000.0,
+        b: 0.0,
+        d: 0.0,
+    };
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 400,
+        height: 400,
+    };
+    // Boundary latitudes are below 80 degrees, but the interior contains the pole.
+    let upper = eviction_north_bound(&chunk, &gt, &crs);
+    let (_, lat) = crs.transform_point(5000.0, -5000.0).unwrap();
+    assert!(lat > 89.0);
+    assert!(
+        lat <= upper,
+        "Interior latitude {lat} exceeds bound {upper}"
+    );
+    assert_eq!(upper, f64::INFINITY);
+}
+
+#[test]
+fn albers_apex_inside_chunk_disables_boundary_certificate() {
+    use raster_h3::crs::transformer::AlbersConicFast;
+    let albers = AlbersConicFast::epsg_5070();
+    let crs = CrsTransformer::AlbersConic(albers);
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 1000,
+        height: 1000,
+    };
+    for rotation in [0.0, 2000.0] {
+        let gt = GeoTransform {
+            a: 10000.0,
+            b: rotation,
+            c0: -5000000.0 - rotation * 500.0,
+            d: rotation,
+            e: -10000.0,
+            f0: albers.rho0 + 5000000.0 - rotation * 500.0,
+        };
+        let upper = eviction_north_bound(&chunk, &gt, &crs);
+        // The unrotated case previously returned 69.43 for this 76.15 degree pixel.
+        let (x, y) = gt.pixel_center_to_coord(500, 950);
+        let (_, lat) = crs.transform_point(x, y).unwrap();
+        assert!(lat > 70.0 && lat < 90.0);
+        assert!(lat <= upper);
+        assert_eq!(upper, f64::INFINITY);
+    }
 }

@@ -415,12 +415,19 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             while index < items.len() {
                 jobs.clear();
                 while jobs.len() < self.worker_tasks && index < items.len() {
-                    let (tile_idx, _, chunk, data, overlap) = items[index]
+                    let (tile_idx, chunk_idx, chunk, data, overlap) = items[index]
                         .as_ref()
                         .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
                     let width = chunk.width as usize;
                     let height = chunk.height as usize;
-                    if row >= height || width == 0 {
+                    // Do not interpret a decoder's sparse fill as observed data:
+                    // the effective nodata may differ from the file's sentinel.
+                    if row >= height
+                        || width == 0
+                        || self.mosaic.tiles[*tile_idx]
+                            .reader
+                            .is_sparse_chunk(*chunk_idx)
+                    {
                         index += 1;
                         row = 0;
                         col = 0;

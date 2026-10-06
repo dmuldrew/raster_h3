@@ -204,10 +204,13 @@ impl SamplingPattern {
         }
     }
 
-    /// Whether this is single-point center sampling
+    /// Whether this can use the unit-weight pixel-center fast path
     #[inline(always)]
     pub fn is_single_point(&self) -> bool {
         self.points.len() == 1
+            && self.points[0].dx == 0.5
+            && self.points[0].dy == 0.5
+            && self.points[0].weight == 1.0
     }
 
     /// Returns (min_dx, max_dx) across all sample points in pattern

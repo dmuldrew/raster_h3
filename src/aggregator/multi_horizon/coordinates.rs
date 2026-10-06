@@ -360,13 +360,7 @@ impl RowCoordinates {
         run_cell: u64,
     ) -> (usize, Option<u64>) {
         super::span::H3SpanOptimizer::find_span_end(
-            self,
-            row_cache,
-            c,
-            lon_curr,
-            ctx,
-            res,
-            run_cell,
+            self, row_cache, c, lon_curr, ctx, res, run_cell,
         )
     }
 
@@ -442,8 +436,8 @@ pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTra
             // For Albers Equal Area Conic:
             // Parallels are concentric circular arcs centered at the cone apex (apex_x, apex_y).
             // Distance rho to the apex is monotonic with latitude.
-            // Minimum distance to the apex along the rectangular chunk occurs either at the 4 corners
-            // or at the analytical tangent point where an edge is closest to the apex.
+            // Outside the chunk, the apex has its nearest point on an edge.
+            // A chunk containing the apex can have an interior latitude maximum.
             let apex_x = albers.x_0;
             let apex_y = albers.y_0 + albers.rho0;
 
@@ -473,6 +467,26 @@ pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTra
                 upper = upper.max(lat);
             }
 
+            // A bounding-box containment test is conservative for rotated grids:
+            // it may disable eviction unnecessarily, but cannot miss an interior
+            // apex. Boundary samples alone cannot certify such a chunk.
+            let min_x = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let max_x = corners
+                .iter()
+                .map(|p| p.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let max_y = corners
+                .iter()
+                .map(|p| p.1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !apex_x.is_finite()
+                || !apex_y.is_finite()
+                || (apex_x >= min_x && apex_x <= max_x && apex_y >= min_y && apex_y <= max_y)
+            {
+                return f64::INFINITY;
+            }
+
             // Test critical point along each edge closest to apex
             let edges = [(p0, p1), (p1, p2), (p2, p3), (p3, p0)];
             for ((x1, y1), (x2, y2)) in edges {
@@ -496,60 +510,10 @@ pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTra
             }
             upper.next_up()
         }
-        CrsTransformer::Proj4 { .. } => {
-            let p0 = gt.pixel_to_coord(chunk.col_offset as f64, chunk.row_offset as f64);
-            let p1 = gt.pixel_to_coord(
-                chunk.col_offset as f64 + chunk.width as f64,
-                chunk.row_offset as f64,
-            );
-            let p2 = gt.pixel_to_coord(
-                chunk.col_offset as f64 + chunk.width as f64,
-                chunk.row_offset as f64 + chunk.height as f64,
-            );
-            let p3 = gt.pixel_to_coord(
-                chunk.col_offset as f64,
-                chunk.row_offset as f64 + chunk.height as f64,
-            );
-
-            // Densify boundary edges with 32 samples each
-            let edges = [(p0, p1), (p1, p2), (p2, p3), (p3, p0)];
-            let mut max_sampled_lat = f64::NEG_INFINITY;
-            let mut max_step_meters = 0.0f64;
-
-            for ((x1, y1), (x2, y2)) in edges {
-                let dx = x2 - x1;
-                let dy = y2 - y1;
-                let len = (dx * dx + dy * dy).sqrt();
-                let steps = 32usize;
-                let step_len = len / steps as f64;
-                max_step_meters = max_step_meters.max(step_len);
-
-                for s in 0..=steps {
-                    let t = s as f64 / steps as f64;
-                    let px = x1 + t * dx;
-                    let py = y1 + t * dy;
-                    let Ok((_, lat)) = crs.transform_point(px, py) else {
-                        return f64::INFINITY;
-                    };
-                    if !lat.is_finite() {
-                        return f64::INFINITY;
-                    }
-                    max_sampled_lat = max_sampled_lat.max(lat);
-                }
-            }
-
-            // Near polar regions (|lat| >= 80.0), off-grid pole singularities can occur,
-            // so safe conservative eviction returns INFINITY.
-            if max_sampled_lat >= 80.0 {
-                return f64::INFINITY;
-            }
-
-            // Max gradient of latitude in meters on Earth ellipsoid (at equator: ~8.98e-6 deg/m, pole: ~9.05e-6 deg/m).
-            // With projection distortion factor bounded by k <= 2.0:
-            // max_deg_per_meter <= 2.0 * (180.0 / (PI * 6356752.3)) ~= 1.8e-5 deg/m.
-            // Half step interval headroom:
-            let margin = 0.5 * max_step_meters * 1.8e-5;
-            (max_sampled_lat + margin).next_up()
-        }
+        // Arbitrary PROJ definitions have no certified scale or domain bound.
+        // Boundary samples cannot rule out an interior pole, and a constant
+        // degrees-per-meter margin is invalid for arbitrary scales and units.
+        // Keep cells until EOF (or spill them) rather than evict irreversibly.
+        CrsTransformer::Proj4 { .. } => f64::INFINITY,
     }
 }
