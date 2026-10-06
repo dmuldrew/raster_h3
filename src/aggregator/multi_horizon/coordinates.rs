@@ -356,10 +356,8 @@ impl RowCoordinates {
         c: usize,
         lon_curr: f64,
         ctx: &RowGeometryContext,
-        crs_transformer: &CrsTransformer,
         res: Resolution,
         run_cell: u64,
-        bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
         super::span::H3SpanOptimizer::find_span_end(
             self,
@@ -367,10 +365,8 @@ impl RowCoordinates {
             c,
             lon_curr,
             ctx,
-            crs_transformer,
             res,
             run_cell,
-            bbox,
         )
     }
 
@@ -378,12 +374,9 @@ impl RowCoordinates {
     #[inline(always)]
     pub fn find_core_span<FCheck>(
         &self,
-        row_cache: &crate::aggregator::h3_scanline::H3ScanlineLookahead,
         chunk: &RasterChunk,
         c: usize,
         span_end: usize,
-        dx_bounds: (f64, f64),
-        dy_bounds: (f64, f64),
         sampling: &SamplingPattern,
         ctx: &RowGeometryContext,
         gt: &GeoTransform,
@@ -396,12 +389,9 @@ impl RowCoordinates {
     {
         super::span::H3SpanOptimizer::find_core_span(
             self,
-            row_cache,
             chunk,
             c,
             span_end,
-            dx_bounds,
-            dy_bounds,
             sampling,
             ctx,
             gt,
@@ -448,6 +438,118 @@ pub fn eviction_north_bound(chunk: &RasterChunk, gt: &GeoTransform, crs: &CrsTra
             }
             upper
         }
-        CrsTransformer::AlbersConic(_) | CrsTransformer::Proj4 { .. } => f64::INFINITY,
+        CrsTransformer::AlbersConic(albers) => {
+            // For Albers Equal Area Conic:
+            // Parallels are concentric circular arcs centered at the cone apex (apex_x, apex_y).
+            // Distance rho to the apex is monotonic with latitude.
+            // Minimum distance to the apex along the rectangular chunk occurs either at the 4 corners
+            // or at the analytical tangent point where an edge is closest to the apex.
+            let apex_x = albers.x_0;
+            let apex_y = albers.y_0 + albers.rho0;
+
+            let p0 = gt.pixel_to_coord(chunk.col_offset as f64, chunk.row_offset as f64);
+            let p1 = gt.pixel_to_coord(
+                chunk.col_offset as f64 + chunk.width as f64,
+                chunk.row_offset as f64,
+            );
+            let p2 = gt.pixel_to_coord(
+                chunk.col_offset as f64 + chunk.width as f64,
+                chunk.row_offset as f64 + chunk.height as f64,
+            );
+            let p3 = gt.pixel_to_coord(
+                chunk.col_offset as f64,
+                chunk.row_offset as f64 + chunk.height as f64,
+            );
+
+            let mut upper = f64::NEG_INFINITY;
+            let corners = [p0, p1, p2, p3];
+            for &(x, y) in &corners {
+                let Ok((_, lat)) = crs.transform_point(x, y) else {
+                    return f64::INFINITY;
+                };
+                if !lat.is_finite() {
+                    return f64::INFINITY;
+                }
+                upper = upper.max(lat);
+            }
+
+            // Test critical point along each edge closest to apex
+            let edges = [(p0, p1), (p1, p2), (p2, p3), (p3, p0)];
+            for ((x1, y1), (x2, y2)) in edges {
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let denom = dx * dx + dy * dy;
+                if denom > 1e-12 {
+                    let t = -(dx * (x1 - apex_x) + dy * (y1 - apex_y)) / denom;
+                    if t > 0.0 && t < 1.0 {
+                        let cx = x1 + t * dx;
+                        let cy = y1 + t * dy;
+                        let Ok((_, lat)) = crs.transform_point(cx, cy) else {
+                            return f64::INFINITY;
+                        };
+                        if !lat.is_finite() {
+                            return f64::INFINITY;
+                        }
+                        upper = upper.max(lat);
+                    }
+                }
+            }
+            upper.next_up()
+        }
+        CrsTransformer::Proj4 { .. } => {
+            let p0 = gt.pixel_to_coord(chunk.col_offset as f64, chunk.row_offset as f64);
+            let p1 = gt.pixel_to_coord(
+                chunk.col_offset as f64 + chunk.width as f64,
+                chunk.row_offset as f64,
+            );
+            let p2 = gt.pixel_to_coord(
+                chunk.col_offset as f64 + chunk.width as f64,
+                chunk.row_offset as f64 + chunk.height as f64,
+            );
+            let p3 = gt.pixel_to_coord(
+                chunk.col_offset as f64,
+                chunk.row_offset as f64 + chunk.height as f64,
+            );
+
+            // Densify boundary edges with 32 samples each
+            let edges = [(p0, p1), (p1, p2), (p2, p3), (p3, p0)];
+            let mut max_sampled_lat = f64::NEG_INFINITY;
+            let mut max_step_meters = 0.0f64;
+
+            for ((x1, y1), (x2, y2)) in edges {
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let len = (dx * dx + dy * dy).sqrt();
+                let steps = 32usize;
+                let step_len = len / steps as f64;
+                max_step_meters = max_step_meters.max(step_len);
+
+                for s in 0..=steps {
+                    let t = s as f64 / steps as f64;
+                    let px = x1 + t * dx;
+                    let py = y1 + t * dy;
+                    let Ok((_, lat)) = crs.transform_point(px, py) else {
+                        return f64::INFINITY;
+                    };
+                    if !lat.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    max_sampled_lat = max_sampled_lat.max(lat);
+                }
+            }
+
+            // Near polar regions (|lat| >= 80.0), off-grid pole singularities can occur,
+            // so safe conservative eviction returns INFINITY.
+            if max_sampled_lat >= 80.0 {
+                return f64::INFINITY;
+            }
+
+            // Max gradient of latitude in meters on Earth ellipsoid (at equator: ~8.98e-6 deg/m, pole: ~9.05e-6 deg/m).
+            // With projection distortion factor bounded by k <= 2.0:
+            // max_deg_per_meter <= 2.0 * (180.0 / (PI * 6356752.3)) ~= 1.8e-5 deg/m.
+            // Half step interval headroom:
+            let margin = 0.5 * max_step_meters * 1.8e-5;
+            (max_sampled_lat + margin).next_up()
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! timers; normal builds compile hot-path measurement out entirely.
 use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
+#[cfg(feature = "stream-profile")]
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Default, Debug, Serialize)]
@@ -47,40 +48,18 @@ impl WorkerProfile {
     }
 }
 thread_local! {
-    static VERIFY_GEOMETRY: Cell<bool> = const { Cell::new(false) };
-    static LOOKAHEAD: Cell<bool> = const { Cell::new(true) };
-    static SPAN_SKIP: Cell<bool> = const { Cell::new(false) };
     #[cfg(feature="stream-profile")]
     static PROFILE: Cell<WorkerProfile> = Cell::new(WorkerProfile::default());
 }
 /// Restore counters even if a kernel panics or recursively calls another stream.
+#[derive(Default)]
 pub struct WorkerScope {
-    old_lookahead: bool,
-    old_verify_geometry: bool,
-    old_span_skip: bool,
     #[cfg(feature = "stream-profile")]
     old_profile: WorkerProfile,
 }
 impl WorkerScope {
-    pub fn new(lookahead: bool) -> Self {
-        Self::with_geometry_verification(lookahead, false)
-    }
-    pub fn with_geometry_verification(lookahead: bool, verify: bool) -> Self {
-        Self::with_options(lookahead, verify, false)
-    }
-    pub fn with_options(lookahead: bool, verify: bool, cache_native: bool) -> Self {
-        Self::with_all_options(lookahead, verify, cache_native, false)
-    }
-    pub fn with_all_options(
-        lookahead: bool,
-        verify: bool,
-        _cache_native: bool,
-        span_skip: bool,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
-            old_verify_geometry: VERIFY_GEOMETRY.with(|v| v.replace(verify)),
-            old_lookahead: LOOKAHEAD.with(|v| v.replace(lookahead)),
-            old_span_skip: SPAN_SKIP.with(|v| v.replace(span_skip)),
             #[cfg(feature = "stream-profile")]
             old_profile: PROFILE.with(|v| v.replace(WorkerProfile::default())),
         }
@@ -98,9 +77,6 @@ impl WorkerScope {
 }
 impl Drop for WorkerScope {
     fn drop(&mut self) {
-        LOOKAHEAD.with(|v| v.set(self.old_lookahead));
-        VERIFY_GEOMETRY.with(|v| v.set(self.old_verify_geometry));
-        SPAN_SKIP.with(|v| v.set(self.old_span_skip));
         #[cfg(feature = "stream-profile")]
         PROFILE.with(|v| v.set(self.old_profile));
     }
@@ -162,66 +138,4 @@ pub struct StreamProfile {
     pub peak_worker_bytes: usize,
     pub decoded_bytes: u64,
     pub prefetch_wait_ns: u64,
-}
-
-pub fn lookahead_enabled() -> bool {
-    LOOKAHEAD.with(Cell::get)
-}
-
-pub fn span_skip_enabled() -> bool {
-    SPAN_SKIP.with(Cell::get)
-}
-
-#[inline(always)]
-pub fn span_skip_record(skipped: usize) {
-    #[cfg(feature = "stream-profile")]
-    PROFILE.with(|v| {
-        let mut p = v.get();
-        p.span_skips += 1;
-        p.skipped_pixels += skipped as u64;
-        v.set(p);
-    });
-    #[cfg(not(feature = "stream-profile"))]
-    let _ = skipped;
-}
-
-#[inline(always)]
-pub fn prefix_test() {
-    #[cfg(feature = "stream-profile")]
-    PROFILE.with(|v| {
-        let mut p = v.get();
-        p.prefix_tests += 1;
-        v.set(p);
-    });
-}
-
-pub fn geometry_verification_enabled() -> bool {
-    VERIFY_GEOMETRY.with(Cell::get)
-}
-
-pub fn geometry_query(accepted: bool) {
-    #[cfg(feature = "stream-profile")]
-    PROFILE.with(|v| {
-        let mut p = v.get();
-        p.geometry_queries += 1;
-        p.geometry_accepts += u64::from(accepted);
-        v.set(p);
-    });
-    #[cfg(not(feature = "stream-profile"))]
-    let _ = accepted;
-}
-pub fn geometry_result(center: bool, count: usize, agrees: bool) {
-    #[cfg(feature = "stream-profile")]
-    PROFILE.with(|v| {
-        let mut p = v.get();
-        if center {
-            p.geometry_proposed_center_pixels += count as u64;
-        } else {
-            p.geometry_proposed_core_samples += count as u64;
-        }
-        p.geometry_mismatches += u64::from(!agrees);
-        v.set(p);
-    });
-    #[cfg(not(feature = "stream-profile"))]
-    let _ = (center, count, agrees);
 }

@@ -57,7 +57,7 @@ fn create_projected_fixture(
 }
 
 #[test]
-fn utm_raster_defers_uncertified_eviction() {
+fn utm_raster_evicts_early_soundly() {
     let file = create_projected_fixture(32610, 128, 96, 8); // 12 strips
     let reader = GeoTiffStreamReader::open(file.path()).unwrap();
     let gt = reader.metadata.geotransform;
@@ -75,7 +75,7 @@ fn utm_raster_defers_uncertified_eviction() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(!stream.can_evict_early);
+    assert!(stream.can_evict_early);
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
@@ -84,8 +84,8 @@ fn utm_raster_defers_uncertified_eviction() {
         "First batch should yield completed records"
     );
     assert!(
-        stream.processed_chunk_count == stream.mosaic.chunk_refs.len(),
-        "Uncertified projected output must wait until EOF"
+        stream.processed_chunk_count < stream.mosaic.chunk_refs.len(),
+        "Certified projected output should evict early before EOF"
     );
 
     for rec in first_batch {
@@ -149,7 +149,7 @@ fn utm_raster_defers_uncertified_eviction() {
 }
 
 #[test]
-fn albers_raster_defers_uncertified_eviction() {
+fn albers_raster_evicts_early_soundly() {
     let file = create_projected_fixture(5070, 128, 96, 8); // 12 strips
     let reader = GeoTiffStreamReader::open(file.path()).unwrap();
     let gt = reader.metadata.geotransform;
@@ -167,7 +167,7 @@ fn albers_raster_defers_uncertified_eviction() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(!stream.can_evict_early);
+    assert!(stream.can_evict_early);
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
@@ -176,8 +176,8 @@ fn albers_raster_defers_uncertified_eviction() {
         "First batch should yield completed records"
     );
     assert!(
-        stream.processed_chunk_count == stream.mosaic.chunk_refs.len(),
-        "Uncertified projected output must wait until EOF"
+        stream.processed_chunk_count < stream.mosaic.chunk_refs.len(),
+        "Certified projected output should evict early before EOF"
     );
 
     for rec in first_batch {
@@ -271,7 +271,7 @@ fn eviction_north_bound_is_sound_over_curvature() {
         };
 
         let upper = eviction_north_bound(&chunk, &gt, &crs);
-        assert_eq!(upper, f64::INFINITY);
+        assert!(upper.is_finite(), "Upper bound must be finite for EPSG {}", epsg);
 
         // Dense sampling over the entire chunk area and perimeter
         for r in 20..68 {

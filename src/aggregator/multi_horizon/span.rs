@@ -28,10 +28,8 @@ impl H3SpanOptimizer {
         c: usize,
         lon_curr: f64,
         ctx: &RowGeometryContext,
-        _crs_transformer: &CrsTransformer,
         res: Resolution,
         run_cell: u64,
-        _bbox: Option<[f64; 4]>,
     ) -> (usize, Option<u64>) {
         let r_u8 = res as u8;
         // Certified prefix search (or its sequential baseline) uses constant-latitude transforms.
@@ -64,12 +62,9 @@ impl H3SpanOptimizer {
     #[inline(always)]
     pub fn find_core_span<FCheck>(
         row_coords: &RowCoordinates,
-        _row_cache: &H3ScanlineLookahead,
         chunk: &RasterChunk,
         c: usize,
         span_end: usize,
-        _dx_bounds: (f64, f64),
-        _dy_bounds: (f64, f64),
         sampling: &SamplingPattern,
         ctx: &RowGeometryContext,
         gt: &GeoTransform,

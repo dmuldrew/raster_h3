@@ -257,8 +257,6 @@ fn walk_single_res_row<T, Acc, E>(
 {
     row_cache.reset_row();
     let is_single_point = sampling.is_single_point();
-    let dx_bounds = sampling.dx_bounds();
-    let dy_bounds = sampling.dy_bounds();
 
     let mut run_cell: u64 = 0;
     let mut run_acc = engine.new_acc();
@@ -324,10 +322,8 @@ fn walk_single_res_row<T, Acc, E>(
                 c,
                 cursor.lon_curr,
                 geom_ctx,
-                crs_transformer,
                 res,
                 run_cell,
-                bbox,
             );
 
             if is_single_point {
@@ -335,12 +331,9 @@ fn walk_single_res_row<T, Acc, E>(
                 engine.accumulate_span(&mut run_acc, span_slice);
             } else {
                 let (core_start, core_end) = coords.find_core_span(
-                    row_cache,
                     chunk,
                     c,
                     span_end,
-                    dx_bounds,
-                    dy_bounds,
                     sampling,
                     geom_ctx,
                     gt,
@@ -501,8 +494,6 @@ fn walk_multi_res_row<T, Acc, E>(
     let num_res = resolutions.len();
     buf.reset_for_row(coords.row_c_start, engine);
     let is_single_point = sampling.is_single_point();
-    let dx_bounds = sampling.dx_bounds();
-    let dy_bounds = sampling.dy_bounds();
 
     let mut cursor = ScanlineCursor::new(
         coords.row_c_start,
@@ -571,10 +562,8 @@ fn walk_multi_res_row<T, Acc, E>(
                         c,
                         cursor.lon_curr,
                         geom_ctx,
-                        crs_transformer,
                         res,
                         buf.run_cells[i],
-                        bbox,
                     );
 
                     buf.span_ends[i] = span_end;
@@ -582,12 +571,9 @@ fn walk_multi_res_row<T, Acc, E>(
 
                     if !is_single_point {
                         let (c_start, c_end) = coords.find_core_span(
-                            &buf.row_caches[i],
                             chunk,
                             c,
                             span_end,
-                            dx_bounds,
-                            dy_bounds,
                             sampling,
                             geom_ctx,
                             gt,

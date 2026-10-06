@@ -64,6 +64,22 @@ fn test_southern_interior_edge_extrema() {
             "res {res}: computed ({computed}) must be <= dense oracle ({oracle})"
         );
 
+        // Tightness invariant: computed bound must be close to true oracle, not trivial -90
+        let max_slack = match res {
+            2 => 1.5,
+            3 => 0.6,
+            4 => 0.25,
+            5 => 0.1,
+            6 => 0.05,
+            7 => 0.02,
+            _ => 2.0,
+        };
+        assert!(
+            oracle - computed <= max_slack,
+            "res {res}: south bound is too loose (oracle - computed = {} > {max_slack})",
+            oracle - computed
+        );
+
         // Check that vertex endpoints alone do NOT capture the true minimum:
         let vertex_min = cell
             .boundary()
@@ -177,6 +193,20 @@ fn test_dense_sampling_regression_oracle_across_globe() {
                 assert!(
                     computed <= oracle,
                     "at lat {lat}, lon {lon}, res {res}: computed {computed} > oracle {oracle}"
+                );
+                let max_slack = match res {
+                    0 => 25.0,
+                    1 => 12.0,
+                    2 => 7.0,
+                    4 => 2.0,
+                    6 => 0.5,
+                    8 => 0.1,
+                    _ => 25.0,
+                };
+                assert!(
+                    oracle - computed <= max_slack,
+                    "at lat {lat}, lon {lon}, res {res}: bound is too loose (oracle - computed = {} > {max_slack})",
+                    oracle - computed
                 );
             }
         }

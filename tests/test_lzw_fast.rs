@@ -14,6 +14,7 @@ use weezl::BitOrder;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 #[test]
+#[ignore = "requires external dataset data/CFL_HI.tif"]
 fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
     let path = "data/CFL_HI.tif";
     if !Path::new(path).exists() {
@@ -81,6 +82,7 @@ fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
 }
 
 #[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
 fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
     let path = "data/LF2024_FBFM40_HI.tif";
     if !Path::new(path).exists() {

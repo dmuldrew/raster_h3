@@ -1239,6 +1239,7 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
 }
 
 #[test]
+#[ignore = "requires external dataset data/CFL_HI.tif"]
 fn test_parallel_chunk_aggregation_hawaii_dataset() {
     let tiff_path = Path::new("data/CFL_HI.tif");
     if !tiff_path.exists() {
@@ -1274,6 +1275,7 @@ fn test_parallel_chunk_aggregation_hawaii_dataset() {
 }
 
 #[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
 fn test_parallel_categorical_aggregation_hawaii_dataset() {
     use raster_h3::aggregator::multi_horizon::{
         MultiCategoricalHorizonStreamer, MultiResolutionConfig,

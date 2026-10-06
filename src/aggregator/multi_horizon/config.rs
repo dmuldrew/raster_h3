@@ -160,19 +160,6 @@ pub struct MultiResolutionConfig {
     /// Active aggregation budget in bytes (not a whole-process RSS limit).
     /// Includes table capacity and dynamic accumulator state; oversized individual states fail.
     pub aggregation_budget_bytes: usize,
-    /// Search monotone, exactly checked prefixes using exponential/binary search.
-    /// False selects the sequential baseline; every center is visited in either mode.
-    pub certified_lookahead: bool,
-    /// Use sufficient projected-rectangle certificates to skip native quantization
-    /// and index construction. Every pixel still executes its native projection;
-    /// this does not infer geographic spans from endpoints. Opt-in: certificate
-    /// construction can cost more than the quantization work it saves.
-    pub certified_span_skip: bool,
-    /// Shadow-test interval edge proposals against exact indexing; never skips calls.
-    /// Requires stream-profile and certified_lookahead. Disabled by default.
-    pub verify_geometric_lookahead: bool,
-    /// Exact face/grid address cache for ordinary indexing requests.
-    pub cache_native_index: bool,
     /// Optional directory for automatically cleaned-up temporary aggregation runs.
     pub spill_directory: Option<std::path::PathBuf>,
     /// Decoded chunk ring and idle pool capacity (minimum 16).
@@ -220,10 +207,6 @@ impl MultiResolutionConfig {
     pub fn new(resolutions: Vec<u8>) -> Self {
         Self {
             aggregation_budget_bytes: 64 * 1024 * 1024,
-            certified_lookahead: true,
-            certified_span_skip: false,
-            verify_geometric_lookahead: false,
-            cache_native_index: true,
             spill_directory: None,
             prefetch_chunks: 16,
             decode_workers: 4,
@@ -272,13 +255,6 @@ impl MultiResolutionConfig {
     /// and duplicate records from the requested parent resolution (7). Therefore, adjacent
     /// resolutions cannot be combined with hierarchical compaction.
     pub fn validate(&self) -> Result<()> {
-        if self.verify_geometric_lookahead
-            && (!self.certified_lookahead || !cfg!(feature = "stream-profile"))
-        {
-            return Err(RasterH3Error::InvalidParameter(
-                "geometric verification requires stream-profile and certified_lookahead".into(),
-            ));
-        }
         if self.aggregation_budget_bytes < self.resolutions.len().max(1) * 64 * 1024 {
             return Err(RasterH3Error::InvalidParameter(
                 "aggregation budget must provide at least 64 KiB per resolution".into(),
@@ -350,26 +326,6 @@ impl Default for MultiResolutionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn geometric_verification_requires_reference_search_and_counters() {
-        let mut cfg = MultiResolutionConfig::default();
-        assert!(!cfg.verify_geometric_lookahead);
-        cfg.verify_geometric_lookahead = true;
-        cfg.certified_lookahead = false;
-        assert!(cfg.validate().is_err());
-        cfg.certified_lookahead = true;
-        assert_eq!(cfg.validate().is_ok(), cfg!(feature = "stream-profile"));
-    }
-
-    #[test]
-    fn native_cache_supported_in_tree() {
-        let mut cfg = MultiResolutionConfig::default();
-        assert!(cfg.cache_native_index);
-        assert!(cfg.validate().is_ok());
-        cfg.cache_native_index = false;
-        assert!(cfg.validate().is_ok());
-    }
 
     #[test]
     fn test_config_defaults() {
