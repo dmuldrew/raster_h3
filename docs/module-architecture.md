@@ -103,7 +103,8 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | :--- | :--- |
 | [`walker.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/walker.rs) | Unified geometric pixel walker and spatial math driver. Defines the `ScanlineEngine<T, Acc>` trait that continuous and categorical kernels implement, and orchestrates the generic scanline traversal loop: row iteration, coordinate setup, span discovery, accumulator updates, and chunk bounding-box pruning. Re-exports key types from `coordinates.rs` and `span.rs`. |
 | [`coordinates.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/coordinates.rs) | Coordinate transformation for multi-horizon aggregators (`CoordinateTransformer`, `RowCoordinates`, `RowGeometryContext`). Provides reference coordinate transforms from raster pixel space to WGS84, explicit fast paths for north-up WGS84 and Web Mercator grids, and exact per-sample projected CRS transformation. |
-| [`span.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/span.rs) | Scanline span discovery and core/boundary classification (`H3SpanOptimizer`). Identifies which horizontal samples share an H3 cell assignment (the "span") and classifies subpixel samples as strictly interior (core) vs boundary. Does not update statistics, mutate accumulators, or manage streaming state. |
+| [`span.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/span.rs) | Sequential center-sampling span discovery (`H3SpanOptimizer`). Indexes each candidate and returns contiguous equal-cell runs; supersampling uses the fused sample walker. |
+| `supersampling.rs` | Fused sample projection, indexing, and accumulation with reusable per-pixel buffers. Shares projected coordinates across resolutions, combines uniform cell weights, and replays stored boundary or quantile assignments without recomputation. |
 
 ---
 

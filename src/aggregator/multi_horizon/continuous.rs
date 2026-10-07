@@ -149,6 +149,10 @@ struct ContinuousEngine<T> {
 impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngine<T> {
     type Sample = f64;
 
+    fn combine_sample_weights(&self) -> bool {
+        !self.track_quantiles
+    }
+
     #[inline(always)]
     fn new_acc(&self) -> H3Accumulator {
         if self.track_quantiles {

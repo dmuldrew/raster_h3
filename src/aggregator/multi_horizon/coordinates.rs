@@ -303,37 +303,6 @@ impl RowCoordinates {
             self, c, ctx, gt, crs, col_offset, res, run_cell,
         )
     }
-
-    /// Identify the inner core column range `(core_start, core_end)` where all subpixel sample points land inside `run_cell`
-    #[inline(always)]
-    pub fn find_core_span<FCheck>(
-        &self,
-        chunk: &RasterChunk,
-        c: usize,
-        span_end: usize,
-        sampling: &SamplingPattern,
-        ctx: &RowGeometryContext,
-        gt: &GeoTransform,
-        crs_transformer: &CrsTransformer,
-        bbox: Option<[f64; 4]>,
-        is_in_cell: FCheck,
-    ) -> (usize, usize)
-    where
-        FCheck: FnMut(f64, f64) -> bool,
-    {
-        super::span::H3SpanOptimizer::find_core_span(
-            self,
-            chunk,
-            c,
-            span_end,
-            sampling,
-            ctx,
-            gt,
-            crs_transformer,
-            bbox,
-            is_in_cell,
-        )
-    }
 }
 
 /// Upper latitude bound for every sample in a chunk's pixel rectangle.

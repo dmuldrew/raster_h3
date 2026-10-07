@@ -172,6 +172,10 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
 {
     type Sample = i64;
 
+    fn combine_sample_weights(&self) -> bool {
+        true
+    }
+
     #[inline(always)]
     fn new_acc(&self) -> CategoricalAccumulator {
         CategoricalAccumulator::default()

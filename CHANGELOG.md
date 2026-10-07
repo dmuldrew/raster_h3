@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Fuse supersample projection, H3 assignment, and accumulation with reusable per-pixel scratch buffers; avoid repeated certification work and preserve individual quantile sample updates.
 - Use absolute pixel coordinates consistently for indexing, sequential span discovery, and supersampling; remove incremental coordinate stepping and obsolete width-prediction state.
 - Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
 - Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.

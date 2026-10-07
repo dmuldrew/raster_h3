@@ -44,12 +44,19 @@ $$\left( \frac{3}{8}, \frac{1}{8} \right), \quad \left( \frac{7}{8}, \frac{3}{8}
 
 Because **no two points share the same horizontal ($X$) or vertical ($Y$) coordinate**, RGSS provides 4 distinct 1D projection slices across any arbitrary hexagon edge with only 4 evaluation points.
 
-### 2. Algorithmic Synergy with Core Span Lookahead
-The scanline walker separates raster rows into:
-- **Core Interior Spans**: Pixels whose full sub-pixel bounding envelope $[0.125, 0.875] \times [0.125, 0.875]$ is guaranteed to lie inside the active H3 hexagon. These pixels are accumulated in bulk using single-pass SIMD vectorization at baseline speed with zero coordinate transformations or H3 lookups.
-- **Boundary Perimeter Pixels**: Only pixels straddling the hexagon edge execute exact spherical H3 cell resolution.
+### 2. Fused Sample Evaluation
 
-Because the RGSS envelope is compact and interior pixels bypass individual sample indexing, **a $4\times$ increase in sampling density incurs only a $\sim 2.1\times$ runtime difference rather than a $4\times$ penalty**.
+For ordinary non-overlap scans, each valid pixel's sample locations are transformed
+once, then indexed once per requested H3 resolution. Small reusable buffers retain
+these assignments. If every retained sample belongs to the same cell, continuous
+and categorical engines combine their weights into one update. Otherwise, stored
+assignments are replayed without repeating projection or indexing. Bounding-box
+clipping preserves only the included sample weights, including partial pixels.
+
+Quantile-enabled continuous aggregation retains individual sample updates. The
+mosaic overlap path keeps its ownership-aware sample walker. Center sampling
+continues to use sequential span accumulation. No geometric containment shortcut
+skips sample indexing, and performance depends on the CRS and sampling pattern.
 
 ### 3. Selection Heuristic
 

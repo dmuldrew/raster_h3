@@ -4,7 +4,7 @@
 //! and scanline span accumulation across both continuous (Welford) and categorical engines.
 
 use fxhash::FxBuildHasher;
-use h3o::{LatLng, Resolution};
+use h3o::Resolution;
 use std::collections::HashMap;
 
 use crate::aggregator::h3_scanline::cell_at;
@@ -26,6 +26,11 @@ pub use crate::aggregator::nodata::is_slice_all_native_nodata;
 /// Trait implemented by accumulator engines (continuous and categorical) to drive the generic scanline walker
 pub trait ScanlineEngine<T, Acc> {
     type Sample: Copy;
+
+    /// Opt in only when combining weights for the same pixel preserves semantics.
+    fn combine_sample_weights(&self) -> bool {
+        false
+    }
 
     /// Allocate a fresh empty accumulator (or with quantiles if configured)
     fn new_acc(&self) -> Acc;
@@ -66,135 +71,6 @@ impl ScanlineCursor {
     }
     pub fn step_one(&mut self) {
         self.advance(1);
-    }
-}
-
-/// Evaluates subpixel sample points for a boundary pixel in the single-resolution path.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn evaluate_subpixel_pixel<T, Acc, E>(
-    val_raw: T,
-    k: usize,
-    run_cell: u64,
-    res: Resolution,
-    coords: &RowCoordinates,
-    gt: &GeoTransform,
-    crs_transformer: &CrsTransformer,
-    col_offset: usize,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    engine: &E,
-    run_acc: &mut Acc,
-    active_map: &mut HashMap<u64, Acc, FxBuildHasher>,
-) where
-    T: Copy,
-    Acc: Clone,
-    E: ScanlineEngine<T, Acc>,
-{
-    if let Some(sample) = engine.get_sample(val_raw) {
-        coords.for_each_subpixel(
-            k,
-            gt,
-            crs_transformer,
-            col_offset,
-            sampling,
-            bbox,
-            |lon, lat, d_x, d_y, weight| {
-                let cell = match resolve_subpixel_cell(run_cell, lat, lon, d_x, d_y, res) {
-                    Some(c) => c,
-                    None => return,
-                };
-
-                if cell == run_cell {
-                    engine.update_sample(run_acc, sample, weight);
-                } else {
-                    active_map
-                        .entry(cell)
-                        .and_modify(|acc| engine.update_sample(acc, sample, weight))
-                        .or_insert_with(|| {
-                            let mut acc = engine.new_acc();
-                            engine.update_sample(&mut acc, sample, weight);
-                            acc
-                        });
-                }
-            },
-        );
-    }
-}
-
-/// Evaluates subpixel sample points for a boundary pixel across multiple active resolutions.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn evaluate_subpixel_pixel_multi<T, Acc, E>(
-    val_raw: T,
-    k: usize,
-    num_res: usize,
-    resolutions: &[Resolution],
-    run_cells: &[u64],
-    core_starts: &[usize],
-    core_ends: &[usize],
-    coords: &RowCoordinates,
-    gt: &GeoTransform,
-    crs_transformer: &CrsTransformer,
-    col_offset: usize,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    engine: &E,
-    run_accs: &mut [Acc],
-    chunk_maps: &mut [HashMap<u64, Acc, FxBuildHasher>],
-) where
-    T: Copy,
-    Acc: Clone,
-    E: ScanlineEngine<T, Acc>,
-{
-    if let Some(sample) = engine.get_sample(val_raw) {
-        for i in 0..num_res {
-            if run_cells[i] == 0 {
-                continue;
-            }
-            if k >= core_starts[i] && k < core_ends[i] {
-                engine.update_sample(&mut run_accs[i], sample, 1.0);
-            }
-        }
-
-        let any_subpixel =
-            (0..num_res).any(|i| run_cells[i] != 0 && (k < core_starts[i] || k >= core_ends[i]));
-        if any_subpixel {
-            coords.for_each_subpixel(
-                k,
-                gt,
-                crs_transformer,
-                col_offset,
-                sampling,
-                bbox,
-                |lon, lat, d_x, d_y, weight| {
-                    for i in 0..num_res {
-                        if run_cells[i] == 0 || (k >= core_starts[i] && k < core_ends[i]) {
-                            continue;
-                        }
-                        let res = resolutions[i];
-                        let cell =
-                            match resolve_subpixel_cell(run_cells[i], lat, lon, d_x, d_y, res) {
-                                Some(c) => c,
-                                None => continue,
-                            };
-
-                        if cell == run_cells[i] {
-                            engine.update_sample(&mut run_accs[i], sample, weight);
-                        } else {
-                            chunk_maps[i]
-                                .entry(cell)
-                                .and_modify(|acc| engine.update_sample(acc, sample, weight))
-                                .or_insert_with(|| {
-                                    let mut a = engine.new_acc();
-                                    engine.update_sample(&mut a, sample, weight);
-                                    a
-                                });
-                        }
-                    }
-                },
-            );
-        }
     }
 }
 
@@ -272,67 +148,8 @@ fn walk_single_res_row<T, Acc, E>(
                 run_cell,
             );
 
-            if is_single_point {
-                let span_slice = &slice_row[c..span_end];
-                engine.accumulate_span(&mut run_acc, span_slice);
-            } else {
-                let (core_start, core_end) = coords.find_core_span(
-                    chunk,
-                    c,
-                    span_end,
-                    sampling,
-                    geom_ctx,
-                    gt,
-                    crs_transformer,
-                    bbox,
-                    |lat, lon| {
-                        LatLng::new(lat, lon).ok().map(|ll| {
-                            crate::aggregator::multi_horizon::profile::index(ll, res).into()
-                        }) == Some(run_cell)
-                    },
-                );
-
-                for k in c..core_start {
-                    evaluate_subpixel_pixel(
-                        slice_row[k],
-                        k,
-                        run_cell,
-                        res,
-                        coords,
-                        gt,
-                        crs_transformer,
-                        chunk.col_offset as usize,
-                        sampling,
-                        bbox,
-                        engine,
-                        &mut run_acc,
-                        active_map,
-                    );
-                }
-
-                if core_end > core_start {
-                    let core_slice = &slice_row[core_start..core_end];
-                    engine.accumulate_span(&mut run_acc, core_slice);
-                }
-
-                for k in core_end..span_end {
-                    evaluate_subpixel_pixel(
-                        slice_row[k],
-                        k,
-                        run_cell,
-                        res,
-                        coords,
-                        gt,
-                        crs_transformer,
-                        chunk.col_offset as usize,
-                        sampling,
-                        bbox,
-                        engine,
-                        &mut run_acc,
-                        active_map,
-                    );
-                }
-            }
+            let span_slice = &slice_row[c..span_end];
+            engine.accumulate_span(&mut run_acc, span_slice);
 
             let num_stepped = span_end - c;
             cursor.advance(num_stepped);
@@ -356,8 +173,6 @@ struct MultiResRowBuffers<Acc> {
     run_cells: Vec<u64>,
     run_accs: Vec<Acc>,
     known_next_cells: Vec<Option<u64>>,
-    core_starts: Vec<usize>,
-    core_ends: Vec<usize>,
 }
 
 impl<Acc: Clone> MultiResRowBuffers<Acc> {
@@ -368,8 +183,6 @@ impl<Acc: Clone> MultiResRowBuffers<Acc> {
             run_cells: vec![0; num_res],
             run_accs: (0..num_res).map(|_| engine.new_acc()).collect(),
             known_next_cells: vec![None; num_res],
-            core_starts: vec![0; num_res],
-            core_ends: vec![0; num_res],
         }
     }
 
@@ -380,8 +193,6 @@ impl<Acc: Clone> MultiResRowBuffers<Acc> {
             engine.clear_acc(&mut self.run_accs[i]);
             self.known_next_cells[i] = None;
             self.span_ends[i] = row_c_start;
-            self.core_starts[i] = row_c_start;
-            self.core_ends[i] = row_c_start;
         }
     }
 
@@ -402,8 +213,6 @@ impl<Acc: Clone> MultiResRowBuffers<Acc> {
         self.run_cells[i] = 0;
         self.span_ends[i] = c + 1;
         self.known_next_cells[i] = None;
-        self.core_starts[i] = c + 1;
-        self.core_ends[i] = c + 1;
     }
 }
 
@@ -491,26 +300,6 @@ fn walk_multi_res_row<T, Acc, E>(
 
                     buf.span_ends[i] = span_end;
                     buf.known_next_cells[i] = next_cell;
-
-                    if !is_single_point {
-                        let (c_start, c_end) = coords.find_core_span(
-                            chunk,
-                            c,
-                            span_end,
-                            sampling,
-                            geom_ctx,
-                            gt,
-                            crs_transformer,
-                            bbox,
-                            |test_lat, test_lon| {
-                                LatLng::new(test_lat, test_lon).ok().map(|ll| {
-                                    crate::aggregator::multi_horizon::profile::index(ll, res).into()
-                                }) == Some(buf.run_cells[i])
-                            },
-                        );
-                        buf.core_starts[i] = c_start;
-                        buf.core_ends[i] = c_end;
-                    }
                 } else {
                     buf.flush_inactive_cell(i, c, engine, &mut chunk_maps[i]);
                 }
@@ -523,87 +312,8 @@ fn walk_multi_res_row<T, Acc, E>(
         }
         let step_end = step_end.max(c + 1).min(coords.row_c_end);
 
-        if is_single_point {
-            let span_slice = &slice_row[c..step_end];
-            engine.accumulate_span_multi(&mut buf.run_accs, &buf.run_cells, span_slice);
-        } else {
-            let mut sub_core_start = c;
-            let mut sub_core_end = step_end;
-            for i in 0..num_res {
-                if buf.run_cells[i] != 0 {
-                    sub_core_start = sub_core_start.max(buf.core_starts[i]);
-                    sub_core_end = sub_core_end.min(buf.core_ends[i]);
-                }
-            }
-
-            if sub_core_start < sub_core_end {
-                for k in c..sub_core_start {
-                    evaluate_subpixel_pixel_multi(
-                        slice_row[k],
-                        k,
-                        num_res,
-                        resolutions,
-                        &buf.run_cells,
-                        &buf.core_starts,
-                        &buf.core_ends,
-                        coords,
-                        gt,
-                        crs_transformer,
-                        chunk.col_offset as usize,
-                        sampling,
-                        bbox,
-                        engine,
-                        &mut buf.run_accs,
-                        chunk_maps,
-                    );
-                }
-
-                let core_slice = &slice_row[sub_core_start..sub_core_end];
-                engine.accumulate_span_multi(&mut buf.run_accs, &buf.run_cells, core_slice);
-
-                for k in sub_core_end..step_end {
-                    evaluate_subpixel_pixel_multi(
-                        slice_row[k],
-                        k,
-                        num_res,
-                        resolutions,
-                        &buf.run_cells,
-                        &buf.core_starts,
-                        &buf.core_ends,
-                        coords,
-                        gt,
-                        crs_transformer,
-                        chunk.col_offset as usize,
-                        sampling,
-                        bbox,
-                        engine,
-                        &mut buf.run_accs,
-                        chunk_maps,
-                    );
-                }
-            } else {
-                for k in c..step_end {
-                    evaluate_subpixel_pixel_multi(
-                        slice_row[k],
-                        k,
-                        num_res,
-                        resolutions,
-                        &buf.run_cells,
-                        &buf.core_starts,
-                        &buf.core_ends,
-                        coords,
-                        gt,
-                        crs_transformer,
-                        chunk.col_offset as usize,
-                        sampling,
-                        bbox,
-                        engine,
-                        &mut buf.run_accs,
-                        chunk_maps,
-                    );
-                }
-            }
-        }
+        let span_slice = &slice_row[c..step_end];
+        engine.accumulate_span_multi(&mut buf.run_accs, &buf.run_cells, span_slice);
 
         let num_stepped = step_end - c;
         cursor.advance(num_stepped);
@@ -639,6 +349,22 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
     E: ScanlineEngine<T, Acc>,
     FNoData: Fn(&[T]) -> bool,
 {
+    if !sampling.is_single_point() {
+        super::supersampling::walk_samples(
+            slice,
+            chunk,
+            resolutions,
+            crs_transformer,
+            gt,
+            sampling,
+            bbox,
+            chunk_stride,
+            is_row_all_nodata,
+            engine,
+            chunk_maps,
+        );
+        return;
+    }
     let geom_ctx = RowGeometryContext::new(chunk, slice.len(), chunk_stride, crs_transformer, gt);
     let RowGeometryContext {
         stride,

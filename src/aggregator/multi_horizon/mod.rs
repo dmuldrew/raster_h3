@@ -18,6 +18,7 @@ pub mod sharded_map;
 pub mod span;
 pub mod spectral;
 pub mod spill;
+mod supersampling;
 pub mod walker;
 
 pub use categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};

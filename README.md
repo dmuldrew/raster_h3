@@ -207,8 +207,8 @@ Generates single-file **PMTiles v3** vector pyramids directly inside DuckDB in a
 Pixel centers and subpixel samples use absolute raster coordinates followed by
 CRS transformation. Span discovery uses the same calculation as ordinary pixel
 assignment, avoiding accumulated coordinate drift. Each candidate is indexed
-with H3; contiguous equal-cell runs share accumulation work. Supersampling bulk
-accumulation checks every sample before combining a run.
+with H3; contiguous equal-cell runs share accumulation work. Supersampling evaluates each sample once and combines same-cell weights per pixel,
+replaying stored assignments when samples split across cells.
 
 ### In-Database Streaming
 
