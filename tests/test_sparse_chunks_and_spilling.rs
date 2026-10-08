@@ -60,11 +60,14 @@ fn test_sparse_chunk_filled_with_nonzero_nodata() {
     // Now modify the TIFF file so strip 1 is sparse (offset = 0, byte_count = 0)
     let mut bytes = std::fs::read(file.path()).unwrap();
 
-    let reader_initial = GeoTiffStreamReader::open(file.path()).unwrap();
-    assert_eq!(reader_initial.metadata.nodata, Some(32767.0));
-    let chunk_info = reader_initial.chunk_info.as_ref().unwrap();
-    let strip0_offset = chunk_info.chunk_offsets[0];
-    let strip1_offset = chunk_info.chunk_offsets[1];
+    // Scope the reader so its memory map is released before the file is rewritten;
+    // Windows refuses to write to a file with a mapped section open.
+    let (strip0_offset, strip1_offset) = {
+        let reader_initial = GeoTiffStreamReader::open(file.path()).unwrap();
+        assert_eq!(reader_initial.metadata.nodata, Some(32767.0));
+        let chunk_info = reader_initial.chunk_info.as_ref().unwrap();
+        (chunk_info.chunk_offsets[0], chunk_info.chunk_offsets[1])
+    };
 
     let mut target_pair = [0u8; 8];
     target_pair[0..4].copy_from_slice(&(strip0_offset as u32).to_le_bytes());
