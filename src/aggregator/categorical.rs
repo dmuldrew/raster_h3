@@ -115,17 +115,26 @@ impl CategoricalAccumulator {
         });
     }
 
-    /// Return majority (mode) category, its count, and its fraction of total
+    /// Return majority (mode) category, its count, and its fraction of total.
+    ///
+    /// Counts within a relative epsilon of each other are treated as tied, and ties resolve to
+    /// the lowest category ID. Fractional sub-pixel weights summed in a different merge order
+    /// (e.g. under different thread scheduling) can differ in the last few ulps, so an exact
+    /// comparison would let class insertion order and rounding pick the winner.
     pub fn majority(&self) -> (i64, f64, f64) {
         if self.total_count == 0.0 {
             return (0, 0.0, 0.0);
         }
+        let tie_eps = self.total_count.abs() * 1e-9;
         let mut max_cat = 0;
         let mut max_count = -1.0;
+        let mut seen_any = false;
         self.for_each_class(|cat, cnt| {
-            if cnt > max_count {
+            let is_tie = (cnt - max_count).abs() <= tie_eps;
+            if !seen_any || (cnt > max_count && !is_tie) || (is_tie && cat < max_cat) {
                 max_count = cnt;
                 max_cat = cat;
+                seen_any = true;
             }
         });
         let frac = if self.total_count > 0.0 && max_count > 0.0 {
@@ -640,7 +649,13 @@ mod tests {
         let (maj_cat, maj_cnt, maj_frac) = acc.majority();
         assert_eq!(maj_cnt, 50.0);
         assert!((maj_frac - 0.5).abs() < 1e-9);
-        assert!(maj_cat == 10 || maj_cat == 20);
+        assert_eq!(maj_cat, 10, "Ties resolve to the lowest category ID");
+
+        // Insertion order and last-ulp rounding differences must not change the winner
+        let mut reordered = CategoricalAccumulator::new();
+        reordered.update_weighted(20, 0.1 + 0.2);
+        reordered.update_weighted(10, 0.3);
+        assert_eq!(reordered.majority().0, 10);
 
         // Adding 0.001 to class 20 cleanly breaks tie
         acc.update_weighted(20, 0.001);
