@@ -3,7 +3,8 @@
 //! Bounded worker windows merge into resolution maps. Conservative chunk/cell
 //! bounds permit early finalization; memory pressure creates sorted partial runs.
 //! Once spilled, a resolution is finalized only after external merging at EOF.
-//! Output and sorted sibling compaction are incremental. Failures latch and drop
+//! Output and sibling compaction are incremental: compaction groups complete
+//! during streaming or at EOF in sorted order. Failures latch and drop
 //! temporary files. The aggregation budget excludes decoded chunks and metadata.
 
 use fxhash::FxBuildHasher;
@@ -218,7 +219,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
         // Bounds cover whole chunks and all subpixel offsets. Unknown projected
         // chunks get +infinity; once they are processed a later suffix can still
-        // become certifiable. Compaction uses sorted EOF groups, not parent geometry.
+        // become certifiable.
         let n_chunks = mosaic.chunk_refs.len();
         let mut suffix_max_north_lat = vec![f64::NEG_INFINITY; n_chunks + 1];
         for k in (0..n_chunks).rev() {
@@ -236,7 +237,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             );
             suffix_max_north_lat[k] = suffix_max_north_lat[k + 1].max(north);
         }
-        let can_evict_early = !should_compact && suffix_max_north_lat.iter().any(|v| v.is_finite());
+        let can_evict_early = suffix_max_north_lat.iter().any(|v| v.is_finite());
         for map in &mut resolution_shards {
             map.set_eviction_enabled(can_evict_early);
         }
@@ -363,17 +364,19 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         self.compactor.is_enabled()
     }
 
-    /// Emit one final cell. In sorted EOF order siblings are contiguous, so
-    /// compaction retains at most one parent's children, including pentagons.
+    /// Emit one final cell. In sorted EOF order siblings are contiguous, so a
+    /// parent's group is decomposed as soon as the stream moves past it.
     fn emit_final(&mut self, res_idx: usize, key: u64, acc: K::Accumulator) {
-        if self.compactor.is_enabled() {
+        if self.compactor.is_enabled() && self.finishing {
             let parent = CellIndex::try_from(key)
                 .ok()
                 .and_then(|cell| cell.resolution().pred().and_then(|r| cell.parent(r)))
                 .map(u64::from);
             if parent != self.compaction_parent {
-                self.compactor
-                    .flush_all(&self.kernel, &mut self.output_buffer);
+                if let Some(previous) = self.compaction_parent {
+                    self.compactor
+                        .flush_parent(previous, &self.kernel, &mut self.output_buffer);
+                }
                 self.compaction_parent = parent;
             }
         }
@@ -591,8 +594,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         continue;
                     }
                     self.final_reader = None;
-                    self.compactor
-                        .flush_all(&self.kernel, &mut self.output_buffer);
+                    self.compactor.flush_resolution(
+                        self.resolution_u8s[self.final_resolution - 1],
+                        &self.kernel,
+                        &mut self.output_buffer,
+                    );
                     self.compaction_parent = None;
                     continue;
                 }
@@ -614,6 +620,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     self.final_resolution += 1;
                     continue;
                 }
+                // Records still buffered here are drained before is_finished().
+                self.compactor
+                    .flush_all(&self.kernel, &mut self.output_buffer);
                 self.lifecycle.mark_finished();
                 break;
             }
@@ -636,11 +645,31 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             if emitted {
                 continue;
             }
-            if self.output_buffer.is_empty()
-                && !self.spill_runs.iter().any(|r| r.has_spilled())
-                && !self.compactor.is_enabled()
-            {
-                self.current_lat_horizon = self.eviction_horizon;
+            if self.can_evict_early {
+                // Every finalizable cell has been popped, so a group whose
+                // logical children all lie north of the horizon is final.
+                let buffered = self.output_buffer.len();
+                let (spill_runs, resolution_u8s) = (&self.spill_runs, &self.resolution_u8s);
+                self.compactor.flush_completed(
+                    self.eviction_horizon,
+                    |res| {
+                        resolution_u8s
+                            .iter()
+                            .position(|&r| r == res)
+                            .is_some_and(|i| !spill_runs[i].has_spilled())
+                    },
+                    &self.kernel,
+                    &mut self.output_buffer,
+                );
+                if self.output_buffer.len() > buffered {
+                    continue;
+                }
+            }
+            if self.output_buffer.is_empty() && !self.spill_runs.iter().any(|r| r.has_spilled()) {
+                // Held sibling groups may still emit records north of the horizon.
+                self.current_lat_horizon = self
+                    .eviction_horizon
+                    .max(self.compactor.pending_emit_south());
             }
 
             let t0 = std::time::Instant::now();
@@ -676,7 +705,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             // Every sample of the current chunk has been merged or persisted.
             // Spilling may defer older northern cells, so do not publish a new
             // horizon downstream after any resolution has spilled.
-            if !self.spill_runs.iter().any(|r| r.has_spilled()) && !self.compactor.is_enabled() {
+            if !self.spill_runs.iter().any(|r| r.has_spilled()) {
                 self.eviction_horizon = self.suffix_max_north_lat[self.processed_chunk_count];
             }
         }
