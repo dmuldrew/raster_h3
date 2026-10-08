@@ -64,8 +64,8 @@ fn test_pmtiles_v3_header_and_archive_validation() {
     writer.add_tile(10, 163, 395, uncompressed_mvt).unwrap();
     writer.add_tile(11, 327, 791, uncompressed_mvt).unwrap();
 
-    let tmp_file = NamedTempFile::new().unwrap();
-    let pmtiles_path = tmp_file.path().to_str().unwrap().to_string();
+    let tmp_file = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = tmp_file.to_str().unwrap().to_string();
 
     writer.finish(&pmtiles_path).unwrap();
 
