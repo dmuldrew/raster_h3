@@ -140,6 +140,7 @@ fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
 }
 
 #[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
 fn test_lzw_read_chunk_into_buffer_recycling() {
     let path = "data/LF2024_FBFM40_HI.tif";
     assert!(

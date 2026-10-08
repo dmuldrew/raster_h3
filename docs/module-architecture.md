@@ -71,7 +71,7 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | [`remap.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/remap.rs) | Categorical class remapper (`CategoryRemapper`) with L1-cache direct array lookup table. Supports exact value and inclusive range rules with pass-through, drop, and default actions for unmapped categories. |
 | [`sampling.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/sampling.rs) | Sub-pixel sample offset definitions (`SamplingPattern`) — center, bilinear, RGSS 4-point, 5-point quincunx, Gaussian 5-point, 9-point grid, jittered, and stratified random patterns with fractional weights. |
 | [`simd.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/simd.rs) | Trait `SimdSpanAccumulate` and vectorized multi-lane scanline span accumulation for high-throughput pixel aggregation across native data types (`f32`, `f64`, `u8`–`u64`, `i8`–`i64`). |
-| [`h3_scanline.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/h3_scanline.rs) | Exact H3 indexing and sequential span discovery. Every candidate is indexed; contiguous equal-cell runs share accumulation work. |
+| [`h3_scanline.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/h3_scanline.rs) | Exact H3 indexing of a WGS84 point (`cell_at`), rejecting latitudes outside [-90, 90]. |
 | [`horizon_streamer.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/horizon_streamer.rs) | Priority queue entry (`HexEvictionEntry`) for streaming scanline horizon eviction, ordered by southernmost latitude. Provides `compute_cell_south_lat` for cell boundary calculation and `chunk_intersects_bbox` for spatial pruning. |
 
 #### [`multi_horizon/`](https://github.com/dmuldrew/raster_h3/tree/main/src/aggregator/multi_horizon) — Multi-Resolution Streaming Engine
@@ -87,11 +87,10 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | [`continuous_streamer.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/continuous_streamer.rs) | Continuous raster horizon streamer (`ContinuousKernel`, `MultiScanHorizonStreamer`). Implements single-pass streaming aggregation across multiple H3 resolutions for raw raster bands and spectral index formulas. |
 | [`categorical.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/categorical.rs) | Categorical chunk payload processing (`MultiCategoricalRecord`). Processes discrete integer chunk data into class histograms per H3 cell, enforcing mosaic tile ownership rules and class remappings. |
 | [`categorical_streamer.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/categorical_streamer.rs) | Categorical raster horizon streamer (`CategoricalKernel`, `MultiCategoricalHorizonStreamer`). Drives single-pass multi-resolution class aggregation, remapping, and majority fraction filtering. |
-| [`overlap_walker.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/overlap_walker.rs) | Pixel-by-pixel mosaic overlap walker (`walk_overlap_pixel_cells`). Evaluates per-pixel tile ownership when chunks intersect overlapping mosaic tiles, applying cutline/Voronoi, first, or average rules. |
 | [`spectral.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/spectral.rs) | On-the-fly spectral index formulas (`SpectralFormula`) and physical reflectance evaluation for NDVI, NDWI, NBR, and EVI with singularity/zero-division protections. |
 
 
-##### [`walker.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/walker.rs), [`coordinates.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/coordinates.rs), [`span.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/span.rs) — Hot-Path Scanline Traversal
+##### [`walker.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/walker.rs), [`coordinates.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/coordinates.rs) — Hot-Path Scanline Traversal
 
 > **Architectural Note — Intentional Coupling for Cache Locality**
 >
@@ -101,10 +100,8 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 
 | File | Responsibility |
 | :--- | :--- |
-| [`walker.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/walker.rs) | Unified geometric pixel walker and spatial math driver. Defines the `ScanlineEngine<T, Acc>` trait that continuous and categorical kernels implement, and orchestrates the generic scanline traversal loop: row iteration, coordinate setup, span discovery, accumulator updates, and chunk bounding-box pruning. Re-exports key types from `coordinates.rs` and `span.rs`. |
-| [`coordinates.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/coordinates.rs) | Coordinate transformation for multi-horizon aggregators (`CoordinateTransformer`, `RowCoordinates`, `RowGeometryContext`). Provides reference coordinate transforms from raster pixel space to WGS84, explicit fast paths for north-up WGS84 and Web Mercator grids, and exact per-sample projected CRS transformation. |
-| [`span.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/span.rs) | Sequential center-sampling span discovery (`H3SpanOptimizer`). Indexes each candidate and returns contiguous equal-cell runs; supersampling uses the fused sample walker. |
-| `supersampling.rs` | Fused sample projection, indexing, and accumulation with reusable per-pixel buffers. Shares projected coordinates across resolutions, combines uniform cell weights, and replays stored boundary or quantile assignments without recomputation. |
+| [`walker.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/walker.rs) | Single pixel walker for every kernel. Defines the `ScanlineEngine<T, Acc>` trait and `WalkContext`; `walk_direct` handles single-band windows and `walk_interleaved` handles band selection and spectral indices. Each valid pixel projects its samples once, filters them by bbox (antimeridian-aware) and mosaic tile ownership, and indexes them exactly at every resolution. Per-resolution runs merge into chunk maps on cell change; single-band center sampling batches contiguous pixels through the SIMD span kernels, and pixels wholly inside one cell combine their sample weights when the engine allows it. North-up WGS84/Web Mercator rows are pruned conservatively before projection. |
+| [`coordinates.rs`](https://github.com/dmuldrew/raster_h3/blob/main/src/aggregator/multi_horizon/coordinates.rs) | Reference pixel-to-WGS84 transforms (`CoordinateTransformer`), antimeridian-aware bbox tests (`is_point_in_bbox`), and conservative per-chunk northern latitude bounds for eviction (`eviction_north_bound`). |
 
 ---
 

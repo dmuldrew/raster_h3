@@ -84,8 +84,8 @@ fn test_geoparquet_continuous_metadata_and_wkb() {
     let tiff_file = create_test_geotiff(60, 60);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8, 9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -172,8 +172,8 @@ fn test_geoparquet_compact_continuous() {
     let tiff_file = create_test_geotiff(40, 40);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -224,8 +224,8 @@ fn test_geoparquet_categorical() {
     let tiff_file = create_test_geotiff(40, 40);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -287,8 +287,8 @@ fn test_geoparquet_disabled_by_default() {
     let tiff_file = create_test_geotiff(30, 30);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -334,8 +334,8 @@ fn test_geoparquet_raster_source_end_to_end() {
     let tiff_file = create_test_geotiff(40, 40);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_str().unwrap();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_str().unwrap();
 
     let config = MultiResolutionConfig::new(vec![8]);
     let parquet_config = ParquetExportConfig {
@@ -373,8 +373,8 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
     let tiff_file = create_test_geotiff(50, 50);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -474,8 +474,8 @@ fn test_geoparquet_non_compact_categorical_metadata_and_columns() {
     let tiff_file = create_test_geotiff(30, 30);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -537,8 +537,8 @@ fn test_geoparquet_column_projection_and_filtering() {
     let tiff_file = create_test_geotiff(40, 40);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();

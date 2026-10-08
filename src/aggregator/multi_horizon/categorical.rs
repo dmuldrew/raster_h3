@@ -1,5 +1,5 @@
 use fxhash::FxBuildHasher;
-use h3o::{LatLng, Resolution};
+use h3o::Resolution;
 use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
@@ -13,7 +13,7 @@ use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
 
 use super::walker::{
-    is_slice_all_native_nodata, scanline_walk, walk_overlap_pixel_cells, ScanlineEngine,
+    is_slice_all_native_nodata, walk_direct, walk_interleaved, ScanlineEngine, WalkContext,
 };
 /// Categorical record yielded by the multi-resolution categorical streamer
 #[derive(Debug, Clone, PartialEq)]
@@ -23,118 +23,36 @@ pub struct MultiCategoricalRecord {
     pub accumulator: CategoricalAccumulator,
 }
 
-/// Direct pixel-by-pixel categorical slice aggregation with strict tile ownership resolution
-fn process_categorical_overlap_slice_into_maps<T>(
-    slice: &[T],
-    chunk: &RasterChunk,
-    native_nodata: Option<T>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
-    tile_idx: usize,
-    mosaic: &MosaicReader,
-    remapper: Option<&CategoryRemapper>,
-    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
-) where
-    T: CategoricalUniformity,
-{
-    let resolve_cat = |val: T| -> Option<i64> {
-        let rule = PixelValidity::new(native_nodata);
-        if !rule.is_valid(val) {
-            return None;
-        }
-        let raw_cat = val.to_category()?;
-        if let Some(rem) = remapper {
-            rem.remap(raw_cat)
-        } else {
-            Some(raw_cat)
-        }
-    };
-
-    walk_overlap_pixel_cells(
-        slice,
-        chunk,
-        chunk_stride,
-        resolutions,
-        crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        tile_idx,
-        mosaic,
-        |val| resolve_cat(val).is_some(),
-        |res_idx, cell_u64, weight, val| {
-            if let Some(cat) = resolve_cat(val) {
-                chunk_maps[res_idx]
-                    .entry(cell_u64)
-                    .and_modify(|acc| acc.update_weighted(cat, weight))
-                    .or_insert_with(|| {
-                        let mut acc = CategoricalAccumulator::default();
-                        acc.update_weighted(cat, weight);
-                        acc
-                    });
-            }
-        },
-    );
-}
-
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
-fn process_categorical_slice_into_maps<T>(
+fn process_categorical_slice_into_maps<T: CategoricalUniformity>(
+    ctx: &WalkContext,
     slice: &[T],
-    chunk: &RasterChunk,
     native_nodata: Option<T>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
+    samples_per_pixel: usize,
+    band: usize,
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
-) where
-    T: CategoricalUniformity,
-{
-    if slice.is_empty() {
-        return;
-    }
-
-    if let Some((tile_idx, mosaic)) = overlap_ctx {
-        process_categorical_overlap_slice_into_maps(
+) {
+    let engine = CategoricalEngine::new(native_nodata, remapper);
+    if samples_per_pixel <= 1 {
+        walk_direct(
+            ctx,
             slice,
-            chunk,
-            native_nodata,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
-            tile_idx,
-            mosaic,
-            remapper,
+            |s| is_slice_all_native_nodata(s, native_nodata),
+            &engine,
             chunk_maps,
         );
-        return;
+    } else {
+        let b = band.saturating_sub(1).min(samples_per_pixel - 1);
+        walk_interleaved(
+            ctx,
+            slice,
+            samples_per_pixel,
+            |px| engine.get_sample(px[b]),
+            &engine,
+            chunk_maps,
+        );
     }
-
-    let engine = CategoricalEngine::new(native_nodata, remapper);
-    scanline_walk(
-        slice,
-        chunk,
-        resolutions,
-        crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        chunk_stride,
-        |s| is_slice_all_native_nodata(s, native_nodata),
-        &engine,
-        chunk_maps,
-    );
 }
 
 struct CategoricalEngine<'a, T> {
@@ -304,94 +222,6 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
     }
 }
 
-/// Process a multi-sample categorical slice into thread-local hash maps for a specific band
-fn process_categorical_multisample_slice_into_maps<T>(
-    slice: &[T],
-    chunk: &RasterChunk,
-    native_nodata: Option<T>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
-    samples_per_pixel: usize,
-    band: usize,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    remapper: Option<&CategoryRemapper>,
-    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
-) where
-    T: CategoricalUniformity,
-{
-    let row_width = chunk.width as usize;
-    let spp = samples_per_pixel.max(1);
-    let b_idx = (band.saturating_sub(1)).min(spp - 1);
-    let num_res = resolutions.len();
-
-    for row_idx in 0..chunk.height as usize {
-        let slice_row_start = (row_idx * (chunk_stride as usize)) * spp;
-
-        for c in 0..row_width {
-            let raw = slice[slice_row_start + c * spp + b_idx];
-            if let Some(nd) = native_nodata {
-                if raw == nd {
-                    continue;
-                }
-            }
-
-            let raw_cat = match raw.to_category() {
-                Some(cls) => cls,
-                None => continue,
-            };
-
-            let cat = if let Some(rem) = remapper {
-                match rem.remap(raw_cat) {
-                    Some(c) => c,
-                    None => continue,
-                }
-            } else {
-                raw_cat
-            };
-
-            for sp in &sampling.points {
-                let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
-                let py = (chunk.row_offset as f64) + (row_idx as f64) + sp.dy;
-                let (x, y) = gt.pixel_to_coord(px, py);
-                if let Ok((lon, lat)) = super::profile::transform(crs_transformer, x, y) {
-                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat
-                        {
-                            continue;
-                        }
-                    }
-
-                    if let Some((tile_idx, mosaic)) = overlap_ctx {
-                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
-                            continue;
-                        }
-                    }
-
-                    if let Ok(ll) = LatLng::new(lat, lon) {
-                        for res_idx in 0..num_res {
-                            let res = resolutions[res_idx];
-                            let cell: u64 =
-                                crate::aggregator::multi_horizon::profile::index(ll, res).into();
-                            chunk_maps[res_idx]
-                                .entry(cell)
-                                .and_modify(|acc| acc.update_weighted(cat, sp.weight))
-                                .or_insert_with(|| {
-                                    let mut a = CategoricalAccumulator::default();
-                                    a.update_weighted(cat, sp.weight);
-                                    a
-                                });
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Process a categorical chunk across all resolutions into thread-local hash maps
 pub fn process_categorical_chunk_payload_into(
     chunk_bounds: &RasterChunk,
@@ -443,49 +273,22 @@ pub fn process_categorical_borrowed_into(
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) -> bool {
-    let is_multisample = samples_per_pixel > 1 && band > 1;
     let spp = samples_per_pixel.max(1) as usize;
-
-    if !is_multisample {
-        if decoding_result.all_nodata(nodata) {
-            return false;
-        }
-
-        crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
-            process_categorical_slice_into_maps(
-                slice,
-                chunk_bounds,
-                nd,
-                resolutions,
-                crs_transformer,
-                gt,
-                sampling,
-                bbox,
-                chunk_stride,
-                overlap_ctx,
-                remapper,
-                chunk_maps,
-            );
-        });
-    } else {
-        crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
-            process_categorical_multisample_slice_into_maps(
-                slice,
-                chunk_bounds,
-                nd,
-                resolutions,
-                crs_transformer,
-                gt,
-                sampling,
-                bbox,
-                chunk_stride,
-                spp,
-                band,
-                overlap_ctx,
-                remapper,
-                chunk_maps,
-            );
-        });
+    if spp == 1 && decoding_result.all_nodata(nodata) {
+        return false;
     }
+    let ctx = WalkContext {
+        chunk: chunk_bounds,
+        resolutions,
+        crs: crs_transformer,
+        gt,
+        sampling,
+        bbox,
+        stride: chunk_stride,
+        owner: overlap_ctx,
+    };
+    crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
+        process_categorical_slice_into_maps(&ctx, slice, nd, spp, band, remapper, chunk_maps);
+    });
     true
 }

@@ -757,6 +757,25 @@ impl CrsTransformer {
             }
         }
 
+        // Longitude is affine in pixel space here, so unwrapped corners bound it
+        // exactly. Wrapped corners cannot distinguish a >180 degree span (e.g. a
+        // 0..360 grid) from one that does not cross the antimeridian.
+        if matches!(self, Self::Wgs84Identity | Self::WebMercatorFast) {
+            let lons: Vec<f64> = corners
+                .iter()
+                .filter_map(|&(x, y)| self.transform_point(x, y).ok().map(|p| p.0))
+                .collect();
+            if lons.len() == corners.len() && lons.iter().all(|v| v.is_finite()) {
+                let lo = lons.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                (min_lon, max_lon) = if lo < -180.0 || hi > 180.0 {
+                    (-180.0, 180.0)
+                } else {
+                    (lo, hi)
+                };
+            }
+        }
+
         // Handle rasters spanning across the antimeridian
         if max_lon - min_lon > 180.0 {
             min_lon = -180.0;
@@ -1140,6 +1159,24 @@ mod tests {
         // so bounds must report [-180, 0, 180, 10]
         assert_eq!(bounds[0], -180.0);
         assert_eq!(bounds[2], 180.0);
+
+        // A 0..360 grid spanning 100..300 wraps to corners 100 and -60, whose
+        // naive span (160) would hide the crossing.
+        let gt = GeoTransform {
+            c0: 100.0,
+            a: 1.0,
+            b: 0.0,
+            f0: 10.0,
+            d: 0.0,
+            e: -1.0,
+        };
+        let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 200.0, 10.0);
+        assert_eq!((bounds[0], bounds[2]), (-180.0, 180.0));
+
+        // Ending exactly at 180 does not cross.
+        let gt = GeoTransform { c0: 160.0, ..gt };
+        let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 20.0, 10.0);
+        assert_eq!((bounds[0], bounds[2]), (160.0, 180.0));
     }
 
     #[test]
