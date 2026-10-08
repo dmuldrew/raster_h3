@@ -95,7 +95,8 @@ impl Default for StreamLifecycle {
 /// Buffer for holding completed output records awaiting consumer pickup.
 #[derive(Debug)]
 pub struct OutputBuffer<R> {
-    records: VecDeque<R>,
+    records: VecDeque<(R, usize)>,
+    estimated_bytes: usize,
 }
 
 impl<R> OutputBuffer<R> {
@@ -103,12 +104,23 @@ impl<R> OutputBuffer<R> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             records: VecDeque::with_capacity(capacity),
+            estimated_bytes: 0,
         }
     }
 
     /// Push an output record onto the back of the buffer.
     pub fn push(&mut self, record: R) {
-        self.records.push_back(record);
+        self.push_sized(record, std::mem::size_of::<R>());
+    }
+
+    /// Account for dynamic accumulator state as well as the record itself.
+    pub fn push_sized(&mut self, record: R, bytes: usize) {
+        self.estimated_bytes += bytes;
+        self.records.push_back((record, bytes));
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
     }
 
     /// Number of records currently buffered.
@@ -123,12 +135,16 @@ impl<R> OutputBuffer<R> {
 
     /// Pop the next completed record from the front of the buffer.
     pub fn pop_front(&mut self) -> Option<R> {
-        self.records.pop_front()
+        self.records.pop_front().map(|(record, bytes)| {
+            self.estimated_bytes -= bytes;
+            record
+        })
     }
 
     /// Clear all records in the buffer.
     pub fn clear(&mut self) {
         self.records.clear();
+        self.estimated_bytes = 0;
     }
 
     /// Drain up to `max_rows` records into a vector.
@@ -136,7 +152,7 @@ impl<R> OutputBuffer<R> {
         let n = max_rows.min(self.records.len());
         let mut batch = Vec::with_capacity(n);
         for _ in 0..n {
-            if let Some(r) = self.records.pop_front() {
+            if let Some(r) = self.pop_front() {
                 batch.push(r);
             }
         }
@@ -150,7 +166,7 @@ impl<R> OutputBuffer<R> {
     {
         let n = max_rows.min(self.records.len());
         for i in 0..n {
-            if let Some(r) = self.records.pop_front() {
+            if let Some(r) = self.pop_front() {
                 consumer(i, r);
             }
         }

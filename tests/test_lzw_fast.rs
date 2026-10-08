@@ -14,12 +14,13 @@ use weezl::BitOrder;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 #[test]
+#[ignore = "requires external dataset data/CFL_HI.tif"]
 fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
     let path = "data/CFL_HI.tif";
-    if !Path::new(path).exists() {
-        eprintln!("Skipping test: {} does not exist", path);
-        return;
-    }
+    assert!(
+        Path::new(path).exists(),
+        "Required external dataset missing: {path}"
+    );
 
     let reader = GeoTiffStreamReader::open(path).expect("Failed to open CFL_HI.tif");
     let mmap = reader.mmap().expect("Failed to get mmap");
@@ -81,12 +82,13 @@ fn test_lzw_hawaii_cfl_exact_bitwise_parity() {
 }
 
 #[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
 fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
     let path = "data/LF2024_FBFM40_HI.tif";
-    if !Path::new(path).exists() {
-        eprintln!("Skipping test: {} does not exist", path);
-        return;
-    }
+    assert!(
+        Path::new(path).exists(),
+        "Required external dataset missing: {path}"
+    );
 
     let reader = GeoTiffStreamReader::open(path).expect("Failed to open LF2024_FBFM40_HI.tif");
     let mmap = reader.mmap().expect("Failed to get mmap");
@@ -138,12 +140,50 @@ fn test_lzw_hawaii_landfire_exact_bitwise_parity() {
 }
 
 #[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
 fn test_lzw_read_chunk_into_buffer_recycling() {
-    let path = "data/LF2024_FBFM40_HI.tif";
-    if !Path::new(path).exists() {
-        eprintln!("Skipping test: {} does not exist", path);
-        return;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path();
+
+    let width = 64u32;
+    let height = 64u32;
+    let tile_w = 32u32;
+    let tile_h = 32u32;
+    write_synthetic_lzw_geotiff(path, width, height, tile_w, tile_h, 1);
+
+    let reader = GeoTiffStreamReader::open(path).unwrap();
+    let mut fast_decoder = reader.open_decoder().unwrap();
+
+    let total_chunks = reader.chunk_layout.total_chunks;
+    assert_eq!(total_chunks, 4);
+
+    // Read first chunk to establish baseline and recycled buffer
+    let (_bounds0, mut recycled) = fast_decoder.read_chunk(0).unwrap();
+
+    for chunk_idx in 1..total_chunks {
+        let (_bounds_direct, direct) = fast_decoder.read_chunk(chunk_idx).unwrap();
+        let (_bounds_rec, next_recycled) = fast_decoder
+            .read_chunk_into(chunk_idx, recycled)
+            .unwrap();
+
+        match (&next_recycled, &direct) {
+            (DecodingResult::U16(v_rec), DecodingResult::U16(v_dir)) => {
+                assert_eq!(v_rec, v_dir, "Mismatch on chunk {chunk_idx}");
+            }
+            _ => panic!("Expected U16 DecodingResult"),
+        }
+        recycled = next_recycled;
     }
+}
+
+#[test]
+#[ignore = "requires external dataset data/LF2024_FBFM40_HI.tif"]
+fn test_lzw_hawaii_landfire_read_chunk_into_buffer_recycling() {
+    let path = "data/LF2024_FBFM40_HI.tif";
+    assert!(
+        Path::new(path).exists(),
+        "Required external dataset missing: {path}"
+    );
 
     let reader = GeoTiffStreamReader::open(path).unwrap();
     let mut fast_decoder = reader.open_decoder().unwrap();

@@ -2,9 +2,11 @@ use fxhash::FxBuildHasher;
 use rayon::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 
+use super::spill::table_bytes;
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
 use crate::aggregator::horizon_streamer::{compute_cell_south_lat, HexEvictionEntry};
+use crate::aggregator::quantiles::QuantileSketch;
 
 /// Number of concurrent shards for parallel active map merging
 pub const NUM_SHARDS: usize = 32;
@@ -26,9 +28,22 @@ pub fn get_shard(cell_u64: u64) -> usize {
 /// Trait defining an accumulator that can be merged into another
 pub trait AccumulatorMerge: Clone + Send + Sync + 'static {
     fn merge(&mut self, other: &Self);
+    /// Owned dynamic state used by the aggregation budget. Inline-only custom
+    /// accumulators can use the default; heap-owning implementations must override.
+    fn heap_bytes(&self) -> usize {
+        0
+    }
 }
 
 impl AccumulatorMerge for H3Accumulator {
+    fn heap_bytes(&self) -> usize {
+        self.quantiles.as_ref().map_or(0, |q| {
+            std::mem::size_of::<QuantileSketch>()
+                + table_bytes::<i32, f64>(q.pos_bins.capacity())
+                + table_bytes::<i32, f64>(q.neg_bins.capacity())
+        })
+    }
+
     #[inline(always)]
     fn merge(&mut self, other: &Self) {
         H3Accumulator::merge(self, other);
@@ -36,6 +51,12 @@ impl AccumulatorMerge for H3Accumulator {
 }
 
 impl AccumulatorMerge for CategoricalAccumulator {
+    fn heap_bytes(&self) -> usize {
+        self.heap_counts.as_ref().map_or(0, |h| {
+            std::mem::size_of_val(&**h) + table_bytes::<i64, f64>(h.capacity())
+        })
+    }
+
     #[inline(always)]
     fn merge(&mut self, other: &Self) {
         CategoricalAccumulator::merge(self, other);
@@ -44,11 +65,15 @@ impl AccumulatorMerge for CategoricalAccumulator {
 
 /// A 32-way hash-partitioned active map and eviction heap for a single H3 resolution.
 ///
-/// Encapsulates lock-free parallel merging of thread-local worker maps, parallel eviction
-/// of hexagons past the latitude horizon, and parallel H3 index sorting.
+/// Both batch merges and the budget-aware owned merge require exclusive access.
+/// Legacy batch APIs parallelize over disjoint shards. The controller joins
+/// bounded worker waves, merges owned states with budget checks, and pops completed
+/// cells incrementally. Merge and eviction phases cannot overlap in safe Rust.
 pub struct ShardedResolutionMap<A: AccumulatorMerge> {
     pub shards: Vec<HashMap<u64, A, FxBuildHasher>>,
     pub eviction: Vec<BinaryHeap<HexEvictionEntry>>,
+    dynamic_bytes: usize,
+    track_eviction: bool,
 }
 
 impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
@@ -58,22 +83,30 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
         let mut eviction = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
             shards.push(HashMap::with_capacity_and_hasher(
-                128,
+                0,
                 FxBuildHasher::default(),
             ));
-            eviction.push(BinaryHeap::with_capacity(128));
+            eviction.push(BinaryHeap::new());
         }
-        Self { shards, eviction }
+        Self {
+            shards,
+            eviction,
+            dynamic_bytes: 0,
+            track_eviction: true,
+        }
     }
 
-    /// Merge partial chunk results from parallel worker threads into the 32 shards with zero lock contention.
+    /// Merge partial chunk results from parallel worker threads into the 32 shards.
     ///
-    /// Each Rayon worker thread merges into a distinct shard concurrently.
+    /// Executes an exclusive merge phase using Rayon parallel mutable iteration over disjoint shards.
+    /// Each Rayon task exclusively owns and mutates one shard map and eviction heap, merging
+    /// contributions sequentially within that shard.
     pub fn merge_thread_results<T: Sync>(
         &mut self,
         parallel_results: &[(Vec<[Vec<(u64, A)>; NUM_SHARDS]>, T)],
         res_idx: usize,
     ) {
+        let track_eviction = self.track_eviction;
         self.shards
             .par_iter_mut()
             .zip(self.eviction.par_iter_mut())
@@ -86,17 +119,25 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
                                 .entry(cell_u64)
                                 .and_modify(|existing| existing.merge(acc))
                                 .or_insert_with(|| {
-                                    let south_lat = compute_cell_south_lat(cell_u64);
-                                    shard_evict.push(HexEvictionEntry {
-                                        south_lat,
-                                        cell_u64,
-                                    });
+                                    if track_eviction {
+                                        let south_lat = compute_cell_south_lat(cell_u64);
+                                        shard_evict.push(HexEvictionEntry {
+                                            south_lat,
+                                            cell_u64,
+                                        });
+                                    }
                                     acc.clone()
                                 });
                         }
                     }
                 }
             });
+        self.dynamic_bytes = self
+            .shards
+            .iter()
+            .flat_map(|map| map.values())
+            .map(A::heap_bytes)
+            .sum();
     }
 
     /// Evict completed cells that lie north of `lat_horizon` across all 32 shards in parallel,
@@ -123,6 +164,10 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             .flatten()
             .collect();
 
+        self.dynamic_bytes -= newly_evicted
+            .iter()
+            .map(|(_, acc)| acc.heap_bytes())
+            .sum::<usize>();
         newly_evicted.par_sort_unstable_by_key(|item| item.0);
         newly_evicted
     }
@@ -145,6 +190,7 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             .flatten()
             .collect();
 
+        self.dynamic_bytes = 0;
         remaining.par_sort_unstable_by_key(|item| item.0);
         remaining
     }
@@ -152,5 +198,85 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
     /// Return total active in-flight cell count across all 32 shards
     pub fn active_cell_count(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
+    }
+}
+
+impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
+    pub fn set_eviction_enabled(&mut self, enabled: bool) {
+        self.track_eviction = enabled;
+        if !enabled {
+            for heap in &mut self.eviction {
+                *heap = BinaryHeap::new();
+            }
+        }
+    }
+
+    /// Owned merge avoids cloning a large quantile or categorical state.
+    pub fn merge_owned(&mut self, key: u64, acc: A) -> usize {
+        let s = get_shard(key);
+        match self.shards[s].entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                self.dynamic_bytes -= entry.get().heap_bytes();
+                entry.get_mut().merge(&acc);
+                self.dynamic_bytes += entry.get().heap_bytes();
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.dynamic_bytes += acc.heap_bytes();
+                entry.insert(acc);
+                if self.track_eviction {
+                    self.eviction[s].push(HexEvictionEntry {
+                        cell_u64: key,
+                        south_lat: compute_cell_south_lat(key),
+                    });
+                }
+            }
+        }
+        self.shards[s][&key].memory_bytes()
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.dynamic_bytes
+            + self
+                .shards
+                .iter()
+                .map(|s| super::spill::table_bytes::<u64, A>(s.capacity()))
+                .sum::<usize>()
+            + self
+                .eviction
+                .iter()
+                .map(|h| h.capacity() * std::mem::size_of::<HexEvictionEntry>())
+                .sum::<usize>()
+    }
+
+    /// Remove at most one completed cell, keeping output backpressure effective.
+    pub fn pop_completed(&mut self, horizon: f64) -> Option<(u64, A)> {
+        for (map, heap) in self.shards.iter_mut().zip(&mut self.eviction) {
+            while heap.peek().is_some_and(|e| e.south_lat > horizon) {
+                let key = heap.pop().unwrap().cell_u64;
+                if let Some(acc) = map.remove(&key) {
+                    self.dynamic_bytes -= acc.heap_bytes();
+                    if map.is_empty() {
+                        *map = HashMap::with_hasher(FxBuildHasher::default());
+                        *heap = BinaryHeap::new();
+                    }
+                    return Some((key, acc));
+                }
+            }
+        }
+        None
+    }
+
+    /// A run is bounded by the active-map budget. Release buckets/heaps rather
+    /// than retaining their high-water capacity during external merging.
+    pub fn take_sorted(&mut self) -> Vec<(u64, A)> {
+        let mut records = Vec::with_capacity(self.active_cell_count());
+        for (map, heap) in self.shards.iter_mut().zip(&mut self.eviction) {
+            let owned = std::mem::replace(map, HashMap::with_hasher(FxBuildHasher::default()));
+            records.extend(owned);
+            *heap = BinaryHeap::new();
+        }
+        self.dynamic_bytes = 0;
+        records.sort_unstable_by_key(|(key, _)| *key);
+        records
     }
 }

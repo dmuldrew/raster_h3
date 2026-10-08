@@ -293,6 +293,7 @@ pub struct ChunkDecoder<'a> {
     width: u32,
     height: u32,
     samples_per_pixel: u16,
+    pub nodata: Option<f64>,
     chunk_info: Option<Arc<TiffChunkInfo>>,
     source: DecoderSource<'a>,
     libdeflater: Option<libdeflater::Decompressor>,
@@ -353,6 +354,130 @@ impl<'a> ChunkDecoder<'a> {
         let chunk_bounds = self
             .chunk_layout
             .get_chunk_bounds(chunk_index, self.width, self.height);
+
+        // Check for sparse / unallocated chunk (e.g. in Cloud-Optimized GeoTIFFs where ocean/empty tiles have offset 0 or bytes 0)
+        let is_sparse = if let Some(bytes) = provided_bytes {
+            bytes.is_empty()
+        } else if let Some(ref info) = self.chunk_info {
+            let idx = chunk_index as usize;
+            let offset = info.chunk_offsets.get(idx).copied().unwrap_or(0);
+            let byte_count = info.chunk_bytes.get(idx).copied().unwrap_or(0);
+            offset == 0 || byte_count == 0
+        } else {
+            false
+        };
+
+        if is_sparse {
+            let spp = self.samples_per_pixel.max(1) as usize;
+            let total_samples =
+                (chunk_bounds.width as usize) * (chunk_bounds.height as usize) * spp;
+            if let Some(mut buf) = target_buffer {
+                match buf {
+                    DecodingResult::U8(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as u8).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::U16(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as u16).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::U32(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as u32).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::U64(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as u64).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::I8(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as i8).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::I16(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as i16).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::I32(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as i32).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::I64(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as i64).unwrap_or(0);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::F32(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.map(|n| n as f32).unwrap_or(f32::NAN);
+                        v.resize(total_samples, fill);
+                    }
+                    DecodingResult::F64(ref mut v) => {
+                        v.clear();
+                        let fill = self.nodata.unwrap_or(f64::NAN);
+                        v.resize(total_samples, fill);
+                    }
+                }
+                return Ok((chunk_bounds, buf));
+            } else if let Some(ref info) = self.chunk_info {
+                let res = match (info.sample_format, info.bits_per_sample) {
+                    (SampleFormat::Uint, 8) => {
+                        let fill = self.nodata.map(|n| n as u8).unwrap_or(0);
+                        DecodingResult::U8(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Uint, 16) => {
+                        let fill = self.nodata.map(|n| n as u16).unwrap_or(0);
+                        DecodingResult::U16(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Uint, 32) => {
+                        let fill = self.nodata.map(|n| n as u32).unwrap_or(0);
+                        DecodingResult::U32(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Uint, 64) => {
+                        let fill = self.nodata.map(|n| n as u64).unwrap_or(0);
+                        DecodingResult::U64(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Int, 8) => {
+                        let fill = self.nodata.map(|n| n as i8).unwrap_or(0);
+                        DecodingResult::I8(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Int, 16) => {
+                        let fill = self.nodata.map(|n| n as i16).unwrap_or(0);
+                        DecodingResult::I16(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Int, 32) => {
+                        let fill = self.nodata.map(|n| n as i32).unwrap_or(0);
+                        DecodingResult::I32(vec![fill; total_samples])
+                    }
+                    (SampleFormat::Int, 64) => {
+                        let fill = self.nodata.map(|n| n as i64).unwrap_or(0);
+                        DecodingResult::I64(vec![fill; total_samples])
+                    }
+                    (SampleFormat::IEEEFP, 32) => {
+                        let fill = self.nodata.map(|n| n as f32).unwrap_or(f32::NAN);
+                        DecodingResult::F32(vec![fill; total_samples])
+                    }
+                    (SampleFormat::IEEEFP, 64) => {
+                        let fill = self.nodata.unwrap_or(f64::NAN);
+                        DecodingResult::F64(vec![fill; total_samples])
+                    }
+                    _ => {
+                        let fill = self.nodata.map(|n| n as f32).unwrap_or(f32::NAN);
+                        DecodingResult::F32(vec![fill; total_samples])
+                    }
+                };
+                return Ok((chunk_bounds, res));
+            } else {
+                let fill = self.nodata.map(|n| n as f32).unwrap_or(f32::NAN);
+                return Ok((chunk_bounds, DecodingResult::F32(vec![fill; total_samples])));
+            }
+        }
 
         let fast_res = if let Some(bytes) = provided_bytes {
             self.decompress_chunk_fast_bytes(chunk_index, bytes, target_buffer.as_mut())
@@ -745,6 +870,14 @@ impl<'a> ChunkDecoder<'a> {
 }
 
 impl GeoTiffStreamReader {
+    /// Unallocated TIFF chunks contain no observations, regardless of nodata overrides.
+    pub fn is_sparse_chunk(&self, chunk_index: u32) -> bool {
+        self.chunk_info.as_ref().is_some_and(|info| {
+            let index = chunk_index as usize;
+            info.chunk_offsets.get(index) == Some(&0) || info.chunk_bytes.get(index) == Some(&0)
+        })
+    }
+
     /// Backward-compatible accessor for memory-mapped buffer if the source is local
     pub fn mmap(&self) -> Option<&Arc<Mmap>> {
         match &self.source {
@@ -987,6 +1120,7 @@ impl GeoTiffStreamReader {
             width: self.metadata.width,
             height: self.metadata.height,
             samples_per_pixel: self.metadata.samples_per_pixel,
+            nodata: self.metadata.nodata,
             chunk_info: self.chunk_info.clone(),
             source,
             libdeflater,

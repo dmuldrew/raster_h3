@@ -192,7 +192,7 @@ impl MockHttpServer {
 
         // Check for simulated transient failure (HTTP 503 Slow Down)
         let fail_hit =
-            transient_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            transient_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 if count > 0 {
                     Some(count - 1)
                 } else {

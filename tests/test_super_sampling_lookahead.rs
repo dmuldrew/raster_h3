@@ -467,3 +467,58 @@ fn test_projected_utm_gradient_exact_cell_assignment() {
         );
     }
 }
+
+#[test]
+fn custom_single_samples_preserve_offsets_and_weights() {
+    use h3o::{LatLng, Resolution};
+    use raster_h3::aggregator::sampling::SamplePoint;
+    use std::collections::HashMap;
+    let (_file, path) = TestGeoTiffBuilder::new(16, 4)
+        .origin(-122.0, 38.0)
+        .pixel_size(0.01)
+        .epsg(4326)
+        .create_f32_tempfile(|_, _| 3.0);
+    for (dx, dy, weight) in [(0.1, 0.9, 1.0), (0.5, 0.5, 0.25), (0.1, 0.9, 0.25)] {
+        for resolutions in [vec![9], vec![8, 9]] {
+            let reader = GeoTiffStreamReader::open(&path).unwrap();
+            let gt = reader.metadata.geotransform;
+            let mut expected = HashMap::<u64, f64>::new();
+            for &res in &resolutions {
+                for row in 0..4 {
+                    for col in 0..16 {
+                        let (lon, lat) = gt.pixel_to_coord(col as f64 + dx, row as f64 + dy);
+                        let cell = LatLng::new(lat, lon)
+                            .unwrap()
+                            .to_cell(Resolution::try_from(res).unwrap());
+                        *expected.entry(cell.into()).or_default() += weight;
+                    }
+                }
+            }
+            let mut config = MultiResolutionConfig::new(resolutions);
+            config.sampling = SamplingPattern {
+                points: vec![SamplePoint { dx, dy, weight }],
+            };
+            let mut stream = MultiScanHorizonStreamer::new(reader.clone(), &config).unwrap();
+            let mut actual = HashMap::new();
+            while !stream.is_finished() {
+                for record in stream.fetch_next_batch(17).unwrap() {
+                    assert!(actual
+                        .insert(record.h3_index, record.accumulator.count)
+                        .is_none());
+                    assert_eq!(record.accumulator.sum, record.accumulator.count * 3.0);
+                }
+            }
+            assert_eq!(actual, expected);
+            let mut stream = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
+            let mut actual = HashMap::new();
+            while !stream.is_finished() {
+                for record in stream.fetch_next_batch(17).unwrap() {
+                    assert!(actual
+                        .insert(record.h3_index, record.accumulator.total_count)
+                        .is_none());
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+}

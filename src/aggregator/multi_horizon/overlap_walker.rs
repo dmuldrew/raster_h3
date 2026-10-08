@@ -73,7 +73,8 @@ pub fn walk_overlap_pixel_cells<T, FVal, FAccum>(
                 if let Ok(ll) = LatLng::new(lat, lon) {
                     for res_idx in 0..num_res {
                         let res = resolutions[res_idx];
-                        let cell_u64: u64 = ll.to_cell(res).into();
+                        let cell_u64: u64 =
+                            crate::aggregator::multi_horizon::profile::index(ll, res).into();
                         on_cell(res_idx, cell_u64, 1.0, val);
                     }
                 }
@@ -99,7 +100,8 @@ pub fn walk_overlap_pixel_cells<T, FVal, FAccum>(
                     if let Ok(ll) = LatLng::new(lat, lon) {
                         for res_idx in 0..num_res {
                             let res = resolutions[res_idx];
-                            let cell_u64: u64 = ll.to_cell(res).into();
+                            let cell_u64: u64 =
+                                crate::aggregator::multi_horizon::profile::index(ll, res).into();
                             on_cell(res_idx, cell_u64, sp.weight, val);
                         }
                     }

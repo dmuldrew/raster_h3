@@ -45,6 +45,9 @@ pub mod raster;
 /// Cross-format dataset transcoding pipelines (e.g. Parquet to PMTiles).
 pub mod transcode;
 
+pub use h3o;
+pub use h3o::{CellIndex, LatLng, Resolution};
+
 use std::ffi::c_char;
 use std::ptr;
 

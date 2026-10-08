@@ -4,11 +4,10 @@ use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::{CategoricalAccumulator, CategoricalUniformity};
-use crate::aggregator::nodata::{is_decoding_result_all_nodata, PixelValidity};
+use crate::aggregator::nodata::PixelValidity;
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::crs::transformer::CrsTransformer;
-use crate::dispatch_decoding;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
@@ -354,7 +353,7 @@ fn process_categorical_multisample_slice_into_maps<T>(
                 let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
                 let py = (chunk.row_offset as f64) + (row_idx as f64) + sp.dy;
                 let (x, y) = gt.pixel_to_coord(px, py);
-                if let Ok((lon, lat)) = crs_transformer.transform_point(x, y) {
+                if let Ok((lon, lat)) = super::profile::transform(crs_transformer, x, y) {
                     if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
                         if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat
                         {
@@ -371,7 +370,8 @@ fn process_categorical_multisample_slice_into_maps<T>(
                     if let Ok(ll) = LatLng::new(lat, lon) {
                         for res_idx in 0..num_res {
                             let res = resolutions[res_idx];
-                            let cell: u64 = ll.to_cell(res).into();
+                            let cell: u64 =
+                                crate::aggregator::multi_horizon::profile::index(ll, res).into();
                             chunk_maps[res_idx]
                                 .entry(cell)
                                 .and_modify(|acc| acc.update_weighted(cat, sp.weight))
@@ -405,15 +405,49 @@ pub fn process_categorical_chunk_payload_into(
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
 ) -> bool {
+    process_categorical_borrowed_into(
+        chunk_bounds,
+        super::borrowed::BorrowedSamples::from(decoding_result),
+        resolutions,
+        crs_transformer,
+        gt,
+        sampling,
+        bbox,
+        chunk_stride,
+        nodata,
+        samples_per_pixel,
+        band,
+        overlap_ctx,
+        remapper,
+        chunk_maps,
+    )
+}
+
+pub fn process_categorical_borrowed_into(
+    chunk_bounds: &RasterChunk,
+    decoding_result: super::borrowed::BorrowedSamples<'_>,
+    resolutions: &[Resolution],
+    crs_transformer: &CrsTransformer,
+    gt: &GeoTransform,
+    sampling: &SamplingPattern,
+    bbox: Option<[f64; 4]>,
+    chunk_stride: u32,
+    nodata: Option<f64>,
+    samples_per_pixel: u16,
+    band: usize,
+    overlap_ctx: Option<(usize, &MosaicReader)>,
+    remapper: Option<&CategoryRemapper>,
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
+) -> bool {
     let is_multisample = samples_per_pixel > 1 && band > 1;
     let spp = samples_per_pixel.max(1) as usize;
 
     if !is_multisample {
-        if is_decoding_result_all_nodata(decoding_result, nodata) {
+        if decoding_result.all_nodata(nodata) {
             return false;
         }
 
-        dispatch_decoding!(decoding_result, nodata, |slice, nd| {
+        crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
             process_categorical_slice_into_maps(
                 slice,
                 chunk_bounds,
@@ -430,7 +464,7 @@ pub fn process_categorical_chunk_payload_into(
             );
         });
     } else {
-        dispatch_decoding!(decoding_result, nodata, |slice, nd| {
+        crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
             process_categorical_multisample_slice_into_maps(
                 slice,
                 chunk_bounds,

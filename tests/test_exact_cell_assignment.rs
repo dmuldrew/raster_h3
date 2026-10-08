@@ -273,3 +273,50 @@ fn bbox_keeps_subpixel_samples_when_center_is_outside() {
     assert!((records[0].accumulator.sum - 1.4).abs() < 1e-10);
     assert!((categories[0].accumulator.total_count - 0.2).abs() < 1e-10);
 }
+
+#[test]
+fn boundary_assignments_do_not_depend_on_worker_partitioning() {
+    // Place a pixel center at an H3 vertex after a long row prefix. Different
+    // budgets split rows into different jobs; all must use absolute coordinates.
+    let cell = LatLng::new(37.8, -122.4).unwrap().to_cell(Resolution::Nine);
+    let vertex = cell.boundary()[0];
+    let step = 0.00037;
+    let (_file, path) = TestGeoTiffBuilder::new(4096, 2)
+        .origin(vertex.lng() - 1023.5 * step, vertex.lat() + 0.5 * step)
+        .pixel_size(step)
+        .epsg(4326)
+        .create_f32_tempfile(|col, _| (1 + col % 7) as f32);
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let gt = reader.metadata.geotransform;
+    for resolutions in [vec![9], vec![8, 9]] {
+        let mut expected = HashMap::<u64, (f64, f64)>::new();
+        for row in 0..2 {
+            for col in 0..4096 {
+                let (lon, lat) = gt.pixel_center_to_coord(col, row);
+                for &res in &resolutions {
+                    let key = LatLng::new(lat, lon)
+                        .unwrap()
+                        .to_cell(Resolution::try_from(res).unwrap())
+                        .into();
+                    let acc = expected.entry(key).or_default();
+                    acc.0 += 1.0;
+                    acc.1 += (1 + col % 7) as f64;
+                }
+            }
+        }
+        for budget in [64 * 1024, 64 * 1024 * 1024] {
+            let mut config = MultiResolutionConfig::new(resolutions.clone());
+            config.aggregation_budget_bytes = budget * resolutions.len();
+            let mut stream = MultiScanHorizonStreamer::new(reader.clone(), &config).unwrap();
+            let mut actual = HashMap::new();
+            while !stream.is_finished() {
+                for rec in stream.fetch_next_batch(37).unwrap() {
+                    assert!(actual
+                        .insert(rec.h3_index, (rec.accumulator.count, rec.accumulator.sum))
+                        .is_none());
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+}

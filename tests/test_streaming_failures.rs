@@ -69,7 +69,18 @@ fn corrupt_chunk_errors_are_latched_for_both_streamers() {
     let mut continuous =
         MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(file.path()).unwrap(), &config)
             .unwrap();
-    let first = continuous.fetch_next_batch(2048).unwrap_err().to_string();
+    // Completed cells may stream before a later corrupt strip is encountered.
+    let mut failure = None;
+    for _ in 0..1024 {
+        match continuous.fetch_next_batch(2048) {
+            Ok(batch) => assert!(!batch.is_empty(), "corruption must not become EOF"),
+            Err(error) => {
+                failure = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    let first = failure.expect("corrupt strip must eventually fail");
     assert!(first.contains("Raster stream failed"));
     assert_eq!(
         continuous.fetch_next_batch(2048).unwrap_err().to_string(),
@@ -87,11 +98,23 @@ fn corrupt_chunk_errors_are_latched_for_both_streamers() {
         &config,
     )
     .unwrap();
+    let mut failed = false;
+    for _ in 0..1024 {
+        match categorical.drain_completed_into(2048, |_, _| emitted += 1) {
+            Ok(count) => assert!(count > 0, "corruption must not become EOF"),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    let before = emitted;
     assert!(categorical
         .drain_completed_into(2048, |_, _| emitted += 1)
         .is_err());
+    assert_eq!(emitted, before, "no records may be emitted after failure");
     assert!(categorical.fetch_next_batch(2048).is_err());
-    assert_eq!(emitted, 0);
 }
 
 #[test]
@@ -105,11 +128,23 @@ fn duckdb_record_queue_propagates_failure_instead_of_eof() {
         .unwrap(),
     );
     let queue = ConcurrentRecordQueue::new();
-    for _ in 0..2 {
-        assert!(queue
-            .pop_or_refill(&streamer, |s, n, f| s.drain_completed_into(n, f))
-            .is_err());
+    let mut failed = false;
+    for _ in 0..1024 {
+        match queue.pop_or_refill(&streamer, |s, n, f| s.drain_completed_into(n, f)) {
+            Ok(batch) => assert!(
+                batch.is_some_and(|b| !b.is_empty()),
+                "corruption must not become EOF"
+            ),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
     }
+    assert!(failed);
+    assert!(queue
+        .pop_or_refill(&streamer, |s, n, f| s.drain_completed_into(n, f))
+        .is_err());
     assert!(queue.ready_batches.lock().unwrap().is_empty());
 }
 

@@ -164,3 +164,55 @@ fn categorical_sharded_merge_and_eviction_preserve_histograms() {
     }
     check_merge_and_eviction(first, second);
 }
+
+#[test]
+fn test_worker_results_merged_before_watermark_advancement() {
+    // Verifies phase ordering: all worker thread outputs must be merged into
+    // ShardedResolutionMap before watermark advancement and eviction.
+    let res = Resolution::Seven;
+    let test_lat = 45.0;
+    let test_lon = -120.0;
+    let cell: u64 = LatLng::new(test_lat, test_lon).unwrap().to_cell(res).into();
+    let south_lat = compute_cell_south_lat(cell);
+
+    let mut map: ShardedResolutionMap<H3Accumulator> = ShardedResolutionMap::new();
+
+    // 1. Worker threads produce partial results for `cell`
+    let num_workers = 4;
+    let worker_results: Vec<_> = (0..num_workers)
+        .map(|w| {
+            let mut shards: [Vec<(u64, H3Accumulator)>; NUM_SHARDS] =
+                std::array::from_fn(|_| Vec::new());
+            shards[get_shard(cell)].push((cell, H3Accumulator::new((w + 1) as f64)));
+            (vec![shards], ())
+        })
+        .collect();
+
+    // Before merge, cell is not present in map
+    assert_eq!(map.active_cell_count(), 0);
+
+    // If eviction were called with horizon south of cell before merge:
+    let premature_evicted = map.evict_completed(south_lat - 1.0);
+    assert!(premature_evicted.is_empty());
+
+    // 2. Perform Phase 2: Merge all worker outputs into map
+    map.merge_thread_results(&worker_results, 0);
+    assert_eq!(map.active_cell_count(), 1);
+
+    // Verify accumulator before eviction has sum = 1 + 2 + 3 + 4 = 10, count = 4
+    let shard_idx = get_shard(cell);
+    let acc = map.shards[shard_idx].get(&cell).unwrap();
+    assert_eq!(acc.count, 4.0);
+    assert_eq!(acc.sum, 10.0);
+
+    // 3. Perform Phase 3: Watermark advancement and eviction
+    // Horizon is south of cell south_lat: cell should be evicted
+    let evicted = map.evict_completed(south_lat - 1.0);
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(evicted[0].0, cell);
+    assert_eq!(evicted[0].1.count, 4.0);
+    assert_eq!(evicted[0].1.sum, 10.0);
+
+    // Map is now empty
+    assert_eq!(map.active_cell_count(), 0);
+}

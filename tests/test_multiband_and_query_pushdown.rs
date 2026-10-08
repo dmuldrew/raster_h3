@@ -591,3 +591,43 @@ fn test_spectral_formula_out_of_bounds_band_clamping() {
         assert!((rec.accumulator.mean() - 0.60).abs() < 1e-6);
     }
 }
+
+#[test]
+fn borrowed_interleaved_windows_match_across_job_sizes() {
+    // Odd width forces short final horizontal windows at the small budget.
+    // The large budget combines full rows, exercising physical interleaved stride.
+    let file = create_test_rgba_geotiff(257, 33, 50, 100, 150, 200);
+    let mut expected = None;
+    for budget in [64 * 1024, 64 * 1024 * 1024] {
+        let mut config = MultiResolutionConfig::single(11);
+        config.band = 4;
+        config.aggregation_budget_bytes = budget;
+        let mut stream =
+            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(file.path()).unwrap(), &config)
+                .unwrap();
+        let mut result = std::collections::BTreeMap::new();
+        loop {
+            let batch = stream.fetch_next_batch(11).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for r in batch {
+                assert!(result
+                    .insert(r.h3_index, (r.accumulator.count, r.accumulator.sum))
+                    .is_none());
+            }
+        }
+        assert_eq!(result.values().map(|v| v.0).sum::<f64>(), 257.0 * 33.0);
+        assert_eq!(
+            result.values().map(|v| v.1).sum::<f64>(),
+            257.0 * 33.0 * 200.0
+        );
+        if let Some(ref expected) = expected {
+            assert_eq!(&result, expected);
+        } else {
+            expected = Some(result);
+        }
+        #[cfg(feature = "stream-profile")]
+        assert_eq!(stream.metrics.worker.copied_bytes, 0);
+    }
+}

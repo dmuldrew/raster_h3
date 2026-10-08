@@ -12,7 +12,7 @@ use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3::pmtiles::writer::{zxy_to_tile_id, PmtilesWriter};
 use std::fs::File;
 use std::io::Read;
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::NamedTempFile;
 
 #[path = "helpers.rs"]
 mod helpers;
@@ -64,8 +64,8 @@ fn test_pmtiles_v3_header_and_archive_validation() {
     writer.add_tile(10, 163, 395, uncompressed_mvt).unwrap();
     writer.add_tile(11, 327, 791, uncompressed_mvt).unwrap();
 
-    let tmp_dir = tempdir().unwrap();
-    let pmtiles_path = tmp_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let tmp_file = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = tmp_file.to_str().unwrap().to_string();
 
     writer.finish(&pmtiles_path).unwrap();
 
@@ -131,8 +131,8 @@ fn test_geotiff_to_pmtiles_end_to_end() {
     let tiff_path = tiff_tmp.path().to_str().unwrap().to_string();
     create_temp_geotiff(&tiff_path, 256, 256, tiff::tags::CompressionMethod::None).unwrap();
 
-    let pmtiles_dir = tempdir().unwrap();
-    let pmtiles_path = pmtiles_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     let config = MultiResolutionConfig::new(vec![7, 8]);
     let total_hexagons =
@@ -186,8 +186,8 @@ fn test_export_generic_h3_features_with_validation() {
     use raster_h3::pmtiles::mvt::MvtValue;
     use raster_h3::pmtiles::tiler::H3Feature;
 
-    let pmtiles_dir = tempdir().unwrap();
-    let pmtiles_path = pmtiles_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     let valid_cell_1 = 0x8828308281fffffu64; // SF Res 8
     let valid_cell_2 = 0x8828308283fffffu64; // SF Res 8 neighbor
@@ -269,8 +269,8 @@ fn test_parquet_to_pmtiles_end_to_end() {
     use parquet::schema::parser::parse_message_type;
     use std::sync::Arc;
 
-    let tmp_dir = tempdir().unwrap();
-    let parquet_path = tmp_dir.path().join("test.parquet").to_str().unwrap().to_string();
+    let parquet_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_tmp.to_str().unwrap().to_string();
 
     let message_type = "
         message schema {
@@ -315,7 +315,8 @@ fn test_parquet_to_pmtiles_end_to_end() {
     writer.close().unwrap();
 
     // Test process_parquet_to_pmtiles
-    let pmtiles_path = tmp_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     let summary =
         H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
@@ -339,8 +340,8 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
     use parquet::schema::parser::parse_message_type;
     use std::sync::Arc;
 
-    let tmp_dir = tempdir().unwrap();
-    let parquet_path = tmp_dir.path().join("test.parquet").to_str().unwrap().to_string();
+    let parquet_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_tmp.to_str().unwrap().to_string();
 
     let message_type = "
         message schema {
@@ -375,7 +376,8 @@ fn test_parquet_to_pmtiles_custom_col_and_hex_string() {
     row_group.close().unwrap();
     writer.close().unwrap();
 
-    let pmtiles_path = tmp_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     let summary = H3PmtilesTiler::process_parquet_to_pmtiles(
         &parquet_path,
@@ -397,8 +399,8 @@ fn test_parquet_to_pmtiles_multi_row_group_eviction() {
     use parquet::schema::parser::parse_message_type;
     use std::sync::Arc;
 
-    let tmp_dir = tempdir().unwrap();
-    let parquet_path = tmp_dir.path().join("test.parquet").to_str().unwrap().to_string();
+    let parquet_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_tmp.to_str().unwrap().to_string();
 
     let message_type = "
         message schema {
@@ -464,7 +466,8 @@ fn test_parquet_to_pmtiles_multi_row_group_eviction() {
 
     writer.close().unwrap();
 
-    let pmtiles_path = tmp_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     let summary =
         H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
@@ -509,8 +512,8 @@ fn test_pmtiles_coarse_zoom_parent_aggregation_content() {
     let tiff_path = tiff_tmp.path().to_str().unwrap().to_string();
     create_temp_geotiff(&tiff_path, 64, 64, tiff::tags::CompressionMethod::None).unwrap();
 
-    let pmtiles_dir = tempdir().unwrap();
-    let pmtiles_path = pmtiles_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     // Export fine resolutions 7 and 8
     let config = MultiResolutionConfig::new(vec![7, 8]);
@@ -593,8 +596,8 @@ fn test_all_nodata_geotiff_to_pmtiles_export() {
         image.write_data(&data).unwrap();
     }
 
-    let pmtiles_dir = tempdir().unwrap();
-    let pmtiles_path = pmtiles_dir.path().join("test.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
     let config = MultiResolutionConfig::new(vec![7, 8]);
     let total_hexagons =
@@ -715,8 +718,8 @@ fn test_geotiff_to_pmtiles_selective_properties() {
     create_temp_geotiff(&tiff_path, 256, 256, tiff::tags::CompressionMethod::None).unwrap();
 
     // 1. Generate full archive with all properties
-    let pmtiles_dir = tempdir().unwrap();
-    let pmtiles_all_path = pmtiles_dir.path().join("all.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_all_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_all_path = pmtiles_all_tmp.to_str().unwrap().to_string();
     let config_all = MultiResolutionConfig::new(vec![7, 8]);
     let hex_all =
         H3PmtilesTiler::process_geotiff_to_pmtiles(&tiff_path, &pmtiles_all_path, config_all)
@@ -728,7 +731,8 @@ fn test_geotiff_to_pmtiles_selective_properties() {
         .len();
 
     // 2. Generate selective archive with only "mean,count"
-    let pmtiles_sel_path = pmtiles_dir.path().join("sel.pmtiles").to_str().unwrap().to_string();
+    let pmtiles_sel_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_sel_path = pmtiles_sel_tmp.to_str().unwrap().to_string();
     let mut config_sel = MultiResolutionConfig::new(vec![7, 8]);
     config_sel.properties = Some("mean,count".to_string());
     let hex_sel =

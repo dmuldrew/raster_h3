@@ -7,7 +7,7 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::fs::File;
-use tempfile::tempdir;
+use tempfile::NamedTempFile;
 
 use helpers::create_wave_test_geotiff as create_test_geotiff;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -403,7 +403,12 @@ fn test_multi_resolution_categorical_supersampling_exact_match() {
                 "Total count mismatch at cell {:x}",
                 cell_u64
             );
-            assert_eq!(multi_rec.accumulator.majority(), single_acc.majority());
+            let (multi_class, multi_weight, multi_fraction) = multi_rec.accumulator.majority();
+            let (single_class, single_weight, single_fraction) = single_acc.majority();
+            assert_eq!(multi_class, single_class);
+            // Bounded windows change merge association for fractional weights.
+            assert!((multi_weight - single_weight).abs() < 1e-9);
+            assert!((multi_fraction - single_fraction).abs() < 1e-12);
             single_acc.for_each_class(|cat, cnt| {
                 assert!(
                     (multi_rec.accumulator.get_class_count(cat) - cnt).abs() < 1e-6,
@@ -421,8 +426,8 @@ fn test_parquet_continuous_streaming_export_and_sorting() {
     let tiff_file = create_test_geotiff(128, 128);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_dir = tempdir().unwrap();
-    let parquet_path = parquet_dir.path().join("test.parquet");
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8, 9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -489,8 +494,8 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
     let tiff_file = create_test_geotiff(128, 128);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_dir = tempdir().unwrap();
-    let parquet_path = parquet_dir.path().join("test.parquet");
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8, 9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
