@@ -290,7 +290,7 @@ impl RecordStreamer for MultiScanHorizonStreamer {
 
     #[inline(always)]
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
-        Some(self.inner.mosaic.mosaic_bounds_wgs84)
+        Some(self.inner.mosaic().mosaic_bounds_wgs84)
     }
 
     #[inline(always)]

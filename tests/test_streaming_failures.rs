@@ -256,7 +256,7 @@ fn premature_prefetch_termination_is_an_error() {
         &MultiResolutionConfig::single(8),
     )
     .unwrap();
-    streamer.prefetcher.take();
+    streamer.abort_prefetch_for_testing();
     assert!(streamer
         .fetch_next_batch(2048)
         .unwrap_err()

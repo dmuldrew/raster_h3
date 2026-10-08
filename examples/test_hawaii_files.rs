@@ -78,7 +78,7 @@ fn main() {
         dur_cfl_full,
         (total_cfl_pixels / 1_000_000.0) / dur_cfl_full.as_secs_f64()
     );
-    let s = &streamer_cfl.metrics;
+    let s = streamer_cfl.metrics();
     println!(
         "      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms",
         s.prefetch_wait_ns as f64 / 1_000_000.0,
@@ -224,7 +224,7 @@ fn main() {
         dur_lf_full,
         (total_lf_pixels / 1_000_000.0) / dur_lf_full.as_secs_f64()
     );
-    let s_lf = &streamer_lf.metrics;
+    let s_lf = streamer_lf.metrics();
     println!(
         "      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms",
         s_lf.prefetch_wait_ns as f64 / 1_000_000.0,

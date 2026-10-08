@@ -102,13 +102,9 @@ fn check_merge_and_eviction<A: SpillAccumulator + PartialEq + Debug>(first: A, s
         }
     }
     assert_eq!(map.active_cell_count(), cells.len());
-    assert!(map.shards.iter().all(|shard| !shard.is_empty()));
-    for (shard, heap) in map.shards.iter().zip(&map.eviction) {
-        assert_eq!(
-            shard.len(),
-            heap.len(),
-            "one eviction entry per cell after merging"
-        );
+    for (cells, entries) in map.shard_occupancy() {
+        assert!(cells > 0);
+        assert_eq!(cells, entries, "one eviction entry per cell after merging");
     }
 
     let mut evicted = Vec::new();
@@ -132,7 +128,7 @@ fn check_merge_and_eviction<A: SpillAccumulator + PartialEq + Debug>(first: A, s
     assert_eq!(evicted.len(), cells.len(), "no missing or duplicate cells");
     assert_eq!(evicted.into_iter().collect::<HashMap<_, _>>(), expected);
     assert_eq!(map.active_cell_count(), 0);
-    assert!(map.eviction.iter().all(|heap| heap.is_empty()));
+    assert!(map.shard_occupancy().all(|(_, entries)| entries == 0));
 }
 
 #[test]
@@ -169,7 +165,7 @@ fn test_worker_results_merged_before_watermark_advancement() {
         map.merge_owned(cell, H3Accumulator::new(w as f64));
     }
     assert_eq!(map.active_cell_count(), 1);
-    let acc = map.shards[get_shard(cell)].get(&cell).unwrap();
+    let acc = map.get(cell).unwrap();
     assert_eq!(acc.count, 4.0);
     assert_eq!(acc.sum, 10.0);
 

@@ -68,12 +68,11 @@ impl AccumulatorMerge for CategoricalAccumulator {
 /// checks, and pops completed cells incrementally. Merging and eviction both
 /// require exclusive access, so the phases cannot overlap in safe Rust.
 pub struct ShardedResolutionMap<A: AccumulatorMerge> {
-    pub shards: Vec<HashMap<u64, A, FxBuildHasher>>,
-    pub eviction: Vec<BinaryHeap<HexEvictionEntry>>,
+    shards: Vec<HashMap<u64, A, FxBuildHasher>>,
+    eviction: Vec<BinaryHeap<HexEvictionEntry>>,
     dynamic_bytes: usize,
     /// Table and heap allocation, maintained incrementally so budget checks
-    /// stay O(1) per merged cell. Mutating `shards` or `eviction` directly
-    /// bypasses this count.
+    /// stay O(1) per merged cell.
     structure_bytes: usize,
     track_eviction: bool,
 }
@@ -112,6 +111,19 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
     /// Return total active in-flight cell count across all 32 shards
     pub fn active_cell_count(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    /// The active accumulator for `cell`, if any
+    pub fn get(&self, cell: u64) -> Option<&A> {
+        self.shards[get_shard(cell)].get(&cell)
+    }
+
+    /// Per shard: (active cells, pending eviction entries)
+    pub fn shard_occupancy(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.shards
+            .iter()
+            .zip(&self.eviction)
+            .map(|(map, heap)| (map.len(), heap.len()))
     }
 }
 

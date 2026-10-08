@@ -138,22 +138,22 @@ pub trait RecordStreamer {
 
 /// Generic single-pass streaming aggregator across multiple H3 resolutions
 pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
-    pub kernel: K,
-    pub prefetcher: Option<PrefetchedMosaicReader>,
-    pub mosaic: Arc<MosaicReader>,
-    pub resolutions: Vec<Resolution>,
-    pub resolution_u8s: Vec<u8>,
-    pub nodata: Option<f64>,
-    pub bbox: Option<[f64; 4]>,
-    pub sampling: SamplingPattern,
-    pub resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
+    kernel: K,
+    prefetcher: Option<PrefetchedMosaicReader>,
+    mosaic: Arc<MosaicReader>,
+    resolutions: Vec<Resolution>,
+    resolution_u8s: Vec<u8>,
+    nodata: Option<f64>,
+    bbox: Option<[f64; 4]>,
+    sampling: SamplingPattern,
+    resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
     compactor: HierarchicalCompactor<K>,
     output_buffer: OutputBuffer<K::Record>,
     lifecycle: StreamLifecycle,
-    pub current_lat_horizon: f64,
-    pub can_evict_early: bool,
-    pub suffix_max_north_lat: Vec<f64>,
-    pub processed_chunk_count: usize,
+    current_lat_horizon: f64,
+    can_evict_early: bool,
+    suffix_max_north_lat: Vec<f64>,
+    processed_chunk_count: usize,
     spill_runs: Vec<SpillRuns<K::Accumulator>>,
     final_reader: Option<FinalCells<K::Accumulator>>,
     eviction_horizon: f64,
@@ -169,7 +169,7 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     output_byte_limit: usize,
     peak_active_bytes: usize,
     worker_maps: Vec<Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>>,
-    pub metrics: super::profile::StreamProfile,
+    metrics: super::profile::StreamProfile,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -329,6 +329,33 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// Target H3 resolution integer levels
     pub fn resolution_u8s(&self) -> &[u8] {
         &self.resolution_u8s
+    }
+
+    /// The tiles and latitude-ordered chunk list being streamed
+    pub fn mosaic(&self) -> &MosaicReader {
+        &self.mosaic
+    }
+
+    /// Whether some chunk suffix has a certified northern bound, permitting
+    /// cells to be finalized before EOF
+    pub fn can_evict_early(&self) -> bool {
+        self.can_evict_early
+    }
+
+    /// Chunks fully merged into the resolution maps so far
+    pub fn processed_chunk_count(&self) -> usize {
+        self.processed_chunk_count
+    }
+
+    /// Stage timings and counters for this stream
+    pub fn metrics(&self) -> &super::profile::StreamProfile {
+        &self.metrics
+    }
+
+    /// Drop the prefetcher as if it ended early, for failure-path tests.
+    #[doc(hidden)]
+    pub fn abort_prefetch_for_testing(&mut self) {
+        self.prefetcher.take();
     }
 
     /// Whether hierarchical child-to-parent compaction is active
