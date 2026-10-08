@@ -81,7 +81,7 @@ jobs:
           cp target/duckdb_lib/duckdb.dll . || true
 
       - name: Run Tests
-        run: cargo test --release
+        run: cargo test --release --no-fail-fast
 
       - name: Build Dynamic Library & Binaries
         run: cargo build --release --target ${{ matrix.target }}
