@@ -82,7 +82,9 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
                         entry.0.merge(&acc);
                         entry.1.push((cell_u64, acc));
 
-                        if entry.1.len() == parent.children(cell.resolution()).count() {
+                        // A pentagon has six children at the next resolution.
+                        let siblings = if parent.is_pentagon() { 6 } else { 7 };
+                        if entry.1.len() == siblings {
                             let (parent_acc, _) = self.pending.remove(&parent_u64).unwrap();
                             let p_res_u8: u8 = parent_res.into();
                             kernel.buffer_record(p_res_u8, parent_u64, parent_acc, output);

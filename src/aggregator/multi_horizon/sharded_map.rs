@@ -73,6 +73,9 @@ pub struct ShardedResolutionMap<A: AccumulatorMerge> {
     pub shards: Vec<HashMap<u64, A, FxBuildHasher>>,
     pub eviction: Vec<BinaryHeap<HexEvictionEntry>>,
     dynamic_bytes: usize,
+    /// Table and heap allocation, maintained incrementally so budget checks
+    /// stay O(1) per merged cell. Refreshed after every bulk mutation.
+    structure_bytes: usize,
     track_eviction: bool,
 }
 
@@ -92,8 +95,19 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             shards,
             eviction,
             dynamic_bytes: 0,
+            structure_bytes: 0,
             track_eviction: true,
         }
+    }
+
+    #[inline]
+    fn shard_bytes(&self, s: usize) -> usize {
+        super::spill::table_bytes::<u64, A>(self.shards[s].capacity())
+            + self.eviction[s].capacity() * std::mem::size_of::<HexEvictionEntry>()
+    }
+
+    fn recount_structure(&mut self) {
+        self.structure_bytes = (0..NUM_SHARDS).map(|s| self.shard_bytes(s)).sum();
     }
 
     /// Merge partial chunk results from parallel worker threads into the 32 shards.
@@ -138,6 +152,7 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             .flat_map(|map| map.values())
             .map(A::heap_bytes)
             .sum();
+        self.recount_structure();
     }
 
     /// Evict completed cells that lie north of `lat_horizon` across all 32 shards in parallel,
@@ -168,6 +183,7 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             .iter()
             .map(|(_, acc)| acc.heap_bytes())
             .sum::<usize>();
+        self.recount_structure();
         newly_evicted.par_sort_unstable_by_key(|item| item.0);
         newly_evicted
     }
@@ -191,6 +207,7 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             .collect();
 
         self.dynamic_bytes = 0;
+        self.recount_structure();
         remaining.par_sort_unstable_by_key(|item| item.0);
         remaining
     }
@@ -208,19 +225,25 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
             for heap in &mut self.eviction {
                 *heap = BinaryHeap::new();
             }
+            self.recount_structure();
         }
     }
 
     /// Owned merge avoids cloning a large quantile or categorical state.
+    /// Returns the merged accumulator's memory footprint.
     pub fn merge_owned(&mut self, key: u64, acc: A) -> usize {
         let s = get_shard(key);
-        match self.shards[s].entry(key) {
+        let before = self.shard_bytes(s);
+        let merged_bytes = match self.shards[s].entry(key) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                self.dynamic_bytes -= entry.get().heap_bytes();
-                entry.get_mut().merge(&acc);
-                self.dynamic_bytes += entry.get().heap_bytes();
+                let existing = entry.get_mut();
+                self.dynamic_bytes -= existing.heap_bytes();
+                existing.merge(&acc);
+                self.dynamic_bytes += existing.heap_bytes();
+                existing.memory_bytes()
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let bytes = acc.memory_bytes();
                 self.dynamic_bytes += acc.heap_bytes();
                 entry.insert(acc);
                 if self.track_eviction {
@@ -229,36 +252,35 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
                         south_lat: compute_cell_south_lat(key),
                     });
                 }
+                bytes
             }
-        }
-        self.shards[s][&key].memory_bytes()
+        };
+        self.structure_bytes = self.structure_bytes - before + self.shard_bytes(s);
+        merged_bytes
     }
 
     pub fn estimated_bytes(&self) -> usize {
-        self.dynamic_bytes
-            + self
-                .shards
-                .iter()
-                .map(|s| super::spill::table_bytes::<u64, A>(s.capacity()))
-                .sum::<usize>()
-            + self
-                .eviction
-                .iter()
-                .map(|h| h.capacity() * std::mem::size_of::<HexEvictionEntry>())
-                .sum::<usize>()
+        self.dynamic_bytes + self.structure_bytes
     }
 
     /// Remove at most one completed cell, keeping output backpressure effective.
     pub fn pop_completed(&mut self, horizon: f64) -> Option<(u64, A)> {
-        for (map, heap) in self.shards.iter_mut().zip(&mut self.eviction) {
-            while heap.peek().is_some_and(|e| e.south_lat > horizon) {
-                let key = heap.pop().unwrap().cell_u64;
-                if let Some(acc) = map.remove(&key) {
+        for s in 0..NUM_SHARDS {
+            while self.eviction[s]
+                .peek()
+                .is_some_and(|e| e.south_lat > horizon)
+            {
+                // Removal can leave a tombstone that lowers reported capacity.
+                let before = self.shard_bytes(s);
+                let key = self.eviction[s].pop().unwrap().cell_u64;
+                let removed = self.shards[s].remove(&key);
+                if removed.is_some() && self.shards[s].is_empty() {
+                    self.shards[s] = HashMap::with_hasher(FxBuildHasher::default());
+                    self.eviction[s] = BinaryHeap::new();
+                }
+                self.structure_bytes = self.structure_bytes - before + self.shard_bytes(s);
+                if let Some(acc) = removed {
                     self.dynamic_bytes -= acc.heap_bytes();
-                    if map.is_empty() {
-                        *map = HashMap::with_hasher(FxBuildHasher::default());
-                        *heap = BinaryHeap::new();
-                    }
                     return Some((key, acc));
                 }
             }
@@ -276,7 +298,58 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
             *heap = BinaryHeap::new();
         }
         self.dynamic_bytes = 0;
+        self.structure_bytes = 0;
         records.sort_unstable_by_key(|(key, _)| *key);
         records
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use h3o::{LatLng, Resolution};
+
+    fn recounted(map: &ShardedResolutionMap<H3Accumulator>) -> usize {
+        let dynamic: usize = map
+            .shards
+            .iter()
+            .flat_map(|s| s.values())
+            .map(|a| a.heap_bytes())
+            .sum();
+        dynamic + (0..NUM_SHARDS).map(|s| map.shard_bytes(s)).sum::<usize>()
+    }
+
+    #[test]
+    fn incremental_estimate_matches_full_recount() {
+        let mut map = ShardedResolutionMap::<H3Accumulator>::new();
+        let res = Resolution::try_from(7).unwrap();
+        let cells: Vec<u64> = (0..2000)
+            .map(|i| {
+                let ll = LatLng::new(60.0 - i as f64 * 0.05, -120.0 + (i % 40) as f64 * 0.1);
+                u64::from(ll.unwrap().to_cell(res))
+            })
+            .collect();
+        for (i, &cell) in cells.iter().enumerate() {
+            let mut acc = if i % 3 == 0 {
+                H3Accumulator::with_quantiles()
+            } else {
+                H3Accumulator::default()
+            };
+            acc.update(i as f64);
+            map.merge_owned(cell, acc);
+            assert_eq!(map.estimated_bytes(), recounted(&map));
+        }
+        // Pop until shards empty out and are replaced.
+        while map.pop_completed(f64::NEG_INFINITY).is_some() {
+            assert_eq!(map.estimated_bytes(), recounted(&map));
+        }
+        assert_eq!(map.estimated_bytes(), 0);
+        for &cell in &cells[..500] {
+            map.merge_owned(cell, H3Accumulator::new(1.0));
+        }
+        map.set_eviction_enabled(false);
+        assert_eq!(map.estimated_bytes(), recounted(&map));
+        map.take_sorted();
+        assert_eq!(map.estimated_bytes(), 0);
     }
 }
