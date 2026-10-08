@@ -426,8 +426,8 @@ fn test_parquet_continuous_streaming_export_and_sorting() {
     let tiff_file = create_test_geotiff(128, 128);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8, 9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
@@ -494,8 +494,8 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
     let tiff_file = create_test_geotiff(128, 128);
     let tiff_path = tiff_file.path().to_str().unwrap();
 
-    let parquet_file = NamedTempFile::new().unwrap();
-    let parquet_path = parquet_file.path().to_path_buf();
+    let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+    let parquet_path = parquet_file.to_path_buf();
 
     let config = MultiResolutionConfig::new(vec![8, 9]);
     let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
