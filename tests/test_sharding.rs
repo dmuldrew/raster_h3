@@ -6,9 +6,8 @@ use h3o::{LatLng, Resolution};
 use raster_h3::aggregator::accumulator::H3Accumulator;
 use raster_h3::aggregator::categorical::CategoricalAccumulator;
 use raster_h3::aggregator::horizon_streamer::compute_cell_south_lat;
-use raster_h3::aggregator::multi_horizon::{
-    get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS,
-};
+use raster_h3::aggregator::multi_horizon::spill::SpillAccumulator;
+use raster_h3::aggregator::multi_horizon::{get_shard, ShardedResolutionMap, NUM_SHARDS};
 
 fn global_cells(res: Resolution) -> HashSet<u64> {
     (-75..75)
@@ -87,7 +86,7 @@ fn shard_distribution_in_local_raster_neighborhoods() {
     }
 }
 
-fn check_merge_and_eviction<A: AccumulatorMerge + PartialEq + Debug>(first: A, second: A) {
+fn check_merge_and_eviction<A: SpillAccumulator + PartialEq + Debug>(first: A, second: A) {
     let cells = global_cells(Resolution::Eight);
     let mut expected_value = first.clone();
     expected_value.merge(&second);
@@ -95,58 +94,45 @@ fn check_merge_and_eviction<A: AccumulatorMerge + PartialEq + Debug>(first: A, s
         .iter()
         .map(|&cell| (cell, expected_value.clone()))
         .collect();
-    let results: Vec<_> = [first, second]
-        .into_iter()
-        .map(|value| {
-            let mut shards: [Vec<(u64, A)>; NUM_SHARDS] = std::array::from_fn(|_| Vec::new());
-            for &cell in &cells {
-                shards[get_shard(cell)].push((cell, value.clone()));
-            }
-            // A second resolution slot checks that the requested slot is used.
-            (vec![std::array::from_fn(|_| Vec::new()), shards], ())
-        })
-        .collect();
 
-    for threads in [1, 4] {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap()
-            .install(|| {
-                let mut map = ShardedResolutionMap::new();
-                map.merge_thread_results(&results, 0);
-                assert_eq!(map.active_cell_count(), 0);
-                map.merge_thread_results(&results, 1);
-                assert_eq!(map.active_cell_count(), cells.len());
-                assert!(map.shards.iter().all(|shard| !shard.is_empty()));
-                for (shard, heap) in map.shards.iter().zip(&map.eviction) {
-                    assert_eq!(
-                        shard.len(),
-                        heap.len(),
-                        "one eviction entry per cell after merging"
-                    );
-                }
-                let mut evicted = map.evict_completed(0.0);
-                assert!(!evicted.is_empty());
-                assert!(evicted
-                    .iter()
-                    .all(|(cell, _)| compute_cell_south_lat(*cell) > 0.0));
-                assert!(evicted.windows(2).all(|w| w[0].0 < w[1].0));
-                assert_eq!(map.active_cell_count(), cells.len() - evicted.len());
-                assert!(map.evict_completed(0.0).is_empty());
-                let remaining = map.drain_all();
-                assert!(!remaining.is_empty());
-                assert!(remaining
-                    .iter()
-                    .all(|(cell, _)| compute_cell_south_lat(*cell) <= 0.0));
-                assert!(remaining.windows(2).all(|w| w[0].0 < w[1].0));
-                evicted.extend(remaining);
-                assert_eq!(evicted.len(), cells.len(), "no missing or duplicate cells");
-                assert_eq!(evicted.into_iter().collect::<HashMap<_, _>>(), expected);
-                assert_eq!(map.active_cell_count(), 0);
-                assert!(map.eviction.iter().all(|heap| heap.is_empty()));
-            });
+    let mut map = ShardedResolutionMap::new();
+    for value in [first, second] {
+        for &cell in &cells {
+            map.merge_owned(cell, value.clone());
+        }
     }
+    assert_eq!(map.active_cell_count(), cells.len());
+    assert!(map.shards.iter().all(|shard| !shard.is_empty()));
+    for (shard, heap) in map.shards.iter().zip(&map.eviction) {
+        assert_eq!(
+            shard.len(),
+            heap.len(),
+            "one eviction entry per cell after merging"
+        );
+    }
+
+    let mut evicted = Vec::new();
+    while let Some(item) = map.pop_completed(0.0) {
+        evicted.push(item);
+    }
+    assert!(!evicted.is_empty());
+    assert!(evicted
+        .iter()
+        .all(|(cell, _)| compute_cell_south_lat(*cell) > 0.0));
+    assert_eq!(map.active_cell_count(), cells.len() - evicted.len());
+    assert!(map.pop_completed(0.0).is_none());
+
+    let remaining = map.take_sorted();
+    assert!(!remaining.is_empty());
+    assert!(remaining
+        .iter()
+        .all(|(cell, _)| compute_cell_south_lat(*cell) <= 0.0));
+    assert!(remaining.windows(2).all(|w| w[0].0 < w[1].0));
+    evicted.extend(remaining);
+    assert_eq!(evicted.len(), cells.len(), "no missing or duplicate cells");
+    assert_eq!(evicted.into_iter().collect::<HashMap<_, _>>(), expected);
+    assert_eq!(map.active_cell_count(), 0);
+    assert!(map.eviction.iter().all(|heap| heap.is_empty()));
 }
 
 #[test]
@@ -167,52 +153,34 @@ fn categorical_sharded_merge_and_eviction_preserve_histograms() {
 
 #[test]
 fn test_worker_results_merged_before_watermark_advancement() {
-    // Verifies phase ordering: all worker thread outputs must be merged into
-    // ShardedResolutionMap before watermark advancement and eviction.
+    // Verifies phase ordering: all worker outputs for a cell must be merged
+    // into ShardedResolutionMap before the watermark passes it.
     let res = Resolution::Seven;
-    let test_lat = 45.0;
-    let test_lon = -120.0;
-    let cell: u64 = LatLng::new(test_lat, test_lon).unwrap().to_cell(res).into();
+    let cell: u64 = LatLng::new(45.0, -120.0).unwrap().to_cell(res).into();
     let south_lat = compute_cell_south_lat(cell);
 
     let mut map: ShardedResolutionMap<H3Accumulator> = ShardedResolutionMap::new();
 
-    // 1. Worker threads produce partial results for `cell`
-    let num_workers = 4;
-    let worker_results: Vec<_> = (0..num_workers)
-        .map(|w| {
-            let mut shards: [Vec<(u64, H3Accumulator)>; NUM_SHARDS] =
-                std::array::from_fn(|_| Vec::new());
-            shards[get_shard(cell)].push((cell, H3Accumulator::new((w + 1) as f64)));
-            (vec![shards], ())
-        })
-        .collect();
+    // Eviction before any merge finds nothing, even with the horizon past the cell.
+    assert!(map.pop_completed(south_lat - 1.0).is_none());
 
-    // Before merge, cell is not present in map
-    assert_eq!(map.active_cell_count(), 0);
-
-    // If eviction were called with horizon south of cell before merge:
-    let premature_evicted = map.evict_completed(south_lat - 1.0);
-    assert!(premature_evicted.is_empty());
-
-    // 2. Perform Phase 2: Merge all worker outputs into map
-    map.merge_thread_results(&worker_results, 0);
+    // Merge four worker partials for the same cell.
+    for w in 1..=4 {
+        map.merge_owned(cell, H3Accumulator::new(w as f64));
+    }
     assert_eq!(map.active_cell_count(), 1);
-
-    // Verify accumulator before eviction has sum = 1 + 2 + 3 + 4 = 10, count = 4
-    let shard_idx = get_shard(cell);
-    let acc = map.shards[shard_idx].get(&cell).unwrap();
+    let acc = map.shards[get_shard(cell)].get(&cell).unwrap();
     assert_eq!(acc.count, 4.0);
     assert_eq!(acc.sum, 10.0);
 
-    // 3. Perform Phase 3: Watermark advancement and eviction
-    // Horizon is south of cell south_lat: cell should be evicted
-    let evicted = map.evict_completed(south_lat - 1.0);
-    assert_eq!(evicted.len(), 1);
-    assert_eq!(evicted[0].0, cell);
-    assert_eq!(evicted[0].1.count, 4.0);
-    assert_eq!(evicted[0].1.sum, 10.0);
+    // A horizon north of the cell's southern bound must not evict it.
+    assert!(map.pop_completed(south_lat + 1.0).is_none());
 
-    // Map is now empty
+    // Once the horizon passes the cell, it is emitted exactly once with all partials.
+    let (key, acc) = map.pop_completed(south_lat - 1.0).unwrap();
+    assert_eq!(key, cell);
+    assert_eq!(acc.count, 4.0);
+    assert_eq!(acc.sum, 10.0);
+    assert!(map.pop_completed(south_lat - 1.0).is_none());
     assert_eq!(map.active_cell_count(), 0);
 }

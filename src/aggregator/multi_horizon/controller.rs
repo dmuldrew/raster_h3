@@ -153,7 +153,6 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     pub current_lat_horizon: f64,
     pub can_evict_early: bool,
     pub suffix_max_north_lat: Vec<f64>,
-    pub profile_stats: [u64; 4],
     pub processed_chunk_count: usize,
     spill_runs: Vec<SpillRuns<K::Accumulator>>,
     final_reader: Option<FinalCells<K::Accumulator>>,
@@ -284,7 +283,6 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             current_lat_horizon: f64::INFINITY,
             can_evict_early,
             suffix_max_north_lat,
-            profile_stats: [0; 4],
             processed_chunk_count: 0,
             spill_runs,
             final_reader: None,
@@ -507,7 +505,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         .map(process)
                         .collect_into_vec(&mut results);
                 }
-                self.profile_stats[1] += t.elapsed().as_nanos() as u64;
+                self.metrics.kernel_wall_ns += t.elapsed().as_nanos() as u64;
                 for (profile, ns) in results.drain(..) {
                     self.metrics.worker.merge(profile);
                     self.metrics.worker_ns += ns;
@@ -527,7 +525,6 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     self.merge_window(m)?;
                 }
                 let ns = t.elapsed().as_nanos() as u64;
-                self.profile_stats[2] += ns;
                 self.metrics.merge_ns += ns;
                 // Retained buckets are part of worker storage, not free capacity.
                 if bytes > self.worker_budget {
@@ -625,7 +622,6 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 prefetcher.drain_chunk_batch_into(&mut items, 1, self.batch_size);
             }
             let elapsed = t0.elapsed().as_nanos() as u64;
-            self.profile_stats[0] += elapsed;
             self.metrics.prefetch_wait_ns += elapsed;
             if items.is_empty() {
                 if self.processed_chunk_count != self.mosaic.chunk_refs.len() {

@@ -78,9 +78,12 @@ fn main() {
         dur_cfl_full,
         (total_cfl_pixels / 1_000_000.0) / dur_cfl_full.as_secs_f64()
     );
-    let s = streamer_cfl.profile_stats;
-    println!("      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms, evict={:.2}ms",
-        s[0] as f64 / 1_000_000.0, s[1] as f64 / 1_000_000.0, s[2] as f64 / 1_000_000.0, s[3] as f64 / 1_000_000.0
+    let s = &streamer_cfl.metrics;
+    println!(
+        "      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms",
+        s.prefetch_wait_ns as f64 / 1_000_000.0,
+        s.kernel_wall_ns as f64 / 1_000_000.0,
+        s.merge_ns as f64 / 1_000_000.0
     );
 
     // 1B. Spatial Filter Pushdown: Bounding Box (Oahu South Shore ROI)
@@ -221,9 +224,12 @@ fn main() {
         dur_lf_full,
         (total_lf_pixels / 1_000_000.0) / dur_lf_full.as_secs_f64()
     );
-    let s_lf = streamer_lf.profile_stats;
-    println!("      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms, evict={:.2}ms",
-        s_lf[0] as f64 / 1_000_000.0, s_lf[1] as f64 / 1_000_000.0, s_lf[2] as f64 / 1_000_000.0, s_lf[3] as f64 / 1_000_000.0
+    let s_lf = &streamer_lf.metrics;
+    println!(
+        "      - Profile Stats   : wait/decomp={:.2}ms, rayon_kernel={:.2}ms, merge={:.2}ms",
+        s_lf.prefetch_wait_ns as f64 / 1_000_000.0,
+        s_lf.kernel_wall_ns as f64 / 1_000_000.0,
+        s_lf.merge_ns as f64 / 1_000_000.0
     );
 
     let mut top_classes: Vec<_> = class_distribution.into_iter().collect();

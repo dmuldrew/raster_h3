@@ -4,7 +4,6 @@
 //! the logical parent changes. Siblings are contiguous at a fixed resolution,
 //! bounding pending storage to one group (seven hexagon or six pentagon children).
 //! This avoids assuming that geographic parent polygons contain logical children.
-//! Legacy horizon-based methods remain available but are not used by the controller.
 
 use fxhash::FxBuildHasher;
 use h3o::CellIndex;
@@ -13,7 +12,6 @@ use std::collections::HashMap;
 use super::controller::HorizonStreamKernel;
 use super::lifecycle::OutputBuffer;
 use super::sharded_map::AccumulatorMerge;
-use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 
 /// Generic hierarchical H3 7-to-1 compaction aggregator.
 #[allow(clippy::type_complexity)]
@@ -97,55 +95,6 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
         }
 
         kernel.buffer_record(res_u8, cell_u64, acc, output);
-    }
-
-    /// Evict pending parents that lie strictly north of the scanline latitude horizon.
-    ///
-    /// Incomplete parents (those with < 7 children) cannot receive any further child cells
-    /// because the scanline horizon has passed their southernmost latitude. They are decomposed
-    /// and emitted as individual child records at their native resolution.
-    pub fn evict_above_horizon(
-        &mut self,
-        kernel: &K,
-        lat_horizon: f64,
-        output: &mut OutputBuffer<K::Record>,
-    ) {
-        if !self.enabled || self.pending.is_empty() {
-            return;
-        }
-
-        let mut to_flush = Vec::new();
-        for &parent_u64 in self.pending.keys() {
-            // Logical children protrude outside a parent's geographic polygon.
-            // Bound their union instead of treating the parent polygon as a cover.
-            let parent_south = CellIndex::try_from(parent_u64)
-                .ok()
-                .and_then(|parent| {
-                    parent.resolution().succ().map(|res| {
-                        parent
-                            .children(res)
-                            .map(|child| compute_cell_south_lat(child.into()))
-                            .fold(f64::INFINITY, f64::min)
-                    })
-                })
-                .unwrap_or(-90.0);
-            if parent_south > lat_horizon {
-                to_flush.push(parent_u64);
-            }
-        }
-
-        for p in to_flush {
-            if let Some((_, children)) = self.pending.remove(&p) {
-                for (cell_u64, acc) in children {
-                    let res_u8 = if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                        cell.resolution().into()
-                    } else {
-                        8
-                    };
-                    kernel.buffer_record(res_u8, cell_u64, acc, output);
-                }
-            }
-        }
     }
 
     /// Flush all remaining pending parents at EOF, decomposing them into child records.
