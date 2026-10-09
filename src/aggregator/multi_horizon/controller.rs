@@ -115,6 +115,12 @@ pub trait RecordStreamer {
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         None
     }
+
+    /// Whether complete sibling groups are emitted as parent records at one
+    /// resolution coarser than requested
+    fn compacts_children(&self) -> bool {
+        false
+    }
 }
 
 /// Generic single-pass streaming aggregator across multiple H3 resolutions
@@ -779,6 +785,11 @@ impl<K: HorizonStreamKernel> RecordStreamer for MultiHorizonStreamer<K> {
     #[inline(always)]
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         Some(self.mosaic.mosaic_bounds_wgs84)
+    }
+
+    #[inline(always)]
+    fn compacts_children(&self) -> bool {
+        self.compactor.is_enabled()
     }
 }
 

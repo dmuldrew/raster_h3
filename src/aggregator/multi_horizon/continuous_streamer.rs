@@ -273,6 +273,11 @@ impl RecordStreamer for MultiScanHorizonStreamer {
     }
 
     #[inline(always)]
+    fn compacts_children(&self) -> bool {
+        self.inner.compacts_children()
+    }
+
+    #[inline(always)]
     fn resolution_u8s(&self) -> &[u8] {
         self.inner.resolution_u8s()
     }
