@@ -51,6 +51,10 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
 }
 
 /// Generic C-compatible deallocator for `Box<T>` allocated data pointers
+///
+/// # Safety
+/// `data` must be null or a pointer obtained from `Box::<T>::into_raw` that
+/// has not been freed. DuckDB calls this destructor exactly once.
 pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !data.is_null() {
@@ -66,6 +70,10 @@ pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
 }
 
 /// Attach boxed global init state to DuckDB table function lifecycle with type-safe destructor and Send + Sync enforcement
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passed to the current init
+/// callback.
 pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(
     info: duckdb_init_info,
     data: T,
@@ -78,6 +86,10 @@ pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(
 }
 
 /// Attach boxed thread-local init state to DuckDB table function lifecycle with Send enforcement
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passed to the current init
+/// callback.
 pub unsafe fn set_table_function_local_init_data<T: Send + 'static>(
     info: duckdb_init_info,
     data: T,
@@ -90,6 +102,10 @@ pub unsafe fn set_table_function_local_init_data<T: Send + 'static>(
 }
 
 /// Open a raster mosaic reader from resolved paths, setting DuckDB init error on failure
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passed to the current init
+/// callback.
 pub unsafe fn open_mosaic_or_set_error(
     info: duckdb_init_info,
     paths: &[PathBuf],
@@ -127,6 +143,10 @@ impl Default for TableFunctionLocalData {
 
 impl TableFunctionLocalData {
     /// Resolve scratch buffers from thread-local state or fallback buffers
+    ///
+    /// # Safety
+    /// `ptr` must be null or point to a live `TableFunctionLocalData` that is
+    /// not otherwise borrowed for `'a`.
     #[inline(always)]
     pub unsafe fn get_scratch_buffers<'a>(
         ptr: *mut TableFunctionLocalData,
@@ -142,6 +162,9 @@ impl TableFunctionLocalData {
 }
 
 /// Standard thread-local initialization callback for DuckDB table functions
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn init_table_function_local(info: duckdb_init_info) {
     crate::ffi::ffi_init_guard(info, || {
         let local_data = TableFunctionLocalData::default();
@@ -150,6 +173,10 @@ pub unsafe extern "C" fn init_table_function_local(info: duckdb_init_info) {
 }
 
 /// Extract projected column indices requested by DuckDB projection pushdown
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passed to the current init
+/// callback.
 pub unsafe fn extract_projected_columns(info: duckdb_init_info) -> Vec<usize> {
     let col_count = duckdb_init_get_column_count(info);
     let mut projected_columns = Vec::with_capacity(col_count as usize);

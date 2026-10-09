@@ -18,12 +18,12 @@ impl MercatorPoint {
     #[inline(always)]
     pub fn from_lat_lng(lat: f64, lng: f64) -> Self {
         let x = (lng + 180.0) / 360.0;
-        let lat_clamped = lat.max(-85.05112878).min(85.05112878);
+        let lat_clamped = lat.clamp(-85.05112878, 85.05112878);
         let lat_rad = lat_clamped.to_radians();
         let y = (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
         Self {
-            x: x.max(0.0).min(1.0),
-            y: y.max(0.0).min(1.0),
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
         }
     }
 }
@@ -83,7 +83,7 @@ impl PartialEq for MvtValue {
         match (self, other) {
             (MvtValue::String(a), MvtValue::String(b)) => a == b,
             (MvtValue::HexStr(a, len_a), MvtValue::HexStr(b, len_b)) => {
-                len_a == len_b && &a[..*len_a as usize] == &b[..*len_b as usize]
+                len_a == len_b && a[..*len_a as usize] == b[..*len_b as usize]
             }
             (MvtValue::String(a), MvtValue::HexStr(b, len_b)) => {
                 a.as_bytes() == &b[..*len_b as usize]
@@ -614,6 +614,7 @@ impl MvtLayer {
     }
 
     /// Add an H3 hexagon feature with its boundary vertices converted to tile [0, 4096] coordinates
+    #[allow(clippy::too_many_arguments)]
     pub fn add_hexagon(
         &mut self,
         id: u64,
@@ -651,7 +652,7 @@ impl MvtLayer {
         for (i, v) in vertices.iter().take(count).enumerate() {
             px[i] = ((v.lng() - tile_min_lon) / lon_span * extent_f).round() as i32;
 
-            let lat_clamped = v.lat().max(-85.05112878).min(85.05112878);
+            let lat_clamped = v.lat().clamp(-85.05112878, 85.05112878);
             let lat_rad = lat_clamped.to_radians();
             let y_merc =
                 (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;

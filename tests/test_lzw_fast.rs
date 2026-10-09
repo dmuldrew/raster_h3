@@ -215,8 +215,8 @@ fn write_synthetic_lzw_geotiff(
     let mut file = BufWriter::new(File::create(path).unwrap());
     file.write_all(b"II\x2a\x00\x08\x00\x00\x00").unwrap();
 
-    let tiles_across = (width + tile_w - 1) / tile_w;
-    let tiles_down = (height + tile_h - 1) / tile_h;
+    let tiles_across = width.div_ceil(tile_w);
+    let tiles_down = height.div_ceil(tile_h);
     let total_tiles = tiles_across * tiles_down;
 
     let tile_data_start = 65536u64;

@@ -105,6 +105,8 @@ pub struct StreamProfile {
     pub worker: WorkerProfile,
     /// Sum of worker elapsed times; may exceed wall time with parallel workers.
     pub worker_ns: u64,
+    /// Wall time spent in parallel kernel waves.
+    pub kernel_wall_ns: u64,
     pub merge_ns: u64,
     pub spill_ns: u64,
     pub jobs: u64,

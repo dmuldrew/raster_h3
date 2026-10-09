@@ -24,6 +24,7 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 /// Helper to encode a GeoTIFF with custom projection tags and tiepoints
+#[allow(clippy::too_many_arguments)]
 fn create_albers_conus_geotiff(
     path: &std::path::Path,
     width: u32,

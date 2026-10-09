@@ -11,17 +11,16 @@ use std::sync::Arc;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::sampling::SamplingPattern;
-use crate::crs::transformer::CrsTransformer;
 use crate::error::Result;
 use crate::raster::geotiff::GeoTiffStreamReader;
-use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
-use crate::raster::RasterChunk;
 
 use super::config::{MultiResolutionConfig, SpectralFormula};
-use super::continuous::{process_continuous_chunk_payload_into, MultiContinuousRecord};
+use super::continuous::{
+    process_continuous_chunk_payload_into, ContinuousOptions, MultiContinuousRecord,
+};
 use super::controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
+use super::walker::WalkContext;
 
 /// Kernel implementation for continuous (floating point / spectral) raster aggregation
 #[derive(Clone)]
@@ -32,6 +31,16 @@ pub struct ContinuousKernel {
     pub min_mean: Option<f64>,
     pub max_mean: Option<f64>,
     pub track_quantiles: bool,
+}
+
+impl ContinuousKernel {
+    fn options(&self) -> ContinuousOptions {
+        ContinuousOptions {
+            band: self.band,
+            spectral_formula: self.spectral_formula,
+            track_quantiles: self.track_quantiles,
+        }
+    }
 }
 
 impl HorizonStreamKernel for ContinuousKernel {
@@ -79,68 +88,33 @@ impl HorizonStreamKernel for ContinuousKernel {
     #[inline(always)]
     fn process_chunk(
         &self,
-        chunk_bounds: &RasterChunk,
+        window: &WalkContext,
         decoding_result: &mut DecodingResult,
-        resolutions: &[Resolution],
-        crs_transformer: &CrsTransformer,
-        gt: &GeoTransform,
-        sampling: &SamplingPattern,
-        bbox: Option<[f64; 4]>,
-        chunk_stride: u32,
         nodata: Option<f64>,
-        samples_per_pixel: u16,
-        overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool {
         process_continuous_chunk_payload_into(
-            chunk_bounds,
+            window,
             decoding_result,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
             nodata,
-            samples_per_pixel,
-            self.band,
-            self.spectral_formula,
-            overlap_ctx,
-            self.track_quantiles,
+            self.options(),
             local_maps,
         )
     }
+
     #[inline(always)]
     fn process_window(
         &self,
-        chunk_bounds: &RasterChunk,
-        decoding_result: super::borrowed::BorrowedSamples<'_>,
-        resolutions: &[Resolution],
-        crs_transformer: &CrsTransformer,
-        gt: &GeoTransform,
-        sampling: &SamplingPattern,
-        bbox: Option<[f64; 4]>,
-        chunk_stride: u32,
+        window: &WalkContext,
+        samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
-        samples_per_pixel: u16,
-        overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool {
         super::continuous::process_continuous_borrowed_into(
-            chunk_bounds,
-            decoding_result,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
+            window,
+            samples,
             nodata,
-            samples_per_pixel,
-            self.band,
-            self.spectral_formula,
-            overlap_ctx,
-            self.track_quantiles,
+            self.options(),
             local_maps,
         )
     }
@@ -149,10 +123,15 @@ impl HorizonStreamKernel for ContinuousKernel {
 /// Single-pass streaming aggregator across multiple H3 resolutions (Continuous Data)
 pub struct MultiScanHorizonStreamer {
     inner: MultiHorizonStreamer<ContinuousKernel>,
-    pub track_quantiles: bool,
+    track_quantiles: bool,
 }
 
 impl MultiScanHorizonStreamer {
+    /// Whether records carry streaming quantile sketches
+    pub fn track_quantiles(&self) -> bool {
+        self.track_quantiles
+    }
+
     /// Initialize a new MultiScanHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
         let kernel = ContinuousKernel {
@@ -290,7 +269,7 @@ impl RecordStreamer for MultiScanHorizonStreamer {
 
     #[inline(always)]
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
-        Some(self.inner.mosaic.mosaic_bounds_wgs84)
+        Some(self.inner.mosaic().mosaic_bounds_wgs84)
     }
 
     #[inline(always)]

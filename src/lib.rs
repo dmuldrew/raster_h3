@@ -70,6 +70,10 @@ impl Drop for ConnectionGuard {
 }
 
 /// Extension entry point invoked by DuckDB upon `LOAD 'raster_h3'`
+///
+/// # Safety
+/// `db` must be a valid DuckDB database handle; DuckDB calls this once
+/// when loading the extension.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -119,6 +123,10 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
 }
 
 /// C API extension entry point invoked by DuckDB v1.2+
+///
+/// # Safety
+/// `info` and `access` must be the extension info and access table
+/// DuckDB passes to this entry point.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_init_c_api(
     info: crate::ffi::duckdb_c::duckdb_extension_info,
@@ -169,6 +177,6 @@ pub unsafe extern "C" fn raster_h3_init_c_api(
 
 /// Version entry point invoked by DuckDB (specifies C-API version v0.0.1)
 #[no_mangle]
-pub unsafe extern "C" fn raster_h3_version() -> *const c_char {
+pub extern "C" fn raster_h3_version() -> *const c_char {
     c"v0.0.1".as_ptr()
 }

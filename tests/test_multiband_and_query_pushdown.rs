@@ -628,6 +628,6 @@ fn borrowed_interleaved_windows_match_across_job_sizes() {
             expected = Some(result);
         }
         #[cfg(feature = "stream-profile")]
-        assert_eq!(stream.metrics.worker.copied_bytes, 0);
+        assert_eq!(stream.metrics().worker.copied_bytes, 0);
     }
 }

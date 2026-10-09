@@ -67,12 +67,12 @@ fn validate_wkb_hexagon(bytes: &[u8]) {
     // Check bounds roughly around SF Bay
     for (lon, lat) in coords {
         assert!(
-            lon >= -123.0 && lon <= -122.0,
+            (-123.0..=-122.0).contains(&lon),
             "Longitude {} out of expected range",
             lon
         );
         assert!(
-            lat >= 37.5 && lat <= 38.0,
+            (37.5..=38.0).contains(&lat),
             "Latitude {} out of expected range",
             lat
         );
@@ -527,8 +527,8 @@ fn test_geoparquet_non_compact_categorical_metadata_and_columns() {
 
         let lat = row.get_double(8).unwrap();
         let lng = row.get_double(9).unwrap();
-        assert!(lat >= 37.0 && lat <= 38.5);
-        assert!(lng >= -123.0 && lng <= -122.0);
+        assert!((37.0..=38.5).contains(&lat));
+        assert!((-123.0..=-122.0).contains(&lng));
     }
 }
 

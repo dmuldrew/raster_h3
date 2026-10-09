@@ -111,7 +111,7 @@ fn main() {
 
 fn print_help() {
     println!("Usage: parquet_to_pmtiles --input <file.parquet> --output <file.pmtiles> [OPTIONS]");
-    println!("");
+    println!();
     println!("Options:");
     println!("  -i, --input <path>     Input Parquet file containing H3 index column");
     println!("  -o, --output <path>    Output .pmtiles archive path");

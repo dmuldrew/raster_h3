@@ -83,8 +83,7 @@ fn test_resolve_sources_vrt_xml() {
     create_test_geotiff(&f2, 10, 10, -122.40, 37.80, 0.001, 2);
 
     let vrt_path = temp_dir.join("mosaic.vrt");
-    let vrt_content = format!(
-        r#"<VRTDataset rasterXSize="20" rasterYSize="10">
+    let vrt_content = r#"<VRTDataset rasterXSize="20" rasterYSize="10">
   <VRTRasterBand dataType="Byte" band="1">
     <SimpleSource>
       <SourceFilename relativeToVRT="1">part1.tif</SourceFilename>
@@ -94,7 +93,7 @@ fn test_resolve_sources_vrt_xml() {
     </SimpleSource>
   </VRTRasterBand>
 </VRTDataset>"#
-    );
+        .to_string();
     let mut vrt_file = File::create(&vrt_path).expect("create vrt");
     vrt_file
         .write_all(vrt_content.as_bytes())

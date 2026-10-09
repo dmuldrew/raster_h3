@@ -1,19 +1,13 @@
 use fxhash::FxBuildHasher;
-use h3o::{LatLng, Resolution};
 use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::sampling::SamplingPattern;
 use crate::aggregator::simd::SimdSpanAccumulate;
-use crate::crs::transformer::CrsTransformer;
-use crate::raster::geotransform::GeoTransform;
-use crate::raster::mosaic::MosaicReader;
-use crate::raster::RasterChunk;
 
 use super::config::SpectralFormula;
 use super::walker::{
-    is_slice_all_native_nodata, scanline_walk, walk_overlap_pixel_cells, ScanlineEngine,
+    is_slice_all_native_nodata, walk_direct, walk_interleaved, ScanlineEngine, WalkContext,
 };
 
 /// Continuous record yielded by the multi-resolution streamer
@@ -24,121 +18,44 @@ pub struct MultiContinuousRecord {
     pub accumulator: H3Accumulator,
 }
 
-/// Direct pixel-by-pixel continuous slice aggregation with strict tile ownership resolution
-fn process_continuous_overlap_slice_into_maps<T>(
-    slice: &[T],
-    chunk: &RasterChunk,
-    native_nodata: Option<T>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
-    tile_idx: usize,
-    mosaic: &MosaicReader,
-    track_quantiles: bool,
-    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
-) where
-    T: SimdSpanAccumulate,
-{
-    walk_overlap_pixel_cells(
-        slice,
-        chunk,
-        chunk_stride,
-        resolutions,
-        crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        tile_idx,
-        mosaic,
-        |val| val.is_valid(native_nodata),
-        |res_idx, cell_u64, weight, val| {
-            let float_val = val.to_f64_val();
-            chunk_maps[res_idx]
-                .entry(cell_u64)
-                .and_modify(|acc| {
-                    if weight == 1.0 {
-                        acc.update(float_val);
-                    } else {
-                        acc.update_weighted(float_val, weight);
-                    }
-                })
-                .or_insert_with(|| {
-                    let mut acc = if track_quantiles {
-                        H3Accumulator::with_quantiles()
-                    } else {
-                        H3Accumulator::default()
-                    };
-                    if weight == 1.0 {
-                        acc.update(float_val);
-                    } else {
-                        acc.update_weighted(float_val, weight);
-                    }
-                    acc
-                });
-        },
-    );
+/// Per-stream options for continuous aggregation.
+#[derive(Debug, Clone, Copy)]
+pub struct ContinuousOptions {
+    /// 1-based band read when no spectral formula is set.
+    pub band: usize,
+    pub spectral_formula: Option<SpectralFormula>,
+    pub track_quantiles: bool,
 }
 
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
-fn process_continuous_slice_into_maps<T>(
+fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
+    ctx: &WalkContext,
     slice: &[T],
-    chunk: &RasterChunk,
     native_nodata: Option<T>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    track_quantiles: bool,
+    options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
-) where
-    T: SimdSpanAccumulate,
-{
-    if slice.is_empty() {
-        return;
-    }
-
-    if let Some((tile_idx, mosaic)) = overlap_ctx {
-        process_continuous_overlap_slice_into_maps(
-            slice,
-            chunk,
-            native_nodata,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
-            tile_idx,
-            mosaic,
-            track_quantiles,
-            chunk_maps,
-        );
-        return;
-    }
-
+) {
     let engine = ContinuousEngine {
         native_nodata,
-        track_quantiles,
+        track_quantiles: options.track_quantiles,
     };
-    scanline_walk(
-        slice,
-        chunk,
-        resolutions,
-        crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        chunk_stride,
-        |s| is_slice_all_native_nodata(s, native_nodata),
-        &engine,
-        chunk_maps,
-    );
+    if ctx.samples_per_pixel <= 1 && options.spectral_formula.is_none() {
+        walk_direct(
+            ctx,
+            slice,
+            |s| is_slice_all_native_nodata(s, native_nodata),
+            &engine,
+            chunk_maps,
+        );
+    } else {
+        walk_interleaved(
+            ctx,
+            slice,
+            |px| pixel_value(px, native_nodata, options.band, options.spectral_formula),
+            &engine,
+            chunk_maps,
+        );
+    }
 }
 
 struct ContinuousEngine<T> {
@@ -148,6 +65,10 @@ struct ContinuousEngine<T> {
 
 impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngine<T> {
     type Sample = f64;
+
+    fn combine_sample_weights(&self) -> bool {
+        !self.track_quantiles
+    }
 
     #[inline(always)]
     fn new_acc(&self) -> H3Accumulator {
@@ -191,29 +112,18 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
     }
 
     #[inline(always)]
-    fn accumulate_span_multi(
-        &self,
-        run_accs: &mut [H3Accumulator],
-        run_cells: &[u64],
-        slice: &[T],
-    ) {
+    fn accumulate_span_multi(&self, run_accs: &mut [H3Accumulator], slice: &[T]) {
         let span_acc = T::accumulate_span(slice, self.native_nodata);
         if span_acc.count > 0.0 {
-            for i in 0..run_accs.len() {
-                if run_cells[i] != 0 {
-                    run_accs[i].merge(&span_acc);
-                }
+            for acc in run_accs.iter_mut() {
+                acc.merge(&span_acc);
             }
             if self.track_quantiles {
                 for &v in slice {
                     if v.is_valid(self.native_nodata) {
                         let fv = v.to_f64_val();
-                        for i in 0..run_accs.len() {
-                            if run_cells[i] != 0 {
-                                if let Some(ref mut q) = run_accs[i].quantiles {
-                                    q.update(fv, 1.0);
-                                }
-                            }
+                        for q in run_accs.iter_mut().filter_map(|a| a.quantiles.as_mut()) {
+                            q.update(fv, 1.0);
                         }
                     }
                 }
@@ -241,280 +151,84 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
     }
 }
 
-/// Process a multi-sample or spectral formula continuous slice into thread-local hash maps
-fn process_continuous_multisample_slice_into_maps<T: SimdSpanAccumulate>(
-    slice: &[T],
-    chunk: &RasterChunk,
-    native_nodata: Option<T>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
-    samples_per_pixel: usize,
+/// Reduce one pixel's interleaved band values to the selected band or spectral index.
+#[inline(always)]
+fn pixel_value<T: SimdSpanAccumulate>(
+    px: &[T],
+    nodata: Option<T>,
     band: usize,
-    spectral_formula: Option<SpectralFormula>,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    track_quantiles: bool,
-    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
-) {
-    let row_width = chunk.width as usize;
-    let spp = samples_per_pixel.max(1);
-    let num_res = resolutions.len();
-
-    for row_idx in 0..chunk.height as usize {
-        let slice_row_start = (row_idx * (chunk_stride as usize)) * spp;
-
-        for c in 0..row_width {
-            let pixel_base = slice_row_start + c * spp;
-
-            let val_opt = match spectral_formula {
-                Some(SpectralFormula::Ndvi { nir_band, red_band }) => {
-                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
-                    let red_idx = (red_band.saturating_sub(1)).min(spp - 1);
-                    let nir_raw = slice[pixel_base + nir_idx];
-                    let red_raw = slice[pixel_base + red_idx];
-                    if nir_raw.is_valid(native_nodata) && red_raw.is_valid(native_nodata) {
-                        let nir = nir_raw.to_f64_val();
-                        let red = red_raw.to_f64_val();
-                        let denom = nir + red;
-                        if denom.abs() > 1e-12 {
-                            Some((nir - red) / denom)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Some(SpectralFormula::Ndwi {
-                    green_band,
-                    nir_band,
-                }) => {
-                    let green_idx = (green_band.saturating_sub(1)).min(spp - 1);
-                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
-                    let green_raw = slice[pixel_base + green_idx];
-                    let nir_raw = slice[pixel_base + nir_idx];
-                    if green_raw.is_valid(native_nodata) && nir_raw.is_valid(native_nodata) {
-                        let green = green_raw.to_f64_val();
-                        let nir = nir_raw.to_f64_val();
-                        let denom = green + nir;
-                        if denom.abs() > 1e-12 {
-                            Some((green - nir) / denom)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Some(SpectralFormula::Nbr {
-                    nir_band,
-                    swir_band,
-                }) => {
-                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
-                    let swir_idx = (swir_band.saturating_sub(1)).min(spp - 1);
-                    let nir_raw = slice[pixel_base + nir_idx];
-                    let swir_raw = slice[pixel_base + swir_idx];
-                    if nir_raw.is_valid(native_nodata) && swir_raw.is_valid(native_nodata) {
-                        let nir = nir_raw.to_f64_val();
-                        let swir = swir_raw.to_f64_val();
-                        let denom = nir + swir;
-                        if denom.abs() > 1e-12 {
-                            Some((nir - swir) / denom)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Some(SpectralFormula::Evi {
-                    nir_band,
-                    red_band,
-                    blue_band,
-                }) => {
-                    let nir_idx = (nir_band.saturating_sub(1)).min(spp - 1);
-                    let red_idx = (red_band.saturating_sub(1)).min(spp - 1);
-                    let blue_idx = (blue_band.saturating_sub(1)).min(spp - 1);
-                    let nir_raw = slice[pixel_base + nir_idx];
-                    let red_raw = slice[pixel_base + red_idx];
-                    let blue_raw = slice[pixel_base + blue_idx];
-                    if nir_raw.is_valid(native_nodata)
-                        && red_raw.is_valid(native_nodata)
-                        && blue_raw.is_valid(native_nodata)
-                    {
-                        let nir = nir_raw.to_f64_val();
-                        let red = red_raw.to_f64_val();
-                        let blue = blue_raw.to_f64_val();
-                        let denom = nir + 6.0 * red - 7.5 * blue + 1.0;
-                        if denom.abs() > 1e-12 {
-                            Some(2.5 * (nir - red) / denom)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                None => {
-                    let b_idx = (band.saturating_sub(1)).min(spp - 1);
-                    let raw = slice[pixel_base + b_idx];
-                    if raw.is_valid(native_nodata) {
-                        Some(raw.to_f64_val())
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            let val = match val_opt {
-                Some(v) => v,
-                None => continue,
-            };
-
-            for sp in &sampling.points {
-                let px = (chunk.col_offset as f64) + (c as f64) + sp.dx;
-                let py = (chunk.row_offset as f64) + (row_idx as f64) + sp.dy;
-                let (x, y) = gt.pixel_to_coord(px, py);
-                if let Ok((lon, lat)) = super::profile::transform(crs_transformer, x, y) {
-                    if let Some([b_min_lon, b_min_lat, b_max_lon, b_max_lat]) = bbox {
-                        if lon < b_min_lon || lon > b_max_lon || lat < b_min_lat || lat > b_max_lat
-                        {
-                            continue;
-                        }
-                    }
-
-                    if let Some((tile_idx, mosaic)) = overlap_ctx {
-                        if !mosaic.is_point_owned_by(tile_idx, lon, lat) {
-                            continue;
-                        }
-                    }
-
-                    if let Ok(ll) = LatLng::new(lat, lon) {
-                        for res_idx in 0..num_res {
-                            let res = resolutions[res_idx];
-                            let cell: u64 =
-                                crate::aggregator::multi_horizon::profile::index(ll, res).into();
-                            chunk_maps[res_idx]
-                                .entry(cell)
-                                .and_modify(|acc| acc.update_weighted(val, sp.weight))
-                                .or_insert_with(|| {
-                                    let mut a = if track_quantiles {
-                                        H3Accumulator::with_quantiles()
-                                    } else {
-                                        H3Accumulator::default()
-                                    };
-                                    a.update_weighted(val, sp.weight);
-                                    a
-                                });
-                        }
-                    }
-                }
-            }
+    formula: Option<SpectralFormula>,
+) -> Option<f64> {
+    let get = |b: usize| {
+        let v = px[b.saturating_sub(1).min(px.len() - 1)];
+        v.is_valid(nodata).then(|| v.to_f64_val())
+    };
+    let ratio = |num: f64, den: f64| (den.abs() > 1e-12).then(|| num / den);
+    match formula {
+        Some(SpectralFormula::Ndvi { nir_band, red_band }) => {
+            let (nir, red) = (get(nir_band)?, get(red_band)?);
+            ratio(nir - red, nir + red)
         }
+        Some(SpectralFormula::Ndwi {
+            green_band,
+            nir_band,
+        }) => {
+            let (green, nir) = (get(green_band)?, get(nir_band)?);
+            ratio(green - nir, green + nir)
+        }
+        Some(SpectralFormula::Nbr {
+            nir_band,
+            swir_band,
+        }) => {
+            let (nir, swir) = (get(nir_band)?, get(swir_band)?);
+            ratio(nir - swir, nir + swir)
+        }
+        Some(SpectralFormula::Evi {
+            nir_band,
+            red_band,
+            blue_band,
+        }) => {
+            let (nir, red, blue) = (get(nir_band)?, get(red_band)?, get(blue_band)?);
+            ratio(2.5 * (nir - red), nir + 6.0 * red - 7.5 * blue + 1.0)
+        }
+        None => get(band),
     }
 }
 
-/// Process a continuous chunk across all resolutions into thread-local hash maps
+/// Process a continuous chunk across all resolutions into thread-local hash maps.
+/// Returns false when a single-band chunk is entirely nodata.
 pub fn process_continuous_chunk_payload_into(
-    chunk_bounds: &RasterChunk,
+    window: &WalkContext,
     decoding_result: &DecodingResult,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
     nodata: Option<f64>,
-    samples_per_pixel: u16,
-    band: usize,
-    spectral_formula: Option<SpectralFormula>,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    track_quantiles: bool,
+    options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
     process_continuous_borrowed_into(
-        chunk_bounds,
+        window,
         super::borrowed::BorrowedSamples::from(decoding_result),
-        resolutions,
-        crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        chunk_stride,
         nodata,
-        samples_per_pixel,
-        band,
-        spectral_formula,
-        overlap_ctx,
-        track_quantiles,
+        options,
         chunk_maps,
     )
 }
 
+/// Borrowed-window form of [`process_continuous_chunk_payload_into`].
 pub fn process_continuous_borrowed_into(
-    chunk_bounds: &RasterChunk,
-    decoding_result: super::borrowed::BorrowedSamples<'_>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
+    window: &WalkContext,
+    samples: super::borrowed::BorrowedSamples<'_>,
     nodata: Option<f64>,
-    samples_per_pixel: u16,
-    band: usize,
-    spectral_formula: Option<SpectralFormula>,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    track_quantiles: bool,
+    options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
-    let is_multisample = samples_per_pixel > 1 || spectral_formula.is_some() || band > 1;
-    let spp = samples_per_pixel.max(1) as usize;
-
-    if !is_multisample {
-        if decoding_result.all_nodata(nodata) {
-            return false;
-        }
-
-        crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
-            process_continuous_slice_into_maps(
-                slice,
-                chunk_bounds,
-                nd,
-                resolutions,
-                crs_transformer,
-                gt,
-                sampling,
-                bbox,
-                chunk_stride,
-                overlap_ctx,
-                track_quantiles,
-                chunk_maps,
-            );
-        });
-    } else {
-        crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
-            process_continuous_multisample_slice_into_maps(
-                slice,
-                chunk_bounds,
-                nd,
-                resolutions,
-                crs_transformer,
-                gt,
-                sampling,
-                bbox,
-                chunk_stride,
-                spp,
-                band,
-                spectral_formula,
-                overlap_ctx,
-                track_quantiles,
-                chunk_maps,
-            );
-        });
+    if window.samples_per_pixel <= 1
+        && options.spectral_formula.is_none()
+        && samples.all_nodata(nodata)
+    {
+        return false;
     }
+    crate::dispatch_samples!(samples, nodata, |slice, nd| {
+        process_continuous_slice_into_maps(window, slice, nd, options, chunk_maps);
+    });
     true
 }

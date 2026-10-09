@@ -53,6 +53,9 @@ pub struct RasterH3CategoricalGlobalData {
 pub type RasterH3CategoricalLocalData = TableFunctionLocalData;
 
 /// Bind callback for categorical aggregation table function
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
     ffi_bind_guard(info, || {
         let bind = BindHelper::new(info);
@@ -148,6 +151,9 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
 }
 
 /// Global init callback for categorical aggregation
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
     ffi_init_guard(info, || {
         let bind_data_ptr = duckdb_init_get_bind_data(info) as *const RasterH3CategoricalBindData;
@@ -211,6 +217,9 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
 }
 
 /// Thread-local init callback for categorical aggregation
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn raster_h3_categorical_init_local(info: duckdb_init_info) {
     ffi_init_guard(info, || {
         init_table_function_local(info);
@@ -218,6 +227,10 @@ pub unsafe extern "C" fn raster_h3_categorical_init_local(info: duckdb_init_info
 }
 
 /// Scan callback for categorical aggregation
+///
+/// # Safety
+/// `info` and `output` must be the handles DuckDB passes to this scan
+/// callback, with `output` laid out as the columns declared at bind time.
 pub unsafe extern "C" fn raster_h3_categorical_scan(
     info: duckdb_function_info,
     output: duckdb_data_chunk,
@@ -547,6 +560,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 }
 
 /// Register `h3_raster_categorical_aggregate` and `h3_raster_categorical` table functions
+///
+/// # Safety
+/// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_categorical_table_function(
     con: duckdb_connection,
 ) -> std::result::Result<(), String> {

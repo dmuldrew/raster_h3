@@ -206,15 +206,9 @@ impl AlbersConicFast {
             }
         }
 
-        let is_grs80_or_wgs84_ellps = match ellps {
-            Some("grs80") | Some("wgs84") => true,
-            _ => false,
-        };
+        let is_grs80_or_wgs84_ellps = matches!(ellps, Some("grs80") | Some("wgs84"));
 
-        let is_grs80_or_wgs84_datum = match datum {
-            Some("nad83") | Some("wgs84") => true,
-            _ => false,
-        };
+        let is_grs80_or_wgs84_datum = matches!(datum, Some("nad83") | Some("wgs84"));
 
         let is_grs80_or_wgs84_params = match (a_val, rf_val) {
             (Some(a), Some(rf)) => (a - 6378137.0).abs() < 1.0 && (rf - 298.257).abs() < 0.02,
@@ -274,7 +268,7 @@ impl AlbersConicFast {
         let q = (self.c - (rho * rho * self.n * self.n) / (self.a * self.a)) / self.n;
 
         // Newton-Raphson inverse for latitude from q
-        let sin_beta = (q / self.qp).max(-1.0).min(1.0);
+        let sin_beta = (q / self.qp).clamp(-1.0, 1.0);
         let mut phi = sin_beta.asin();
 
         // 2 iterations of Newton-Raphson provide nanometer precision
@@ -312,8 +306,9 @@ pub enum CrsTransformer {
     WebMercatorFast,
     /// Fast analytical Albers Equal Area Conic (EPSG:5070 CONUS Albers)
     AlbersConic(AlbersConicFast),
-    /// Pure Rust PROJ4 transformation for arbitrary projections
-    Proj4 { from: Proj, to: Proj },
+    /// Pure Rust PROJ4 transformation for arbitrary projections. Boxed so the
+    /// common fast-path variants stay small.
+    Proj4 { from: Box<Proj>, to: Box<Proj> },
 }
 
 impl CrsTransformer {
@@ -393,7 +388,10 @@ impl CrsTransformer {
                             e
                         ))
                     })?;
-                Ok(Self::Proj4 { from, to })
+                Ok(Self::Proj4 {
+                    from: Box::new(from),
+                    to: Box::new(to),
+                })
             }
         }
     }
@@ -450,22 +448,22 @@ impl CrsTransformer {
         if let Some(proj) = tokens.get("proj") {
             match proj.as_str() {
                 "longlat" | "latlong" => {
-                    let valid_datum = match tokens.get("datum").map(|s| s.as_str()) {
-                        None | Some("wgs84") | Some("grs80") | Some("nad83") => true,
-                        _ => false,
-                    };
-                    let valid_ellps = match tokens.get("ellps").map(|s| s.as_str()) {
-                        None | Some("wgs84") | Some("grs80") => true,
-                        _ => false,
-                    };
+                    let valid_datum = matches!(
+                        tokens.get("datum").map(|s| s.as_str()),
+                        None | Some("wgs84") | Some("grs80") | Some("nad83")
+                    );
+                    let valid_ellps = matches!(
+                        tokens.get("ellps").map(|s| s.as_str()),
+                        None | Some("wgs84") | Some("grs80")
+                    );
                     let valid_a = tokens
                         .get("a")
                         .and_then(|v| v.parse::<f64>().ok())
-                        .map_or(true, |a| (a - WGS84_A).abs() < 1.0);
+                        .is_none_or(|a| (a - WGS84_A).abs() < 1.0);
                     let valid_rf = tokens
                         .get("rf")
                         .and_then(|v| v.parse::<f64>().ok())
-                        .map_or(true, |rf| (rf - 298.257).abs() < 0.01);
+                        .is_none_or(|rf| (rf - 298.257).abs() < 0.01);
 
                     if valid_datum && valid_ellps && valid_a && valid_rf {
                         return Ok(Self::Wgs84Identity);
@@ -478,13 +476,10 @@ impl CrsTransformer {
                     let f_val = tokens.get("f");
                     let ellps_val = tokens.get("ellps").map(|s| s.as_str());
 
-                    let a_is_6378137 = a_val.map_or(false, |a| (a - 6378137.0).abs() < 1e-3);
-                    let b_is_6378137 = b_val.map_or(false, |b| (b - 6378137.0).abs() < 1e-3);
+                    let a_is_6378137 = a_val.is_some_and(|a| (a - 6378137.0).abs() < 1e-3);
+                    let b_is_6378137 = b_val.is_some_and(|b| (b - 6378137.0).abs() < 1e-3);
                     let absent_rf_f_b = rf_val.is_none() && f_val.is_none() && b_val.is_none();
-                    let ellps_sphere_or_absent = match ellps_val {
-                        None | Some("sphere") => true,
-                        _ => false,
-                    };
+                    let ellps_sphere_or_absent = matches!(ellps_val, None | Some("sphere"));
 
                     let is_sphere_6378137 =
                         a_is_6378137 && (b_is_6378137 || (absent_rf_f_b && ellps_sphere_or_absent));
@@ -543,7 +538,10 @@ impl CrsTransformer {
             ))
         })?;
 
-        Ok(Self::Proj4 { from, to })
+        Ok(Self::Proj4 {
+            from: Box::new(from),
+            to: Box::new(to),
+        })
     }
 
     /// Transform a single (x, y) point to (lon, lat) in WGS84 degrees
@@ -757,6 +755,25 @@ impl CrsTransformer {
             }
         }
 
+        // Longitude is affine in pixel space here, so unwrapped corners bound it
+        // exactly. Wrapped corners cannot distinguish a >180 degree span (e.g. a
+        // 0..360 grid) from one that does not cross the antimeridian.
+        if matches!(self, Self::Wgs84Identity | Self::WebMercatorFast) {
+            let lons: Vec<f64> = corners
+                .iter()
+                .filter_map(|&(x, y)| self.transform_point(x, y).ok().map(|p| p.0))
+                .collect();
+            if lons.len() == corners.len() && lons.iter().all(|v| v.is_finite()) {
+                let lo = lons.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                (min_lon, max_lon) = if lo < -180.0 || hi > 180.0 {
+                    (-180.0, 180.0)
+                } else {
+                    (lo, hi)
+                };
+            }
+        }
+
         // Handle rasters spanning across the antimeridian
         if max_lon - min_lon > 180.0 {
             min_lon = -180.0;
@@ -939,7 +956,7 @@ mod tests {
         let (_lon_s, lat_s) = tf_wm.transform_point(0.0, -20000000.0).unwrap();
         assert!(!lat_s.is_nan());
         assert!(
-            lat_s < -85.0 && lat_s >= -90.0,
+            (-90.0..-85.0).contains(&lat_s),
             "Latitude must remain bounded: {}",
             lat_s
         );
@@ -1140,6 +1157,24 @@ mod tests {
         // so bounds must report [-180, 0, 180, 10]
         assert_eq!(bounds[0], -180.0);
         assert_eq!(bounds[2], 180.0);
+
+        // A 0..360 grid spanning 100..300 wraps to corners 100 and -60, whose
+        // naive span (160) would hide the crossing.
+        let gt = GeoTransform {
+            c0: 100.0,
+            a: 1.0,
+            b: 0.0,
+            f0: 10.0,
+            d: 0.0,
+            e: -1.0,
+        };
+        let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 200.0, 10.0);
+        assert_eq!((bounds[0], bounds[2]), (-180.0, 180.0));
+
+        // Ending exactly at 180 does not cross.
+        let gt = GeoTransform { c0: 160.0, ..gt };
+        let bounds = tf.transform_rect_bounds(&gt, 0.0, 0.0, 20.0, 10.0);
+        assert_eq!((bounds[0], bounds[2]), (160.0, 180.0));
     }
 
     #[test]

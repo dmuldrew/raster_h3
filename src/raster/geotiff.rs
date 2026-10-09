@@ -16,7 +16,7 @@ use crate::error::{RasterH3Error, Result};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::http_range::{is_remote_url, HttpRangeReader, RemoteHttpSource};
 use crate::raster::metadata::{extract_crs, extract_geotransform, extract_nodata};
-use crate::raster::predictor::{unpack_f32, unpack_f64, unpack_integer_samples};
+use crate::raster::predictor::{unpack_f32, unpack_f64, unpack_integer_samples, ChunkEncoding};
 use crate::raster::RasterChunk;
 
 /// TIFF byte order (Intel Little-Endian vs Motorola Big-Endian)
@@ -70,8 +70,8 @@ impl ChunkLayout {
         tile_width: u32,
         tile_height: u32,
     ) -> Self {
-        let chunks_across = (image_width + tile_width - 1) / tile_width;
-        let chunks_down = (image_height + tile_height - 1) / tile_height;
+        let chunks_across = image_width.div_ceil(tile_width);
+        let chunks_down = image_height.div_ceil(tile_height);
         Self {
             chunk_width: tile_width,
             chunk_height: tile_height,
@@ -83,7 +83,7 @@ impl ChunkLayout {
 
     /// Create layout for striped TIFFs
     pub fn new_striped(image_width: u32, image_height: u32, rows_per_strip: u32) -> Self {
-        let chunks_down = (image_height + rows_per_strip - 1) / rows_per_strip;
+        let chunks_down = image_height.div_ceil(rows_per_strip);
         Self {
             chunk_width: image_width,
             chunk_height: rows_per_strip,
@@ -177,7 +177,7 @@ impl<'a> DecoderSource<'a> {
         match self {
             DecoderSource::Local(mmap) => {
                 let off = offset as usize;
-                if off.checked_add(len).map_or(true, |end| end > mmap.len()) {
+                if off.checked_add(len).is_none_or(|end| end > mmap.len()) {
                     return Err(RasterH3Error::InvalidMetadata(
                         "chunk offset out of bounds".into(),
                     ));
@@ -744,37 +744,26 @@ impl<'a> ChunkDecoder<'a> {
             decomp_slice,
         )?;
 
+        let encoding = ChunkEncoding {
+            tile_w,
+            data_w,
+            data_h,
+            spp,
+            byte_order: info.byte_order,
+            predictor: info.predictor,
+            photometric: info.photometric,
+        };
         macro_rules! unpack_int_branch {
             ($variant:ident, $t:ty) => {
                 match target_buffer {
                     Some(DecodingResult::$variant(ref mut v)) => {
                         v.resize(total_samples, 0);
-                        unpack_integer_samples(
-                            decomp_slice,
-                            &mut v[..total_samples],
-                            tile_w,
-                            data_w,
-                            data_h,
-                            spp,
-                            info.byte_order,
-                            info.predictor,
-                            info.photometric,
-                        )?;
+                        unpack_integer_samples(decomp_slice, &mut v[..total_samples], encoding)?;
                         Ok(None)
                     }
                     _ => {
                         let mut v = vec![0 as $t; total_samples];
-                        unpack_integer_samples(
-                            decomp_slice,
-                            &mut v,
-                            tile_w,
-                            data_w,
-                            data_h,
-                            spp,
-                            info.byte_order,
-                            info.predictor,
-                            info.photometric,
-                        )?;
+                        unpack_integer_samples(decomp_slice, &mut v, encoding)?;
                         Ok(Some(DecodingResult::$variant(v)))
                     }
                 }
@@ -793,64 +782,24 @@ impl<'a> ChunkDecoder<'a> {
             (SampleFormat::IEEEFP, 32) => match target_buffer {
                 Some(DecodingResult::F32(ref mut v)) => {
                     v.resize(total_samples, 0.0);
-                    unpack_f32(
-                        decomp_slice,
-                        &mut v[..total_samples],
-                        tile_w,
-                        data_w,
-                        data_h,
-                        spp,
-                        info.byte_order,
-                        info.predictor,
-                        info.photometric,
-                    )?;
+                    unpack_f32(decomp_slice, &mut v[..total_samples], encoding)?;
                     Ok(None)
                 }
                 _ => {
                     let mut v = vec![0.0f32; total_samples];
-                    unpack_f32(
-                        decomp_slice,
-                        &mut v,
-                        tile_w,
-                        data_w,
-                        data_h,
-                        spp,
-                        info.byte_order,
-                        info.predictor,
-                        info.photometric,
-                    )?;
+                    unpack_f32(decomp_slice, &mut v, encoding)?;
                     Ok(Some(DecodingResult::F32(v)))
                 }
             },
             (SampleFormat::IEEEFP, 64) => match target_buffer {
                 Some(DecodingResult::F64(ref mut v)) => {
                     v.resize(total_samples, 0.0);
-                    unpack_f64(
-                        decomp_slice,
-                        &mut v[..total_samples],
-                        tile_w,
-                        data_w,
-                        data_h,
-                        spp,
-                        info.byte_order,
-                        info.predictor,
-                        info.photometric,
-                    )?;
+                    unpack_f64(decomp_slice, &mut v[..total_samples], encoding)?;
                     Ok(None)
                 }
                 _ => {
                     let mut v = vec![0.0f64; total_samples];
-                    unpack_f64(
-                        decomp_slice,
-                        &mut v,
-                        tile_w,
-                        data_w,
-                        data_h,
-                        spp,
-                        info.byte_order,
-                        info.predictor,
-                        info.photometric,
-                    )?;
+                    unpack_f64(decomp_slice, &mut v, encoding)?;
                     Ok(Some(DecodingResult::F64(v)))
                 }
             },
@@ -923,8 +872,8 @@ impl GeoTiffStreamReader {
             .unwrap_or(1);
 
         let (chunk_w, chunk_h) = decoder.chunk_dimensions();
-        let chunks_across = (width + chunk_w - 1) / chunk_w;
-        let chunks_down = (height + chunk_h - 1) / chunk_h;
+        let chunks_across = width.div_ceil(chunk_w);
+        let chunks_down = height.div_ceil(chunk_h);
         let total_chunks = chunks_across * chunks_down;
 
         let chunk_layout = ChunkLayout {
@@ -1087,7 +1036,7 @@ impl GeoTiffStreamReader {
             }
         };
 
-        let libdeflater = if self.chunk_info.as_ref().map_or(false, |info| {
+        let libdeflater = if self.chunk_info.as_ref().is_some_and(|info| {
             matches!(
                 info.compression,
                 CompressionMethod::Deflate | CompressionMethod::OldDeflate
@@ -1098,9 +1047,11 @@ impl GeoTiffStreamReader {
             None
         };
 
-        let lzw_decoder = if self.chunk_info.as_ref().map_or(false, |info| {
-            matches!(info.compression, CompressionMethod::LZW)
-        }) {
+        let lzw_decoder = if self
+            .chunk_info
+            .as_ref()
+            .is_some_and(|info| matches!(info.compression, CompressionMethod::LZW))
+        {
             Some(weezl::decode::Decoder::with_tiff_size_switch(
                 weezl::BitOrder::Msb,
                 8,

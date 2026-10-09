@@ -297,7 +297,7 @@ fn test_categorical_supersampling_all_patterns_conservation() {
                 cell_count += 1;
                 total_count += acc.total_count;
                 let (maj_class, maj_cnt, maj_frac) = acc.majority();
-                assert!(maj_class >= 1 && maj_class <= 4);
+                assert!((1..=4).contains(&maj_class));
                 assert!(maj_cnt > 0.0);
                 assert!(maj_frac > 0.0 && maj_frac <= 1.0);
             }

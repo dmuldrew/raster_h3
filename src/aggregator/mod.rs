@@ -9,7 +9,7 @@
 //!
 //! - [`accumulator`](crate::aggregator::accumulator): Welford online statistics accumulation (mean, variance, min, max, count, sum).
 //! - [`categorical`](crate::aggregator::categorical): Class frequency tracking and mode computation for discrete rasters.
-//! - [`h3_scanline`](crate::aggregator::h3_scanline): Scanline lookahead buffering and H3 neighbor caching.
+//! - [`h3_scanline`](crate::aggregator::h3_scanline): Exact H3 indexing of a WGS84 point.
 //! - [`horizon_streamer`](crate::aggregator::horizon_streamer): Southernmost scan-line horizon eviction engine for single-resolution streaming.
 //! - [`multi_horizon`](crate::aggregator::multi_horizon): Single-pass multi-resolution fusion and concurrent horizon streaming.
 //! - [`nodata`](crate::aggregator::nodata): NoData detection, value casting, and dispatching.

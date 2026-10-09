@@ -8,7 +8,7 @@ pub fn lon_lat_to_tile_xy(lon: f64, lat: f64, z: u8) -> (u32, u32) {
     let n = (1u32 << z) as f64;
     let x = ((lon + 180.0) / 360.0 * n).floor().max(0.0).min(n - 1.0) as u32;
 
-    let lat_clamped = lat.max(-85.05112878).min(85.05112878);
+    let lat_clamped = lat.clamp(-85.05112878, 85.05112878);
     let lat_rad = lat_clamped.to_radians();
     let y = ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n)
         .floor()

@@ -47,7 +47,10 @@ fn ground_error_m(lon: f64, lat: f64, ref_lon: f64, ref_lat: f64) -> f64 {
 ///   `printf "x y\n" | cs2cs -f "%.10f" <src> +to +proj=longlat <ellps/datum of src> +no_defs`
 /// The reference target uses the *same* ellipsoid as the source so that only the projection
 /// inverse is compared (no datum shift is applied by the engine either).
-fn assert_golden(tf: &CrsTransformer, name: &str, cases: &[((f64, f64), (f64, f64))]) {
+/// ((x, y) in the source CRS, (lon, lat) from cs2cs)
+type GoldenCase = ((f64, f64), (f64, f64));
+
+fn assert_golden(tf: &CrsTransformer, name: &str, cases: &[GoldenCase]) {
     for &((x, y), (ref_lon, ref_lat)) in cases {
         let (lon, lat) = tf
             .transform_point(x, y)
@@ -74,7 +77,7 @@ fn golden_web_mercator_fast_path() {
                 (-122.4193999891, 37.7748999692),
             ),
             (
-                (1_113_194.9079, 6_800_125.4544),
+                (1_113_194.907_9, 6_800_125.454_4),
                 (9.9999999997, 52.0000000000),
             ),
             (
@@ -197,7 +200,7 @@ fn geotransform_round_trip_rotated_and_sheared() {
             c0: 123_456.789,
             a: 10.0 * c + 2.0,
             b: -10.0 * s + 1.5,
-            f0: -98_765.4321,
+            f0: -98_765.432_1,
             d: 10.0 * s - 0.75,
             e: -10.0 * c,
         });
@@ -618,7 +621,7 @@ fn coverage_polar_stereographic_raster_containing_pole() {
 
     // The chunk containing the pole must report max_lat == 90 so it sorts first.
     let tf = CrsTransformer::from_crs_or_epsg(Some(3413), None).unwrap();
-    let pole_row = (gt.f0 / -gt.e) as f64; // row index whose top edge is y = 0
+    let pole_row = gt.f0 / -gt.e; // row index whose top edge is y = 0
     let b = tf.transform_rect_bounds(&gt, 0.0, pole_row - 1.0, width as f64, 2.0);
     assert_eq!(b[3], 90.0, "pole chunk must report max_lat = 90");
 

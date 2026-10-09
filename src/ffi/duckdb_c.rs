@@ -134,6 +134,9 @@ pub union duckdb_string_t {
 }
 
 impl duckdb_string_t {
+    /// # Safety
+    /// `self` must be a `duckdb_string_t` initialized by DuckDB; both union
+    /// variants begin with the length, so either may be active.
     #[inline(always)]
     pub unsafe fn length(&self) -> u32 {
         self.inlined.length
@@ -347,6 +350,10 @@ extern "C" {
 
 /// Check if a specific row in a validity mask is valid.
 /// If `validity` is NULL, all rows in DuckDB are considered valid.
+///
+/// # Safety
+/// `validity` must be null or the validity mask of a live vector, and
+/// `row` must be below that vector's capacity.
 #[inline(always)]
 pub unsafe fn duckdb_validity_is_valid(validity: *mut u64, row: idx_t) -> bool {
     if validity.is_null() {
@@ -357,6 +364,10 @@ pub unsafe fn duckdb_validity_is_valid(validity: *mut u64, row: idx_t) -> bool {
 }
 
 /// Mark a specific row in a vector as invalid (NULL).
+///
+/// # Safety
+/// `vector` must be null or a live, writable vector, and `row` must be
+/// below its capacity.
 #[inline(always)]
 pub unsafe fn duckdb_vector_set_row_invalid(vector: duckdb_vector, row: idx_t) {
     if vector.is_null() {

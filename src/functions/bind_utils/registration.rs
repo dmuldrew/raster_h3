@@ -5,6 +5,10 @@ use crate::ffi::{
 };
 
 /// Add a positional parameter with automated logical type lifecycle management
+///
+/// # Safety
+/// `func` must be a valid table function handle that has not yet been
+/// registered.
 pub unsafe fn add_positional_parameter(func: duckdb_table_function, duckdb_type: DuckDBType) {
     let mut logical_type = duckdb_create_logical_type(duckdb_type);
     duckdb_table_function_add_parameter(func, logical_type);
@@ -12,6 +16,10 @@ pub unsafe fn add_positional_parameter(func: duckdb_table_function, duckdb_type:
 }
 
 /// Add a named parameter with automated logical type lifecycle management
+///
+/// # Safety
+/// `func` must be a valid table function handle that has not yet been
+/// registered.
 pub unsafe fn add_named_parameter(
     func: duckdb_table_function,
     name: &str,
@@ -24,6 +32,10 @@ pub unsafe fn add_named_parameter(
 }
 
 /// Register standard named parameters shared across all raster aggregation functions
+///
+/// # Safety
+/// `func` must be a valid table function handle that has not yet been
+/// registered.
 pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_function) {
     add_named_parameter(func, "resolution", DuckDBType::BigInt);
     add_named_parameter(func, "resolutions", DuckDBType::Varchar);

@@ -253,7 +253,7 @@ fn test_multi_scan_streamer_with_quantiles_enabled() {
     assert!(config.track_quantiles());
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    assert!(streamer.track_quantiles);
+    assert!(streamer.track_quantiles());
 
     let mut total_records = 0;
     loop {
@@ -301,7 +301,7 @@ fn test_multi_scan_streamer_with_quantiles_disabled_zero_cost() {
     assert!(!config.track_quantiles());
 
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    assert!(!streamer.track_quantiles);
+    assert!(!streamer.track_quantiles());
 
     let mut total_records = 0;
     loop {

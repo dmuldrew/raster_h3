@@ -64,8 +64,10 @@ This document compares the architectural design and performance characteristics 
 These historical throughput measurements have not been revalidated after the exact-indexing and memory-budget changes. They are not guarantees for the current implementation.
 
 Benchmarks were conducted on full-scale 257-Megapixel regional rasters (State of Hawaii, 30-meter resolution):
-- **Continuous Surface**: `CFL_HI.tif` ($16,384 \times 16,384$ pixels = 268.4M pixels), IEEE 754 Float32, LZW compression, 268 MB on disk.
-- **Categorical Surface**: `LF2024_FBFM40_HI.tif` ($16,384 \times 16,384$ pixels = 268.4M pixels), Int16, Deflate/Zlib compression, 40 LANDFIRE fuel models.
+- **Continuous Surface**: `CFL_HI.tif` ($20,385 \times 12,602$ pixels = 256.9M pixels), IEEE 754 Float32, LZW compression, 59 MB on disk.
+- **Categorical Surface**: `LF2024_FBFM40_HI.tif` ($20,385 \times 12,600$ pixels = 256.9M pixels), Int16, Deflate/Zlib compression, 40 LANDFIRE fuel models, 11 MB on disk.
+
+Both use 128 × 128 tiles and a custom Albers Equal Area projection (`+proj=aea +lat_1=8 +lat_2=18 +lat_0=13 +lon_0=-157 +datum=NAD83`), so every pixel is reprojected.
 
 Tests were executed on an 8-core ARM64 workstation with 16 GB unified memory running the native release build:
 
@@ -76,6 +78,19 @@ Tests were executed on an 8-core ARM64 workstation with 16 GB unified memory run
 | **Dual-Pyramid Stream (Res 7 & 8 single pass)** | 4.32 s | **3.90 s** | **+9.7% faster** | **~68.8M pixels / sec** (~115,000 hex/s combined) |
 | **Shannon Landscape Entropy Calculation** | 0.38 s | **0.30 s** | **+21.1% faster** | **~894.7M pixels / sec** |
 | **Active Peak RAM Usage** | Not revalidated | Not revalidated | Configuration dependent | Aggregation budget excludes decoding and prefetch overhead |
+
+### Current Streaming Path (measured 2026-10-08)
+
+End-to-end `MultiScanHorizonStreamer` / `MultiCategoricalHorizonStreamer` runs over the two rasters above, draining all records in 2048-row batches. Apple M1 Pro (10 cores, 16 GB), release build, median of 3 interleaved runs (8 for the first row). "Before" is the fused-supersampling walker (`02ff37c`); "after" adds the consolidated walker, O(1) shard accounting, streaming compaction, and the `as_chunks` span loops. Each case produced identical row counts before and after.
+
+| Case | Before | After | Change |
+| :--- | ---: | ---: | ---: |
+| Continuous, center, res 8 | 3.44 s | 3.19 s | −7% |
+| Continuous, center, res 6 + 8 + 10 | 11.78 s | 10.39 s | −12% |
+| Continuous, RGSS 4-point, res 8 | 9.78 s | 9.53 s | −3% |
+| Categorical, center, res 8 | 22.77 s | 21.81 s | −4% |
+
+Run-to-run spread on this machine was up to ±10%, so single-digit differences are indicative only. The multi-resolution gain comes mainly from transforming each pixel once rather than once per resolution.
 
 ### Engineering Analysis:
 1. **Minimized Allocation Churn**: By recycling decompression buffers via `DecodingBufferPool`, repetitive buffer allocations and OS page mappings are minimized during sustained streaming while strictly bounding retained idle memory.

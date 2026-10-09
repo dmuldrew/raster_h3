@@ -75,7 +75,7 @@ fn utm_raster_retains_cells_without_a_certificate() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(!stream.can_evict_early);
+    assert!(!stream.can_evict_early());
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
@@ -84,7 +84,7 @@ fn utm_raster_retains_cells_without_a_certificate() {
         "First batch should yield completed records"
     );
     assert!(
-        stream.processed_chunk_count == stream.mosaic.chunk_refs.len(),
+        stream.processed_chunk_count() == stream.mosaic().chunk_refs.len(),
         "Uncertified projected output must wait until EOF"
     );
 
@@ -167,7 +167,7 @@ fn albers_raster_evicts_early_soundly() {
     };
 
     let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
-    assert!(stream.can_evict_early);
+    assert!(stream.can_evict_early());
 
     let mut actual = HashMap::new();
     let first_batch = stream.fetch_next_batch(10).unwrap();
@@ -176,7 +176,7 @@ fn albers_raster_evicts_early_soundly() {
         "First batch should yield completed records"
     );
     assert!(
-        stream.processed_chunk_count < stream.mosaic.chunk_refs.len(),
+        stream.processed_chunk_count() < stream.mosaic().chunk_refs.len(),
         "Certified projected output should evict early before EOF"
     );
 

@@ -50,6 +50,7 @@ impl Default for TestGeoTiffBuilder {
 /// Trait implemented by supported TIFF sample types for testing
 pub trait TestTiffSample: Copy + 'static {
     type ColorType: colortype::ColorType;
+    #[allow(clippy::too_many_arguments)]
     fn write_image<W: std::io::Write + std::io::Seek>(
         encoder: &mut TiffEncoder<W>,
         width: u32,
@@ -174,8 +175,7 @@ impl TestGeoTiffBuilder {
     ) -> std::io::Result<()> {
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
-        let mut encoder = TiffEncoder::new(writer)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut encoder = TiffEncoder::new(writer).map_err(std::io::Error::other)?;
 
         let tiepoint = [0.0_f64, 0.0, 0.0, self.origin_lon, self.origin_lat, 0.0];
         let pixel_scale = [self.pixel_size_x, self.pixel_size_y, 0.0];
@@ -419,6 +419,7 @@ pub fn create_fn_f32_geotiff<F: Fn(u32, u32) -> f32>(
 /// * `path` – Destination path for the file.
 /// * `width`, `height` – Image dimensions.
 /// * `compression` – Desired TIFF compression.
+///
 /// The image is a single‑band 8‑bit grayscale with deterministic pixel values.
 pub fn create_temp_geotiff<P: AsRef<Path>>(
     path: P,

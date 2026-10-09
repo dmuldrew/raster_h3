@@ -206,6 +206,22 @@ impl_tiff_int_sample!(i32, |x: i32| x);
 impl_tiff_int_sample!(u64, |x: u64| u64::MAX - x);
 impl_tiff_int_sample!(i64, |x: i64| x);
 
+/// Layout and encoding of one decompressed TIFF chunk.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkEncoding {
+    /// Allocated tile width in pixels; the source row stride.
+    pub tile_w: usize,
+    /// Valid pixel columns to copy from each row.
+    pub data_w: usize,
+    /// Valid rows to copy.
+    pub data_h: usize,
+    /// Interleaved samples per pixel.
+    pub spp: usize,
+    pub byte_order: TiffByteOrder,
+    pub predictor: Predictor,
+    pub photometric: PhotometricInterpretation,
+}
+
 /// Unpack generic integer samples from decompressed TIFF chunk bytes.
 ///
 /// Handles:
@@ -216,14 +232,17 @@ impl_tiff_int_sample!(i64, |x: i64| x);
 pub fn unpack_integer_samples<T: TiffSample + WrappingAdd>(
     src: &[u8],
     dst: &mut [T],
-    tile_w: usize,
-    data_w: usize,
-    data_h: usize,
-    spp: usize,
-    byte_order: TiffByteOrder,
-    predictor: Predictor,
-    photometric: PhotometricInterpretation,
+    encoding: ChunkEncoding,
 ) -> Result<()> {
+    let ChunkEncoding {
+        tile_w,
+        data_w,
+        data_h,
+        spp,
+        byte_order,
+        predictor,
+        photometric,
+    } = encoding;
     let sample_bytes = T::BYTES;
     let src_stride_bytes = tile_w * spp * sample_bytes;
     let dst_stride = data_w * spp;
@@ -481,17 +500,16 @@ pub fn decode_fp_predict_f64(input: &mut [u8], output: &mut [f64], spp: usize) {
 }
 
 /// Unpack 32-bit floating point samples from decompressed TIFF chunk bytes.
-pub fn unpack_f32(
-    src: &mut [u8],
-    dst: &mut [f32],
-    tile_w: usize,
-    data_w: usize,
-    data_h: usize,
-    spp: usize,
-    byte_order: TiffByteOrder,
-    predictor: Predictor,
-    photometric: PhotometricInterpretation,
-) -> Result<()> {
+pub fn unpack_f32(src: &mut [u8], dst: &mut [f32], encoding: ChunkEncoding) -> Result<()> {
+    let ChunkEncoding {
+        tile_w,
+        data_w,
+        data_h,
+        spp,
+        byte_order,
+        predictor,
+        photometric,
+    } = encoding;
     let src_stride_bytes = tile_w * spp * 4;
     let dst_stride = data_w * spp;
     match predictor {
@@ -587,17 +605,16 @@ pub fn unpack_f32(
 }
 
 /// Unpack 64-bit floating point samples from decompressed TIFF chunk bytes.
-pub fn unpack_f64(
-    src: &mut [u8],
-    dst: &mut [f64],
-    tile_w: usize,
-    data_w: usize,
-    data_h: usize,
-    spp: usize,
-    byte_order: TiffByteOrder,
-    predictor: Predictor,
-    photometric: PhotometricInterpretation,
-) -> Result<()> {
+pub fn unpack_f64(src: &mut [u8], dst: &mut [f64], encoding: ChunkEncoding) -> Result<()> {
+    let ChunkEncoding {
+        tile_w,
+        data_w,
+        data_h,
+        spp,
+        byte_order,
+        predictor,
+        photometric,
+    } = encoding;
     let src_stride_bytes = tile_w * spp * 8;
     let dst_stride = data_w * spp;
     match predictor {
@@ -735,13 +752,15 @@ mod tests {
         unpack_integer_samples(
             &tile,
             &mut dst,
-            4,
-            2,
-            2,
-            1,
-            TiffByteOrder::LittleEndian,
-            Predictor::None,
-            PhotometricInterpretation::WhiteIsZero,
+            ChunkEncoding {
+                tile_w: 4,
+                data_w: 2,
+                data_h: 2,
+                spp: 1,
+                byte_order: TiffByteOrder::LittleEndian,
+                predictor: Predictor::None,
+                photometric: PhotometricInterpretation::WhiteIsZero,
+            },
         )
         .unwrap();
 
@@ -756,13 +775,15 @@ mod tests {
         let result = unpack_f32(
             &mut src,
             &mut dst,
-            2,
-            2,
-            1,
-            1,
-            TiffByteOrder::LittleEndian,
-            Predictor::Horizontal,
-            PhotometricInterpretation::BlackIsZero,
+            ChunkEncoding {
+                tile_w: 2,
+                data_w: 2,
+                data_h: 1,
+                spp: 1,
+                byte_order: TiffByteOrder::LittleEndian,
+                predictor: Predictor::Horizontal,
+                photometric: PhotometricInterpretation::BlackIsZero,
+            },
         );
         assert!(result.is_err());
     }

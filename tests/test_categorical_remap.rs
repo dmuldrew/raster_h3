@@ -182,9 +182,7 @@ fn test_multi_categorical_horizon_streamer_with_remapping() {
         for rec in batch {
             *total_pixels_by_res.entry(rec.resolution).or_insert(0.0) +=
                 rec.accumulator.total_count;
-            let class_map = counts_by_res
-                .entry(rec.resolution)
-                .or_insert_with(HashMap::new);
+            let class_map = counts_by_res.entry(rec.resolution).or_default();
             rec.accumulator.for_each_class(|cat, cnt| {
                 *class_map.entry(cat).or_insert(0.0) += cnt;
             });

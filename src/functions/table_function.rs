@@ -37,6 +37,9 @@ pub struct RasterH3GlobalData {
 pub type RasterH3LocalData = TableFunctionLocalData;
 
 /// Bind callback: parses input arguments, defines output columns, and returns bind data
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
     ffi_bind_guard(info, || {
         let bind = BindHelper::new(info);
@@ -136,6 +139,10 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
 }
 
 /// Global init callback: opens GeoTIFF stream reader and initializes streaming scanline horizon aggregator
+///
+/// # Safety
+/// `db` must be a valid DuckDB database handle; DuckDB calls this once
+/// when loading the extension.
 pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
     ffi_init_guard(info, || {
         let bind_data_ptr = duckdb_init_get_bind_data(info) as *const RasterH3BindData;
@@ -197,6 +204,9 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
 }
 
 /// Thread-local init callback for multi-threaded parallel DuckDB execution
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
     ffi_init_guard(info, || {
         init_table_function_local(info);
@@ -204,6 +214,10 @@ pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
 }
 
 /// Scan callback: streaming vector emission directly from scanline horizon eviction with projection pushdown
+///
+/// # Safety
+/// `info` and `output` must be the handles DuckDB passes to this scan
+/// callback, with `output` laid out as the columns declared at bind time.
 pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     ffi_scan_guard(info, output, || {
         let global_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3GlobalData;
@@ -344,6 +358,9 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 }
 
 /// Register `h3_raster_continuous_aggregate` and `h3_raster_continuous` table functions
+///
+/// # Safety
+/// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Result<(), String> {
     let names = [
         "h3_raster_continuous_aggregate",

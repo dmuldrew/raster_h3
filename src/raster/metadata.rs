@@ -14,7 +14,9 @@ use crate::raster::geotransform::GeoTransform;
 /// Helper: GeoKey 1025 GTRasterTypeGeoKey: 1 = RasterPixelIsArea (default), 2 = RasterPixelIsPoint
 #[inline]
 fn raster_type_is_point(keys: &[u16]) -> bool {
-    keys.chunks_exact(4)
+    keys.as_chunks::<4>()
+        .0
+        .iter()
         .skip(1)
         .any(|k| k[0] == 1025 && k[1] == 0 && k[3] == 2)
 }
