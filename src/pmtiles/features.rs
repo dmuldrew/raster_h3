@@ -398,6 +398,7 @@ impl TilePyramidAccumulator {
 }
 
 /// Unified PMTiles v3 metadata / TileJSON builder
+#[allow(clippy::too_many_arguments)]
 pub fn build_pmtiles_metadata(
     name: &str,
     description: &str,

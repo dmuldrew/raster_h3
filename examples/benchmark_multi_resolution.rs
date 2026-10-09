@@ -21,12 +21,11 @@ use raster_h3::raster::geotiff::GeoTiffStreamReader;
 fn generate_benchmark_raster(path: &Path, width: u32, height: u32) -> std::io::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-    let mut encoder =
-        TiffEncoder::new(writer).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut encoder = TiffEncoder::new(writer).map_err(std::io::Error::other)?;
 
     let mut image = encoder
         .new_image::<Gray32Float>(width, height)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // ModelTiepoint: San Francisco (-122.50, 37.85)
     image
@@ -35,20 +34,20 @@ fn generate_benchmark_raster(path: &Path, width: u32, height: u32) -> std::io::R
             Tag::Unknown(33922),
             &[-0.0f64, 0.0, 0.0, -122.50, 37.85, 0.0][..],
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // Pixel Scale: ~10m resolution (0.0001 deg)
     image
         .encoder()
         .write_tag(Tag::Unknown(33550), &[0.0001f64, 0.0001, 0.0][..])
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // EPSG:4326 GeoKeys
     let geokeys: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
     image
         .encoder()
         .write_tag(Tag::Unknown(34735), &geokeys[..])
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let total_pixels = (width as usize) * (height as usize);
     let mut data = Vec::with_capacity(total_pixels);
@@ -60,9 +59,7 @@ fn generate_benchmark_raster(path: &Path, width: u32, height: u32) -> std::io::R
         }
     }
 
-    image
-        .write_data(&data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    image.write_data(&data).map_err(std::io::Error::other)?;
 
     Ok(())
 }

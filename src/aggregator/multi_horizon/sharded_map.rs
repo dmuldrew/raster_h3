@@ -77,6 +77,12 @@ pub struct ShardedResolutionMap<A: AccumulatorMerge> {
     track_eviction: bool,
 }
 
+impl<A: AccumulatorMerge> Default for ShardedResolutionMap<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
     /// Create a new ShardedResolutionMap with `NUM_SHARDS` shards
     pub fn new() -> Self {

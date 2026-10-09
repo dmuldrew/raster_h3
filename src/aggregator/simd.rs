@@ -80,8 +80,7 @@ fn accumulate_span_f32_no_nodata(slice: &[f32]) -> H3Accumulator {
     let mut count6 = 0usize;
     let mut count7 = 0usize;
 
-    let chunks = slice.chunks_exact(8);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = slice.as_chunks::<8>();
 
     for chunk in chunks {
         let v0 = chunk[0];
@@ -180,8 +179,7 @@ fn accumulate_span_f32_no_nodata(slice: &[f32]) -> H3Accumulator {
     let mut m2_6 = 0.0f64;
     let mut m2_7 = 0.0f64;
 
-    let chunks2 = slice.chunks_exact(8);
-    let remainder2 = chunks2.remainder();
+    let (chunks2, remainder2) = slice.as_chunks::<8>();
 
     if (total_count as usize) == slice.len() {
         // All values are finite: branchless second pass
@@ -302,8 +300,7 @@ fn accumulate_span_f32_with_nodata(slice: &[f32], nd: f32) -> H3Accumulator {
     let mut count6 = 0usize;
     let mut count7 = 0usize;
 
-    let chunks = slice.chunks_exact(8);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = slice.as_chunks::<8>();
 
     for chunk in chunks {
         let v0 = chunk[0];
@@ -400,8 +397,7 @@ fn accumulate_span_f32_with_nodata(slice: &[f32], nd: f32) -> H3Accumulator {
     let mut m2_6 = 0.0f64;
     let mut m2_7 = 0.0f64;
 
-    let chunks2 = slice.chunks_exact(8);
-    let remainder2 = chunks2.remainder();
+    let (chunks2, remainder2) = slice.as_chunks::<8>();
 
     for chunk in chunks2 {
         let v0 = chunk[0];
@@ -508,8 +504,7 @@ impl SimdSpanAccumulate for f64 {
             true
         };
 
-        let chunks = slice.chunks_exact(4);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = slice.as_chunks::<4>();
 
         for chunk in chunks {
             let v0 = chunk[0];
@@ -568,8 +563,7 @@ impl SimdSpanAccumulate for f64 {
         let mut m2_2 = 0.0f64;
         let mut m2_3 = 0.0f64;
 
-        let chunks2 = slice.chunks_exact(4);
-        let remainder2 = chunks2.remainder();
+        let (chunks2, remainder2) = slice.as_chunks::<4>();
 
         for chunk in chunks2 {
             let v0 = chunk[0];
@@ -649,8 +643,7 @@ macro_rules! impl_simd_span_integer {
                 let mut count2 = 0usize;
                 let mut count3 = 0usize;
 
-                let chunks = slice.chunks_exact(4);
-                let remainder = chunks.remainder();
+                let (chunks, remainder) = slice.as_chunks::<4>();
 
                 match nodata {
                     None => {
@@ -753,8 +746,7 @@ macro_rules! impl_simd_span_integer {
                 let mut m2_2 = 0.0f64;
                 let mut m2_3 = 0.0f64;
 
-                let chunks2 = slice.chunks_exact(4);
-                let remainder2 = chunks2.remainder();
+                let (chunks2, remainder2) = slice.as_chunks::<4>();
 
                 match nodata {
                     None => {

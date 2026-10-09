@@ -318,6 +318,7 @@ fn download_band_tiles(
     Ok(valid_sources)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_band_streaming(
     band_index: usize,
     paths: &[PathBuf],

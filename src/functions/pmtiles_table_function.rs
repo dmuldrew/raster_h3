@@ -48,6 +48,9 @@ unsafe fn add_pmtiles_summary_columns(bind: &BindHelper) {
 }
 
 /// Bind callback: parses input arguments and defines output table schema
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
     ffi_bind_guard(info, || {
         let bind = BindHelper::new(info);
@@ -105,6 +108,9 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
 }
 
 /// Init callback
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn pmtiles_init(info: duckdb_init_info) {
     ffi_init_guard(info, || {
         set_table_function_init_data(
@@ -117,6 +123,10 @@ pub unsafe extern "C" fn pmtiles_init(info: duckdb_init_info) {
 }
 
 /// Scan callback: runs GeoTIFF-to-PMTiles conversion and streams the single summary row
+///
+/// # Safety
+/// `info` and `output` must be the handles DuckDB passes to this scan
+/// callback, with `output` laid out as the columns declared at bind time.
 pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     ffi_scan_guard(info, output, || {
         let bind_data = &*(duckdb_function_get_bind_data(info) as *const PmtilesBindData);
@@ -198,6 +208,9 @@ pub struct ParquetPmtilesGlobalData {
 }
 
 /// Bind callback: parses input arguments for `h3_parquet_to_pmtiles`
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
     ffi_bind_guard(info, || {
         let bind = BindHelper::new(info);
@@ -247,6 +260,9 @@ pub unsafe extern "C" fn parquet_pmtiles_bind(info: duckdb_bind_info) {
 }
 
 /// Init callback for `h3_parquet_to_pmtiles`
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn parquet_pmtiles_init(info: duckdb_init_info) {
     ffi_init_guard(info, || {
         set_table_function_init_data(
@@ -259,6 +275,10 @@ pub unsafe extern "C" fn parquet_pmtiles_init(info: duckdb_init_info) {
 }
 
 /// Scan callback: runs Parquet-to-PMTiles conversion and streams the single summary row
+///
+/// # Safety
+/// `info` and `output` must be the handles DuckDB passes to this scan
+/// callback, with `output` laid out as the columns declared at bind time.
 pub unsafe extern "C" fn parquet_pmtiles_scan(
     info: duckdb_function_info,
     output: duckdb_data_chunk,
@@ -312,6 +332,9 @@ pub unsafe extern "C" fn parquet_pmtiles_scan(
 }
 
 /// Register `h3_raster_to_pmtiles` and `h3_parquet_to_pmtiles` Table Functions with DuckDB
+///
+/// # Safety
+/// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<(), String> {
     // 1. Register h3_raster_to_pmtiles
     let fn_name = to_c_string("h3_raster_to_pmtiles");

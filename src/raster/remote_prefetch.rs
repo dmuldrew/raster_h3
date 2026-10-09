@@ -88,7 +88,7 @@ pub fn coalesce_chunk_ranges(
         if let Some(ref mut curr) = current_range {
             // Must belong to the same tile to coalesce
             let same_tile = curr.tile_idx == chunk.tile_idx;
-            let monotonic_offset = chunk.offset >= curr.end_offset + 1;
+            let monotonic_offset = chunk.offset > curr.end_offset;
 
             if same_tile && monotonic_offset {
                 let gap = chunk.offset - (curr.end_offset + 1);
@@ -123,9 +123,12 @@ pub fn coalesce_chunk_ranges(
     ranges
 }
 
+/// Fetched chunk bytes keyed by (tile, chunk index), shared with the workers.
+type ReadyChunks = Arc<Mutex<FxHashMap<(usize, u32), Arc<Vec<u8>>>>>;
+
 /// Parallel asynchronous prefetch queue managing concurrent HTTP Range requests
 pub struct RemoteChunkPrefetchQueue {
-    ready_chunks: Arc<Mutex<FxHashMap<(usize, u32), Arc<Vec<u8>>>>>,
+    ready_chunks: ReadyChunks,
     condvar: Arc<Condvar>,
     next_job: Arc<AtomicUsize>,
     total_jobs: usize,

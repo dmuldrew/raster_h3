@@ -258,6 +258,11 @@ unsafe fn binary_str_scalar_to_str_kernel<T2: Copy, const N: usize, F>(
 // =========================================================================
 
 /// Scalar function: h3_to_string(UBIGINT) -> VARCHAR (Zero-allocation)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_string(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -271,6 +276,11 @@ pub unsafe extern "C" fn scalar_h3_to_string(
 }
 
 /// Scalar function: string_to_h3(VARCHAR) -> UBIGINT (Zero-allocation hex parsing)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_string_to_h3(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -282,6 +292,11 @@ pub unsafe extern "C" fn scalar_string_to_h3(
 }
 
 /// Scalar function: h3_to_lat(UBIGINT) -> DOUBLE
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_lat(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -297,6 +312,11 @@ pub unsafe extern "C" fn scalar_h3_to_lat(
 }
 
 /// Scalar function: h3_to_lng(UBIGINT) -> DOUBLE
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_lng(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -312,6 +332,11 @@ pub unsafe extern "C" fn scalar_h3_to_lng(
 }
 
 /// Scalar function: h3_get_resolution(UBIGINT) -> BIGINT (1-cycle bitshift)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_get_resolution(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -330,6 +355,11 @@ pub unsafe extern "C" fn scalar_h3_get_resolution(
 }
 
 /// Scalar function: h3_is_valid(UBIGINT) -> BOOLEAN
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_is_valid_u64(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -343,6 +373,11 @@ pub unsafe extern "C" fn scalar_h3_is_valid_u64(
 }
 
 /// Scalar function: h3_is_valid(VARCHAR) -> BOOLEAN
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_is_valid_str(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -358,6 +393,11 @@ pub unsafe extern "C" fn scalar_h3_is_valid_str(
 }
 
 /// Scalar function: h3_to_wkb(UBIGINT) -> BLOB (Zero-allocation WKB polygon encoder)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_wkb_u64(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -371,6 +411,11 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_u64(
 }
 
 /// Scalar function: h3_to_wkb(VARCHAR) -> BLOB (Zero-allocation WKB polygon encoder)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_wkb_str(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -386,6 +431,11 @@ pub unsafe extern "C" fn scalar_h3_to_wkb_str(
 }
 
 /// Scalar function: h3_to_geometry(UBIGINT) -> GEOMETRY (Zero-allocation WKB polygon encoder)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_geometry_u64(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -397,6 +447,11 @@ pub unsafe extern "C" fn scalar_h3_to_geometry_u64(
 }
 
 /// Scalar function: h3_to_geometry(VARCHAR) -> GEOMETRY (Zero-allocation WKB polygon encoder)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_to_geometry_str(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -408,6 +463,11 @@ pub unsafe extern "C" fn scalar_h3_to_geometry_str(
 }
 
 /// Scalar function: h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_cell_to_parent_u64(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -430,6 +490,11 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_u64(
 }
 
 /// Scalar function: h3_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
 pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
     info: duckdb_function_info,
     input: duckdb_data_chunk,
@@ -498,6 +563,9 @@ unsafe fn register_binary_scalar_fn(
 }
 
 /// Register scalar functions with DuckDB
+///
+/// # Safety
+/// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), String> {
     let type_ubigint = duckdb_create_logical_type(DuckDBType::UBigInt);
     let type_varchar = duckdb_create_logical_type(DuckDBType::Varchar);

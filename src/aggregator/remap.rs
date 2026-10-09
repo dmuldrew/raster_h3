@@ -173,7 +173,7 @@ impl CategoryRemapper {
         if (clean.starts_with('{') && clean.ends_with('}'))
             || (clean.starts_with('[') && clean.ends_with(']'))
         {
-            clean = &clean[1..clean.len() - 1].trim();
+            clean = clean[1..clean.len() - 1].trim();
         }
 
         let mut rules = Vec::new();
@@ -240,10 +240,10 @@ fn is_fallback_token(s: &str) -> bool {
 fn clean_token(s: &str) -> String {
     let t = s.trim();
     // Strip surrounding single or double quotes
-    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
-        if t.len() >= 2 {
-            return t[1..t.len() - 1].trim().to_string();
-        }
+    if ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
+        && t.len() >= 2
+    {
+        return t[1..t.len() - 1].trim().to_string();
     }
     t.to_string()
 }

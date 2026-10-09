@@ -57,6 +57,9 @@ impl ChunkWriter {
     }
 
     /// Retrieve the underlying vector for a specific column index, bounds-checked against column count
+    ///
+    /// # Safety
+    /// `self.chunk` must be null or a live DuckDB data chunk.
     #[inline(always)]
     pub unsafe fn get_vector(&self, col_idx: usize) -> duckdb_vector {
         if self.chunk.is_null() || col_idx >= self.column_count {
@@ -89,6 +92,11 @@ impl ChunkWriter {
     }
 
     /// Set an i64 integer sample at (col_idx, row_idx)
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must have physical type BIGINT (`i64`),
+    /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_int64(&self, col_idx: usize, row_idx: usize, val: i64) {
         if row_idx >= self.vector_size {
@@ -106,6 +114,11 @@ impl ChunkWriter {
     }
 
     /// Set a u64 unsigned integer sample at (col_idx, row_idx)
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must have physical type UBIGINT (`u64`),
+    /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_uint64(&self, col_idx: usize, row_idx: usize, val: u64) {
         if row_idx >= self.vector_size {
@@ -123,6 +136,11 @@ impl ChunkWriter {
     }
 
     /// Set a u8 unsigned integer sample at (col_idx, row_idx)
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must have physical type UTINYINT (`u8`),
+    /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_uint8(&self, col_idx: usize, row_idx: usize, val: u8) {
         if row_idx >= self.vector_size {
@@ -140,6 +158,11 @@ impl ChunkWriter {
     }
 
     /// Set an f64 double sample at (col_idx, row_idx)
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must have physical type DOUBLE (`f64`),
+    /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_double(&self, col_idx: usize, row_idx: usize, val: f64) {
         if row_idx >= self.vector_size {
@@ -157,6 +180,11 @@ impl ChunkWriter {
     }
 
     /// Assign a null-terminated UTF-8 string at (col_idx, row_idx)
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must be VARCHAR or BLOB, and no
+    /// other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_string(&self, col_idx: usize, row_idx: usize, s: &str) {
         if row_idx >= self.vector_size {
@@ -175,6 +203,11 @@ impl ChunkWriter {
     }
 
     /// Assign a string slice or binary blob bytes of known length at (col_idx, row_idx)
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must be VARCHAR or BLOB, and no
+    /// other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_string_bytes(&self, col_idx: usize, row_idx: usize, bytes: &[u8]) {
         if row_idx >= self.vector_size {
@@ -193,6 +226,10 @@ impl ChunkWriter {
     }
 
     /// Set a NULL value at (col_idx, row_idx) by updating the DuckDB validity mask
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_null(&self, col_idx: usize, row_idx: usize) {
         if row_idx >= self.vector_size {
@@ -206,6 +243,11 @@ impl ChunkWriter {
     }
 
     /// Fill a primitive copyable column slice from an iterator
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, column `col_idx` must have physical type `T`, and no
+    /// other reference may alias that vector's buffer during the call.
     #[inline(always)]
     pub unsafe fn fill_column<T: Copy, I: IntoIterator<Item = T>>(
         &mut self,
@@ -221,6 +263,10 @@ impl ChunkWriter {
     }
 
     /// Write formatted 16-character hexadecimal H3 cell index strings using scratch buffer
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, and column `out_idx` must be VARCHAR.
     #[inline(always)]
     pub unsafe fn write_hex_column<'a, I>(&self, out_idx: usize, cells: I, hex_buf: &mut [u8; 16])
     where
@@ -233,6 +279,10 @@ impl ChunkWriter {
     }
 
     /// Write WKB and Native GEOMETRY columns from H3 cell indices with NULL handling
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, and the given columns must be BLOB or GEOMETRY.
     #[inline(always)]
     pub unsafe fn write_wkb_and_geom_columns<'a, I>(
         &self,
@@ -267,6 +317,10 @@ impl ChunkWriter {
     }
 
     /// Set the total number of valid rows in this data chunk
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk with capacity for at least
+    /// `self.vector_size` rows.
     #[inline(always)]
     pub unsafe fn set_size(&self, size: usize) {
         let safe_size = size.min(self.vector_size);

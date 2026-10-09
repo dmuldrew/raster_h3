@@ -30,6 +30,17 @@ use super::lifecycle::{OutputBuffer, StreamLifecycle};
 use super::sharded_map::{AccumulatorMerge, ShardedResolutionMap};
 use super::spill::{RunReader, SpillAccumulator, SpillRuns};
 
+/// One worker window: (tile index, window bounds, borrowed samples, row stride, overlaps another tile).
+type WindowJob<'a> = (
+    usize,
+    RasterChunk,
+    super::borrowed::BorrowedSamples<'a>,
+    u32,
+    bool,
+);
+/// One worker's per-resolution cell maps.
+type CellMaps<A> = Vec<HashMap<u64, A, FxBuildHasher>>;
+
 /// Kernel trait parameterizing data type-specific chunk processing, aggregation, and filtering
 pub trait HorizonStreamKernel: Send + Sync + 'static {
     type Accumulator: SpillAccumulator + Default + 'static;
@@ -169,7 +180,7 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     batch_size: usize,
     output_byte_limit: usize,
     peak_active_bytes: usize,
-    worker_maps: Vec<Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>>,
+    worker_maps: Vec<CellMaps<K::Accumulator>>,
     metrics: super::profile::StreamProfile,
 }
 
@@ -498,10 +509,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     continue;
                 }
                 let t = std::time::Instant::now();
-                let process = |(job, maps): (
-                    &(usize, RasterChunk, BorrowedSamples<'_>, u32, bool),
-                    &mut Vec<HashMap<u64, K::Accumulator, FxBuildHasher>>,
-                )| {
+                let process = |(job, maps): (&WindowJob<'_>, &mut CellMaps<K::Accumulator>)| {
                     let (tile_idx, chunk, samples, stride, overlap) = job;
                     let tile = &self.mosaic.tiles[*tile_idx];
                     let scope = super::profile::WorkerScope::new();

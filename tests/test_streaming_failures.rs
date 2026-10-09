@@ -158,9 +158,11 @@ fn corrupt_chunk_exports_fail_and_preserve_existing_outputs() {
         fs::write(&parquet, b"existing parquet").unwrap();
         fs::write(&pmtiles, b"existing pmtiles").unwrap();
         let config = MultiResolutionConfig::single(8);
-        let mut export = ParquetExportConfig::default();
-        export.is_categorical = categorical;
-        export.row_group_size = 1;
+        let export = ParquetExportConfig {
+            is_categorical: categorical,
+            row_group_size: 1,
+            ..Default::default()
+        };
         assert!(H3ParquetWriter::process_raster_source_to_parquet(
             file.path(),
             &parquet,
@@ -233,8 +235,10 @@ fn parquet_failure_after_flushed_row_groups_is_not_published() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("output.parquet");
     fs::write(&output, b"existing dataset").unwrap();
-    let mut config = ParquetExportConfig::default();
-    config.row_group_size = 1;
+    let config = ParquetExportConfig {
+        row_group_size: 1,
+        ..Default::default()
+    };
     let result = run_parquet_streaming_pipeline::<_, ContinuousRowGroupBuffer, _>(
         FailingStreamer { remaining: 8 },
         &output,

@@ -33,7 +33,7 @@ impl SamplingPattern {
     }
 
     /// 2. Rotated Grid Super-Sampling (RGSS / 4-point rotated: optimal anti-aliasing efficiency)
-    /// Rotates coordinates by ~26.6 degrees so no two points share the same X or Y axis.
+    ///    Rotates coordinates by ~26.6 degrees so no two points share the same X or Y axis.
     pub fn rgss() -> Self {
         Self {
             points: vec![
@@ -95,7 +95,7 @@ impl SamplingPattern {
     }
 
     /// 4. Gaussian Center-Weighted 5-point sampling (Point Spread Function / optical sensor modeling)
-    /// Center has 50% weight; 4 cross points have 12.5% weight each.
+    ///    Center has 50% weight; 4 cross points have 12.5% weight each.
     pub fn gaussian_five_point() -> Self {
         Self {
             points: vec![

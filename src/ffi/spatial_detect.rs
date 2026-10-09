@@ -46,6 +46,10 @@ extern "system" {
 }
 
 /// Dynamically looks up a symbol from DuckDB's runtime environment
+///
+/// # Safety
+/// `symbol` must be NUL-terminated. Transmuting the returned pointer to a
+/// function type is only sound if it matches the symbol's C signature.
 pub unsafe fn dlsym_duckdb_symbol(symbol: &[u8]) -> *mut std::ffi::c_void {
     #[cfg(unix)]
     {
@@ -97,6 +101,9 @@ pub fn is_geometry_available() -> bool {
 }
 
 /// Probes the DuckDB database to check if spatial extension is loaded or GEOMETRY type is registered
+///
+/// # Safety
+/// `con` must be a valid, open DuckDB connection.
 pub unsafe fn is_spatial_loaded_query(con: duckdb_connection) -> bool {
     let mut result = duckdb_result::default();
     let query = to_c_string(
@@ -117,6 +124,10 @@ pub unsafe fn is_spatial_loaded_query(con: duckdb_connection) -> bool {
 /// 1. If DuckDB >= 1.5, attempts to create native DuckDBType::Geometry (40).
 /// 2. Fallback: Creates DuckDBType::Blob and aliases it as "GEOMETRY",
 ///    which is the universal DuckDB spatial convention.
+///
+/// # Safety
+/// The DuckDB C API must be initialized. The caller owns the returned
+/// type and must release it with `duckdb_destroy_logical_type`.
 pub unsafe fn create_geometry_logical_type() -> duckdb_logical_type {
     if is_duckdb_version_at_least(1, 5) {
         let geom_type = duckdb_create_logical_type(DuckDBType::Geometry);

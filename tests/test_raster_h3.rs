@@ -1178,9 +1178,7 @@ fn test_categorical_rle_alternating_and_interspersed_nodata() {
     let mut expected_valid_pixels = 0.0;
     for row in 0..height {
         for col in 0..width {
-            if row < 32 {
-                expected_valid_pixels += 1.0;
-            } else if col % 10 != 5 {
+            if row < 32 || col % 10 != 5 {
                 expected_valid_pixels += 1.0;
             }
         }

@@ -169,7 +169,7 @@ fn test_categorical_streaming_performance_scaling() {
             accumulated_pixels += acc.total_count;
             assert!(acc.unique_classes() >= 1);
             let (maj_class, maj_count, maj_frac) = acc.majority();
-            assert!(maj_class >= 1 && maj_class <= 16);
+            assert!((1..=16).contains(&maj_class));
             assert!(maj_count > 0.0);
             assert!(maj_frac > 0.0 && maj_frac <= 1.0);
         }

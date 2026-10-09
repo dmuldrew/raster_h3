@@ -12,7 +12,7 @@ use raster_h3::raster::geotiff::GeoTiffStreamReader;
 use std::collections::HashMap;
 
 fn pixel_value(col: u32, row: u32) -> f32 {
-    if (col + row * 32) % 17 == 0 {
+    if (col + row * 32).is_multiple_of(17) {
         f32::NAN
     } else {
         (1 + (col / 3 + row / 2) % 5) as f32

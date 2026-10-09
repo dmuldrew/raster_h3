@@ -209,7 +209,7 @@ fn test_prefetch_drain_chunk_batch_into() {
 
     let temp_raster = create_test_geotiff(64, 64);
     let reader = GeoTiffStreamReader::open(temp_raster.path()).unwrap();
-    let num_chunks = reader.chunk_layout.total_chunks as u32;
+    let num_chunks = reader.chunk_layout.total_chunks;
 
     let indices: Vec<u32> = (0..num_chunks).collect();
     let prefetcher =
@@ -483,8 +483,7 @@ fn test_parquet_continuous_streaming_export_and_sorting() {
     // Verify sorting within row groups
     let iter = reader.get_row_iter(None).unwrap();
     let mut prev_index = i64::MIN;
-    let mut current_rg_rows = 0;
-    for row in iter {
+    for (current_rg_rows, row) in iter.enumerate() {
         let row = row.unwrap();
         let h3_idx = row.get_long(0).unwrap();
         if current_rg_rows % 50 == 0 {
@@ -499,7 +498,6 @@ fn test_parquet_continuous_streaming_export_and_sorting() {
             );
             prev_index = h3_idx;
         }
-        current_rg_rows += 1;
     }
 }
 
@@ -550,8 +548,7 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
     // Verify sorting within row groups
     let iter = reader.get_row_iter(None).unwrap();
     let mut prev_index = i64::MIN;
-    let mut current_rg_rows = 0;
-    for row in iter {
+    for (current_rg_rows, row) in iter.enumerate() {
         let row = row.unwrap();
         let h3_idx = row.get_long(0).unwrap();
         if current_rg_rows % 50 == 0 {
@@ -563,7 +560,6 @@ fn test_parquet_categorical_streaming_export_and_sorting() {
             );
             prev_index = h3_idx;
         }
-        current_rg_rows += 1;
     }
 }
 #[test]

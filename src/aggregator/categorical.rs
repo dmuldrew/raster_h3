@@ -198,7 +198,7 @@ impl CategoricalAccumulator {
                 s.push_str(", ");
             }
             let frac = if self.total_count > 0.0 {
-                (cnt / self.total_count).max(0.0).min(1.0)
+                (cnt / self.total_count).clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -259,8 +259,7 @@ impl CategoricalUniformity for u8 {
         }
         let first = slice[0];
         let rest = &slice[1..];
-        let chunks = rest.chunks_exact(32);
-        let rem = chunks.remainder();
+        let (chunks, rem) = rest.as_chunks::<32>();
         for chunk in chunks {
             let mut diff = 0u8;
             for &v in chunk {
@@ -306,8 +305,7 @@ impl CategoricalUniformity for u16 {
         }
         let first = slice[0];
         let rest = &slice[1..];
-        let chunks = rest.chunks_exact(16);
-        let rem = chunks.remainder();
+        let (chunks, rem) = rest.as_chunks::<16>();
         for chunk in chunks {
             let mut diff = 0u16;
             for &v in chunk {
@@ -353,8 +351,7 @@ impl CategoricalUniformity for u32 {
         }
         let first = slice[0];
         let rest = &slice[1..];
-        let chunks = rest.chunks_exact(8);
-        let rem = chunks.remainder();
+        let (chunks, rem) = rest.as_chunks::<8>();
         for chunk in chunks {
             let mut diff = 0u32;
             for &v in chunk {
@@ -404,8 +401,7 @@ impl CategoricalUniformity for u64 {
         }
         let first = slice[0];
         let rest = &slice[1..];
-        let chunks = rest.chunks_exact(8);
-        let rem = chunks.remainder();
+        let (chunks, rem) = rest.as_chunks::<8>();
         for chunk in chunks {
             let mut diff = 0u64;
             for &v in chunk {
@@ -456,8 +452,7 @@ impl CategoricalUniformity for f32 {
         let first = slice[0];
         let first_bits = first.to_bits();
         let rest = &slice[1..];
-        let chunks = rest.chunks_exact(8);
-        let rem = chunks.remainder();
+        let (chunks, rem) = rest.as_chunks::<8>();
         for chunk in chunks {
             let mut diff = 0u32;
             for &v in chunk {
@@ -498,8 +493,7 @@ impl CategoricalUniformity for f64 {
         let first = slice[0];
         let first_bits = first.to_bits();
         let rest = &slice[1..];
-        let chunks = rest.chunks_exact(8);
-        let rem = chunks.remainder();
+        let (chunks, rem) = rest.as_chunks::<8>();
         for chunk in chunks {
             let mut diff = 0u64;
             for &v in chunk {

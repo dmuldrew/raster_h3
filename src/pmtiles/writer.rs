@@ -55,9 +55,7 @@ pub fn zxy_to_tile_id(z: u8, x: u32, y: u32) -> u64 {
                 lx = s - 1 - lx;
                 ly = s - 1 - ly;
             }
-            let t = lx;
-            lx = ly;
-            ly = t;
+            std::mem::swap(&mut lx, &mut ly);
         }
         tx = lx;
         ty = ly;
@@ -91,9 +89,7 @@ pub fn tile_id_to_zxy(i: u64) -> (u8, u32, u32) {
                 x = s - 1 - x;
                 y = s - 1 - y;
             }
-            let temp = x;
-            x = y;
-            y = temp;
+            std::mem::swap(&mut x, &mut y);
         }
         x += s * rx;
         y += s * ry;
@@ -121,12 +117,7 @@ pub fn gzip_compress(data: &[u8]) -> io::Result<Vec<u8>> {
         let mut compressed = vec![0u8; max_len];
         let actual_size = compressor
             .gzip_compress(data, &mut compressed)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("gzip compression error: {:?}", e),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("gzip compression error: {:?}", e)))?;
         compressed.truncate(actual_size);
         Ok(compressed)
     })

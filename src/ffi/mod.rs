@@ -13,6 +13,10 @@ pub fn to_c_string(s: &str) -> CString {
 }
 
 /// Helper to convert a DuckDB allocated C string to a Rust String and free the C string
+///
+/// # Safety
+/// `ptr` must be null or a NUL-terminated string allocated by DuckDB. It
+/// is freed here, so the caller must not use it afterwards.
 pub unsafe fn from_duckdb_string(ptr: *mut c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -62,7 +66,7 @@ pub fn safe_eprintln(prefix: &str, msg: &str) {
 }
 
 /// Generic FFI panic guard executing `body` safely and invoking `set_error` on panic.
-pub unsafe fn ffi_guard<T, F, E>(context: T, set_error: E, body: F)
+pub fn ffi_guard<T, F, E>(context: T, set_error: E, body: F)
 where
     F: FnOnce(),
     E: FnOnce(T, *const c_char),
@@ -86,6 +90,10 @@ where
 }
 
 /// Guard for DuckDB table function bind callbacks (`duckdb_bind_info`).
+///
+/// # Safety
+/// `info` must be the valid handle DuckDB passed to the current callback;
+/// it is used only to report a panic from `body`.
 pub unsafe fn ffi_bind_guard<F: FnOnce()>(info: duckdb_bind_info, body: F) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -101,6 +109,10 @@ pub unsafe fn ffi_bind_guard<F: FnOnce()>(info: duckdb_bind_info, body: F) {
 }
 
 /// Guard for DuckDB table function init callbacks (`duckdb_init_info`).
+///
+/// # Safety
+/// `info` must be the valid handle DuckDB passed to the current callback;
+/// it is used only to report a panic from `body`.
 pub unsafe fn ffi_init_guard<F: FnOnce()>(info: duckdb_init_info, body: F) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -116,6 +128,10 @@ pub unsafe fn ffi_init_guard<F: FnOnce()>(info: duckdb_init_info, body: F) {
 }
 
 /// Guard for DuckDB table function scan callbacks (`duckdb_function_info`, `duckdb_data_chunk`).
+///
+/// # Safety
+/// `info` and `output` must be the valid handles DuckDB passed to the
+/// current scan callback; they are used only to report a panic from `body`.
 pub unsafe fn ffi_scan_guard<F: FnOnce()>(
     info: duckdb_function_info,
     output: duckdb_data_chunk,
@@ -137,6 +153,10 @@ pub unsafe fn ffi_scan_guard<F: FnOnce()>(
 }
 
 /// Guard for DuckDB scalar function callbacks (`duckdb_function_info`).
+///
+/// # Safety
+/// `info` must be the valid handle DuckDB passed to the current callback;
+/// it is used only to report a panic from `body`.
 pub unsafe fn ffi_scalar_guard<F: FnOnce()>(info: duckdb_function_info, body: F) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

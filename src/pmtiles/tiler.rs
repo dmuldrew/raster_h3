@@ -406,7 +406,7 @@ impl H3PmtilesTiler {
 
                     let properties = FeatureProperties::Continuous {
                         h3_index,
-                        resolution: resolution as u8,
+                        resolution,
                         mean: accumulator.mean(),
                         sum: accumulator.sum,
                         stddev,
@@ -544,7 +544,7 @@ impl H3PmtilesTiler {
             for hex in prepared_batch {
                 res_stats
                     .entry(hex.resolution)
-                    .or_insert_with(ResolutionAccumulatorStats::new)
+                    .or_default()
                     .record(&hex.accumulator);
 
                 if hex.c_lon < global_min_lon {
@@ -803,7 +803,7 @@ impl H3PmtilesTiler {
 
                     let properties = FeatureProperties::Categorical {
                         h3_index,
-                        resolution: resolution as u8,
+                        resolution,
                         majority: majority_class,
                         majority_fraction,
                         distinct_classes: distinct_classes as u32,
