@@ -123,10 +123,15 @@ impl HorizonStreamKernel for ContinuousKernel {
 /// Single-pass streaming aggregator across multiple H3 resolutions (Continuous Data)
 pub struct MultiScanHorizonStreamer {
     inner: MultiHorizonStreamer<ContinuousKernel>,
-    pub track_quantiles: bool,
+    track_quantiles: bool,
 }
 
 impl MultiScanHorizonStreamer {
+    /// Whether records carry streaming quantile sketches
+    pub fn track_quantiles(&self) -> bool {
+        self.track_quantiles
+    }
+
     /// Initialize a new MultiScanHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
         let kernel = ContinuousKernel {

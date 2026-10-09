@@ -112,29 +112,18 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
     }
 
     #[inline(always)]
-    fn accumulate_span_multi(
-        &self,
-        run_accs: &mut [H3Accumulator],
-        run_cells: &[u64],
-        slice: &[T],
-    ) {
+    fn accumulate_span_multi(&self, run_accs: &mut [H3Accumulator], slice: &[T]) {
         let span_acc = T::accumulate_span(slice, self.native_nodata);
         if span_acc.count > 0.0 {
-            for i in 0..run_accs.len() {
-                if run_cells[i] != 0 {
-                    run_accs[i].merge(&span_acc);
-                }
+            for acc in run_accs.iter_mut() {
+                acc.merge(&span_acc);
             }
             if self.track_quantiles {
                 for &v in slice {
                     if v.is_valid(self.native_nodata) {
                         let fv = v.to_f64_val();
-                        for i in 0..run_accs.len() {
-                            if run_cells[i] != 0 {
-                                if let Some(ref mut q) = run_accs[i].quantiles {
-                                    q.update(fv, 1.0);
-                                }
-                            }
+                        for q in run_accs.iter_mut().filter_map(|a| a.quantiles.as_mut()) {
+                            q.update(fv, 1.0);
                         }
                     }
                 }

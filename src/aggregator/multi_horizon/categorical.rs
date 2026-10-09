@@ -147,12 +147,7 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
     }
 
     #[inline(always)]
-    fn accumulate_span_multi(
-        &self,
-        run_accs: &mut [CategoricalAccumulator],
-        run_cells: &[u64],
-        sub_slice: &[T],
-    ) {
+    fn accumulate_span_multi(&self, run_accs: &mut [CategoricalAccumulator], sub_slice: &[T]) {
         if sub_slice.is_empty() {
             return;
         }
@@ -162,10 +157,8 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
         if is_uniform {
             if let Some(cat) = self.resolve_category(first_val) {
                 let weight = sub_slice.len() as f64;
-                for i in 0..run_accs.len() {
-                    if run_cells[i] != 0 {
-                        run_accs[i].update_weighted(cat, weight);
-                    }
+                for acc in run_accs.iter_mut() {
+                    acc.update_weighted(cat, weight);
                 }
             }
         } else {
@@ -181,10 +174,8 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
                     curr_cat_count += 1.0;
                 } else {
                     if let Some(prev) = curr_cat {
-                        for i in 0..run_accs.len() {
-                            if run_cells[i] != 0 {
-                                run_accs[i].update_weighted(prev, curr_cat_count);
-                            }
+                        for acc in run_accs.iter_mut() {
+                            acc.update_weighted(prev, curr_cat_count);
                         }
                     }
                     curr_cat = Some(cat);
@@ -194,10 +185,8 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
 
             if let Some(last_cat) = curr_cat {
                 if curr_cat_count > 0.0 {
-                    for i in 0..run_accs.len() {
-                        if run_cells[i] != 0 {
-                            run_accs[i].update_weighted(last_cat, curr_cat_count);
-                        }
+                    for acc in run_accs.iter_mut() {
+                        acc.update_weighted(last_cat, curr_cat_count);
                     }
                 }
             }

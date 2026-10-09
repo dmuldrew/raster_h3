@@ -106,10 +106,15 @@ impl HorizonStreamKernel for CategoricalKernel {
 /// Single-pass streaming aggregator across multiple H3 resolutions (Categorical Data)
 pub struct MultiCategoricalHorizonStreamer {
     inner: MultiHorizonStreamer<CategoricalKernel>,
-    pub remapper: Option<Arc<CategoryRemapper>>,
+    remapper: Option<Arc<CategoryRemapper>>,
 }
 
 impl MultiCategoricalHorizonStreamer {
+    /// Category remapping applied before aggregation, if configured
+    pub fn remapper(&self) -> Option<&CategoryRemapper> {
+        self.remapper.as_deref()
+    }
+
     /// Initialize a new MultiCategoricalHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
         let kernel = CategoricalKernel {

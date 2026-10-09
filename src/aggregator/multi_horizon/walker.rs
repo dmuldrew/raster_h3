@@ -49,8 +49,8 @@ pub trait ScanlineEngine<T, Acc> {
     /// Accumulate a span of pixels into a single accumulator
     fn accumulate_span(&self, acc: &mut Acc, slice: &[T]);
 
-    /// Accumulate a span of pixels across multiple active resolution accumulators
-    fn accumulate_span_multi(&self, run_accs: &mut [Acc], run_cells: &[u64], slice: &[T]);
+    /// Accumulate a span of pixels into every resolution's accumulator
+    fn accumulate_span_multi(&self, run_accs: &mut [Acc], slice: &[T]);
 
     /// Extract a valid sample from a raw pixel, or None if nodata
     fn get_sample(&self, pixel: T) -> Option<Self::Sample>;
@@ -258,14 +258,14 @@ fn walk<T, Acc, E, N, R>(
                 let mut changed = false;
                 for (i, &res) in ctx.resolutions.iter().enumerate() {
                     cells[i] = u64::from(super::profile::index(ll, res));
-                    changed |= cells[i] != runs.cells[i];
+                    changed |= Some(cells[i]) != runs.cells[i];
                 }
                 if changed {
                     if let Some(s) = span_start.take() {
                         runs.add_span(&row[s..c], engine);
                     }
                     for (i, map) in maps.iter_mut().enumerate() {
-                        if cells[i] != runs.cells[i] {
+                        if Some(cells[i]) != runs.cells[i] {
                             runs.restart(i, cells[i], engine, map);
                         }
                     }
@@ -306,16 +306,16 @@ fn walk<T, Acc, E, N, R>(
     runs.finish(engine, maps);
 }
 
-/// Current cell and partial accumulator per resolution.
+/// Current cell (None before the first) and partial accumulator per resolution.
 struct Runs<Acc> {
-    cells: Vec<u64>,
+    cells: Vec<Option<u64>>,
     accs: Vec<Acc>,
 }
 
 impl<Acc: Clone> Runs<Acc> {
     fn new<T, E: ScanlineEngine<T, Acc>>(num_res: usize, engine: &E) -> Self {
         Self {
-            cells: vec![0; num_res],
+            cells: vec![None; num_res],
             accs: (0..num_res).map(|_| engine.new_acc()).collect(),
         }
     }
@@ -329,7 +329,7 @@ impl<Acc: Clone> Runs<Acc> {
         map: &mut CellMap<Acc>,
     ) {
         flush_run(map, self.cells[i], &mut self.accs[i], engine);
-        self.cells[i] = cell;
+        self.cells[i] = Some(cell);
     }
 
     #[inline]
@@ -342,18 +342,19 @@ impl<Acc: Clone> Runs<Acc> {
         engine: &E,
         map: &mut CellMap<Acc>,
     ) {
-        if cell != self.cells[i] {
+        if Some(cell) != self.cells[i] {
             self.restart(i, cell, engine, map);
         }
         engine.update_sample(&mut self.accs[i], sample, weight);
     }
 
+    /// Only called once every resolution has a current cell.
     #[inline]
     fn add_span<T, E: ScanlineEngine<T, Acc>>(&mut self, values: &[T], engine: &E) {
         if let [acc] = self.accs.as_mut_slice() {
             engine.accumulate_span(acc, values);
         } else {
-            engine.accumulate_span_multi(&mut self.accs, &self.cells, values);
+            engine.accumulate_span_multi(&mut self.accs, values);
         }
     }
 
@@ -368,13 +369,13 @@ impl<Acc: Clone> Runs<Acc> {
 #[inline]
 fn flush_run<T, Acc, E: ScanlineEngine<T, Acc>>(
     map: &mut CellMap<Acc>,
-    cell: u64,
+    cell: Option<u64>,
     acc: &mut Acc,
     engine: &E,
 ) {
-    if cell == 0 || !engine.has_samples(acc) {
+    let Some(cell) = cell.filter(|_| engine.has_samples(acc)) else {
         return;
-    }
+    };
     match map.entry(cell) {
         Entry::Occupied(mut entry) => {
             engine.merge_acc(entry.get_mut(), acc);
