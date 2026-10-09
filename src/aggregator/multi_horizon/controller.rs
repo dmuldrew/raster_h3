@@ -15,10 +15,8 @@ use std::sync::Arc;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::sampling::SamplingPattern;
-use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
-use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::prefetch::PrefetchedMosaicReader;
 use crate::raster::RasterChunk;
@@ -29,6 +27,7 @@ use super::coordinates::eviction_north_bound;
 use super::lifecycle::{OutputBuffer, StreamLifecycle};
 use super::sharded_map::{AccumulatorMerge, ShardedResolutionMap};
 use super::spill::{RunReader, SpillAccumulator, SpillRuns};
+use super::walker::WalkContext;
 
 /// One worker window: (tile index, window bounds, borrowed samples, row stride, overlaps another tile).
 type WindowJob<'a> = (
@@ -67,57 +66,27 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
         output.push_sized(self.make_record(resolution, key, acc), bytes);
     }
 
-    /// Execute chunk processing kernel into thread-local hash maps
-    #[allow(clippy::too_many_arguments)]
+    /// Aggregate one decoded window into thread-local cell maps, one per
+    /// resolution. Returns false when the window held no valid data.
     fn process_chunk(
         &self,
-        chunk_bounds: &RasterChunk,
+        window: &WalkContext,
         decoding_result: &mut DecodingResult,
-        resolutions: &[Resolution],
-        crs_transformer: &CrsTransformer,
-        gt: &GeoTransform,
-        sampling: &SamplingPattern,
-        bbox: Option<[f64; 4]>,
-        chunk_stride: u32,
         nodata: Option<f64>,
-        samples_per_pixel: u16,
-        overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool;
 
     /// Borrowed window override. Built-in kernels never allocate a pixel copy.
-    #[allow(clippy::too_many_arguments)]
     fn process_window(
         &self,
-        chunk_bounds: &RasterChunk,
-        decoding_result: super::borrowed::BorrowedSamples<'_>,
-        resolutions: &[Resolution],
-        crs_transformer: &CrsTransformer,
-        gt: &GeoTransform,
-        sampling: &SamplingPattern,
-        bbox: Option<[f64; 4]>,
-        chunk_stride: u32,
+        window: &WalkContext,
+        samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
-        samples_per_pixel: u16,
-        overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool {
-        super::profile::copied(decoding_result.bytes());
-        let mut owned = decoding_result.to_owned();
-        self.process_chunk(
-            chunk_bounds,
-            &mut owned,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
-            nodata,
-            samples_per_pixel,
-            overlap_ctx,
-            local_maps,
-        )
+        super::profile::copied(samples.bytes());
+        let mut owned = samples.to_owned();
+        self.process_chunk(window, &mut owned, nodata, local_maps)
     }
 }
 
@@ -514,22 +483,21 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     let tile = &self.mosaic.tiles[*tile_idx];
                     let scope = super::profile::WorkerScope::new();
                     let start = std::time::Instant::now();
-                    self.kernel.process_window(
+                    let window = WalkContext {
                         chunk,
+                        resolutions: &self.resolutions,
+                        crs: &tile.crs_transformer,
+                        gt: &tile.reader.metadata.geotransform,
+                        sampling: &self.sampling,
+                        bbox: self.bbox,
+                        stride: *stride,
+                        samples_per_pixel: tile.reader.metadata.samples_per_pixel,
+                        owner: overlap.then_some((*tile_idx, &*self.mosaic)),
+                    };
+                    self.kernel.process_window(
+                        &window,
                         *samples,
-                        &self.resolutions,
-                        &tile.crs_transformer,
-                        &tile.reader.metadata.geotransform,
-                        &self.sampling,
-                        self.bbox,
-                        *stride,
                         self.nodata.or(tile.reader.metadata.nodata),
-                        tile.reader.metadata.samples_per_pixel,
-                        if *overlap {
-                            Some((*tile_idx, &*self.mosaic))
-                        } else {
-                            None
-                        },
                         maps,
                     );
                     (scope.snapshot(), start.elapsed().as_nanos() as u64)

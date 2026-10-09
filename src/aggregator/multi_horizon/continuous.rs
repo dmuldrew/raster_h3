@@ -1,15 +1,9 @@
 use fxhash::FxBuildHasher;
-use h3o::Resolution;
 use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::accumulator::H3Accumulator;
-use crate::aggregator::sampling::SamplingPattern;
 use crate::aggregator::simd::SimdSpanAccumulate;
-use crate::crs::transformer::CrsTransformer;
-use crate::raster::geotransform::GeoTransform;
-use crate::raster::mosaic::MosaicReader;
-use crate::raster::RasterChunk;
 
 use super::config::SpectralFormula;
 use super::walker::{
@@ -24,23 +18,28 @@ pub struct MultiContinuousRecord {
     pub accumulator: H3Accumulator,
 }
 
+/// Per-stream options for continuous aggregation.
+#[derive(Debug, Clone, Copy)]
+pub struct ContinuousOptions {
+    /// 1-based band read when no spectral formula is set.
+    pub band: usize,
+    pub spectral_formula: Option<SpectralFormula>,
+    pub track_quantiles: bool,
+}
+
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
-#[allow(clippy::too_many_arguments)]
 fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
     ctx: &WalkContext,
     slice: &[T],
     native_nodata: Option<T>,
-    samples_per_pixel: usize,
-    band: usize,
-    spectral_formula: Option<SpectralFormula>,
-    track_quantiles: bool,
+    options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) {
     let engine = ContinuousEngine {
         native_nodata,
-        track_quantiles,
+        track_quantiles: options.track_quantiles,
     };
-    if samples_per_pixel <= 1 && spectral_formula.is_none() {
+    if ctx.samples_per_pixel <= 1 && options.spectral_formula.is_none() {
         walk_direct(
             ctx,
             slice,
@@ -52,8 +51,7 @@ fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
         walk_interleaved(
             ctx,
             slice,
-            samples_per_pixel,
-            |px| pixel_value(px, native_nodata, band, spectral_formula),
+            |px| pixel_value(px, native_nodata, options.band, options.spectral_formula),
             &engine,
             chunk_maps,
         );
@@ -208,85 +206,40 @@ fn pixel_value<T: SimdSpanAccumulate>(
     }
 }
 
-/// Process a continuous chunk across all resolutions into thread-local hash maps
+/// Process a continuous chunk across all resolutions into thread-local hash maps.
+/// Returns false when a single-band chunk is entirely nodata.
 pub fn process_continuous_chunk_payload_into(
-    chunk_bounds: &RasterChunk,
+    window: &WalkContext,
     decoding_result: &DecodingResult,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
     nodata: Option<f64>,
-    samples_per_pixel: u16,
-    band: usize,
-    spectral_formula: Option<SpectralFormula>,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    track_quantiles: bool,
+    options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
     process_continuous_borrowed_into(
-        chunk_bounds,
+        window,
         super::borrowed::BorrowedSamples::from(decoding_result),
-        resolutions,
-        crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        chunk_stride,
         nodata,
-        samples_per_pixel,
-        band,
-        spectral_formula,
-        overlap_ctx,
-        track_quantiles,
+        options,
         chunk_maps,
     )
 }
 
+/// Borrowed-window form of [`process_continuous_chunk_payload_into`].
 pub fn process_continuous_borrowed_into(
-    chunk_bounds: &RasterChunk,
-    decoding_result: super::borrowed::BorrowedSamples<'_>,
-    resolutions: &[Resolution],
-    crs_transformer: &CrsTransformer,
-    gt: &GeoTransform,
-    sampling: &SamplingPattern,
-    bbox: Option<[f64; 4]>,
-    chunk_stride: u32,
+    window: &WalkContext,
+    samples: super::borrowed::BorrowedSamples<'_>,
     nodata: Option<f64>,
-    samples_per_pixel: u16,
-    band: usize,
-    spectral_formula: Option<SpectralFormula>,
-    overlap_ctx: Option<(usize, &MosaicReader)>,
-    track_quantiles: bool,
+    options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
 ) -> bool {
-    let spp = samples_per_pixel.max(1) as usize;
-    if spp == 1 && spectral_formula.is_none() && decoding_result.all_nodata(nodata) {
+    if window.samples_per_pixel <= 1
+        && options.spectral_formula.is_none()
+        && samples.all_nodata(nodata)
+    {
         return false;
     }
-    let ctx = WalkContext {
-        chunk: chunk_bounds,
-        resolutions,
-        crs: crs_transformer,
-        gt,
-        sampling,
-        bbox,
-        stride: chunk_stride,
-        owner: overlap_ctx,
-    };
-    crate::dispatch_samples!(decoding_result, nodata, |slice, nd| {
-        process_continuous_slice_into_maps(
-            &ctx,
-            slice,
-            nd,
-            spp,
-            band,
-            spectral_formula,
-            track_quantiles,
-            chunk_maps,
-        );
+    crate::dispatch_samples!(samples, nodata, |slice, nd| {
+        process_continuous_slice_into_maps(window, slice, nd, options, chunk_maps);
     });
     true
 }

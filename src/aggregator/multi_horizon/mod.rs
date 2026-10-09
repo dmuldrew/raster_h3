@@ -22,7 +22,9 @@ pub use categorical::{process_categorical_chunk_payload_into, MultiCategoricalRe
 pub use categorical_streamer::MultiCategoricalHorizonStreamer;
 pub use compaction::HierarchicalCompactor;
 pub use config::{MultiResolutionConfig, QuantileTarget, SpectralFormula};
-pub use continuous::{process_continuous_chunk_payload_into, MultiContinuousRecord};
+pub use continuous::{
+    process_continuous_chunk_payload_into, ContinuousOptions, MultiContinuousRecord,
+};
 pub use continuous_streamer::MultiScanHorizonStreamer;
 pub use controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
 pub use coordinates::{is_point_in_bbox, CoordinateTransformer, RAD_TO_DEG, WGS84_A};

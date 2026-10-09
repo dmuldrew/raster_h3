@@ -52,7 +52,8 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
     use h3o::{LatLng, Resolution};
     use raster_h3::aggregator::multi_horizon::{
         categorical::process_categorical_chunk_payload_into,
-        continuous::process_continuous_chunk_payload_into,
+        continuous::{process_continuous_chunk_payload_into, ContinuousOptions},
+        WalkContext,
     };
     use raster_h3::aggregator::sampling::SamplePoint;
     use raster_h3::aggregator::{accumulator::H3Accumulator, categorical::CategoricalAccumulator};
@@ -150,25 +151,30 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                         }
                     }
                 }
+                let window = WalkContext {
+                    chunk: &chunk,
+                    resolutions: &resolutions,
+                    crs: &crs,
+                    gt: &gt,
+                    sampling: &pattern,
+                    bbox,
+                    stride: 24,
+                    samples_per_pixel: 1,
+                    owner: None,
+                };
                 for quantiles in [false, true] {
                     let mut actual =
                         vec![HashMap::<u64, H3Accumulator, FxBuildHasher>::default(); 2];
                     let scope = raster_h3::aggregator::multi_horizon::profile::WorkerScope::new();
                     process_continuous_chunk_payload_into(
-                        &chunk,
+                        &window,
                         &decoded,
-                        &resolutions,
-                        &crs,
-                        &gt,
-                        &pattern,
-                        bbox,
-                        24,
                         None,
-                        1,
-                        1,
-                        None,
-                        None,
-                        quantiles,
+                        ContinuousOptions {
+                            band: 1,
+                            spectral_formula: None,
+                            track_quantiles: quantiles,
+                        },
                         &mut actual,
                     );
                     let metrics = scope.snapshot();
@@ -214,18 +220,10 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                 let mut actual =
                     vec![HashMap::<u64, CategoricalAccumulator, FxBuildHasher>::default(); 2];
                 process_categorical_chunk_payload_into(
-                    &chunk,
+                    &window,
                     &decoded,
-                    &resolutions,
-                    &crs,
-                    &gt,
-                    &pattern,
-                    bbox,
-                    24,
                     None,
                     1,
-                    1,
-                    None,
                     None,
                     &mut actual,
                 );

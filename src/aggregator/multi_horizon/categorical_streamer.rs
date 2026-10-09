@@ -12,17 +12,14 @@ use tiff::decoder::DecodingResult;
 
 use crate::aggregator::categorical::CategoricalAccumulator;
 use crate::aggregator::remap::CategoryRemapper;
-use crate::aggregator::sampling::SamplingPattern;
-use crate::crs::transformer::CrsTransformer;
 use crate::error::Result;
 use crate::raster::geotiff::GeoTiffStreamReader;
-use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
-use crate::raster::RasterChunk;
 
 use super::categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
 use super::config::MultiResolutionConfig;
 use super::controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
+use super::walker::WalkContext;
 
 pub use super::sharded_map::{get_shard as pub_get_shard, NUM_SHARDS as PUB_NUM_SHARDS};
 
@@ -72,65 +69,34 @@ impl HorizonStreamKernel for CategoricalKernel {
     #[inline(always)]
     fn process_chunk(
         &self,
-        chunk_bounds: &RasterChunk,
+        window: &WalkContext,
         decoding_result: &mut DecodingResult,
-        resolutions: &[Resolution],
-        crs_transformer: &CrsTransformer,
-        gt: &GeoTransform,
-        sampling: &SamplingPattern,
-        bbox: Option<[f64; 4]>,
-        chunk_stride: u32,
         nodata: Option<f64>,
-        samples_per_pixel: u16,
-        overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool {
         process_categorical_chunk_payload_into(
-            chunk_bounds,
+            window,
             decoding_result,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
             nodata,
-            samples_per_pixel,
             self.band,
-            overlap_ctx,
             self.remapper.as_deref(),
             local_maps,
         )
     }
+
     #[inline(always)]
     fn process_window(
         &self,
-        chunk_bounds: &RasterChunk,
-        decoding_result: super::borrowed::BorrowedSamples<'_>,
-        resolutions: &[Resolution],
-        crs_transformer: &CrsTransformer,
-        gt: &GeoTransform,
-        sampling: &SamplingPattern,
-        bbox: Option<[f64; 4]>,
-        chunk_stride: u32,
+        window: &WalkContext,
+        samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
-        samples_per_pixel: u16,
-        overlap_ctx: Option<(usize, &MosaicReader)>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
     ) -> bool {
         super::categorical::process_categorical_borrowed_into(
-            chunk_bounds,
-            decoding_result,
-            resolutions,
-            crs_transformer,
-            gt,
-            sampling,
-            bbox,
-            chunk_stride,
+            window,
+            samples,
             nodata,
-            samples_per_pixel,
             self.band,
-            overlap_ctx,
             self.remapper.as_deref(),
             local_maps,
         )

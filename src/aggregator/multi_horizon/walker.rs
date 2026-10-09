@@ -72,6 +72,8 @@ pub struct WalkContext<'a> {
     pub bbox: Option<[f64; 4]>,
     /// Physical row stride in pixels; 0 means the chunk width.
     pub stride: u32,
+    /// Interleaved samples per pixel; 1 for single-band data.
+    pub samples_per_pixel: u16,
     /// Keep only samples owned by this tile of an overlapping mosaic.
     pub owner: Option<(usize, &'a MosaicReader)>,
 }
@@ -103,12 +105,11 @@ pub fn walk_direct<T, Acc, E, N>(
     );
 }
 
-/// Walk a window of `samples_per_pixel` interleaved values; `read` reduces one
-/// pixel's values (a band selection or spectral index) to a sample.
+/// Walk a window of `ctx.samples_per_pixel` interleaved values; `read` reduces
+/// one pixel's values (a band selection or spectral index) to a sample.
 pub fn walk_interleaved<T, Acc, E, R>(
     ctx: &WalkContext,
     slice: &[T],
-    samples_per_pixel: usize,
     read: R,
     engine: &E,
     maps: &mut [CellMap<Acc>],
@@ -121,7 +122,7 @@ pub fn walk_interleaved<T, Acc, E, R>(
     walk(
         ctx,
         slice,
-        samples_per_pixel,
+        ctx.samples_per_pixel as usize,
         |_| false,
         read,
         false,
@@ -158,6 +159,7 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
         sampling,
         bbox,
         stride: chunk_stride,
+        samples_per_pixel: 1,
         owner: None,
     };
     walk_direct(&ctx, slice, is_row_all_nodata, engine, chunk_maps);
@@ -511,6 +513,7 @@ mod tests {
             sampling,
             bbox: Some(bbox),
             stride: 200,
+            samples_per_pixel: 1,
             owner: None,
         };
         RowPruner::new(&ctx).unwrap().columns(&ctx, 0, 200)
