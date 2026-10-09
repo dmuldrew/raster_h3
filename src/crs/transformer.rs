@@ -13,6 +13,18 @@ use proj4rs::proj::Proj;
 const WGS84_A: f64 = 6378137.0; // WGS84 semi-major axis in meters
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
+/// Spherical Web Mercator (EPSG:3857) easting to longitude in degrees.
+#[inline(always)]
+pub fn web_mercator_lon(x: f64) -> f64 {
+    (x / WGS84_A) * RAD_TO_DEG
+}
+
+/// Spherical Web Mercator (EPSG:3857) northing to latitude in degrees.
+#[inline(always)]
+pub fn web_mercator_lat(y: f64) -> f64 {
+    (2.0 * (y / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG
+}
+
 /// Normalize longitude to [-180.0, 180.0) degrees
 #[inline]
 pub fn wrap_lon(lon: f64) -> f64 {
@@ -549,12 +561,7 @@ impl CrsTransformer {
     pub fn transform_point(&self, x: f64, y: f64) -> Result<(f64, f64)> {
         match self {
             Self::Wgs84Identity => Ok((x, y)),
-            Self::WebMercatorFast => {
-                let lon = (x / WGS84_A) * RAD_TO_DEG;
-                let lat =
-                    (2.0 * (y / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
-                Ok((lon, lat))
-            }
+            Self::WebMercatorFast => Ok((web_mercator_lon(x), web_mercator_lat(y))),
             Self::AlbersConic(albers) => Ok(albers.transform_point(x, y)),
             Self::Proj4 { from, to } => {
                 let mut point_3d = (x, y, 0.0);
