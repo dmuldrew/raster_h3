@@ -180,6 +180,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
         config.compact = bind_data.common.compact;
         config.compact_h3_children = bind_data.common.compact;
         config.quantiles = bind_data.quantiles.clone();
+        bind_data.common.execution.apply(&mut config);
 
         let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
             Ok(s) => s,

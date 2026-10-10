@@ -342,7 +342,9 @@ impl<'a> SampleProjector<'a> {
     }
 
     /// Project sampling point `k` of pixel (`col`, `row_idx`), or None if the
-    /// CRS cannot transform it.
+    /// CRS cannot transform it. Such samples lie outside the projection's
+    /// domain and are skipped rather than aborting the query; transforms that
+    /// succeed always return a finite latitude in [-90, 90].
     #[inline(always)]
     fn project(&self, col: usize, row_idx: usize, k: usize, sp: SamplePoint) -> Option<(f64, f64)> {
         match &self.row_lats {

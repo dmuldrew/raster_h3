@@ -76,6 +76,26 @@ pub fn is_point_in_bbox(lon: f64, lat: f64, bbox: Option<[f64; 4]>) -> bool {
     }
 }
 
+/// Whether a non-crossing WGS84 rectangle `[min_lon, min_lat, max_lon, max_lat]`
+/// (as produced by `transform_rect_bounds`) intersects a query bounding box
+/// that may cross the antimeridian (`min_lon > max_lon`). This is the
+/// rectangle counterpart of [`is_point_in_bbox`]; tile, chunk and sample
+/// filters must agree on wrap semantics.
+#[inline]
+pub fn rect_intersects_bbox(rect: &[f64; 4], bbox: &[f64; 4]) -> bool {
+    let [r_min_lon, r_min_lat, r_max_lon, r_max_lat] = *rect;
+    let [b_min_lon, b_min_lat, b_max_lon, b_max_lat] = *bbox;
+    if r_min_lat > b_max_lat || r_max_lat < b_min_lat {
+        return false;
+    }
+    if b_min_lon <= b_max_lon {
+        r_min_lon <= b_max_lon && r_max_lon >= b_min_lon
+    } else {
+        // [b_min_lon, 180] or [-180, b_max_lon]
+        r_max_lon >= b_min_lon || r_min_lon <= b_max_lon
+    }
+}
+
 /// Upper latitude bound for every sample in a chunk's pixel rectangle.
 /// Affine latitude (WGS84) and monotone northing (Web Mercator) attain
 /// their maxima at corners, including rotated/reversed affine grids.

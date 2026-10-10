@@ -11,7 +11,8 @@ use fxhash::FxBuildHasher;
 use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tiff::decoder::DecodingResult;
 
 use crate::aggregator::sampling::SamplingPattern;
@@ -39,6 +40,30 @@ type WindowJob<'a> = (
 );
 /// One worker's per-resolution cell maps.
 type CellMaps<A> = Vec<HashMap<u64, A, FxBuildHasher>>;
+
+/// Dedicated aggregation pool of `threads` workers, shared by all live
+/// streams requesting the same size so concurrent queries do not each spawn
+/// their own threads.
+fn shared_aggregation_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>> {
+    static POOLS: OnceLock<Mutex<HashMap<usize, Weak<rayon::ThreadPool>>>> = OnceLock::new();
+    let mut pools = POOLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(pool) = pools.get(&threads).and_then(Weak::upgrade) {
+        return Ok(pool);
+    }
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("raster-h3-agg-{i}"))
+            .build()
+            .map_err(|e| RasterH3Error::InvalidParameter(format!("aggregation pool: {e}")))?,
+    );
+    pools.retain(|_, w| w.strong_count() > 0);
+    pools.insert(threads, Arc::downgrade(&pool));
+    Ok(pool)
+}
 
 /// Kernel trait parameterizing data type-specific chunk processing, aggregation, and filtering
 pub trait HorizonStreamKernel: Send + Sync + 'static {
@@ -151,6 +176,8 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     accumulator_limit: usize,
     worker_pixels: usize,
     worker_tasks: usize,
+    /// Dedicated kernel pool (`aggregation_workers`); None uses the ambient pool.
+    pool: Option<Arc<rayon::ThreadPool>>,
     worker_budget: usize,
     batch_size: usize,
     output_byte_limit: usize,
@@ -193,10 +220,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             resolution_u8s.push(res_u8);
         }
 
-        let prefetcher = PrefetchedMosaicReader::spawn_with_workers(
+        let prefetcher = PrefetchedMosaicReader::spawn_with_fetch_workers(
             Arc::clone(&mosaic),
             config.prefetch_chunks,
             config.decode_workers,
+            config.fetch_workers,
         );
         let num_res = resolutions.len();
         let mut resolution_shards: Vec<_> =
@@ -247,9 +275,15 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     .into(),
             ));
         }
-        let worker_tasks = rayon::current_num_threads()
-            .clamp(1, 8)
-            .min(worker_budget / per_pixel);
+        let pool = config
+            .aggregation_workers
+            .map(shared_aggregation_pool)
+            .transpose()?;
+        let worker_tasks = match config.aggregation_workers {
+            Some(n) => n.clamp(1, 64),
+            None => rayon::current_num_threads().clamp(1, 8),
+        }
+        .min(worker_budget / per_pixel);
         let batch_size = (worker_tasks * 2).min((n_chunks / 4).max(1));
         let worker_pixels = (worker_budget / worker_tasks / per_pixel).clamp(1, 16384);
         let output_byte_limit = config.aggregation_budget_bytes / 4;
@@ -281,6 +315,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             accumulator_limit,
             worker_pixels,
             worker_tasks,
+            pool,
             worker_budget,
             batch_size,
             output_byte_limit,
@@ -484,7 +519,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     continue;
                 }
                 let t = std::time::Instant::now();
+                let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
                 let process = |(job, maps): (&WindowJob<'_>, &mut CellMaps<K::Accumulator>)| {
+                    peak.fetch_max(
+                        active.fetch_add(1, Ordering::Relaxed) + 1,
+                        Ordering::Relaxed,
+                    );
                     let (tile_idx, chunk, samples, stride, overlap) = job;
                     let tile = &self.mosaic.tiles[*tile_idx];
                     let scope = super::profile::WorkerScope::new();
@@ -506,17 +546,44 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         self.nodata.or(tile.reader.metadata.nodata),
                         maps,
                     );
+                    active.fetch_sub(1, Ordering::Relaxed);
                     (scope.snapshot(), start.elapsed().as_nanos() as u64)
                 };
                 results.clear();
-                if rayon::current_thread_index().is_some() {
-                    results.extend(jobs.iter().zip(maps.iter_mut()).map(process));
-                } else {
+                let parallel = |maps: &mut [CellMaps<K::Accumulator>], results: &mut Vec<_>| {
                     jobs.par_iter()
                         .zip(maps.par_iter_mut())
-                        .map(process)
-                        .collect_into_vec(&mut results);
+                        .map(&process)
+                        .collect_into_vec(results)
+                };
+                // Execution policy: a Rayon worker waiting on a join steals
+                // unrelated tasks from its own pool, which deadlocks if such a
+                // task needs a lock the caller holds (e.g. a shared streamer
+                // mutex). So callers on a Rayon worker either hand the wave to
+                // the dedicated pool through a helper OS thread, whose join
+                // blocks without stealing, or, with no dedicated pool, run it
+                // serially.
+                match &self.pool {
+                    Some(pool) if pool.current_thread_index().is_some() => {
+                        results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
+                    }
+                    Some(pool) if rayon::current_thread_index().is_some() => {
+                        std::thread::scope(|s| {
+                            s.spawn(|| pool.install(|| parallel(&mut maps, &mut results)))
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        })
+                    }
+                    Some(pool) => pool.install(|| parallel(&mut maps, &mut results)),
+                    None if rayon::current_thread_index().is_some() => {
+                        results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
+                    }
+                    None => parallel(&mut maps, &mut results),
                 }
+                self.metrics.peak_concurrent_jobs = self
+                    .metrics
+                    .peak_concurrent_jobs
+                    .max(peak.load(Ordering::Relaxed));
                 self.metrics.kernel_wall_ns += t.elapsed().as_nanos() as u64;
                 for (profile, ns) in results.drain(..) {
                     self.metrics.worker.merge(profile);

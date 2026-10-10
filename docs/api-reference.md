@@ -30,8 +30,10 @@ This document provides the complete API reference for the DuckDB H3 Raster Hexif
 | `h3_cell` | `BIGINT` | `None` | Single H3 cell index for predicate pushdown (only process chunks intersecting this cell). |
 | `h3_hex` | `VARCHAR` | `None` | Single H3 hex string for predicate pushdown (alternative to `h3_cell`). |
 | `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR) and merge complete sets of seven H3 children into a parent. Cannot be combined with adjacent requested resolutions, which would duplicate parent cells. |
-| `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'` (Voronoi bisector), `'first'` (painter's precedence), `'average'` (blend). |
-| `workers` / `threads` | `BIGINT` | `auto` | Number of background decompression worker threads. |
+| `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'` (among tiles whose footprint contains the point, the one with the nearest centre pixel by great-circle distance), `'first'` (first tile in input order whose footprint contains the point; its nodata is not filled from later tiles), `'average'` (accumulate every observation, so denser or finer overlapping grids carry more weight). |
+| `workers` / `threads` | `BIGINT` | ambient | Aggregation (kernel) threads. When set, the query runs kernel windows on a dedicated pool of this size, shared by concurrent queries that request the same size. When unset, windows use the caller's Rayon pool, capped at 8 per wave. |
+| `decode_workers` | `BIGINT` | `4` | Chunk decompression threads. |
+| `fetch_workers` | `BIGINT` | `8` | Concurrent HTTP range requests for remote tiles. |
 | `formula` | `VARCHAR` | `None` | Spectral index formula: `'ndvi'`, `'ndwi'`, `'nbr'`, `'evi'`. Requires multi-band raster. |
 | `nir_band`, `red_band`, `green_band`, `blue_band`, `swir_band` | `BIGINT` | `auto` | 1-indexed band assignments for spectral index formulas. |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold — cells below this are excluded from output. |
@@ -92,8 +94,10 @@ This document provides the complete API reference for the DuckDB H3 Raster Hexif
 | `h3_cell` | `BIGINT` | `None` | Single H3 cell index for predicate pushdown. |
 | `h3_hex` | `VARCHAR` | `None` | Single H3 hex string for predicate pushdown. |
 | `compact` | `BOOLEAN` | `false` | Compact output format (omits `h3_hex` VARCHAR) and merge complete sets of seven H3 children into a parent. Cannot be combined with adjacent requested resolutions. |
-| `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'`, `'first'`, `'average'`. |
-| `workers` / `threads` | `BIGINT` | `auto` | Number of background decompression worker threads. |
+| `overlap_rule` | `VARCHAR` | `'cutline'` | Mosaic tile overlap resolution: `'cutline'`, `'first'`, `'average'` (see above). |
+| `workers` / `threads` | `BIGINT` | ambient | Aggregation (kernel) threads. When set, the query runs kernel windows on a dedicated pool of this size, shared by concurrent queries that request the same size. When unset, windows use the caller's Rayon pool, capped at 8 per wave. |
+| `decode_workers` | `BIGINT` | `4` | Chunk decompression threads. |
+| `fetch_workers` | `BIGINT` | `8` | Concurrent HTTP range requests for remote tiles. |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold for output. |
 | `min_majority_fraction` | `DOUBLE` | `None` | Minimum majority class fraction — cells below this threshold are excluded. |
 | `remap` | `VARCHAR` | `None` | Category remapping rules: exact (`'10=Forest,20=Urban'`), range (`'20-29=Urban'`), wildcard (`'*=Other'`). |

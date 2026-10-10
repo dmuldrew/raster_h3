@@ -164,8 +164,16 @@ pub struct MultiResolutionConfig {
     pub spill_directory: Option<std::path::PathBuf>,
     /// Decoded chunk ring and idle pool capacity (minimum 16).
     pub prefetch_chunks: usize,
-    /// Maximum simultaneously decoding workers.
+    /// Maximum simultaneously decoding workers (dedicated OS threads).
     pub decode_workers: usize,
+    /// Kernel (aggregation) worker threads. `None` runs windows on the
+    /// caller's ambient Rayon pool, and serially when the caller is itself a
+    /// Rayon worker (it may hold locks other tasks on that pool need). `Some(n)`
+    /// runs them on a dedicated pool of `n` threads, shared by every stream
+    /// configured with the same `n`, from any calling thread.
+    pub aggregation_workers: Option<usize>,
+    /// Concurrent HTTP range-request workers for remote tiles.
+    pub fetch_workers: usize,
     /// Sorted list of target H3 resolution levels.
     pub resolutions: Vec<u8>,
     /// 1-indexed raster band to extract.
@@ -210,6 +218,8 @@ impl MultiResolutionConfig {
             spill_directory: None,
             prefetch_chunks: 16,
             decode_workers: 4,
+            aggregation_workers: None,
+            fetch_workers: crate::raster::remote_prefetch::DEFAULT_PREFETCH_WORKERS,
             resolutions,
             band: 1,
             custom_nodata: None,
@@ -263,6 +273,11 @@ impl MultiResolutionConfig {
         if self.prefetch_chunks < 16 || self.decode_workers == 0 {
             return Err(RasterH3Error::InvalidParameter(
                 "prefetch_chunks must be >=16 and decode_workers >=1".into(),
+            ));
+        }
+        if self.aggregation_workers == Some(0) || self.fetch_workers == 0 {
+            return Err(RasterH3Error::InvalidParameter(
+                "aggregation_workers and fetch_workers must be >=1".into(),
             ));
         }
         if self.sampling.points.is_empty()
