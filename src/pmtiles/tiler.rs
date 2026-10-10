@@ -153,6 +153,24 @@ pub fn flush_all_tiles(
     acc.flush_all(writer)
 }
 
+/// PMTiles tiling assumes every record is at a requested resolution: zooms and
+/// the tile eviction margin are derived from those resolutions. A compacted
+/// parent record is one level coarser and about 2.65 times wider, so it would
+/// exceed the margin and appear only at coarser zooms, leaving holes at the
+/// requested resolutions.
+fn reject_compaction<S: RecordStreamer>(
+    streamer: &S,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if streamer.compacts_children() {
+        return Err(
+            "PMTiles output does not support H3 child compaction; disable \
+                    compact_h3_children for tiling"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// High-level builder to convert H3 data and GeoTIFF raster aggregations directly to PMTiles v3
 pub struct H3PmtilesTiler;
 
@@ -308,6 +326,7 @@ impl H3PmtilesTiler {
     where
         S: RecordStreamer<Record = MultiContinuousRecord> + Send + 'static,
     {
+        reject_compaction(&streamer)?;
         let property_filter = properties
             .map(PropertyFilter::parse)
             .unwrap_or_else(PropertyFilter::all);
@@ -330,6 +349,8 @@ impl H3PmtilesTiler {
             }
         }
 
+        // Records arrive only at the requested resolutions; reject_compaction
+        // rules out coarser parent records that would exceed this margin.
         let max_cell_radius = resolutions
             .iter()
             .map(|&r| max_hex_radius_deg(r))
@@ -691,6 +712,7 @@ impl H3PmtilesTiler {
     where
         S: RecordStreamer<Record = MultiCategoricalRecord> + Send + 'static,
     {
+        reject_compaction(&streamer)?;
         let property_filter = properties
             .map(PropertyFilter::parse)
             .unwrap_or_else(PropertyFilter::all);
@@ -714,6 +736,8 @@ impl H3PmtilesTiler {
             }
         }
 
+        // Records arrive only at the requested resolutions; reject_compaction
+        // rules out coarser parent records that would exceed this margin.
         let max_cell_radius = resolutions
             .iter()
             .map(|&r| max_hex_radius_deg(r))

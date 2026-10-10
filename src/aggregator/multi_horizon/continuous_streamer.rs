@@ -207,6 +207,11 @@ impl MultiScanHorizonStreamer {
         self.inner.resolution_u8s()
     }
 
+    /// Stage timings and counters, including observed kernel concurrency.
+    pub fn metrics(&self) -> &super::profile::StreamProfile {
+        self.inner.metrics()
+    }
+
     /// Number of partial aggregation runs persisted under memory pressure.
     pub fn spill_run_count(&self) -> u64 {
         self.inner.spill_run_count()
@@ -270,6 +275,11 @@ impl RecordStreamer for MultiScanHorizonStreamer {
     #[inline(always)]
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         Some(self.inner.mosaic().mosaic_bounds_wgs84)
+    }
+
+    #[inline(always)]
+    fn compacts_children(&self) -> bool {
+        self.inner.compacts_children()
     }
 
     #[inline(always)]

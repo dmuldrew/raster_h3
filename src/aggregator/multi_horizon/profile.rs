@@ -107,6 +107,8 @@ pub struct StreamProfile {
     pub worker_ns: u64,
     /// Wall time spent in parallel kernel waves.
     pub kernel_wall_ns: u64,
+    /// Most window jobs observed running at the same instant.
+    pub peak_concurrent_jobs: usize,
     pub merge_ns: u64,
     pub spill_ns: u64,
     pub jobs: u64,

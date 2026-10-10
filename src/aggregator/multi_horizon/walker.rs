@@ -14,8 +14,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::aggregator::sampling::SamplingPattern;
-use crate::crs::transformer::CrsTransformer;
+use crate::aggregator::sampling::{SamplePoint, SamplingPattern};
+use crate::crs::transformer::{web_mercator_lat, web_mercator_lon, CrsTransformer};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
@@ -195,7 +195,7 @@ fn walk<T, Acc, E, N, R>(
     let num_res = ctx.resolutions.len();
     let combine = engine.combine_sample_weights();
     let pruner = RowPruner::new(ctx);
-    let transformer = CoordinateTransformer::new(ctx.gt, ctx.crs);
+    let mut projector = SampleProjector::new(ctx);
     let mut runs = Runs::new(num_res, engine);
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
@@ -219,6 +219,7 @@ fn walk<T, Acc, E, N, R>(
             },
             None => 0..row_px,
         };
+        projector.start_row(ctx, row_idx);
         // Batch mode: pixels in `span_start..` all map to `runs.cells`.
         // Invalid pixels may sit inside a span; the span kernels skip them.
         let mut span_start: Option<usize> = None;
@@ -229,8 +230,8 @@ fn walk<T, Acc, E, N, R>(
             };
             positions.clear();
             let col = chunk.col_offset as usize + c;
-            for sp in &ctx.sampling.points {
-                let Ok((lon, lat)) = transformer.subpixel_to_wgs84(col, row_idx, *sp) else {
+            for (k, sp) in ctx.sampling.points.iter().enumerate() {
+                let Some((lon, lat)) = projector.project(col, row_idx, k, *sp) else {
                     continue;
                 };
                 if !(-90.0..=90.0).contains(&lat) || !is_point_in_bbox(lon, lat, ctx.bbox) {
@@ -304,6 +305,58 @@ fn walk<T, Acc, E, N, R>(
         }
     }
     runs.finish(engine, maps);
+}
+
+/// Projects sample positions to WGS84. On north-up Web Mercator grids a
+/// sample's latitude depends only on its row and vertical offset, so it is
+/// computed once per row and offset rather than per sample. Both paths
+/// evaluate identical expressions, so results are bit-for-bit equal.
+struct SampleProjector<'a> {
+    transformer: CoordinateTransformer<'a>,
+    gt: &'a GeoTransform,
+    /// Latitude of each sampling point on the current row (Web Mercator only).
+    row_lats: Option<Vec<f64>>,
+}
+
+impl<'a> SampleProjector<'a> {
+    fn new(ctx: &WalkContext<'a>) -> Self {
+        let mercator = matches!(ctx.crs, CrsTransformer::WebMercatorFast)
+            && ctx.gt.b == 0.0
+            && ctx.gt.d == 0.0;
+        Self {
+            transformer: CoordinateTransformer::new(ctx.gt, ctx.crs),
+            gt: ctx.gt,
+            row_lats: mercator.then(|| Vec::with_capacity(ctx.sampling.points.len())),
+        }
+    }
+
+    fn start_row(&mut self, ctx: &WalkContext, row_idx: usize) {
+        if let Some(lats) = &mut self.row_lats {
+            lats.clear();
+            // With no column rotation (d == 0), y does not depend on the column.
+            lats.extend(ctx.sampling.points.iter().map(|sp| {
+                let (_, y) = self.gt.pixel_to_coord(0.0, row_idx as f64 + sp.dy);
+                web_mercator_lat(y)
+            }));
+        }
+    }
+
+    /// Project sampling point `k` of pixel (`col`, `row_idx`), or None if the
+    /// CRS cannot transform it. Such samples lie outside the projection's
+    /// domain and are skipped rather than aborting the query; transforms that
+    /// succeed always return a finite latitude in [-90, 90].
+    #[inline(always)]
+    fn project(&self, col: usize, row_idx: usize, k: usize, sp: SamplePoint) -> Option<(f64, f64)> {
+        match &self.row_lats {
+            Some(lats) => {
+                let (x, _) = self
+                    .gt
+                    .pixel_to_coord(col as f64 + sp.dx, row_idx as f64 + sp.dy);
+                Some((web_mercator_lon(x), lats[k]))
+            }
+            None => self.transformer.subpixel_to_wgs84(col, row_idx, sp).ok(),
+        }
+    }
 }
 
 /// Current cell (None before the first) and partial accumulator per resolution.
@@ -518,6 +571,64 @@ mod tests {
             owner: None,
         };
         RowPruner::new(&ctx).unwrap().columns(&ctx, 0, 200)
+    }
+
+    #[test]
+    fn mercator_row_latitudes_match_per_sample_projection_bitwise() {
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 1,
+            height: 1,
+        };
+        for gt in [
+            // North-up, origin north of the equator.
+            GeoTransform {
+                c0: -13_627_665.27,
+                a: 30.0,
+                b: 0.0,
+                f0: 4_547_675.35,
+                d: 0.0,
+                e: -30.0,
+            },
+            // Southern hemisphere, origin at -0.0, south-up rows.
+            GeoTransform {
+                c0: 0.0,
+                a: 152.874_057_3,
+                b: 0.0,
+                f0: -0.0,
+                d: -0.0,
+                e: 152.874_057_3,
+            },
+        ] {
+            for sampling in [SamplingPattern::center(), SamplingPattern::sixteen_point()] {
+                let ctx = WalkContext {
+                    chunk: &chunk,
+                    resolutions: &[],
+                    crs: &CrsTransformer::WebMercatorFast,
+                    gt: &gt,
+                    sampling: &sampling,
+                    bbox: None,
+                    stride: 1,
+                    samples_per_pixel: 1,
+                    owner: None,
+                };
+                let mut projector = SampleProjector::new(&ctx);
+                assert!(projector.row_lats.is_some());
+                let reference = CoordinateTransformer::new(&gt, ctx.crs);
+                for row in [0usize, 1, 7, 4_095, 100_000] {
+                    projector.start_row(&ctx, row);
+                    for col in [0usize, 3, 65_535] {
+                        for (k, sp) in sampling.points.iter().enumerate() {
+                            let (lon, lat) = projector.project(col, row, k, *sp).unwrap();
+                            let (rlon, rlat) = reference.subpixel_to_wgs84(col, row, *sp).unwrap();
+                            assert_eq!(lon.to_bits(), rlon.to_bits());
+                            assert_eq!(lat.to_bits(), rlat.to_bits());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -13,6 +13,18 @@ use proj4rs::proj::Proj;
 const WGS84_A: f64 = 6378137.0; // WGS84 semi-major axis in meters
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
+/// Spherical Web Mercator (EPSG:3857) easting to longitude in degrees.
+#[inline(always)]
+pub fn web_mercator_lon(x: f64) -> f64 {
+    (x / WGS84_A) * RAD_TO_DEG
+}
+
+/// Spherical Web Mercator (EPSG:3857) northing to latitude in degrees.
+#[inline(always)]
+pub fn web_mercator_lat(y: f64) -> f64 {
+    (2.0 * (y / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG
+}
+
 /// Normalize longitude to [-180.0, 180.0) degrees
 #[inline]
 pub fn wrap_lon(lon: f64) -> f64 {
@@ -61,6 +73,24 @@ pub(crate) fn tokenize_proj_string(src: &str) -> std::collections::HashMap<Strin
         }
     }
     map
+}
+
+/// Keys every fast path tolerates: they either carry no geometric meaning or
+/// are validated separately (`towgs84`, `nadgrids`).
+const NEUTRAL_KEYS: &[&str] = &["proj", "no_defs", "wktext", "type", "towgs84", "nadgrids"];
+
+/// True when every token in `tokens` is understood by a fast path that
+/// accepts `keys` in addition to [`NEUTRAL_KEYS`]. Linear units must be
+/// metres and any prime meridian Greenwich; everything else (`+axis`, `+pm`,
+/// `+geoc`, `+lon_wrap`, `+over`, foot units, ...) routes to proj4rs, which
+/// honours those parameters, rather than being silently dropped.
+fn fast_path_accepts(tokens: &std::collections::HashMap<String, String>, keys: &[&str]) -> bool {
+    tokens.iter().all(|(k, v)| match k.as_str() {
+        "units" => v == "m",
+        "to_meter" => v.parse::<f64>().is_ok_and(|m| m == 1.0),
+        "pm" => v == "greenwich" || v.parse::<f64>().is_ok_and(|d| d == 0.0),
+        k => NEUTRAL_KEYS.contains(&k) || keys.contains(&k),
+    })
 }
 
 /// Helper to check if a +towgs84 parameter list is effectively all-zero (e.g., "0,0,0" or "0,0,0,0,0,0,0").
@@ -163,6 +193,12 @@ impl AlbersConicFast {
         if tokens.get("proj").map(|s| s.as_str()) != Some("aea") {
             return None;
         }
+        let keys = [
+            "lat_1", "lat_2", "lat_0", "lon_0", "x_0", "y_0", "ellps", "datum", "a", "rf", "f",
+        ];
+        if !fast_path_accepts(tokens, &keys) {
+            return None;
+        }
 
         // Must NOT have nadgrids (unless @null or empty)
         if let Some(nadgrids) = tokens.get("nadgrids") {
@@ -250,6 +286,23 @@ impl AlbersConicFast {
     pub fn from_proj_string(src: &str) -> Option<Self> {
         let tokens = tokenize_proj_string(src);
         Self::from_proj_tokens(&tokens)
+    }
+
+    /// Forward transformation from (lon, lat) in degrees to projected (x, y).
+    pub fn project_point(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
+        let phi = lat_deg / RAD_TO_DEG;
+        let sin_phi = phi.sin();
+        let e_sin = self.e * sin_phi;
+        let q = (1.0 - self.e2)
+            * (sin_phi / (1.0 - e_sin * e_sin)
+                - (1.0 / (2.0 * self.e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln());
+        let rho = self.a * (self.c - self.n * q).max(0.0).sqrt() / self.n;
+        let d_lam = wrap_lon(lon_deg - self.lon_origin_rad * RAD_TO_DEG) / RAD_TO_DEG;
+        let theta = self.n * d_lam;
+        (
+            self.x_0 + rho * theta.sin(),
+            self.y_0 + self.rho0 - rho * theta.cos(),
+        )
     }
 
     /// Analytical inverse transformation from projected (x, y) to (lon, lat) in WGS84 degrees
@@ -374,25 +427,26 @@ impl CrsTransformer {
                 let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
                 Self::from_proj_string(p_str)
             }
-            _ => {
-                let p_str = format!("+init=epsg:{}", code);
-                let from =
-                    Proj::from_proj_string(&p_str).map_err(|_| RasterH3Error::UnsupportedEpsg {
-                        code,
-                        detail: format!("Unsupported or unrecognized EPSG code: {}", code),
-                    })?;
-                let to =
-                    Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| {
-                        RasterH3Error::CrsError(format!(
-                            "Failed to initialize WGS84 target projection: {:?}",
-                            e
-                        ))
-                    })?;
-                Ok(Self::Proj4 {
-                    from: Box::new(from),
-                    to: Box::new(to),
-                })
+            // GDA2020 / MGA zones 46-59. GDA2020 is treated as WGS84 under the
+            // same metre-level datum approximation as EPSG:4269.
+            7846..=7859 => {
+                let zone = code - 7800;
+                let p_str = format!("+proj=utm +zone={} +south +ellps=GRS80 +units=m +no_defs", zone);
+                Self::from_proj_string(&p_str)
             }
+            // WGS 84 / NSIDC EASE-Grid 2.0 Global.
+            6933 => Self::from_proj_string(
+                "+proj=cea +lat_ts=30 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            ),
+            // proj4rs is built without an EPSG database, so any other code
+            // must be supplied as a PROJ string.
+            _ => Err(RasterH3Error::UnsupportedEpsg {
+                code,
+                detail: format!(
+                    "Unsupported or unrecognized EPSG code: {}. Supply the CRS as a PROJ string instead.",
+                    code
+                ),
+            }),
         }
     }
 
@@ -465,7 +519,13 @@ impl CrsTransformer {
                         .and_then(|v| v.parse::<f64>().ok())
                         .is_none_or(|rf| (rf - 298.257).abs() < 0.01);
 
-                    if valid_datum && valid_ellps && valid_a && valid_rf {
+                    let keys = ["datum", "ellps", "a", "rf"];
+                    if valid_datum
+                        && valid_ellps
+                        && valid_a
+                        && valid_rf
+                        && fast_path_accepts(&tokens, &keys)
+                    {
                         return Ok(Self::Wgs84Identity);
                     }
                 }
@@ -512,7 +572,10 @@ impl CrsTransformer {
                         && (k - 1.0).abs() < 1e-6
                         && lat_ts.abs() < 1e-6;
 
-                    if is_sphere_6378137 && is_standard_merc {
+                    let keys = [
+                        "a", "b", "ellps", "lon_0", "x_0", "y_0", "k", "k_0", "lat_ts",
+                    ];
+                    if is_sphere_6378137 && is_standard_merc && fast_path_accepts(&tokens, &keys) {
                         return Ok(Self::WebMercatorFast);
                     }
                 }
@@ -531,6 +594,14 @@ impl CrsTransformer {
                 src_proj, e
             ))
         })?;
+        // proj4rs adds a degree-valued prime meridian to radian longitudes on
+        // projected sources; refuse rather than shift by the wrong amount.
+        if !from.is_latlong() && from.from_greenwich() != 0.0 {
+            return Err(RasterH3Error::CrsError(format!(
+                "Non-Greenwich prime meridians on projected CRSs are not supported: '{}'",
+                src_proj
+            )));
+        }
         let to = Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| {
             RasterH3Error::CrsError(format!(
                 "Failed to initialize WGS84 target projection: {:?}",
@@ -549,25 +620,79 @@ impl CrsTransformer {
     pub fn transform_point(&self, x: f64, y: f64) -> Result<(f64, f64)> {
         match self {
             Self::Wgs84Identity => Ok((x, y)),
-            Self::WebMercatorFast => {
-                let lon = (x / WGS84_A) * RAD_TO_DEG;
-                let lat =
-                    (2.0 * (y / WGS84_A).exp().atan() - std::f64::consts::FRAC_PI_2) * RAD_TO_DEG;
-                Ok((lon, lat))
-            }
+            Self::WebMercatorFast => Ok((web_mercator_lon(x), web_mercator_lat(y))),
             Self::AlbersConic(albers) => Ok(albers.transform_point(x, y)),
             Self::Proj4 { from, to } => {
-                let mut point_3d = (x, y, 0.0);
+                // proj4rs reads and writes geographic coordinates in radians,
+                // and skips the prime-meridian shift for geographic sources
+                // (`from_greenwich` is in degrees).
+                let mut point_3d = if from.is_latlong() {
+                    (
+                        (x + from.from_greenwich()) / RAD_TO_DEG,
+                        y / RAD_TO_DEG,
+                        0.0,
+                    )
+                } else {
+                    (x, y, 0.0)
+                };
                 proj4rs::transform::transform(from, to, &mut point_3d).map_err(|e| {
                     RasterH3Error::CrsError(format!(
                         "Reprojection error for point ({}, {}): {:?}",
                         x, y, e
                     ))
                 })?;
-                // proj4rs outputs radians for longlat
                 let lon_deg = point_3d.0 * RAD_TO_DEG;
                 let lat_deg = point_3d.1 * RAD_TO_DEG;
-                Ok((lon_deg, lat_deg))
+                // Reject results outside the geographic domain instead of
+                // handing callers coordinates that only look like degrees.
+                if !lon_deg.is_finite() || !lat_deg.is_finite() || lat_deg.abs() > 90.0 + 1e-9 {
+                    return Err(RasterH3Error::CrsError(format!(
+                        "Reprojection of ({}, {}) left the geographic domain: ({}, {})",
+                        x, y, lon_deg, lat_deg
+                    )));
+                }
+                Ok((lon_deg, lat_deg.clamp(-90.0, 90.0)))
+            }
+        }
+    }
+
+    /// Inverse of [`Self::transform_point`]: WGS84 (lon, lat) in degrees to
+    /// source CRS coordinates.
+    pub fn wgs84_to_source(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
+        match self {
+            Self::Wgs84Identity => Ok((lon, lat)),
+            Self::WebMercatorFast => {
+                let phi = lat.clamp(-89.999999, 89.999999) / RAD_TO_DEG;
+                Ok((
+                    WGS84_A * lon / RAD_TO_DEG,
+                    WGS84_A * (std::f64::consts::FRAC_PI_4 + phi / 2.0).tan().ln(),
+                ))
+            }
+            Self::AlbersConic(albers) => Ok(albers.project_point(lon, lat)),
+            Self::Proj4 { from, to } => {
+                let mut point_3d = (lon / RAD_TO_DEG, lat / RAD_TO_DEG, 0.0);
+                proj4rs::transform::transform(to, from, &mut point_3d).map_err(|e| {
+                    RasterH3Error::CrsError(format!(
+                        "Inverse reprojection error for point ({}, {}): {:?}",
+                        lon, lat, e
+                    ))
+                })?;
+                let (x, y) = if from.is_latlong() {
+                    (
+                        point_3d.0 * RAD_TO_DEG - from.from_greenwich(),
+                        point_3d.1 * RAD_TO_DEG,
+                    )
+                } else {
+                    (point_3d.0, point_3d.1)
+                };
+                if x.is_finite() && y.is_finite() {
+                    Ok((x, y))
+                } else {
+                    Err(RasterH3Error::CrsError(format!(
+                        "Inverse reprojection of ({}, {}) is outside the source CRS domain",
+                        lon, lat
+                    )))
+                }
             }
         }
     }
@@ -588,6 +713,39 @@ impl CrsTransformer {
             out_lat[i] = lat;
         }
         Ok(())
+    }
+
+    /// Widen bounds from [`Self::transform_rect_bounds`] before they are used
+    /// to *reject* data (bbox pruning). Identity, Web Mercator and Albers
+    /// bounds are analytic; generic PROJ bounds come from sampled edges and an
+    /// interior grid, so they are padded by a tenth of their span (at least
+    /// 0.01 degree) in each axis. Sampling is not a certificate, so this keeps
+    /// borderline tiles and chunks and leaves the exact decision to the
+    /// per-sample bbox test.
+    pub fn rejection_bounds(&self, b: [f64; 4]) -> [f64; 4] {
+        if !matches!(self, Self::Proj4 { .. }) {
+            return b;
+        }
+        let pad_lon = ((b[2] - b[0]) * 0.1).max(0.01);
+        let pad_lat = ((b[3] - b[1]) * 0.1).max(0.01);
+        let (min_lon, max_lon) = if b[2] - b[0] + 2.0 * pad_lon >= 360.0 {
+            (-180.0, 180.0)
+        } else {
+            (b[0] - pad_lon, b[2] + pad_lon)
+        };
+        // Spill past the antimeridian is folded into a full-longitude range so
+        // the rectangle stays non-crossing.
+        let (min_lon, max_lon) = if min_lon < -180.0 || max_lon > 180.0 {
+            (-180.0, 180.0)
+        } else {
+            (min_lon, max_lon)
+        };
+        [
+            min_lon,
+            (b[1] - pad_lat).max(-90.0),
+            max_lon,
+            (b[3] + pad_lat).min(90.0),
+        ]
     }
 
     /// Calculate WGS84 [min_lon, min_lat, max_lon, max_lat] spatial bounds for a raster pixel rectangle.
@@ -1311,6 +1469,119 @@ mod tests {
                 assert!(msg.contains("towgs84") || msg.contains("Helmert"));
             }
             other => panic!("Expected RasterH3Error::CrsError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_geographic_fallback_converts_degrees_to_radians() {
+        // Audit probe: a non-WGS84 ellipsoid without datum parameters skips
+        // the identity fast path and must still return degrees.
+        let tf = CrsTransformer::from_proj_string("+proj=longlat +ellps=clrk66 +no_defs").unwrap();
+        assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+        let (lon, lat) = tf.transform_point(2.0, 45.0).unwrap();
+        assert!(
+            (lon - 2.0).abs() < 1e-9 && (lat - 45.0).abs() < 1e-9,
+            "({lon}, {lat})"
+        );
+    }
+
+    #[test]
+    fn test_prime_meridian_is_honoured() {
+        let tf = CrsTransformer::from_proj_string("+proj=longlat +datum=WGS84 +pm=paris +no_defs")
+            .unwrap();
+        assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+        let (lon, lat) = tf.transform_point(2.0, 45.0).unwrap();
+        // PROJ: (4.3372291667, 45)
+        assert!((lon - 4.3372291667).abs() < 1e-8, "lon = {lon}");
+        assert!((lat - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_albers_in_us_feet_is_not_fast_path() {
+        let ft = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +datum=NAD83 +units=us-ft";
+        let tf = CrsTransformer::from_proj_string(ft).unwrap();
+        assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+        let (lon, lat) = tf.transform_point(1_580_000.0, 1_940_000.0).unwrap();
+        // PROJ inverse to NAD83 geographic: (-91.1030319046, 28.2800931283)
+        assert!((lon + 91.1030319046).abs() < 1e-6, "lon = {lon}");
+        assert!((lat - 28.2800931283).abs() < 1e-6, "lat = {lat}");
+        // Explicit metres keep the analytical path.
+        let m = ft.replace("us-ft", "m");
+        assert!(matches!(
+            CrsTransformer::from_proj_string(&m).unwrap(),
+            CrsTransformer::AlbersConic(_)
+        ));
+    }
+
+    #[test]
+    fn test_unknown_modifiers_leave_fast_paths() {
+        for s in [
+            "+proj=longlat +datum=WGS84 +axis=neu",
+            "+proj=longlat +datum=WGS84 +geoc",
+            "+proj=merc +a=6378137 +b=6378137 +units=ft",
+            "+proj=aea +lat_1=29.5 +lat_2=45.5 +lon_0=-96 +ellps=GRS80 +to_meter=0.3048",
+        ] {
+            let tf = CrsTransformer::from_proj_string(s).unwrap();
+            assert!(
+                matches!(tf, CrsTransformer::Proj4 { .. }),
+                "{s} took a fast path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_projected_prime_meridian_is_rejected() {
+        let s = "+proj=utm +zone=31 +ellps=intl +pm=paris +units=m";
+        assert!(CrsTransformer::from_proj_string(s).is_err());
+    }
+
+    #[test]
+    fn test_documented_epsg_codes_resolve() {
+        for code in [6933, 7856] {
+            assert!(CrsTransformer::from_epsg_code(code).is_ok(), "EPSG:{code}");
+        }
+        // EASE-Grid 2.0 origin is (0, 0).
+        let tf = CrsTransformer::from_epsg_code(6933).unwrap();
+        let (lon, lat) = tf.transform_point(0.0, 0.0).unwrap();
+        assert!(lon.abs() < 1e-9 && lat.abs() < 1e-9);
+        // MGA zone 56 central meridian is 153E.
+        let tf = CrsTransformer::from_epsg_code(7856).unwrap();
+        let (lon, _) = tf.transform_point(500_000.0, 6_250_000.0).unwrap();
+        assert!((lon - 153.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_wgs84_to_source_round_trips() {
+        let cases: Vec<(CrsTransformer, (f64, f64))> = vec![
+            (
+                CrsTransformer::from_epsg_code(3857).unwrap(),
+                (-1.3e7, 4.5e6),
+            ),
+            (
+                CrsTransformer::from_epsg_code(5070).unwrap(),
+                (1.58e6, 1.94e6),
+            ),
+            (
+                CrsTransformer::from_epsg_code(3338).unwrap(),
+                (-2.0e5, 1.2e6),
+            ),
+            (
+                CrsTransformer::from_epsg_code(32633).unwrap(),
+                (450_000.0, 5_500_000.0),
+            ),
+            (
+                CrsTransformer::from_proj_string("+proj=longlat +datum=WGS84 +pm=paris").unwrap(),
+                (2.0, 45.0),
+            ),
+        ];
+        for (tf, (x, y)) in cases {
+            let (lon, lat) = tf.transform_point(x, y).unwrap();
+            let (x2, y2) = tf.wgs84_to_source(lon, lat).unwrap();
+            let tol = 1e-6 * x.abs().max(y.abs()).max(1.0);
+            assert!(
+                (x - x2).abs() < tol && (y - y2).abs() < tol,
+                "({x},{y}) -> ({x2},{y2})"
+            );
         }
     }
 }

@@ -21,13 +21,24 @@ With **Sub-Pixel Super-Sampling**, multiple sample offsets (dx_i, dy_i) are eval
 | **`'9point'`** / `'3x3'` | 9 | 1/9 each | Regular 3 × 3 grid | **Dense Uniform Coverage**: Smooth, uniform sub-pixel discretization. |
 | **`'16point'`** / `'4x4'` | 16 | 1/16 each | Regular 4 × 4 grid | **Coarse → Fine Resampling**: Ideal when coarse pixels (e.g. 1km climate / ERA5 data) overlap fine H3 cells (Res 9–11). |
 
+## What Sampling Does and Does Not Compute
+
+Counts and means are **sample-weighted**: each sample point contributes its
+pattern weight to the H3 cell containing it. Supersampling approximates each
+pixel's split across cell boundaries; it is not an exact pixel–hexagon area
+intersection, and it does not weight by ground area (pixels in geographic
+grids shrink toward the poles). The approximation error depends on the
+pattern, pixel size relative to cell size, and the CRS; no universal bound is
+claimed. Workflows that need area-weighted means or conserved extensive totals
+should supply equal-area inputs or apply their own area weights.
+
 ## Performance & Precision Trade-Off Guide
 
 | Sampling Mode | Samples / Pixel | Relative Runtime | Boundary Precision | Recommended Use Case |
 | :--- | :---: | :---: | :--- | :--- |
 | **`center`** | 1 | **$1.0\times$** (Fastest) | Baseline | Fast exploratory scans, massive high-resolution rasters (10m pixels into Res 6–8 cells) |
 | **`rgss`** *(Recommended)* | 4 | **$\sim 0.75\times$** | High Anti-Aliasing | Default for production analytical queries; eliminates axis-aligned blind spots |
-| **`hex`** | 7 | **$\sim 0.60\times$** | True Hexagonal Symmetry | When strict hexagonal area weighting is required |
+| **`hex`** | 7 | **$\sim 0.60\times$** | Hexagonally symmetric sample layout | When a symmetric sub-pixel pattern is preferred (still sample-weighted, not area-weighted) |
 | **`gaussian`** | 5 | **$\sim 0.68\times$** | Optical PSF Emulation | Remote sensing satellite imagery where pixel centers dominate sensor response |
 | **`8rooks`** | 8 | **$\sim 0.55\times$** | Full Stratified Anti-Aliasing | Highly complex boundary contours with diagonal edges |
 | **`16point`** | 16 | **$\sim 0.35\times$** | Sub-Grid Reconstruction | Coarse rasters (e.g. 1km climate grids) aggregated into fine H3 cells (Res 9–11) |
@@ -62,7 +73,7 @@ skips sample indexing, and performance depends on the CRS and sampling pattern.
 
 ```
 Is raster pixel resolution significantly smaller than H3 cell? (e.g. 10m pixels into Res 7/8)
- ├── YES ──> Use 'center' (Maximum throughput; boundary partial-pixel area error is < 0.5%)
+ ├── YES ──> Use 'center' (Maximum throughput; only pixels straddling cell edges are misattributed, so the error shrinks as pixels get smaller relative to cells)
  └── NO
       ├── Are raster pixels LARGER than H3 cells? (e.g. 1km climate grids into Res 9+)
       │    └── YES ──> Use '16point' (Prevents blocky spatial quantization across hexagons)

@@ -189,6 +189,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
         config.compact = bind_data.common.compact;
         config.compact_h3_children = bind_data.common.compact;
         config.remapper = bind_data.remapper.clone();
+        bind_data.common.execution.apply(&mut config);
 
         let streamer = match MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config) {
             Ok(s) => s,

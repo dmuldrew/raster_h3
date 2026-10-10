@@ -539,7 +539,27 @@ impl PrefetchedMosaicReader {
         buffer_capacity: usize,
         num_workers: usize,
     ) -> Self {
-        let remote_queue = RemoteChunkPrefetchQueue::spawn_mosaic(&mosaic, None).map(Arc::new);
+        Self::spawn_with_fetch_workers(
+            mosaic,
+            buffer_capacity,
+            num_workers,
+            crate::raster::remote_prefetch::DEFAULT_PREFETCH_WORKERS,
+        )
+    }
+
+    /// Spawn with explicit decode and remote-fetch worker counts.
+    pub fn spawn_with_fetch_workers(
+        mosaic: Arc<MosaicReader>,
+        buffer_capacity: usize,
+        num_workers: usize,
+        fetch_workers: usize,
+    ) -> Self {
+        let remote_config = crate::raster::remote_prefetch::RemotePrefetchConfig {
+            num_workers: fetch_workers,
+            ..Default::default()
+        };
+        let remote_queue =
+            RemoteChunkPrefetchQueue::spawn_mosaic(&mosaic, Some(remote_config)).map(Arc::new);
         let total_jobs = mosaic.chunk_refs.len();
         let queue = Arc::new(OrderedPrefetchQueue::new(
             buffer_capacity.max(16),
