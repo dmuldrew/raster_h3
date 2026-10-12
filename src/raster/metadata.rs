@@ -351,10 +351,7 @@ fn user_defined_geokeys_to_proj(
 /// a WGS 1984 or NAD83 datum with a Greenwich prime meridian, degree angular
 /// units and all defining parameters present. Anything else returns None.
 pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
-    let upper = s.trim().to_uppercase();
-    if !upper.starts_with("PROJCS[") {
-        return None;
-    }
+    let upper = extract_projcs(&s.to_uppercase())?;
 
     // Datum by name only; ellipsoid names (e.g. GRS 1980) are shared by
     // several datums and do not identify one.
@@ -424,6 +421,28 @@ pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
     Some(projected_proj_string(
         proj, &params, false_en, datum, linear,
     ))
+}
+
+/// The bracket-balanced `PROJCS[...]` inside a GeoAsciiParamsTag citation,
+/// which GDAL may wrap, e.g. `ESRI PE String = PROJCS[...]|`.
+fn extract_projcs(upper: &str) -> Option<String> {
+    let start = upper.find("PROJCS[")?;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (i, c) in upper[start..].char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '[' if !quoted => depth += 1,
+            ']' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(upper[start..=start + i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The quoted name of the first `tag` section, e.g. `DATUM["WGS_1984",...`.
@@ -716,5 +735,29 @@ mod tests {
         assert_eq!(parse_wkt_or_ascii_to_proj(&paris), None);
         let no_scale = wkt.replace(r#"PARAMETER["scale_factor",0.9999],"#, "");
         assert_eq!(parse_wkt_or_ascii_to_proj(&no_scale), None);
+    }
+
+    #[test]
+    fn test_parse_wkt_inside_esri_pe_citation() {
+        let wkt = r#"PROJCS["Albers_Conic_Equal_Area",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-96.0],PARAMETER["Standard_Parallel_1",29.5],PARAMETER["Standard_Parallel_2",45.5],PARAMETER["Latitude_Of_Origin",23.0],UNIT["Meter",1.0]]"#;
+        let bare = parse_wkt_or_ascii_to_proj(wkt).unwrap();
+        for wrapped in [
+            format!("ESRI PE String = {wkt}|"),
+            format!("NAD83 / Conus Albers|ESRI PE String = {wkt}|"),
+        ] {
+            assert_eq!(
+                parse_wkt_or_ascii_to_proj(&wrapped).as_deref(),
+                Some(bare.as_str())
+            );
+        }
+        // Unbalanced or absent definitions are not guessed.
+        assert_eq!(
+            parse_wkt_or_ascii_to_proj("ESRI PE String = PROJCS[\"x\""),
+            None
+        );
+        assert_eq!(
+            parse_wkt_or_ascii_to_proj("WGS 84 / UTM zone 10N|WGS 84|"),
+            None
+        );
     }
 }

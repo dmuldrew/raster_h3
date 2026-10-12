@@ -350,6 +350,52 @@ impl AlbersConicFast {
     }
 }
 
+/// Axis order and prime meridian of a geographic source CRS.
+///
+/// proj4rs normalizes axes but skips the prime-meridian shift for geographic
+/// sources, so the shift cannot simply be added to the raw input: it belongs
+/// to canonical longitude, after axis normalization and before any datum
+/// transformation, exactly as in PROJ. The wrapper therefore performs both
+/// steps itself and hands proj4rs a canonical, Greenwich definition.
+#[derive(Debug, Clone, Copy)]
+pub struct GeoFrame {
+    axis: proj4rs::proj::Axis,
+    /// Prime meridian, degrees east of Greenwich.
+    pm: f64,
+}
+
+impl GeoFrame {
+    /// Source-order (a, b) to canonical (east, north).
+    fn normalize(&self, a: f64, b: f64) -> (f64, f64) {
+        let (mut e, mut n) = (a, b);
+        for (axe, v) in self.axis.iter().zip([a, b]) {
+            match axe {
+                b'e' => e = v,
+                b'w' => e = -v,
+                b'n' => n = v,
+                b's' => n = -v,
+                _ => {}
+            }
+        }
+        (e, n)
+    }
+
+    /// Canonical (east, north) back to source order.
+    fn denormalize(&self, e: f64, n: f64) -> (f64, f64) {
+        let mut out = [e, n];
+        for (slot, axe) in out.iter_mut().zip(self.axis.iter()) {
+            *slot = match axe {
+                b'e' => e,
+                b'w' => -e,
+                b'n' => n,
+                b's' => -n,
+                _ => *slot,
+            };
+        }
+        (out[0], out[1])
+    }
+}
+
 /// High-performance CRS to WGS84 coordinate transformer
 #[derive(Clone)]
 pub enum CrsTransformer {
@@ -361,7 +407,13 @@ pub enum CrsTransformer {
     AlbersConic(AlbersConicFast),
     /// Pure Rust PROJ4 transformation for arbitrary projections. Boxed so the
     /// common fast-path variants stay small.
-    Proj4 { from: Box<Proj>, to: Box<Proj> },
+    Proj4 {
+        from: Box<Proj>,
+        to: Box<Proj>,
+        /// Axis order and prime meridian of a geographic source, applied by
+        /// this wrapper; `from` is then built without `+axis`/`+pm`.
+        geo: Option<GeoFrame>,
+    },
 }
 
 impl CrsTransformer {
@@ -588,12 +640,31 @@ impl CrsTransformer {
             }
         }
 
-        let from = Proj::from_proj_string(src_proj).map_err(|e| {
-            RasterH3Error::CrsError(format!(
-                "Failed to parse source PROJ string '{}': {:?}",
-                src_proj, e
-            ))
-        })?;
+        let parse = |def: &str| {
+            Proj::from_proj_string(def).map_err(|e| {
+                RasterH3Error::CrsError(format!(
+                    "Failed to parse source PROJ string '{}': {:?}",
+                    src_proj, e
+                ))
+            })
+        };
+        let mut from = parse(src_proj)?;
+        let mut geo = None;
+        if from.is_latlong() {
+            geo = Some(GeoFrame {
+                axis: *from.axis(),
+                pm: from.from_greenwich(),
+            });
+            // Canonical, Greenwich copy; the wrapper applies axis and pm.
+            let canonical: Vec<&str> = src_proj
+                .split_whitespace()
+                .filter(|t| {
+                    let key = t.trim_start_matches('+').split('=').next().unwrap_or("");
+                    !key.eq_ignore_ascii_case("axis") && !key.eq_ignore_ascii_case("pm")
+                })
+                .collect();
+            from = parse(&canonical.join(" "))?;
+        }
         // proj4rs adds a degree-valued prime meridian to radian longitudes on
         // projected sources; refuse rather than shift by the wrong amount.
         if !from.is_latlong() && from.from_greenwich() != 0.0 {
@@ -612,6 +683,7 @@ impl CrsTransformer {
         Ok(Self::Proj4 {
             from: Box::new(from),
             to: Box::new(to),
+            geo,
         })
     }
 
@@ -622,18 +694,14 @@ impl CrsTransformer {
             Self::Wgs84Identity => Ok((x, y)),
             Self::WebMercatorFast => Ok((web_mercator_lon(x), web_mercator_lat(y))),
             Self::AlbersConic(albers) => Ok(albers.transform_point(x, y)),
-            Self::Proj4 { from, to } => {
-                // proj4rs reads and writes geographic coordinates in radians,
-                // and skips the prime-meridian shift for geographic sources
-                // (`from_greenwich` is in degrees).
-                let mut point_3d = if from.is_latlong() {
-                    (
-                        (x + from.from_greenwich()) / RAD_TO_DEG,
-                        y / RAD_TO_DEG,
-                        0.0,
-                    )
-                } else {
-                    (x, y, 0.0)
+            Self::Proj4 { from, to, geo } => {
+                // proj4rs reads and writes geographic coordinates in radians.
+                let mut point_3d = match geo {
+                    Some(g) => {
+                        let (e, n) = g.normalize(x, y);
+                        ((e + g.pm) / RAD_TO_DEG, n / RAD_TO_DEG, 0.0)
+                    }
+                    None => (x, y, 0.0),
                 };
                 proj4rs::transform::transform(from, to, &mut point_3d).map_err(|e| {
                     RasterH3Error::CrsError(format!(
@@ -669,7 +737,7 @@ impl CrsTransformer {
                 ))
             }
             Self::AlbersConic(albers) => Ok(albers.project_point(lon, lat)),
-            Self::Proj4 { from, to } => {
+            Self::Proj4 { from, to, geo } => {
                 let mut point_3d = (lon / RAD_TO_DEG, lat / RAD_TO_DEG, 0.0);
                 proj4rs::transform::transform(to, from, &mut point_3d).map_err(|e| {
                     RasterH3Error::CrsError(format!(
@@ -677,13 +745,11 @@ impl CrsTransformer {
                         lon, lat, e
                     ))
                 })?;
-                let (x, y) = if from.is_latlong() {
-                    (
-                        point_3d.0 * RAD_TO_DEG - from.from_greenwich(),
-                        point_3d.1 * RAD_TO_DEG,
-                    )
-                } else {
-                    (point_3d.0, point_3d.1)
+                let (x, y) = match geo {
+                    Some(g) => {
+                        g.denormalize(point_3d.0 * RAD_TO_DEG - g.pm, point_3d.1 * RAD_TO_DEG)
+                    }
+                    None => (point_3d.0, point_3d.1),
                 };
                 if x.is_finite() && y.is_finite() {
                     Ok((x, y))
@@ -1583,5 +1649,38 @@ mod tests {
                 "({x},{y}) -> ({x2},{y2})"
             );
         }
+    }
+
+    #[test]
+    fn test_prime_meridian_with_non_canonical_axes() {
+        // PROJ: (4.3372291667, 45) for Paris longitude 2, latitude 45.
+        let cases = [
+            ("+axis=neu", (45.0, 2.0)),
+            ("+axis=wnu", (-2.0, 45.0)),
+            ("+axis=swu", (-45.0, -2.0)),
+            ("", (2.0, 45.0)),
+        ];
+        for (axis, input) in cases {
+            let def = format!("+proj=longlat +datum=WGS84 +pm=paris {axis} +no_defs");
+            let tf = CrsTransformer::from_proj_string(&def).unwrap();
+            let (lon, lat) = tf.transform_point(input.0, input.1).unwrap();
+            assert!((lon - 4.3372291667).abs() < 1e-8, "{def}: lon = {lon}");
+            assert!((lat - 45.0).abs() < 1e-9, "{def}: lat = {lat}");
+            let (x, y) = tf.wgs84_to_source(lon, lat).unwrap();
+            assert!(
+                (x - input.0).abs() < 1e-9 && (y - input.1).abs() < 1e-9,
+                "{def}: ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_axis_without_prime_meridian() {
+        let tf = CrsTransformer::from_proj_string("+proj=longlat +datum=WGS84 +axis=neu").unwrap();
+        let (lon, lat) = tf.transform_point(45.0, 2.0).unwrap();
+        assert!(
+            (lon - 2.0).abs() < 1e-9 && (lat - 45.0).abs() < 1e-9,
+            "({lon}, {lat})"
+        );
     }
 }

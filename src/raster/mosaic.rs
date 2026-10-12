@@ -240,6 +240,10 @@ pub struct TileDescriptor {
     pub centroid_wgs84: (f64, f64),
     /// CRS transformer for projecting raster coordinates to WGS 84.
     pub crs_transformer: CrsTransformer,
+    /// Source-coordinate offset equivalent to 360 degrees of longitude, for
+    /// cylindrical CRSs (geographic, Mercator, ...) whose rasters may use
+    /// unwrapped coordinates; None for other projections.
+    lon_period: Option<(f64, f64)>,
 }
 
 impl TileDescriptor {
@@ -282,6 +286,8 @@ impl TileDescriptor {
             (bounds_wgs84[1] + bounds_wgs84[3]) * 0.5,
         ));
 
+        let lon_period = source_longitude_period(&crs_transformer, centroid_wgs84);
+
         Ok(Self {
             tile_idx,
             file_path: reader.file_path.clone(),
@@ -289,6 +295,7 @@ impl TileDescriptor {
             bounds_wgs84,
             centroid_wgs84,
             crs_transformer,
+            lon_period,
         })
     }
 
@@ -303,20 +310,47 @@ impl TileDescriptor {
         }
         let md = &self.reader.metadata;
         let (w, h) = (md.width as f64, md.height as f64);
-        let inside = |lon: f64| {
-            self.crs_transformer
-                .wgs84_to_source(lon, lat)
-                .ok()
-                .and_then(|(x, y)| md.geotransform.coord_to_pixel(x, y))
+        let Ok((x, y)) = self.crs_transformer.wgs84_to_source(lon, lat) else {
+            return false;
+        };
+        let inside = |x: f64, y: f64| {
+            md.geotransform
+                .coord_to_pixel(x, y)
                 .is_some_and(|(c, r)| (0.0..=w).contains(&c) && (0.0..=h).contains(&r))
         };
-        // Geographic grids may use 0..360 or other unwrapped longitudes.
-        if matches!(self.crs_transformer, CrsTransformer::Wgs84Identity) {
-            inside(lon) || inside(lon - 360.0) || inside(lon + 360.0)
-        } else {
-            inside(lon)
-        }
+        // The inverse returns one longitude branch; a raster stored on an
+        // adjacent branch (e.g. 181..182 rather than -179..-178) is the same
+        // place one period away in source coordinates.
+        inside(x, y)
+            || self
+                .lon_period
+                .is_some_and(|(px, py)| inside(x + px, y + py) || inside(x - px, y - py))
     }
+}
+
+/// The source-coordinate offset of 360 degrees of longitude when the CRS is
+/// cylindrical, i.e. source coordinates move by a constant vector per degree
+/// of longitude (geographic in any axis order, Web Mercator, ellipsoidal
+/// Mercator, equirectangular, cylindrical equal-area). Detected numerically
+/// with three probes 10 degrees apart near the tile, stepping toward the
+/// prime meridian; any non-linearity (conics, azimuthal projections, or a
+/// branch cut between probes) yields None.
+fn source_longitude_period(crs: &CrsTransformer, (lon, lat): (f64, f64)) -> Option<(f64, f64)> {
+    let base = crate::crs::transformer::wrap_lon(lon);
+    let step = if base > 0.0 { -10.0 } else { 10.0 };
+    let lat = lat.clamp(-60.0, 60.0);
+    let p = [0.0, 1.0, 2.0].map(|i| crs.wgs84_to_source(base + step * i, lat).ok());
+    let [Some(p0), Some(p1), Some(p2)] = p else {
+        return None;
+    };
+    let d1 = (p1.0 - p0.0, p1.1 - p0.1);
+    let d2 = (p2.0 - p1.0, p2.1 - p1.1);
+    let len = d1.0.hypot(d1.1);
+    if !(len.is_finite() && len > 0.0) || (d2.0 - d1.0).hypot(d2.1 - d1.1) > 1e-9 * len {
+        return None;
+    }
+    let k = 360.0 / step.abs();
+    Some((d1.0 * k, d1.1 * k))
 }
 
 /// Squared chord length between two WGS84 points on the unit sphere; a

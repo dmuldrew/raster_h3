@@ -124,3 +124,47 @@ fn first_rule_still_suppresses_true_overlap_inside_rotated_footprint() {
     assert_eq!(mosaic_count(&paths, None, OverlapRule::First), 100.0);
     assert_eq!(mosaic_count(&paths, None, OverlapRule::Average), 200.0);
 }
+
+/// Identical footprints stored on different longitude branches must be
+/// recognised as the same place, including for projected cylindrical CRSs.
+#[test]
+fn first_rule_handles_mixed_longitude_branches() {
+    const A: f64 = 6378137.0;
+    let deg = |d: f64| A * d.to_radians();
+    let dir = tempfile::tempdir().unwrap();
+    let cases: [(u16, f64, f64, f64); 2] = [
+        // (EPSG, unwrapped origin x, wrapped origin x, pixel size)
+        (3857, deg(181.0), deg(-179.0), deg(0.1)),
+        (4326, 181.0, -179.0, 0.1),
+    ];
+    for (epsg, unwrapped, wrapped, px) in cases {
+        let origin_y = if epsg == 3857 { deg(1.0) } else { 1.0 };
+        let a = dir.path().join(format!("{epsg}_unwrapped.tif"));
+        let b = dir.path().join(format!("{epsg}_wrapped.tif"));
+        for (path, x) in [(&a, unwrapped), (&b, wrapped)] {
+            TestGeoTiffBuilder::new(10, 10)
+                .epsg(epsg)
+                .origin(x, origin_y)
+                .pixel_size(px)
+                .write_constant(path, 1.0f32)
+                .unwrap();
+        }
+        for paths in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+            assert_eq!(
+                mosaic_count(&paths, None, OverlapRule::First),
+                100.0,
+                "EPSG:{epsg}"
+            );
+            assert_eq!(
+                mosaic_count(&paths, None, OverlapRule::Cutline),
+                100.0,
+                "EPSG:{epsg}"
+            );
+            assert_eq!(
+                mosaic_count(&paths, None, OverlapRule::Average),
+                200.0,
+                "EPSG:{epsg}"
+            );
+        }
+    }
+}
