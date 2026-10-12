@@ -75,17 +75,19 @@ pub(crate) fn tokenize_proj_string(src: &str) -> std::collections::HashMap<Strin
     map
 }
 
-/// Keys every fast path tolerates: they either carry no geometric meaning or
-/// are validated separately (`towgs84`, `nadgrids`).
-const NEUTRAL_KEYS: &[&str] = &["proj", "no_defs", "wktext", "type", "towgs84", "nadgrids"];
+/// Keys every fast path tolerates because they carry no geometric meaning.
+const NEUTRAL_KEYS: &[&str] = &["proj", "no_defs", "wktext", "type"];
 
 /// True when every token in `tokens` is understood by a fast path that
 /// accepts `keys` in addition to [`NEUTRAL_KEYS`]. Linear units must be
-/// metres and any prime meridian Greenwich; everything else (`+axis`, `+pm`,
-/// `+geoc`, `+lon_wrap`, `+over`, foot units, ...) routes to proj4rs, which
-/// honours those parameters, rather than being silently dropped.
+/// metres, any prime meridian Greenwich and any datum shift zero; everything
+/// else (`+axis`, `+pm`, `+geoc`, `+lon_wrap`, `+over`, foot units, Helmert
+/// shifts, ...) routes to proj4rs, which honours those parameters, rather
+/// than being silently dropped.
 fn fast_path_accepts(tokens: &std::collections::HashMap<String, String>, keys: &[&str]) -> bool {
     tokens.iter().all(|(k, v)| match k.as_str() {
+        "towgs84" => is_all_zero_towgs84(v),
+        "nadgrids" => v == "@null" || v.is_empty(),
         "units" => v == "m",
         "to_meter" => v.parse::<f64>().is_ok_and(|m| m == 1.0),
         "pm" => v == "greenwich" || v.parse::<f64>().is_ok_and(|d| d == 0.0),
@@ -479,6 +481,54 @@ impl CrsTransformer {
                 let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
                 Self::from_proj_string(p_str)
             }
+            // Codes below carry a Helmert datum shift chosen from the EPSG
+            // registry (accuracy as published there); see
+            // docs/crs-and-projection.md.
+            // British National Grid: OSGB36 to WGS 84 (6), EPSG:1314, 2 m.
+            27700 => Self::from_proj_string(
+                "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 \
+                 +ellps=airy +towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 \
+                 +units=m +no_defs",
+            ),
+            // Amersfoort / RD New: Amersfoort to WGS 84 (4), EPSG:4833, 1 m.
+            // Published as coordinate frame; rotations negated for +towgs84.
+            28992 => Self::from_proj_string(
+                "+proj=sterea +lat_0=52.1561605555556 +lon_0=5.38763888888889 +k=0.9999079 \
+                 +x_0=155000 +y_0=463000 +ellps=bessel \
+                 +towgs84=565.4171,50.3319,465.5524,-0.398957388243134,0.343987817378283,-1.87740163998045,4.0725 \
+                 +units=m +no_defs",
+            ),
+            // DHDN / 3-degree Gauss-Kruger zones 2-5: DHDN to WGS 84 (2),
+            // EPSG:1777, 3 m (former West Germany).
+            31466..=31469 => {
+                let zone = code - 31464;
+                Self::from_proj_string(&format!(
+                    "+proj=tmerc +lat_0=0 +lon_0={} +k=1 +x_0={} +y_0=0 +ellps=bessel \
+                     +towgs84=598.1,73.7,418.2,0.202,0.045,-2.455,6.7 +units=m +no_defs",
+                    zone * 3,
+                    zone * 1_000_000 + 500_000
+                ))
+            }
+            // ED50 / UTM zones 28-38: ED50 to WGS 84 (1), EPSG:1133, 10 m.
+            23028..=23038 => Self::from_proj_string(&format!(
+                "+proj=utm +zone={} +ellps=intl +towgs84=-87,-98,-121 +units=m +no_defs",
+                code - 23000
+            )),
+            // ETRS89 is treated as WGS84 (sub-metre, time-dependent offset).
+            // RGF93 / Lambert-93.
+            2154 => Self::from_proj_string(
+                "+proj=lcc +lat_0=46.5 +lon_0=3 +lat_1=49 +lat_2=44 +x_0=700000 +y_0=6600000 \
+                 +ellps=GRS80 +units=m +no_defs",
+            ),
+            // ETRS89-extended / LAEA Europe.
+            3035 => Self::from_proj_string(
+                "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs",
+            ),
+            // ETRS89 / UTM zones 28-38.
+            25828..=25838 => Self::from_proj_string(&format!(
+                "+proj=utm +zone={} +ellps=GRS80 +units=m +no_defs",
+                code - 25800
+            )),
             // GDA2020 / MGA zones 46-59. GDA2020 is treated as WGS84 under the
             // same metre-level datum approximation as EPSG:4269.
             7846..=7859 => {
@@ -524,15 +574,9 @@ impl CrsTransformer {
 
         let tokens = tokenize_proj_string(trimmed);
 
-        // Reject datum transformations on ANY projection (proj4rs has no grid-shift or datum-shift support)
-        if let Some(towgs84) = tokens.get("towgs84") {
-            if !is_all_zero_towgs84(towgs84) {
-                return Err(RasterH3Error::CrsError(format!(
-                    "Datum transformations via Helmert shifts (+towgs84={}) are not supported",
-                    towgs84
-                )));
-            }
-        }
+        // Helmert shifts (`+towgs84`, explicit or implied by a named datum
+        // such as `+datum=OSGB36`) are applied by proj4rs. Grid shifts are
+        // not: no grid files are bundled.
         if let Some(nadgrids) = tokens.get("nadgrids") {
             if nadgrids != "@null" && !nadgrids.is_empty() {
                 return Err(RasterH3Error::CrsError(format!(
@@ -540,6 +584,13 @@ impl CrsTransformer {
                     nadgrids
                 )));
             }
+        }
+        if tokens.get("datum").map(|s| s.as_str()) == Some("nad27") {
+            return Err(RasterH3Error::CrsError(
+                "+datum=NAD27 requires NADCON/NTv2 grid shifts, which are not supported; \
+                 supply an explicit +ellps=clrk66 +towgs84=... approximation instead"
+                    .into(),
+            ));
         }
 
         // +init=epsg:NNNN -> treat as EPSG code
@@ -1523,19 +1574,10 @@ mod tests {
     }
 
     #[test]
-    fn test_albers_with_nonzero_towgs84_is_error() {
-        let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +towgs84=-8,160,176 +units=m +no_defs";
-        let res = CrsTransformer::from_proj_string(proj_str);
-        assert!(
-            res.is_err(),
-            "Expected error for nonzero +towgs84 parameters"
-        );
-        match res.err().unwrap() {
-            RasterH3Error::CrsError(msg) => {
-                assert!(msg.contains("towgs84") || msg.contains("Helmert"));
-            }
-            other => panic!("Expected RasterH3Error::CrsError, got {:?}", other),
-        }
+    fn test_albers_with_nonzero_towgs84_uses_proj4() {
+        let proj_str = "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=clrk66 +towgs84=-8,160,176 +units=m +no_defs";
+        let tf = CrsTransformer::from_proj_string(proj_str).unwrap();
+        assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
     }
 
     #[test]

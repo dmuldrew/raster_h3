@@ -191,14 +191,13 @@ impl MockHttpServer {
         request_count.fetch_add(1, Ordering::SeqCst);
 
         // Check for simulated transient failure (HTTP 503 Slow Down)
-        let fail_hit =
-            transient_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                if count > 0 {
-                    Some(count - 1)
-                } else {
-                    None
-                }
-            });
+        let fail_hit = transient_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            if count > 0 {
+                Some(count - 1)
+            } else {
+                None
+            }
+        });
         if fail_hit.is_ok() {
             let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes());
