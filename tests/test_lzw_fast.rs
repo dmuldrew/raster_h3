@@ -162,8 +162,9 @@ fn test_lzw_read_chunk_into_buffer_recycling() {
 
     for chunk_idx in 1..total_chunks {
         let (_bounds_direct, direct) = fast_decoder.read_chunk(chunk_idx).unwrap();
-        let (_bounds_rec, next_recycled) =
-            fast_decoder.read_chunk_into(chunk_idx, recycled).unwrap();
+        let (_bounds_rec, next_recycled) = fast_decoder
+            .read_chunk_into(chunk_idx, recycled)
+            .unwrap();
 
         match (&next_recycled, &direct) {
             (DecodingResult::U16(v_rec), DecodingResult::U16(v_dir)) => {
