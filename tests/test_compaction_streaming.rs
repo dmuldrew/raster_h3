@@ -8,7 +8,10 @@ use tiff::tags::Tag;
 
 use h3o::CellIndex;
 use raster_h3::aggregator::horizon_streamer::compute_cell_south_lat;
-use raster_h3::aggregator::multi_horizon::{MultiResolutionConfig, MultiScanHorizonStreamer};
+use raster_h3::aggregator::multi_horizon::{
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+};
+use raster_h3::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3::raster::geotiff::GeoTiffStreamReader;
 
 const NODATA: f32 = -9999.0;
@@ -152,4 +155,24 @@ fn compaction_streams_early_and_matches_eof_grouping() {
             assert!((actual - count).abs() < 1e-9, "{resolutions:?}: {key:?}");
         }
     }
+}
+
+#[test]
+fn pmtiles_rejects_compacting_streamers_before_writing() {
+    let file = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pmtiles");
+    let compacting = config(&[8], true);
+    let open = || GeoTiffStreamReader::open(file.path()).unwrap();
+
+    let continuous = MultiScanHorizonStreamer::new(open(), &compacting).unwrap();
+    let err = H3PmtilesTiler::generate_from_continuous_streamer(continuous, &out).unwrap_err();
+    assert!(err.to_string().contains("compaction"), "{err}");
+    let categorical = MultiCategoricalHorizonStreamer::new(open(), &compacting).unwrap();
+    assert!(H3PmtilesTiler::generate_from_categorical_streamer(categorical, &out).is_err());
+    assert!(!out.exists(), "a rejected stream must not create output");
+
+    // Without compaction the same input tiles normally.
+    let plain = MultiScanHorizonStreamer::new(open(), &config(&[8], false)).unwrap();
+    assert!(H3PmtilesTiler::generate_from_continuous_streamer(plain, &out).unwrap() > 0);
 }

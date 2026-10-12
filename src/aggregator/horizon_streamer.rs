@@ -102,30 +102,18 @@ pub fn chunk_intersects_bbox(
     transformer: &CrsTransformer,
     bbox: &[f64; 4],
 ) -> bool {
-    let [b_min_lon, b_min_lat, b_max_lon, b_max_lat] = *bbox;
-
-    let [c_min_lon, c_min_lat, c_max_lon, c_max_lat] = transformer.transform_rect_bounds(
+    let bounds = transformer.transform_rect_bounds(
         gt,
         chunk.col_offset as f64,
         chunk.row_offset as f64,
         chunk.width as f64,
         chunk.height as f64,
     );
-
-    if !c_min_lon.is_finite() {
+    if !bounds[0].is_finite() {
         return true;
     }
-
-    let lat_intersects = c_min_lat <= b_max_lat && c_max_lat >= b_min_lat;
-    if !lat_intersects {
-        return false;
-    }
-
-    if b_min_lon <= b_max_lon {
-        c_min_lon <= b_max_lon && c_max_lon >= b_min_lon
-    } else {
-        // Antimeridian-crossing bounding box (e.g. Fiji [178, -20, -178, -15])
-        (c_min_lon <= 180.0 && c_max_lon >= b_min_lon)
-            || (c_min_lon <= b_max_lon && c_max_lon >= -180.0)
-    }
+    crate::aggregator::multi_horizon::coordinates::rect_intersects_bbox(
+        &transformer.rejection_bounds(bounds),
+        bbox,
+    )
 }

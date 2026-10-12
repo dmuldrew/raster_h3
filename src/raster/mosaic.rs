@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::aggregator::horizon_streamer::chunk_intersects_bbox;
+use crate::aggregator::multi_horizon::coordinates::{is_point_in_bbox, rect_intersects_bbox};
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
@@ -15,10 +16,13 @@ use crate::raster::http_range::is_remote_url;
 /// Overlap resolution strategy for overlapping tiles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlapRule {
-    /// Geometric Voronoi bisector between tile centroids (Default)
+    /// Each point belongs to the tile, among those whose footprint contains
+    /// it, with the nearest centre pixel by great-circle distance (Default)
     #[default]
     Cutline,
-    /// Priority ordering: first file in input list takes precedence
+    /// Priority ordering: the first file in the input list whose footprint
+    /// contains the point takes precedence. A nodata pixel in that tile is
+    /// not filled from lower-priority tiles.
     First,
     /// Accumulate all overlapping observations into target H3 cell
     Average,
@@ -232,10 +236,14 @@ pub struct TileDescriptor {
     pub reader: GeoTiffStreamReader,
     /// Spatial bounding box in WGS 84 coordinates: `[min_lon, min_lat, max_lon, max_lat]`.
     pub bounds_wgs84: [f64; 4],
-    /// Geographic centroid in WGS 84 coordinates: `(lon, lat)`.
+    /// WGS 84 position of the raster's centre pixel: `(lon, lat)`.
     pub centroid_wgs84: (f64, f64),
     /// CRS transformer for projecting raster coordinates to WGS 84.
     pub crs_transformer: CrsTransformer,
+    /// Source-coordinate offset equivalent to 360 degrees of longitude, for
+    /// cylindrical CRSs (geographic, Mercator, ...) whose rasters may use
+    /// unwrapped coordinates; None for other projections.
+    lon_period: Option<(f64, f64)>,
 }
 
 impl TileDescriptor {
@@ -272,10 +280,13 @@ impl TileDescriptor {
         let gt = &reader.metadata.geotransform;
 
         let bounds_wgs84 = crs_transformer.transform_rect_bounds(gt, 0.0, 0.0, w, h);
-        let centroid_wgs84 = (
+        let (cx, cy) = gt.pixel_to_coord(w * 0.5, h * 0.5);
+        let centroid_wgs84 = crs_transformer.transform_point(cx, cy).unwrap_or((
             (bounds_wgs84[0] + bounds_wgs84[2]) * 0.5,
             (bounds_wgs84[1] + bounds_wgs84[3]) * 0.5,
-        );
+        ));
+
+        let lon_period = source_longitude_period(&crs_transformer, centroid_wgs84);
 
         Ok(Self {
             tile_idx,
@@ -284,8 +295,73 @@ impl TileDescriptor {
             bounds_wgs84,
             centroid_wgs84,
             crs_transformer,
+            lon_period,
         })
     }
+
+    /// Whether WGS84 `(lon, lat)` lies inside this raster's pixel grid,
+    /// tested exactly by inverse-projecting into pixel space. A bounding
+    /// rectangle is only a candidate filter: rotated and projected rasters do
+    /// not fill their WGS84 bbox.
+    pub fn contains(&self, lon: f64, lat: f64) -> bool {
+        let candidate = self.crs_transformer.rejection_bounds(self.bounds_wgs84);
+        if !is_point_in_bbox(lon, lat, Some(candidate)) {
+            return false;
+        }
+        let md = &self.reader.metadata;
+        let (w, h) = (md.width as f64, md.height as f64);
+        let Ok((x, y)) = self.crs_transformer.wgs84_to_source(lon, lat) else {
+            return false;
+        };
+        let inside = |x: f64, y: f64| {
+            md.geotransform
+                .coord_to_pixel(x, y)
+                .is_some_and(|(c, r)| (0.0..=w).contains(&c) && (0.0..=h).contains(&r))
+        };
+        // The inverse returns one longitude branch; a raster stored on an
+        // adjacent branch (e.g. 181..182 rather than -179..-178) is the same
+        // place one period away in source coordinates.
+        inside(x, y)
+            || self
+                .lon_period
+                .is_some_and(|(px, py)| inside(x + px, y + py) || inside(x - px, y - py))
+    }
+}
+
+/// The source-coordinate offset of 360 degrees of longitude when the CRS is
+/// cylindrical, i.e. source coordinates move by a constant vector per degree
+/// of longitude (geographic in any axis order, Web Mercator, ellipsoidal
+/// Mercator, equirectangular, cylindrical equal-area). Detected numerically
+/// with three probes 10 degrees apart near the tile, stepping toward the
+/// prime meridian; any non-linearity (conics, azimuthal projections, or a
+/// branch cut between probes) yields None.
+fn source_longitude_period(crs: &CrsTransformer, (lon, lat): (f64, f64)) -> Option<(f64, f64)> {
+    let base = crate::crs::transformer::wrap_lon(lon);
+    let step = if base > 0.0 { -10.0 } else { 10.0 };
+    let lat = lat.clamp(-60.0, 60.0);
+    let p = [0.0, 1.0, 2.0].map(|i| crs.wgs84_to_source(base + step * i, lat).ok());
+    let [Some(p0), Some(p1), Some(p2)] = p else {
+        return None;
+    };
+    let d1 = (p1.0 - p0.0, p1.1 - p0.1);
+    let d2 = (p2.0 - p1.0, p2.1 - p1.1);
+    let len = d1.0.hypot(d1.1);
+    if !(len.is_finite() && len > 0.0) || (d2.0 - d1.0).hypot(d2.1 - d1.1) > 1e-9 * len {
+        return None;
+    }
+    let k = 360.0 / step.abs();
+    Some((d1.0 * k, d1.1 * k))
+}
+
+/// Squared chord length between two WGS84 points on the unit sphere; a
+/// monotone, wrap-safe proxy for great-circle distance.
+fn sphere_chord_sq(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let unit = |(lon, lat): (f64, f64)| {
+        let (lon, lat) = (lon.to_radians(), lat.to_radians());
+        (lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin())
+    };
+    let (p, q) = (unit(a), unit(b));
+    (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2)
 }
 
 /// Global chunk reference across all tiles in a mosaic, sorted by latitude
@@ -408,8 +484,8 @@ impl MosaicReader {
 
             // If user specified bbox, skip tiles that don't intersect the bbox at all
             if let Some(ref b) = bbox {
-                let tb = &desc.bounds_wgs84;
-                if tb[2] < b[0] || tb[0] > b[2] || tb[3] < b[1] || tb[1] > b[3] {
+                let tb = desc.crs_transformer.rejection_bounds(desc.bounds_wgs84);
+                if !rect_intersects_bbox(&tb, b) {
                     continue;
                 }
             }
@@ -515,33 +591,17 @@ impl MosaicReader {
 
         match self.overlap_rule {
             OverlapRule::Average => true,
-            OverlapRule::First => {
-                for j in 0..tile_idx {
-                    let b = &self.tiles[j].bounds_wgs84;
-                    if lon >= b[0] && lon <= b[2] && lat >= b[1] && lat <= b[3] {
+            OverlapRule::First => !self.tiles[..tile_idx].iter().any(|t| t.contains(lon, lat)),
+            OverlapRule::Cutline => {
+                let own = sphere_chord_sq((lon, lat), self.tiles[tile_idx].centroid_wgs84);
+                // Ties go to the lower tile index.
+                !self.tiles.iter().enumerate().any(|(idx, t)| {
+                    if idx == tile_idx {
                         return false;
                     }
-                }
-                true
-            }
-            OverlapRule::Cutline => {
-                let mut best_tile = tile_idx;
-                let mut best_dist_sq = f64::INFINITY;
-
-                for (idx, tile) in self.tiles.iter().enumerate() {
-                    let b = &tile.bounds_wgs84;
-                    if lon >= b[0] && lon <= b[2] && lat >= b[1] && lat <= b[3] {
-                        let d_lon = lon - tile.centroid_wgs84.0;
-                        let d_lat = lat - tile.centroid_wgs84.1;
-                        let dist_sq = d_lon * d_lon + d_lat * d_lat;
-                        if dist_sq < best_dist_sq {
-                            best_dist_sq = dist_sq;
-                            best_tile = idx;
-                        }
-                    }
-                }
-
-                best_tile == tile_idx
+                    let d = sphere_chord_sq((lon, lat), t.centroid_wgs84);
+                    (d < own || (d == own && idx < tile_idx)) && t.contains(lon, lat)
+                })
             }
         }
     }

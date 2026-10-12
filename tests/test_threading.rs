@@ -16,16 +16,23 @@ fn drain_streamer_to_map(
     reader: GeoTiffStreamReader,
     config: &MultiResolutionConfig,
 ) -> HashMap<u64, H3Accumulator> {
-    let mut streamer = MultiScanHorizonStreamer::new(reader, config).unwrap();
+    drain_with_peak(MultiScanHorizonStreamer::new(reader, config).unwrap()).0
+}
+
+/// Drain every record, failing on any repeated cell (merging would hide
+/// duplicate emission), and report peak simultaneous kernel jobs.
+fn drain_with_peak(mut streamer: MultiScanHorizonStreamer) -> (HashMap<u64, H3Accumulator>, usize) {
     let mut map = HashMap::new();
     while !streamer.is_finished() {
         for record in streamer.fetch_next_batch(128).unwrap() {
-            map.entry(record.h3_index)
-                .and_modify(|acc: &mut H3Accumulator| acc.merge(&record.accumulator))
-                .or_insert(record.accumulator);
+            let cell = record.h3_index;
+            assert!(
+                map.insert(cell, record.accumulator).is_none(),
+                "cell {cell:x} emitted twice"
+            );
         }
     }
-    map
+    (map, streamer.metrics().peak_concurrent_jobs)
 }
 
 #[test]
@@ -238,5 +245,96 @@ fn test_prefetched_chunk_reader_multithreaded_pipeline() -> Result<()> {
     let _ = prefetcher_early.next_chunk();
     drop(prefetcher_early);
 
+    Ok(())
+}
+
+/// `ThreadPool::install` does not choose where kernel windows run: with the
+/// ambient default a Rayon caller runs them serially, while a dedicated
+/// `aggregation_workers` pool runs them concurrently from any caller.
+#[test]
+fn test_aggregation_workers_run_concurrently_inside_pool_install() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("agg_pool.tif");
+    helpers::create_temp_geotiff(&path, 512, 512, CompressionMethod::None)?;
+    let mut config = MultiResolutionConfig::new(vec![6, 8, 10]);
+    config.sampling = raster_h3::aggregator::sampling::SamplingPattern::rgss();
+    config.aggregation_budget_bytes = 1 << 30;
+
+    let reference = drain_streamer_to_map(GeoTiffStreamReader::open(&path)?, &config);
+    let caller = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+
+    let (ambient, ambient_peak) = caller.install(|| {
+        drain_with_peak(
+            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config)
+                .unwrap(),
+        )
+    });
+    assert_eq!(ambient_peak, 1, "ambient policy is serial on Rayon workers");
+
+    config.aggregation_workers = Some(4);
+    let (dedicated, dedicated_peak) = caller.install(|| {
+        drain_with_peak(
+            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config)
+                .unwrap(),
+        )
+    });
+    assert!(
+        dedicated_peak > 1,
+        "dedicated pool never ran jobs concurrently"
+    );
+    assert!(dedicated_peak <= 4);
+
+    for map in [ambient, dedicated] {
+        assert_eq!(map.len(), reference.len());
+        for (k, v) in &reference {
+            let o = &map[k];
+            assert_eq!(v.count, o.count);
+            assert!((v.sum - o.sum).abs() <= 1e-9 * v.sum.abs().max(1.0));
+            assert_eq!((v.min, v.max), (o.min, o.max));
+        }
+    }
+    Ok(())
+}
+
+/// Rayon workers that hold a shared streamer mutex while sibling tasks wait
+/// for it must not deadlock when the streamer uses a dedicated pool.
+#[test]
+fn test_dedicated_pool_under_shared_mutex_does_not_deadlock() -> Result<()> {
+    use rayon::prelude::*;
+    use std::sync::Mutex;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("agg_mutex.tif");
+    helpers::create_temp_geotiff(&path, 256, 256, CompressionMethod::None)?;
+    let mut config = MultiResolutionConfig::new(vec![7, 8]);
+    config.aggregation_workers = Some(3);
+    let streamer = Mutex::new(MultiScanHorizonStreamer::new(
+        GeoTiffStreamReader::open(&path)?,
+        &config,
+    )?);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let counts: Vec<f64> = pool.install(|| {
+        (0..8)
+            .into_par_iter()
+            .map(|_| {
+                let mut total = 0.0;
+                loop {
+                    let batch = streamer.lock().unwrap().fetch_next_batch(64).unwrap();
+                    if batch.is_empty() {
+                        return total;
+                    }
+                    total += batch.iter().map(|r| r.accumulator.count).sum::<f64>();
+                }
+            })
+            .collect()
+    });
+    assert_eq!(counts.iter().sum::<f64>(), 2.0 * 256.0 * 256.0);
     Ok(())
 }

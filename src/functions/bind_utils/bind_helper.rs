@@ -278,11 +278,26 @@ impl BindHelper {
             .or_else(|| self.get_named_string("crs"))
     }
 
-    /// Parse thread/worker limit (`workers` or `threads`)
-    pub fn parse_workers(&self) -> Option<usize> {
-        self.get_named_int("workers")
-            .or_else(|| self.get_named_int("threads"))
-            .and_then(|w| if w > 0 { Some(w as usize) } else { None })
+    /// Parse execution limits: `workers`/`threads` (aggregation),
+    /// `decode_workers` and `fetch_workers`. Non-positive values are errors.
+    pub fn parse_execution(&self) -> Option<ExecutionParams> {
+        let positive = |names: &[&str]| -> Result<Option<usize>, ()> {
+            for name in names {
+                if let Some(v) = self.get_named_int(name) {
+                    if v <= 0 {
+                        self.set_error(&format!("{} must be a positive integer", name));
+                        return Err(());
+                    }
+                    return Ok(Some(v as usize));
+                }
+            }
+            Ok(None)
+        };
+        Some(ExecutionParams {
+            aggregation_workers: positive(&["workers", "threads"]).ok()?,
+            decode_workers: positive(&["decode_workers"]).ok()?,
+            fetch_workers: positive(&["fetch_workers"]).ok()?,
+        })
     }
 
     /// Parse common raster parameters shared across continuous and categorical aggregations
@@ -318,6 +333,7 @@ impl BindHelper {
         let emit_geom = self
             .get_named_bool("geom")
             .unwrap_or_else(crate::ffi::is_geometry_available);
+        let execution = self.parse_execution()?;
 
         let resolved_paths = match crate::raster::mosaic::resolve_raster_sources(&file_path) {
             Ok(paths) => paths,
@@ -340,6 +356,7 @@ impl BindHelper {
             compact,
             overlap_rule,
             emit_geom,
+            execution,
         })
     }
 }
@@ -363,6 +380,33 @@ pub struct CommonRasterParams {
     pub compact: bool,
     pub overlap_rule: OverlapRule,
     pub emit_geom: bool,
+    pub execution: ExecutionParams,
+}
+
+/// SQL execution limits. Each `None` keeps the streamer default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionParams {
+    /// `workers` / `threads`: dedicated aggregation pool size.
+    pub aggregation_workers: Option<usize>,
+    /// `decode_workers`: chunk decoding threads.
+    pub decode_workers: Option<usize>,
+    /// `fetch_workers`: concurrent remote range requests.
+    pub fetch_workers: Option<usize>,
+}
+
+impl ExecutionParams {
+    /// Apply the requested limits to a streamer configuration.
+    pub fn apply(&self, config: &mut crate::aggregator::multi_horizon::MultiResolutionConfig) {
+        if self.aggregation_workers.is_some() {
+            config.aggregation_workers = self.aggregation_workers;
+        }
+        if let Some(n) = self.decode_workers {
+            config.decode_workers = n;
+        }
+        if let Some(n) = self.fetch_workers {
+            config.fetch_workers = n;
+        }
+    }
 }
 
 pub type CommonRasterBindParams = CommonRasterParams;
@@ -387,5 +431,34 @@ mod tests {
         let val = OwnedValue(std::ptr::null_mut());
         // Dropping null value must not panic or segfault
         drop(val);
+    }
+
+    #[test]
+    fn test_execution_params_override_streamer_defaults() {
+        use crate::aggregator::multi_horizon::MultiResolutionConfig;
+        let mut config = MultiResolutionConfig::new(vec![8]);
+        let defaults = (
+            config.aggregation_workers,
+            config.decode_workers,
+            config.fetch_workers,
+        );
+        ExecutionParams::default().apply(&mut config);
+        assert_eq!(
+            (
+                config.aggregation_workers,
+                config.decode_workers,
+                config.fetch_workers
+            ),
+            defaults
+        );
+        ExecutionParams {
+            aggregation_workers: Some(3),
+            decode_workers: Some(2),
+            fetch_workers: Some(5),
+        }
+        .apply(&mut config);
+        assert_eq!(config.aggregation_workers, Some(3));
+        assert_eq!(config.decode_workers, 2);
+        assert_eq!(config.fetch_workers, 5);
     }
 }

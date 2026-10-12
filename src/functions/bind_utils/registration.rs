@@ -57,4 +57,6 @@ pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_functio
     add_named_parameter(func, "overlap_rule", DuckDBType::Varchar);
     add_named_parameter(func, "workers", DuckDBType::BigInt);
     add_named_parameter(func, "threads", DuckDBType::BigInt);
+    add_named_parameter(func, "decode_workers", DuckDBType::BigInt);
+    add_named_parameter(func, "fetch_workers", DuckDBType::BigInt);
 }
