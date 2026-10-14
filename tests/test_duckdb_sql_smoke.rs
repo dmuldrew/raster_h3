@@ -1,6 +1,7 @@
 //! Real-engine SQL smoke test. Run after `cargo build --lib` with
 //! `cargo test --test test_duckdb_sql_smoke -- --ignored`.
 //! DUCKDB_BIN and RASTER_H3_LIBRARY optionally select the CLI and built library.
+//! CI runs it explicitly against the DuckDB CLI it downloads (see ci.yml).
 mod helpers;
 
 use std::path::Path;

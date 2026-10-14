@@ -130,6 +130,20 @@ jobs:
           $DUCKDB_BIN -unsigned -c "LOAD '$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
           echo "Smoke test passed successfully on ${{ matrix.platform }}!"
 
+      # Runs real export SQL through the CLI downloaded above. Uses the host-built
+      # library so it matches the CLI's platform (osx_amd64 cross-compiles on arm64).
+      - name: Run DuckDB SQL Smoke Test
+        if: matrix.cli_arch != ''
+        shell: bash
+        run: |
+          DUCKDB_BIN="$(pwd)/duckdb"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            DUCKDB_BIN="$(cygpath -w "$(pwd)/duckdb.exe")"
+          fi
+          export DUCKDB_BIN
+          cargo build --release --lib
+          cargo test --release --test test_duckdb_sql_smoke -- --ignored
+
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@v4
         with:
