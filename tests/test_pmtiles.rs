@@ -16,6 +16,8 @@ use tempfile::NamedTempFile;
 
 #[path = "helpers.rs"]
 mod helpers;
+#[path = "support/mvt.rs"]
+mod mvt_decode;
 use helpers::create_temp_geotiff;
 
 #[test]
@@ -843,4 +845,301 @@ fn test_pmtiles_writer_finish_with_bare_filename() {
 
     // Clean up
     let _ = fs::remove_file(bare_filename);
+}
+
+#[test]
+fn test_mvt_class_iii_pentagon_10_vertices_preserved() {
+    use h3o::CellIndex;
+    use raster_h3::pmtiles::pyramid::cell_boundary_mercator;
+
+    // Resolution 7 pentagon has 10 vertices due to Class III icosahedron face crossings
+    let pentagon_res7 = CellIndex::try_from(0x870800000ffffffu64).unwrap();
+    assert!(pentagon_res7.is_pentagon());
+    let (v_merc, v_count) = cell_boundary_mercator(pentagon_res7);
+    assert_eq!(v_count, 10);
+
+    let center: h3o::LatLng = pentagon_res7.into();
+    let (tx, ty) = raster_h3::pmtiles::tiler::lon_lat_to_tile_xy(center.lng(), center.lat(), 11);
+    let props = FeatureProperties::Continuous {
+        h3_index: pentagon_res7.into(),
+        resolution: 7,
+        mean: 10.0,
+        sum: 100.0,
+        stddev: 1.0,
+        count: 10.0,
+        min: 9.0,
+        max: 11.0,
+    };
+
+    let feat = raster_h3::pmtiles::mvt::MvtFeature::from_mercator(
+        pentagon_res7.into(),
+        &v_merc[..v_count],
+        11,
+        tx,
+        ty,
+        4096,
+        props,
+    );
+    assert_eq!(
+        feat.num_points, 10,
+        "Class III pentagon must retain all 10 vertices in MvtFeature"
+    );
+
+    let mut layer = MvtLayer::new("h3_hexagons");
+    layer.add_feature(feat);
+    let encoded = layer.encode();
+    let decoded = mvt_decode::decode(&encoded);
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].id, u64::from(pentagon_res7));
+    assert_eq!(decoded[0].rings.len(), 1);
+    assert_eq!(decoded[0].rings[0].len(), 10);
+}
+
+#[test]
+fn test_pmtiles_antimeridian_straddling_cell_tile_range_and_unwrap() {
+    use h3o::{LatLng, Resolution};
+    use raster_h3::pmtiles::mvt::{MercatorPoint, MvtFeature};
+    use raster_h3::pmtiles::pyramid::{cell_boundary_mercator, for_each_cell_tile_mercator};
+
+    let cell = LatLng::new(-18.0, 180.0).unwrap().to_cell(Resolution::Five);
+    let center: LatLng = cell.into();
+    let center_merc = MercatorPoint::from_lat_lng(center.lat(), center.lng());
+    let (v_merc, v_count) = cell_boundary_mercator(cell);
+    let vertices_merc = &v_merc[..v_count];
+
+    let z = 8u8;
+    let n = 1u32 << z; // 256 tiles across
+    let mut touched_tiles = Vec::new();
+    for_each_cell_tile_mercator(center_merc, vertices_merc, z, |tx, ty| {
+        touched_tiles.push((tx, ty));
+    });
+
+    // Must only touch tiles immediately adjacent to the antimeridian (tx == 0 or tx == 255),
+    // never all 256 tiles across the world!
+    assert!(
+        touched_tiles.len() <= 4,
+        "Antimeridian cell should touch at most 4 tiles at z=8, got {}",
+        touched_tiles.len()
+    );
+    assert!(touched_tiles.iter().any(|&(x, _)| x == 0));
+    assert!(touched_tiles.iter().any(|&(x, _)| x == n - 1));
+    assert_eq!(
+        touched_tiles
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        touched_tiles.len()
+    );
+    for &(tx, _ty) in &touched_tiles {
+        assert!(
+            tx == 0 || tx == n - 1,
+            "Unexpected tile x={tx} for antimeridian cell at z=8"
+        );
+    }
+
+    // Verify local MVT coordinates are continuous and not stretched across 256 * 4096 units
+    for &(tx, ty) in &touched_tiles {
+        let feat =
+            MvtFeature::from_mercator(cell.into(), vertices_merc, z, tx, ty, 4096, Vec::new());
+        let xs = &feat.polygon_x[..feat.num_points as usize];
+        let min_x = *xs.iter().min().unwrap();
+        let max_x = *xs.iter().max().unwrap();
+        assert!(
+            max_x - min_x < 4096,
+            "Tile (z={z}, tx={tx}) polygon x span {} should be < 4096",
+            max_x - min_x
+        );
+    }
+}
+
+#[test]
+fn test_pmtiles_coarse_zoom_parent_aggregates_all_children() {
+    use h3o::{CellIndex, LatLng, Resolution};
+    use raster_h3::aggregator::accumulator::H3Accumulator;
+    use raster_h3::aggregator::categorical::CategoricalAccumulator;
+    use raster_h3::aggregator::multi_horizon::{
+        MultiCategoricalRecord, MultiContinuousRecord, RecordStreamer,
+    };
+
+    struct VecStreamer<R> {
+        records: std::vec::IntoIter<R>,
+        resolutions: Vec<u8>,
+    }
+
+    impl<R> RecordStreamer for VecStreamer<R> {
+        type Record = R;
+        fn drain_completed_into<F>(
+            &mut self,
+            max_rows: usize,
+            mut consumer: F,
+        ) -> raster_h3::error::Result<usize>
+        where
+            F: FnMut(usize, Self::Record),
+        {
+            let mut n = 0;
+            while n < max_rows.min(2) {
+                let Some(rec) = self.records.next() else {
+                    break;
+                };
+                consumer(n, rec);
+                n += 1;
+            }
+            Ok(n)
+        }
+        fn current_lat_horizon(&self) -> f64 {
+            if self.is_finished() {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        }
+        fn is_finished(&self) -> bool {
+            self.records.len() == 0
+        }
+        fn resolution_u8s(&self) -> &[u8] {
+            &self.resolutions
+        }
+    }
+
+    // Take a Res 5 parent cell and all 7 of its Res 6 children
+    let parent = LatLng::new(37.7749, -122.4194)
+        .unwrap()
+        .to_cell(Resolution::Five);
+    let children: Vec<CellIndex> = parent.children(Resolution::Six).collect();
+    assert_eq!(children.len(), 7);
+
+    // 1. Continuous: give each child a distinct value (10, 20, ..., 70) with count = 2.0
+    // Total count = 14.0, total sum = 560.0, mean = 40.0, min = 10.0, max = 70.0
+    let cont_records: Vec<MultiContinuousRecord> = children
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let val = ((i + 1) * 10) as f64;
+            MultiContinuousRecord {
+                resolution: 6,
+                h3_index: c.into(),
+                accumulator: H3Accumulator::new_weighted(val, 2.0),
+            }
+        })
+        .collect();
+
+    let cont_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let cont_path = cont_tmp.to_str().unwrap().to_string();
+    let count = H3PmtilesTiler::generate_from_continuous_streamer(
+        VecStreamer {
+            records: cont_records.into_iter(),
+            resolutions: vec![6],
+        },
+        &cont_path,
+    )
+    .unwrap();
+    assert_eq!(count, 7);
+
+    // Read the first tile in the archive (zoom 0, tile_id 0, right at tile_data_offset)
+    let mut full = Vec::new();
+    File::open(&cont_path)
+        .unwrap()
+        .read_to_end(&mut full)
+        .unwrap();
+    let tile_data_offset = u64::from_le_bytes(full[56..64].try_into().unwrap()) as usize;
+    let mut gz = GzDecoder::new(&full[tile_data_offset..]);
+    let mut mvt_z0 = Vec::new();
+    gz.read_to_end(&mut mvt_z0).unwrap();
+
+    let decoded = mvt_decode::decode(&mvt_z0);
+    let expected_parent = parent.parent(Resolution::Zero).unwrap();
+    assert_eq!(decoded.len(), 1, "one complete parent, without duplicates");
+    let feature = &decoded[0];
+    assert_eq!(feature.id, u64::from(expected_parent));
+    for (key, expected) in [
+        ("sum", 560.0),
+        ("mean", 40.0),
+        ("count", 14.0),
+        ("min", 10.0),
+        ("max", 70.0),
+    ] {
+        assert_eq!(feature.properties[key], MvtValue::Double(expected), "{key}");
+    }
+    let MvtValue::Double(stddev) = feature.properties["stddev"] else {
+        panic!("stddev must be a double")
+    };
+    assert!((stddev - (5600.0_f64 / 13.0).sqrt()).abs() < 1e-10);
+
+    // 2. Categorical: child 0 has class 1 (count 1), children 1..7 have class 2 (count 10 each -> 60 total)
+    // If only child 0 were used, majority would be 1 and count would be 1.0; merged parent has majority 2 and count 61.0!
+    let cat_records: Vec<MultiCategoricalRecord> = children
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let mut acc = CategoricalAccumulator::new();
+            if i == 0 {
+                acc.update_weighted(1, 1.0);
+            } else {
+                acc.update_weighted(2, 10.0);
+            }
+            MultiCategoricalRecord {
+                resolution: 6,
+                h3_index: c.into(),
+                accumulator: acc,
+            }
+        })
+        .collect();
+
+    let cat_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let cat_path = cat_tmp.to_str().unwrap().to_string();
+    H3PmtilesTiler::generate_from_categorical_streamer(
+        VecStreamer {
+            records: cat_records.into_iter(),
+            resolutions: vec![6],
+        },
+        &cat_path,
+    )
+    .unwrap();
+
+    let mut cat_full = Vec::new();
+    File::open(&cat_path)
+        .unwrap()
+        .read_to_end(&mut cat_full)
+        .unwrap();
+    let cat_tile_offset = u64::from_le_bytes(cat_full[56..64].try_into().unwrap()) as usize;
+    let mut cat_gz = GzDecoder::new(&cat_full[cat_tile_offset..]);
+    let mut cat_mvt_z0 = Vec::new();
+    cat_gz.read_to_end(&mut cat_mvt_z0).unwrap();
+    let decoded = mvt_decode::decode(&cat_mvt_z0);
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].id, u64::from(expected_parent));
+    let props = &decoded[0].properties;
+    assert_eq!(props["count"], MvtValue::Double(61.0));
+    assert_eq!(props["majority"], MvtValue::Int(2));
+    assert_eq!(props["majority_fraction"], MvtValue::Double(60.0 / 61.0));
+}
+
+#[test]
+fn world_tile_encodes_both_antimeridian_pieces_in_one_feature() {
+    use raster_h3::pmtiles::pyramid::cell_boundary_mercator;
+    for lat in [-18.0, 52.0] {
+        let cell = h3o::LatLng::new(lat, 180.0)
+            .unwrap()
+            .to_cell(h3o::Resolution::Zero);
+        let (vertices, count) = cell_boundary_mercator(cell);
+        let mut layer = MvtLayer::new("h3_hexagons");
+        layer.add_hexagon_mercator(u64::from(cell), &vertices[..count], 0, 0, 0, Vec::new());
+        let decoded = mvt_decode::decode(&layer.encode());
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].id, u64::from(cell));
+        let rings = &decoded[0].rings;
+        assert_eq!(rings.len(), 2);
+        assert_eq!(rings[0].len(), count);
+        assert_eq!(rings[1].len(), count);
+        let crosses = |ring: &Vec<(i32, i32)>, edge: i32| {
+            ring.iter().any(|p| p.0 < edge) && ring.iter().any(|p| p.0 > edge)
+        };
+        assert!(rings.iter().any(|r| crosses(r, 0)));
+        assert!(rings.iter().any(|r| crosses(r, 4096)));
+        let shift = rings[1][0].0 - rings[0][0].0;
+        assert_eq!(shift.abs(), 4096);
+        for (a, b) in rings[0].iter().zip(&rings[1]) {
+            assert_eq!((b.0 - a.0, b.1 - a.1), (shift, 0));
+        }
+    }
 }

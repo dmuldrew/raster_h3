@@ -14,9 +14,11 @@ use crate::ffi::duckdb_c::*;
 use crate::ffi::{ffi_bind_guard, ffi_init_guard, ffi_scan_guard, to_c_string};
 use crate::functions::bind_utils::lifecycle::set_table_function_init_data;
 use crate::functions::bind_utils::{
-    add_named_parameter, add_positional_parameter, delete_boxed, BindHelper, ChunkWriter,
+    add_named_parameter, add_positional_parameter, delete_boxed,
+    register_common_raster_named_parameters, BindHelper, ChunkWriter, ExecutionParams,
 };
 use crate::pmtiles::tiler::{h3_res_to_zoom, H3PmtilesTiler};
+use crate::raster::mosaic::OverlapRule;
 
 /// Bind data parsed during SQL query planning
 pub struct PmtilesBindData {
@@ -24,10 +26,14 @@ pub struct PmtilesBindData {
     pub output_pmtiles: String,
     pub resolutions: Vec<u8>,
     pub band: usize,
+    pub source_crs: Option<String>,
     pub custom_nodata: Option<f64>,
     pub sampling: SamplingPattern,
+    pub overlap_rule: OverlapRule,
+    pub bbox: Option<[f64; 4]>,
     pub is_categorical: bool,
     pub properties: Option<String>,
+    pub execution: ExecutionParams,
 }
 
 /// Global execution state for the single-row generator
@@ -82,10 +88,16 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
 
         let resolutions = bind.parse_resolutions(8, None);
         let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
+        let source_crs = bind.parse_source_crs();
         let custom_nodata = bind.get_named_double("nodata");
         let sampling = bind.parse_sampling();
+        let overlap_rule = bind.parse_overlap_rule();
+        let bbox = bind.parse_bbox();
         let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
         let properties = bind.get_named_string("properties");
+        let Some(execution) = bind.parse_execution() else {
+            return;
+        };
 
         add_pmtiles_summary_columns(&bind);
 
@@ -94,10 +106,14 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
             output_pmtiles,
             resolutions,
             band,
+            source_crs,
             custom_nodata,
             sampling,
+            overlap_rule,
+            bbox,
             is_categorical,
             properties,
+            execution,
         });
         duckdb_bind_set_bind_data(
             info,
@@ -139,9 +155,13 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
 
         let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
         config.band = bind_data.band;
+        config.custom_crs = bind_data.source_crs.clone();
         config.custom_nodata = bind_data.custom_nodata;
         config.sampling = bind_data.sampling.clone();
+        config.overlap_rule = bind_data.overlap_rule;
+        config.bbox = bind_data.bbox;
         config.properties = bind_data.properties.clone();
+        bind_data.execution.apply(&mut config);
 
         let start = Instant::now();
         let result = if bind_data.is_categorical {
@@ -346,13 +366,7 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
     add_positional_parameter(tf, DuckDBType::Varchar);
 
     // Named parameters:
-    add_named_parameter(tf, "resolution", DuckDBType::BigInt);
-    add_named_parameter(tf, "resolutions", DuckDBType::Varchar);
-    add_named_parameter(tf, "min_resolution", DuckDBType::BigInt);
-    add_named_parameter(tf, "max_resolution", DuckDBType::BigInt);
-    add_named_parameter(tf, "sampling", DuckDBType::Varchar);
-    add_named_parameter(tf, "band", DuckDBType::BigInt);
-    add_named_parameter(tf, "nodata", DuckDBType::Double);
+    register_common_raster_named_parameters(tf);
     add_named_parameter(tf, "categorical", DuckDBType::Boolean);
     add_named_parameter(tf, "properties", DuckDBType::Varchar);
 

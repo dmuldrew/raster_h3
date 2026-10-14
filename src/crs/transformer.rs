@@ -887,6 +887,28 @@ impl CrsTransformer {
                 let apex_x = albers.x_0;
                 let apex_y = albers.y_0 + albers.rho0;
 
+                // If the cone apex lies inside the pixel rectangle's bounding box,
+                // the chunk contains the pole (North Pole for n >= 0, South Pole for n < 0).
+                let min_x = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                let max_x = corners
+                    .iter()
+                    .map(|p| p.0)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let min_y = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                let max_y = corners
+                    .iter()
+                    .map(|p| p.1)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if apex_x >= min_x && apex_x <= max_x && apex_y >= min_y && apex_y <= max_y {
+                    if albers.n >= 0.0 {
+                        max_lat = 90.0;
+                    } else {
+                        min_lat = -90.0;
+                    }
+                    min_lon = -180.0;
+                    max_lon = 180.0;
+                }
+
                 let edges = [(p0, p1), (p1, p2), (p2, p3), (p3, p0)];
                 for ((x1, y1), (x2, y2)) in edges {
                     let dx = x2 - x1;

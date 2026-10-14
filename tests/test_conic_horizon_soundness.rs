@@ -283,3 +283,91 @@ fn test_max_hex_radius_headroom_all_resolutions() {
         "Span must be safely bounded by updated radius 0.28°"
     );
 }
+
+#[test]
+fn test_albers_interior_apex_and_southern_hemisphere_bounds() {
+    use raster_h3::crs::transformer::AlbersConicFast;
+
+    // 1. Northern hemisphere Albers (EPSG:5070, n > 0) chunk containing the cone apex (North Pole)
+    let albers_north = AlbersConicFast::epsg_5070();
+    let tf_north = CrsTransformer::AlbersConic(albers_north);
+    let gt_apex_n = GeoTransform {
+        c0: albers_north.x_0 - 500_000.0,
+        a: 10_000.0,
+        b: 0.0,
+        f0: albers_north.y_0 + albers_north.rho0 + 500_000.0,
+        d: 0.0,
+        e: -10_000.0,
+    };
+    let bounds_n = tf_north.transform_rect_bounds(&gt_apex_n, 0.0, 0.0, 100.0, 100.0);
+    assert_eq!(
+        bounds_n[3], 90.0,
+        "Northern Albers chunk containing cone apex must report max_lat = 90.0"
+    );
+    assert_eq!((bounds_n[0], bounds_n[2]), (-180.0, 180.0));
+
+    // 2. Southern hemisphere Albers (Australia Albers EPSG:3577: lat_1=-18, lat_2=-36, lat_0=0, lon_0=132, n < 0)
+    let proj_aus = "+proj=aea +lat_1=-18 +lat_2=-36 +lat_0=0 +lon_0=132 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs";
+    let tf_south = CrsTransformer::from_proj_string(proj_aus).unwrap();
+    let albers_south = match tf_south {
+        CrsTransformer::AlbersConic(a) => a,
+        _ => panic!("Expected AlbersConic fast path for Australia Albers"),
+    };
+    assert!(
+        albers_south.n < 0.0,
+        "Southern Albers must have negative cone constant n"
+    );
+
+    // Chunk containing the southern cone apex (South Pole)
+    let gt_apex_s = GeoTransform {
+        c0: albers_south.x_0 - 500_000.0,
+        a: 10_000.0,
+        b: 0.0,
+        f0: albers_south.y_0 + albers_south.rho0 + 500_000.0,
+        d: 0.0,
+        e: -10_000.0,
+    };
+    let bounds_s = tf_south.transform_rect_bounds(&gt_apex_s, 0.0, 0.0, 100.0, 100.0);
+    assert_eq!(
+        bounds_s[1], -90.0,
+        "Southern Albers chunk containing cone apex must report min_lat = -90.0"
+    );
+    assert_eq!((bounds_s[0], bounds_s[2]), (-180.0, 180.0));
+
+    // 3. Stream a southern-hemisphere Albers raster straddling its central meridian (132°E)
+    let temp_dir = TempDir::new().unwrap();
+    let tif_path = temp_dir.path().join("aus_albers.tif");
+    create_albers_conus_geotiff(
+        &tif_path,
+        200,
+        8,
+        -500_000.0,
+        -2_500_000.0,
+        5_000.0,
+        5_000.0,
+        5.0,
+    );
+
+    let reader = GeoTiffStreamReader::open(&tif_path).unwrap();
+    let mut config = MultiResolutionConfig::new(vec![5]);
+    config.custom_crs = Some(proj_aus.to_string());
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+
+    let mut seen = HashSet::new();
+    let mut total_count = 0.0;
+    while !streamer.is_finished() {
+        let batch = streamer.fetch_next_batch(64).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            assert!(
+                seen.insert(rec.h3_index),
+                "Duplicate cell in southern Albers stream: {:x}",
+                rec.h3_index
+            );
+            total_count += rec.accumulator.count;
+        }
+    }
+    assert!((total_count - 1600.0).abs() < 1e-6);
+}

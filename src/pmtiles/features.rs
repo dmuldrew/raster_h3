@@ -8,7 +8,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::pmtiles::mvt::{MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter};
-use crate::pmtiles::pyramid::{cell_tile_range_mercator, tile_xy_to_bbox};
+use crate::pmtiles::pyramid::{for_each_cell_tile_mercator, tile_xy_to_bbox};
 use crate::pmtiles::writer::PmtilesWriter;
 
 /// Per-resolution statistics accumulator for multi-resolution pyramids
@@ -290,26 +290,20 @@ impl TilePyramidAccumulator {
         center_merc: MercatorPoint,
         vertices_merc: &[MercatorPoint],
         zoom: u8,
-        mut properties: Vec<(Cow<'static, str>, MvtValue)>,
+        properties: Vec<(Cow<'static, str>, MvtValue)>,
     ) {
-        let (min_tx, max_tx, min_ty, max_ty) =
-            cell_tile_range_mercator(center_merc, vertices_merc, zoom);
-        if min_tx == max_tx && min_ty == max_ty {
-            let layer = self.get_or_create_layer((zoom, min_tx, min_ty));
-            layer.add_hexagon_mercator(h3_u64, vertices_merc, zoom, min_tx, min_ty, properties);
-        } else {
-            for tx in min_tx..=max_tx {
-                for ty in min_ty..=max_ty {
-                    let is_last = tx == max_tx && ty == max_ty;
-                    let props = if is_last {
-                        std::mem::take(&mut properties)
-                    } else {
-                        properties.clone()
-                    };
-                    let layer = self.get_or_create_layer((zoom, tx, ty));
-                    layer.add_hexagon_mercator(h3_u64, vertices_merc, zoom, tx, ty, props);
-                }
+        // Delay one tile so the final insertion can take ownership of properties.
+        // This keeps the common single-tile path allocation- and clone-free.
+        let mut last_tile = None;
+        for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
+            if let Some((px, py)) = last_tile.replace((tx, ty)) {
+                self.get_or_create_layer((zoom, px, py))
+                    .add_hexagon_mercator(h3_u64, vertices_merc, zoom, px, py, properties.clone());
             }
+        });
+        if let Some((tx, ty)) = last_tile {
+            self.get_or_create_layer((zoom, tx, ty))
+                .add_hexagon_mercator(h3_u64, vertices_merc, zoom, tx, ty, properties);
         }
     }
 

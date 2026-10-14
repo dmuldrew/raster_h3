@@ -13,6 +13,86 @@ use crate::raster::mosaic::OverlapRule;
 
 use super::parsing::{parse_bbox_str, parse_resolutions_str};
 
+/// Conservative WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]` for an H3 cell.
+/// Accounts for high-latitude longitudinal widening, polar containment, and antimeridian
+/// crossing (`min_lon > max_lon`), so `is_point_in_bbox` and `rect_intersects_bbox` never
+/// clip valid samples belonging to `cell`.
+pub fn cell_wgs84_bbox(cell: h3o::CellIndex) -> [f64; 4] {
+    let res = cell.resolution();
+    let is_north_pole = cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(res);
+    let is_south_pole = cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
+    let boundary = cell.boundary();
+    let n = boundary.len();
+    if n == 0 {
+        return [-180.0, -90.0, 180.0, 90.0];
+    }
+
+    let south_lat = crate::aggregator::horizon_streamer::compute_cell_south_lat(cell.into());
+    // By symmetry, great-circle edges in the northern hemisphere can bulge northward by at most
+    // (|delta_lat| + |delta_lon|) / 2 relative to their endpoints.
+    let mut north_lat = if is_north_pole { 90.0 } else { -90.0_f64 };
+    if !is_north_pole {
+        for i in 0..n {
+            let p = boundary[i];
+            let q = boundary[(i + 1) % n];
+            let mut edge_north = p.lat().max(q.lat()).next_up();
+            if p.lat() >= 0.0 || q.lat() >= 0.0 {
+                let direct = (p.lng() - q.lng()).abs();
+                let delta_lon = direct.min(360.0 - direct);
+                let delta_lat = (p.lat() - q.lat()).abs();
+                edge_north = (edge_north + 0.5 * (delta_lat + delta_lon)).next_up();
+            }
+            north_lat = north_lat.max(edge_north);
+        }
+        north_lat = north_lat.min(90.0);
+    }
+
+    if is_north_pole || is_south_pole || north_lat >= 89.5 || south_lat <= -89.5 {
+        return [-180.0, south_lat, 180.0, north_lat];
+    }
+
+    // Unwrap boundary vertex longitudes around vertex 0 so antimeridian-crossing
+    // cells form a tight continuous interval instead of [-180, 180].
+    let mut lngs = [0.0f64; 10];
+    lngs[0] = boundary[0].lng();
+    let mut min_u = lngs[0];
+    let mut max_u = lngs[0];
+    for i in 1..n {
+        let mut lng = boundary[i].lng();
+        while lng - lngs[i - 1] > 180.0 {
+            lng -= 360.0;
+        }
+        while lng - lngs[i - 1] < -180.0 {
+            lng += 360.0;
+        }
+        lngs[i] = lng;
+        min_u = min_u.min(lng);
+        max_u = max_u.max(lng);
+    }
+
+    // Pad longitude by a small geodesic safety margin scaled by sec(lat).
+    let max_abs_lat = south_lat.abs().max(north_lat.abs()).min(89.0);
+    let r = crate::pmtiles::tiler::max_hex_radius_deg(res.into());
+    let pad_lon = (r * 0.25 / max_abs_lat.to_radians().cos()).max(1e-5);
+    let lo = min_u - pad_lon;
+    let hi = max_u + pad_lon;
+    if hi - lo >= 360.0 {
+        return [-180.0, south_lat, 180.0, north_lat];
+    }
+
+    let wrap = crate::crs::transformer::wrap_lon;
+    // If [lo, hi] stays within [-180, 180], return non-crossing bounds;
+    // if it crosses ±180, wrap both endpoints so min_lon > max_lon, which
+    // `is_point_in_bbox` and `rect_intersects_bbox` treat as an antimeridian bbox.
+    let (min_lon, max_lon) = if lo >= -180.0 && hi <= 180.0 {
+        (lo, hi)
+    } else {
+        (wrap(lo), wrap(hi))
+    };
+
+    [min_lon, south_lat, max_lon, north_lat]
+}
+
 /// RAII guard ensuring DuckDB allocated value handle is destroyed
 pub struct OwnedValue(pub duckdb_value);
 
@@ -236,18 +316,14 @@ impl BindHelper {
             .or_else(|| self.get_named_int("h3_cell").map(|v| v as u64))
         {
             if let Ok(cell) = h3o::CellIndex::try_from(cell_u64) {
-                let ll: h3o::LatLng = cell.into();
-                let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
-                return Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
+                return Some(cell_wgs84_bbox(cell));
             }
         }
 
         // 4. H3 hex string
         if let Some(hex_str) = self.get_named_string("h3_hex") {
             if let Ok(cell) = hex_str.trim().parse::<h3o::CellIndex>() {
-                let ll: h3o::LatLng = cell.into();
-                let r = crate::pmtiles::tiler::max_hex_radius_deg(cell.resolution().into());
-                return Some([ll.lng() - r, ll.lat() - r, ll.lng() + r, ll.lat() + r]);
+                return Some(cell_wgs84_bbox(cell));
             }
         }
 
