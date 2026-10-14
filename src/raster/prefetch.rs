@@ -237,6 +237,155 @@ impl<T> OrderedPrefetchQueue<T> {
     }
 }
 
+/// Allocated bytes of a decoded chunk buffer.
+pub fn decoded_buffer_bytes(buf: &DecodingResult) -> usize {
+    fn cap<T>(v: &Vec<T>) -> usize {
+        v.capacity() * std::mem::size_of::<T>()
+    }
+    match buf {
+        DecodingResult::U8(v) => cap(v),
+        DecodingResult::U16(v) => cap(v),
+        DecodingResult::U32(v) => cap(v),
+        DecodingResult::U64(v) => cap(v),
+        DecodingResult::I8(v) => cap(v),
+        DecodingResult::I16(v) => cap(v),
+        DecodingResult::I32(v) => cap(v),
+        DecodingResult::I64(v) => cap(v),
+        DecodingResult::F32(v) => cap(v),
+        DecodingResult::F64(v) => cap(v),
+    }
+}
+
+struct BudgetState {
+    used: usize,
+    peak: usize,
+    /// Next job allowed to reserve. Grants follow job order, so the job the
+    /// ordered queue is waiting for never waits behind later jobs.
+    next_job: usize,
+    closed: bool,
+    idle: Vec<DecodingResult>,
+}
+
+/// Byte budget for decoded chunk buffers: those being decoded, waiting in
+/// the ordered queue, held by the consumer, and idle for reuse.
+///
+/// A worker reserves its chunk's expected size before decoding, in job
+/// order, then settles to the buffer's actual allocation. The consumer must
+/// return every delivered buffer through [`DecodeBudget::recycle`]; idle
+/// buffers stay charged until reused or evicted for a waiting reservation.
+/// A chunk larger than the whole budget is admitted only when no other
+/// decoded buffer is outstanding.
+pub struct DecodeBudget {
+    limit: usize,
+    idle_capacity: usize,
+    state: Mutex<BudgetState>,
+    changed: Condvar,
+}
+
+impl DecodeBudget {
+    pub fn new(limit: usize, idle_capacity: usize) -> Self {
+        Self {
+            limit,
+            idle_capacity,
+            state: Mutex::new(BudgetState {
+                used: 0,
+                peak: 0,
+                next_job: 0,
+                closed: false,
+                idle: Vec::new(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BudgetState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reserve `need` bytes for `job_id`, blocking until it is that job's turn
+    /// and the bytes fit. Returns an idle buffer to decode into, if any, and
+    /// the bytes charged. `None` once closed.
+    pub fn acquire(&self, job_id: usize, need: usize) -> Option<(Option<DecodingResult>, usize)> {
+        let mut state = self.lock();
+        while state.next_job != job_id && !state.closed {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        let buffer = state.idle.pop();
+        let credit = buffer.as_ref().map_or(0, decoded_buffer_bytes);
+        let extra = need.saturating_sub(credit);
+        loop {
+            if state.closed {
+                state.used -= credit;
+                return None;
+            }
+            let others = state.used - credit;
+            if state.used.saturating_add(extra) <= self.limit || others == 0 {
+                break;
+            }
+            match state.idle.pop() {
+                Some(evicted) => state.used -= decoded_buffer_bytes(&evicted),
+                None => state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+        state.used += extra;
+        state.peak = state.peak.max(state.used);
+        state.next_job += 1;
+        self.changed.notify_all();
+        Some((buffer, credit + extra))
+    }
+
+    /// Replace a reservation of `charged` bytes with the decoded buffer's
+    /// actual allocation (`0` when decoding produced no buffer).
+    pub fn settle(&self, charged: usize, actual: usize) {
+        let mut state = self.lock();
+        state.used = state.used - charged + actual;
+        state.peak = state.peak.max(state.used);
+        if actual < charged {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Return a delivered buffer: keep it idle for reuse, or free it.
+    pub fn recycle(&self, buffer: DecodingResult) {
+        let bytes = decoded_buffer_bytes(&buffer);
+        let mut state = self.lock();
+        if state.closed || state.idle.len() >= self.idle_capacity {
+            state.used -= bytes;
+            drop(state);
+            drop(buffer);
+        } else {
+            state.idle.push(buffer);
+        }
+        // Waiters may now proceed or evict the idle buffer.
+        self.changed.notify_all();
+    }
+
+    /// Wake and refuse all waiting and future reservations.
+    pub fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        let idle = std::mem::take(&mut state.idle);
+        state.used -= idle.iter().map(decoded_buffer_bytes).sum::<usize>();
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Bytes currently charged.
+    pub fn used_bytes(&self) -> usize {
+        self.lock().used
+    }
+
+    /// Highest charge observed.
+    pub fn peak_bytes(&self) -> usize {
+        self.lock().peak
+    }
+
+    /// Configured limit in bytes.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
 /// Bounded lock-free buffer pool for reusable chunk decoding buffers.
 /// Uses `crossbeam_deque::Injector` with retry-on-contention stealing
 /// and an atomic count to cap maximum idle buffer retention.
@@ -497,10 +646,14 @@ impl PrefetchedChunkReader {
 }
 
 /// Multi-file mosaic prefetcher providing globally latitude-interleaved chunk decoding
-/// with lock-free buffer pooling and single-hop bounded in-order queueing.
+/// with byte-budgeted buffer reuse and single-hop bounded in-order queueing.
+///
+/// Every buffer delivered through the queue must be returned with
+/// [`PrefetchedMosaicReader::recycle_batch`]; with a finite decode budget an
+/// unreturned buffer stays charged until the reader is dropped.
 pub struct PrefetchedMosaicReader {
     queue: Arc<OrderedPrefetchQueue<MosaicPrefetchItem>>,
-    buffer_pool: Arc<DecodingBufferPool>,
+    budget: Arc<DecodeBudget>,
     _remote_queue: Option<Arc<RemoteChunkPrefetchQueue>>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
@@ -508,6 +661,7 @@ pub struct PrefetchedMosaicReader {
 impl Drop for PrefetchedMosaicReader {
     fn drop(&mut self) {
         self.queue.close();
+        self.budget.close();
         if let Some(ref rq) = self._remote_queue {
             rq.cancel();
         }
@@ -554,6 +708,24 @@ impl PrefetchedMosaicReader {
         num_workers: usize,
         fetch_workers: usize,
     ) -> Self {
+        Self::spawn_with_budget(
+            mosaic,
+            buffer_capacity,
+            num_workers,
+            fetch_workers,
+            usize::MAX,
+        )
+    }
+
+    /// Spawn with explicit worker counts and a byte budget covering every
+    /// decoded buffer this reader owns or has delivered and not yet recycled.
+    pub fn spawn_with_budget(
+        mosaic: Arc<MosaicReader>,
+        buffer_capacity: usize,
+        num_workers: usize,
+        fetch_workers: usize,
+        decode_budget_bytes: usize,
+    ) -> Self {
         let remote_config = crate::raster::remote_prefetch::RemotePrefetchConfig {
             num_workers: fetch_workers,
             ..Default::default()
@@ -565,12 +737,15 @@ impl PrefetchedMosaicReader {
             buffer_capacity.max(16),
             total_jobs,
         ));
-        let buffer_pool = Arc::new(DecodingBufferPool::new(buffer_capacity.max(16)));
+        let budget = Arc::new(DecodeBudget::new(
+            decode_budget_bytes,
+            buffer_capacity.max(16),
+        ));
 
         if total_jobs == 0 {
             return Self {
                 queue,
-                buffer_pool,
+                budget,
                 _remote_queue: remote_queue,
                 _worker_handles: Vec::new(),
             };
@@ -584,13 +759,15 @@ impl PrefetchedMosaicReader {
             let worker_mosaic = Arc::clone(&mosaic);
             let worker_job_idx = Arc::clone(&next_job_idx);
             let worker_queue = Arc::clone(&queue);
-            let worker_buffer_pool = Arc::clone(&buffer_pool);
+            let worker_budget = Arc::clone(&budget);
             let worker_remote_queue = remote_queue.clone();
 
             let handle = thread::spawn(move || {
                 let q = Arc::clone(&worker_queue);
+                let b = Arc::clone(&worker_budget);
                 let _panic_guard = WorkerPanicGuard {
                     on_panic: Some(move || {
+                        b.close();
                         q.fail(Err(RasterH3Error::InvalidParameter(
                             "Mosaic decode worker panicked during chunk decompression".to_string(),
                         )));
@@ -614,10 +791,18 @@ impl PrefetchedMosaicReader {
                         let chunk_idx = chunk_ref.chunk_idx;
                         let has_overlap = chunk_ref.has_overlap;
 
+                        let reader = &worker_mosaic.tiles[tile_idx].reader;
+                        let Some((recycled_buf, charged)) =
+                            worker_budget.acquire(job_id, reader.decoded_chunk_bytes())
+                        else {
+                            break;
+                        };
                         if decoders[tile_idx].is_none() {
-                            match worker_mosaic.tiles[tile_idx].reader.open_decoder() {
+                            match reader.open_decoder() {
                                 Ok(d) => decoders[tile_idx] = Some(d),
                                 Err(e) => {
+                                    worker_budget.settle(charged, 0);
+                                    worker_budget.close();
                                     worker_queue.fail(Err(e));
                                     return;
                                 }
@@ -625,7 +810,6 @@ impl PrefetchedMosaicReader {
                         }
                         let decoder = decoders[tile_idx].as_mut().unwrap();
 
-                        let recycled_buf = worker_buffer_pool.pop();
                         let prefetched_bytes = worker_remote_queue
                             .as_ref()
                             .map(|q| q.get_chunk_payload(tile_idx, chunk_idx))
@@ -641,8 +825,13 @@ impl PrefetchedMosaicReader {
                                 )
                             })
                             .map(|(bounds, data)| (tile_idx, chunk_idx, bounds, data, has_overlap));
+                        let actual = item
+                            .as_ref()
+                            .map_or(0, |(_, _, _, data, _)| decoded_buffer_bytes(data));
+                        worker_budget.settle(charged, actual);
 
                         if !worker_queue.push(job_id, item) {
+                            worker_budget.settle(actual, 0);
                             break;
                         }
                     }
@@ -650,6 +839,7 @@ impl PrefetchedMosaicReader {
 
                 if let Err(payload) = res {
                     let msg = crate::ffi::panic_payload_to_string(payload);
+                    worker_budget.close();
                     worker_queue.fail(Err(RasterH3Error::InvalidParameter(format!(
                         "Mosaic decode worker panicked during chunk decompression: {msg}"
                     ))));
@@ -660,17 +850,28 @@ impl PrefetchedMosaicReader {
 
         Self {
             queue,
-            buffer_pool,
+            budget,
             _remote_queue: remote_queue,
             _worker_handles: handles,
         }
     }
 
-    /// Return processed decoding buffers back to worker pool for zero-allocation reuse
+    /// Return processed decoding buffers for reuse, releasing their budget
+    /// charge when the idle pool is full.
     pub fn recycle_batch(&self, buffers: impl IntoIterator<Item = DecodingResult>) {
         for buf in buffers {
-            self.buffer_pool.push(buf);
+            self.budget.recycle(buf);
         }
+    }
+
+    /// Highest decoded-buffer bytes charged at once, including idle buffers.
+    pub fn peak_decoded_bytes(&self) -> usize {
+        self.budget.peak_bytes()
+    }
+
+    /// Decoded-buffer bytes currently charged, including idle buffers.
+    pub fn decoded_bytes_in_use(&self) -> usize {
+        self.budget.used_bytes()
     }
 
     /// Pull next prefetched chunk
@@ -699,6 +900,102 @@ impl PrefetchedMosaicReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_buffer(len: usize) -> DecodingResult {
+        DecodingResult::F32(vec![0.0; len])
+    }
+
+    #[test]
+    fn decode_budget_blocks_until_recycle_and_grants_in_job_order() {
+        let budget = Arc::new(DecodeBudget::new(100, 16));
+        let (_, charged0) = budget.acquire(0, 60).unwrap();
+        budget.settle(charged0, 60);
+
+        // Job 2 cannot overtake job 1, and job 1 does not fit yet.
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let spawn = |job: usize| {
+            let (budget, order) = (Arc::clone(&budget), Arc::clone(&order));
+            thread::spawn(move || {
+                let (_, charged) = budget.acquire(job, 60).unwrap();
+                order.lock().unwrap().push(job);
+                charged
+            })
+        };
+        let second = spawn(2);
+        let first = spawn(1);
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(order.lock().unwrap().is_empty());
+        assert_eq!(budget.used_bytes(), 60);
+
+        // Returning job 0's buffer frees room for job 1 only.
+        budget.settle(60, 0);
+        let charged1 = first.join().unwrap();
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(*order.lock().unwrap(), vec![1]);
+        budget.settle(charged1, 0);
+        second.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        assert!(budget.peak_bytes() <= 100);
+    }
+
+    #[test]
+    fn decode_budget_admits_oversized_chunk_alone() {
+        let budget = DecodeBudget::new(10, 16);
+        let (_, charged) = budget.acquire(0, 1000).unwrap();
+        assert_eq!(charged, 1000);
+        budget.settle(charged, 0);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn decode_budget_reuses_and_evicts_idle_buffers() {
+        let budget = DecodeBudget::new(1000, 16);
+        let decode = |job: usize| {
+            let (reused, charged) = budget.acquire(job, 400).unwrap();
+            let buf = reused.unwrap_or_else(|| f32_buffer(100));
+            budget.settle(charged, decoded_buffer_bytes(&buf));
+            buf
+        };
+        let first = decode(0);
+        budget.recycle(first);
+        // Idle buffers stay charged until reused or evicted.
+        assert_eq!(budget.used_bytes(), 400);
+
+        // Reuse credits the idle buffer against the reservation.
+        let first = decode(1);
+        assert_eq!(budget.used_bytes(), 400);
+        let second = decode(2);
+        assert_eq!(budget.used_bytes(), 800);
+        budget.recycle(first);
+        budget.recycle(second);
+        assert_eq!(budget.used_bytes(), 800);
+
+        // The second idle buffer is evicted rather than blocking.
+        let (reused, charged) = budget.acquire(3, 700).unwrap();
+        assert!(reused.is_some());
+        assert_eq!((charged, budget.used_bytes()), (700, 700));
+        budget.settle(charged, 0);
+        assert!(budget.peak_bytes() <= 1000);
+    }
+
+    #[test]
+    fn decode_budget_close_unblocks_waiters() {
+        let budget = Arc::new(DecodeBudget::new(10, 16));
+        let (_, charged) = budget.acquire(0, 10).unwrap();
+        budget.settle(charged, 10);
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            thread::spawn(move || budget.acquire(1, 10).is_none())
+        };
+        let later = {
+            let budget = Arc::clone(&budget);
+            thread::spawn(move || budget.acquire(2, 1).is_none())
+        };
+        thread::sleep(std::time::Duration::from_millis(20));
+        budget.close();
+        assert!(waiter.join().unwrap());
+        assert!(later.join().unwrap());
+    }
 
     #[test]
     fn terminal_error_does_not_wait_for_missing_earlier_jobs() {

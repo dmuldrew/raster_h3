@@ -116,4 +116,10 @@ pub struct StreamProfile {
     pub peak_worker_bytes: usize,
     pub decoded_bytes: u64,
     pub prefetch_wait_ns: u64,
+    /// Highest decoded-buffer bytes held at once (see `decode_budget_bytes`).
+    pub peak_decoded_bytes: usize,
+    /// Highest estimated bytes of pending compaction groups.
+    pub peak_compaction_bytes: usize,
+    /// Sibling groups decomposed early to respect the compaction byte limit.
+    pub forced_compaction_flushes: u64,
 }

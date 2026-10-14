@@ -279,7 +279,9 @@ impl BindHelper {
     }
 
     /// Parse execution limits: `workers`/`threads` (aggregation),
-    /// `decode_workers` and `fetch_workers`. Non-positive values are errors.
+    /// `decode_workers`, `fetch_workers`, `decode_budget_mb` and
+    /// `compaction_budget_mb`.
+    /// Non-positive values are errors.
     pub fn parse_execution(&self) -> Option<ExecutionParams> {
         let positive = |names: &[&str]| -> Result<Option<usize>, ()> {
             for name in names {
@@ -297,6 +299,8 @@ impl BindHelper {
             aggregation_workers: positive(&["workers", "threads"]).ok()?,
             decode_workers: positive(&["decode_workers"]).ok()?,
             fetch_workers: positive(&["fetch_workers"]).ok()?,
+            decode_budget_mb: positive(&["decode_budget_mb"]).ok()?,
+            compaction_budget_mb: positive(&["compaction_budget_mb"]).ok()?,
         })
     }
 
@@ -392,6 +396,10 @@ pub struct ExecutionParams {
     pub decode_workers: Option<usize>,
     /// `fetch_workers`: concurrent remote range requests.
     pub fetch_workers: Option<usize>,
+    /// `decode_budget_mb`: decoded chunk memory budget in MiB.
+    pub decode_budget_mb: Option<usize>,
+    /// `compaction_budget_mb`: opt-in limit on pending compaction groups in MiB.
+    pub compaction_budget_mb: Option<usize>,
 }
 
 impl ExecutionParams {
@@ -405,6 +413,12 @@ impl ExecutionParams {
         }
         if let Some(n) = self.fetch_workers {
             config.fetch_workers = n;
+        }
+        if let Some(mb) = self.decode_budget_mb {
+            config.decode_budget_bytes = mb.saturating_mul(1024 * 1024);
+        }
+        if let Some(mb) = self.compaction_budget_mb {
+            config.compaction_budget_bytes = Some(mb.saturating_mul(1024 * 1024));
         }
     }
 }
@@ -455,10 +469,14 @@ mod tests {
             aggregation_workers: Some(3),
             decode_workers: Some(2),
             fetch_workers: Some(5),
+            decode_budget_mb: Some(32),
+            compaction_budget_mb: Some(8),
         }
         .apply(&mut config);
         assert_eq!(config.aggregation_workers, Some(3));
         assert_eq!(config.decode_workers, 2);
         assert_eq!(config.fetch_workers, 5);
+        assert_eq!(config.decode_budget_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.compaction_budget_bytes, Some(8 * 1024 * 1024));
     }
 }

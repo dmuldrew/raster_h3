@@ -164,6 +164,16 @@ pub struct MultiResolutionConfig {
     pub spill_directory: Option<std::path::PathBuf>,
     /// Decoded chunk ring and idle pool capacity (minimum 16).
     pub prefetch_chunks: usize,
+    /// Bytes of decoded chunk buffers held at once: decoding, queued, being
+    /// aggregated, and idle for reuse. Separate from the aggregation budget.
+    /// A chunk larger than this is decoded only when no other is held.
+    pub decode_budget_bytes: usize,
+    /// Optional limit on pending compaction groups, in bytes. Past it, the
+    /// groups nearest completion are emitted as individual children. Which
+    /// groups this affects depends on chunk batch timing, so compacted output
+    /// may differ between runs (never in samples or totals). `None` keeps
+    /// compaction deterministic and its memory unbounded.
+    pub compaction_budget_bytes: Option<usize>,
     /// Maximum simultaneously decoding workers (dedicated OS threads).
     pub decode_workers: usize,
     /// Kernel (aggregation) worker threads. `None` runs windows on the
@@ -217,6 +227,8 @@ impl MultiResolutionConfig {
             aggregation_budget_bytes: 64 * 1024 * 1024,
             spill_directory: None,
             prefetch_chunks: 16,
+            decode_budget_bytes: 256 * 1024 * 1024,
+            compaction_budget_bytes: None,
             decode_workers: 4,
             aggregation_workers: None,
             fetch_workers: crate::raster::remote_prefetch::DEFAULT_PREFETCH_WORKERS,
@@ -273,6 +285,11 @@ impl MultiResolutionConfig {
         if self.prefetch_chunks < 16 || self.decode_workers == 0 {
             return Err(RasterH3Error::InvalidParameter(
                 "prefetch_chunks must be >=16 and decode_workers >=1".into(),
+            ));
+        }
+        if self.decode_budget_bytes == 0 || self.compaction_budget_bytes == Some(0) {
+            return Err(RasterH3Error::InvalidParameter(
+                "decode_budget_bytes and compaction_budget_bytes must be positive".into(),
             ));
         }
         if self.aggregation_workers == Some(0) || self.fetch_workers == 0 {

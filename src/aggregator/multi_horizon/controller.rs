@@ -5,7 +5,10 @@
 //! Once spilled, a resolution is finalized only after external merging at EOF.
 //! Output and sibling compaction are incremental: compaction groups complete
 //! during streaming or at EOF in sorted order. Failures latch and drop
-//! temporary files. The aggregation budget excludes decoded chunks and metadata.
+//! temporary files. The aggregation budget covers active maps, worker maps
+//! and buffered output. Decoded chunks have their own budget
+//! (`decode_budget_bytes`); pending compaction groups are accounted and
+//! optionally limited (`compaction_budget_bytes`). Metadata is not budgeted.
 
 use fxhash::FxBuildHasher;
 use h3o::{CellIndex, Resolution};
@@ -220,16 +223,21 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             resolution_u8s.push(res_u8);
         }
 
-        let prefetcher = PrefetchedMosaicReader::spawn_with_fetch_workers(
+        let prefetcher = PrefetchedMosaicReader::spawn_with_budget(
             Arc::clone(&mosaic),
             config.prefetch_chunks,
             config.decode_workers,
             config.fetch_workers,
+            config.decode_budget_bytes,
         );
         let num_res = resolutions.len();
         let mut resolution_shards: Vec<_> =
             (0..num_res).map(|_| ShardedResolutionMap::new()).collect();
-        let compactor = HierarchicalCompactor::new(should_compact);
+        // Past an opt-in limit, pending sibling groups are decomposed before completion.
+        let compactor = HierarchicalCompactor::with_byte_limit(
+            should_compact,
+            config.compaction_budget_bytes.unwrap_or(usize::MAX),
+        );
 
         // Bounds cover whole chunks and all subpixel offsets. Unknown projected
         // chunks get +infinity; once they are processed a later suffix can still
@@ -437,7 +445,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     self.resolution_shards
                         .iter()
                         .map(|s| s.estimated_bytes())
-                        .sum(),
+                        .sum::<usize>()
+                        + self.compactor.estimated_bytes(),
                 );
                 if self.resolution_shards[i].estimated_bytes() >= self.map_budget {
                     self.spill_resolution(i)?;
@@ -624,6 +633,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             return Err(RasterH3Error::StreamFailed(reason.to_string()));
         }
         let result = self.advance_inner(min_rows.min(2048));
+        self.metrics.peak_compaction_bytes = self.compactor.peak_bytes();
+        self.metrics.forced_compaction_flushes = self.compactor.forced_flushes();
+        if let Some(prefetcher) = &self.prefetcher {
+            self.metrics.peak_decoded_bytes = prefetcher.peak_decoded_bytes();
+        }
         match result {
             Ok(()) => Ok(()),
             Err(e) => Err(self.fail(e.to_string())),
@@ -709,6 +723,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     },
                     &self.kernel,
                     &mut self.output_buffer,
+                    self.output_byte_limit,
                 );
                 if self.output_buffer.len() > buffered {
                     continue;
@@ -736,7 +751,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         self.mosaic.chunk_refs.len()
                     )));
                 }
-                self.prefetcher.take();
+                if let Some(prefetcher) = self.prefetcher.take() {
+                    self.metrics.peak_decoded_bytes = prefetcher.peak_decoded_bytes();
+                }
                 self.finishing = true;
                 // Keep the published horizon conservative until deferred output
                 // is consumed; downstream tilers must not flush ahead of it.
@@ -798,7 +815,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         self.spill_runs.iter().map(|r| r.runs_written).sum()
     }
 
-    /// Peak estimate of active table/heap allocation; excludes decoder and output memory.
+    /// Peak estimate of active table/heap allocation, including pending
+    /// compaction groups; excludes decoded chunks and output memory.
     pub fn peak_active_bytes(&self) -> usize {
         self.peak_active_bytes
     }
