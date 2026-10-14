@@ -1,4 +1,4 @@
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
@@ -33,7 +33,7 @@ fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
     slice: &[T],
     native_nodata: Option<T>,
     options: ContinuousOptions,
-    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, H3BuildHasher>],
 ) {
     let engine = ContinuousEngine {
         native_nodata,
@@ -202,7 +202,7 @@ pub fn process_continuous_chunk_payload_into(
     decoding_result: &DecodingResult,
     nodata: Option<f64>,
     options: ContinuousOptions,
-    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, H3BuildHasher>],
 ) -> bool {
     process_continuous_borrowed_into(
         window,
@@ -219,7 +219,7 @@ pub fn process_continuous_borrowed_into(
     samples: super::borrowed::BorrowedSamples<'_>,
     nodata: Option<f64>,
     options: ContinuousOptions,
-    chunk_maps: &mut [HashMap<u64, H3Accumulator, FxBuildHasher>],
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, H3BuildHasher>],
 ) -> bool {
     if window.samples_per_pixel <= 1
         && options.spectral_formula.is_none()

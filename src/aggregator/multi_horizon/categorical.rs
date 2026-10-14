@@ -1,4 +1,4 @@
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use std::collections::HashMap;
 use tiff::decoder::DecodingResult;
 
@@ -24,7 +24,7 @@ fn process_categorical_slice_into_maps<T: CategoricalUniformity>(
     native_nodata: Option<T>,
     band: usize,
     remapper: Option<&CategoryRemapper>,
-    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, H3BuildHasher>],
 ) {
     let engine = CategoricalEngine::new(native_nodata, remapper);
     let samples_per_pixel = ctx.samples_per_pixel as usize;
@@ -212,7 +212,7 @@ pub fn process_categorical_chunk_payload_into(
     nodata: Option<f64>,
     band: usize,
     remapper: Option<&CategoryRemapper>,
-    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, H3BuildHasher>],
 ) -> bool {
     process_categorical_borrowed_into(
         window,
@@ -231,7 +231,7 @@ pub fn process_categorical_borrowed_into(
     nodata: Option<f64>,
     band: usize,
     remapper: Option<&CategoryRemapper>,
-    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, FxBuildHasher>],
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, H3BuildHasher>],
 ) -> bool {
     if window.samples_per_pixel <= 1 && samples.all_nodata(nodata) {
         return false;

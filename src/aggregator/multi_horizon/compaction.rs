@@ -7,7 +7,7 @@
 //! bound; at EOF, once the sorted stream passes the parent. Grouping is
 //! logical, so a parent polygon is never assumed to cover its children.
 
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::CellIndex;
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ struct Group<A> {
 /// Generic hierarchical H3 7-to-1 compaction aggregator.
 pub struct HierarchicalCompactor<K: HorizonStreamKernel> {
     enabled: bool,
-    pending: HashMap<u64, Group<K::Accumulator>, FxBuildHasher>,
+    pending: HashMap<u64, Group<K::Accumulator>, H3BuildHasher>,
 }
 
 impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
@@ -39,7 +39,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            pending: HashMap::with_hasher(FxBuildHasher::default()),
+            pending: HashMap::with_hasher(H3BuildHasher),
         }
     }
 

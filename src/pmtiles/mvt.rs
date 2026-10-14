@@ -3,9 +3,10 @@
 //! Encodes H3 hexagonal geometries and statistical properties directly into
 //! standard MVT protocol buffer byte streams without intermediate GIS allocations.
 
-use fxhash::FxHashSet;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::LatLng;
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 /// Normalized Web Mercator point with coordinates in [0.0, 1.0]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -518,7 +519,7 @@ pub struct MvtLayer {
     pub extent: u32,
     pub features: Vec<MvtFeature>,
     pub property_filter: PropertyFilter,
-    pub seen_ids: FxHashSet<u64>,
+    pub seen_ids: HashSet<u64, H3BuildHasher>,
 }
 
 impl MvtLayer {
@@ -529,7 +530,7 @@ impl MvtLayer {
             extent: 4096,
             features: Vec::new(),
             property_filter: PropertyFilter::all(),
-            seen_ids: FxHashSet::default(),
+            seen_ids: HashSet::default(),
         }
     }
 
@@ -540,7 +541,7 @@ impl MvtLayer {
             extent: 4096,
             features: Vec::new(),
             property_filter: filter,
-            seen_ids: FxHashSet::default(),
+            seen_ids: HashSet::default(),
         }
     }
 

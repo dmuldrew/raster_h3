@@ -139,7 +139,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
         .build()
         .unwrap();
     let mt_4_start = Instant::now();
-    let chunks_res_4: Vec<std::collections::HashMap<u64, H3Accumulator, fxhash::FxBuildHasher>> =
+    let chunks_res_4: Vec<std::collections::HashMap<u64, H3Accumulator, raster_h3::aggregator::cell_hash::H3BuildHasher>> =
         pool_4.install(|| {
             let reader_mt = GeoTiffStreamReader::open(&path).unwrap();
             let total_chunks = reader_mt.chunk_layout.total_chunks;
@@ -148,7 +148,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
                 .map(|chunk_idx| {
                     let chunk_reader = GeoTiffStreamReader::open(&path).unwrap();
                     let mut map =
-                        std::collections::HashMap::with_hasher(fxhash::FxBuildHasher::default());
+                        std::collections::HashMap::with_hasher(raster_h3::aggregator::cell_hash::H3BuildHasher);
                     if let Ok((chunk, decoding)) = chunk_reader.read_chunk(chunk_idx) {
                         let gt = chunk_reader.metadata.geotransform;
                         if let tiff::decoder::DecodingResult::F32(ref slice) = decoding {
@@ -191,7 +191,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
         .build()
         .unwrap();
     let mt_8_start = Instant::now();
-    let chunks_res_8: Vec<std::collections::HashMap<u64, H3Accumulator, fxhash::FxBuildHasher>> =
+    let chunks_res_8: Vec<std::collections::HashMap<u64, H3Accumulator, raster_h3::aggregator::cell_hash::H3BuildHasher>> =
         pool_8.install(|| {
             let reader_mt = GeoTiffStreamReader::open(&path).unwrap();
             let total_chunks = reader_mt.chunk_layout.total_chunks;
@@ -200,7 +200,7 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
                 .map(|chunk_idx| {
                     let chunk_reader = GeoTiffStreamReader::open(&path).unwrap();
                     let mut map =
-                        std::collections::HashMap::with_hasher(fxhash::FxBuildHasher::default());
+                        std::collections::HashMap::with_hasher(raster_h3::aggregator::cell_hash::H3BuildHasher);
                     if let Ok((chunk, decoding)) = chunk_reader.read_chunk(chunk_idx) {
                         let gt = chunk_reader.metadata.geotransform;
                         if let tiff::decoder::DecodingResult::F32(ref slice) = decoding {

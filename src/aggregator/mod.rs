@@ -22,6 +22,8 @@
 pub mod accumulator;
 /// Frequency tracking and summary metrics for categorical raster data.
 pub mod categorical;
+/// Hashing for maps keyed by raw H3 cell indices.
+pub mod cell_hash;
 /// Scanline lookahead buffering and H3 spatial neighbor traversal caching.
 pub mod h3_scanline;
 /// Southernmost scan-line horizon eviction engine for single-resolution streaming.

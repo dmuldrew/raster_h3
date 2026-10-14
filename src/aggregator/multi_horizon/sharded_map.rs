@@ -1,4 +1,4 @@
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::{mix_h3, H3BuildHasher};
 use std::collections::{BinaryHeap, HashMap};
 
 use super::spill::table_bytes;
@@ -13,15 +13,14 @@ pub const NUM_SHARDS: usize = 32;
 /// Mix the full H3 index before selecting a power-of-two shard.
 /// Unused H3 child digits fill the low bits with ones, so masking the low
 /// bits of a simple product sends every cell at resolutions 0..=13 to one shard.
+///
+/// Shard maps hash with the same finalizer ([`H3BuildHasher`]), and hashbrown
+/// takes bucket positions from the low bits and tags from the top 7. The shard
+/// therefore comes from bits 32.., so keys within one shard still spread over
+/// every bucket and tag.
 #[inline(always)]
 pub fn get_shard(cell_u64: u64) -> usize {
-    // SplitMix64 finalizer: fold the varying base-cell and child digits into
-    // every output bit. Keep all arithmetic in u64 on both 32- and 64-bit hosts.
-    let mut h = cell_u64;
-    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^= h >> 31;
-    (h as usize) & (NUM_SHARDS - 1)
+    ((mix_h3(cell_u64) >> 32) as usize) & (NUM_SHARDS - 1)
 }
 
 /// Trait defining an accumulator that can be merged into another
@@ -68,7 +67,7 @@ impl AccumulatorMerge for CategoricalAccumulator {
 /// checks, and pops completed cells incrementally. Merging and eviction both
 /// require exclusive access, so the phases cannot overlap in safe Rust.
 pub struct ShardedResolutionMap<A: AccumulatorMerge> {
-    shards: Vec<HashMap<u64, A, FxBuildHasher>>,
+    shards: Vec<HashMap<u64, A, H3BuildHasher>>,
     eviction: Vec<BinaryHeap<HexEvictionEntry>>,
     dynamic_bytes: usize,
     /// Table and heap allocation, maintained incrementally so budget checks
@@ -89,10 +88,7 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         let mut eviction = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
-            shards.push(HashMap::with_capacity_and_hasher(
-                0,
-                FxBuildHasher::default(),
-            ));
+            shards.push(HashMap::with_capacity_and_hasher(0, H3BuildHasher));
             eviction.push(BinaryHeap::new());
         }
         Self {
@@ -190,7 +186,7 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
                 let key = self.eviction[s].pop().unwrap().cell_u64;
                 let removed = self.shards[s].remove(&key);
                 if removed.is_some() && self.shards[s].is_empty() {
-                    self.shards[s] = HashMap::with_hasher(FxBuildHasher::default());
+                    self.shards[s] = HashMap::with_hasher(H3BuildHasher);
                     self.eviction[s] = BinaryHeap::new();
                 }
                 self.structure_bytes = self.structure_bytes - before + self.shard_bytes(s);
@@ -208,7 +204,7 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
     pub fn take_sorted(&mut self) -> Vec<(u64, A)> {
         let mut records = Vec::with_capacity(self.active_cell_count());
         for (map, heap) in self.shards.iter_mut().zip(&mut self.eviction) {
-            let owned = std::mem::replace(map, HashMap::with_hasher(FxBuildHasher::default()));
+            let owned = std::mem::replace(map, HashMap::with_hasher(H3BuildHasher));
             records.extend(owned);
             *heap = BinaryHeap::new();
         }

@@ -8,7 +8,7 @@
 //! the engine's span kernels. Scratch storage is bounded by the sampling
 //! pattern and resolution count, not by row or raster size.
 
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::{LatLng, Resolution};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -59,7 +59,7 @@ pub trait ScanlineEngine<T, Acc> {
     fn update_sample(&self, acc: &mut Acc, sample: Self::Sample, weight: f64);
 }
 
-type CellMap<Acc> = HashMap<u64, Acc, FxBuildHasher>;
+type CellMap<Acc> = HashMap<u64, Acc, H3BuildHasher>;
 
 /// Borrowed inputs shared by every row of one chunk window.
 #[derive(Clone, Copy)]

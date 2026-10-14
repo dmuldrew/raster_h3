@@ -48,8 +48,8 @@ fn benchmark_supersampling() {
 
 #[test]
 fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
-    use fxhash::FxBuildHasher;
     use h3o::{LatLng, Resolution};
+    use raster_h3::aggregator::cell_hash::H3BuildHasher;
     use raster_h3::aggregator::multi_horizon::{
         categorical::process_categorical_chunk_payload_into,
         continuous::{process_continuous_chunk_payload_into, ContinuousOptions},
@@ -164,7 +164,7 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                 };
                 for quantiles in [false, true] {
                     let mut actual =
-                        vec![HashMap::<u64, H3Accumulator, FxBuildHasher>::default(); 2];
+                        vec![HashMap::<u64, H3Accumulator, H3BuildHasher>::default(); 2];
                     let scope = raster_h3::aggregator::multi_horizon::profile::WorkerScope::new();
                     process_continuous_chunk_payload_into(
                         &window,
@@ -218,7 +218,7 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                     }
                 }
                 let mut actual =
-                    vec![HashMap::<u64, CategoricalAccumulator, FxBuildHasher>::default(); 2];
+                    vec![HashMap::<u64, CategoricalAccumulator, H3BuildHasher>::default(); 2];
                 process_categorical_chunk_payload_into(
                     &window,
                     &decoded,
