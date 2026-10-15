@@ -20,7 +20,8 @@ pub use mosaic::{
     glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor,
 };
 pub use prefetch::{
-    DecodingBufferPool, MosaicPrefetchItem, PrefetchedChunkReader, PrefetchedMosaicReader,
+    DecodeBudget, DecodingBufferPool, MosaicPrefetchItem, PrefetchedChunkReader,
+    PrefetchedMosaicReader,
 };
 pub use remote_prefetch::{
     coalesce_chunk_ranges, ChunkLocation, CoalescedRange, RemoteChunkPrefetchQueue,

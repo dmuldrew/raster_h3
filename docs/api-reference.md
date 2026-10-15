@@ -34,6 +34,8 @@ This document provides the complete API reference for the DuckDB H3 Raster Hexif
 | `workers` / `threads` | `BIGINT` | ambient | Aggregation (kernel) threads. When set, the query runs kernel windows on a dedicated pool of this size, shared by concurrent queries that request the same size. When unset, windows use the caller's Rayon pool, capped at 8 per wave. |
 | `decode_workers` | `BIGINT` | `4` | Chunk decompression threads. |
 | `fetch_workers` | `BIGINT` | `8` | Concurrent HTTP range requests for remote tiles. |
+| `decode_budget_mb` | `BIGINT` | `256` | Memory for decoded chunks held at once (decoding, queued, being aggregated, idle for reuse), in MiB. Decoding waits for room; a single chunk larger than the budget is decoded only when no other is held. |
+| `compaction_budget_mb` | `BIGINT` | `None` | Opt-in limit on pending `compact` sibling groups, in MiB. Past it, the groups nearest completion are emitted as individual children. Samples and totals are unchanged, but which groups compact can vary between runs. Unset keeps compaction deterministic and its memory unbounded. |
 | `formula` | `VARCHAR` | `None` | Spectral index formula: `'ndvi'`, `'ndwi'`, `'nbr'`, `'evi'`. Requires multi-band raster. |
 | `nir_band`, `red_band`, `green_band`, `blue_band`, `swir_band` | `BIGINT` | `auto` | 1-indexed band assignments for spectral index formulas. |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold — cells below this are excluded from output. |
@@ -98,6 +100,8 @@ This document provides the complete API reference for the DuckDB H3 Raster Hexif
 | `workers` / `threads` | `BIGINT` | ambient | Aggregation (kernel) threads. When set, the query runs kernel windows on a dedicated pool of this size, shared by concurrent queries that request the same size. When unset, windows use the caller's Rayon pool, capped at 8 per wave. |
 | `decode_workers` | `BIGINT` | `4` | Chunk decompression threads. |
 | `fetch_workers` | `BIGINT` | `8` | Concurrent HTTP range requests for remote tiles. |
+| `decode_budget_mb` | `BIGINT` | `256` | Memory for decoded chunks held at once (decoding, queued, being aggregated, idle for reuse), in MiB. Decoding waits for room; a single chunk larger than the budget is decoded only when no other is held. |
+| `compaction_budget_mb` | `BIGINT` | `None` | Opt-in limit on pending `compact` sibling groups, in MiB. Past it, the groups nearest completion are emitted as individual children. Samples and totals are unchanged, but which groups compact can vary between runs. Unset keeps compaction deterministic and its memory unbounded. |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold for output. |
 | `min_majority_fraction` | `DOUBLE` | `None` | Minimum majority class fraction — cells below this threshold are excluded. |
 | `remap` | `VARCHAR` | `None` | Category remapping rules: exact (`'10=Forest,20=Urban'`), range (`'20-29=Urban'`), wildcard (`'*=Other'`). |

@@ -819,6 +819,19 @@ impl<'a> ChunkDecoder<'a> {
 }
 
 impl GeoTiffStreamReader {
+    /// Expected decoded size of one full chunk. Without parsed chunk info the
+    /// sample width is unknown, so assume the widest (8 bytes).
+    pub fn decoded_chunk_bytes(&self) -> usize {
+        let bytes_per_sample = self
+            .chunk_info
+            .as_ref()
+            .map_or(8, |info| (info.bits_per_sample as usize).div_ceil(8).max(1));
+        (self.chunk_layout.chunk_width as usize)
+            .saturating_mul(self.chunk_layout.chunk_height as usize)
+            .saturating_mul(self.metadata.samples_per_pixel.max(1) as usize)
+            .saturating_mul(bytes_per_sample)
+    }
+
     /// Unallocated TIFF chunks contain no observations, regardless of nodata overrides.
     pub fn is_sparse_chunk(&self, chunk_index: u32) -> bool {
         self.chunk_info.as_ref().is_some_and(|info| {

@@ -34,7 +34,14 @@ sufficient. Unknown Proj4 bounds and Albers chunks that may contain the cone ape
 disable early eviction until the remaining suffix is certifiable or EOF.
 
 The aggregation budget defaults to 64 MiB. Disk spilling limits active
-accumulators; decoding, prefetching, output, and runtime overhead also use RAM.
+accumulators. Pending compaction groups are accounted in bytes and can be
+limited with the opt-in `compaction_budget_bytes`: past it, the groups nearest
+completion are emitted as individual children instead of waiting for missing
+siblings. That never drops or duplicates a sample, but pending size depends on
+chunk batch timing, so which groups compact can vary between runs. Without the
+limit, compaction output is deterministic and its memory is unbounded. Decoded chunks have a
+separate budget (`decode_budget_bytes`, default 256 MiB). Output and runtime
+overhead also use RAM.
 
 ## 2. Sequential H3 Span Discovery
 Every candidate pixel center is indexed directly. Consecutive equal-cell pixels
@@ -99,9 +106,9 @@ Traditional background prefetchers often suffer from thread thrashing: either un
 
 `ChunkWriter` bounds writes to DuckDB's output vectors; it does not throttle or schedule decompression. Continuous and wide categorical scan callbacks pull from `ConcurrentRecordQueue::pop_or_refill()` before writing. A refill requests at most four vector-sized batches from the streamer, returns one, and retains at most three. With no further scan calls, no further refills occur. The prefetch ring then fills and each decompression worker eventually blocks in `push()`, after finishing its current decode. An already-running scan may finish its current refill before stalling.
 
-For a single prefetcher, let **C** be ring capacity, **W** decoder workers, **B** the consumer's chunk batch size, and **P** idle-pool capacity. Decoded buffer ownership is bounded by **C + W + B + P** buffers along this path (including a worker's completed buffer waiting to be deposited). This is a count bound, not a fixed byte budget. If each buffer's allocated capacity is at most **S** bytes, those buffers occupy at most **(C + W + B + P) × S** bytes, excluding allocator overhead and decoder scratch storage.
+For a single prefetcher, let **C** be ring capacity, **W** decoder workers, **B** the consumer's chunk batch size, and **P** idle-pool capacity. Decoded buffer ownership is bounded by **C + W + B + P** buffers along this path (including a worker's completed buffer waiting to be deposited). The streamer's mosaic prefetcher also charges every one of those buffers against `decode_budget_bytes`: a worker reserves its chunk's expected size before decoding and settles to the actual allocation afterwards; idle buffers stay charged until reused or evicted for a waiting reservation. Reservations are granted in job order, so the chunk the ordered ring is waiting for never waits behind later chunks, and the consumer returns its whole batch before draining again. A chunk larger than the budget is admitted only when no other decoded buffer is held, so the bound is **max(budget, largest chunk)**, excluding allocator overhead and decoder scratch storage. `PrefetchedChunkReader` (single file, not used by the streamer) keeps only the count bound.
 
-Whole-query memory also includes raster metadata and job lists, compressed remote payloads, decoder scratch buffers, aggregation maps, compaction state, output records, and DuckDB execution state. `OutputBuffer::with_capacity(2048)` reserves initial space; it is not a hard limit. Horizon eviction and EOF flushing can emit more records than the requested row count. Long categorical output additionally expands each cell into one row per category and can overshoot its refill threshold. Therefore these queue bounds do **not** establish a fixed whole-query RAM limit or a universal zero-churn guarantee.
+Whole-query memory also includes raster metadata and job lists, compressed remote payloads, decoder scratch buffers, aggregation maps, compaction state (bounded only when `compaction_budget_bytes` is set), output records, and DuckDB execution state. `OutputBuffer::with_capacity(2048)` reserves initial space; it is not a hard limit. Horizon eviction and EOF flushing can emit more records than the requested row count. Long categorical output additionally expands each cell into one row per category and can overshoot its refill threshold. Therefore these queue bounds do **not** establish a fixed whole-query RAM limit or a universal zero-churn guarantee.
 
 Regression coverage includes an explicit producer-wait handshake for oversized batch drains and a 15,840-item test connecting the real record and prefetch queues. The latter pauses record consumption, observes the producer blocked at the expected capacity boundary, and checks ordered completion after resuming. It uses one synthetic record per chunk; it is not a live DuckDB/TIFF memory benchmark.
 
