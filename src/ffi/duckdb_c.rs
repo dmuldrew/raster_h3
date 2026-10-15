@@ -2,28 +2,35 @@
 
 use std::ffi::c_void;
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Minimum C extension API version requested from DuckDB's `get_api`.
 pub const DUCKDB_C_API_VERSION: &std::ffi::CStr = c"v1.2.0";
 
-/// `duckdb_ext_api_v1` function table handed over by DuckDB at load time.
-static API_TABLE: AtomicPtr<*const c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Process-wide copy of the `duckdb_ext_api_v1` function table handed over
+/// by DuckDB at load time. Reinstalling overwrites it in place, so repeated
+/// extension loads never allocate.
+static API_TABLE: [AtomicPtr<c_void>; API_TABLE_LEN] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; API_TABLE_LEN];
+static API_TABLE_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Installs a copy of the `duckdb_ext_api_v1` table returned by
 /// `access->get_api`, which DuckDB only keeps alive during extension init.
+/// A null `table` uninstalls it.
 ///
 /// # Safety
 /// `table` must be null or point to a `duckdb_ext_api_v1` struct of at
 /// least `DUCKDB_C_API_VERSION` (`API_TABLE_LEN` function pointers).
 pub unsafe fn install_api_table(table: *const c_void) {
-    let copy = if table.is_null() {
-        std::ptr::null_mut()
-    } else {
-        let entries = std::slice::from_raw_parts(table as *const *const c_void, API_TABLE_LEN);
-        Box::leak(entries.to_vec().into_boxed_slice()).as_mut_ptr()
-    };
-    API_TABLE.store(copy, Ordering::Release);
+    if table.is_null() {
+        API_TABLE_INSTALLED.store(false, Ordering::Release);
+        return;
+    }
+    let entries = std::slice::from_raw_parts(table as *const *mut c_void, API_TABLE_LEN);
+    for (slot, &func) in API_TABLE.iter().zip(entries) {
+        slot.store(func, Ordering::Relaxed);
+    }
+    API_TABLE_INSTALLED.store(true, Ordering::Release);
 }
 
 /// Resolves the DuckDB C API function at `index` of `duckdb_ext_api_v1`.
@@ -35,8 +42,7 @@ unsafe fn resolve_api_fn(
     name: &'static str,
     fallback: &AtomicPtr<c_void>,
 ) -> *mut c_void {
-    let table = API_TABLE.load(Ordering::Acquire);
-    let func = if table.is_null() {
+    let func = if !API_TABLE_INSTALLED.load(Ordering::Acquire) {
         let mut func = fallback.load(Ordering::Relaxed);
         if func.is_null() {
             func = crate::ffi::spatial_detect::dlsym_duckdb_symbol(name.as_bytes());
@@ -44,7 +50,7 @@ unsafe fn resolve_api_fn(
         }
         func
     } else {
-        *table.add(index) as *mut c_void
+        API_TABLE[index].load(Ordering::Relaxed)
     };
     if func.is_null() {
         missing_api_fn(name);
@@ -59,11 +65,10 @@ unsafe fn resolve_api_fn(
 /// `name` must be NUL-terminated and `index` must be its position in
 /// `duckdb_ext_api_v1`.
 pub unsafe fn lookup_api_fn(index: usize, name: &str) -> *mut c_void {
-    let table = API_TABLE.load(Ordering::Acquire);
-    if table.is_null() {
+    if !API_TABLE_INSTALLED.load(Ordering::Acquire) {
         crate::ffi::spatial_detect::dlsym_duckdb_symbol(name.as_bytes())
     } else {
-        *table.add(index) as *mut c_void
+        API_TABLE[index].load(Ordering::Relaxed)
     }
 }
 
