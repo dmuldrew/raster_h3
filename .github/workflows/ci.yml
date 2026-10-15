@@ -124,16 +124,19 @@ jobs:
           unzip -o -q "duckdb_cli-${{ matrix.cli_arch }}.zip"
           
           DUCKDB_BIN="./duckdb"
+          EXT_PATH="$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             DUCKDB_BIN="./duckdb.exe"
             cp target/duckdb_lib/duckdb.dll . || true
+            # DuckDB needs a native path (D:/...), not Git Bash's /d/...
+            EXT_PATH="$(cygpath -m "$EXT_PATH")"
           fi
           
           chmod +x $DUCKDB_BIN || true
           if [[ -n "${{ matrix.cli_prefix }}" ]]; then
             softwareupdate --install-rosetta --agree-to-license || true
           fi
-          ${{ matrix.cli_prefix }} $DUCKDB_BIN -unsigned -bail -c "LOAD '$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
+          ${{ matrix.cli_prefix }} $DUCKDB_BIN -unsigned -bail -c "LOAD '$EXT_PATH'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
           echo "Smoke test passed successfully on ${{ matrix.platform }}!"
 
       # Runs real export SQL through the CLI downloaded above. Uses the host-built
