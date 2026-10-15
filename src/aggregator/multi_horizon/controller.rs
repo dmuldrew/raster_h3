@@ -10,7 +10,7 @@
 //! (`decode_budget_bytes`); pending compaction groups are accounted and
 //! optionally limited (`compaction_budget_bytes`). Metadata is not budgeted.
 
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ type WindowJob<'a> = (
     bool,
 );
 /// One worker's per-resolution cell maps.
-type CellMaps<A> = Vec<HashMap<u64, A, FxBuildHasher>>;
+type CellMaps<A> = Vec<HashMap<u64, A, H3BuildHasher>>;
 
 /// Dedicated aggregation pool of `threads` workers, shared by all live
 /// streams requesting the same size so concurrent queries do not each spawn
@@ -101,7 +101,7 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
         window: &WalkContext,
         decoding_result: &mut DecodingResult,
         nodata: Option<f64>,
-        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+        local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
     ) -> bool;
 
     /// Borrowed window override. Built-in kernels never allocate a pixel copy.
@@ -110,7 +110,7 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
         window: &WalkContext,
         samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
-        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+        local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
     ) -> bool {
         super::profile::copied(samples.bytes());
         let mut owned = samples.to_owned();
@@ -331,7 +331,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             worker_maps: (0..worker_tasks)
                 .map(|_| {
                     (0..num_res)
-                        .map(|_| HashMap::with_hasher(FxBuildHasher::default()))
+                        .map(|_| HashMap::with_hasher(H3BuildHasher))
                         .collect()
                 })
                 .collect(),
@@ -431,7 +431,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     fn merge_window(
         &mut self,
-        maps: &mut [HashMap<u64, K::Accumulator, FxBuildHasher>],
+        maps: &mut [HashMap<u64, K::Accumulator, H3BuildHasher>],
     ) -> Result<()> {
         for (i, map) in maps.iter_mut().enumerate() {
             for (key, acc) in map.drain() {

@@ -14,7 +14,7 @@
 //! compaction: those children are emitted individually and their remaining
 //! siblings can never form a complete group, so no parent duplicates them.
 
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::CellIndex;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -84,7 +84,7 @@ impl Ord for HeapEntry {
 /// Generic hierarchical H3 7-to-1 compaction aggregator.
 pub struct HierarchicalCompactor<K: HorizonStreamKernel> {
     enabled: bool,
-    pending: HashMap<u64, Group<K::Accumulator>, FxBuildHasher>,
+    pending: HashMap<u64, Group<K::Accumulator>, H3BuildHasher>,
     /// Per child resolution, groups by `siblings_south`, northernmost first.
     completion: Vec<BinaryHeap<HeapEntry>>,
     /// Groups by `emit_south`, northernmost first.
@@ -107,7 +107,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
     pub fn with_byte_limit(enabled: bool, byte_limit: usize) -> Self {
         Self {
             enabled,
-            pending: HashMap::with_hasher(FxBuildHasher::default()),
+            pending: HashMap::with_hasher(H3BuildHasher),
             completion: (0..RESOLUTIONS).map(|_| BinaryHeap::new()).collect(),
             emit: BinaryHeap::new(),
             group_bytes: 0,
@@ -157,7 +157,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
 
     /// Clear all pending compaction state.
     pub fn clear(&mut self) {
-        self.pending = HashMap::with_hasher(FxBuildHasher::default());
+        self.pending = HashMap::with_hasher(H3BuildHasher);
         self.completion
             .iter_mut()
             .for_each(|h| *h = BinaryHeap::new());
@@ -363,6 +363,11 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
         if bytes <= self.byte_limit {
             return;
         }
+        // Removals leave tombstones that can grow the table without adding
+        // groups, and decomposing groups never shrinks it. Reclaim first so
+        // excess capacity is not paid for with groups that could still compact.
+        self.reclaim();
+        bytes = self.estimated_bytes();
         while bytes > self.byte_limit && !self.pending.is_empty() {
             let Some((res, entry)) = self.next_to_complete() else {
                 break;
@@ -373,14 +378,18 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
             bytes = self.estimated_bytes();
         }
         if bytes > self.byte_limit {
-            // Removal leaves table capacity and stale heap entries behind.
-            self.pending.shrink_to_fit();
-            self.compact_indexes();
-            self.emit.shrink_to_fit();
-            self.completion
-                .iter_mut()
-                .for_each(BinaryHeap::shrink_to_fit);
+            self.reclaim();
         }
+    }
+
+    /// Release table capacity and stale heap entries left behind by removal.
+    fn reclaim(&mut self) {
+        self.pending.shrink_to_fit();
+        self.compact_indexes();
+        self.emit.shrink_to_fit();
+        self.completion
+            .iter_mut()
+            .for_each(BinaryHeap::shrink_to_fit);
     }
 
     /// Live group with the northernmost `siblings_south` over all resolutions.

@@ -3,7 +3,7 @@
 //! Provides single-pass streaming aggregation across multiple H3 resolution levels simultaneously
 //! for discrete integer / land cover categories and classification maps.
 
-use fxhash::FxBuildHasher;
+use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::Resolution;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -72,7 +72,7 @@ impl HorizonStreamKernel for CategoricalKernel {
         window: &WalkContext,
         decoding_result: &mut DecodingResult,
         nodata: Option<f64>,
-        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+        local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
     ) -> bool {
         process_categorical_chunk_payload_into(
             window,
@@ -90,7 +90,7 @@ impl HorizonStreamKernel for CategoricalKernel {
         window: &WalkContext,
         samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
-        local_maps: &mut [HashMap<u64, Self::Accumulator, FxBuildHasher>],
+        local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
     ) -> bool {
         super::categorical::process_categorical_borrowed_into(
             window,
