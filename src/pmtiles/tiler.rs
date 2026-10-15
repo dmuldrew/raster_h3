@@ -33,7 +33,7 @@ use crate::raster::geotiff::GeoTiffStreamReader;
 pub use crate::pmtiles::pyramid::{
     cell_boundary_mercator, cell_tile_range, cell_tile_range_mercator, for_each_cell_tile_mercator,
     h3_res_for_zoom, h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy,
-    tile_xy_to_bbox, zoom_to_h3_res, zooms_for_h3_res,
+    tile_xy_to_bbox, zoom_to_h3_res, zooms_for_h3_res, Wgs84BoundsAccumulator,
 };
 
 // Re-export feature definitions, metadata, accumulator, and export summaries from features module
@@ -51,25 +51,21 @@ struct PreparedTileOp {
 
 /// Precomputed continuous hexagon ready for thread-safe insertion into tile buckets
 struct PreparedContinuousHex {
-    h3_index: u64,
+    cell: CellIndex,
     resolution: u8,
     accumulator: H3Accumulator,
-    c_lat: f64,
-    c_lon: f64,
     ops: Vec<PreparedTileOp>,
 }
 
 /// Precomputed categorical hexagon ready for thread-safe insertion into tile buckets
 struct PreparedCategoricalHex {
-    h3_index: u64,
+    cell: CellIndex,
     resolution: u8,
     majority_fraction: f64,
     entropy: f64,
     distinct_classes: usize,
     pixel_count: f64,
     accumulator: CategoricalAccumulator,
-    c_lat: f64,
-    c_lon: f64,
     ops: Vec<PreparedTileOp>,
 }
 
@@ -188,11 +184,7 @@ impl H3PmtilesTiler {
         let mut total_features = 0usize;
         let mut valid_features = 0usize;
         let mut invalid_dropped = 0usize;
-
-        let mut global_min_lon = 180.0f64;
-        let mut global_min_lat = 90.0f64;
-        let mut global_max_lon = -180.0f64;
-        let mut global_max_lat = -90.0f64;
+        let mut bounds_acc = Wgs84BoundsAccumulator::new();
 
         let mut min_zoom = 255u8;
         let mut max_zoom = 0u8;
@@ -210,22 +202,10 @@ impl H3PmtilesTiler {
             };
 
             valid_features += 1;
+            bounds_acc.record_cell(cell);
             let center: LatLng = cell.into();
             let c_lat = center.lat();
             let c_lon = center.lng();
-
-            if c_lon < global_min_lon {
-                global_min_lon = c_lon;
-            }
-            if c_lon > global_max_lon {
-                global_max_lon = c_lon;
-            }
-            if c_lat < global_min_lat {
-                global_min_lat = c_lat;
-            }
-            if c_lat > global_max_lat {
-                global_max_lat = c_lat;
-            }
 
             let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
             let (v_merc, v_count) = cell_boundary_mercator(cell);
@@ -264,13 +244,10 @@ impl H3PmtilesTiler {
         }
 
         if valid_features == 0 {
-            global_min_lon = -180.0;
-            global_min_lat = -85.0;
-            global_max_lon = 180.0;
-            global_max_lat = 85.0;
             min_zoom = 0;
             max_zoom = 0;
         }
+        let bbox = bounds_acc.finish([-180.0, -85.0, 180.0, 85.0]);
 
         let metadata = build_pmtiles_metadata(
             "h3_pmtiles_export",
@@ -283,17 +260,7 @@ impl H3PmtilesTiler {
             None,
         );
 
-        let mut writer = PmtilesWriter::new(
-            min_zoom,
-            max_zoom,
-            [
-                global_min_lon,
-                global_min_lat,
-                global_max_lon,
-                global_max_lat,
-            ],
-            metadata.to_string(),
-        )?;
+        let mut writer = PmtilesWriter::new(min_zoom, max_zoom, bbox, metadata.to_string())?;
 
         let total_tiles = accumulator.active_tile_count();
         accumulator.flush_all(&mut writer)?;
@@ -364,10 +331,7 @@ impl H3PmtilesTiler {
             TilePyramidAccumulator::new(safety_margin).with_filter(property_filter.clone());
 
         let mut total_hexagons = 0usize;
-        let mut global_min_lon = 180.0f64;
-        let mut global_min_lat = 90.0f64;
-        let mut global_max_lon = -180.0f64;
-        let mut global_max_lat = -90.0f64;
+        let mut bounds_acc = Wgs84BoundsAccumulator::new();
 
         let mut res_stats: HashMap<u8, ResolutionAccumulatorStats, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
@@ -479,11 +443,9 @@ impl H3PmtilesTiler {
                     }
 
                     Some(PreparedContinuousHex {
-                        h3_index,
+                        cell,
                         resolution,
                         accumulator,
-                        c_lat,
-                        c_lon,
                         ops,
                     })
                 })
@@ -496,23 +458,10 @@ impl H3PmtilesTiler {
                     .record(&hex.accumulator);
 
                 if hex.resolution == min_res {
-                    if let Ok(cell) = CellIndex::try_from(hex.h3_index) {
-                        coarse_parents.push(cell, &hex.accumulator)?;
-                    }
+                    coarse_parents.push(hex.cell, &hex.accumulator)?;
                 }
 
-                if hex.c_lon < global_min_lon {
-                    global_min_lon = hex.c_lon;
-                }
-                if hex.c_lon > global_max_lon {
-                    global_max_lon = hex.c_lon;
-                }
-                if hex.c_lat < global_min_lat {
-                    global_min_lat = hex.c_lat;
-                }
-                if hex.c_lat > global_max_lat {
-                    global_max_lat = hex.c_lat;
-                }
+                bounds_acc.record_cell(hex.cell);
 
                 for op in hex.ops {
                     accumulator.add_op(op.tile_key, op.feature, op.is_parent);
@@ -548,13 +497,10 @@ impl H3PmtilesTiler {
         accumulator.flush_all(&mut writer)?;
 
         if total_hexagons == 0 {
-            global_min_lon = -180.0;
-            global_min_lat = -90.0;
-            global_max_lon = 180.0;
-            global_max_lat = 90.0;
             min_zoom = 0;
             max_zoom = 0;
         }
+        let bbox = bounds_acc.finish([-180.0, -90.0, 180.0, 90.0]);
 
         let mut sorted_res: Vec<u8> = res_stats.keys().copied().collect();
         sorted_res.sort_unstable();
@@ -627,15 +573,7 @@ impl H3PmtilesTiler {
             }),
         );
 
-        writer.set_metadata(
-            [
-                global_min_lon,
-                global_min_lat,
-                global_max_lon,
-                global_max_lat,
-            ],
-            metadata.to_string(),
-        );
+        writer.set_metadata(bbox, metadata.to_string());
 
         writer.finish(output_path)?;
         Ok(total_hexagons)
@@ -697,10 +635,7 @@ impl H3PmtilesTiler {
             TilePyramidAccumulator::new(safety_margin).with_filter(property_filter.clone());
 
         let mut total_hexagons = 0usize;
-        let mut global_min_lon = 180.0f64;
-        let mut global_min_lat = 90.0f64;
-        let mut global_max_lon = -180.0f64;
-        let mut global_max_lat = -90.0f64;
+        let mut bounds_acc = Wgs84BoundsAccumulator::new();
 
         let mut res_cell_counts: HashMap<u8, usize, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
@@ -822,15 +757,13 @@ impl H3PmtilesTiler {
                     }
 
                     Some(PreparedCategoricalHex {
-                        h3_index,
+                        cell,
                         resolution,
                         majority_fraction,
                         entropy,
                         distinct_classes,
                         pixel_count,
                         accumulator,
-                        c_lat,
-                        c_lon,
                         ops,
                     })
                 })
@@ -852,23 +785,10 @@ impl H3PmtilesTiler {
                 });
 
                 if hex.resolution == min_res {
-                    if let Ok(cell) = CellIndex::try_from(hex.h3_index) {
-                        coarse_parents.push(cell, &hex.accumulator)?;
-                    }
+                    coarse_parents.push(hex.cell, &hex.accumulator)?;
                 }
 
-                if hex.c_lon < global_min_lon {
-                    global_min_lon = hex.c_lon;
-                }
-                if hex.c_lon > global_max_lon {
-                    global_max_lon = hex.c_lon;
-                }
-                if hex.c_lat < global_min_lat {
-                    global_min_lat = hex.c_lat;
-                }
-                if hex.c_lat > global_max_lat {
-                    global_max_lat = hex.c_lat;
-                }
+                bounds_acc.record_cell(hex.cell);
 
                 for op in hex.ops {
                     accumulator.add_op(op.tile_key, op.feature, op.is_parent);
@@ -910,13 +830,10 @@ impl H3PmtilesTiler {
         accumulator.flush_all(&mut writer)?;
 
         if total_hexagons == 0 {
-            global_min_lon = -180.0;
-            global_min_lat = -90.0;
-            global_max_lon = 180.0;
-            global_max_lat = 90.0;
             min_zoom = 0;
             max_zoom = 0;
         }
+        let bbox = bounds_acc.finish([-180.0, -90.0, 180.0, 90.0]);
 
         let mut sorted_res: Vec<u8> = res_cell_counts.keys().copied().collect();
         sorted_res.sort_unstable();
@@ -1032,15 +949,7 @@ impl H3PmtilesTiler {
             }),
         );
 
-        writer.set_metadata(
-            [
-                global_min_lon,
-                global_min_lat,
-                global_max_lon,
-                global_max_lat,
-            ],
-            metadata.to_string(),
-        );
+        writer.set_metadata(bbox, metadata.to_string());
 
         writer.finish(output_path)?;
         Ok(total_hexagons)

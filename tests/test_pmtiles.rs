@@ -1143,3 +1143,116 @@ fn world_tile_encodes_both_antimeridian_pieces_in_one_feature() {
         }
     }
 }
+
+#[test]
+fn test_pmtiles_header_bounds_include_cell_vertices_and_antimeridian_center() {
+    use raster_h3::pmtiles::tiler::H3Feature;
+
+    // 1. Single cell in SF: header bbox must reflect cell vertex extent (not a zero-area point)
+    let sf_cell = 0x85283083fffffffu64; // Res 5 SF
+    let sf_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let sf_path = sf_tmp.to_str().unwrap().to_string();
+    H3PmtilesTiler::export_h3_features([H3Feature::new::<&str>(sf_cell, Vec::new())], &sf_path)
+        .unwrap();
+
+    let mut header = [0u8; 127];
+    File::open(&sf_path)
+        .unwrap()
+        .read_exact(&mut header)
+        .unwrap();
+    let min_lon_e7 = i32::from_le_bytes(header[102..106].try_into().unwrap());
+    let min_lat_e7 = i32::from_le_bytes(header[106..110].try_into().unwrap());
+    let max_lon_e7 = i32::from_le_bytes(header[110..114].try_into().unwrap());
+    let max_lat_e7 = i32::from_le_bytes(header[114..118].try_into().unwrap());
+    assert!(
+        max_lon_e7 > min_lon_e7 && max_lat_e7 > min_lat_e7,
+        "Single-cell PMTiles header bbox must have positive width and height: [{min_lon_e7}, {min_lat_e7}, {max_lon_e7}, {max_lat_e7}]"
+    );
+
+    // 2. Antimeridian-crossing cells in Fiji: header center_lon must lie near ±180° (Pacific), not 0° (Atlantic)
+    let fiji_cell = h3o::LatLng::new(-18.0, 180.0)
+        .unwrap()
+        .to_cell(h3o::Resolution::Five);
+    let fiji_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let fiji_path = fiji_tmp.to_str().unwrap().to_string();
+    H3PmtilesTiler::export_h3_features(
+        [H3Feature::new::<&str>(fiji_cell.into(), Vec::new())],
+        &fiji_path,
+    )
+    .unwrap();
+
+    File::open(&fiji_path)
+        .unwrap()
+        .read_exact(&mut header)
+        .unwrap();
+    let fiji_min_lon = i32::from_le_bytes(header[102..106].try_into().unwrap()) as f64 / 1e7;
+    let fiji_max_lon = i32::from_le_bytes(header[110..114].try_into().unwrap()) as f64 / 1e7;
+    let fiji_center_lon = i32::from_le_bytes(header[119..123].try_into().unwrap()) as f64 / 1e7;
+    assert!(
+        fiji_min_lon == -180.0 && fiji_max_lon == 180.0,
+        "Antimeridian archive bounds must be ordered and cover both pieces, got [{fiji_min_lon}, {fiji_max_lon}]"
+    );
+    assert!(
+        fiji_center_lon.abs() > 179.0,
+        "Antimeridian center_lon must be near ±180° in the Pacific, got {fiji_center_lon}"
+    );
+}
+
+#[test]
+fn legacy_world_tile_preserves_both_antimeridian_pieces() {
+    for lat in [-18.0, 52.0] {
+        let cell = h3o::LatLng::new(lat, 180.0)
+            .unwrap()
+            .to_cell(h3o::Resolution::Zero);
+        let boundary = cell.boundary();
+        let mut layer = MvtLayer::new("h3_hexagons");
+        layer.add_hexagon(
+            cell.into(),
+            &boundary,
+            -180.0,
+            180.0,
+            -85.05112878,
+            85.05112878,
+            Vec::new(),
+        );
+        let decoded = mvt_decode::decode(&layer.encode());
+        assert_eq!(decoded.len(), 1);
+        let rings = &decoded[0].rings;
+        assert_eq!(rings.len(), 2);
+        for edge in [0, 4096] {
+            assert!(rings
+                .iter()
+                .any(|r| r.iter().any(|p| p.0 < edge) && r.iter().any(|p| p.0 > edge)));
+        }
+        let shift = rings[1][0].0 - rings[0][0].0;
+        assert_eq!(shift.abs(), 4096);
+        for (a, b) in rings[0].iter().zip(&rings[1]) {
+            assert_eq!((b.0 - a.0, b.1 - a.1), (shift, 0));
+        }
+    }
+}
+
+#[test]
+fn wrapped_writer_bounds_preserve_center_after_metadata_update() {
+    for update_metadata in [false, true] {
+        let bbox = [170.0, -25.0, -178.0, -15.0];
+        let mut writer = PmtilesWriter::new(0, 0, bbox, "{}".into()).unwrap();
+        if update_metadata {
+            writer.set_metadata([175.0, -25.0, -177.0, -15.0], "{}".into());
+        }
+        writer.add_tile(0, 0, 0, b"test").unwrap();
+        let tmp = NamedTempFile::new().unwrap().into_temp_path();
+        writer.finish(&tmp).unwrap();
+        let mut header = [0u8; 127];
+        File::open(&tmp).unwrap().read_exact(&mut header).unwrap();
+        let coord = |offset| {
+            i32::from_le_bytes(header[offset..offset + 4].try_into().unwrap()) as f64 / 1e7
+        };
+        assert_eq!(coord(102), -180.0);
+        assert_eq!(coord(110), 180.0);
+        assert_eq!(coord(106), -25.0);
+        assert_eq!(coord(114), -15.0);
+        assert_eq!(coord(119), if update_metadata { 179.0 } else { 176.0 });
+        assert_eq!(coord(123), -20.0);
+    }
+}
