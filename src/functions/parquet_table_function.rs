@@ -23,24 +23,29 @@ use crate::ffi::duckdb_c::*;
 use crate::ffi::{ffi_bind_guard, ffi_init_guard, ffi_scan_guard, to_c_string};
 use crate::functions::bind_utils::lifecycle::set_table_function_init_data;
 use crate::functions::bind_utils::{
-    add_named_parameter, add_positional_parameter, delete_boxed, BindHelper, ChunkWriter,
+    add_named_parameter, add_positional_parameter, delete_boxed,
+    register_common_raster_named_parameters, BindHelper, ChunkWriter, ExecutionParams,
 };
 use crate::parquet::{H3ParquetWriter, ParquetExportConfig};
+use crate::raster::mosaic::OverlapRule;
 
 /// Bind data parsed during SQL query planning
 pub struct ParquetBindData {
     pub file_path: String,
     pub output_parquet: String,
-    pub resolution: u8,
+    pub resolutions: Vec<u8>,
     pub band: usize,
+    pub source_crs: Option<String>,
     pub custom_nodata: Option<f64>,
     pub sampling: SamplingPattern,
+    pub overlap_rule: OverlapRule,
     pub is_categorical: bool,
     pub compact: bool,
     pub compression: Compression,
     pub row_group_size: usize,
     pub bbox: Option<[f64; 4]>,
     pub geoparquet: bool,
+    pub execution: ExecutionParams,
 }
 
 /// Global execution state for the single-row generator
@@ -81,14 +86,10 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
             }
         };
 
-        let mut resolution = 8u8;
-        if let Some(r) = bind.get_named_int("resolution") {
-            if (0..=15).contains(&r) {
-                resolution = r as u8;
-            }
-        }
-
+        let resolutions = bind.parse_resolutions(8, None);
+        let source_crs = bind.parse_source_crs();
         let sampling = bind.parse_sampling();
+        let overlap_rule = bind.parse_overlap_rule();
         let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
         let custom_nodata = bind.get_named_double("nodata");
         let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
@@ -97,6 +98,9 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
             .get_named_bool("geoparquet")
             .or_else(|| bind.get_named_bool("geom"))
             .unwrap_or(false);
+        let Some(execution) = bind.parse_execution() else {
+            return;
+        };
 
         let mut compression = Compression::SNAPPY;
         if let Some(s) = bind.get_named_string("compression") {
@@ -130,16 +134,19 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
         let bind_data = Box::new(ParquetBindData {
             file_path,
             output_parquet,
-            resolution,
+            resolutions,
             band,
+            source_crs,
             custom_nodata,
             sampling,
+            overlap_rule,
             is_categorical,
             compact,
             compression,
             row_group_size,
             bbox,
             geoparquet,
+            execution,
         });
         duckdb_bind_set_bind_data(
             info,
@@ -179,11 +186,14 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
             return;
         }
 
-        let mut config = MultiResolutionConfig::new(vec![bind_data.resolution]);
+        let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
         config.band = bind_data.band;
+        config.custom_crs = bind_data.source_crs.clone();
         config.custom_nodata = bind_data.custom_nodata;
         config.sampling = bind_data.sampling.clone();
+        config.overlap_rule = bind_data.overlap_rule;
         config.bbox = bind_data.bbox;
+        bind_data.execution.apply(&mut config);
 
         let parquet_config = ParquetExportConfig {
             omit_redundant_columns: bind_data.compact,
@@ -246,21 +256,10 @@ pub unsafe fn register_parquet_table_function(con: duckdb_connection) -> Result<
     add_positional_parameter(tf, DuckDBType::Varchar);
 
     // Named parameters:
-    add_named_parameter(tf, "resolution", DuckDBType::BigInt);
-    add_named_parameter(tf, "sampling", DuckDBType::Varchar);
-    add_named_parameter(tf, "band", DuckDBType::BigInt);
-    add_named_parameter(tf, "nodata", DuckDBType::Double);
+    register_common_raster_named_parameters(tf);
     add_named_parameter(tf, "categorical", DuckDBType::Boolean);
-    add_named_parameter(tf, "compact", DuckDBType::Boolean);
     add_named_parameter(tf, "compression", DuckDBType::Varchar);
     add_named_parameter(tf, "row_group_size", DuckDBType::BigInt);
-    add_named_parameter(tf, "min_lon", DuckDBType::Double);
-    add_named_parameter(tf, "min_lat", DuckDBType::Double);
-    add_named_parameter(tf, "max_lon", DuckDBType::Double);
-    add_named_parameter(tf, "max_lat", DuckDBType::Double);
-    add_named_parameter(tf, "bbox", DuckDBType::Varchar);
-    add_named_parameter(tf, "h3_cell", DuckDBType::BigInt);
-    add_named_parameter(tf, "h3_hex", DuckDBType::Varchar);
     add_named_parameter(tf, "geoparquet", DuckDBType::Boolean);
     add_named_parameter(tf, "geom", DuckDBType::Boolean);
 

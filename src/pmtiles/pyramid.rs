@@ -83,6 +83,74 @@ pub fn cell_tile_range_mercator(
     (min_tx, max_tx, min_ty, max_ty)
 }
 
+/// Invoke `f(tx, ty)` for every tile at zoom `z` intersected by an H3 cell.
+/// Properly wraps across the antimeridian (`tx = 2^z - 1` to `tx = 0`) without
+/// enumerating every intermediate tile across the globe.
+#[inline]
+pub fn for_each_cell_tile_mercator<F>(
+    center: MercatorPoint,
+    vertices: &[MercatorPoint],
+    z: u8,
+    mut f: F,
+) where
+    F: FnMut(u32, u32),
+{
+    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center, vertices, z);
+    if min_tx == max_tx {
+        for ty in min_ty..=max_ty {
+            f(min_tx, ty);
+        }
+        return;
+    }
+
+    let mut min_raw_x = center.x;
+    let mut max_raw_x = center.x;
+    for &v in vertices {
+        min_raw_x = min_raw_x.min(v.x);
+        max_raw_x = max_raw_x.max(v.x);
+    }
+
+    if !vertices.is_empty() && max_raw_x - min_raw_x > 0.5 {
+        let count = vertices.len().min(10);
+        let mut ux0 = vertices[0].x;
+        let mut min_ux = ux0;
+        let mut max_ux = ux0;
+        for v in vertices.iter().take(count).skip(1) {
+            let mut x = v.x;
+            while x - ux0 > 0.5 {
+                x -= 1.0;
+            }
+            while x - ux0 < -0.5 {
+                x += 1.0;
+            }
+            ux0 = x;
+            min_ux = min_ux.min(x);
+            max_ux = max_ux.max(x);
+        }
+        if max_ux - min_ux < 0.5 {
+            let n_i = 1i64 << z;
+            let n_f = n_i as f64;
+            let t_min = (min_ux * n_f).floor() as i64;
+            let t_max = (max_ux * n_f).floor() as i64;
+            if t_max - t_min < n_i {
+                for t in t_min..=t_max {
+                    let tx = t.rem_euclid(n_i) as u32;
+                    for ty in min_ty..=max_ty {
+                        f(tx, ty);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    for tx in min_tx..=max_tx {
+        for ty in min_ty..=max_ty {
+            f(tx, ty);
+        }
+    }
+}
+
 /// Compute boundary vertices for an H3 cell directly into a stack-allocated array (zero heap allocations)
 #[inline(always)]
 pub fn cell_boundary_mercator(cell: CellIndex) -> ([MercatorPoint; 10], usize) {

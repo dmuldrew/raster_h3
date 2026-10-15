@@ -471,10 +471,12 @@ pub struct MvtFeature {
     pub id: u64,
     /// Properties
     pub properties: FeatureProperties,
-    /// Boundary vertices in tile-local [0, 4096] integer coordinate space (stack allocated)
-    pub polygon_x: [i32; 8],
-    pub polygon_y: [i32; 8],
+    /// Boundary vertices in tile-local [0, 4096] integer coordinate space (stack allocated; up to 10 for Class III pentagons)
+    pub polygon_x: [i32; 10],
+    pub polygon_y: [i32; 10],
     pub num_points: u8,
+    /// Translation of a second exterior ring for a seam-crossing world tile.
+    pub wrapped_x_offset: i32,
 }
 
 impl MvtFeature {
@@ -495,11 +497,75 @@ impl MvtFeature {
         let tile_y_min = (ty as f64) / n;
         let tile_span = 1.0 / n;
 
-        let count = vertices.len().min(8);
-        let mut px = [0i32; 8];
-        let mut py = [0i32; 8];
+        let count = vertices.len().min(10);
+        let mut ux = [0.0f64; 10];
+        let mut min_raw_x = f64::INFINITY;
+        let mut max_raw_x = f64::NEG_INFINITY;
         for (i, v) in vertices.iter().take(count).enumerate() {
-            px[i] = ((v.x - tile_x_min) / tile_span * extent_f).round() as i32;
+            ux[i] = v.x;
+            min_raw_x = min_raw_x.min(v.x);
+            max_raw_x = max_raw_x.max(v.x);
+        }
+
+        // Antimeridian unwrapping: if vertex Mercator x jumps across 0.0 / 1.0
+        // (and does not encircle a pole), unwrap consecutive vertices and align
+        // the ring to the target tile's branch.
+        if count > 0 && max_raw_x - min_raw_x > 0.5 {
+            let mut min_ux = ux[0];
+            let mut max_ux = ux[0];
+            for i in 1..count {
+                let mut x = ux[i];
+                while x - ux[i - 1] > 0.5 {
+                    x -= 1.0;
+                }
+                while x - ux[i - 1] < -0.5 {
+                    x += 1.0;
+                }
+                ux[i] = x;
+                min_ux = min_ux.min(x);
+                max_ux = max_ux.max(x);
+            }
+            if max_ux - min_ux < 0.5 {
+                let mid_ux = 0.5 * (min_ux + max_ux);
+                let tile_center_x = tile_x_min + 0.5 * tile_span;
+                let shift = if mid_ux - tile_center_x > 0.5 {
+                    -1.0
+                } else if mid_ux - tile_center_x < -0.5 {
+                    1.0
+                } else {
+                    0.0
+                };
+                for x in &mut ux[..count] {
+                    *x += shift;
+                }
+            } else {
+                for (i, v) in vertices.iter().take(count).enumerate() {
+                    ux[i] = v.x;
+                }
+            }
+        }
+
+        let wrapped_x_offset = if z == 0 && max_raw_x - min_raw_x > 0.5 {
+            let lo = ux[..count].iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = ux[..count]
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            if hi - lo < 0.5 && lo < 0.0 {
+                extent as i32
+            } else if hi - lo < 0.5 && hi > 1.0 {
+                -(extent as i32)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let mut px = [0i32; 10];
+        let mut py = [0i32; 10];
+        for (i, v) in vertices.iter().take(count).enumerate() {
+            px[i] = ((ux[i] - tile_x_min) / tile_span * extent_f).round() as i32;
             py[i] = ((v.y - tile_y_min) / tile_span * extent_f).round() as i32;
         }
 
@@ -509,6 +575,7 @@ impl MvtFeature {
             polygon_x: px,
             polygon_y: py,
             num_points: count as u8,
+            wrapped_x_offset,
         }
     }
 }
@@ -646,9 +713,9 @@ impl MvtLayer {
             (1.0 - (min_lat_rad.tan() + 1.0 / min_lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
         let merc_span = y_merc_bottom - y_merc_top;
 
-        let count = vertices.len().min(8);
-        let mut px = [0i32; 8];
-        let mut py = [0i32; 8];
+        let count = vertices.len().min(10);
+        let mut px = [0i32; 10];
+        let mut py = [0i32; 10];
 
         for (i, v) in vertices.iter().take(count).enumerate() {
             px[i] = ((v.lng() - tile_min_lon) / lon_span * extent_f).round() as i32;
@@ -671,6 +738,7 @@ impl MvtLayer {
             polygon_x: px,
             polygon_y: py,
             num_points: count as u8,
+            wrapped_x_offset: 0,
         });
     }
 
@@ -722,30 +790,33 @@ impl MvtLayer {
             // Encode geometry commands: MoveTo(1) -> LineTo(N-1) -> ClosePath(1) directly to geom_bytes
             geom_bytes.clear();
             if feat.num_points >= 3 {
-                let p0_x = feat.polygon_x[0];
-                let p0_y = feat.polygon_y[0];
-                write_varint(&mut geom_bytes, ((CMD_MOVE_TO & 0x7) | (1 << 3)) as u64);
-                write_varint(&mut geom_bytes, zigzag_encode(p0_x) as u64);
-                write_varint(&mut geom_bytes, zigzag_encode(p0_y) as u64);
-
-                let line_count = (feat.num_points - 1) as u32;
-                write_varint(
-                    &mut geom_bytes,
-                    ((CMD_LINE_TO & 0x7) | (line_count << 3)) as u64,
-                );
-                let mut prev_x = p0_x;
-                let mut prev_y = p0_y;
-                for i in 1..feat.num_points as usize {
-                    let px = feat.polygon_x[i];
-                    let py = feat.polygon_y[i];
-                    let dx = px - prev_x;
-                    let dy = py - prev_y;
-                    write_varint(&mut geom_bytes, zigzag_encode(dx) as u64);
-                    write_varint(&mut geom_bytes, zigzag_encode(dy) as u64);
-                    prev_x = px;
-                    prev_y = py;
+                // MVT's cursor persists across rings, including ClosePath.
+                let mut prev_x = 0;
+                let mut prev_y = 0;
+                let offsets = [0, feat.wrapped_x_offset];
+                let ring_count = if feat.wrapped_x_offset == 0 { 1 } else { 2 };
+                for &offset in &offsets[..ring_count] {
+                    let p0_x = feat.polygon_x[0] + offset;
+                    let p0_y = feat.polygon_y[0];
+                    write_varint(&mut geom_bytes, ((CMD_MOVE_TO & 0x7) | (1 << 3)) as u64);
+                    write_varint(&mut geom_bytes, zigzag_encode(p0_x - prev_x) as u64);
+                    write_varint(&mut geom_bytes, zigzag_encode(p0_y - prev_y) as u64);
+                    write_varint(
+                        &mut geom_bytes,
+                        ((CMD_LINE_TO & 0x7) | (((feat.num_points - 1) as u32) << 3)) as u64,
+                    );
+                    prev_x = p0_x;
+                    prev_y = p0_y;
+                    for i in 1..feat.num_points as usize {
+                        let px = feat.polygon_x[i] + offset;
+                        let py = feat.polygon_y[i];
+                        write_varint(&mut geom_bytes, zigzag_encode(px - prev_x) as u64);
+                        write_varint(&mut geom_bytes, zigzag_encode(py - prev_y) as u64);
+                        prev_x = px;
+                        prev_y = py;
+                    }
+                    write_varint(&mut geom_bytes, ((CMD_CLOSE_PATH & 0x7) | (1 << 3)) as u64);
                 }
-                write_varint(&mut geom_bytes, ((CMD_CLOSE_PATH & 0x7) | (1 << 3)) as u64);
             }
 
             // Serialize feature protobuf into feat_buf

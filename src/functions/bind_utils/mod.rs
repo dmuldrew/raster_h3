@@ -12,7 +12,8 @@ pub mod record_queue;
 pub mod registration;
 
 pub use bind_helper::{
-    BindHelper, CommonRasterBindParams, CommonRasterParams, ExecutionParams, OwnedValue,
+    cell_wgs84_bbox, BindHelper, CommonRasterBindParams, CommonRasterParams, ExecutionParams,
+    OwnedValue,
 };
 pub use chunk_writer::ChunkWriter;
 pub use lifecycle::{

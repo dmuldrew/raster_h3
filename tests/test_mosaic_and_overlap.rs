@@ -364,3 +364,68 @@ fn test_prefetched_mosaic_reader_early_drop() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_vrt_mixed_paths_error_handling_and_export_pipelines() {
+    use raster_h3::parquet::{H3ParquetWriter, ParquetExportConfig};
+    use raster_h3::pmtiles::tiler::H3PmtilesTiler;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let sub_dir = temp_dir.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+
+    let f_rel = sub_dir.join("rel_tile.tif");
+    let f_abs = temp_dir.path().join("abs_tile.tif");
+    create_test_geotiff(&f_rel, 20, 20, -122.45, 37.85, 0.001, 15);
+    create_test_geotiff(&f_abs, 20, 20, -122.43, 37.85, 0.001, 25);
+
+    // 1. VRT combining a relative subdirectory path and an absolute path
+    let vrt_path = temp_dir.path().join("combined.vrt");
+    let vrt_xml = format!(
+        r#"<VRTDataset rasterXSize="40" rasterYSize="20">
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">sub/rel_tile.tif</SourceFilename>
+    </SimpleSource>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">{}</SourceFilename>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>"#,
+        f_abs.display()
+    );
+    File::create(&vrt_path)
+        .unwrap()
+        .write_all(vrt_xml.as_bytes())
+        .unwrap();
+
+    let resolved = resolve_raster_sources(&vrt_path.to_string_lossy()).unwrap();
+    assert_eq!(resolved, vec![f_rel.clone(), f_abs.clone()]);
+
+    // 2. Empty VRT without <SourceFilename> returns an error
+    let empty_vrt = temp_dir.path().join("empty.vrt");
+    File::create(&empty_vrt)
+        .unwrap()
+        .write_all(b"<VRTDataset></VRTDataset>")
+        .unwrap();
+    assert!(resolve_raster_sources(&empty_vrt.to_string_lossy()).is_err());
+
+    // 3. Stream VRT directly through H3ParquetWriter and H3PmtilesTiler
+    let out_pq = temp_dir.path().join("vrt_out.parquet");
+    let out_pm = temp_dir.path().join("vrt_out.pmtiles");
+    let pq_count = H3ParquetWriter::process_raster_source_to_parquet(
+        &vrt_path,
+        &out_pq,
+        MultiResolutionConfig::new(vec![8]),
+        ParquetExportConfig::default(),
+    )
+    .unwrap();
+    let pm_count = H3PmtilesTiler::process_raster_source_to_pmtiles(
+        &vrt_path,
+        &out_pm,
+        MultiResolutionConfig::new(vec![8]),
+    )
+    .unwrap();
+    assert!(pq_count > 0);
+    assert_eq!(pq_count, pm_count);
+}

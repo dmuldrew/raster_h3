@@ -5,6 +5,7 @@
 
 pub mod features;
 pub mod mvt;
+mod overview;
 pub use crate::transcode::parquet_tiler;
 pub mod pyramid;
 pub mod tiler;

@@ -4,7 +4,7 @@
 //! and packages the resulting vector hexagons directly into a single PMTiles v3 archive.
 
 use fxhash::FxBuildHasher;
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, LatLng};
 use rayon::prelude::*;
 use serde_json::json;
 use std::borrow::Cow;
@@ -25,14 +25,15 @@ use crate::pmtiles::mvt::{
     PROP_COUNT, PROP_H3_HEX, PROP_H3_INDEX, PROP_MAX, PROP_MEAN, PROP_MIN, PROP_RESOLUTION,
     PROP_STDDEV, PROP_SUM,
 };
+use crate::pmtiles::overview::Overview;
 use crate::pmtiles::writer::PmtilesWriter;
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 // Re-export tile pyramid coordinate math and zoom calculations from pyramid module
 pub use crate::pmtiles::pyramid::{
-    cell_boundary_mercator, cell_tile_range, cell_tile_range_mercator, h3_res_for_zoom,
-    h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy, tile_xy_to_bbox,
-    zoom_to_h3_res, zooms_for_h3_res,
+    cell_boundary_mercator, cell_tile_range, cell_tile_range_mercator, for_each_cell_tile_mercator,
+    h3_res_for_zoom, h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy,
+    tile_xy_to_bbox, zoom_to_h3_res, zooms_for_h3_res,
 };
 
 // Re-export feature definitions, metadata, accumulator, and export summaries from features module
@@ -50,6 +51,7 @@ struct PreparedTileOp {
 
 /// Precomputed continuous hexagon ready for thread-safe insertion into tile buckets
 struct PreparedContinuousHex {
+    h3_index: u64,
     resolution: u8,
     accumulator: H3Accumulator,
     c_lat: f64,
@@ -59,6 +61,7 @@ struct PreparedContinuousHex {
 
 /// Precomputed categorical hexagon ready for thread-safe insertion into tile buckets
 struct PreparedCategoricalHex {
+    h3_index: u64,
     resolution: u8,
     majority_fraction: f64,
     entropy: f64,
@@ -368,6 +371,15 @@ impl H3PmtilesTiler {
 
         let mut res_stats: HashMap<u8, ResolutionAccumulatorStats, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
+        let min_res_zooms = zooms_for_h3_res(min_res, min_res);
+        let mut coarse_res_list: Vec<u8> = min_res_zooms
+            .iter()
+            .map(|&z| h3_res_for_zoom(z))
+            .filter(|&r| r < min_res)
+            .collect();
+        coarse_res_list.sort_unstable();
+        coarse_res_list.dedup();
+        let mut coarse_parents = Overview::<H3Accumulator>::new(&coarse_res_list);
 
         let mut writer = PmtilesWriter::new(
             min_zoom,
@@ -443,116 +455,31 @@ impl H3PmtilesTiler {
                     for &zoom in &zooms {
                         let optimal_res = h3_res_for_zoom(zoom);
                         if optimal_res < resolution {
-                            if let Ok(res_enum) = Resolution::try_from(optimal_res) {
-                                if let Some(parent_cell) = cell.parent(res_enum) {
-                                    let parent_h3: u64 = parent_cell.into();
-                                    let p_center: LatLng = parent_cell.into();
-                                    let p_center_merc =
-                                        MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
-                                    let (p_v_merc, p_v_count) = cell_boundary_mercator(parent_cell);
-                                    let p_vertices_merc = &p_v_merc[..p_v_count];
-
-                                    let parent_stddev = if needs_stddev {
-                                        accumulator.stddev()
-                                    } else {
-                                        0.0
-                                    };
-                                    let parent_properties = FeatureProperties::Continuous {
-                                        h3_index: parent_h3,
-                                        resolution: optimal_res,
-                                        mean: accumulator.mean(),
-                                        sum: accumulator.sum,
-                                        stddev: parent_stddev,
-                                        count: accumulator.count,
-                                        min: accumulator.min,
-                                        max: accumulator.max,
-                                    };
-
-                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(
-                                        p_center_merc,
-                                        p_vertices_merc,
-                                        zoom,
-                                    );
-                                    if min_tx == max_tx && min_ty == max_ty {
-                                        let feature = MvtFeature::from_mercator(
-                                            parent_h3,
-                                            p_vertices_merc,
-                                            zoom,
-                                            min_tx,
-                                            min_ty,
-                                            4096,
-                                            parent_properties,
-                                        );
-                                        ops.push(PreparedTileOp {
-                                            tile_key: (zoom, min_tx, min_ty),
-                                            feature,
-                                            is_parent: true,
-                                        });
-                                    } else {
-                                        for tx in min_tx..=max_tx {
-                                            for ty in min_ty..=max_ty {
-                                                let feature = MvtFeature::from_mercator(
-                                                    parent_h3,
-                                                    p_vertices_merc,
-                                                    zoom,
-                                                    tx,
-                                                    ty,
-                                                    4096,
-                                                    parent_properties.clone(),
-                                                );
-                                                ops.push(PreparedTileOp {
-                                                    tile_key: (zoom, tx, ty),
-                                                    feature,
-                                                    is_parent: true,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
+                            // Coarse overview parents are aggregated across all
+                            // contributing children using bounded spill buffers.
+                            continue;
                         }
 
-                        let (min_tx, max_tx, min_ty, max_ty) =
-                            cell_tile_range_mercator(center_merc, vertices_merc, zoom);
-                        if min_tx == max_tx && min_ty == max_ty {
+                        for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
                             let feature = MvtFeature::from_mercator(
                                 h3_index,
                                 vertices_merc,
                                 zoom,
-                                min_tx,
-                                min_ty,
+                                tx,
+                                ty,
                                 4096,
                                 properties.clone(),
                             );
                             ops.push(PreparedTileOp {
-                                tile_key: (zoom, min_tx, min_ty),
+                                tile_key: (zoom, tx, ty),
                                 feature,
                                 is_parent: false,
                             });
-                        } else {
-                            for tx in min_tx..=max_tx {
-                                for ty in min_ty..=max_ty {
-                                    let feature = MvtFeature::from_mercator(
-                                        h3_index,
-                                        vertices_merc,
-                                        zoom,
-                                        tx,
-                                        ty,
-                                        4096,
-                                        properties.clone(),
-                                    );
-                                    ops.push(PreparedTileOp {
-                                        tile_key: (zoom, tx, ty),
-                                        feature,
-                                        is_parent: false,
-                                    });
-                                }
-                            }
-                        }
+                        });
                     }
 
                     Some(PreparedContinuousHex {
+                        h3_index,
                         resolution,
                         accumulator,
                         c_lat,
@@ -567,6 +494,12 @@ impl H3PmtilesTiler {
                     .entry(hex.resolution)
                     .or_default()
                     .record(&hex.accumulator);
+
+                if hex.resolution == min_res {
+                    if let Ok(cell) = CellIndex::try_from(hex.h3_index) {
+                        coarse_parents.push(cell, &hex.accumulator)?;
+                    }
+                }
 
                 if hex.c_lon < global_min_lon {
                     global_min_lon = hex.c_lon;
@@ -595,6 +528,22 @@ impl H3PmtilesTiler {
             Ok(result) => result?,
             Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
+
+        coarse_parents.write(
+            &min_res_zooms,
+            &property_filter,
+            &mut writer,
+            |id, resolution, acc| FeatureProperties::Continuous {
+                h3_index: id,
+                resolution,
+                mean: acc.mean(),
+                sum: acc.sum,
+                stddev: if needs_stddev { acc.stddev() } else { 0.0 },
+                count: acc.count,
+                min: acc.min,
+                max: acc.max,
+            },
+        )?;
 
         accumulator.flush_all(&mut writer)?;
 
@@ -765,6 +714,15 @@ impl H3PmtilesTiler {
             HashMap::with_hasher(FxBuildHasher::default());
         let mut res_pixel_sums: HashMap<u8, f64, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher::default());
+        let min_res_zooms = zooms_for_h3_res(min_res, min_res);
+        let mut coarse_res_list: Vec<u8> = min_res_zooms
+            .iter()
+            .map(|&z| h3_res_for_zoom(z))
+            .filter(|&r| r < min_res)
+            .collect();
+        coarse_res_list.sort_unstable();
+        coarse_res_list.dedup();
+        let mut coarse_parents = Overview::<CategoricalAccumulator>::new(&coarse_res_list);
 
         let mut writer = PmtilesWriter::new(
             min_zoom,
@@ -842,110 +800,29 @@ impl H3PmtilesTiler {
                     for &zoom in &zooms {
                         let optimal_res = h3_res_for_zoom(zoom);
                         if optimal_res < resolution {
-                            if let Ok(res_enum) = Resolution::try_from(optimal_res) {
-                                if let Some(parent_cell) = cell.parent(res_enum) {
-                                    let parent_h3: u64 = parent_cell.into();
-                                    let p_center: LatLng = parent_cell.into();
-                                    let p_center_merc =
-                                        MercatorPoint::from_lat_lng(p_center.lat(), p_center.lng());
-                                    let (p_v_merc, p_v_count) = cell_boundary_mercator(parent_cell);
-                                    let p_vertices_merc = &p_v_merc[..p_v_count];
-
-                                    let parent_properties = FeatureProperties::Categorical {
-                                        h3_index: parent_h3,
-                                        resolution: optimal_res,
-                                        majority: majority_class,
-                                        majority_fraction,
-                                        distinct_classes: distinct_classes as u32,
-                                        entropy,
-                                        count: pixel_count,
-                                    };
-
-                                    let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(
-                                        p_center_merc,
-                                        p_vertices_merc,
-                                        zoom,
-                                    );
-                                    if min_tx == max_tx && min_ty == max_ty {
-                                        let feature = MvtFeature::from_mercator(
-                                            parent_h3,
-                                            p_vertices_merc,
-                                            zoom,
-                                            min_tx,
-                                            min_ty,
-                                            4096,
-                                            parent_properties,
-                                        );
-                                        ops.push(PreparedTileOp {
-                                            tile_key: (zoom, min_tx, min_ty),
-                                            feature,
-                                            is_parent: true,
-                                        });
-                                    } else {
-                                        for tx in min_tx..=max_tx {
-                                            for ty in min_ty..=max_ty {
-                                                let feature = MvtFeature::from_mercator(
-                                                    parent_h3,
-                                                    p_vertices_merc,
-                                                    zoom,
-                                                    tx,
-                                                    ty,
-                                                    4096,
-                                                    parent_properties.clone(),
-                                                );
-                                                ops.push(PreparedTileOp {
-                                                    tile_key: (zoom, tx, ty),
-                                                    feature,
-                                                    is_parent: true,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
+                            continue;
                         }
 
-                        let (min_tx, max_tx, min_ty, max_ty) =
-                            cell_tile_range_mercator(center_merc, vertices_merc, zoom);
-                        if min_tx == max_tx && min_ty == max_ty {
+                        for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
                             let feature = MvtFeature::from_mercator(
                                 h3_index,
                                 vertices_merc,
                                 zoom,
-                                min_tx,
-                                min_ty,
+                                tx,
+                                ty,
                                 4096,
                                 properties.clone(),
                             );
                             ops.push(PreparedTileOp {
-                                tile_key: (zoom, min_tx, min_ty),
+                                tile_key: (zoom, tx, ty),
                                 feature,
                                 is_parent: false,
                             });
-                        } else {
-                            for tx in min_tx..=max_tx {
-                                for ty in min_ty..=max_ty {
-                                    let feature = MvtFeature::from_mercator(
-                                        h3_index,
-                                        vertices_merc,
-                                        zoom,
-                                        tx,
-                                        ty,
-                                        4096,
-                                        properties.clone(),
-                                    );
-                                    ops.push(PreparedTileOp {
-                                        tile_key: (zoom, tx, ty),
-                                        feature,
-                                        is_parent: false,
-                                    });
-                                }
-                            }
-                        }
+                        });
                     }
 
                     Some(PreparedCategoricalHex {
+                        h3_index,
                         resolution,
                         majority_fraction,
                         entropy,
@@ -974,6 +851,12 @@ impl H3PmtilesTiler {
                     *class_map.entry(cls).or_insert(0) += cnt as u64;
                 });
 
+                if hex.resolution == min_res {
+                    if let Ok(cell) = CellIndex::try_from(hex.h3_index) {
+                        coarse_parents.push(cell, &hex.accumulator)?;
+                    }
+                }
+
                 if hex.c_lon < global_min_lon {
                     global_min_lon = hex.c_lon;
                 }
@@ -1001,6 +884,28 @@ impl H3PmtilesTiler {
             Ok(result) => result?,
             Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
+
+        coarse_parents.write(
+            &min_res_zooms,
+            &property_filter,
+            &mut writer,
+            |id, resolution, acc| {
+                let (majority, _, majority_fraction) = acc.majority();
+                FeatureProperties::Categorical {
+                    h3_index: id,
+                    resolution,
+                    majority,
+                    majority_fraction,
+                    entropy: if needs_entropy {
+                        acc.shannon_entropy()
+                    } else {
+                        0.0
+                    },
+                    distinct_classes: acc.unique_classes() as u32,
+                    count: acc.total_count,
+                }
+            },
+        )?;
 
         accumulator.flush_all(&mut writer)?;
 
