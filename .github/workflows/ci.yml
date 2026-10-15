@@ -21,7 +21,8 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            platform: linux_amd64
+            # DuckDB v1.2 tags its glibc x86_64 builds linux_amd64_gcc4
+            platform: linux_amd64_gcc4
             lib_file: libraster_h3.so
             cli_arch: linux-amd64
           - os: ubuntu-24.04-arm
@@ -127,7 +128,7 @@ jobs:
           fi
           
           chmod +x $DUCKDB_BIN || true
-          $DUCKDB_BIN -unsigned -c "LOAD '$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
+          $DUCKDB_BIN -unsigned -bail -c "LOAD '$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
           echo "Smoke test passed successfully on ${{ matrix.platform }}!"
 
       # Runs real export SQL through the CLI downloaded above. Uses the host-built

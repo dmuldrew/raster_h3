@@ -435,12 +435,6 @@ pub unsafe extern "C" fn duckdb_bind_set_bind_data(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn duckdb_bind_get_bind_data(info: duckdb_bind_info) -> *mut c_void {
-    let b = &*(info as *const MockBindContext);
-    b.bind_data
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn duckdb_bind_set_cardinality(
     info: duckdb_bind_info,
     cardinality: idx_t,
@@ -471,12 +465,6 @@ pub unsafe extern "C" fn duckdb_init_set_init_data(
     let i = &mut *(info as *mut MockInitContext);
     i.init_data = extra_data;
     i.init_destroy = destroy;
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn duckdb_init_get_init_data(info: duckdb_init_info) -> *mut c_void {
-    let i = &*(info as *const MockInitContext);
-    i.init_data
 }
 
 #[no_mangle]
@@ -812,9 +800,12 @@ pub unsafe extern "C" fn duckdb_query(
 pub unsafe extern "C" fn duckdb_destroy_result(_result: *mut duckdb_result) {}
 
 #[no_mangle]
-pub unsafe extern "C" fn duckdb_row_count(_result: *mut duckdb_result) -> idx_t {
-    0
+pub unsafe extern "C" fn duckdb_fetch_chunk(_result: duckdb_result) -> duckdb_data_chunk {
+    ptr::null_mut()
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_destroy_data_chunk(_chunk: *mut duckdb_data_chunk) {}
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_column_count(_result: *mut duckdb_result) -> idx_t {
@@ -830,8 +821,95 @@ pub unsafe extern "C" fn duckdb_result_error(_result: *mut duckdb_result) -> *co
 // 1. Extension Initialization & Function Registration Tests
 // =============================================================================
 
+/// Points the extension's DuckDB C API table at the mocks above.
+fn install_mock_api() {
+    static TABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let table = *TABLE.get_or_init(|| {
+        let mut table = vec![ptr::null::<c_void>(); API_TABLE_LEN];
+        macro_rules! mock {
+            ($($name:ident,)*) => {
+                $(table[api_index::$name] = $name as *const c_void;)*
+            };
+        }
+        mock! {
+        duckdb_bind_add_result_column,
+        duckdb_bind_get_named_parameter,
+        duckdb_bind_get_parameter,
+        duckdb_bind_get_parameter_count,
+        duckdb_bind_set_bind_data,
+        duckdb_bind_set_cardinality,
+        duckdb_bind_set_error,
+        duckdb_column_count,
+        duckdb_connect,
+        duckdb_create_logical_type,
+        duckdb_create_scalar_function,
+        duckdb_create_table_function,
+        duckdb_data_chunk_get_column_count,
+        duckdb_data_chunk_get_size,
+        duckdb_data_chunk_get_vector,
+        duckdb_data_chunk_set_size,
+        duckdb_destroy_data_chunk,
+        duckdb_destroy_logical_type,
+        duckdb_destroy_result,
+        duckdb_destroy_scalar_function,
+        duckdb_destroy_table_function,
+        duckdb_destroy_value,
+        duckdb_disconnect,
+        duckdb_fetch_chunk,
+        duckdb_free,
+        duckdb_function_get_bind_data,
+        duckdb_function_get_init_data,
+        duckdb_function_get_local_init_data,
+        duckdb_function_set_error,
+        duckdb_get_bool,
+        duckdb_get_double,
+        duckdb_get_int64,
+        duckdb_get_uint64,
+        duckdb_get_varchar,
+        duckdb_init_get_bind_data,
+        duckdb_init_get_column_count,
+        duckdb_init_get_column_index,
+        duckdb_init_set_error,
+        duckdb_init_set_init_data,
+        duckdb_library_version,
+        duckdb_logical_type_get_alias,
+        duckdb_logical_type_set_alias,
+        duckdb_query,
+        duckdb_register_scalar_function,
+        duckdb_register_table_function,
+        duckdb_result_error,
+        duckdb_scalar_function_add_parameter,
+        duckdb_scalar_function_set_error,
+        duckdb_scalar_function_set_function,
+        duckdb_scalar_function_set_name,
+        duckdb_scalar_function_set_return_type,
+        duckdb_table_function_add_named_parameter,
+        duckdb_table_function_add_parameter,
+        duckdb_table_function_set_bind,
+        duckdb_table_function_set_function,
+        duckdb_table_function_set_init,
+        duckdb_table_function_set_local_init,
+        duckdb_table_function_set_name,
+        duckdb_table_function_supports_projection_pushdown,
+        duckdb_validity_row_is_valid,
+        duckdb_validity_set_row_invalid,
+        duckdb_validity_set_row_valid,
+        duckdb_validity_set_row_validity,
+        duckdb_vector_assign_string_element,
+        duckdb_vector_assign_string_element_len,
+        duckdb_vector_ensure_validity_writable,
+        duckdb_vector_get_data,
+        duckdb_vector_get_validity,
+        duckdb_vector_size,
+        }
+        Box::leak(table.into_boxed_slice()).as_ptr() as usize
+    });
+    unsafe { install_api_table(table as *const c_void) };
+}
+
 #[test]
 fn test_extension_init_and_registration_completeness() {
+    install_mock_api();
     let ver = unsafe { CStr::from_ptr(raster_h3::raster_h3_version()).to_string_lossy() };
     assert_eq!(ver, "v0.0.1");
 
@@ -930,6 +1008,7 @@ fn test_extension_init_and_registration_completeness() {
 
 #[test]
 fn test_all_scalar_functions_and_null_propagation() {
+    install_mock_api();
     let valid_cell: u64 = 0x8828308281fffff; // Res 8 SF
     let invalid_cell: u64 = 0;
 
@@ -1122,6 +1201,7 @@ fn test_all_scalar_functions_and_null_propagation() {
 
 #[test]
 fn test_continuous_table_function_full_scan_and_projection_pushdown() {
+    install_mock_api();
     let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
         .origin(-122.45, 37.80)
         .pixel_size(0.001)
@@ -1229,6 +1309,7 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
 
 #[test]
 fn test_categorical_table_function_wide_and_long_formats() {
+    install_mock_api();
     let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
         .origin(-122.45, 37.80)
         .pixel_size(0.001)
@@ -1394,6 +1475,7 @@ fn test_categorical_table_function_wide_and_long_formats() {
 
 #[test]
 fn test_export_table_functions_with_crs_override() {
+    install_mock_api();
     // Create an unreferenced GeoTIFF (no GeoKeys) so `crs := 'EPSG:4326'` is required
     let (_tmp, tif_path) = TestGeoTiffBuilder::new(24, 24)
         .origin(-122.45, 37.80)
