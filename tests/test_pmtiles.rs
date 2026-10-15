@@ -1065,6 +1065,27 @@ fn test_pmtiles_coarse_zoom_parent_aggregates_all_children() {
     };
     assert!((stddev - (5600.0_f64 / 13.0).sqrt()).abs() < 1e-10);
 
+    // Header bounds must cover the overview parent polygon, not just the detail cells.
+    let header_deg =
+        |off: usize| i32::from_le_bytes(full[off..off + 4].try_into().unwrap()) as f64 / 1e7;
+    let (min_lon, min_lat, max_lon, max_lat) = (
+        header_deg(102),
+        header_deg(106),
+        header_deg(110),
+        header_deg(114),
+    );
+    for v in expected_parent.boundary().iter() {
+        assert!(
+            v.lng() >= min_lon - 1e-6
+                && v.lng() <= max_lon + 1e-6
+                && v.lat() >= min_lat - 1e-6
+                && v.lat() <= max_lat + 1e-6,
+            "overview vertex ({}, {}) outside header bbox [{min_lon}, {min_lat}, {max_lon}, {max_lat}]",
+            v.lng(),
+            v.lat()
+        );
+    }
+
     // 2. Categorical: child 0 has class 1 (count 1), children 1..7 have class 2 (count 10 each -> 60 total)
     // If only child 0 were used, majority would be 1 and count would be 1.0; merged parent has majority 2 and count 61.0!
     let cat_records: Vec<MultiCategoricalRecord> = children

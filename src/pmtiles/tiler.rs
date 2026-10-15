@@ -482,6 +482,7 @@ impl H3PmtilesTiler {
             &min_res_zooms,
             &property_filter,
             &mut writer,
+            &mut bounds_acc,
             |id, resolution, acc| FeatureProperties::Continuous {
                 h3_index: id,
                 resolution,
@@ -809,6 +810,7 @@ impl H3PmtilesTiler {
             &min_res_zooms,
             &property_filter,
             &mut writer,
+            &mut bounds_acc,
             |id, resolution, acc| {
                 let (majority, _, majority_fraction) = acc.majority();
                 FeatureProperties::Categorical {
