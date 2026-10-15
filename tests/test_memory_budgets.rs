@@ -128,6 +128,10 @@ fn compaction_limit_decomposes_groups_without_losing_or_duplicating_samples() {
 
     let mut config = MultiResolutionConfig::new(vec![8]);
     config.compact_h3_children = true;
+    // Pending groups grow with the number of chunks aggregated per wave, which
+    // otherwise follows the host's core count. Pin it so the limit below is
+    // exceeded on small CI runners too.
+    config.aggregation_workers = Some(8);
     let unbounded = run(file.path(), &config);
     // The limit is opt-in; by default compaction is never cut short.
     assert_eq!(unbounded.forced_compaction_flushes, 0);
