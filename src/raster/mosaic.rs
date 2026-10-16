@@ -531,23 +531,20 @@ impl MosaicReader {
                     chunk_bounds.width as f64,
                     chunk_bounds.height as f64,
                 );
-                let c_min_lon = bounds[0];
                 let c_min_lat = bounds[1];
-                let c_max_lon = bounds[2];
                 let c_max_lat = bounds[3];
 
                 let mut has_overlap = false;
                 if tiles.len() > 1 && overlap_rule != OverlapRule::Average {
+                    let cb = crs_trans.rejection_bounds(bounds);
                     for (other_idx, other_tile) in tiles.iter().enumerate() {
                         if other_idx == tile_idx {
                             continue;
                         }
-                        let ob = &other_tile.bounds_wgs84;
-                        if !(c_max_lon < ob[0]
-                            || c_min_lon > ob[2]
-                            || c_max_lat < ob[1]
-                            || c_min_lat > ob[3])
-                        {
+                        let ob = other_tile
+                            .crs_transformer
+                            .rejection_bounds(other_tile.bounds_wgs84);
+                        if rect_intersects_bbox(&cb, &ob) {
                             has_overlap = true;
                             break;
                         }

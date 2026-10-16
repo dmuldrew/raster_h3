@@ -93,6 +93,20 @@ fn fast_path_accepts(tokens: &std::collections::HashMap<String, String>, keys: &
     })
 }
 
+/// Parse an optional numeric token; returns `Some(default)` when absent and
+/// `None` when present but not a finite `f64`, so malformed numbers never
+/// silently fall back to defaults on a fast path.
+fn parse_opt_f64(
+    tokens: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: f64,
+) -> Option<f64> {
+    match tokens.get(key) {
+        Some(v) => v.parse::<f64>().ok().filter(|x| x.is_finite()),
+        None => Some(default),
+    }
+}
+
 /// Helper to check if a +towgs84 parameter list is effectively all-zero (e.g., "0,0,0" or "0,0,0,0,0,0,0").
 fn is_all_zero_towgs84(val: &str) -> bool {
     let mut count = 0;
@@ -219,6 +233,22 @@ impl AlbersConicFast {
         let ellps = tokens.get("ellps").map(|s| s.as_str());
         let datum = tokens.get("datum").map(|s| s.as_str());
 
+        // If an explicit a, rf, or f is present but not a valid finite number, reject fast path
+        if tokens
+            .get("a")
+            .is_some_and(|v| v.parse::<f64>().ok().is_none_or(|x| !x.is_finite()))
+            || tokens
+                .get("rf")
+                .is_some_and(|v| v.parse::<f64>().ok().is_none_or(|x| !x.is_finite()))
+            || tokens.get("f").is_some_and(|v| {
+                v.parse::<f64>()
+                    .ok()
+                    .is_none_or(|x| !x.is_finite() || x == 0.0)
+            })
+        {
+            return None;
+        }
+
         let a_val = tokens.get("a").and_then(|v| v.parse::<f64>().ok());
         let rf_val = tokens
             .get("rf")
@@ -258,28 +288,31 @@ impl AlbersConicFast {
             return None;
         }
 
-        let lat_1 = tokens.get("lat_1").and_then(|v| v.parse::<f64>().ok());
-        let lat_2 = tokens.get("lat_2").and_then(|v| v.parse::<f64>().ok());
-        let lat_0 = tokens.get("lat_0").and_then(|v| v.parse::<f64>().ok());
-        let lon_0 = tokens.get("lon_0").and_then(|v| v.parse::<f64>().ok());
-        let x_0 = tokens
-            .get("x_0")
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let y_0 = tokens
-            .get("y_0")
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
+        let l1 = tokens
+            .get("lat_1")?
+            .parse::<f64>()
+            .ok()
+            .filter(|x| x.is_finite() && (-90.0..=90.0).contains(x))?;
+        let l2 = match tokens.get("lat_2") {
+            Some(v) => v
+                .parse::<f64>()
+                .ok()
+                .filter(|x| x.is_finite() && (-90.0..=90.0).contains(x))?,
+            None => l1,
+        };
+        let l0_val = parse_opt_f64(tokens, "lat_0", 0.0).filter(|x| (-90.0..=90.0).contains(x))?;
+        let ln0 = tokens
+            .get("lon_0")?
+            .parse::<f64>()
+            .ok()
+            .filter(|x| x.is_finite())?;
+        let x_0 = parse_opt_f64(tokens, "x_0", 0.0)?;
+        let y_0 = parse_opt_f64(tokens, "y_0", 0.0)?;
 
-        let l2_val = lat_2.or(lat_1);
-        let l0_val = lat_0.unwrap_or(0.0);
-
-        match (lat_1, l2_val, lon_0) {
-            (Some(l1), Some(l2), Some(ln0)) => {
-                Some(Self::with_offsets(l1, l2, l0_val, ln0, x_0, y_0))
-            }
-            _ => None,
-        }
+        let albers = Self::with_offsets(l1, l2, l0_val, ln0, x_0, y_0);
+        // Symmetric parallels (phi1 == -phi2) yield n == 0 (cylindrical limit);
+        // route that degenerate case to proj4rs rather than dividing by zero.
+        (albers.n.abs() >= 1e-10 && albers.rho0.is_finite()).then_some(albers)
     }
 
     /// Parse PROJ string parameters for an Albers Equal Area projection (+proj=aea)
@@ -541,6 +574,14 @@ impl CrsTransformer {
                 )));
             }
         }
+        if let Some(datum) = tokens.get("datum") {
+            if !matches!(datum.as_str(), "wgs84" | "nad83" | "grs80") {
+                return Err(RasterH3Error::CrsError(format!(
+                    "Unsupported datum '+datum={}' (requires datum shift or grid shift not supported without PROJ grids)",
+                    datum
+                )));
+            }
+        }
 
         // +init=epsg:NNNN -> treat as EPSG code
         if let Some(init_val) = tokens.get("init") {
@@ -562,14 +603,14 @@ impl CrsTransformer {
                         tokens.get("ellps").map(|s| s.as_str()),
                         None | Some("wgs84") | Some("grs80")
                     );
-                    let valid_a = tokens
-                        .get("a")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .is_none_or(|a| (a - WGS84_A).abs() < 1.0);
-                    let valid_rf = tokens
-                        .get("rf")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .is_none_or(|rf| (rf - 298.257).abs() < 0.01);
+                    let valid_a = tokens.get("a").is_none_or(|v| {
+                        v.parse::<f64>()
+                            .is_ok_and(|a| a.is_finite() && (a - WGS84_A).abs() < 1.0)
+                    });
+                    let valid_rf = tokens.get("rf").is_none_or(|v| {
+                        v.parse::<f64>()
+                            .is_ok_and(|rf| rf.is_finite() && (rf - 298.257).abs() < 0.01)
+                    });
 
                     let keys = ["datum", "ellps", "a", "rf"];
                     if valid_datum
@@ -589,40 +630,44 @@ impl CrsTransformer {
                     let ellps_val = tokens.get("ellps").map(|s| s.as_str());
 
                     let a_is_6378137 = a_val.is_some_and(|a| (a - 6378137.0).abs() < 1e-3);
-                    let b_is_6378137 = b_val.is_some_and(|b| (b - 6378137.0).abs() < 1e-3);
-                    let absent_rf_f_b = rf_val.is_none() && f_val.is_none() && b_val.is_none();
+                    let has_b = tokens.contains_key("b");
+                    let b_is_6378137 = !has_b || b_val.is_some_and(|b| (b - 6378137.0).abs() < 1e-3);
+                    let absent_rf_f_b = rf_val.is_none() && f_val.is_none() && !has_b;
                     let ellps_sphere_or_absent = matches!(ellps_val, None | Some("sphere"));
 
-                    let is_sphere_6378137 =
-                        a_is_6378137 && (b_is_6378137 || (absent_rf_f_b && ellps_sphere_or_absent));
+                    let is_sphere_6378137 = a_is_6378137
+                        && ((has_b && b_is_6378137)
+                            || (absent_rf_f_b && ellps_sphere_or_absent));
 
-                    let lon_0 = tokens
-                        .get("lon_0")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    let x_0 = tokens
-                        .get("x_0")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    let y_0 = tokens
-                        .get("y_0")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    let k = tokens
-                        .get("k")
-                        .or_else(|| tokens.get("k_0"))
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(1.0);
-                    let lat_ts = tokens
-                        .get("lat_ts")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(0.0);
+                    let k_opt = match (tokens.get("k"), tokens.get("k_0")) {
+                        (Some(v), None) | (None, Some(v)) => {
+                            v.parse::<f64>().ok().filter(|x| x.is_finite())
+                        }
+                        (Some(v1), Some(v2)) => {
+                            let k1 = v1.parse::<f64>().ok().filter(|x| x.is_finite());
+                            let k2 = v2.parse::<f64>().ok().filter(|x| x.is_finite());
+                            k1.zip(k2)
+                                .and_then(|(a, b)| ((a - b).abs() < 1e-12).then_some(a))
+                        }
+                        (None, None) => Some(1.0),
+                    };
 
-                    let is_standard_merc = lon_0.abs() < 1e-6
-                        && x_0.abs() < 1e-6
-                        && y_0.abs() < 1e-6
-                        && (k - 1.0).abs() < 1e-6
-                        && lat_ts.abs() < 1e-6;
+                    let is_standard_merc = match (
+                        parse_opt_f64(&tokens, "lon_0", 0.0),
+                        parse_opt_f64(&tokens, "x_0", 0.0),
+                        parse_opt_f64(&tokens, "y_0", 0.0),
+                        k_opt,
+                        parse_opt_f64(&tokens, "lat_ts", 0.0),
+                    ) {
+                        (Some(lon_0), Some(x_0), Some(y_0), Some(k), Some(lat_ts)) => {
+                            lon_0.abs() < 1e-6
+                                && x_0.abs() < 1e-6
+                                && y_0.abs() < 1e-6
+                                && (k - 1.0).abs() < 1e-6
+                                && lat_ts.abs() < 1e-6
+                        }
+                        _ => false,
+                    };
 
                     let keys = [
                         "a", "b", "ellps", "lon_0", "x_0", "y_0", "k", "k_0", "lat_ts",
@@ -1001,10 +1046,14 @@ impl CrsTransformer {
             }
         }
 
-        // Longitude is affine in pixel space here, so unwrapped corners bound it
-        // exactly. Wrapped corners cannot distinguish a >180 degree span (e.g. a
-        // 0..360 grid) from one that does not cross the antimeridian.
-        if matches!(self, Self::Wgs84Identity | Self::WebMercatorFast) {
+        // Longitude is affine in pixel space for Wgs84Identity/WebMercatorFast and
+        // monotone in polar angle around the cone apex for AlbersConic (when the apex
+        // is outside the chunk), so unwrapped corner longitudes detect antimeridian
+        // crossings even when wrapped corners span <= 180 degrees.
+        if matches!(
+            self,
+            Self::Wgs84Identity | Self::WebMercatorFast | Self::AlbersConic(_)
+        ) {
             let lons: Vec<f64> = corners
                 .iter()
                 .filter_map(|&(x, y)| self.transform_point(x, y).ok().map(|p| p.0))
@@ -1012,11 +1061,11 @@ impl CrsTransformer {
             if lons.len() == corners.len() && lons.iter().all(|v| v.is_finite()) {
                 let lo = lons.iter().copied().fold(f64::INFINITY, f64::min);
                 let hi = lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                (min_lon, max_lon) = if lo < -180.0 || hi > 180.0 {
-                    (-180.0, 180.0)
-                } else {
-                    (lo, hi)
-                };
+                if lo < -180.0 || hi > 180.0 {
+                    (min_lon, max_lon) = (-180.0, 180.0);
+                } else if matches!(self, Self::Wgs84Identity | Self::WebMercatorFast) {
+                    (min_lon, max_lon) = (lo, hi);
+                }
             }
         }
 
@@ -1704,5 +1753,30 @@ mod tests {
             (lon - 2.0).abs() < 1e-9 && (lat - 45.0).abs() < 1e-9,
             "({lon}, {lat})"
         );
+    }
+
+    #[test]
+    fn test_symmetric_albers_equal_and_opposite_parallels_rejected_without_nan() {
+        // Symmetric standard parallels (lat_1 = -lat_2) have cone constant n = 0
+        // (ProjErrConicLatEqual in PROJ). Fast path must reject it so proj4rs
+        // reports CrsError rather than dividing by zero and returning NaN.
+        let s = "+proj=aea +lat_1=-20 +lat_2=20 +lat_0=0 +lon_0=0 +datum=WGS84 +units=m +no_defs";
+        assert!(CrsTransformer::from_proj_string(s).is_err());
+    }
+
+    #[test]
+    fn test_malformed_numeric_fast_path_parameters_and_unsupported_datums_rejected() {
+        for bad in [
+            "+proj=longlat +datum=WGS84 +a=not_a_number",
+            "+proj=longlat +datum=WGS84 +rf=not_a_number",
+            "+proj=merc +a=6378137 +b=6378137 +lon_0=not_a_number",
+            "+proj=merc +a=6378137 +b=6378137 +k=not_a_number",
+            "+proj=aea +lat_1=29.5 +lat_2=45.5 +lon_0=-96 +datum=WGS84 +x_0=not_a_number",
+            "+proj=utm +zone=10 +datum=NAD27 +units=m",
+            "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +datum=OSGB36 +units=m",
+        ] {
+            let res = CrsTransformer::from_proj_string(bad);
+            assert!(res.is_err(), "Expected CrsError for '{bad}'");
+        }
     }
 }
