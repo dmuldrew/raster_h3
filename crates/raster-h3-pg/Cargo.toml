@@ -12,6 +12,12 @@ description = "PostgreSQL extension (Set-Returning Functions and H3 scalar funct
 name = "raster_h3_pg"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# Build the loadable PostgreSQL module (magic block, text/bytea functions, SRFs).
+# Needs the target server's major version: RASTER_H3_PG_MAJOR=<n> or pg_config on PATH.
+pg-extension = []
+
 [dependencies]
 raster-h3-core = { path = "../raster-h3-core" }
 h3o.workspace = true

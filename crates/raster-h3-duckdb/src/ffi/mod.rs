@@ -26,35 +26,7 @@ pub unsafe fn from_duckdb_string(ptr: *mut c_char) -> Option<String> {
     Some(s)
 }
 
-/// Extracts a human-readable panic message from a panic payload while ensuring
-/// payload disposal does not escape with a secondary panic across FFI boundaries.
-pub fn safe_panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    let msg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "Unknown panic payload".to_string()
-        }
-    }));
-
-    // Dispose of the payload within a catch boundary; if payload's Drop panics, forget secondary payload
-    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
-    {
-        std::mem::forget(secondary);
-    }
-
-    msg_res.unwrap_or_else(|secondary| {
-        std::mem::forget(secondary);
-        "Unknown panic (payload downcast failed)".to_string()
-    })
-}
-
-/// Extracts a human-readable panic message from a panic payload.
-pub fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    safe_panic_payload_to_string(payload)
-}
+pub use raster_h3_core::error::{panic_payload_to_string, safe_panic_payload_to_string};
 
 /// Write error message to stderr without aborting on BrokenPipe or other stderr write errors.
 pub fn safe_eprintln(prefix: &str, msg: &str) {

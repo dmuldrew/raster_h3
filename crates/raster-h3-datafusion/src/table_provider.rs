@@ -80,6 +80,57 @@ pub trait TableProvider: Send + Sync {
     ) -> Result<Box<dyn ExecutionPlan>>;
 }
 
+/// Apply a filter common to both providers (`MinCount`, `Bbox`, `Resolution`) by narrowing
+/// `config`. Returns `false` when the filter excludes every row. Filters only ever narrow the
+/// table: a `Resolution` outside the configured set or a `Bbox` disjoint from the configured
+/// one yields an empty scan rather than widening it.
+fn apply_shared_filter(config: &mut MultiResolutionConfig, filter: &FilterPredicate) -> bool {
+    match *filter {
+        FilterPredicate::MinCount(v) => {
+            config.min_count = Some(config.min_count.map_or(v, |c| c.max(v)));
+            true
+        }
+        FilterPredicate::Resolution(r) => {
+            if config.resolutions.contains(&r) {
+                config.resolutions = vec![r];
+                true
+            } else {
+                false
+            }
+        }
+        FilterPredicate::Bbox(bbox) => match config.bbox {
+            None => {
+                config.bbox = Some(bbox);
+                true
+            }
+            Some(current) => match intersect_bbox(current, bbox) {
+                Some(narrowed) => {
+                    config.bbox = Some(narrowed);
+                    true
+                }
+                None => false,
+            },
+        },
+        _ => true,
+    }
+}
+
+/// Intersect two `[min_lon, min_lat, max_lon, max_lat]` boxes; `None` when disjoint.
+/// Antimeridian-crossing boxes (`min_lon > max_lon`) keep `current`: `Bbox` pushdown is
+/// `Inexact`, so the caller still re-applies the predicate.
+fn intersect_bbox(current: [f64; 4], other: [f64; 4]) -> Option<[f64; 4]> {
+    if current[0] > current[2] || other[0] > other[2] {
+        return Some(current);
+    }
+    let out = [
+        current[0].max(other[0]),
+        current[1].max(other[1]),
+        current[2].min(other[2]),
+        current[3].min(other[3]),
+    ];
+    (out[0] <= out[2] && out[1] <= out[3]).then_some(out)
+}
+
 /// Physical execution plan for continuous H3 raster aggregation.
 pub struct ContinuousRasterExec {
     paths: Vec<PathBuf>,
@@ -88,6 +139,8 @@ pub struct ContinuousRasterExec {
     schema: Arc<ColumnSchema>,
     batch_size: usize,
     limit: Option<usize>,
+    /// Pushed-down filters exclude every row (e.g. an unconfigured resolution).
+    empty: bool,
 }
 
 impl ExecutionPlan for ContinuousRasterExec {
@@ -96,6 +149,9 @@ impl ExecutionPlan for ContinuousRasterExec {
     }
 
     fn execute(&self) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + Send>> {
+        if self.empty {
+            return Ok(Box::new(std::iter::empty()));
+        }
         let reader = ContinuousBatchReader::open(
             &self.paths,
             &self.config,
@@ -231,24 +287,16 @@ impl TableProvider for ContinuousRasterTableProvider {
         limit: Option<usize>,
     ) -> Result<Box<dyn ExecutionPlan>> {
         let mut config = self.config.clone();
+        let mut empty = false;
         for f in filters {
             match *f {
-                FilterPredicate::MinCount(v) => {
-                    config.min_count = Some(config.min_count.map_or(v, |c| c.max(v)));
-                }
                 FilterPredicate::MinMean(v) => {
                     config.min_mean = Some(config.min_mean.map_or(v, |c| c.max(v)));
                 }
                 FilterPredicate::MaxMean(v) => {
                     config.max_mean = Some(config.max_mean.map_or(v, |c| c.min(v)));
                 }
-                FilterPredicate::Bbox(bbox) => {
-                    config.bbox = Some(bbox);
-                }
-                FilterPredicate::Resolution(r) if r <= 15 => {
-                    config.resolutions = vec![r];
-                }
-                _ => {}
+                _ => empty |= !apply_shared_filter(&mut config, f),
             }
         }
 
@@ -265,6 +313,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             schema,
             batch_size: self.batch_size,
             limit,
+            empty,
         }))
     }
 }
@@ -278,6 +327,8 @@ pub struct CategoricalRasterExec {
     schema: Arc<ColumnSchema>,
     batch_size: usize,
     limit: Option<usize>,
+    /// Pushed-down filters exclude every row (e.g. an unconfigured resolution).
+    empty: bool,
 }
 
 impl ExecutionPlan for CategoricalRasterExec {
@@ -286,6 +337,9 @@ impl ExecutionPlan for CategoricalRasterExec {
     }
 
     fn execute(&self) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + Send>> {
+        if self.empty {
+            return Ok(Box::new(std::iter::empty()));
+        }
         let reader = CategoricalBatchReader::open(
             &self.paths,
             &self.config,
@@ -400,22 +454,14 @@ impl TableProvider for CategoricalRasterTableProvider {
         limit: Option<usize>,
     ) -> Result<Box<dyn ExecutionPlan>> {
         let mut config = self.config.clone();
+        let mut empty = false;
         for f in filters {
             match *f {
-                FilterPredicate::MinCount(v) => {
-                    config.min_count = Some(config.min_count.map_or(v, |c| c.max(v)));
-                }
                 FilterPredicate::MinMajorityFraction(v) => {
                     config.min_majority_fraction =
                         Some(config.min_majority_fraction.map_or(v, |c| c.max(v)));
                 }
-                FilterPredicate::Bbox(bbox) => {
-                    config.bbox = Some(bbox);
-                }
-                FilterPredicate::Resolution(r) if r <= 15 => {
-                    config.resolutions = vec![r];
-                }
-                _ => {}
+                _ => empty |= !apply_shared_filter(&mut config, f),
             }
         }
 
@@ -433,6 +479,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             schema,
             batch_size: self.batch_size,
             limit,
+            empty,
         }))
     }
 }

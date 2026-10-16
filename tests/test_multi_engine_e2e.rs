@@ -128,7 +128,10 @@ fn assert_categorical_maps_equal(
         let act = actual
             .get(cell)
             .unwrap_or_else(|| panic!("{engine_name}: missing categorical H3 cell {cell:#x}"));
-        assert_eq!(exp.resolution, act.resolution, "{engine_name}: res mismatch");
+        assert_eq!(
+            exp.resolution, act.resolution,
+            "{engine_name}: res mismatch"
+        );
         assert_eq!(
             exp.majority_class, act.majority_class,
             "{engine_name}: majority_class mismatch for {cell:#x}"
@@ -429,11 +432,7 @@ fn test_cross_engine_continuous_e2e_parity() {
 
     // Verify projection + limit pushdown on DataFusion TableProvider
     let pushed_plan = provider
-        .scan(
-            Some(&[0, 2, 4]),
-            &[FilterPredicate::Resolution(8)],
-            Some(2),
-        )
+        .scan(Some(&[0, 2, 4]), &[FilterPredicate::Resolution(8)], Some(2))
         .unwrap();
     let pushed_batches: Vec<_> = pushed_plan.execute().unwrap().collect();
     let pushed_rows: usize = pushed_batches
@@ -626,11 +625,7 @@ print(json.dumps(d))
             let lng_d = pg_h3_to_lng(&mut fc1);
             let lat = datum_to_float8(lat_d);
             let lng = datum_to_float8(lng_d);
-            assert!(
-                !fc1.isnull
-                    && (37.0..38.5).contains(&lat)
-                    && (-123.0..-122.0).contains(&lng)
-            );
+            assert!(!fc1.isnull && (37.0..38.5).contains(&lat) && (-123.0..-122.0).contains(&lng));
 
             let mut fc_parent = FunctionCallInfoBaseData::with_args(&[
                 NullableDatum {

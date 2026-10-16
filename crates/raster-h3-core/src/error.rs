@@ -94,4 +94,3 @@ pub fn safe_panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> S
 pub fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     safe_panic_payload_to_string(payload)
 }
-

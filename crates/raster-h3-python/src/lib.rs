@@ -64,6 +64,16 @@ impl Default for PyScanConfig {
     }
 }
 
+/// Boxed streaming iterator of [`RecordBatch`]es.
+pub type BatchIter = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
+
+/// Pull-based batch reader handed to Python, which wraps each batch as its own
+/// single-batch Arrow stream so Polars can consume results incrementally.
+pub struct PyBatchReader {
+    schema: Arc<ColumnSchema>,
+    iter: BatchIter,
+}
+
 /// Scanner backing the Python `RasterH3Scanner` object (`__arrow_c_schema__` and `__arrow_c_stream__`).
 #[derive(Debug, Clone)]
 pub struct PyRasterScanner {
@@ -122,8 +132,8 @@ impl PyRasterScanner {
         Ok(ArrowSchema::from_column_schema(&schema))
     }
 
-    /// Export an [`ArrowArrayStream`] struct for `__arrow_c_stream__`.
-    pub fn to_arrow_c_stream(&self) -> Result<ArrowArrayStream> {
+    /// Open the streaming [`RecordBatch`] iterator for this scan.
+    pub fn batch_iter(&self) -> Result<(Arc<ColumnSchema>, BatchIter)> {
         let paths = resolve_raster_sources(&self.config.path)?;
         let res = if self.config.resolutions.is_empty() {
             vec![8]
@@ -145,8 +155,7 @@ impl PyRasterScanner {
                 self.config.batch_size,
                 self.config.limit,
             )?;
-            let schema = reader.schema();
-            Ok(ArrowArrayStream::from_iterator(schema, reader))
+            Ok((reader.schema(), Box::new(reader)))
         } else {
             let reader = CategoricalBatchReader::open(
                 &paths,
@@ -156,9 +165,14 @@ impl PyRasterScanner {
                 self.config.batch_size,
                 self.config.limit,
             )?;
-            let schema = reader.schema();
-            Ok(ArrowArrayStream::from_iterator(schema, reader))
+            Ok((reader.schema(), Box::new(reader)))
         }
+    }
+
+    /// Export an [`ArrowArrayStream`] struct for `__arrow_c_stream__`.
+    pub fn to_arrow_c_stream(&self) -> Result<ArrowArrayStream> {
+        let (schema, iter) = self.batch_iter()?;
+        Ok(ArrowArrayStream::from_iterator(schema, iter))
     }
 
     /// Collect all batches into a columnar JSON object `{"col_name": [v1, v2, ...], ...}`.
@@ -272,7 +286,7 @@ unsafe fn build_py_scan_config(
             .filter(|c| !c.is_empty())
             .collect::<Vec<_>>()
     });
-    let limit_opt = if limit > 0 {
+    let limit_opt = if limit >= 0 {
         Some(limit as usize)
     } else {
         None
@@ -404,6 +418,106 @@ pub unsafe extern "C" fn raster_h3_py_create_arrow_stream(
 pub unsafe extern "C" fn raster_h3_py_free_arrow_stream(ptr: *mut ArrowArrayStream) {
     if !ptr.is_null() {
         drop(Box::from_raw(ptr));
+    }
+}
+
+/// Open a [`PyBatchReader`] for incremental consumption (`batch_size` <= 0 uses the default).
+/// Free with `raster_h3_py_free_batch_reader`.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_open_batch_reader(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    batch_size: i64,
+    out_err: *mut *mut c_char,
+) -> *mut PyBatchReader {
+    let res =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<PyBatchReader> {
+            let mut cfg = build_py_scan_config(
+                path,
+                resolutions,
+                categorical,
+                format,
+                crs,
+                has_nodata,
+                nodata,
+                bbox,
+                columns,
+                limit,
+            )?;
+            if batch_size > 0 {
+                cfg.batch_size = batch_size as usize;
+            }
+            let (schema, iter) = PyRasterScanner::new(cfg).batch_iter()?;
+            Ok(PyBatchReader { schema, iter })
+        }));
+
+    match res {
+        Ok(Ok(reader)) => Box::into_raw(Box::new(reader)),
+        Ok(Err(e)) => {
+            set_c_err(out_err, &e.to_string());
+            ptr::null_mut()
+        }
+        Err(payload) => {
+            let msg = safe_panic_payload_to_string(payload);
+            set_c_err(out_err, &format!("Panic in open_batch_reader: {msg}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Pull the next batch as a single-batch `ArrowArrayStream`. Returns NULL at end of
+/// stream, or NULL with `out_err` set on failure.
+///
+/// # Safety
+/// `reader` must be a live pointer returned by `raster_h3_py_open_batch_reader`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_batch_reader_next(
+    reader: *mut PyBatchReader,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowArrayStream {
+    if reader.is_null() {
+        set_c_err(out_err, "batch reader is NULL");
+        return ptr::null_mut();
+    }
+    let reader = &mut *reader;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.iter.next()));
+    match res {
+        Ok(Some(Ok(batch))) => Box::into_raw(Box::new(ArrowArrayStream::from_iterator(
+            Arc::clone(&reader.schema),
+            std::iter::once(Ok(batch)),
+        ))),
+        Ok(None) => ptr::null_mut(),
+        Ok(Some(Err(e))) => {
+            set_c_err(out_err, &e.to_string());
+            ptr::null_mut()
+        }
+        Err(payload) => {
+            let msg = safe_panic_payload_to_string(payload);
+            set_c_err(out_err, &format!("Panic in batch_reader_next: {msg}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Free a reader returned by `raster_h3_py_open_batch_reader`.
+///
+/// # Safety
+/// `reader` must be null or returned by `raster_h3_py_open_batch_reader`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_free_batch_reader(reader: *mut PyBatchReader) {
+    if !reader.is_null() {
+        drop(Box::from_raw(reader));
     }
 }
 

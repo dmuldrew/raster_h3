@@ -21,7 +21,7 @@ use raster_h3_core::error::{RasterH3Error, Result};
 use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3_core::pmtiles::H3PmtilesTiler;
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
-use raster_h3_core::scalar_ops::{parse_bbox_str, parse_resolutions_str};
+use raster_h3_core::scalar_ops::{parse_bbox_str, try_parse_resolutions_str};
 
 /// Output wire format for streaming CLI queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +79,10 @@ fn resolve_projection_indices(
     let mut indices = Vec::with_capacity(cols.len());
     for name in cols {
         let idx = schema.index_of(name).ok_or_else(|| {
-            RasterH3Error::InvalidParameter(format!("Unknown column name in projection: '{}'", name))
+            RasterH3Error::InvalidParameter(format!(
+                "Unknown column name in projection: '{}'",
+                name
+            ))
         })?;
         indices.push(idx);
     }
@@ -99,13 +102,8 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
     if !opts.categorical {
         let full_schema = ColumnSchema::continuous(&config.quantiles);
         let projection = resolve_projection_indices(&full_schema, &opts.columns)?;
-        let reader = ContinuousBatchReader::open(
-            &paths,
-            &config,
-            projection,
-            opts.batch_size,
-            opts.limit,
-        )?;
+        let reader =
+            ContinuousBatchReader::open(&paths, &config, projection, opts.batch_size, opts.limit)?;
         let schema = reader.schema();
         match opts.output_format {
             StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, reader),
@@ -197,6 +195,9 @@ pub fn export_raster_to_pmtiles(
 }
 
 /// Parse CLI arguments into [`CliStreamOptions`] and an optional output file path (`None` = stdout).
+///
+/// Unknown flags, missing flag values, malformed numbers/lists and extra positional
+/// arguments are rejected rather than silently falling back to defaults.
 pub fn parse_stream_args(
     args: &[String],
     default_format: StreamOutputFormat,
@@ -207,82 +208,86 @@ pub fn parse_stream_args(
     };
     let mut output_file: Option<String> = None;
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-i" | "--input" => {
-                i += 1;
-                if i < args.len() {
-                    opts.input_path = args[i].clone();
-                }
-            }
+    let invalid = |flag: &str, value: &str, expected: &str| {
+        RasterH3Error::InvalidParameter(format!(
+            "Invalid value '{value}' for {flag}: expected {expected}"
+        ))
+    };
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let flag = arg.as_str();
+        let mut value = || {
+            iter.next()
+                .map(String::as_str)
+                .ok_or_else(|| RasterH3Error::InvalidParameter(format!("Missing value for {flag}")))
+        };
+        match flag {
+            "-i" | "--input" => opts.input_path = value()?.to_string(),
             "-o" | "--output" => {
-                i += 1;
-                if i < args.len() && args[i] != "-" {
-                    output_file = Some(args[i].clone());
-                }
+                let v = value()?;
+                output_file = (v != "-").then(|| v.to_string());
             }
             "-r" | "--resolution" | "--resolutions" => {
-                i += 1;
-                if i < args.len() {
-                    let parsed = parse_resolutions_str(&args[i]);
-                    if !parsed.is_empty() {
-                        opts.resolutions = parsed;
-                    }
-                }
+                let v = value()?;
+                opts.resolutions = try_parse_resolutions_str(v)
+                    .ok_or_else(|| invalid(flag, v, "H3 resolutions between 0 and 15, e.g. 7,8"))?;
             }
-            "-c" | "--categorical" => {
-                opts.categorical = true;
-            }
+            "-c" | "--categorical" => opts.categorical = true,
             "--format" => {
-                i += 1;
-                if i < args.len() && args[i].eq_ignore_ascii_case("long") {
-                    opts.categorical_format = CategoricalFormat::Long;
-                }
+                let v = value()?;
+                opts.categorical_format = if v.eq_ignore_ascii_case("long") {
+                    CategoricalFormat::Long
+                } else if v.eq_ignore_ascii_case("wide") {
+                    CategoricalFormat::Wide
+                } else {
+                    return Err(invalid(flag, v, "'wide' or 'long'"));
+                };
             }
-            "--crs" | "--source-crs" => {
-                i += 1;
-                if i < args.len() {
-                    opts.source_crs = Some(args[i].clone());
-                }
-            }
+            "--crs" | "--source-crs" => opts.source_crs = Some(value()?.to_string()),
             "--nodata" => {
-                i += 1;
-                if i < args.len() {
-                    opts.nodata = args[i].parse().ok();
-                }
+                let v = value()?;
+                opts.nodata = Some(v.parse().map_err(|_| invalid(flag, v, "a number"))?);
             }
             "--bbox" => {
-                i += 1;
-                if i < args.len() {
-                    opts.bbox = parse_bbox_str(&args[i]);
-                }
+                let v = value()?;
+                opts.bbox = Some(
+                    parse_bbox_str(v)
+                        .ok_or_else(|| invalid(flag, v, "min_lon,min_lat,max_lon,max_lat"))?,
+                );
             }
             "--columns" => {
-                i += 1;
-                if i < args.len() {
-                    let cols: Vec<String> = args[i]
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !cols.is_empty() {
-                        opts.columns = Some(cols);
-                    }
+                let v = value()?;
+                let cols: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if cols.is_empty() {
+                    return Err(invalid(flag, v, "a comma-separated column list"));
                 }
+                opts.columns = Some(cols);
             }
             "--limit" => {
-                i += 1;
-                if i < args.len() {
-                    opts.limit = args[i].parse().ok();
-                }
+                let v = value()?;
+                opts.limit = Some(
+                    v.parse()
+                        .map_err(|_| invalid(flag, v, "a non-negative integer"))?,
+                );
             }
-            arg if !arg.starts_with('-') && opts.input_path.is_empty() => {
-                opts.input_path = arg.to_string();
+            _ if flag.starts_with('-') && flag != "-" => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unknown option '{flag}'"
+                )));
             }
-            _ => {}
+            _ if opts.input_path.is_empty() => opts.input_path = flag.to_string(),
+            _ => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unexpected argument '{flag}' (input path already set to '{}')",
+                    opts.input_path
+                )));
+            }
         }
-        i += 1;
     }
 
     if opts.input_path.is_empty() {
@@ -365,5 +370,36 @@ mod tests {
         let text = String::from_utf8(jsonl_buf).unwrap();
         assert_eq!(text.lines().count(), jrows);
         assert!(text.contains("\"mean\":42.0"));
+    }
+
+    #[test]
+    fn test_cli_rejects_invalid_arguments() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["in.tif".to_string()];
+            args.extend(extra.iter().map(|s| s.to_string()));
+            parse_stream_args(&args, StreamOutputFormat::Ipc)
+        };
+
+        let (opts, out) =
+            parse(&["-r", "7,8", "--bbox", "1,2,3,4", "--limit", "5", "-o", "x"]).unwrap();
+        assert_eq!(opts.resolutions, vec![7, 8]);
+        assert_eq!(opts.bbox, Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(opts.limit, Some(5));
+        assert_eq!(out.as_deref(), Some("x"));
+
+        for bad in [
+            &["--bbox", "10,20,30"][..],
+            &["-r", "16"],
+            &["-r", "8,abc"],
+            &["--nodata", "abc"],
+            &["--limit", "-1"],
+            &["--format", "tall"],
+            &["--limt", "10"],
+            &["--bbox"],
+            &["second.tif"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(parse_stream_args(&[], StreamOutputFormat::Ipc).is_err());
     }
 }

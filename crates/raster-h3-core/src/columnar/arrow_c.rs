@@ -272,6 +272,23 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
     out
 }
 
+/// Pack variable-width values into Arrow `i32` offsets and a contiguous data buffer,
+/// dropping each value once copied.
+fn pack_var_width(
+    values: impl Iterator<Item = Vec<u8>>,
+    len: usize,
+    total_bytes: usize,
+) -> (Vec<i32>, Vec<u8>) {
+    let mut offsets = Vec::with_capacity(len + 1);
+    let mut data = Vec::with_capacity(total_bytes.max(1));
+    offsets.push(0i32);
+    for v in values {
+        data.extend_from_slice(&v);
+        offsets.push(data.len() as i32);
+    }
+    (offsets, data)
+}
+
 /// Unpack an LSB-first Arrow bitmap of length `len`.
 unsafe fn unpack_bits(ptr: *const u8, len: usize) -> Vec<bool> {
     if ptr.is_null() {
@@ -304,90 +321,65 @@ impl ArrowArray {
         }
     }
 
-    /// Construct a leaf `ArrowArray` from a [`ColumnArray`].
-    pub fn from_column_array(col: &ColumnArray) -> Self {
+    /// Construct a leaf `ArrowArray` from a [`ColumnArray`], taking ownership of its buffers.
+    /// Fixed-width columns are handed to the consumer without copying; variable-width columns
+    /// are packed into offsets + data, freeing each source value as it is copied.
+    pub fn from_column_array(col: ColumnArray) -> Self {
         let len = col.len();
         let null_count = col.null_count();
         let mut owned_buffers = Vec::with_capacity(3);
         let mut buffer_ptrs = Vec::with_capacity(3);
 
         // Buffer 0: Validity bitmap (NULL if null_count == 0 per Arrow C Data Interface spec)
-        if null_count > 0 {
-            if let Some(val) = col.validity() {
+        match col.validity() {
+            Some(val) if null_count > 0 => {
                 let bitmap = pack_bits(val);
-                let ptr = bitmap.as_ptr() as *const c_void;
+                buffer_ptrs.push(bitmap.as_ptr() as *const c_void);
                 owned_buffers.push(OwnedArrowBuffer::U8(bitmap));
-                buffer_ptrs.push(ptr);
-            } else {
-                buffer_ptrs.push(ptr::null());
             }
-        } else {
-            buffer_ptrs.push(ptr::null());
+            _ => buffer_ptrs.push(ptr::null()),
         }
 
-        // Remaining buffers depend on physical layout
+        // Remaining buffers depend on physical layout. Moving a Vec does not move its heap
+        // allocation, so pointers taken before the move stay valid.
         match col {
             ColumnArray::UInt64 { values, .. } => {
-                let v = values.clone();
-                let ptr = v.as_ptr() as *const c_void;
-                owned_buffers.push(OwnedArrowBuffer::U64(v));
-                buffer_ptrs.push(ptr);
+                buffer_ptrs.push(values.as_ptr() as *const c_void);
+                owned_buffers.push(OwnedArrowBuffer::U64(values));
             }
             ColumnArray::Int64 { values, .. } => {
-                let v = values.clone();
-                let ptr = v.as_ptr() as *const c_void;
-                owned_buffers.push(OwnedArrowBuffer::I64(v));
-                buffer_ptrs.push(ptr);
+                buffer_ptrs.push(values.as_ptr() as *const c_void);
+                owned_buffers.push(OwnedArrowBuffer::I64(values));
             }
             ColumnArray::UInt8 { values, .. } => {
-                let v = values.clone();
-                let ptr = v.as_ptr() as *const c_void;
-                owned_buffers.push(OwnedArrowBuffer::U8(v));
-                buffer_ptrs.push(ptr);
+                buffer_ptrs.push(values.as_ptr() as *const c_void);
+                owned_buffers.push(OwnedArrowBuffer::U8(values));
             }
             ColumnArray::Float64 { values, .. } => {
-                let v = values.clone();
-                let ptr = v.as_ptr() as *const c_void;
-                owned_buffers.push(OwnedArrowBuffer::F64(v));
-                buffer_ptrs.push(ptr);
+                buffer_ptrs.push(values.as_ptr() as *const c_void);
+                owned_buffers.push(OwnedArrowBuffer::F64(values));
             }
             ColumnArray::Boolean { values, .. } => {
-                let packed = pack_bits(values);
-                let ptr = packed.as_ptr() as *const c_void;
+                let packed = pack_bits(&values);
+                buffer_ptrs.push(packed.as_ptr() as *const c_void);
                 owned_buffers.push(OwnedArrowBuffer::U8(packed));
-                buffer_ptrs.push(ptr);
             }
             ColumnArray::Utf8 { values, .. } => {
-                let mut offsets = Vec::with_capacity(len + 1);
                 let total_bytes: usize = values.iter().map(|s| s.len()).sum();
-                let mut data = Vec::with_capacity(total_bytes.max(1));
-                offsets.push(0i32);
-                for s in values {
-                    data.extend_from_slice(s.as_bytes());
-                    offsets.push(data.len() as i32);
-                }
-                let off_ptr = offsets.as_ptr() as *const c_void;
-                let data_ptr = data.as_ptr() as *const c_void;
+                let (offsets, data) =
+                    pack_var_width(values.into_iter().map(String::into_bytes), len, total_bytes);
+                buffer_ptrs.push(offsets.as_ptr() as *const c_void);
+                buffer_ptrs.push(data.as_ptr() as *const c_void);
                 owned_buffers.push(OwnedArrowBuffer::I32(offsets));
                 owned_buffers.push(OwnedArrowBuffer::U8(data));
-                buffer_ptrs.push(off_ptr);
-                buffer_ptrs.push(data_ptr);
             }
             ColumnArray::Binary { values, .. } => {
-                let mut offsets = Vec::with_capacity(len + 1);
                 let total_bytes: usize = values.iter().map(|b| b.len()).sum();
-                let mut data = Vec::with_capacity(total_bytes.max(1));
-                offsets.push(0i32);
-                for b in values {
-                    data.extend_from_slice(b);
-                    offsets.push(data.len() as i32);
-                }
-                let off_ptr = offsets.as_ptr() as *const c_void;
-                let data_ptr = data.as_ptr() as *const c_void;
+                let (offsets, data) = pack_var_width(values.into_iter(), len, total_bytes);
+                buffer_ptrs.push(offsets.as_ptr() as *const c_void);
+                buffer_ptrs.push(data.as_ptr() as *const c_void);
                 owned_buffers.push(OwnedArrowBuffer::I32(offsets));
                 owned_buffers.push(OwnedArrowBuffer::U8(data));
-                buffer_ptrs.push(off_ptr);
-                buffer_ptrs.push(data_ptr);
             }
         }
 
@@ -413,11 +405,13 @@ impl ArrowArray {
         }
     }
 
-    /// Construct a top-level struct `ArrowArray` from a [`RecordBatch`].
-    pub fn from_record_batch(batch: &RecordBatch) -> Self {
+    /// Construct a top-level struct `ArrowArray` from a [`RecordBatch`], taking ownership
+    /// of its column buffers.
+    pub fn from_record_batch(batch: RecordBatch) -> Self {
+        let num_rows = batch.num_rows;
         let mut children_vec: Vec<*mut ArrowArray> = batch
             .columns
-            .iter()
+            .into_iter()
             .map(|c| Box::into_raw(Box::new(Self::from_column_array(c))))
             .collect();
         let n_children = children_vec.len() as i64;
@@ -437,7 +431,7 @@ impl ArrowArray {
         let buffers_ptr = priv_box.buffer_ptrs.as_mut_ptr();
 
         Self {
-            length: batch.num_rows as i64,
+            length: num_rows as i64,
             null_count: 0,
             offset: 0,
             n_buffers: 1,
@@ -639,7 +633,7 @@ unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut Ar
     let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| priv_data.iter.next()));
     match step {
         Ok(Some(Ok(batch))) => {
-            ptr::write(out, ArrowArray::from_record_batch(&batch));
+            ptr::write(out, ArrowArray::from_record_batch(batch));
             0
         }
         Ok(None) => {
@@ -792,10 +786,7 @@ mod tests {
                     validity: None,
                 },
                 ColumnArray::Utf8 {
-                    values: vec![
-                        "8828308281fffff".to_string(),
-                        "8828308283fffff".to_string(),
-                    ],
+                    values: vec!["8828308281fffff".to_string(), "8828308283fffff".to_string()],
                     validity: None,
                 },
                 ColumnArray::Float64 {
@@ -818,8 +809,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut stream =
-            ArrowArrayStream::from_iterator(Arc::clone(&schema), vec![Ok(batch.clone())].into_iter());
+        let mut stream = ArrowArrayStream::from_iterator(
+            Arc::clone(&schema),
+            vec![Ok(batch.clone())].into_iter(),
+        );
         let (out_schema, out_batches) = unsafe { stream.collect_batches().unwrap() };
         assert_eq!(*out_schema, *schema);
         assert_eq!(out_batches.len(), 1);

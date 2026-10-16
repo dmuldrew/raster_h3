@@ -95,6 +95,31 @@ def _get_lib() -> ctypes.CDLL:
     lib.raster_h3_py_free_arrow_stream.argtypes = [ctypes.c_void_p]
     lib.raster_h3_py_free_arrow_stream.restype = None
 
+    lib.raster_h3_py_open_batch_reader.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.raster_h3_py_open_batch_reader.restype = ctypes.c_void_p
+
+    lib.raster_h3_py_batch_reader_next.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.raster_h3_py_batch_reader_next.restype = ctypes.c_void_p
+
+    lib.raster_h3_py_free_batch_reader.argtypes = [ctypes.c_void_p]
+    lib.raster_h3_py_free_batch_reader.restype = None
+
     lib.raster_h3_py_scan_json.argtypes = [
         ctypes.c_char_p,
         ctypes.c_char_p,
@@ -237,6 +262,39 @@ def _encode_columns(columns: Optional[Sequence[str]]) -> Optional[bytes]:
     return ",".join(columns).encode("utf-8")
 
 
+class _OwnedArrowStream:
+    """Owns one native `ArrowArrayStream*` and hands it out once via `__arrow_c_stream__`."""
+
+    def __init__(self, ptr: int) -> None:
+        self._ptr: Optional[int] = ptr
+
+    def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
+        ptr, self._ptr = self._ptr, None
+        if not ptr:
+            raise RuntimeError("Arrow stream was already consumed")
+        return ctypes.pythonapi.PyCapsule_New(
+            ptr, b"arrow_array_stream", _stream_capsule_destructor
+        )
+
+    def __del__(self) -> None:
+        if self._ptr and _LIB is not None:
+            _LIB.raster_h3_py_free_arrow_stream(self._ptr)
+            self._ptr = None
+
+
+def _polars_from_stream(obj: Any) -> Any:
+    """Build a Polars DataFrame from an object exposing `__arrow_c_stream__`."""
+    import polars as pl  # type: ignore
+
+    try:
+        return pl.from_arrow(obj)
+    except TypeError:
+        # Polars predating Arrow PyCapsule support rejects the object before reading it.
+        import pyarrow as pa  # type: ignore
+
+        return pl.from_arrow(pa.table(obj))
+
+
 # -----------------------------------------------------------------------------
 # Arrow PyCapsule Stream Object
 # -----------------------------------------------------------------------------
@@ -342,13 +400,43 @@ class RasterH3ArrowStream:
             lib.raster_h3_py_free_string(json_ptr)
 
     def to_polars(self) -> Any:
-        """Convert to a Polars DataFrame (using zero-copy Arrow PyCapsule when supported)."""
-        import polars as pl  # type: ignore
+        """Convert to a Polars DataFrame via the Arrow PyCapsule stream.
 
+        Scan errors propagate; the scan is never re-run through another path.
+        """
+        return _polars_from_stream(self)
+
+    def iter_batches(self, batch_size: Optional[int] = None) -> Iterable[Any]:
+        """Yield the scan incrementally as Polars DataFrames of up to `batch_size` rows."""
+        lib = _get_lib()
+        err = ctypes.c_void_p(0)
+        reader = lib.raster_h3_py_open_batch_reader(
+            self.path.encode("utf-8"),
+            _encode_resolutions(self.resolutions),
+            1 if self.categorical else 0,
+            self.format.encode("utf-8"),
+            self.crs.encode("utf-8") if self.crs else None,
+            1 if self.nodata is not None else 0,
+            float(self.nodata) if self.nodata is not None else 0.0,
+            _encode_bbox(self.bbox),
+            _encode_columns(self.columns),
+            int(self.limit) if self.limit is not None else -1,
+            int(batch_size) if batch_size else 0,
+            ctypes.byref(err),
+        )
+        _raise_if_err(err)
+        if not reader:
+            raise RuntimeError("Failed to open raster_h3 batch reader")
         try:
-            return pl.from_arrow(self)
-        except Exception:
-            return pl.DataFrame(self.to_dict())
+            while True:
+                err = ctypes.c_void_p(0)
+                ptr = lib.raster_h3_py_batch_reader_next(reader, ctypes.byref(err))
+                _raise_if_err(err)
+                if not ptr:
+                    return
+                yield _polars_from_stream(_OwnedArrowStream(ptr))
+        finally:
+            lib.raster_h3_py_free_batch_reader(reader)
 
     def to_pyarrow(self) -> Any:
         """Convert to a PyArrow Table via zero-copy `__arrow_c_stream__`."""
@@ -395,7 +483,6 @@ def scan_raster_h3(
         import polars as pl  # type: ignore
         from polars.io.plugins import register_io_source  # type: ignore
 
-        base_df = stream.to_polars() if False else None  # schema probe via 0-row or Arrow schema
         # Build Polars schema from field names
         if not categorical:
             pl_schema = {
@@ -452,7 +539,14 @@ def scan_raster_h3(
             batch_size: Optional[int],
         ) -> Iterable[Any]:
             pushed_cols = with_columns if with_columns is not None else columns
-            pushed_limit = n_rows if n_rows is not None else limit
+            # `n_rows` can only be pushed into the scan when no predicate runs after it;
+            # otherwise it caps the rows that survive the filter.
+            if predicate is None:
+                scan_limit = n_rows if n_rows is not None else limit
+                remaining = None
+            else:
+                scan_limit = limit
+                remaining = n_rows
             s = RasterH3ArrowStream(
                 path=path,
                 resolutions=resolutions,
@@ -462,12 +556,19 @@ def scan_raster_h3(
                 nodata=nodata,
                 bbox=bbox,
                 columns=pushed_cols,
-                limit=pushed_limit,
+                limit=scan_limit,
             )
-            df = s.to_polars()
-            if predicate is not None:
-                df = df.filter(predicate)
-            yield df
+            if remaining is not None and remaining <= 0:
+                return
+            for df in s.iter_batches(batch_size):
+                if predicate is not None:
+                    df = df.filter(predicate)
+                if remaining is not None:
+                    df = df.head(remaining)
+                    remaining -= df.height
+                yield df
+                if remaining is not None and remaining <= 0:
+                    return
 
         return register_io_source(io_source=_source_gen, schema=pl_schema)
     except ImportError:

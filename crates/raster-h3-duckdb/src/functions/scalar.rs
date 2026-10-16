@@ -1,10 +1,11 @@
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, Resolution};
 use std::ffi::c_char;
 
 #[cfg(test)]
 use crate::encoding::WKB_BUF_LEN;
 use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf};
 use crate::ffi::*;
+use crate::scalar_ops;
 
 // =========================================================================
 // Generic Zero-Cost Scalar Execution Kernels
@@ -303,11 +304,7 @@ pub unsafe extern "C" fn scalar_h3_to_lat(
     output: duckdb_vector,
 ) {
     ffi_scalar_guard(info, || {
-        unary_scalar_kernel(input, output, |cell_u64: u64| {
-            CellIndex::try_from(cell_u64)
-                .map(|c| LatLng::from(c).lat())
-                .unwrap_or(f64::NAN)
-        });
+        unary_scalar_kernel(input, output, scalar_ops::h3_to_lat);
     });
 }
 
@@ -323,11 +320,7 @@ pub unsafe extern "C" fn scalar_h3_to_lng(
     output: duckdb_vector,
 ) {
     ffi_scalar_guard(info, || {
-        unary_scalar_kernel(input, output, |cell_u64: u64| {
-            CellIndex::try_from(cell_u64)
-                .map(|c| LatLng::from(c).lng())
-                .unwrap_or(f64::NAN)
-        });
+        unary_scalar_kernel(input, output, scalar_ops::h3_to_lng);
     });
 }
 
@@ -366,9 +359,7 @@ pub unsafe extern "C" fn scalar_h3_is_valid_u64(
     output: duckdb_vector,
 ) {
     ffi_scalar_guard(info, || {
-        unary_scalar_kernel(input, output, |cell_u64: u64| {
-            CellIndex::try_from(cell_u64).is_ok()
-        });
+        unary_scalar_kernel(input, output, scalar_ops::h3_is_valid_u64);
     });
 }
 
@@ -384,11 +375,7 @@ pub unsafe extern "C" fn scalar_h3_is_valid_str(
     output: duckdb_vector,
 ) {
     ffi_scalar_guard(info, || {
-        unary_str_to_scalar_kernel(input, output, |s| {
-            parse_hex_u64(s)
-                .map(|u| CellIndex::try_from(u).is_ok())
-                .unwrap_or(false)
-        });
+        unary_str_to_scalar_kernel(input, output, scalar_ops::h3_is_valid_str);
     });
 }
 
@@ -475,16 +462,7 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_u64(
 ) {
     ffi_scalar_guard(info, || {
         binary_scalar_kernel(input, output, |cell_u64: u64, parent_res_i64: i64| {
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                if (0..=15).contains(&parent_res_i64) {
-                    if let Ok(target_res) = Resolution::try_from(parent_res_i64 as u8) {
-                        if let Some(parent) = cell.parent(target_res) {
-                            return parent.into();
-                        }
-                    }
-                }
-            }
-            0
+            scalar_ops::h3_cell_to_parent_u64(cell_u64, parent_res_i64).unwrap_or(0)
         });
     });
 }

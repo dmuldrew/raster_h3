@@ -15,6 +15,9 @@ crate-type = ["rlib"]
 [features]
 default = []
 stream-profile = []
+# Exposes test-only synchronization handshakes (e.g. `OrderedPrefetchQueue::wait_for_blocked_job`)
+# to other workspace crates' tests without compiling them into release builds.
+test-hooks = []
 
 [dependencies]
 h3o.workspace = true

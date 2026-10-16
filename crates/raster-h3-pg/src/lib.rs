@@ -3,11 +3,18 @@
 //! PostgreSQL extension interface for [`raster_h3_core`], providing:
 //! - Set-Returning Function (SRF) iterators [`PgContinuousSrf`] (`h3_raster_continuous_aggregate`)
 //!   and [`PgCategoricalSrf`] (`h3_raster_categorical_aggregate`)
-//! - PostgreSQL V1 Function Manager (`fmgr`) calling convention structs (`PgMagicBlock`,
+//! - PostgreSQL V1 Function Manager (`fmgr`) calling convention structs (`Pg_finfo_record`,
 //!   `PgFnInfoV1`, `Datum`, `NullableDatum`, `FunctionCallInfoBaseData`)
 //! - C-ABI entry points for PostgreSQL scalar functions and SRFs.
+//!
+//! The loadable module itself (`PG_MODULE_MAGIC`, `text`/`bytea` functions and the
+//! `h3_raster_*_aggregate` SRFs) lives in `fmgr` and is built with the `pg-extension`
+//! feature, e.g. `RASTER_H3_PG_MAJOR=16 cargo build -p raster-h3-pg --features pg-extension`.
 
 #![allow(non_camel_case_types)]
+
+#[cfg(feature = "pg-extension")]
+pub mod fmgr;
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_short, c_void, CStr, CString};
@@ -369,7 +376,9 @@ impl PgContinuousSrf {
         };
 
         let hex_bytes = fast_hex_u64(rec.h3_index, &mut self.hex_buf);
-        let h3_hex = std::str::from_utf8(hex_bytes).unwrap_or_default().to_owned();
+        let h3_hex = std::str::from_utf8(hex_bytes)
+            .unwrap_or_default()
+            .to_owned();
         let wkb = match h3_index_to_wkb(rec.h3_index, &mut self.wkb_buf) {
             Some(len) => self.wkb_buf[..len].to_vec(),
             None => Vec::new(),
@@ -471,7 +480,9 @@ impl PgCategoricalSrf {
         };
 
         let hex_bytes = fast_hex_u64(rec.h3_index, &mut self.hex_buf);
-        let h3_hex = std::str::from_utf8(hex_bytes).unwrap_or_default().to_owned();
+        let h3_hex = std::str::from_utf8(hex_bytes)
+            .unwrap_or_default()
+            .to_owned();
         let (maj_class, maj_count, maj_frac) = rec.accumulator.majority();
         let wkb = match h3_index_to_wkb(rec.h3_index, &mut self.wkb_buf) {
             Some(len) => self.wkb_buf[..len].to_vec(),
@@ -553,18 +564,20 @@ pub unsafe extern "C" fn pg_srf_continuous_open(
     bbox: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut PgContinuousSrf {
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<PgContinuousSrf> {
-        let path_str = opt_cstr(raster_path)
-            .ok_or_else(|| RasterH3Error::InvalidParameter("Missing raster_path".into()))?;
-        let res_vec = opt_cstr(resolutions)
-            .map(|s| parse_resolutions_str(&s))
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec![8]);
-        let crs_opt = opt_cstr(source_crs);
-        let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
-        let bbox_opt = opt_cstr(bbox).and_then(|s| parse_bbox_str(&s));
-        PgContinuousSrf::open(&path_str, res_vec, crs_opt, nodata_opt, bbox_opt)
-    }));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<PgContinuousSrf> {
+            let path_str = opt_cstr(raster_path)
+                .ok_or_else(|| RasterH3Error::InvalidParameter("Missing raster_path".into()))?;
+            let res_vec = opt_cstr(resolutions)
+                .map(|s| parse_resolutions_str(&s))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| vec![8]);
+            let crs_opt = opt_cstr(source_crs);
+            let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
+            let bbox_opt = opt_cstr(bbox).and_then(|s| parse_bbox_str(&s));
+            PgContinuousSrf::open(&path_str, res_vec, crs_opt, nodata_opt, bbox_opt)
+        },
+    ));
 
     match res {
         Ok(Ok(srf)) => Box::into_raw(Box::new(srf)),
@@ -646,11 +659,10 @@ pub unsafe extern "C" fn pg_srf_continuous_close(srf: *mut PgContinuousSrf) {
 pub use raster_h3_core::scalar_ops::{
     h3_cell_to_parent_str as pg_scalar_h3_cell_to_parent_str,
     h3_cell_to_parent_u64 as pg_scalar_h3_cell_to_parent_u64,
-    h3_get_resolution as pg_scalar_h3_get_resolution,
-    h3_is_valid_str as pg_scalar_h3_is_valid_str, h3_is_valid_u64 as pg_scalar_h3_is_valid_u64,
-    h3_to_lat as pg_scalar_h3_to_lat, h3_to_lng as pg_scalar_h3_to_lng,
-    h3_to_string as pg_scalar_h3_to_string, h3_to_wkb_u64 as pg_scalar_h3_to_wkb_u64,
-    string_to_h3 as pg_scalar_string_to_h3,
+    h3_get_resolution as pg_scalar_h3_get_resolution, h3_is_valid_str as pg_scalar_h3_is_valid_str,
+    h3_is_valid_u64 as pg_scalar_h3_is_valid_u64, h3_to_lat as pg_scalar_h3_to_lat,
+    h3_to_lng as pg_scalar_h3_to_lng, h3_to_string as pg_scalar_h3_to_string,
+    h3_to_wkb_u64 as pg_scalar_h3_to_wkb_u64, string_to_h3 as pg_scalar_string_to_h3,
 };
 
 #[cfg(test)]

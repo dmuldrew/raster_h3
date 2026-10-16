@@ -823,8 +823,7 @@ impl CategoricalBatchReader {
                         }
                         let entropy = rec.accumulator.shannon_entropy();
                         let distinct = rec.accumulator.unique_classes() as i64;
-                        let mut entries: Vec<(i64, f64)> =
-                            Vec::with_capacity(distinct as usize);
+                        let mut entries: Vec<(i64, f64)> = Vec::with_capacity(distinct as usize);
                         rec.accumulator.for_each_class(|k, v| {
                             entries.push((k, v));
                         });

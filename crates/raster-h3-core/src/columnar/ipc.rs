@@ -369,8 +369,7 @@ mod tests {
         .unwrap();
 
         let mut buf = Vec::new();
-        let rows =
-            write_ipc_stream(&mut buf, &schema, vec![Ok(batch.clone())]).expect("write ipc");
+        let rows = write_ipc_stream(&mut buf, &schema, vec![Ok(batch.clone())]).expect("write ipc");
         assert_eq!(rows, 2);
 
         let mut cursor = std::io::Cursor::new(buf);

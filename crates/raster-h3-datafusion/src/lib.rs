@@ -70,7 +70,8 @@ impl RasterH3SessionCatalog {
 
     /// Register a named `TableProvider`.
     pub fn register_table(&mut self, name: impl Into<String>, provider: Arc<dyn TableProvider>) {
-        self.tables.insert(name.into().to_ascii_lowercase(), provider);
+        self.tables
+            .insert(name.into().to_ascii_lowercase(), provider);
     }
 
     /// Look up a registered `TableProvider` by name.
@@ -161,7 +162,10 @@ mod tests {
         let stats = provider.statistics();
         assert!(stats.num_rows > 0);
 
-        let filters = vec![FilterPredicate::MinCount(1.0), FilterPredicate::MinMean(10.0)];
+        let filters = vec![
+            FilterPredicate::MinCount(1.0),
+            FilterPredicate::MinMean(10.0),
+        ];
         let pushdown = provider.supports_filters_pushdown(&filters);
         assert_eq!(
             pushdown,
@@ -187,10 +191,75 @@ mod tests {
             .with_crs("EPSG:4326")
             .with_format(CategoricalFormat::Long);
         let cat_plan = cat_provider.scan(Some(&[0, 2, 3]), &[], Some(5)).unwrap();
-        let cat_batches: Vec<RecordBatch> =
-            cat_plan.execute().unwrap().collect::<Result<Vec<_>>>().unwrap();
+        let cat_batches: Vec<RecordBatch> = cat_plan
+            .execute()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert!(!cat_batches.is_empty());
         assert_eq!(cat_batches[0].schema.fields[1].name, "category");
+    }
+
+    fn count_rows(plan: Box<dyn ExecutionPlan>) -> usize {
+        plan.execute().unwrap().map(|b| b.unwrap().num_rows).sum()
+    }
+
+    #[test]
+    fn test_datafusion_pushdown_filters_only_narrow_the_table() {
+        let tif = write_test_tif(24, 24, 15.0);
+        let path = tif.path().to_string_lossy().to_string();
+        let ctx = RasterH3SessionCatalog::new();
+        let provider = ctx
+            .h3_raster_continuous_aggregate(&path, vec![7, 8])
+            .unwrap()
+            .with_crs("EPSG:4326");
+
+        let all = count_rows(provider.scan(None, &[], None).unwrap());
+        let res8 = count_rows(
+            provider
+                .scan(None, &[FilterPredicate::Resolution(8)], None)
+                .unwrap(),
+        );
+        assert!(res8 > 0 && res8 < all);
+
+        // Resolutions outside the configured set (including > 15) match nothing.
+        for r in [10, 20] {
+            let plan = provider
+                .scan(None, &[FilterPredicate::Resolution(r)], None)
+                .unwrap();
+            assert_eq!(count_rows(plan), 0, "resolution {r}");
+        }
+        let cat = ctx
+            .h3_raster_categorical_aggregate(&path, vec![8])
+            .unwrap()
+            .with_crs("EPSG:4326");
+        let plan = cat
+            .scan(None, &[FilterPredicate::Resolution(9)], None)
+            .unwrap();
+        assert_eq!(count_rows(plan), 0);
+
+        // A pushed bbox intersects the table's own bbox instead of replacing it.
+        let narrow = [-122.45, 37.79, -122.44, 37.80];
+        let bounded = ctx
+            .h3_raster_continuous_aggregate(&path, vec![8])
+            .unwrap()
+            .with_crs("EPSG:4326")
+            .with_bbox(narrow);
+        let own = count_rows(bounded.scan(None, &[], None).unwrap());
+        let wider = count_rows(
+            bounded
+                .scan(
+                    None,
+                    &[FilterPredicate::Bbox([-123.0, 37.0, -122.0, 38.0])],
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_eq!(wider, own);
+        let disjoint = bounded
+            .scan(None, &[FilterPredicate::Bbox([0.0, 0.0, 1.0, 1.0])], None)
+            .unwrap();
+        assert_eq!(count_rows(disjoint), 0);
     }
 
     #[test]
@@ -202,14 +271,18 @@ mod tests {
             validity: Some(vec![true, false]),
         };
 
-        let hex_col = ctx.invoke_scalar("h3_to_string", &[col_u64.clone()]).unwrap();
+        let hex_col = ctx
+            .invoke_scalar("h3_to_string", &[col_u64.clone()])
+            .unwrap();
         let ColumnArray::Utf8 { values, validity } = &hex_col else {
             panic!("expected Utf8");
         };
         assert_eq!(values[0], "8828308281fffff");
         assert_eq!(validity.as_ref().unwrap(), &vec![true, false]);
 
-        let back_u64 = ctx.invoke_scalar("string_to_h3", &[hex_col.clone()]).unwrap();
+        let back_u64 = ctx
+            .invoke_scalar("string_to_h3", &[hex_col.clone()])
+            .unwrap();
         if let ColumnArray::UInt64 { values, .. } = back_u64 {
             assert_eq!(values[0], cell);
         } else {

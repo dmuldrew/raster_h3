@@ -27,6 +27,22 @@ pub fn parse_resolutions_str(s: &str) -> Vec<u8> {
     list
 }
 
+/// Strict variant of [`parse_resolutions_str`]: `None` if any entry is not an integer in
+/// `0..=15` or the list is empty, instead of silently dropping invalid entries.
+pub fn try_parse_resolutions_str(s: &str) -> Option<Vec<u8>> {
+    let mut list = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.parse::<u8>().ok().filter(|&r| r <= 15))
+        .collect::<Option<Vec<u8>>>()?;
+    if list.is_empty() {
+        return None;
+    }
+    list.sort_unstable();
+    list.dedup();
+    Some(list)
+}
+
 /// Parse bounding box coordinates from a comma/whitespace separated string `[min_lon, min_lat, max_lon, max_lat]`.
 pub fn parse_bbox_str(s: &str) -> Option<[f64; 4]> {
     let coords: Vec<f64> = s
