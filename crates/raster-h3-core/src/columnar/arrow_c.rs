@@ -1,0 +1,828 @@
+//! Official Apache Arrow C Data Interface (`ArrowSchema`, `ArrowArray`) and
+//! Apache Arrow C Stream Interface (`ArrowArrayStream`) implementation.
+//!
+//! Conforms to:
+//! - <https://arrow.apache.org/docs/format/CDataInterface.html>
+//! - <https://arrow.apache.org/docs/format/CStreamInterface.html>
+//!
+//! Enables zero-copy and ABI-stable columnar data exchange across Polars, DataFusion,
+//! PyArrow (`__arrow_c_stream__` / `__arrow_c_schema__` PyCapsules), DuckDB, and C/C++ consumers.
+
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ptr;
+use std::sync::Arc;
+
+use crate::columnar::{ArrowDataType, ColumnArray, ColumnField, ColumnSchema, RecordBatch};
+use crate::error::{RasterH3Error, Result};
+
+/// Arrow C Data Interface flag indicating the field is nullable (`ARROW_FLAG_NULLABLE = 2`).
+pub const ARROW_FLAG_NULLABLE: i64 = 2;
+
+/// Official Apache Arrow C Data Interface `ArrowSchema` struct (`#[repr(C)]`).
+#[repr(C)]
+pub struct ArrowSchema {
+    pub format: *const c_char,
+    pub name: *const c_char,
+    pub metadata: *const c_char,
+    pub flags: i64,
+    pub n_children: i64,
+    pub children: *mut *mut ArrowSchema,
+    pub dictionary: *mut ArrowSchema,
+    pub release: Option<unsafe extern "C" fn(schema: *mut ArrowSchema)>,
+    pub private_data: *mut c_void,
+}
+
+unsafe impl Send for ArrowSchema {}
+
+struct SchemaPrivateData {
+    _format: CString,
+    _name: CString,
+    children_vec: Vec<*mut ArrowSchema>,
+}
+
+unsafe extern "C" fn release_arrow_schema(schema: *mut ArrowSchema) {
+    if schema.is_null() {
+        return;
+    }
+    let s = &mut *schema;
+    if s.release.is_none() {
+        return;
+    }
+    if !s.private_data.is_null() {
+        let mut priv_data = Box::from_raw(s.private_data as *mut SchemaPrivateData);
+        for child_ptr in priv_data.children_vec.drain(..) {
+            if !child_ptr.is_null() {
+                if let Some(rel) = (*child_ptr).release {
+                    rel(child_ptr);
+                }
+                drop(Box::from_raw(child_ptr));
+            }
+        }
+        s.private_data = ptr::null_mut();
+    }
+    s.release = None;
+}
+
+impl ArrowSchema {
+    /// Create an empty/released `ArrowSchema`.
+    pub const fn empty() -> Self {
+        Self {
+            format: ptr::null(),
+            name: ptr::null(),
+            metadata: ptr::null(),
+            flags: 0,
+            n_children: 0,
+            children: ptr::null_mut(),
+            dictionary: ptr::null_mut(),
+            release: None,
+            private_data: ptr::null_mut(),
+        }
+    }
+
+    /// Construct a leaf `ArrowSchema` for a single [`ColumnField`].
+    pub fn from_field(field: &ColumnField) -> Self {
+        let format_c = CString::new(field.data_type.arrow_format_str()).unwrap_or_default();
+        let name_c = CString::new(field.name.as_str()).unwrap_or_default();
+        let flags = if field.nullable {
+            ARROW_FLAG_NULLABLE
+        } else {
+            0
+        };
+        let priv_box = Box::new(SchemaPrivateData {
+            _format: format_c,
+            _name: name_c,
+            children_vec: Vec::new(),
+        });
+        let format_ptr = priv_box._format.as_ptr();
+        let name_ptr = priv_box._name.as_ptr();
+        Self {
+            format: format_ptr,
+            name: name_ptr,
+            metadata: ptr::null(),
+            flags,
+            n_children: 0,
+            children: ptr::null_mut(),
+            dictionary: ptr::null_mut(),
+            release: Some(release_arrow_schema),
+            private_data: Box::into_raw(priv_box) as *mut c_void,
+        }
+    }
+
+    /// Construct a top-level struct `ArrowSchema` (`"+s"`) representing a [`ColumnSchema`].
+    pub fn from_column_schema(schema: &ColumnSchema) -> Self {
+        let format_c = CString::new("+s").unwrap();
+        let name_c = CString::new("").unwrap();
+        let mut children_vec: Vec<*mut ArrowSchema> = schema
+            .fields
+            .iter()
+            .map(|f| Box::into_raw(Box::new(Self::from_field(f))))
+            .collect();
+        let n_children = children_vec.len() as i64;
+        let children_ptr = if children_vec.is_empty() {
+            ptr::null_mut()
+        } else {
+            children_vec.as_mut_ptr()
+        };
+        let priv_box = Box::new(SchemaPrivateData {
+            _format: format_c,
+            _name: name_c,
+            children_vec,
+        });
+        let format_ptr = priv_box._format.as_ptr();
+        let name_ptr = priv_box._name.as_ptr();
+        Self {
+            format: format_ptr,
+            name: name_ptr,
+            metadata: ptr::null(),
+            flags: 0,
+            n_children,
+            children: children_ptr,
+            dictionary: ptr::null_mut(),
+            release: Some(release_arrow_schema),
+            private_data: Box::into_raw(priv_box) as *mut c_void,
+        }
+    }
+
+    /// Parse a top-level struct `ArrowSchema` back into a [`ColumnSchema`].
+    ///
+    /// # Safety
+    /// `self` must be a valid, unreleased `ArrowSchema` struct.
+    pub unsafe fn to_column_schema(&self) -> Result<ColumnSchema> {
+        if self.release.is_none() || self.format.is_null() {
+            return Err(RasterH3Error::InvalidParameter(
+                "ArrowSchema is released or null".into(),
+            ));
+        }
+        let fmt = CStr::from_ptr(self.format).to_string_lossy();
+        if fmt != "+s" {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "Expected top-level struct format '+s', got '{}'",
+                fmt
+            )));
+        }
+        let mut fields = Vec::with_capacity(self.n_children.max(0) as usize);
+        for i in 0..(self.n_children.max(0) as usize) {
+            let child_ptr = *self.children.add(i);
+            if child_ptr.is_null() {
+                return Err(RasterH3Error::InvalidParameter(
+                    "Null child pointer in ArrowSchema".into(),
+                ));
+            }
+            let child = &*child_ptr;
+            let name = if child.name.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(child.name).to_string_lossy().into_owned()
+            };
+            let c_fmt = CStr::from_ptr(child.format).to_string_lossy();
+            let dt = match c_fmt.as_ref() {
+                "L" => ArrowDataType::UInt64,
+                "l" => ArrowDataType::Int64,
+                "C" => ArrowDataType::UInt8,
+                "g" => ArrowDataType::Float64,
+                "b" => ArrowDataType::Boolean,
+                "u" => ArrowDataType::Utf8,
+                "z" => ArrowDataType::Binary,
+                other => {
+                    return Err(RasterH3Error::InvalidParameter(format!(
+                        "Unsupported Arrow format '{}' for column '{}'",
+                        other, name
+                    )))
+                }
+            };
+            let nullable = (child.flags & ARROW_FLAG_NULLABLE) != 0;
+            fields.push(ColumnField::new(name, dt, nullable));
+        }
+        Ok(ColumnSchema::new(fields))
+    }
+}
+
+impl Drop for ArrowSchema {
+    fn drop(&mut self) {
+        if let Some(rel) = self.release {
+            unsafe { rel(self) };
+        }
+    }
+}
+
+/// Official Apache Arrow C Data Interface `ArrowArray` struct (`#[repr(C)]`).
+#[repr(C)]
+pub struct ArrowArray {
+    pub length: i64,
+    pub null_count: i64,
+    pub offset: i64,
+    pub n_buffers: i64,
+    pub n_children: i64,
+    pub buffers: *mut *const c_void,
+    pub children: *mut *mut ArrowArray,
+    pub dictionary: *mut ArrowArray,
+    pub release: Option<unsafe extern "C" fn(array: *mut ArrowArray)>,
+    pub private_data: *mut c_void,
+}
+
+unsafe impl Send for ArrowArray {}
+
+#[allow(dead_code)]
+enum OwnedArrowBuffer {
+    U8(Vec<u8>),
+    U64(Vec<u64>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    I32(Vec<i32>),
+}
+
+struct ArrayPrivateData {
+    _owned_buffers: Vec<OwnedArrowBuffer>,
+    buffer_ptrs: Vec<*const c_void>,
+    children_vec: Vec<*mut ArrowArray>,
+}
+
+unsafe extern "C" fn release_arrow_array(array: *mut ArrowArray) {
+    if array.is_null() {
+        return;
+    }
+    let a = &mut *array;
+    if a.release.is_none() {
+        return;
+    }
+    if !a.private_data.is_null() {
+        let mut priv_data = Box::from_raw(a.private_data as *mut ArrayPrivateData);
+        for child_ptr in priv_data.children_vec.drain(..) {
+            if !child_ptr.is_null() {
+                if let Some(rel) = (*child_ptr).release {
+                    rel(child_ptr);
+                }
+                drop(Box::from_raw(child_ptr));
+            }
+        }
+        a.private_data = ptr::null_mut();
+    }
+    a.release = None;
+}
+
+/// Pack a boolean slice into an LSB-first Arrow bitmap.
+fn pack_bits(bits: &[bool]) -> Vec<u8> {
+    let n_bytes = bits.len().div_ceil(8);
+    let mut out = vec![0u8; n_bytes];
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            out[i / 8] |= 1u8 << (i % 8);
+        }
+    }
+    out
+}
+
+/// Unpack an LSB-first Arrow bitmap of length `len`.
+unsafe fn unpack_bits(ptr: *const u8, len: usize) -> Vec<bool> {
+    if ptr.is_null() {
+        return vec![true; len];
+    }
+    let n_bytes = len.div_ceil(8);
+    let bytes = std::slice::from_raw_parts(ptr, n_bytes);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let bit = (bytes[i / 8] >> (i % 8)) & 1 != 0;
+        out.push(bit);
+    }
+    out
+}
+
+impl ArrowArray {
+    /// Create an empty/released `ArrowArray` (used to signal end-of-stream in `ArrowArrayStream`).
+    pub const fn empty() -> Self {
+        Self {
+            length: 0,
+            null_count: 0,
+            offset: 0,
+            n_buffers: 0,
+            n_children: 0,
+            buffers: ptr::null_mut(),
+            children: ptr::null_mut(),
+            dictionary: ptr::null_mut(),
+            release: None,
+            private_data: ptr::null_mut(),
+        }
+    }
+
+    /// Construct a leaf `ArrowArray` from a [`ColumnArray`].
+    pub fn from_column_array(col: &ColumnArray) -> Self {
+        let len = col.len();
+        let null_count = col.null_count();
+        let mut owned_buffers = Vec::with_capacity(3);
+        let mut buffer_ptrs = Vec::with_capacity(3);
+
+        // Buffer 0: Validity bitmap (NULL if null_count == 0 per Arrow C Data Interface spec)
+        if null_count > 0 {
+            if let Some(val) = col.validity() {
+                let bitmap = pack_bits(val);
+                let ptr = bitmap.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::U8(bitmap));
+                buffer_ptrs.push(ptr);
+            } else {
+                buffer_ptrs.push(ptr::null());
+            }
+        } else {
+            buffer_ptrs.push(ptr::null());
+        }
+
+        // Remaining buffers depend on physical layout
+        match col {
+            ColumnArray::UInt64 { values, .. } => {
+                let v = values.clone();
+                let ptr = v.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::U64(v));
+                buffer_ptrs.push(ptr);
+            }
+            ColumnArray::Int64 { values, .. } => {
+                let v = values.clone();
+                let ptr = v.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::I64(v));
+                buffer_ptrs.push(ptr);
+            }
+            ColumnArray::UInt8 { values, .. } => {
+                let v = values.clone();
+                let ptr = v.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::U8(v));
+                buffer_ptrs.push(ptr);
+            }
+            ColumnArray::Float64 { values, .. } => {
+                let v = values.clone();
+                let ptr = v.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::F64(v));
+                buffer_ptrs.push(ptr);
+            }
+            ColumnArray::Boolean { values, .. } => {
+                let packed = pack_bits(values);
+                let ptr = packed.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::U8(packed));
+                buffer_ptrs.push(ptr);
+            }
+            ColumnArray::Utf8 { values, .. } => {
+                let mut offsets = Vec::with_capacity(len + 1);
+                let total_bytes: usize = values.iter().map(|s| s.len()).sum();
+                let mut data = Vec::with_capacity(total_bytes.max(1));
+                offsets.push(0i32);
+                for s in values {
+                    data.extend_from_slice(s.as_bytes());
+                    offsets.push(data.len() as i32);
+                }
+                let off_ptr = offsets.as_ptr() as *const c_void;
+                let data_ptr = data.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::I32(offsets));
+                owned_buffers.push(OwnedArrowBuffer::U8(data));
+                buffer_ptrs.push(off_ptr);
+                buffer_ptrs.push(data_ptr);
+            }
+            ColumnArray::Binary { values, .. } => {
+                let mut offsets = Vec::with_capacity(len + 1);
+                let total_bytes: usize = values.iter().map(|b| b.len()).sum();
+                let mut data = Vec::with_capacity(total_bytes.max(1));
+                offsets.push(0i32);
+                for b in values {
+                    data.extend_from_slice(b);
+                    offsets.push(data.len() as i32);
+                }
+                let off_ptr = offsets.as_ptr() as *const c_void;
+                let data_ptr = data.as_ptr() as *const c_void;
+                owned_buffers.push(OwnedArrowBuffer::I32(offsets));
+                owned_buffers.push(OwnedArrowBuffer::U8(data));
+                buffer_ptrs.push(off_ptr);
+                buffer_ptrs.push(data_ptr);
+            }
+        }
+
+        let n_buffers = buffer_ptrs.len() as i64;
+        let mut priv_box = Box::new(ArrayPrivateData {
+            _owned_buffers: owned_buffers,
+            buffer_ptrs,
+            children_vec: Vec::new(),
+        });
+        let buffers_ptr = priv_box.buffer_ptrs.as_mut_ptr();
+
+        Self {
+            length: len as i64,
+            null_count: null_count as i64,
+            offset: 0,
+            n_buffers,
+            n_children: 0,
+            buffers: buffers_ptr,
+            children: ptr::null_mut(),
+            dictionary: ptr::null_mut(),
+            release: Some(release_arrow_array),
+            private_data: Box::into_raw(priv_box) as *mut c_void,
+        }
+    }
+
+    /// Construct a top-level struct `ArrowArray` from a [`RecordBatch`].
+    pub fn from_record_batch(batch: &RecordBatch) -> Self {
+        let mut children_vec: Vec<*mut ArrowArray> = batch
+            .columns
+            .iter()
+            .map(|c| Box::into_raw(Box::new(Self::from_column_array(c))))
+            .collect();
+        let n_children = children_vec.len() as i64;
+        let children_ptr = if children_vec.is_empty() {
+            ptr::null_mut()
+        } else {
+            children_vec.as_mut_ptr()
+        };
+
+        // Struct arrays have 1 buffer: the null bitmap (NULL since top-level batch has 0 struct nulls)
+        let buffer_ptrs = vec![ptr::null()];
+        let mut priv_box = Box::new(ArrayPrivateData {
+            _owned_buffers: Vec::new(),
+            buffer_ptrs,
+            children_vec,
+        });
+        let buffers_ptr = priv_box.buffer_ptrs.as_mut_ptr();
+
+        Self {
+            length: batch.num_rows as i64,
+            null_count: 0,
+            offset: 0,
+            n_buffers: 1,
+            n_children,
+            buffers: buffers_ptr,
+            children: children_ptr,
+            dictionary: ptr::null_mut(),
+            release: Some(release_arrow_array),
+            private_data: Box::into_raw(priv_box) as *mut c_void,
+        }
+    }
+
+    /// Import an `ArrowArray` into a [`RecordBatch`] given its [`ColumnSchema`].
+    ///
+    /// # Safety
+    /// `self` must be a valid, unreleased `ArrowArray` matching `schema`.
+    pub unsafe fn to_record_batch(&self, schema: Arc<ColumnSchema>) -> Result<RecordBatch> {
+        if self.release.is_none() {
+            return Err(RasterH3Error::InvalidParameter(
+                "ArrowArray is already released".into(),
+            ));
+        }
+        if self.n_children as usize != schema.fields.len() {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "ArrowArray n_children ({}) != schema field count ({})",
+                self.n_children,
+                schema.fields.len()
+            )));
+        }
+        let num_rows = self.length.max(0) as usize;
+        let mut columns = Vec::with_capacity(schema.fields.len());
+
+        for (i, field) in schema.fields.iter().enumerate() {
+            let child_ptr = *self.children.add(i);
+            let child = &*child_ptr;
+            let len = child.length.max(0) as usize;
+            let validity = if child.null_count > 0 && child.n_buffers >= 1 {
+                let bmp_ptr = *child.buffers as *const u8;
+                if bmp_ptr.is_null() {
+                    None
+                } else {
+                    Some(unpack_bits(bmp_ptr, len))
+                }
+            } else {
+                None
+            };
+
+            let col = match field.data_type {
+                ArrowDataType::UInt64 => {
+                    let data_ptr = *child.buffers.add(1) as *const u64;
+                    let values = if len == 0 || data_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        std::slice::from_raw_parts(data_ptr, len).to_vec()
+                    };
+                    ColumnArray::UInt64 { values, validity }
+                }
+                ArrowDataType::Int64 => {
+                    let data_ptr = *child.buffers.add(1) as *const i64;
+                    let values = if len == 0 || data_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        std::slice::from_raw_parts(data_ptr, len).to_vec()
+                    };
+                    ColumnArray::Int64 { values, validity }
+                }
+                ArrowDataType::UInt8 => {
+                    let data_ptr = *child.buffers.add(1) as *const u8;
+                    let values = if len == 0 || data_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        std::slice::from_raw_parts(data_ptr, len).to_vec()
+                    };
+                    ColumnArray::UInt8 { values, validity }
+                }
+                ArrowDataType::Float64 => {
+                    let data_ptr = *child.buffers.add(1) as *const f64;
+                    let values = if len == 0 || data_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        std::slice::from_raw_parts(data_ptr, len).to_vec()
+                    };
+                    ColumnArray::Float64 { values, validity }
+                }
+                ArrowDataType::Boolean => {
+                    let data_ptr = *child.buffers.add(1) as *const u8;
+                    let values = unpack_bits(data_ptr, len);
+                    ColumnArray::Boolean { values, validity }
+                }
+                ArrowDataType::Utf8 => {
+                    let off_ptr = *child.buffers.add(1) as *const i32;
+                    let data_ptr = *child.buffers.add(2) as *const u8;
+                    let mut values = Vec::with_capacity(len);
+                    if len > 0 && !off_ptr.is_null() {
+                        let offsets = std::slice::from_raw_parts(off_ptr, len + 1);
+                        let total_bytes = offsets[len].max(0) as usize;
+                        let bytes = if total_bytes == 0 || data_ptr.is_null() {
+                            &[][..]
+                        } else {
+                            std::slice::from_raw_parts(data_ptr, total_bytes)
+                        };
+                        for r in 0..len {
+                            let start = offsets[r].max(0) as usize;
+                            let end = offsets[r + 1].max(0) as usize;
+                            let s = std::str::from_utf8(&bytes[start..end])
+                                .unwrap_or_default()
+                                .to_owned();
+                            values.push(s);
+                        }
+                    }
+                    ColumnArray::Utf8 { values, validity }
+                }
+                ArrowDataType::Binary => {
+                    let off_ptr = *child.buffers.add(1) as *const i32;
+                    let data_ptr = *child.buffers.add(2) as *const u8;
+                    let mut values = Vec::with_capacity(len);
+                    if len > 0 && !off_ptr.is_null() {
+                        let offsets = std::slice::from_raw_parts(off_ptr, len + 1);
+                        let total_bytes = offsets[len].max(0) as usize;
+                        let bytes = if total_bytes == 0 || data_ptr.is_null() {
+                            &[][..]
+                        } else {
+                            std::slice::from_raw_parts(data_ptr, total_bytes)
+                        };
+                        for r in 0..len {
+                            let start = offsets[r].max(0) as usize;
+                            let end = offsets[r + 1].max(0) as usize;
+                            values.push(bytes[start..end].to_vec());
+                        }
+                    }
+                    ColumnArray::Binary { values, validity }
+                }
+            };
+            columns.push(col);
+        }
+
+        Ok(RecordBatch {
+            schema,
+            columns,
+            num_rows,
+        })
+    }
+}
+
+impl Drop for ArrowArray {
+    fn drop(&mut self) {
+        if let Some(rel) = self.release {
+            unsafe { rel(self) };
+        }
+    }
+}
+
+/// Official Apache Arrow C Stream Interface `ArrowArrayStream` struct (`#[repr(C)]`).
+#[repr(C)]
+pub struct ArrowArrayStream {
+    pub get_schema:
+        Option<unsafe extern "C" fn(stream: *mut ArrowArrayStream, out: *mut ArrowSchema) -> c_int>,
+    pub get_next:
+        Option<unsafe extern "C" fn(stream: *mut ArrowArrayStream, out: *mut ArrowArray) -> c_int>,
+    pub get_last_error:
+        Option<unsafe extern "C" fn(stream: *mut ArrowArrayStream) -> *const c_char>,
+    pub release: Option<unsafe extern "C" fn(stream: *mut ArrowArrayStream)>,
+    pub private_data: *mut c_void,
+}
+
+unsafe impl Send for ArrowArrayStream {}
+
+struct StreamPrivateData {
+    schema: Arc<ColumnSchema>,
+    iter: Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
+    last_error: Option<CString>,
+}
+
+unsafe extern "C" fn stream_get_schema(
+    stream: *mut ArrowArrayStream,
+    out: *mut ArrowSchema,
+) -> c_int {
+    if stream.is_null() || out.is_null() {
+        return libc::EINVAL;
+    }
+    let s = &mut *stream;
+    if s.private_data.is_null() {
+        return libc::EINVAL;
+    }
+    let priv_data = &*(s.private_data as *const StreamPrivateData);
+    ptr::write(out, ArrowSchema::from_column_schema(&priv_data.schema));
+    0
+}
+
+unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut ArrowArray) -> c_int {
+    if stream.is_null() || out.is_null() {
+        return libc::EINVAL;
+    }
+    let s = &mut *stream;
+    if s.private_data.is_null() {
+        return libc::EINVAL;
+    }
+    let priv_data = &mut *(s.private_data as *mut StreamPrivateData);
+    let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| priv_data.iter.next()));
+    match step {
+        Ok(Some(Ok(batch))) => {
+            ptr::write(out, ArrowArray::from_record_batch(&batch));
+            0
+        }
+        Ok(None) => {
+            ptr::write(out, ArrowArray::empty());
+            0
+        }
+        Ok(Some(Err(err))) => {
+            priv_data.last_error = Some(CString::new(err.to_string()).unwrap_or_default());
+            libc::EIO
+        }
+        Err(payload) => {
+            let msg = crate::error::safe_panic_payload_to_string(payload);
+            priv_data.last_error =
+                Some(CString::new(format!("Arrow stream panicked: {msg}")).unwrap_or_default());
+            libc::EIO
+        }
+    }
+}
+
+unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *const c_char {
+    if stream.is_null() {
+        return ptr::null();
+    }
+    let s = &*stream;
+    if s.private_data.is_null() {
+        return ptr::null();
+    }
+    let priv_data = &*(s.private_data as *const StreamPrivateData);
+    match &priv_data.last_error {
+        Some(c) => c.as_ptr(),
+        None => ptr::null(),
+    }
+}
+
+unsafe extern "C" fn release_arrow_stream(stream: *mut ArrowArrayStream) {
+    if stream.is_null() {
+        return;
+    }
+    let s = &mut *stream;
+    if s.release.is_none() {
+        return;
+    }
+    if !s.private_data.is_null() {
+        drop(Box::from_raw(s.private_data as *mut StreamPrivateData));
+        s.private_data = ptr::null_mut();
+    }
+    s.get_schema = None;
+    s.get_next = None;
+    s.get_last_error = None;
+    s.release = None;
+}
+
+impl ArrowArrayStream {
+    /// Wrap any `Iterator<Item = Result<RecordBatch>> + Send + 'static` into an `ArrowArrayStream`.
+    pub fn from_iterator<I>(schema: Arc<ColumnSchema>, iter: I) -> Self
+    where
+        I: Iterator<Item = Result<RecordBatch>> + Send + 'static,
+    {
+        let priv_box = Box::new(StreamPrivateData {
+            schema,
+            iter: Box::new(iter),
+            last_error: None,
+        });
+        Self {
+            get_schema: Some(stream_get_schema),
+            get_next: Some(stream_get_next),
+            get_last_error: Some(stream_get_last_error),
+            release: Some(release_arrow_stream),
+            private_data: Box::into_raw(priv_box) as *mut c_void,
+        }
+    }
+
+    /// Consume all batches from an `ArrowArrayStream` into a `(Arc<ColumnSchema>, Vec<RecordBatch>)`.
+    ///
+    /// # Safety
+    /// `self` must be a valid, unreleased `ArrowArrayStream`.
+    pub unsafe fn collect_batches(&mut self) -> Result<(Arc<ColumnSchema>, Vec<RecordBatch>)> {
+        let get_schema_fn = self.get_schema.ok_or_else(|| {
+            RasterH3Error::InvalidParameter("ArrowArrayStream is released".into())
+        })?;
+        let get_next_fn = self.get_next.ok_or_else(|| {
+            RasterH3Error::InvalidParameter("ArrowArrayStream missing get_next".into())
+        })?;
+
+        let mut raw_schema = ArrowSchema::empty();
+        let rc = get_schema_fn(self, &mut raw_schema);
+        if rc != 0 {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "ArrowArrayStream.get_schema failed with code {}",
+                rc
+            )));
+        }
+        let schema = Arc::new(raw_schema.to_column_schema()?);
+
+        let mut batches = Vec::new();
+        loop {
+            let mut raw_array = ArrowArray::empty();
+            let rc = get_next_fn(self, &mut raw_array);
+            if rc != 0 {
+                let msg = if let Some(err_fn) = self.get_last_error {
+                    let ptr = err_fn(self);
+                    if !ptr.is_null() {
+                        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                    } else {
+                        format!("ArrowArrayStream error code {}", rc)
+                    }
+                } else {
+                    format!("ArrowArrayStream error code {}", rc)
+                };
+                return Err(RasterH3Error::StreamFailed(msg));
+            }
+            if raw_array.release.is_none() {
+                break;
+            }
+            batches.push(raw_array.to_record_batch(Arc::clone(&schema))?);
+        }
+
+        Ok((schema, batches))
+    }
+}
+
+impl Drop for ArrowArrayStream {
+    fn drop(&mut self) {
+        if let Some(rel) = self.release {
+            unsafe { rel(self) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arrow_c_data_and_stream_roundtrip() {
+        let schema = Arc::new(ColumnSchema::new(vec![
+            ColumnField::new("h3_index", ArrowDataType::UInt64, false),
+            ColumnField::new("h3_hex", ArrowDataType::Utf8, false),
+            ColumnField::new("stddev", ArrowDataType::Float64, true),
+            ColumnField::new("resolution", ArrowDataType::UInt8, false),
+            ColumnField::new("is_valid", ArrowDataType::Boolean, false),
+            ColumnField::new("wkb", ArrowDataType::Binary, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                ColumnArray::UInt64 {
+                    values: vec![0x8828308281fffff, 0x8828308283fffff],
+                    validity: None,
+                },
+                ColumnArray::Utf8 {
+                    values: vec![
+                        "8828308281fffff".to_string(),
+                        "8828308283fffff".to_string(),
+                    ],
+                    validity: None,
+                },
+                ColumnArray::Float64 {
+                    values: vec![0.0, 4.25],
+                    validity: Some(vec![false, true]),
+                },
+                ColumnArray::UInt8 {
+                    values: vec![8, 8],
+                    validity: None,
+                },
+                ColumnArray::Boolean {
+                    values: vec![true, false],
+                    validity: None,
+                },
+                ColumnArray::Binary {
+                    values: vec![vec![1, 2, 3], vec![4, 5, 6, 7]],
+                    validity: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut stream =
+            ArrowArrayStream::from_iterator(Arc::clone(&schema), vec![Ok(batch.clone())].into_iter());
+        let (out_schema, out_batches) = unsafe { stream.collect_batches().unwrap() };
+        assert_eq!(*out_schema, *schema);
+        assert_eq!(out_batches.len(), 1);
+        assert_eq!(out_batches[0], batch);
+    }
+}

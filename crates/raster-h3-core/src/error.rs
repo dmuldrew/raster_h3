@@ -65,3 +65,33 @@ pub enum RasterH3Error {
 
 /// Specialized [`Result`] type alias using [`RasterH3Error`].
 pub type Result<T> = std::result::Result<T, RasterH3Error>;
+
+/// Extracts a human-readable panic message from a panic payload while ensuring
+/// payload disposal does not escape with a secondary panic across FFI or thread boundaries.
+pub fn safe_panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    let msg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic payload".to_string()
+        }
+    }));
+
+    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+    {
+        std::mem::forget(secondary);
+    }
+
+    msg_res.unwrap_or_else(|secondary| {
+        std::mem::forget(secondary);
+        "Unknown panic (payload downcast failed)".to_string()
+    })
+}
+
+/// Extracts a human-readable panic message from a panic payload.
+pub fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    safe_panic_payload_to_string(payload)
+}
+
