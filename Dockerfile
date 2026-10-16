@@ -1,7 +1,13 @@
+# DuckDB version the extension is packaged for and the runtime CLI/library.
+# They must match: DuckDB rejects extensions tagged for another platform name.
+ARG DUCKDB_VERSION=v1.2.0
+
 # ==============================================================================
 # Stage 1: Build the Rust DuckDB Extension
 # ==============================================================================
 FROM rust:bookworm AS builder
+
+ARG DUCKDB_VERSION
 
 WORKDIR /build
 
@@ -18,7 +24,7 @@ RUN cargo test --release && \
     cargo run --release --bin package_extension -- \
         --input target/release/libraster_h3.so \
         --output target/release/raster_h3.duckdb_extension \
-        --duckdb-version v1.2.0
+        --duckdb-version "${DUCKDB_VERSION}"
 
 # ==============================================================================
 # Stage 2: Runtime Environment with DuckDB CLI
@@ -33,8 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest DuckDB CLI with multi-arch support
-ARG DUCKDB_VERSION=latest
+# Install the DuckDB CLI and library matching the packaged extension
+ARG DUCKDB_VERSION
 RUN set -eux; \
     ARCH=$(uname -m); \
     case "$ARCH" in \
@@ -42,13 +48,8 @@ RUN set -eux; \
         aarch64|arm64) DUCK_ARCH="linux-arm64" ;; \
         *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac; \
-    if [ "$DUCKDB_VERSION" = "latest" ]; then \
-        CLI_URL="https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-${DUCK_ARCH}.zip"; \
-        LIB_URL="https://github.com/duckdb/duckdb/releases/latest/download/libduckdb-${DUCK_ARCH}.zip"; \
-    else \
-        CLI_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${DUCK_ARCH}.zip"; \
-        LIB_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-${DUCK_ARCH}.zip"; \
-    fi; \
+    CLI_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${DUCK_ARCH}.zip"; \
+    LIB_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-${DUCK_ARCH}.zip"; \
     curl -fsSL "$CLI_URL" -o duckdb.zip; \
     unzip duckdb.zip -d /usr/local/bin; \
     chmod +x /usr/local/bin/duckdb; \

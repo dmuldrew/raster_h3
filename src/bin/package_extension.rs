@@ -5,7 +5,15 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-fn detect_platform() -> String {
+/// Parses `vMAJOR.MINOR[.PATCH]` into `(major, minor)`.
+fn parse_duckdb_version(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn detect_platform(duckdb_version: &str) -> String {
     let os = match env::consts::OS {
         "linux" => "linux",
         "macos" => "osx",
@@ -19,6 +27,12 @@ fn detect_platform() -> String {
         other => other,
     };
 
+    // DuckDB v1.0-v1.2 tag glibc x86_64 builds linux_amd64_gcc4; v1.3 renamed it linux_amd64.
+    let gcc4_era = parse_duckdb_version(duckdb_version).is_some_and(|v| v < (1, 3));
+    if os == "linux" && arch == "amd64" && gcc4_era {
+        return "linux_amd64_gcc4".to_string();
+    }
+
     format!("{}_{}", os, arch)
 }
 
@@ -28,7 +42,7 @@ fn print_help() {
         Options:\n  \
         -i, --input <PATH>           Path to compiled dynamic library (.so, .dylib, .dll)\n  \
         -o, --output <PATH>          Path to output .duckdb_extension file\n  \
-        -p, --platform <NAME>        DuckDB target platform (default: auto-detected host platform)\n  \
+        -p, --platform <NAME>        DuckDB target platform (default: host platform for --duckdb-version)\n  \
         -d, --duckdb-version <VER>   DuckDB version (default: v1.2.0)\n  \
         -v, --ext-version <VER>      Extension version (default: v{})\n  \
         -a, --abi-type <TYPE>        ABI type (0=CPP, 1=C_STRUCT, 2=C_STRUCT_V0; default: 1)\n  \
@@ -150,7 +164,7 @@ fn main() {
         }
     };
 
-    let target_platform = platform.unwrap_or_else(detect_platform);
+    let target_platform = platform.unwrap_or_else(|| detect_platform(&duckdb_version));
 
     println!("Packaging DuckDB Extension:");
     println!("  Input:          {}", input_path);
