@@ -287,12 +287,16 @@ def _polars_from_stream(obj: Any) -> Any:
     import polars as pl  # type: ignore
 
     try:
-        return pl.from_arrow(obj)
+        result = pl.from_arrow(obj)
     except TypeError:
         # Polars predating Arrow PyCapsule support rejects the object before reading it.
         import pyarrow as pa  # type: ignore
 
-        return pl.from_arrow(pa.table(obj))
+        result = pl.from_arrow(pa.table(obj))
+    if isinstance(result, pl.Series):
+        # Polars 2 reads a struct-typed Arrow stream as one struct Series.
+        result = result.struct.unnest()
+    return result
 
 
 # -----------------------------------------------------------------------------
