@@ -76,7 +76,10 @@ pub unsafe fn dlsym_duckdb_symbol(symbol: &[u8]) -> *mut std::ffi::c_void {
 /// Checks if the runtime DuckDB library version is at least (req_major, req_minor)
 pub fn is_duckdb_version_at_least(req_major: u32, req_minor: u32) -> bool {
     unsafe {
-        let sym = dlsym_duckdb_symbol(b"duckdb_library_version\0");
+        let sym = crate::ffi::duckdb_c::lookup_api_fn(
+            crate::ffi::duckdb_c::api_index::duckdb_library_version,
+            "duckdb_library_version\0",
+        );
         if !sym.is_null() {
             let func: unsafe extern "C" fn() -> *const std::os::raw::c_char =
                 std::mem::transmute(sym);
@@ -112,7 +115,14 @@ pub unsafe fn is_spatial_loaded_query(con: duckdb_connection) -> bool {
     );
     let state = duckdb_query(con, query.as_ptr(), &mut result);
     let is_loaded = if state == DuckDBState::Success {
-        duckdb_row_count(&mut result) > 0
+        let mut chunk = duckdb_fetch_chunk(result);
+        if chunk.is_null() {
+            false
+        } else {
+            let has_rows = duckdb_data_chunk_get_size(chunk) > 0;
+            duckdb_destroy_data_chunk(&mut chunk);
+            has_rows
+        }
     } else {
         false
     };
