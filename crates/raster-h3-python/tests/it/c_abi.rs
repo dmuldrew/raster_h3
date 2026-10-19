@@ -381,3 +381,57 @@ fn scan_json_errors_set_out_err() {
     };
     assert!(result.is_null());
 }
+
+#[test]
+fn scan_json_rejects_malformed_options() {
+    let (_tmp, path) = gradient_tif();
+    let err = |scan: Scan| scan.json().unwrap_err();
+
+    for bbox in ["1,2,3", "x,y,z,w", "1,2,3,4,5", "1,2,3,4,x"] {
+        let msg = err(Scan {
+            bbox: Some(bbox.into()),
+            ..Scan::of(&path)
+        });
+        assert!(msg.contains("Invalid bbox"), "{bbox}: {msg}");
+    }
+    for res in ["99", "abc", "7,16", "8,x", ","] {
+        let msg = err(Scan {
+            resolutions: Some(res.into()),
+            ..Scan::of(&path)
+        });
+        assert!(msg.contains("Invalid resolutions"), "{res}: {msg}");
+    }
+    let msg = err(Scan {
+        categorical: true,
+        format: Some("tall".into()),
+        ..Scan::of(&path)
+    });
+    assert!(msg.contains("Invalid format 'tall'"), "{msg}");
+
+    // Valid spellings still parse: whitespace separators and case-insensitive format.
+    Scan {
+        resolutions: Some("8 9".into()),
+        bbox: Some("-122.45 37.78 -122.435 37.795".into()),
+        format: Some("WIDE".into()),
+        ..Scan::of(&path)
+    }
+    .json()
+    .unwrap();
+}
+
+#[test]
+fn create_arrow_schema_rejects_unknown_format() {
+    let format = CString::new("tall").unwrap();
+    let mut err: *mut c_char = ptr::null_mut();
+    let schema = unsafe {
+        raster_h3_python::raster_h3_py_create_arrow_schema(
+            1,
+            format.as_ptr(),
+            ptr::null(),
+            &mut err,
+        )
+    };
+    assert!(schema.is_null());
+    let msg = unsafe { take_err(err) }.unwrap();
+    assert!(msg.contains("Invalid format 'tall'"), "{msg}");
+}

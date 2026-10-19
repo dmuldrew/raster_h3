@@ -103,6 +103,12 @@ fn export_error_paths_return_minus_one_with_a_message() {
         // Empty strings count as missing.
         let e = export(Some(""), s(out), None, false).unwrap_err();
         assert!(e.contains("Missing input_path"), "{e}");
+        // Invalid resolutions are rejected rather than falling back to 8.
+        for res in ["x", "99", "7,16"] {
+            let e = export(s(&tif), s(out), Some(res), false).unwrap_err();
+            assert!(e.contains("Invalid resolutions"), "{e}");
+            assert!(!out.exists());
+        }
 
         for categorical in [false, true] {
             assert!(!export(s(&missing), s(out), None, categorical)
@@ -153,10 +159,9 @@ fn successful_exports_report_core_row_counts() {
     let (_ctmp, classes) = classes_tif();
     let dir = tempfile::tempdir().unwrap();
 
-    // Parquet: the returned count is the number of core rows; an unparsable resolution
-    // list falls back to resolution 8.
+    // Parquet: the returned count is the number of core rows; no resolution list means 8.
     for (path, categorical) in [(&tif, false), (&classes, true)] {
-        for (res, cfg_res) in [(Some("7,8"), "7,8"), (Some("x"), "8"), (None, "8")] {
+        for (res, cfg_res) in [(Some("7,8"), "7,8"), (None, "8")] {
             let out = dir.path().join(format!("{categorical}-{cfg_res}.parquet"));
             let n = parquet(s(path), s(&out), res, categorical).unwrap();
             let scan = Scan {
