@@ -305,6 +305,16 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` | `cargo build --release --lib` then `cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` | Real-SQL DuckDB smoke test against the CLI CI downloads (v1.2.0) |
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
+| [`manual-tests.yml`](../.github/workflows/manual-tests.yml) (manual) | `cargo test [--release] --no-fail-fast -p <engine>` plus `--features pg-extension` for `pg`/`all` (not on Windows) | Any engine (`all`, `core`, `duckdb`, `datafusion`, `cli`, `python`, `pg`, `root`) on one or all of Linux amd64/arm64, macOS arm64 and Windows, for any branch, tag or SHA, with optional libtest arguments |
+
+To run it: **Actions → Manual Tests → Run workflow**, or
+
+```bash
+gh workflow run manual-tests.yml -f ref=my-branch -f engine=datafusion -f platform=all
+```
+
+The workflow file must exist on the default branch for GitHub to list it; `ref` can then
+name any branch, even one without the file.
 
 ### Gaps
 
