@@ -535,7 +535,8 @@ pub struct PgCContinuousRow {
     pub sum: f64,
     pub resolution: i16,
     pub wkb_len: usize,
-    pub wkb: [u8; 128],
+    /// Cell boundary WKB; odd-resolution pentagons need up to 189 bytes.
+    pub wkb: WkbBuf,
 }
 
 unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
@@ -633,9 +634,10 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
             out.max = row.max;
             out.sum = row.sum;
             out.resolution = row.resolution;
-            let wlen = row.wkb.len().min(128);
+            // `row.wkb` comes from a `WkbBuf`, so it always fits.
+            let wlen = row.wkb.len().min(WKB_BUF_LEN);
             out.wkb_len = wlen;
-            out.wkb = [0u8; 128];
+            out.wkb = [0u8; WKB_BUF_LEN];
             out.wkb[..wlen].copy_from_slice(&row.wkb[..wlen]);
             1
         }

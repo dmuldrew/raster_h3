@@ -611,7 +611,7 @@ print(json.dumps(d))
             sum: 0.0,
             resolution: 0,
             wkb_len: 0,
-            wkb: [0u8; 128],
+            wkb: [0u8; 192],
         };
         while pg_srf_continuous_next(srf_ptr, &mut c_row) == 1 {
             let cell_u64 = c_row.h3_index as u64;
