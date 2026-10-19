@@ -4,7 +4,7 @@
 
 This page lists every test suite in the workspace, grouped by what it protects, and
 explains how to run each group and what CI runs. The counts below are the number of
-`#[test]` functions at the time of writing.
+`#[test]` (or pytest `test_*`) functions at the time of writing.
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
@@ -16,6 +16,7 @@ explains how to run each group and what CI runs. The counts below are the number
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 10 (7 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 5 |
 | Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 172 |
+| [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 2 modules | 24 (35 cases) |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -254,6 +255,8 @@ See [DuckDB](engines/duckdb.md).
 | Unit: `raster-h3-datafusion` (3) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
 | Unit: `raster-h3-cli` (2) | Argument validation, IPC and JSONL output. |
 | Unit: `raster-h3-python` (2), `raster-h3-pg` (2 + 3 in `fmgr.rs`) | C-ABI helpers and SRF iterators. The `fmgr.rs` tests only compile with `--features pg-extension`. |
+| [`pytest/test_arrow_stream.py`](../crates/raster-h3-python/tests/pytest/test_arrow_stream.py) (12) | The in-tree `raster_h3` package with the locally built cdylib, read by real PyArrow and Polars: continuous `h3_index`/`count`/`sum`/`min`/`max`/`mean` equal an independent reference that indexes every pixel centre with the `h3` package; `pl.from_arrow`, `to_polars()`, `read_raster_h3` and `iter_batches` equal `pyarrow.table` on `RasterH3ArrowStream` (`__arrow_c_stream__`), and `pyarrow.schema` (`__arrow_c_schema__`) equals the stream schema; `columns` and `limit`; categorical long counts/fractions and wide majority class/count/fraction against the `h3` reference; missing files, non-TIFF input, unknown columns and a non-intersecting bbox raise `RuntimeError`. |
+| [`pytest/test_polars_scan.py`](../crates/raster-h3-python/tests/pytest/test_polars_scan.py) (12) | `scan_raster_h3` as a Polars IO source (`register_io_source`, Polars ≥ 1.4): projection pushdown opens the native scan with only the selected columns; predicate pushdown (numeric, combined, string, `is_in` on `h3_index`) and `head(n)` (pushed as the scan limit), `head` after `filter`, and the `limit`/`columns` arguments give the same rows as the eager full scan filtered in Polars; empty results keep the schema; categorical wide/long pushdown; scan errors and unknown columns raise. |
 | [`wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | After `cibuildwheel` installs a wheel: the bundled library loads, Arrow/Polars paths work, `raster-h3-cli` is on `PATH`. |
 
 See the [engine deep dives](engines/README.md).
@@ -282,6 +285,14 @@ cargo test --release --workspace -- --ignored       # only the gated tests
 RASTER_H3_PG_MAJOR=16 cargo test --release -p raster-h3-pg --features pg-extension  # adds the fmgr suites
 ```
 
+The Python package tests run with pytest against the locally built library:
+
+```bash
+cargo build -p raster-h3-python --lib
+python -m pip install pytest polars pyarrow h3
+python -m pytest crates/raster-h3-python/tests/pytest   # RASTER_H3_PYTHON_LIB picks a specific library
+```
+
 Use `--release` for anything that streams real data; debug builds are much slower and
 `core/performance.rs` can exceed its time limits.
 
@@ -295,6 +306,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `super_sampling::benchmark_supersampling` (core) | `#[ignore]` | `cargo test --release -p raster-h3-core --test it benchmark_supersampling -- --ignored --nocapture` |
 | `pg/fmgr.rs` (7) and the `fmgr.rs` unit tests | `--features pg-extension`; needs `RASTER_H3_PG_MAJOR` or `pg_config` on `PATH` | `RASTER_H3_PG_MAJOR=16 cargo test -p raster-h3-pg --features pg-extension` |
 | DuckDB part of `multi_engine_e2e` | Skipped when `duckdb --version` fails | Put the DuckDB CLI on `PATH` |
+| `crates/raster-h3-python/tests/pytest` | Each module skips when `polars` or `pyarrow` is missing; `test_polars_scan.py` also skips without `polars.io.plugins` (Polars < 1.4), the `h3` reference checks skip without `h3`, the `pl.from_arrow(stream)` check skips on Polars without PyCapsule support, and the string-predicate case skips on Polars < 1.22 (it drops such predicates on IO sources) | `pip install pytest polars pyarrow h3` and build the cdylib |
 | Python part of `multi_engine_e2e` | Runs `/usr/bin/python3`; the test fails if that path is absent | Run on a system with `/usr/bin/python3` |
 
 ## What CI Runs
@@ -306,6 +318,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
 | [`manual-tests.yml`](../.github/workflows/manual-tests.yml) (manual) | `cargo test [--release] --no-fail-fast -p <engine>` plus `--features pg-extension` for `pg`/`all` (not on Windows) | Any engine (`all`, `core`, `duckdb`, `datafusion`, `cli`, `python`, `pg`, `root`) on one or all of Linux amd64/arm64, macOS arm64 and Windows, for any branch, tag or SHA, with optional libtest arguments |
+| `manual-tests.yml`, engine `python-polars` | `cargo build [--release] -p raster-h3-python --lib` then `pytest crates/raster-h3-python/tests/pytest` | The pytest suite per platform with three dependency sets: `polars==1.0.*` + `pyarrow==14.*` (Python 3.11, `numpy<2`), `polars==1.4.*` + `pyarrow==14.*` (first Polars with `register_io_source`) and the latest of both (Python 3.13); `test_args` are passed to pytest |
 
 To run it: **Actions → Manual Tests → Run workflow**, or
 
@@ -318,10 +331,9 @@ name any branch, even one without the file.
 
 ### Gaps
 
-- **CLI, DataFusion, Python and PostgreSQL unit and integration tests are not run in CI.**
+- **CLI, DataFusion, Python and PostgreSQL unit and integration tests are not run in CI**
+  (only on demand through `manual-tests.yml`, including the `python-polars` pytest suite).
   The test step selects the root, core and DuckDB packages; adding `--workspace` would
   cover the rest (they still build, and run in-process, through `root/multi_engine_e2e.rs`).
 - The real PostgreSQL test and the Hawaii-dataset tests never run in CI.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
-- No Python-side test covers `scan_raster_h3` projection, predicate or `n_rows` pushdown
-  into Polars; it needs `polars` installed.
