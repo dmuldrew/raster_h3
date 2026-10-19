@@ -115,10 +115,6 @@ is listed in the [overview](README.md#scalar-helpers)). They operate on single P
 values; for whole columns use the Arrow stream or a Polars expression such as
 `map_elements`.
 
-> **Known limitation:** `h3_to_wkb` copies into a 128-byte buffer, so it returns `None` for
-> cells whose WKB is larger (odd-resolution cells with up to 10 boundary vertices need up
-> to 189 bytes). The `wkb` column of scans is unaffected.
-
 ### Exporters
 
 | Function | Arguments | Returns |

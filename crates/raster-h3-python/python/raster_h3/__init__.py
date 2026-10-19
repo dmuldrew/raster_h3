@@ -630,12 +630,17 @@ def h3_is_valid(cell_or_hex: Union[int, str]) -> bool:
     return bool(lib.raster_h3_py_h3_is_valid_u64(int(cell_or_hex)))
 
 
+_WKB_BUF_LEN = 192
+
+
 def h3_to_wkb(cell_or_hex: Union[int, str]) -> Optional[bytes]:
     cell = string_to_h3(cell_or_hex) if isinstance(cell_or_hex, str) else int(cell_or_hex)
     if cell == 0:
         return None
-    buf = (ctypes.c_uint8 * 128)()
-    written = _get_lib().raster_h3_py_h3_to_wkb(cell, buf, 128)
+    # Matches WKB_BUF_LEN in raster-h3-core: odd-resolution pentagons have up to
+    # 10 boundary vertices (189 bytes of WKB).
+    buf = (ctypes.c_uint8 * _WKB_BUF_LEN)()
+    written = _get_lib().raster_h3_py_h3_to_wkb(cell, buf, _WKB_BUF_LEN)
     if written == 0:
         return None
     return bytes(buf[:written])

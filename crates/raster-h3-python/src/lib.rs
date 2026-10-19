@@ -662,8 +662,9 @@ pub unsafe extern "C" fn raster_h3_py_h3_cell_to_parent_str(
     }
 }
 
-/// C-ABI helper: write WKB polygon for `cell` into `out_buf` (must have capacity >= 128 bytes).
-/// Returns number of bytes written, or `0` if `cell` is invalid.
+/// C-ABI helper: write WKB polygon for `cell` into `out_buf` (capacity of
+/// `raster_h3_core::encoding::WKB_BUF_LEN` bytes always suffices).
+/// Returns number of bytes written, or `0` if `cell` is invalid or `buf_cap` is too small.
 ///
 /// # Safety
 /// `out_buf` must point to at least `buf_cap` writable bytes.
@@ -890,5 +891,22 @@ mod tests {
             assert!(json_s.contains("25.5"));
             raster_h3_py_free_string(json_ptr);
         }
+    }
+
+    #[test]
+    fn test_py_h3_to_wkb_fits_odd_res_pentagon() {
+        // Res-1 pentagon: 10 boundary vertices -> 13 + 16 * 11 = 189 bytes of WKB.
+        let cell = 0x0810_83ff_ffff_ffffu64;
+        let n = h3o::CellIndex::try_from(cell).unwrap().boundary().len();
+        assert!(n > 6, "expected >6 boundary vertices, got {n}");
+        let mut buf = [0u8; raster_h3_core::encoding::WKB_BUF_LEN];
+        let written = unsafe { raster_h3_py_h3_to_wkb(cell, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(written, 13 + 16 * (n + 1));
+        assert!(written > 128);
+        let mut small = [0u8; 128];
+        assert_eq!(
+            unsafe { raster_h3_py_h3_to_wkb(cell, small.as_mut_ptr(), small.len()) },
+            0
+        );
     }
 }

@@ -69,6 +69,9 @@ def main() -> None:
     assert raster_h3.h3_to_string(cell) == "8828308281fffff"
     assert raster_h3.h3_get_resolution(cell) == 8
     assert raster_h3.h3_is_valid("8828308281fffff")
+    # Odd-resolution pentagon with 10 boundary vertices: 189 bytes of WKB.
+    wkb = raster_h3.h3_to_wkb(0x81083FFFFFFFFFF)
+    assert wkb is not None and len(wkb) == 13 + 16 * 11, wkb
 
     with tempfile.TemporaryDirectory() as tmp:
         tif = Path(tmp) / "smoke.tif"
