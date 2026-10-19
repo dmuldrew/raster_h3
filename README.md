@@ -82,6 +82,7 @@ capability matrix, shared schemas and cross-engine parity tests.
 | [CRS & Projections](docs/crs-and-projection.md) | Supported projections, detection, 3-tier transform hierarchy |
 | [Architecture Comparison](docs/architecture-comparison.md) | Benchmarks vs Python/PostGIS/GDAL, environment trade-offs |
 | [API Reference](docs/api-reference.md) | Complete SQL function signatures, parameters, output schemas |
+| [Test Coverage](docs/testing.md) | Every test suite grouped by category (geodetic, threading, eviction, codecs, engines…), gated tests, CI coverage |
 
 ---
 
@@ -736,6 +737,9 @@ cargo build --release -p raster-h3-pg --features pg-extension  # PostgreSQL modu
 | `raster-h3-cli` | [`crates/raster-h3-cli`](crates/raster-h3-cli) |
 
 ### Test
+
+See [Test Coverage](docs/testing.md) for what each suite checks and which tests are gated.
+
 ```bash
 cargo test --release --workspace
 

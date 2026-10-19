@@ -107,6 +107,8 @@ differences that remain:
 
 ## Cross-Engine Parity Testing
 
+For the full test inventory, see [Test Coverage](../testing.md).
+
 | Test | What it checks | How to run |
 | :--- | :--- | :--- |
 | [`tests/test_multi_engine_e2e.rs`](../../tests/test_multi_engine_e2e.rs) | Generates synthetic continuous and categorical GeoTIFFs and compares per-cell results from the core batch readers and Arrow C stream, the CLI (subprocess: `ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, scalar UDFs), Python (a `python3` subprocess loading `libraster_h3_python`), the PostgreSQL SRFs and fmgr scalars in-process, and DuckDB when a `duckdb` binary is on `PATH`. | `cargo test --test test_multi_engine_e2e` |

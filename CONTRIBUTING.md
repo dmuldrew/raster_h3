@@ -205,7 +205,7 @@ Open a GitHub Issue describing:
 
 ### Submitting Pull Requests
 1. Fork the repository and create a feature branch from `main`
-2. Write or update tests in the appropriate `tests/test_*.rs` file (see project tree above for the 18 modular test suites)
+2. Write or update tests in the appropriate `tests/test_*.rs` file ([Test Coverage](docs/testing.md) lists each suite by category)
 3. Ensure all tests pass:
    ```bash
    cargo test --workspace
