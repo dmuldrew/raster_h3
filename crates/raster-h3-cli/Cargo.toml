@@ -24,5 +24,6 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+parquet.workspace = true
 tempfile.workspace = true
 tiff.workspace = true
