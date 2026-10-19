@@ -80,8 +80,10 @@ jobs:
           cp target/duckdb_lib/duckdb.dll target/release/ || true
           cp target/duckdb_lib/duckdb.dll . || true
 
+      # Root (cross-engine/packaging), core and DuckDB integration binaries plus
+      # their unit tests; each crate links a single tests/it binary.
       - name: Run Tests
-        run: cargo test --release --no-fail-fast
+        run: cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb
 
       - name: Build Dynamic Library & Binaries
         run: cargo build --release --target ${{ matrix.target }}
@@ -142,7 +144,7 @@ jobs:
           fi
           export DUCKDB_BIN
           cargo build --release --lib
-          cargo test --release --test test_duckdb_sql_smoke -- --ignored
+          cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
 
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@v4

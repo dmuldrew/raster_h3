@@ -8,7 +8,7 @@
 # Env:   RASTER_H3_PG_RUST_IMAGE  build image (default rust:1-bookworm)
 #        RASTER_H3_PG_IMAGE       server image template (default postgres:<major>-bookworm)
 #
-# Used by tests/test_pg_extension_e2e.rs; can also be run by hand and then queried with
+# Used by tests/it/pg_extension_e2e.rs; can also be run by hand and then queried with
 #   docker exec -it raster-h3-pg-e2e-<major> psql -U postgres
 set -euo pipefail
 

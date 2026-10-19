@@ -155,5 +155,5 @@ cargo test -p raster-h3-datafusion
 ```
 
 Unit tests cover projection, limit, filter narrowing (resolution and bbox), the Arrow C
-stream round trip and every UDF. `tests/test_multi_engine_e2e.rs` checks the providers
+stream round trip and every UDF. `tests/it/multi_engine_e2e.rs` checks the providers
 against the other engines.

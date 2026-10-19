@@ -179,8 +179,8 @@ points (`pg_h3_to_lat`, `pg_h3_get_resolution`, …) can be called with a
 | Test | Requires | Command |
 | :--- | :--- | :--- |
 | Crate unit tests | — | `cargo test -p raster-h3-pg` |
-| In-process SRF / fmgr parity | — | `cargo test --test test_multi_engine_e2e` |
-| Real server | Docker | `cargo test --test test_pg_extension_e2e -- --ignored --nocapture` |
+| In-process SRF / fmgr parity | — | `cargo test -p raster_h3 --test it multi_engine_e2e` |
+| Real server | Docker | `cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture` |
 
 The real-server test runs [`scripts/pg_e2e.sh`](../../scripts/pg_e2e.sh) for each major in
 `RASTER_H3_PG_VERSIONS` (comma-separated, default `16`). The script builds the module in

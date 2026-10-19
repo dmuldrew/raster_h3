@@ -17,12 +17,18 @@ cargo build --release
 # Run the full workspace test suite
 cargo test --release --workspace
 
-# Cross-engine parity and the Docker-based PostgreSQL test
-cargo test --test test_multi_engine_e2e
-cargo test --test test_pg_extension_e2e -- --ignored --nocapture
+# Core engine only (does not compile DuckDB, DataFusion, PostgreSQL or Python)
+cargo test -p raster-h3-core
+
+# One module of a crate's integration binary (tests/it/<module>.rs)
+cargo test -p raster-h3-core --test it pmtiles
+
+# Cross-engine parity and the Docker-based PostgreSQL test (root crate)
+cargo test -p raster_h3 --test it multi_engine_e2e
+cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture
 
 # Run tests with output visible
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 ```
 
 ### Docker
@@ -142,27 +148,52 @@ crates/raster-h3-duckdb/src/
 │   └── mod.rs               # Re-exports fast_hex and wkb from crate::encoding
 └── lib.rs                   # DuckDB entry points (raster_h3_init, raster_h3_init_c_api, raster_h3_version)
 
-tests/                       # Integration test suites (18 files)
-├── helpers.rs               # TestGeoTiffBuilder & shared fixture generators
-├── test_categorical_remap.rs    # Category remapping engine tests
-├── test_conus_pipeline.rs       # CONUS-scale pipeline smoke tests
-├── test_deflate_simd.rs         # SIMD Deflate decompression & corruption fuzzing
-├── test_geoparquet.rs           # OGC GeoParquet 1.1 metadata & geometry tests
-├── test_lzw_fast.rs             # Accelerated LZW decompression tests
-├── test_mosaic_and_overlap.rs   # Multi-file mosaic & overlap rule tests
-├── test_multi_engine_e2e.rs     # Cross-engine parity (core, CLI, DataFusion, Python, PostgreSQL, DuckDB)
-├── test_multi_resolution.rs     # Multi-resolution fusion & conservation tests
-├── test_multiband_and_query_pushdown.rs  # Multi-band & predicate pushdown tests
-├── test_package_extension.rs    # DuckDB extension packaging tests
-├── test_performance.rs          # Performance regression guards
-├── test_pg_extension_e2e.rs     # Real PostgreSQL servers in Docker (ignored by default)
-├── test_pmtiles.rs              # PMTiles v3 archive & MVT encoding tests
-├── test_quantiles.rs            # Streaming quantile sketch tests
-├── test_raster_h3.rs            # Core H3 aggregation & CRS tests
-├── test_remote_cog.rs           # Remote COG/S3 streaming tests
-├── test_spatial_geometry.rs     # WKB geometry emission tests
-├── test_super_sampling.rs        # Super-sampling conservation tests
-└── test_threading.rs            # Multi-threaded determinism & stress tests
+crates/raster-h3-core/tests/it/      # Core engine suites (no DuckDB/DataFusion/pg)
+├── main.rs                  # One test binary per crate: declares every module below
+├── helpers.rs               # TestGeoTiffBuilder & shared fixtures (also used by duckdb and root)
+├── support/mvt.rs           # MVT protobuf decoder for PMTiles assertions
+├── accumulators.rs          # Welford/SIMD span and categorical accumulators
+├── analytic_south_lat.rs    # Cell south-latitude bounds for eviction
+├── antimeridian_bbox.rs     # ±180° bboxes, tile wrap and polar clamping
+├── categorical_remap.rs     # Category remapping engine tests
+├── chunks_and_prefetch.rs   # Chunk layout, bbox chunk pruning, prefetched readers
+├── codecs.rs                # SIMD Deflate and fast LZW decompression parity
+├── compaction_streaming.rs  # Compacted stream eviction
+├── conic_horizon_soundness.rs  # Albers/conic horizon bounds
+├── conus_pipeline.rs        # CONUS-scale pipeline smoke tests
+├── exact_cell_assignment.rs # Exhaustive per-sample cell assignment reference
+├── geodetic_reference.rs    # PROJ golden points within 0.01 m
+├── geoparquet.rs            # OGC GeoParquet 1.1 metadata & geometry tests
+├── geotiff_crs.rs           # GeoTransform and CRS detection/reprojection
+├── horizon_streaming.rs     # Scan-horizon streaming, NoData and error paths
+├── memory_budgets.rs        # Decoded-chunk and compaction budgets
+├── mosaic.rs                # Multi-file mosaics, overlap rules and footprints
+├── multi_resolution.rs      # Multi-resolution fusion & conservation tests
+├── multiband_and_query_pushdown.rs  # Multi-band, spectral formulas & predicate pushdown
+├── performance.rs           # Performance regression guards
+├── pmtiles.rs               # PMTiles v3 archive & MVT encoding tests
+├── projected_eviction.rs    # Projected-CRS eviction soundness
+├── quantiles.rs             # Streaming quantile sketch tests
+├── remote_cog.rs            # Remote COG/S3 streaming tests
+├── rotated_grid_correctness.rs  # Sheared/rotated grids vs exhaustive reference
+├── sharding.rs              # H3 shard balance and sharded merges
+├── sparse_chunks_and_spilling.rs  # Sparse COG chunks and aggregation spilling
+├── streaming_failures.rs    # Corrupt chunks reach stream consumers and exporters
+├── super_sampling.rs        # Super-sampling conservation & fused path parity
+└── threading.rs             # Multi-threaded determinism & stress tests
+
+crates/raster-h3-duckdb/tests/it/    # DuckDB binding suites
+├── cell_bbox_pushdown.rs    # cell_wgs84_bbox pushdown soundness
+├── ffi_sql.rs               # Mock C-API callbacks for every registered function
+├── prefetch_resilience.rs   # Prefetch queues under panics and remote mosaics
+├── record_queue.rs          # Bind-side record queue propagates stream failures
+└── spatial_geometry.rs      # WKB geometry emission and hex formatting
+
+tests/it/                    # Root crate: needs the raster_h3 cdylib or bins
+├── duckdb_sql_smoke.rs      # Real SQL through the DuckDB CLI (ignored by default)
+├── multi_engine_e2e.rs      # Cross-engine parity (core, CLI, DataFusion, Python, PostgreSQL, DuckDB)
+├── package_extension.rs     # DuckDB extension packaging tests
+└── pg_extension_e2e.rs      # Real PostgreSQL servers in Docker (ignored by default)
 
 examples/                    # CLI conversion & benchmark examples
 ├── benchmark_deflate.rs     # SIMD Deflate vs flate2 benchmark
@@ -205,7 +236,7 @@ Open a GitHub Issue describing:
 
 ### Submitting Pull Requests
 1. Fork the repository and create a feature branch from `main`
-2. Write or update tests in the appropriate `tests/test_*.rs` file ([Test Coverage](docs/testing.md) lists each suite by category)
+2. Write or update tests in the matching module of the owning crate's `tests/it/` binary (add a `mod` line to its `main.rs` for a new suite) ([Test Coverage](docs/testing.md) lists each suite by category)
 3. Ensure all tests pass:
    ```bash
    cargo test --workspace

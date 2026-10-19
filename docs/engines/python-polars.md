@@ -165,5 +165,5 @@ uploaded as workflow artifacts; nothing is published to PyPI yet.
 
 ```bash
 cargo test -p raster-h3-python                      # Rust-side unit tests
-cargo test --test test_multi_engine_e2e             # spawns python3 against the built cdylib
+cargo test -p raster_h3 --test it multi_engine_e2e           # spawns python3 against the built cdylib
 ```

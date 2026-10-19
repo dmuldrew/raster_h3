@@ -117,7 +117,7 @@ plain `BLOB`.
 
 | Test | Scope |
 | :--- | :--- |
-| `tests/test_duckdb_ffi_sql.rs`, `tests/test_duckdb_sql_smoke.rs` | SQL through a real DuckDB CLI when available |
-| `tests/test_package_extension.rs` | Extension footer packaging |
-| `tests/test_multi_engine_e2e.rs` | DuckDB results compared with the other engines when `duckdb` is on `PATH` |
-| `cargo test -p raster-h3-duckdb` | Crate unit tests (uses the core `test-hooks` feature) |
+| `crates/raster-h3-duckdb/tests/it/ffi_sql.rs`, `tests/it/duckdb_sql_smoke.rs` | SQL through a real DuckDB CLI when available |
+| `tests/it/package_extension.rs` | Extension footer packaging |
+| `tests/it/multi_engine_e2e.rs` | DuckDB results compared with the other engines when `duckdb` is on `PATH` |
+| `cargo test -p raster-h3-duckdb` | Crate unit tests and its `tests/it` binary (uses the core `test-hooks` feature) |

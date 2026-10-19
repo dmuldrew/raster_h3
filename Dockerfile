@@ -16,7 +16,7 @@ COPY examples/ ./examples/
 # Compile release libraries (every member's cdylib, which the cross-engine tests load),
 # run tests, then build CLI utilities, sample data, and the metadata-tagged extension
 RUN cargo build --release --workspace && \
-    cargo test --release && \
+    cargo test --release -p raster_h3 -p raster-h3-core -p raster-h3-duckdb && \
     cargo build --release --examples && \
     cargo run --release --example generate_sample -- sample_sf.tif && \
     cargo run --release --bin package_extension -- \

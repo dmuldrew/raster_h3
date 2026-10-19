@@ -25,3 +25,5 @@ crossbeam-deque.workspace = true
 
 [dev-dependencies]
 raster-h3-core = { path = "../raster-h3-core", features = ["test-hooks"] }
+tempfile.workspace = true
+tiff.workspace = true

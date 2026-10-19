@@ -875,6 +875,8 @@ dependencies = [
  "libc",
  "parquet",
  "raster-h3-core",
+ "tempfile",
+ "tiff",
 ]
 
 [[package]]
