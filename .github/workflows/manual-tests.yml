@@ -1,0 +1,161 @@
+name: Manual Tests
+
+# Run the test suites of one engine (or all of them) on chosen platforms, for any
+# branch, tag or commit. Start it from Actions > Manual Tests > Run workflow, or:
+#   gh workflow run manual-tests.yml -f ref=my-branch -f engine=pg -f platform=linux_amd64
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to test (blank = the branch picked in "Use workflow from")
+        type: string
+        required: false
+        default: ''
+      engine:
+        description: Crate to test
+        type: choice
+        default: all
+        options:
+          - all
+          - core
+          - duckdb
+          - datafusion
+          - cli
+          - python
+          - pg
+          - root
+      platform:
+        description: Runner platform
+        type: choice
+        default: linux_amd64
+        options:
+          - all
+          - linux_amd64
+          - linux_arm64
+          - osx_arm64
+          - windows_amd64
+      profile:
+        description: Cargo profile
+        type: choice
+        default: release
+        options:
+          - release
+          - debug
+      test_args:
+        description: Extra libtest arguments after `--` (e.g. a name filter, --ignored, --nocapture)
+        type: string
+        required: false
+        default: ''
+
+run-name: Tests ${{ inputs.engine }} on ${{ inputs.platform }} @ ${{ inputs.ref || github.ref_name }}
+
+concurrency:
+  group: manual-tests-${{ inputs.ref || github.ref }}-${{ inputs.engine }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: Select platforms
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.select.outputs.include }}
+    steps:
+      - id: select
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          all='[
+            {"platform":"linux_amd64","os":"ubuntu-24.04"},
+            {"platform":"linux_arm64","os":"ubuntu-24.04-arm"},
+            {"platform":"osx_arm64","os":"macos-latest"},
+            {"platform":"windows_amd64","os":"windows-latest"}
+          ]'
+          if [ "$PLATFORM" = all ]; then
+            include=$(jq -c . <<<"$all")
+          else
+            include=$(jq -c --arg p "$PLATFORM" '[.[] | select(.platform == $p)]' <<<"$all")
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ inputs.engine }} (${{ matrix.platform }})
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    env:
+      ENGINE: ${{ inputs.engine }}
+      PROFILE: ${{ inputs.profile }}
+      TEST_ARGS: ${{ inputs.test_args }}
+      # The pg fmgr suites need a target major; they run against in-process stand-ins.
+      RASTER_H3_PG_MAJOR: '16'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: manual-${{ matrix.platform }}-${{ inputs.profile }}
+
+      - name: Configure macOS Linker Flags
+        if: runner.os == 'macOS'
+        run: |
+          echo "RUSTFLAGS=-C link-arg=-undefined -C link-arg=dynamic_lookup" >> "$GITHUB_ENV"
+
+      - name: Setup DuckDB Import Library (Windows MSVC)
+        if: runner.os == 'Windows' && contains(fromJSON('["all","duckdb","root"]'), inputs.engine)
+        shell: bash
+        run: |
+          mkdir -p target/duckdb_lib
+          curl -sLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          unzip -o -q libduckdb-windows-amd64.zip -d target/duckdb_lib
+          WIN_LIB_DIR=$(cygpath -w "$(pwd)/target/duckdb_lib")
+          echo "LIB=$WIN_LIB_DIR;$LIB" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-L native=$WIN_LIB_DIR" >> "$GITHUB_ENV"
+          echo "$(pwd)/target/duckdb_lib" >> "$GITHUB_PATH"
+          for dir in target/release/deps target/release target/debug/deps target/debug .; do
+            mkdir -p "$dir"
+            cp target/duckdb_lib/duckdb.dll "$dir/" || true
+          done
+
+      - name: Run tests
+        shell: bash
+        run: |
+          case "$ENGINE" in
+            all)        pkgs=(--workspace) ;;
+            core)       pkgs=(-p raster-h3-core) ;;
+            duckdb)     pkgs=(-p raster-h3-duckdb) ;;
+            datafusion) pkgs=(-p raster-h3-datafusion) ;;
+            cli)        pkgs=(-p raster-h3-cli) ;;
+            python)     pkgs=(-p raster-h3-python) ;;
+            pg)         pkgs=(-p raster-h3-pg) ;;
+            root)       pkgs=(-p raster_h3) ;;
+            *) echo "unknown engine '$ENGINE'"; exit 1 ;;
+          esac
+          profile=()
+          [ "$PROFILE" = release ] && profile=(--release)
+          # Word-split the free-form libtest arguments on purpose.
+          # shellcheck disable=SC2206
+          extra=($TEST_ARGS)
+          set -x
+          cargo test "${profile[@]}" --no-fail-fast "${pkgs[@]}" -- "${extra[@]}"
+
+      # The pg-extension feature adds the fmgr unit tests and tests/it fmgr suite.
+      # Its server stand-ins assume the Unix fmgr ABI, so Windows is skipped.
+      - name: Run pg-extension tests
+        if: runner.os != 'Windows' && contains(fromJSON('["all","pg"]'), inputs.engine)
+        shell: bash
+        run: |
+          profile=()
+          [ "$PROFILE" = release ] && profile=(--release)
+          # shellcheck disable=SC2206
+          extra=($TEST_ARGS)
+          set -x
+          cargo test "${profile[@]}" --no-fail-fast -p raster-h3-pg --features pg-extension -- "${extra[@]}"
