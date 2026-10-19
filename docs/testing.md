@@ -8,7 +8,7 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`tests/`](../tests) (root crate integration tests) | 37 files | 286 |
+| [`tests/`](../tests) (root crate integration tests) | 37 files | 283 |
 | Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 172 |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
@@ -41,7 +41,7 @@ its own raster, so the suites need no downloaded data. The few exceptions are li
 19. [Other engines & cross-engine parity](#19-other-engines--cross-engine-parity)
 20. [Performance guards & benchmarks](#20-performance-guards--benchmarks)
 
-`tests/test_raster_h3.rs` (60 tests) is the original catch-all suite. Its tests are listed
+`tests/test_raster_h3.rs` (58 tests) is the original catch-all suite. Its tests are listed
 under the category they belong to rather than as one block.
 
 ---
@@ -68,7 +68,7 @@ grid orientation or bbox edges.
 | [`test_exact_cell_assignment.rs`](../tests/test_exact_cell_assignment.rs) (6) | An independent reference indexes every sample directly with `h3o` (no scanline or cache helpers) and must match supersampled continuous and categorical output per cell and class. Also: NaN NoData keeps finite values; fractional integer NoData does not exclude pixel values; compacting adjacent resolutions is rejected; a bbox keeps subsamples whose pixel centre is outside it; boundary assignment is independent of worker partitioning. |
 | [`test_rotated_grid_correctness.rs`](../tests/test_rotated_grid_correctness.rs) (1) | Streaming results equal an exhaustive per-sample reference for horizontal shear, latitude-varying shear, general rotation + shear, and south-to-north rasters. |
 | [`test_antimeridian_bbox.rs`](../tests/test_antimeridian_bbox.rs) (5) | Bboxes crossing ±180° keep every sample inside them, on grids ending at 180°, crossing 180°, spanning 0–360°, and on multiband rasters. |
-| `test_raster_h3.rs` | `test_bitshift_resolution`, `test_antimeridian_crossing_and_wrap`, `test_bounding_box_pruning`, `test_chunk_intersects_bbox_tile_filtering`, `test_spatial_filter_pushdown_chunk_skipping`. |
+| `test_raster_h3.rs` | `test_antimeridian_crossing_and_wrap`, `test_bounding_box_pruning`, `test_chunk_intersects_bbox_tile_filtering`, `test_spatial_filter_pushdown_chunk_skipping`. |
 | Unit: `aggregator/multi_horizon/walker.rs` (3) | Pixel walker spans and row pruning. |
 
 ## 3. Horizon eviction soundness
@@ -82,13 +82,13 @@ southern-boundary bounds and eviction certificates never under-reach.
 | [`test_conic_horizon_soundness.rs`](../tests/test_conic_horizon_soundness.rs) (5) | Albers strip northern bounds capture the central meridian (regression for a 2.5–3.6° underestimate); bbox intersection along the interior parallel arc; no duplicate cells in multi-horizon streaming; `max_hex_radius_deg` headroom at every resolution; apex and southern-hemisphere bounds. |
 | [`test_projected_eviction.rs`](../tests/test_projected_eviction.rs) (6) | UTM rasters without a certificate retain cells to EOF; Albers rasters evict early and soundly; `eviction_north_bound` holds over curvature; off-grid poles and large polar chunks cannot produce a finite certificate; an Albers apex inside a chunk disables the boundary certificate. |
 | [`test_compaction_streaming.rs`](../tests/test_compaction_streaming.rs) (2) | Compacted streams evict early yet match EOF grouping, never emit north of a published horizon, and PMTiles rejects compacting streamers before writing. |
-| `test_raster_h3.rs` | `test_compute_cell_south_lat`, `test_scan_horizon_streamer_with_prefetch_and_coherence`, `test_web_mercator_hoisted_streaming`. |
+| `test_raster_h3.rs` | `test_compute_cell_south_lat`, `test_scan_horizon_streamer_with_prefetch_and_coherence`, `test_web_mercator_streaming`. |
 
 ## 4. Super-sampling
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`test_super_sampling_lookahead.rs`](../tests/test_super_sampling_lookahead.rs) (7) | Mass conservation for every pattern (centre, RGSS, quincunx, Gaussian, hex, grids) on continuous and categorical rasters, gradient consistency, UTM Jacobian conservation and exact cell assignment, Web Mercator samples equal exact projection, custom single samples keep their offsets and weights. |
+| [`test_super_sampling.rs`](../tests/test_super_sampling.rs) (7) | Mass conservation for every pattern (centre, RGSS, quincunx, Gaussian, hex, grids) on continuous and categorical rasters, gradient consistency, UTM Jacobian conservation and exact cell assignment, Web Mercator samples equal exact projection, custom single samples keep their offsets and weights. |
 | [`test_fused_supersampling.rs`](../tests/test_fused_supersampling.rs) (2) | The fused projection/assignment/accumulation path matches a reference for statistics, histograms and quantiles. A throughput comparison is ignored by default. |
 | `test_raster_h3.rs` | `test_subpixel_sampling_patterns`, `test_subpixel_rgss_streaming`, `test_subpixel_hex_streaming`, `test_sampling_pattern_fallback_to_center`. |
 | Unit: `aggregator/sampling.rs` (2) | Pattern offsets and weights. |
@@ -117,7 +117,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 | :--- | :--- |
 | [`test_multi_resolution.rs`](../tests/test_multi_resolution.rs) (9) | One fused pass over several resolutions equals separate single-resolution runs exactly, for continuous and categorical data, with and without supersampling; empty-resolution errors; prefetch batch draining; sorted streaming Parquet export; compaction configuration validation. |
 | [`test_multiband_and_query_pushdown.rs`](../tests/test_multiband_and_query_pushdown.rs) | `test_hierarchical_compaction_continuous_conservation`, `test_hierarchical_compaction_categorical_conservation`. |
-| `test_raster_h3.rs` | `test_multi_resolution_config_single_delegation`, `test_scalar_resolution_and_parent_calculations`, `test_invalid_resolution_parameter_error`. |
+| `test_raster_h3.rs` | `test_scalar_resolution_and_parent_calculations`, `test_invalid_resolution_parameter_error`. |
 | Unit: `multi_horizon/compaction.rs` (2), `multi_horizon/config.rs` (2) | Compaction groups and config validation. |
 
 ## 8. Bands, spectral indices & pushdown
@@ -189,7 +189,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`test_spatial_geometry.rs`](../tests/test_spatial_geometry.rs) (9) | WKB for every resolution, Class III pentagons and edge-crossing cells; WKB vs `GEOMETRY` byte equality; hex-string input; invalid cells; DuckDB version parsing, spatial toggles and geometry column indices under projection. |
+| [`test_spatial_geometry.rs`](../tests/test_spatial_geometry.rs) (8) | WKB for every resolution, Class III pentagons and edge-crossing cells; WKB vs `GEOMETRY` byte equality; hex-string input; invalid cells; DuckDB version parsing and geometry column indices under projection. |
 | [`test_geodetic_reference.rs`](../tests/test_geodetic_reference.rs) | `wkb_buffer_capacity_all_resolutions_pentagons_and_icosahedron_edges`. |
 | `test_raster_h3.rs` | `test_wkb_ogc_compliance`, `test_fast_hex_formatting`. |
 | Unit: `encoding/wkb.rs` (6), `encoding/fast_hex.rs` (2) | Ring construction, dateline unwrapping, hex formatting/parsing. |

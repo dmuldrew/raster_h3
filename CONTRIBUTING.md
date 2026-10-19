@@ -161,7 +161,7 @@ tests/                       # Integration test suites (18 files)
 ├── test_raster_h3.rs            # Core H3 aggregation & CRS tests
 ├── test_remote_cog.rs           # Remote COG/S3 streaming tests
 ├── test_spatial_geometry.rs     # WKB geometry emission tests
-├── test_super_sampling_lookahead.rs  # Super-sampling conservation tests
+├── test_super_sampling.rs        # Super-sampling conservation tests
 └── test_threading.rs            # Multi-threaded determinism & stress tests
 
 examples/                    # CLI conversion & benchmark examples

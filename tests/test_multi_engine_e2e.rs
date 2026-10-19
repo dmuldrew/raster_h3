@@ -14,7 +14,7 @@
 //!    Postgres V1 `fmgr` scalar C-ABI functions (`pg_h3_to_lat`, `pg_h3_to_lng`, `pg_h3_get_resolution`,
 //!    `pg_h3_is_valid`, `pg_h3_cell_to_parent`, `pg_scalar_*`).
 //! 6. `raster-h3-duckdb`: Real DuckDB CLI execution (when `duckdb` binary is present on PATH) +
-//!    extension packaging and `h3_raster_agg` SQL query parity.
+//!    `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` SQL parity.
 
 mod helpers;
 
