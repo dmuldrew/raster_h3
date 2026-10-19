@@ -97,6 +97,14 @@ pub unsafe extern "C" fn raster_h3_init_c_api(
         if access.is_null() {
             return false;
         }
+        if let Some(get_api) = (*access).get_api {
+            let api = get_api(info, crate::ffi::duckdb_c::DUCKDB_C_API_VERSION.as_ptr());
+            if api.is_null() {
+                // DuckDB has already reported the version mismatch via set_error.
+                return false;
+            }
+            crate::ffi::duckdb_c::install_api_table(api);
+        }
         let get_db = match (*access).get_database {
             Some(f) => f,
             None => return false,

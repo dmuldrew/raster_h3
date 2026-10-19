@@ -21,7 +21,8 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            platform: linux_amd64
+            # DuckDB v1.2 tags its glibc x86_64 builds linux_amd64_gcc4
+            platform: linux_amd64_gcc4
             lib_file: libraster_h3.so
             cli_arch: linux-amd64
           - os: ubuntu-24.04-arm
@@ -39,6 +40,8 @@ jobs:
             platform: osx_amd64
             lib_file: libraster_h3.dylib
             cli_arch: osx-universal
+            # Cross-compiled on an arm64 runner: run the universal CLI's x86_64 slice
+            cli_prefix: arch -x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows_amd64
@@ -123,13 +126,19 @@ jobs:
           unzip -o -q "duckdb_cli-${{ matrix.cli_arch }}.zip"
           
           DUCKDB_BIN="./duckdb"
+          EXT_PATH="$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             DUCKDB_BIN="./duckdb.exe"
             cp target/duckdb_lib/duckdb.dll . || true
+            # DuckDB needs a native path (D:/...), not Git Bash's /d/...
+            EXT_PATH="$(cygpath -m "$EXT_PATH")"
           fi
           
           chmod +x $DUCKDB_BIN || true
-          $DUCKDB_BIN -unsigned -c "LOAD '$(pwd)/target/${{ matrix.target }}/release/raster_h3.duckdb_extension'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
+          if [[ -n "${{ matrix.cli_prefix }}" ]]; then
+            softwareupdate --install-rosetta --agree-to-license || true
+          fi
+          ${{ matrix.cli_prefix }} $DUCKDB_BIN -unsigned -bail -c "LOAD '$EXT_PATH'; SELECT h3_to_string(599686042433355775) AS cell_h3;"
           echo "Smoke test passed successfully on ${{ matrix.platform }}!"
 
       # Runs real export SQL through the CLI downloaded above. Uses the host-built

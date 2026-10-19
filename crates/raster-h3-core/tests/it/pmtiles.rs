@@ -1065,6 +1065,27 @@ fn test_pmtiles_coarse_zoom_parent_aggregates_all_children() {
     };
     assert!((stddev - (5600.0_f64 / 13.0).sqrt()).abs() < 1e-10);
 
+    // Header bounds must cover the overview parent polygon, not just the detail cells.
+    let header_deg =
+        |off: usize| i32::from_le_bytes(full[off..off + 4].try_into().unwrap()) as f64 / 1e7;
+    let (min_lon, min_lat, max_lon, max_lat) = (
+        header_deg(102),
+        header_deg(106),
+        header_deg(110),
+        header_deg(114),
+    );
+    for v in expected_parent.boundary().iter() {
+        assert!(
+            v.lng() >= min_lon - 1e-6
+                && v.lng() <= max_lon + 1e-6
+                && v.lat() >= min_lat - 1e-6
+                && v.lat() <= max_lat + 1e-6,
+            "overview vertex ({}, {}) outside header bbox [{min_lon}, {min_lat}, {max_lon}, {max_lat}]",
+            v.lng(),
+            v.lat()
+        );
+    }
+
     // 2. Categorical: child 0 has class 1 (count 1), children 1..7 have class 2 (count 10 each -> 60 total)
     // If only child 0 were used, majority would be 1 and count would be 1.0; merged parent has majority 2 and count 61.0!
     let cat_records: Vec<MultiCategoricalRecord> = children
@@ -1141,5 +1162,118 @@ fn world_tile_encodes_both_antimeridian_pieces_in_one_feature() {
         for (a, b) in rings[0].iter().zip(&rings[1]) {
             assert_eq!((b.0 - a.0, b.1 - a.1), (shift, 0));
         }
+    }
+}
+
+#[test]
+fn test_pmtiles_header_bounds_include_cell_vertices_and_antimeridian_center() {
+    use raster_h3_core::pmtiles::tiler::H3Feature;
+
+    // 1. Single cell in SF: header bbox must reflect cell vertex extent (not a zero-area point)
+    let sf_cell = 0x85283083fffffffu64; // Res 5 SF
+    let sf_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let sf_path = sf_tmp.to_str().unwrap().to_string();
+    H3PmtilesTiler::export_h3_features([H3Feature::new::<&str>(sf_cell, Vec::new())], &sf_path)
+        .unwrap();
+
+    let mut header = [0u8; 127];
+    File::open(&sf_path)
+        .unwrap()
+        .read_exact(&mut header)
+        .unwrap();
+    let min_lon_e7 = i32::from_le_bytes(header[102..106].try_into().unwrap());
+    let min_lat_e7 = i32::from_le_bytes(header[106..110].try_into().unwrap());
+    let max_lon_e7 = i32::from_le_bytes(header[110..114].try_into().unwrap());
+    let max_lat_e7 = i32::from_le_bytes(header[114..118].try_into().unwrap());
+    assert!(
+        max_lon_e7 > min_lon_e7 && max_lat_e7 > min_lat_e7,
+        "Single-cell PMTiles header bbox must have positive width and height: [{min_lon_e7}, {min_lat_e7}, {max_lon_e7}, {max_lat_e7}]"
+    );
+
+    // 2. Antimeridian-crossing cells in Fiji: header center_lon must lie near ±180° (Pacific), not 0° (Atlantic)
+    let fiji_cell = h3o::LatLng::new(-18.0, 180.0)
+        .unwrap()
+        .to_cell(h3o::Resolution::Five);
+    let fiji_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let fiji_path = fiji_tmp.to_str().unwrap().to_string();
+    H3PmtilesTiler::export_h3_features(
+        [H3Feature::new::<&str>(fiji_cell.into(), Vec::new())],
+        &fiji_path,
+    )
+    .unwrap();
+
+    File::open(&fiji_path)
+        .unwrap()
+        .read_exact(&mut header)
+        .unwrap();
+    let fiji_min_lon = i32::from_le_bytes(header[102..106].try_into().unwrap()) as f64 / 1e7;
+    let fiji_max_lon = i32::from_le_bytes(header[110..114].try_into().unwrap()) as f64 / 1e7;
+    let fiji_center_lon = i32::from_le_bytes(header[119..123].try_into().unwrap()) as f64 / 1e7;
+    assert!(
+        fiji_min_lon == -180.0 && fiji_max_lon == 180.0,
+        "Antimeridian archive bounds must be ordered and cover both pieces, got [{fiji_min_lon}, {fiji_max_lon}]"
+    );
+    assert!(
+        fiji_center_lon.abs() > 179.0,
+        "Antimeridian center_lon must be near ±180° in the Pacific, got {fiji_center_lon}"
+    );
+}
+
+#[test]
+fn legacy_world_tile_preserves_both_antimeridian_pieces() {
+    for lat in [-18.0, 52.0] {
+        let cell = h3o::LatLng::new(lat, 180.0)
+            .unwrap()
+            .to_cell(h3o::Resolution::Zero);
+        let boundary = cell.boundary();
+        let mut layer = MvtLayer::new("h3_hexagons");
+        layer.add_hexagon(
+            cell.into(),
+            &boundary,
+            -180.0,
+            180.0,
+            -85.05112878,
+            85.05112878,
+            Vec::new(),
+        );
+        let decoded = mvt_decode::decode(&layer.encode());
+        assert_eq!(decoded.len(), 1);
+        let rings = &decoded[0].rings;
+        assert_eq!(rings.len(), 2);
+        for edge in [0, 4096] {
+            assert!(rings
+                .iter()
+                .any(|r| r.iter().any(|p| p.0 < edge) && r.iter().any(|p| p.0 > edge)));
+        }
+        let shift = rings[1][0].0 - rings[0][0].0;
+        assert_eq!(shift.abs(), 4096);
+        for (a, b) in rings[0].iter().zip(&rings[1]) {
+            assert_eq!((b.0 - a.0, b.1 - a.1), (shift, 0));
+        }
+    }
+}
+
+#[test]
+fn wrapped_writer_bounds_preserve_center_after_metadata_update() {
+    for update_metadata in [false, true] {
+        let bbox = [170.0, -25.0, -178.0, -15.0];
+        let mut writer = PmtilesWriter::new(0, 0, bbox, "{}".into()).unwrap();
+        if update_metadata {
+            writer.set_metadata([175.0, -25.0, -177.0, -15.0], "{}".into());
+        }
+        writer.add_tile(0, 0, 0, b"test").unwrap();
+        let tmp = NamedTempFile::new().unwrap().into_temp_path();
+        writer.finish(&tmp).unwrap();
+        let mut header = [0u8; 127];
+        File::open(&tmp).unwrap().read_exact(&mut header).unwrap();
+        let coord = |offset| {
+            i32::from_le_bytes(header[offset..offset + 4].try_into().unwrap()) as f64 / 1e7
+        };
+        assert_eq!(coord(102), -180.0);
+        assert_eq!(coord(110), 180.0);
+        assert_eq!(coord(106), -25.0);
+        assert_eq!(coord(114), -15.0);
+        assert_eq!(coord(119), if update_metadata { 179.0 } else { 176.0 });
+        assert_eq!(coord(123), -20.0);
     }
 }
