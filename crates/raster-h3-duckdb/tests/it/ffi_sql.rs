@@ -247,6 +247,13 @@ pub unsafe extern "C" fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn duckdb_create_list_type(
+    _child: duckdb_logical_type,
+) -> duckdb_logical_type {
+    duckdb_create_logical_type(DuckDBType::List)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn duckdb_destroy_logical_type(type_: *mut duckdb_logical_type) {
     if !type_.is_null() && !(*type_).is_null() {
         drop(Box::from_raw(*type_ as *mut MockLogicalType));
@@ -843,6 +850,7 @@ fn install_mock_api() {
         duckdb_bind_set_error,
         duckdb_column_count,
         duckdb_connect,
+        duckdb_create_list_type,
         duckdb_create_logical_type,
         duckdb_create_scalar_function,
         duckdb_create_table_function,
@@ -947,7 +955,19 @@ fn test_extension_init_and_registration_completeness() {
         raster_h3_duckdb::functions::register_parquet_table_function(con_ptr).unwrap();
     }
 
-    assert_eq!(con.scalar_functions.len(), 15);
+    // The mock reports DuckDB v1.2.0, so h3_polygon_to_cells registers only its BLOB overloads.
+    assert_eq!(con.scalar_functions.len(), 17);
+    let polygon_fns: Vec<_> = con
+        .scalar_functions
+        .iter()
+        .filter(|f| f.name == "h3_polygon_to_cells")
+        .collect();
+    assert_eq!(polygon_fns.len(), 2);
+    for sf in &polygon_fns {
+        assert_eq!(sf.params[..2], [DuckDBType::Blob, DuckDBType::BigInt]);
+        assert_eq!(sf.ret, DuckDBType::List);
+    }
+    assert_eq!(polygon_fns[1].params.get(2), Some(&DuckDBType::Varchar));
     for sf in &con.scalar_functions {
         assert!(!sf.name.is_empty());
         assert!(!sf.params.is_empty());

@@ -500,6 +500,173 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
     });
 }
 
+/// Shared body of `h3_polygon_to_cells(geom, res[, containment])` -> `UBIGINT[]`.
+///
+/// Rows with a NULL argument, invalid WKB or a resolution outside `0..=15` yield NULL. An
+/// unknown containment mode or a polygon over the cell limit fails the query, since retrying
+/// row by row would not help.
+unsafe fn polygon_to_cells_kernel(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+    has_mode: bool,
+) {
+    if input.is_null() || output.is_null() {
+        return;
+    }
+    let count = duckdb_data_chunk_get_size(input);
+    if count == 0 {
+        return;
+    }
+    let v_geom = duckdb_data_chunk_get_vector(input, 0);
+    let v_res = duckdb_data_chunk_get_vector(input, 1);
+    let v_mode = if has_mode {
+        duckdb_data_chunk_get_vector(input, 2)
+    } else {
+        std::ptr::null_mut()
+    };
+    if v_geom.is_null() || v_res.is_null() || (has_mode && v_mode.is_null()) {
+        return;
+    }
+    let p_geom = duckdb_vector_get_data(v_geom) as *const duckdb_string_t;
+    let p_res = duckdb_vector_get_data(v_res) as *const i64;
+    let p_mode = if has_mode {
+        duckdb_vector_get_data(v_mode) as *const duckdb_string_t
+    } else {
+        std::ptr::null()
+    };
+    let entries = duckdb_vector_get_data(output) as *mut duckdb_list_entry;
+    let child = duckdb_list_vector_get_child(output);
+    if p_geom.is_null() || p_res.is_null() || (has_mode && p_mode.is_null()) {
+        return;
+    }
+    if entries.is_null() || child.is_null() {
+        return;
+    }
+    let val_geom = duckdb_vector_get_validity(v_geom);
+    let val_res = duckdb_vector_get_validity(v_res);
+    let val_mode = if has_mode {
+        duckdb_vector_get_validity(v_mode)
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let mut total: u64 = 0;
+    for i in 0..count {
+        *entries.add(i as usize) = duckdb_list_entry {
+            offset: total,
+            length: 0,
+        };
+        if !duckdb_validity_is_valid(val_geom, i)
+            || !duckdb_validity_is_valid(val_res, i)
+            || (has_mode && !duckdb_validity_is_valid(val_mode, i))
+        {
+            duckdb_vector_set_row_invalid(output, i);
+            continue;
+        }
+        let mode = if has_mode {
+            let name = (*p_mode.add(i as usize)).as_str();
+            match scalar_ops::parse_containment_mode(name) {
+                Some(mode) => mode,
+                None => {
+                    let msg = to_c_string(&format!(
+                        "h3_polygon_to_cells: unknown containment mode '{name}' (expected one of \
+                         contains_centroid, contains_boundary, intersects_boundary, covers, \
+                         center, full, overlapping)"
+                    ));
+                    duckdb_scalar_function_set_error(info, msg.as_ptr());
+                    return;
+                }
+            }
+        } else {
+            scalar_ops::ContainmentMode::ContainsCentroid
+        };
+        let wkb = (*p_geom.add(i as usize)).as_bytes();
+        let cells = match scalar_ops::h3_polygon_to_cells_wkb(wkb, *p_res.add(i as usize), mode) {
+            Ok(cells) => cells,
+            Err(err @ scalar_ops::PolygonToCellsError::TooManyCells { .. }) => {
+                let msg = to_c_string(&format!("h3_polygon_to_cells: {err}"));
+                duckdb_scalar_function_set_error(info, msg.as_ptr());
+                return;
+            }
+            Err(_) => {
+                duckdb_vector_set_row_invalid(output, i);
+                continue;
+            }
+        };
+        let new_total = total + cells.len() as u64;
+        if duckdb_list_vector_reserve(output, new_total) != DuckDBState::Success {
+            duckdb_scalar_function_set_error(
+                info,
+                c"h3_polygon_to_cells: failed to reserve list storage".as_ptr(),
+            );
+            return;
+        }
+        // Reserving may reallocate the child buffer, so fetch it after every reserve.
+        let p_child = duckdb_vector_get_data(child) as *mut u64;
+        if !cells.is_empty() {
+            std::ptr::copy_nonoverlapping(cells.as_ptr(), p_child.add(total as usize), cells.len());
+        }
+        duckdb_list_vector_set_size(output, new_total);
+        (*entries.add(i as usize)).length = cells.len() as u64;
+        total = new_total;
+    }
+}
+
+/// Scalar function: h3_polygon_to_cells(BLOB | GEOMETRY, BIGINT) -> UBIGINT[]
+/// (containment mode `contains_centroid`)
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
+pub unsafe extern "C" fn scalar_h3_polygon_to_cells(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    ffi_scalar_guard(info, || {
+        polygon_to_cells_kernel(info, input, output, false);
+    });
+}
+
+/// Scalar function: h3_polygon_to_cells(BLOB | GEOMETRY, BIGINT, VARCHAR) -> UBIGINT[]
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this
+/// scalar callback, with `input` holding the declared argument types and
+/// `output` the declared return type.
+pub unsafe extern "C" fn scalar_h3_polygon_to_cells_mode(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    ffi_scalar_guard(info, || {
+        polygon_to_cells_kernel(info, input, output, true);
+    });
+}
+
+#[inline]
+unsafe fn register_scalar_fn(
+    con: duckdb_connection,
+    name: &str,
+    param_types: &[duckdb_logical_type],
+    return_type: duckdb_logical_type,
+    func: duckdb_scalar_function_t,
+) {
+    let scalar_fn = duckdb_create_scalar_function();
+    let c_name = to_c_string(name);
+    duckdb_scalar_function_set_name(scalar_fn, c_name.as_ptr());
+    for &param_type in param_types {
+        duckdb_scalar_function_add_parameter(scalar_fn, param_type);
+    }
+    duckdb_scalar_function_set_return_type(scalar_fn, return_type);
+    duckdb_scalar_function_set_function(scalar_fn, func);
+    duckdb_register_scalar_function(con, scalar_fn);
+    let mut scalar_fn_mut = scalar_fn;
+    duckdb_destroy_scalar_function(&mut scalar_fn_mut);
+}
+
 #[inline]
 unsafe fn register_unary_scalar_fn(
     con: duckdb_connection,
@@ -689,6 +856,32 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
         type_geom,
         scalar_h3_to_geometry_str,
     );
+
+    // 16-19. h3_polygon_to_cells(BLOB | GEOMETRY, BIGINT[, VARCHAR]) -> UBIGINT[].
+    // GEOMETRY overloads only on DuckDB >= 1.5, whose native GEOMETRY vectors hold WKB.
+    let type_cell_list = duckdb_create_list_type(type_ubigint);
+    let mut geom_inputs = vec![type_blob];
+    if crate::ffi::is_duckdb_version_at_least(1, 5) {
+        geom_inputs.push(type_geom);
+    }
+    for geom_input in geom_inputs {
+        register_scalar_fn(
+            con,
+            "h3_polygon_to_cells",
+            &[geom_input, type_bigint],
+            type_cell_list,
+            scalar_h3_polygon_to_cells,
+        );
+        register_scalar_fn(
+            con,
+            "h3_polygon_to_cells",
+            &[geom_input, type_bigint, type_varchar],
+            type_cell_list,
+            scalar_h3_polygon_to_cells_mode,
+        );
+    }
+    let mut type_cell_list_mut = type_cell_list;
+    duckdb_destroy_logical_type(&mut type_cell_list_mut);
 
     // Cleanup types
     let mut type_ubigint_mut = type_ubigint;

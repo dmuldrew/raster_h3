@@ -400,7 +400,12 @@ SELECT
     h3_get_resolution(h3_index) AS res,
     mean
 FROM h3_raster_continuous_aggregate('elevation.tif', 8);
+
+-- Polyfill a WKB polygon: list of UBIGINT cells; containment defaults to 'contains_centroid'
+SELECT h3_polygon_to_cells(ST_AsWKB(geom), 8, 'covers') AS cells FROM areas;
 ```
+
+See [`h3_polygon_to_cells`](docs/api-reference.md#h3_polygon_to_cells) for the containment modes.
 
 ### Spatial Joins
 ```sql

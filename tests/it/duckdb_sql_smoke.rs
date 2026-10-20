@@ -90,4 +90,34 @@ fn real_sql_export_parameters_and_results() {
     for path in [&pmtiles, &categorical] {
         assert_eq!(&std::fs::read(path).unwrap()[..7], b"PMTiles");
     }
+
+    // h3_polygon_to_cells on a hand-built WKB POLYGON (BLOB works on every DuckDB version).
+    let ring = [
+        (-122.47, 37.73),
+        (-122.37, 37.73),
+        (-122.37, 37.81),
+        (-122.47, 37.81),
+        (-122.47, 37.73),
+    ];
+    let mut wkb = vec![1u8];
+    wkb.extend(3u32.to_le_bytes());
+    wkb.extend(1u32.to_le_bytes());
+    wkb.extend((ring.len() as u32).to_le_bytes());
+    for (x, y) in ring {
+        wkb.extend(f64::to_le_bytes(x));
+        wkb.extend(f64::to_le_bytes(y));
+    }
+    let hex: String = wkb.iter().map(|b| format!("{b:02x}")).collect();
+    let sql = format!(
+        r#"
+        LOAD {extension};
+        SELECT len(h3_polygon_to_cells(from_hex('{hex}'), 8)),
+            len(h3_polygon_to_cells(from_hex('{hex}'), 8, 'contains_boundary')),
+            len(h3_polygon_to_cells(from_hex('{hex}'), 8, 'intersects_boundary')),
+            len(h3_polygon_to_cells(from_hex('{hex}'), 8, 'covers')),
+            h3_polygon_to_cells(from_hex('00'), 8) IS NULL;
+    "#,
+        extension = quoted(&extension),
+    );
+    assert_eq!(query(&sql).trim(), "102,79,128,128,true");
 }

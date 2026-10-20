@@ -20,7 +20,9 @@ stream-profile = []
 test-hooks = []
 
 [dependencies]
-h3o.workspace = true
+# `geo` enables h3o's polygon-to-cells tiling (`h3o::geom`).
+h3o = { workspace = true, features = ["geo"] }
+geo-types = "0.7"
 rayon.workspace = true
 tiff.workspace = true
 proj4rs.workspace = true
