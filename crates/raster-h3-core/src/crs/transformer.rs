@@ -631,13 +631,13 @@ impl CrsTransformer {
 
                     let a_is_6378137 = a_val.is_some_and(|a| (a - 6378137.0).abs() < 1e-3);
                     let has_b = tokens.contains_key("b");
-                    let b_is_6378137 = !has_b || b_val.is_some_and(|b| (b - 6378137.0).abs() < 1e-3);
+                    let b_is_6378137 =
+                        !has_b || b_val.is_some_and(|b| (b - 6378137.0).abs() < 1e-3);
                     let absent_rf_f_b = rf_val.is_none() && f_val.is_none() && !has_b;
                     let ellps_sphere_or_absent = matches!(ellps_val, None | Some("sphere"));
 
                     let is_sphere_6378137 = a_is_6378137
-                        && ((has_b && b_is_6378137)
-                            || (absent_rf_f_b && ellps_sphere_or_absent));
+                        && ((has_b && b_is_6378137) || (absent_rf_f_b && ellps_sphere_or_absent));
 
                     let k_opt = match (tokens.get("k"), tokens.get("k_0")) {
                         (Some(v), None) | (None, Some(v)) => {

@@ -1,0 +1,56 @@
+name: Python Wheels
+
+# Builds one `py3-none-<platform>` wheel per platform (Python/Polars bindings + the
+# raster-h3-cli executable) and smoke-tests each after install. Configuration lives in
+# crates/raster-h3-python/pyproject.toml under [tool.cibuildwheel]. No publishing yet.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  wheels:
+    name: Wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: manylinux x86_64
+            os: ubuntu-24.04
+          - name: manylinux aarch64
+            os: ubuntu-24.04-arm
+          # macOS arm64 natively plus x86_64 cross-compiled (tested under Rosetta).
+          - name: macOS arm64 + x86_64
+            os: macos-latest
+          - name: Windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux builds install Rust inside the manylinux container (before-all).
+      - name: Install Rust toolchain
+        if: runner.os != 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v2.23.4
+        with:
+          package-dir: crates/raster-h3-python
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error

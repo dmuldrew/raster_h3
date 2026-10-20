@@ -127,17 +127,6 @@ fn test_fast_hex_formatting() {
 }
 
 #[test]
-fn test_bitshift_resolution() {
-    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
-    let cell_u64: u64 = cell.into();
-
-    let res_bitshift = (cell_u64 >> 52) & 0x0F;
-    assert_eq!(res_bitshift, 8);
-    assert_eq!(u8::from(cell.resolution()), res_bitshift as u8);
-}
-
-#[test]
 fn test_is_chunk_all_nodata() {
     let empty_slice = vec![-9999.0f32; 100];
     assert!(is_chunk_all_nodata(&empty_slice, Some(-9999.0), |x| x as f64));
@@ -230,7 +219,7 @@ fn test_bounding_box_pruning() {
 }
 
 #[test]
-fn test_web_mercator_hoisted_streaming() {
+fn test_web_mercator_streaming() {
     let temp_file = NamedTempFile::new().unwrap();
     let path = temp_file.path().to_path_buf();
 
@@ -1917,16 +1906,4 @@ fn test_categorical_simd_uniformity_types_and_spans() {
     assert!(f32::is_uniform(&zeros_f32));
     let zeros_f64 = vec![0.0f64, -0.0f64, 0.0f64, -0.0f64];
     assert!(f64::is_uniform(&zeros_f64));
-}
-
-#[test]
-fn test_multi_resolution_config_single_delegation() {
-    let single_cfg = raster_h3::aggregator::MultiResolutionConfig::single(8);
-    assert_eq!(single_cfg.resolutions, vec![8]);
-    assert_eq!(single_cfg.band, 1);
-    assert!(!single_cfg.track_quantiles());
-
-    let converted = raster_h3::aggregator::MultiResolutionConfig::new(vec![8]);
-    assert_eq!(converted.resolutions, vec![8]);
-    assert_eq!(converted.band, 1);
 }

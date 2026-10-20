@@ -1,4 +1,4 @@
-//! Tests sub-pixel super-sampling pattern conservation and scanline lookahead.
+//! Tests sub-pixel super-sampling pattern conservation and exact sample assignment.
 //!
 //! Validates total pixel mass conservation across center, RGSS, quincunx, Gaussian, hexagonal,
 //! and grid patterns under geographic (EPSG:4326) and projected (UTM) coordinate reference systems.

@@ -820,6 +820,89 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "raster-h3-cli"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "h3o",
+ "raster-h3-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tiff",
+]
+
+[[package]]
+name = "raster-h3-core"
+version = "0.2.0"
+dependencies = [
+ "crossbeam-deque",
+ "flate2",
+ "fxhash",
+ "h3o",
+ "libc",
+ "libdeflater",
+ "memmap2",
+ "parquet",
+ "proj4rs",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tiff",
+ "ureq",
+ "url",
+ "weezl",
+]
+
+[[package]]
+name = "raster-h3-datafusion"
+version = "0.2.0"
+dependencies = [
+ "h3o",
+ "raster-h3-core",
+ "tempfile",
+ "tiff",
+]
+
+[[package]]
+name = "raster-h3-duckdb"
+version = "0.2.0"
+dependencies = [
+ "crossbeam-deque",
+ "h3o",
+ "libc",
+ "parquet",
+ "raster-h3-core",
+]
+
+[[package]]
+name = "raster-h3-pg"
+version = "0.2.0"
+dependencies = [
+ "h3o",
+ "libc",
+ "raster-h3-core",
+ "tempfile",
+ "tiff",
+]
+
+[[package]]
+name = "raster-h3-python"
+version = "0.2.0"
+dependencies = [
+ "h3o",
+ "libc",
+ "raster-h3-core",
+ "raster-h3-datafusion",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tiff",
+]
+
+[[package]]
 name = "raster_h3"
 version = "0.2.0"
 dependencies = [
@@ -832,6 +915,12 @@ dependencies = [
  "memmap2",
  "parquet",
  "proj4rs",
+ "raster-h3-cli",
+ "raster-h3-core",
+ "raster-h3-datafusion",
+ "raster-h3-duckdb",
+ "raster-h3-pg",
+ "raster-h3-python",
  "rayon",
  "serde",
  "serde_json",

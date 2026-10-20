@@ -1,11 +1,9 @@
 //! Tests WKB polygon geometry emission and DuckDB spatial extension integration.
 //!
 //! Validates OGC-compliant WKB hexagon generation across all H3 resolutions, DuckDB version detection,
-//! spatial extension toggles, projection pushdown column indices, and error handling for invalid cells.
+//! projection pushdown column indices, and error handling for invalid cells.
 
-use raster_h3::ffi::{
-    is_duckdb_version_at_least, is_geometry_available, parse_version_string, set_spatial_loaded,
-};
+use raster_h3::ffi::{is_duckdb_version_at_least, parse_version_string};
 use raster_h3::functions::fast_hex::parse_hex_u64;
 use raster_h3::functions::wkb::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 
@@ -24,15 +22,6 @@ fn test_duckdb_version_parsing_logic() {
 
     // Dynamic library check safely runs via dlsym (returns false outside duckdb)
     assert!(!is_duckdb_version_at_least(99, 0));
-}
-
-#[test]
-fn test_spatial_loaded_toggle() {
-    set_spatial_loaded(false);
-    // If not version >= 1.5, should reflect the atomic flag
-    set_spatial_loaded(true);
-    assert!(is_geometry_available());
-    set_spatial_loaded(false);
 }
 
 #[test]

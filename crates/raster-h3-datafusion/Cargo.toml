@@ -1,0 +1,21 @@
+[package]
+name = "raster-h3-datafusion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "DataFusion TableProvider, TableFunctionImpl, ExecutionPlan, and vectorized ScalarUDF interface for raster_h3"
+
+[lib]
+name = "raster_h3_datafusion"
+crate-type = ["rlib"]
+
+[dependencies]
+raster-h3-core = { path = "../raster-h3-core" }
+h3o.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tiff.workspace = true

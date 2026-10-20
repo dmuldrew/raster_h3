@@ -11,16 +11,20 @@ ARG DUCKDB_VERSION
 
 WORKDIR /build
 
-# Copy source code and configuration
-COPY Cargo.toml ./
+# Copy workspace manifests, member crates, and source code
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ ./.cargo/
+COPY crates/ ./crates/
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY examples/ ./examples/
 
-# Run tests and compile release dynamic library, CLI utilities, and metadata-tagged extension
-RUN cargo test --release && \
-    cargo build --release && \
+# Compile release libraries (every member's cdylib, which the cross-engine tests load),
+# run tests, then build CLI utilities, sample data, and the metadata-tagged extension
+RUN cargo build --release --workspace && \
+    cargo test --release && \
     cargo build --release --examples && \
+    cargo run --release --example generate_sample -- sample_sf.tif && \
     cargo run --release --bin package_extension -- \
         --input target/release/libraster_h3.so \
         --output target/release/raster_h3.duckdb_extension \

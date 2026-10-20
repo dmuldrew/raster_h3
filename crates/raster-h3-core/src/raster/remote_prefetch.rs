@@ -353,7 +353,7 @@ impl RemoteChunkPrefetchQueue {
                 }));
 
                 if let Err(payload) = res {
-                    let msg = crate::ffi::panic_payload_to_string(payload);
+                    let msg = crate::error::panic_payload_to_string(payload);
                     if let Ok(mut err) = err_holder.lock() {
                         if err.is_none() {
                             *err = Some(format!("HTTP prefetch worker panicked: {msg}"));

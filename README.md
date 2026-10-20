@@ -1,10 +1,10 @@
-# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation for DuckDB
+# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation for DuckDB, DataFusion, Python/Polars, PostgreSQL & the CLI
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
 [![DuckDB Extension](https://img.shields.io/badge/DuckDB-Loadable_Extension-blue.svg)](https://duckdb.org)
 
-A native DuckDB extension written in pure Rust that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation uses a configurable memory budget with disk spilling.
+A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation uses a configurable memory budget with disk spilling. The same engine ships as a native DuckDB extension, DataFusion-style table providers, a Python/Polars package, a PostgreSQL extension and a command-line tool (see [Engines](#engines)).
 
 The default aggregation budget is 64 MiB, not a whole-process RAM limit. Decoding,
 prefetching, output buffers, and runtime overhead use additional memory. WGS84,
@@ -27,8 +27,30 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 
 ---
 
+## Engines
+
+The repository is a Cargo workspace: `raster-h3-core` does all decoding, reprojection,
+aggregation and export, and each engine crate is a thin adapter over it, so every engine
+returns the same cells and statistics for the same input.
+
+| Engine | Crate | Get it | One-liner | Deep Dive |
+| :--- | :--- | :--- | :--- | :--- |
+| **DuckDB** | `raster-h3-duckdb` | `cargo build --release` → `libraster_h3.{so,dylib,dll}` | `SELECT * FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8)` | [DuckDB](docs/engines/duckdb.md) |
+| **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | `raster_h3.scan_raster_h3("dem.tif", 8).collect()` | [Python & Polars](docs/engines/python-polars.md) |
+| **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | `SELECT * FROM h3_raster_continuous_aggregate('/data/dem.tif', 8)` | [PostgreSQL](docs/engines/postgresql.md) |
+| **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | `provider.scan(Some(&[0, 2]), &filters, Some(1000))` | [DataFusion](docs/engines/datafusion.md) |
+| **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | `raster-h3-cli jsonl dem.tif -r 8` | [CLI](docs/engines/cli.md) |
+| **Rust library** | `raster-h3-core` | Cargo dependency | `ContinuousBatchReader::open(&paths, &config, None, 2048, None)` | [Core Engine](docs/engines/core.md) |
+
+Feature coverage differs per engine (DuckDB exposes every parameter; PostgreSQL and Python
+expose the common subset). See the [Engines Overview](docs/engines/README.md) for the
+capability matrix, shared schemas and cross-engine parity tests.
+
+---
+
 ## 📖 Table of Contents
 
+- [Engines](#engines)
 - [Motivation & Project Goals](#motivation--project-goals)
 - [How It Works](#how-it-works)
 - [Installation & Docker Quickstart](#installation--docker-quickstart)
@@ -45,6 +67,13 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 
 | Document | What It Covers |
 | :--- | :--- |
+| [Engines Overview](docs/engines/README.md) | Workspace layout, per-engine capability matrix, shared schemas, parity tests |
+| [Core Engine](docs/engines/core.md) | `raster-h3-core`: batch readers, Arrow C Data/Stream, `RH3IPC01`/NDJSON, scalar ops |
+| [DuckDB](docs/engines/duckdb.md) | Extension build/load, entry points, bind → init → scan lifecycle, FFI safety |
+| [DataFusion](docs/engines/datafusion.md) | Table providers, filter/projection/limit pushdown, vectorized scalar UDFs |
+| [Python & Polars](docs/engines/python-polars.md) | Arrow PyCapsule stream, Polars IO source, exporters, wheel builds |
+| [PostgreSQL](docs/engines/postgresql.md) | fmgr extension build/install, SRFs, scalar helpers, Docker e2e tests |
+| [CLI](docs/engines/cli.md) | `ipc`/`jsonl`/`parquet`/`pmtiles` subcommands, ClickHouse and shell pipelines |
 | [Engineering Architecture](docs/engineering.md) | Streaming, memory budgets, disk spilling, and throughput |
 | [Module Architecture](docs/module-architecture.md) | File-by-file source code map with GitHub links |
 | [PMTiles & Multi-Resolution](docs/pmtiles.md) | Multi-resolution pyramids, zoom mapping, zero-server web maps |
@@ -53,6 +82,7 @@ Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) a
 | [CRS & Projections](docs/crs-and-projection.md) | Supported projections, detection, 3-tier transform hierarchy |
 | [Architecture Comparison](docs/architecture-comparison.md) | Benchmarks vs Python/PostGIS/GDAL, environment trade-offs |
 | [API Reference](docs/api-reference.md) | Complete SQL function signatures, parameters, output schemas |
+| [Test Coverage](docs/testing.md) | Every test suite grouped by category (geodetic, threading, eviction, codecs, engines…), gated tests, CI coverage |
 
 ---
 
@@ -470,6 +500,10 @@ SELECT * FROM h3_raster_to_pmtiles(
 
 ### Python, Node.js, and R Integration
 
+These examples load the DuckDB extension from each language's DuckDB client. For a native
+Python package without DuckDB (Arrow streams, Polars `LazyFrame`s), see
+[Python & Polars](docs/engines/python-polars.md).
+
 #### Python
 ```python
 import duckdb
@@ -683,11 +717,37 @@ For maximum ingestion throughput (up to 6× faster) and optimal L2 cache residen
 ```bash
 cargo build --release
 ```
-Outputs: `target/release/libraster_h3.dylib` (macOS) / `.so` (Linux) / `.dll` (Windows)
+Outputs: `target/release/libraster_h3.dylib` (macOS) / `.so` (Linux) / `.dll` (Windows) — the DuckDB extension — and the `raster-h3` CLI.
+
+Other workspace members build individually:
+
+```bash
+cargo build --release -p raster-h3-cli                         # raster-h3-cli executable
+cargo build --release -p raster-h3-python                      # libraster_h3_python (Python ctypes library)
+cargo build --release -p raster-h3-pg --features pg-extension  # PostgreSQL module (needs pg_config or RASTER_H3_PG_MAJOR)
+```
+
+| Crate | Path |
+| :--- | :--- |
+| `raster-h3-core` | [`crates/raster-h3-core`](crates/raster-h3-core) |
+| `raster-h3-duckdb` | [`crates/raster-h3-duckdb`](crates/raster-h3-duckdb) |
+| `raster-h3-datafusion` | [`crates/raster-h3-datafusion`](crates/raster-h3-datafusion) |
+| `raster-h3-python` | [`crates/raster-h3-python`](crates/raster-h3-python) |
+| `raster-h3-pg` | [`crates/raster-h3-pg`](crates/raster-h3-pg) |
+| `raster-h3-cli` | [`crates/raster-h3-cli`](crates/raster-h3-cli) |
 
 ### Test
+
+See [Test Coverage](docs/testing.md) for what each suite checks and which tests are gated.
+
 ```bash
-cargo test --release
+cargo test --release --workspace
+
+# Cross-engine parity (core, CLI, DataFusion, Python, PostgreSQL in-process, DuckDB if on PATH)
+cargo test --test test_multi_engine_e2e
+
+# Real PostgreSQL servers in Docker (RASTER_H3_PG_VERSIONS=14,16,18 to pick majors)
+cargo test --test test_pg_extension_e2e -- --ignored --nocapture
 
 # Or in Docker
 docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release

@@ -36,7 +36,7 @@ struct OrderedQueueState<T> {
     next_read: usize,
     closed: bool,
     terminal_item: Option<T>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     blocked_job: Option<usize>,
 }
 
@@ -48,7 +48,7 @@ pub struct OrderedPrefetchQueue<T> {
     state: Mutex<OrderedQueueState<T>>,
     not_empty: Condvar,
     not_full: Condvar,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     producer_blocked: Condvar,
 }
 
@@ -67,12 +67,12 @@ impl<T> OrderedPrefetchQueue<T> {
                 next_read: 0,
                 closed: false,
                 terminal_item: None,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 blocked_job: None,
             }),
             not_empty: Condvar::new(),
             not_full: Condvar::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             producer_blocked: Condvar::new(),
         }
     }
@@ -82,13 +82,13 @@ impl<T> OrderedPrefetchQueue<T> {
     pub fn push(&self, job_id: usize, item: T) -> bool {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while job_id >= guard.next_read + self.capacity && !guard.closed {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             {
                 guard.blocked_job = Some(job_id);
                 self.producer_blocked.notify_all();
             }
             guard = self.not_full.wait(guard).unwrap_or_else(|e| e.into_inner());
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             {
                 guard.blocked_job = None;
             }
@@ -106,8 +106,10 @@ impl<T> OrderedPrefetchQueue<T> {
 
     /// Test handshake for single-producer schedules. The observer cannot acquire
     /// state until the producer atomically releases it in `not_full.wait()`.
-    #[cfg(test)]
-    pub(crate) fn wait_for_blocked_job(&self, job_id: usize) -> bool {
+    /// Available to other crates' tests through the `test-hooks` feature.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn wait_for_blocked_job(&self, job_id: usize) -> bool {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (guard, _) = self
             .producer_blocked
@@ -598,7 +600,7 @@ impl PrefetchedChunkReader {
                 }));
 
                 if let Err(payload) = res {
-                    let msg = crate::ffi::panic_payload_to_string(payload);
+                    let msg = crate::error::panic_payload_to_string(payload);
                     worker_queue.fail(Err(RasterH3Error::InvalidParameter(format!(
                         "Decode worker panicked during chunk decompression: {msg}"
                     ))));
@@ -838,7 +840,7 @@ impl PrefetchedMosaicReader {
                 }));
 
                 if let Err(payload) = res {
-                    let msg = crate::ffi::panic_payload_to_string(payload);
+                    let msg = crate::error::panic_payload_to_string(payload);
                     worker_budget.close();
                     worker_queue.fail(Err(RasterH3Error::InvalidParameter(format!(
                         "Mosaic decode worker panicked during chunk decompression: {msg}"
@@ -1332,7 +1334,7 @@ mod tests {
             }));
 
             if let Err(payload) = res {
-                let msg = crate::ffi::panic_payload_to_string(payload);
+                let msg = crate::error::panic_payload_to_string(payload);
                 q.fail(Err(format!("Decode worker panicked: {msg}")));
             }
         });

@@ -1,29 +1,4 @@
-/// Parse a list of H3 resolutions from a string (comma/whitespace separated, sorted, deduplicated, <= 15)
-pub fn parse_resolutions_str(s: &str) -> Vec<u8> {
-    let mut list: Vec<u8> = s
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|item| !item.is_empty())
-        .filter_map(|item| item.parse::<u8>().ok())
-        .filter(|&r| r <= 15)
-        .collect();
-    list.sort_unstable();
-    list.dedup();
-    list
-}
-
-/// Parse bounding box coordinates from a comma/whitespace separated string `[min_lon, min_lat, max_lon, max_lat]`
-pub fn parse_bbox_str(s: &str) -> Option<[f64; 4]> {
-    let coords: Vec<f64> = s
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|item| !item.is_empty())
-        .filter_map(|item| item.parse::<f64>().ok())
-        .collect();
-    if coords.len() == 4 {
-        Some([coords[0], coords[1], coords[2], coords[3]])
-    } else {
-        None
-    }
-}
+pub use raster_h3_core::scalar_ops::{parse_bbox_str, parse_resolutions_str};
 
 #[cfg(test)]
 mod tests {
