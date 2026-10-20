@@ -75,6 +75,7 @@ def main() -> None:
     # A cell's own boundary polyfills back to that cell (centroid containment).
     assert raster_h3.h3_polygon_to_cells(raster_h3.h3_to_wkb(cell), 8) == [cell]
     assert len(raster_h3.h3_polygon_to_cells(raster_h3.h3_to_wkb(cell), 9, "covers")) > 7
+    assert raster_h3.h3_polygon_to_cells(raster_h3.h3_to_wkb(cell), 2**64 + 8) is None
 
     with tempfile.TemporaryDirectory() as tmp:
         tif = Path(tmp) / "smoke.tif"

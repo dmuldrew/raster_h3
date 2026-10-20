@@ -703,6 +703,9 @@ def h3_polygon_to_cells(
     ``intersects_boundary`` or ``covers`` (``overlapping``); an unknown name, or a polygon
     that would exceed 10,000,000 cells, raises ``ValueError``.
     """
+    resolution = int(resolution)
+    if not 0 <= resolution <= 15:
+        return None
     lib = _get_lib()
     data = bytes(wkb)
     out_cells = ctypes.POINTER(ctypes.c_uint64)()
@@ -710,7 +713,7 @@ def h3_polygon_to_cells(
     status = lib.raster_h3_py_h3_polygon_to_cells(
         data,
         len(data),
-        int(resolution),
+        resolution,
         containment.encode("utf-8"),
         ctypes.byref(out_cells),
         ctypes.byref(out_len),

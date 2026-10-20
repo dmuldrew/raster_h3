@@ -226,31 +226,21 @@ pub fn parse_containment_mode(s: &str) -> Option<ContainmentMode> {
 }
 
 /// Why [`h3_polygon_to_cells_wkb`] produced no cell list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolygonToCellsError {
     /// Resolution outside `0..=15`.
+    #[error("resolution {0} is outside 0..=15")]
     InvalidResolution(i64),
     /// Input is not a valid WKB `POLYGON` / `MULTIPOLYGON` with finite coordinates.
+    #[error("invalid polygon geometry: {0}")]
     InvalidGeometry(&'static str),
     /// h3o's estimate exceeds [`H3_POLYGON_TO_CELLS_MAX_CELLS`].
+    #[error(
+        "polygon would produce up to {estimate} cells, above the limit of {limit}; \
+         use a coarser resolution or split the polygon"
+    )]
     TooManyCells { estimate: usize, limit: usize },
 }
-
-impl std::fmt::Display for PolygonToCellsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidResolution(res) => write!(f, "resolution {res} is outside 0..=15"),
-            Self::InvalidGeometry(reason) => write!(f, "invalid polygon geometry: {reason}"),
-            Self::TooManyCells { estimate, limit } => write!(
-                f,
-                "polygon would produce up to {estimate} cells, above the limit of {limit}; \
-                 use a coarser resolution or split the polygon"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PolygonToCellsError {}
 
 /// Fill a WKB `POLYGON` / `MULTIPOLYGON` (WGS84 longitude/latitude degrees) with H3 cells
 /// at `res` (`0..=15`) using h3o's polyfill and the given containment `mode`.

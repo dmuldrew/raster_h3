@@ -131,6 +131,9 @@ fn read_polygon_body(
         return Ok(None);
     };
     if exterior.0.is_empty() {
+        if rings.any(|r| !r.0.is_empty()) {
+            return Err("polygon has interior rings but an empty exterior ring");
+        }
         return Ok(None);
     }
     // `Polygon::new` closes any unclosed ring.
@@ -271,6 +274,13 @@ mod tests {
         truncated.extend(1u32.to_le_bytes());
         truncated.extend(u32::MAX.to_le_bytes());
         assert!(wkb_to_multipolygon(&truncated).is_err());
+
+        let mut hole_without_exterior = vec![1u8];
+        hole_without_exterior.extend(3u32.to_le_bytes());
+        hole_without_exterior.extend(2u32.to_le_bytes());
+        ring_bytes(&mut hole_without_exterior, &[], true);
+        ring_bytes(&mut hole_without_exterior, &square(), true);
+        assert!(wkb_to_multipolygon(&hole_without_exterior).is_err());
 
         let mut trailing = empty.clone();
         trailing.push(0);
