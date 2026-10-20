@@ -7,7 +7,7 @@
 //! 2. `raster-h3-cli`: Real subprocess execution of `raster-h3` (`ipc`, `jsonl`, `parquet`, `pmtiles`).
 //! 3. `raster-h3-datafusion`: `RasterH3SessionCatalog`, `TableProvider` scan + pushdown, `ExecutionPlan`
 //!    Arrow C Stream, and vectorized `ScalarUDFImpl` execution.
-//! 4. `raster-h3-python`: Real `/usr/bin/python3` subprocess loading `libraster_h3_python`, testing
+//! 4. `raster-h3-python`: Real Python subprocess loading `libraster_h3_python`, testing
 //!    `RasterH3ArrowStream` (`to_dict()`, `__arrow_c_schema__()`, `__arrow_c_stream__()` C-ABI consumption),
 //!    `raster_to_parquet()`, `raster_to_pmtiles()`, and scalar H3 ops.
 //! 5. `raster-h3-pg`: `PgContinuousSrf` and `PgCategoricalSrf` Set-Returning Functions (both Rust & C-ABI) +
@@ -258,6 +258,13 @@ fn collect_categorical_from_batches(
 fn target_profile_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     exe.parent().unwrap().parent().unwrap().to_path_buf()
+}
+
+/// Python interpreter for subprocess tests: `$PYTHON` if set, else `python` on Windows
+/// (no `python3` there) and `python3` elsewhere.
+fn python_exe() -> String {
+    std::env::var("PYTHON")
+        .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.to_string())
 }
 
 fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
@@ -549,7 +556,7 @@ assert pm_count == len(d["h3_index"])
 print(json.dumps(d))
 "#;
 
-    let py_out = Command::new("/usr/bin/python3")
+    let py_out = Command::new(python_exe())
         .env("PYTHONPATH", &py_pkg_dir)
         .env("RASTER_H3_PYTHON_LIB", &py_lib)
         .args([
@@ -799,7 +806,7 @@ fn test_cross_engine_categorical_e2e_parity() {
     // 4. raster-h3-python subprocess (`RasterH3ArrowStream(..., categorical=True)`)
     let py_lib = ensure_cdylib_built("raster-h3-python", "raster_h3_python");
     let py_pkg_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/raster-h3-python/python");
-    let py_out = Command::new("/usr/bin/python3")
+    let py_out = Command::new(python_exe())
         .env("PYTHONPATH", &py_pkg_dir)
         .env("RASTER_H3_PYTHON_LIB", &py_lib)
         .args([
