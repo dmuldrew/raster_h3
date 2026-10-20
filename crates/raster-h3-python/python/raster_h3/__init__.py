@@ -546,7 +546,10 @@ def scan_raster_h3(
             # `n_rows` can only be pushed into the scan when no predicate runs after it;
             # otherwise it caps the rows that survive the filter.
             if predicate is None:
-                scan_limit = n_rows if n_rows is not None else limit
+                # Narrow, never widen, the caller's explicit `limit`.
+                scan_limit = (
+                    limit if n_rows is None else n_rows if limit is None else min(limit, n_rows)
+                )
                 remaining = None
             else:
                 scan_limit = limit

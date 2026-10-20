@@ -255,13 +255,13 @@ fn collect_categorical_from_batches(
     map
 }
 
-fn target_debug_dir() -> PathBuf {
+fn target_profile_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     exe.parent().unwrap().parent().unwrap().to_path_buf()
 }
 
 fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
-    let dir = target_debug_dir();
+    let dir = target_profile_dir();
     let lib_path = dir.join(format!(
         "{}{}{}",
         std::env::consts::DLL_PREFIX,
@@ -269,10 +269,22 @@ fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
         std::env::consts::DLL_SUFFIX
     ));
     if !lib_path.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "-p", pkg, "--lib"])
-            .status()
-            .expect("invoke cargo build");
+        // Build into the same profile directory the test executable runs from.
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "-p", pkg, "--lib"]);
+        if dir.file_name().is_some_and(|n| n == "release") {
+            cmd.arg("--release");
+        }
+        // With `--target <triple>`, artifacts land in `target/<triple>/<profile>`.
+        if let Some(triple) = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.matches('-').count() >= 2)
+        {
+            cmd.args(["--target", triple]);
+        }
+        let status = cmd.status().expect("invoke cargo build");
         assert!(status.success(), "cargo build -p {pkg} failed");
     }
     assert!(
