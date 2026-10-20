@@ -744,13 +744,13 @@ See [Test Coverage](docs/testing.md) for what each suite checks and which tests 
 cargo test --release --workspace
 
 # Cross-engine parity (core, CLI, DataFusion, Python, PostgreSQL in-process, DuckDB if on PATH)
-cargo test --test test_multi_engine_e2e
+cargo test -p raster_h3 --test it multi_engine_e2e
 
 # Real PostgreSQL servers in Docker (RASTER_H3_PG_VERSIONS=14,16,18 to pick majors)
-cargo test --test test_pg_extension_e2e -- --ignored --nocapture
+cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture
 
 # Or in Docker
-docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release
+docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release --workspace
 ```
 
 ### Profilers & Examples

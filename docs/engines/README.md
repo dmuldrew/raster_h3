@@ -111,8 +111,8 @@ For the full test inventory, see [Test Coverage](../testing.md).
 
 | Test | What it checks | How to run |
 | :--- | :--- | :--- |
-| [`tests/test_multi_engine_e2e.rs`](../../tests/test_multi_engine_e2e.rs) | Generates synthetic continuous and categorical GeoTIFFs and compares per-cell results from the core batch readers and Arrow C stream, the CLI (subprocess: `ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, scalar UDFs), Python (a `python3` subprocess loading `libraster_h3_python`), the PostgreSQL SRFs and fmgr scalars in-process, and DuckDB when a `duckdb` binary is on `PATH`. | `cargo test --test test_multi_engine_e2e` |
-| [`tests/test_pg_extension_e2e.rs`](../../tests/test_pg_extension_e2e.rs) | Builds the real PostgreSQL module in Docker, installs it into `postgres:<major>` containers and compares `psql` output to the in-process SRFs. | `cargo test --test test_pg_extension_e2e -- --ignored --nocapture` |
+| [`root/multi_engine_e2e.rs`](../../tests/it/multi_engine_e2e.rs) | Generates synthetic continuous and categorical GeoTIFFs and compares per-cell results from the core batch readers and Arrow C stream, the CLI (subprocess: `ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, scalar UDFs), Python (a `python3` subprocess loading `libraster_h3_python`), the PostgreSQL SRFs and fmgr scalars in-process, and DuckDB when a `duckdb` binary is on `PATH`. | `cargo test -p raster_h3 --test it multi_engine_e2e` |
+| [`root/pg_extension_e2e.rs`](../../tests/it/pg_extension_e2e.rs) | Builds the real PostgreSQL module in Docker, installs it into `postgres:<major>` containers and compares `psql` output to the in-process SRFs. | `cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture` |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../../crates/raster-h3-python/tests/wheel_smoke.py) | Installs a built wheel and exercises the Python API and the bundled `raster-h3-cli`. | Run by `cibuildwheel` in [`wheels.yml`](../../.github/workflows/wheels.yml) |
 
 ## Choosing an Engine

@@ -17,5 +17,6 @@ raster-h3-core = { path = "../raster-h3-core" }
 h3o.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 tiff.workspace = true

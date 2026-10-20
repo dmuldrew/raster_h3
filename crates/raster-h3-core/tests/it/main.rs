@@ -1,0 +1,33 @@
+//! raster-h3-core integration tests, linked into a single test binary.
+
+mod helpers;
+
+mod accumulators;
+mod analytic_south_lat;
+mod antimeridian_bbox;
+mod categorical_remap;
+mod chunks_and_prefetch;
+mod codecs;
+mod compaction_streaming;
+mod conic_horizon_soundness;
+mod conus_pipeline;
+mod exact_cell_assignment;
+mod geodetic_reference;
+mod geoparquet;
+mod geotiff_crs;
+mod horizon_streaming;
+mod memory_budgets;
+mod mosaic;
+mod multi_resolution;
+mod multiband_and_query_pushdown;
+mod performance;
+mod pmtiles;
+mod projected_eviction;
+mod quantiles;
+mod remote_cog;
+mod rotated_grid_correctness;
+mod sharding;
+mod sparse_chunks_and_spilling;
+mod streaming_failures;
+mod super_sampling;
+mod threading;

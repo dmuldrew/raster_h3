@@ -121,5 +121,5 @@ The binary is a thin wrapper over [`src/lib.rs`](../../crates/raster-h3-cli/src/
 
 ```bash
 cargo test -p raster-h3-cli        # argument parsing, IPC round trip, JSONL
-cargo test --test test_multi_engine_e2e   # runs the built binary for all four subcommands
+cargo test -p raster_h3 --test it multi_engine_e2e # runs the built binary for all four subcommands
 ```
