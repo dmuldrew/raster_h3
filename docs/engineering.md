@@ -169,4 +169,3 @@ Aggregators utilize multi-core chunk parallelism (`init_local`) where independen
 
 ---
 
-See [Rust API migration](refactor-migration.md) for configuration defaults, compatibility adapters, and updated safety contracts.

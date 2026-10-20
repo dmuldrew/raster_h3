@@ -12,9 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `raster-h3-core` `columnar` module: `RecordBatch`/`ColumnSchema` model, `ContinuousBatchReader` / `CategoricalBatchReader`, Arrow C Data and C Stream interface, `RH3IPC01` binary stream and NDJSON writer; `scalar_ops` module with H3 helpers shared by all engines ([Core](docs/engines/core.md)).
 - `raster-h3-datafusion`: DataFusion-style `TableProvider` / `ExecutionPlan` / `ScalarUDFImpl` with projection, filter and limit pushdown ([DataFusion](docs/engines/datafusion.md)).
 - `raster-h3-python` and the `raster-h3` Python package: Arrow PyCapsule stream, Polars IO source (`scan_raster_h3`, `read_raster_h3`), H3 helpers, Parquet/PMTiles exporters; `py3-none-<platform>` wheels built by `.github/workflows/wheels.yml` ([Python & Polars](docs/engines/python-polars.md)).
-- `raster-h3-pg`: PostgreSQL 13–18 extension with `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` SRFs and H3 scalar functions, plus a Docker-based real-server test (`scripts/pg_e2e.sh`, `tests/test_pg_extension_e2e.rs`) ([PostgreSQL](docs/engines/postgresql.md)).
+- `raster-h3-pg`: PostgreSQL 13–18 extension with `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` SRFs and H3 scalar functions, plus a Docker-based real-server test (`scripts/pg_e2e.sh`, `tests/it/pg_extension_e2e.rs`) ([PostgreSQL](docs/engines/postgresql.md)).
 - `raster-h3-cli`: `ipc`, `jsonl`, `parquet` and `pmtiles` subcommands with strict argument validation ([CLI](docs/engines/cli.md)).
-- `tests/test_multi_engine_e2e.rs`: cross-engine parity on shared synthetic rasters.
+- `tests/it/multi_engine_e2e.rs`: cross-engine parity on shared synthetic rasters.
 
 ### Changed
 - Bound decoded chunk memory in bytes, not only by queue length: the mosaic prefetcher charges buffers being decoded, queued, aggregated and idle against `decode_budget_bytes` (SQL `decode_budget_mb`, default 256 MiB). Reservations are granted in job order before decoding; a chunk larger than the budget is decoded only when no other is held. Peak usage is reported as `StreamProfile::peak_decoded_bytes`.
@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
 - Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.
 - Document aggregation budgets, spill behavior, and uncertified projected eviction without unconditional process-memory or geometric-skip claims.
+- Reorganise the documentation for the multi-engine workspace: the README is engine-neutral (Engines section after the introduction, topic deep dives at the end), the worked example has DuckDB and Polars versions, DuckDB install/Docker/SQL recipes/client examples moved to the [DuckDB deep dive](docs/engines/duckdb.md), and the Python, PostgreSQL, CLI and DataFusion deep dives gained matching recipes and troubleshooting sections. `docs/api-reference.md` is now titled the DuckDB SQL API Reference.
 
 ### Fixed
 - Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.

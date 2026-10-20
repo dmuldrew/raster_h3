@@ -69,6 +69,8 @@ As a result:
 
 ### Multi-Resolution SQL Examples
 
+These examples use the [DuckDB](engines/duckdb.md) extension. Python (`scan_raster_h3(path, [7, 8, 9])`) and the CLI (`-r 7,8,9`) take the same resolution lists; see the [Engines Overview](engines/README.md#same-task-every-engine).
+
 **Continuous** — elevation across resolutions 7, 8, and 9:
 ```sql
 SELECT 
@@ -171,6 +173,13 @@ SELECT * FROM h3_raster_to_pmtiles(
     categorical := true,
     sampling := 'rgss'
 );
+```
+
+Without DuckDB (default `center` sampling):
+
+```bash
+raster-h3-cli pmtiles nlcd_landcover_2021.tif -c -r 5,6,7,8 -o landcover.pmtiles
+# or: python -c "import raster_h3; raster_h3.raster_to_pmtiles('nlcd_landcover_2021.tif', 'landcover.pmtiles', [5, 6, 7, 8], categorical=True)"
 ```
 
 ### Step 2 — Upload to Cloud Storage
