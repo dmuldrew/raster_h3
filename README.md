@@ -1,4 +1,4 @@
-# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation for DuckDB, DataFusion, Python/Polars, PostgreSQL & the CLI
+# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
