@@ -582,7 +582,15 @@ pub unsafe extern "C" fn pg_srf_continuous_open(
                 .unwrap_or_else(|| vec![8]);
             let crs_opt = opt_cstr(source_crs);
             let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
-            let bbox_opt = opt_cstr(bbox).and_then(|s| parse_bbox_str(&s));
+            let bbox_opt = opt_cstr(bbox)
+                .map(|s| {
+                    parse_bbox_str(&s).ok_or_else(|| {
+                        RasterH3Error::InvalidParameter(format!(
+                            "bbox must be 'min_lon,min_lat,max_lon,max_lat', got '{s}'"
+                        ))
+                    })
+                })
+                .transpose()?;
             PgContinuousSrf::open(&path_str, res_vec, crs_opt, nodata_opt, bbox_opt)
         },
     ));
@@ -698,6 +706,29 @@ mod tests {
         let data = vec![val; (width * height) as usize];
         img.write_data(&data).unwrap();
         tmp
+    }
+
+    #[test]
+    fn test_pg_srf_continuous_open_rejects_malformed_bbox() {
+        let tif = write_test_tif(16, 16, 25.5);
+        let path_c = CString::new(tif.path().to_string_lossy().as_bytes()).unwrap();
+        let bad_bbox = CString::new("1,garbage,2,3,4").unwrap();
+        unsafe {
+            let mut err: *mut c_char = ptr::null_mut();
+            let srf = pg_srf_continuous_open(
+                path_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                0.0,
+                bad_bbox.as_ptr(),
+                &mut err,
+            );
+            assert!(srf.is_null());
+            assert!(!err.is_null());
+            let msg = CString::from_raw(err).into_string().unwrap();
+            assert!(msg.contains("bbox"), "{msg}");
+        }
     }
 
     #[test]
