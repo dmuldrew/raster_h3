@@ -646,25 +646,42 @@ pub unsafe extern "C" fn scalar_h3_polygon_to_cells_mode(
     });
 }
 
-#[inline]
-unsafe fn register_scalar_fn(
+/// One overload of a scalar function: parameter types, return type and callback.
+type ScalarOverload<'a> = (
+    &'a [duckdb_logical_type],
+    duckdb_logical_type,
+    duckdb_scalar_function_t,
+);
+
+/// Register every overload of `name` as one scalar function set. DuckDB before 1.5 rejects a
+/// second `duckdb_register_scalar_function` under an existing name, so overloads must be
+/// registered together.
+unsafe fn register_scalar_fn_set(
     con: duckdb_connection,
     name: &str,
-    param_types: &[duckdb_logical_type],
-    return_type: duckdb_logical_type,
-    func: duckdb_scalar_function_t,
-) {
-    let scalar_fn = duckdb_create_scalar_function();
+    overloads: &[ScalarOverload<'_>],
+) -> Result<(), String> {
     let c_name = to_c_string(name);
-    duckdb_scalar_function_set_name(scalar_fn, c_name.as_ptr());
-    for &param_type in param_types {
-        duckdb_scalar_function_add_parameter(scalar_fn, param_type);
+    let mut set = duckdb_create_scalar_function_set(c_name.as_ptr());
+    let mut ok = true;
+    for &(param_types, return_type, func) in overloads {
+        let mut scalar_fn = duckdb_create_scalar_function();
+        duckdb_scalar_function_set_name(scalar_fn, c_name.as_ptr());
+        for &param_type in param_types {
+            duckdb_scalar_function_add_parameter(scalar_fn, param_type);
+        }
+        duckdb_scalar_function_set_return_type(scalar_fn, return_type);
+        duckdb_scalar_function_set_function(scalar_fn, func);
+        ok &= duckdb_add_scalar_function_to_set(set, scalar_fn) == DuckDBState::Success;
+        duckdb_destroy_scalar_function(&mut scalar_fn);
     }
-    duckdb_scalar_function_set_return_type(scalar_fn, return_type);
-    duckdb_scalar_function_set_function(scalar_fn, func);
-    duckdb_register_scalar_function(con, scalar_fn);
-    let mut scalar_fn_mut = scalar_fn;
-    duckdb_destroy_scalar_function(&mut scalar_fn_mut);
+    ok = ok && duckdb_register_scalar_function_set(con, set) == DuckDBState::Success;
+    duckdb_destroy_scalar_function_set(&mut set);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("failed to register scalar function {name}"))
+    }
 }
 
 #[inline]
@@ -679,27 +696,6 @@ unsafe fn register_unary_scalar_fn(
     let c_name = to_c_string(name);
     duckdb_scalar_function_set_name(scalar_fn, c_name.as_ptr());
     duckdb_scalar_function_add_parameter(scalar_fn, param_type);
-    duckdb_scalar_function_set_return_type(scalar_fn, return_type);
-    duckdb_scalar_function_set_function(scalar_fn, func);
-    duckdb_register_scalar_function(con, scalar_fn);
-    let mut scalar_fn_mut = scalar_fn;
-    duckdb_destroy_scalar_function(&mut scalar_fn_mut);
-}
-
-#[inline]
-unsafe fn register_binary_scalar_fn(
-    con: duckdb_connection,
-    name: &str,
-    param1_type: duckdb_logical_type,
-    param2_type: duckdb_logical_type,
-    return_type: duckdb_logical_type,
-    func: duckdb_scalar_function_t,
-) {
-    let scalar_fn = duckdb_create_scalar_function();
-    let c_name = to_c_string(name);
-    duckdb_scalar_function_set_name(scalar_fn, c_name.as_ptr());
-    duckdb_scalar_function_add_parameter(scalar_fn, param1_type);
-    duckdb_scalar_function_add_parameter(scalar_fn, param2_type);
     duckdb_scalar_function_set_return_type(scalar_fn, return_type);
     duckdb_scalar_function_set_function(scalar_fn, func);
     duckdb_register_scalar_function(con, scalar_fn);
@@ -765,97 +761,57 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
         scalar_h3_get_resolution,
     );
 
-    // 6. h3_is_valid(UBIGINT) -> BOOLEAN
-    register_unary_scalar_fn(
+    let mut results = Vec::new();
+
+    // 6-7. h3_is_valid(UBIGINT | VARCHAR) -> BOOLEAN
+    results.push(register_scalar_fn_set(
         con,
         "h3_is_valid",
-        type_ubigint,
-        type_bool,
-        scalar_h3_is_valid_u64,
-    );
+        &[
+            (&[type_ubigint], type_bool, scalar_h3_is_valid_u64),
+            (&[type_varchar], type_bool, scalar_h3_is_valid_str),
+        ],
+    ));
 
-    // 7. h3_is_valid(VARCHAR) -> BOOLEAN
-    register_unary_scalar_fn(
-        con,
-        "h3_is_valid",
-        type_varchar,
-        type_bool,
-        scalar_h3_is_valid_str,
-    );
-
-    // 8. h3_to_wkb(UBIGINT) -> BLOB
-    register_unary_scalar_fn(
+    // 8-9. h3_to_wkb(UBIGINT | VARCHAR) -> BLOB
+    results.push(register_scalar_fn_set(
         con,
         "h3_to_wkb",
-        type_ubigint,
-        type_blob,
-        scalar_h3_to_wkb_u64,
-    );
+        &[
+            (&[type_ubigint], type_blob, scalar_h3_to_wkb_u64),
+            (&[type_varchar], type_blob, scalar_h3_to_wkb_str),
+        ],
+    ));
 
-    // 9. h3_to_wkb(VARCHAR) -> BLOB
-    register_unary_scalar_fn(
-        con,
-        "h3_to_wkb",
-        type_varchar,
-        type_blob,
-        scalar_h3_to_wkb_str,
-    );
-
-    // 10. h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT
-    register_binary_scalar_fn(
+    // 10-11. h3_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT, (VARCHAR, BIGINT) -> VARCHAR
+    results.push(register_scalar_fn_set(
         con,
         "h3_cell_to_parent",
-        type_ubigint,
-        type_bigint,
-        type_ubigint,
-        scalar_h3_cell_to_parent_u64,
-    );
+        &[
+            (
+                &[type_ubigint, type_bigint],
+                type_ubigint,
+                scalar_h3_cell_to_parent_u64,
+            ),
+            (
+                &[type_varchar, type_bigint],
+                type_varchar,
+                scalar_h3_cell_to_parent_str,
+            ),
+        ],
+    ));
 
-    // 11. h3_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR
-    register_binary_scalar_fn(
-        con,
-        "h3_cell_to_parent",
-        type_varchar,
-        type_bigint,
-        type_varchar,
-        scalar_h3_cell_to_parent_str,
-    );
-
-    // 12. h3_to_geometry(UBIGINT) -> GEOMETRY
-    register_unary_scalar_fn(
-        con,
-        "h3_to_geometry",
-        type_ubigint,
-        type_geom,
-        scalar_h3_to_geometry_u64,
-    );
-
-    // 13. h3_to_geometry(VARCHAR) -> GEOMETRY
-    register_unary_scalar_fn(
-        con,
-        "h3_to_geometry",
-        type_varchar,
-        type_geom,
-        scalar_h3_to_geometry_str,
-    );
-
-    // 14. h3_cell_to_geometry(UBIGINT) -> GEOMETRY (standard alias)
-    register_unary_scalar_fn(
-        con,
-        "h3_cell_to_geometry",
-        type_ubigint,
-        type_geom,
-        scalar_h3_to_geometry_u64,
-    );
-
-    // 15. h3_cell_to_geometry(VARCHAR) -> GEOMETRY (standard alias)
-    register_unary_scalar_fn(
-        con,
-        "h3_cell_to_geometry",
-        type_varchar,
-        type_geom,
-        scalar_h3_to_geometry_str,
-    );
+    // 12-15. h3_to_geometry / h3_cell_to_geometry (standard alias) (UBIGINT | VARCHAR) -> GEOMETRY
+    for name in ["h3_to_geometry", "h3_cell_to_geometry"] {
+        results.push(register_scalar_fn_set(
+            con,
+            name,
+            &[
+                (&[type_ubigint], type_geom, scalar_h3_to_geometry_u64),
+                (&[type_varchar], type_geom, scalar_h3_to_geometry_str),
+            ],
+        ));
+    }
 
     // 16-19. h3_polygon_to_cells(BLOB | GEOMETRY, BIGINT[, VARCHAR]) -> UBIGINT[].
     // GEOMETRY overloads only on DuckDB >= 1.5, whose native GEOMETRY vectors hold WKB.
@@ -864,22 +820,32 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     if crate::ffi::is_duckdb_version_at_least(1, 5) {
         geom_inputs.push(type_geom);
     }
-    for geom_input in geom_inputs {
-        register_scalar_fn(
-            con,
-            "h3_polygon_to_cells",
-            &[geom_input, type_bigint],
-            type_cell_list,
-            scalar_h3_polygon_to_cells,
-        );
-        register_scalar_fn(
-            con,
-            "h3_polygon_to_cells",
-            &[geom_input, type_bigint, type_varchar],
-            type_cell_list,
-            scalar_h3_polygon_to_cells_mode,
-        );
-    }
+    let polygon_params: Vec<[duckdb_logical_type; 3]> = geom_inputs
+        .iter()
+        .map(|&geom_input| [geom_input, type_bigint, type_varchar])
+        .collect();
+    let polygon_overloads: Vec<ScalarOverload<'_>> = polygon_params
+        .iter()
+        .flat_map(|params| {
+            [
+                (
+                    &params[..2],
+                    type_cell_list,
+                    scalar_h3_polygon_to_cells as duckdb_scalar_function_t,
+                ),
+                (
+                    &params[..],
+                    type_cell_list,
+                    scalar_h3_polygon_to_cells_mode as duckdb_scalar_function_t,
+                ),
+            ]
+        })
+        .collect();
+    results.push(register_scalar_fn_set(
+        con,
+        "h3_polygon_to_cells",
+        &polygon_overloads,
+    ));
     let mut type_cell_list_mut = type_cell_list;
     duckdb_destroy_logical_type(&mut type_cell_list_mut);
 
@@ -899,7 +865,7 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     let mut type_geom_mut = type_geom;
     duckdb_destroy_logical_type(&mut type_geom_mut);
 
-    Ok(())
+    results.into_iter().collect()
 }
 
 #[cfg(test)]

@@ -174,6 +174,7 @@ pub type duckdb_vector = *mut c_void;
 pub type duckdb_logical_type = *mut c_void;
 pub type duckdb_value = *mut c_void;
 pub type duckdb_scalar_function = *mut c_void;
+pub type duckdb_scalar_function_set = *mut c_void;
 pub type duckdb_extension_info = *mut c_void;
 
 #[repr(C)]
@@ -466,6 +467,16 @@ duckdb_api! {
     [219] pub fn duckdb_register_scalar_function(
         con: duckdb_connection,
         scalar_function: duckdb_scalar_function,
+    ) -> DuckDBState;
+    [222] pub fn duckdb_create_scalar_function_set(name: *const c_char) -> duckdb_scalar_function_set;
+    [223] pub fn duckdb_destroy_scalar_function_set(scalar_function_set: *mut duckdb_scalar_function_set);
+    [224] pub fn duckdb_add_scalar_function_to_set(
+        set: duckdb_scalar_function_set,
+        function: duckdb_scalar_function,
+    ) -> DuckDBState;
+    [225] pub fn duckdb_register_scalar_function_set(
+        con: duckdb_connection,
+        set: duckdb_scalar_function_set,
     ) -> DuckDBState;
 
     [7] pub fn duckdb_library_version() -> *const c_char;
