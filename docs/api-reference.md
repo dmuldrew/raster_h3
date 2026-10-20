@@ -1,8 +1,10 @@
-# Complete API Reference
+# DuckDB SQL API Reference
 
 [← Back to README](../README.md)
 
-This document provides the complete API reference for the DuckDB H3 Raster Hexification extension, including table functions for continuous and categorical raster aggregation, direct Parquet and PMTiles v3 vector export, and scalar utility functions.
+This document is the complete SQL reference for the `raster_h3` DuckDB extension ([DuckDB deep dive](engines/duckdb.md)), including table functions for continuous and categorical raster aggregation, direct Parquet and PMTiles v3 vector export, and scalar utility functions.
+
+The other engines accept a subset of these parameters; see their deep dives under [Engines](engines/README.md). Statistic definitions and output column meanings apply to every engine.
 
 ## Continuous Rasters: `h3_raster_continuous_aggregate(file_path, [resolution], ...)`
 *(Alias: `h3_raster_continuous`)*

@@ -61,6 +61,20 @@ keep working. `cargo build --release` at the root still produces
 | H3 scalar helpers | ✅ | ✅ (vectorized) | ✅ | ✅ | — |
 | Output transport | DuckDB `DataChunk` | `RecordBatch` / `ArrowArrayStream` | Arrow PyCapsule | heap tuples (value-per-call SRF) | `RH3IPC01` / NDJSON / files |
 
+## Same Task, Every Engine
+
+Each deep dive has a recipes section covering the same tasks. The core calls, side by side:
+
+| Task | DuckDB | Python / Polars | PostgreSQL | CLI | DataFusion |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Continuous scan | `h3_raster_continuous_aggregate('dem.tif', resolution := 8)` | `scan_raster_h3("dem.tif", 8)` | `h3_raster_continuous_aggregate('/data/dem.tif', 8)` | `raster-h3-cli jsonl dem.tif -r 8` | `ContinuousRasterTableProvider::try_new("dem.tif", vec![8])?` |
+| Categorical scan | `h3_raster_categorical_aggregate(..., format := 'long')` | `scan_raster_h3(..., categorical=True, format="long")` | `h3_raster_categorical_aggregate(...)` (wide only) | `jsonl ... -c --format long` | `CategoricalRasterTableProvider::try_new(..)?.with_format(Long)` |
+| Several resolutions | `resolutions := '7,8'` | `[7, 8]` | one call per resolution | `-r 7,8` | `vec![7, 8]` |
+| CRS / NoData / bbox | `source_crs :=`, `nodata :=`, `bbox :=` | `crs=`, `nodata=`, `bbox=` | `source_crs =>`, `nodata =>`, `bbox =>` | `--crs`, `--nodata`, `--bbox` | `with_crs`, `with_nodata`, `with_bbox` |
+| GeoParquet export | `h3_raster_to_parquet(...)` | `raster_to_parquet(...)` | — (`COPY` to CSV) | `raster-h3-cli parquet ... -o` | — (core `H3ParquetWriter`) |
+| PMTiles export | `h3_raster_to_pmtiles(...)` | `raster_to_pmtiles(...)` | — | `raster-h3-cli pmtiles ... -o` | — (core `H3PmtilesTiler`) |
+| Recipes | [DuckDB](duckdb.md#sql-usage--recipes) | [Python](python-polars.md#recipes) | [PostgreSQL](postgresql.md#recipes) | [CLI](cli.md#recipes) | [DataFusion](datafusion.md#recipes) |
+
 Mosaics (globs, comma-separated lists, VRT) are accepted by every adapter through
 `resolve_raster_sources`. DuckDB exposes the `overlap_rule` choice; DataFusion exposes it via
 `with_overlap_rule`; Python, PostgreSQL and the CLI always use `cutline`.
@@ -78,7 +92,7 @@ All engines derive their columns from `raster_h3_core::columnar::ColumnSchema`:
 | `ColumnSchema::categorical_long()` | `h3_index`, `h3_hex`, `category` i64, `count`, `fraction`, `total_count`, `resolution`, `shannon_entropy`, `entropy`, `distinct_classes`, `unique_classes`, `wkb` |
 
 The DuckDB table functions keep their own historical column sets (documented in the
-[API Reference](../api-reference.md)); PostgreSQL returns a subset (see
+[DuckDB SQL API Reference](../api-reference.md)); PostgreSQL returns a subset (see
 [PostgreSQL](postgresql.md#output-columns)).
 
 ### H3 index representation

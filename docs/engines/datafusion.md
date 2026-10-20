@@ -148,6 +148,171 @@ let cells = ColumnArray::UInt64 { values: vec![0x8828308281fffff], validity: Non
 let hex = ctx.invoke_scalar("h3_to_string", &[cells])?;
 ```
 
+## Recipes
+
+These mirror the [DuckDB SQL recipes](duckdb.md#sql-usage--recipes) as Rust builder calls.
+The option types (`SamplingPattern`, `SpectralFormula`, `QuantileTarget`, `OverlapRule`,
+`CategoryRemapper`) live in `raster-h3-core`, so add it as a dependency next to
+`raster-h3-datafusion`. The snippets assume a function returning
+`raster_h3_core::error::Result<()>`.
+
+```rust
+use std::sync::Arc;
+
+use raster_h3_core::aggregator::multi_horizon::{QuantileTarget, SpectralFormula};
+use raster_h3_core::aggregator::remap::CategoryRemapper;
+use raster_h3_core::aggregator::sampling::SamplingPattern;
+use raster_h3_core::raster::mosaic::OverlapRule;
+use raster_h3_datafusion::{
+    CategoricalFormat, CategoricalRasterTableProvider, ColumnArray, ContinuousRasterTableProvider,
+    FilterPredicate, RasterH3SessionCatalog, TableProvider,
+};
+```
+
+### Basic continuous aggregation
+
+```rust
+let provider = ContinuousRasterTableProvider::try_new("elevation.tif", vec![8])?;
+let plan = provider.scan(None, &[], None)?;
+for batch in plan.execute()? {
+    let batch = batch?;
+    if let Some(ColumnArray::Float64 { values, .. }) = batch.column_by_name("mean") {
+        println!("{} cells, first mean {:?}", batch.num_rows, values.first());
+    }
+}
+```
+
+### CRS, NoData, bounding box and sampling
+
+```rust
+let provider = ContinuousRasterTableProvider::try_new("temperature_global.tif", vec![9])?
+    .with_crs("EPSG:4326")
+    .with_nodata(-9999.0)
+    .with_bbox([-122.50, 37.70, -122.35, 37.85])
+    .with_sampling(SamplingPattern::parse("rgss"));
+```
+
+### Multiple resolutions and quantiles in one pass
+
+```rust
+let provider = ContinuousRasterTableProvider::try_new("elevation.tif", vec![7, 8, 9])?
+    .with_quantiles(QuantileTarget::parse_list("p50,p95,iqr")?); // adds p50, p95, iqr columns
+
+// Push a resolution filter down: only resolution 8 is aggregated
+let res8 = provider.scan(None, &[FilterPredicate::Resolution(8)], None)?;
+```
+
+### Value filters and pushdown
+
+```rust
+let filters = [FilterPredicate::MinCount(10.0), FilterPredicate::MinMean(500.0)];
+let status = provider.supports_filters_pushdown(&filters); // [Exact, Exact]
+let schema = provider.schema();
+let projection = [schema.index_of("h3_index").unwrap(), schema.index_of("mean").unwrap()];
+let plan = provider.scan(Some(&projection), &filters, Some(1000))?;
+```
+
+### Spectral indices and band selection
+
+```rust
+let ndvi = ContinuousRasterTableProvider::try_new("sentinel2_l2a.tif", vec![9])?
+    .with_spectral_formula(SpectralFormula::Ndvi { nir_band: 8, red_band: 4 });
+
+let band3 = ContinuousRasterTableProvider::try_new("multiband.tif", vec![8])?.with_band(3);
+```
+
+### Mosaics and remote COGs
+
+```rust
+let mosaic = ContinuousRasterTableProvider::try_new("tiles/tile_*.tif", vec![8])?
+    .with_overlap_rule(OverlapRule::First);
+let remote = ContinuousRasterTableProvider::try_new("https://example.com/rasters/cog_elevation.tif", vec![8])?;
+```
+
+### Categorical aggregation and remapping
+
+```rust
+// Wide (default): majority class, fractions, histogram JSON
+let wide = CategoricalRasterTableProvider::try_new("worldcover_2021.tif", vec![8])?
+    .with_min_majority_fraction(0.5);
+
+// Long: one row per (cell, class), with classes reclassified during ingestion
+let long = CategoricalRasterTableProvider::try_new("nlcd_landcover_2021.tif", vec![8])?
+    .with_format(CategoricalFormat::Long)
+    .with_remapper(Arc::new(CategoryRemapper::parse("41..43: 1, 21..24: 2, else: null")?));
+```
+
+### Scalar UDFs over a batch column
+
+```rust
+let ctx = RasterH3SessionCatalog::new();
+let plan = provider.scan(Some(&[0]), &[], Some(10))?; // h3_index only
+for batch in plan.execute()? {
+    let cells = batch?.columns.remove(0);
+    let parents = ctx.invoke_scalar("h3_cell_to_parent", &[
+        cells.clone(),
+        ColumnArray::Int64 { values: vec![6; cells.len()], validity: None },
+    ])?;
+    let lat = ctx.invoke_scalar("h3_to_lat", &[cells])?;
+}
+```
+
+### Registering tables in the catalog
+
+```rust
+let mut ctx = RasterH3SessionCatalog::new();
+ctx.register_table("dem", Arc::new(ContinuousRasterTableProvider::try_new("dem.tif", vec![8])?));
+let dem = ctx.table("dem").expect("registered");
+let plan = dem.scan(None, &[], None)?;
+```
+
+### Exports
+
+The DataFusion crate has no file writers. For Parquet/GeoParquet or PMTiles, use the core
+exporters (`H3ParquetWriter`, `H3PmtilesTiler`, see [Core](core.md#file-exporters)) with the
+same `MultiResolutionConfig`, or write the Arrow stream with any Arrow-based writer.
+
+## Using with Apache DataFusion
+
+The traits above mirror DataFusion's, but the crate does not depend on `datafusion`. The
+bridge is the Arrow C Stream: `execute_arrow_c_stream()` returns a `#[repr(C)]`
+`ArrowArrayStream` with the standard layout, which `arrow-rs` can import. A minimal sketch
+that materialises a scan into a DataFusion `MemTable`:
+
+```rust
+use std::sync::Arc;
+
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use datafusion::datasource::MemTable;
+use datafusion::prelude::SessionContext;
+use raster_h3_datafusion::{ContinuousRasterTableProvider, TableProvider};
+
+let provider = ContinuousRasterTableProvider::try_new("dem.tif", vec![8])?;
+let mut stream = provider.scan(None, &[], None)?.execute_arrow_c_stream()?;
+
+// `from_raw` moves the stream out and leaves `stream` released, so its Drop is a no-op.
+let reader = unsafe {
+    ArrowArrayStreamReader::from_raw(&mut stream as *mut _ as *mut FFI_ArrowArrayStream)?
+};
+let schema = reader.schema();
+let batches = reader.collect::<Result<Vec<_>, _>>()?;
+
+let ctx = SessionContext::new();
+ctx.register_table("dem", Arc::new(MemTable::try_new(schema, vec![batches])?))?;
+let df = ctx.sql("SELECT h3_index, mean FROM dem WHERE count > 10").await?;
+```
+
+For streaming instead of materialising, implement DataFusion's `TableProvider` and return
+a `StreamingTableExec` (or your own `ExecutionPlan`) that calls this crate's `scan` with the
+projection, translated filters and limit DataFusion passes in. Map each DataFusion
+`Expr` you recognise to a `FilterPredicate`, and report this crate's
+`supports_filters_pushdown` result (`Exact` / `Inexact` / `Unsupported`) as DataFusion's
+`TableProviderFilterPushDown` so DataFusion re-applies whatever was not handled exactly.
+Wrap the `ScalarUDFImpl`s the same way, converting Arrow arrays to and from `ColumnArray`.
+
+The `arrow` / `datafusion` versions are your choice; this sketch is not compiled in this
+repository's CI.
+
 ## Testing
 
 ```bash
