@@ -44,6 +44,8 @@ test-requires = ["polars>=1.0", "pyarrow>=14.0"]
 test-command = "python {package}/tests/wheel_smoke.py"
 
 [tool.cibuildwheel.linux]
+# 64-bit only: polars/pyarrow publish no i686 wheels, so the smoke test cannot install there.
+archs = ["auto64"]
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
