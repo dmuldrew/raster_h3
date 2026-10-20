@@ -3,4 +3,4 @@ comment = 'High-performance GeoTIFF/COG to H3 hexagonal aggregation and PMTiles/
 default_version = '0.2.0'
 module_pathname = '$libdir/raster_h3_pg'
 relocatable = true
-superuser = false
+superuser = true

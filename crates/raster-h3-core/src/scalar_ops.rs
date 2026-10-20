@@ -44,17 +44,14 @@ pub fn try_parse_resolutions_str(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Parse bounding box coordinates from a comma/whitespace separated string `[min_lon, min_lat, max_lon, max_lat]`.
+/// Returns `None` if any token is not a finite number or the count is not exactly four.
 pub fn parse_bbox_str(s: &str) -> Option<[f64; 4]> {
-    let coords: Vec<f64> = s
+    let coords = s
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|item| !item.is_empty())
-        .filter_map(|item| item.parse::<f64>().ok())
-        .collect();
-    if coords.len() == 4 {
-        Some([coords[0], coords[1], coords[2], coords[3]])
-    } else {
-        None
-    }
+        .map(|item| item.parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<Vec<f64>>>()?;
+    coords.try_into().ok()
 }
 
 /// Estimate query cardinality (number of H3 cells emitted) for a set of raster sources and resolutions.
@@ -229,5 +226,15 @@ mod tests {
         let parent_hex = h3_cell_to_parent_str(&hex, 5).unwrap();
         assert_eq!(string_to_h3(&parent_hex), parent);
         assert!(h3_cell_to_parent_u64(valid_u64, 12).is_none());
+    }
+
+    #[test]
+    fn test_parse_bbox_str_rejects_malformed_tokens() {
+        assert_eq!(parse_bbox_str("1, 2 3,4"), Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(parse_bbox_str("1,garbage,2,3,4"), None);
+        assert_eq!(parse_bbox_str("1,2,3"), None);
+        assert_eq!(parse_bbox_str("1,2,3,4,5"), None);
+        assert_eq!(parse_bbox_str("1,2,3,inf"), None);
+        assert_eq!(parse_bbox_str("1,2,NaN,4"), None);
     }
 }

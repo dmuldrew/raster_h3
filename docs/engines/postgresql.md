@@ -45,7 +45,15 @@ CREATE EXTENSION raster_h3;
 ```
 
 [`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.2.0`,
-`module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = false`.
+`module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = true`.
+
+The raster aggregation functions read files with the server's OS privileges, so `EXECUTE` on
+them is revoked from `PUBLIC` and granted only to `pg_read_server_files` (as with
+`COPY ... FROM` a file). Grant that role to users who need them:
+
+```sql
+GRANT pg_read_server_files TO analyst;
+```
 
 The module requires a little-endian, 64-bit target (pass-by-value `float8`/`int8` Datums);
 other targets fail to compile.

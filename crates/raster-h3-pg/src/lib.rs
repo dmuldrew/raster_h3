@@ -535,7 +535,15 @@ pub struct PgCContinuousRow {
     pub sum: f64,
     pub resolution: i16,
     pub wkb_len: usize,
-    pub wkb: [u8; 128],
+    /// Sized to hold any H3 cell polygon, including 10-vertex odd-resolution pentagons.
+    pub wkb: WkbBuf,
+}
+
+/// Copy a full WKB geometry into the C row. Rows are built from a [`WkbBuf`], so they always fit.
+fn fill_c_wkb(out: &mut PgCContinuousRow, wkb: &[u8]) {
+    out.wkb = [0u8; WKB_BUF_LEN];
+    out.wkb[..wkb.len()].copy_from_slice(wkb);
+    out.wkb_len = wkb.len();
 }
 
 unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
@@ -633,10 +641,7 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
             out.max = row.max;
             out.sum = row.sum;
             out.resolution = row.resolution;
-            let wlen = row.wkb.len().min(128);
-            out.wkb_len = wlen;
-            out.wkb = [0u8; 128];
-            out.wkb[..wlen].copy_from_slice(&row.wkb[..wlen]);
+            fill_c_wkb(out, &row.wkb);
             1
         }
         Ok(None) => 0,
@@ -812,5 +817,19 @@ mod tests {
             assert_eq!(count, rows.len());
             pg_srf_continuous_close(handle);
         }
+    }
+
+    #[test]
+    fn test_c_row_holds_full_pentagon_wkb() {
+        // Odd-resolution pentagons have 10 vertices: the largest H3 polygon (189 bytes).
+        let pentagon = h3o::Resolution::One.pentagons().next().unwrap();
+        let mut buf = [0u8; WKB_BUF_LEN];
+        let len = h3_index_to_wkb(u64::from(pentagon), &mut buf).unwrap();
+        assert!(len > 128, "pentagon WKB is {len} bytes");
+
+        let mut out: PgCContinuousRow = unsafe { std::mem::zeroed() };
+        fill_c_wkb(&mut out, &buf[..len]);
+        assert_eq!(out.wkb_len, len);
+        assert_eq!(&out.wkb[..out.wkb_len], &buf[..len]);
     }
 }
