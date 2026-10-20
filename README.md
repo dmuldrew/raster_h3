@@ -1,8 +1,10 @@
-# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation for DuckDB, DataFusion, Python/Polars, PostgreSQL & the CLI
+# raster_h3: High-Performance GeoTIFF-to-H3 Hexagonal Aggregation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
-[![DuckDB Extension](https://img.shields.io/badge/DuckDB-Loadable_Extension-blue.svg)](https://duckdb.org)
+[![DuckDB Extension](https://img.shields.io/badge/DuckDB-Loadable_Extension-blue.svg)](docs/engines/duckdb.md)
+[![Python / Polars](https://img.shields.io/badge/Python-Polars_%7C_Arrow-3776AB.svg)](docs/engines/python-polars.md)
+[![PostgreSQL 13–18](https://img.shields.io/badge/PostgreSQL-13–18-336791.svg)](docs/engines/postgresql.md)
 
 A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation uses a configurable memory budget with disk spilling. The same engine ships as a native DuckDB extension, DataFusion-style table providers, a Python/Polars package, a PostgreSQL extension and a command-line tool (see [Engines](#engines)).
 
@@ -12,77 +14,28 @@ Web Mercator, and certified Albers chunks can evict completed cells early.
 Arbitrary Proj4 chunks and Albers chunks that may contain the cone apex retain or
 spill cells until the remaining input permits certified eviction or EOF is reached.
 
-Rust API cleanup: use `h3o` directly instead of the former `raster_h3::h3` alias.
-The obsolete `H3ScanlineLookahead` type, unused sampling-bound helpers, and dormant
-profiling fields have been removed; downstream users of those APIs must update.
-
-
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
-| Output | Use Case | One-Liner |
+| Output | Use Case | Available In |
 | :--- | :--- | :--- |
-| **DuckDB Table** | SQL analytics, JOINs, aggregation | `SELECT * FROM h3_raster_continuous_aggregate(...)` |
-| **PMTiles v3** | Web maps — zero servers, one file | `SELECT * FROM h3_raster_to_pmtiles(...)` |
-| **GeoParquet 1.1** | GIS interchange (QGIS, GeoPandas, BigQuery) | `SELECT * FROM h3_raster_to_parquet(..., geoparquet := true)` |
-
----
-
-## Engines
-
-The repository is a Cargo workspace: `raster-h3-core` does all decoding, reprojection,
-aggregation and export, and each engine crate is a thin adapter over it, so every engine
-returns the same cells and statistics for the same input.
-
-| Engine | Crate | Get it | One-liner | Deep Dive |
-| :--- | :--- | :--- | :--- | :--- |
-| **DuckDB** | `raster-h3-duckdb` | `cargo build --release` → `libraster_h3.{so,dylib,dll}` | `SELECT * FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8)` | [DuckDB](docs/engines/duckdb.md) |
-| **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | `raster_h3.scan_raster_h3("dem.tif", 8).collect()` | [Python & Polars](docs/engines/python-polars.md) |
-| **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | `SELECT * FROM h3_raster_continuous_aggregate('/data/dem.tif', 8)` | [PostgreSQL](docs/engines/postgresql.md) |
-| **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | `provider.scan(Some(&[0, 2]), &filters, Some(1000))` | [DataFusion](docs/engines/datafusion.md) |
-| **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | `raster-h3-cli jsonl dem.tif -r 8` | [CLI](docs/engines/cli.md) |
-| **Rust library** | `raster-h3-core` | Cargo dependency | `ContinuousBatchReader::open(&paths, &config, None, 2048, None)` | [Core Engine](docs/engines/core.md) |
-
-Feature coverage differs per engine (DuckDB exposes every parameter; PostgreSQL and Python
-expose the common subset). See the [Engines Overview](docs/engines/README.md) for the
-capability matrix, shared schemas and cross-engine parity tests.
+| **H3 table / Arrow stream** | SQL analytics, JOINs, DataFrames | DuckDB, Python/Polars, PostgreSQL, DataFusion, CLI (NDJSON / `RH3IPC01`) |
+| **PMTiles v3** | Web maps — zero servers, one file | DuckDB, Python, CLI |
+| **GeoParquet 1.1** | GIS interchange (QGIS, GeoPandas, BigQuery) | DuckDB, Python, CLI |
 
 ---
 
 ## 📖 Table of Contents
 
-- [Engines](#engines)
 - [Motivation & Project Goals](#motivation--project-goals)
 - [How It Works](#how-it-works)
-- [Installation & Docker Quickstart](#installation--docker-quickstart)
-- [SQL Usage & Practical Recipes](#sql-usage--practical-recipes)
+- [Engines](#engines)
 - [Core Engineering Architecture](#core-engineering-architecture)
 - [Architecture Diagram](#architecture-diagram)
-- [Source Module Architecture](docs/module-architecture.md)
 - [Core Dependencies](#core-dependencies--architectural-contributions)
 - [Troubleshooting & Common Pitfalls](#troubleshooting--common-pitfalls)
 - [Building & Testing Locally](#building--testing-locally)
+- [Deep Dives](#-deep-dives)
 - [License](#license)
-
-**📖 Deep Dives:**
-
-| Document | What It Covers |
-| :--- | :--- |
-| [Engines Overview](docs/engines/README.md) | Workspace layout, per-engine capability matrix, shared schemas, parity tests |
-| [Core Engine](docs/engines/core.md) | `raster-h3-core`: batch readers, Arrow C Data/Stream, `RH3IPC01`/NDJSON, scalar ops |
-| [DuckDB](docs/engines/duckdb.md) | Extension build/load, entry points, bind → init → scan lifecycle, FFI safety |
-| [DataFusion](docs/engines/datafusion.md) | Table providers, filter/projection/limit pushdown, vectorized scalar UDFs |
-| [Python & Polars](docs/engines/python-polars.md) | Arrow PyCapsule stream, Polars IO source, exporters, wheel builds |
-| [PostgreSQL](docs/engines/postgresql.md) | fmgr extension build/install, SRFs, scalar helpers, Docker e2e tests |
-| [CLI](docs/engines/cli.md) | `ipc`/`jsonl`/`parquet`/`pmtiles` subcommands, ClickHouse and shell pipelines |
-| [Engineering Architecture](docs/engineering.md) | Streaming, memory budgets, disk spilling, and throughput |
-| [Module Architecture](docs/module-architecture.md) | File-by-file source code map with GitHub links |
-| [PMTiles & Multi-Resolution](docs/pmtiles.md) | Multi-resolution pyramids, zoom mapping, zero-server web maps |
-| [Optimal Raster Formats](docs/optimal-raster-format.md) | Why tiled WGS84 COGs are 4.5–6× faster, GDAL recipes |
-| [Super-Sampling](docs/super-sampling.md) | RGSS, Hex, Gaussian boundary anti-aliasing presets |
-| [CRS & Projections](docs/crs-and-projection.md) | Supported projections, detection, 3-tier transform hierarchy |
-| [Architecture Comparison](docs/architecture-comparison.md) | Benchmarks vs Python/PostGIS/GDAL, environment trade-offs |
-| [API Reference](docs/api-reference.md) | Complete SQL function signatures, parameters, output schemas |
-| [Test Coverage](docs/testing.md) | Every test suite grouped by category (geodetic, threading, eviction, codecs, engines…), gated tests, CI coverage |
 
 ---
 
@@ -105,7 +58,7 @@ Aggregating rasters into H3 solves four fundamental challenges of working with r
 * **Normalizes Disparate Resolutions & Projections**: Rasters arrive with differing pixel sizes (10m Sentinel, 30m Landsat, 1km climate grids) and incompatible local projections. H3 maps them all into a single, standardized global grid without manual grid resampling.
 * **Drastic 50×–100× Data Reduction**: An H3 Resolution 8 cell aggregates roughly 800 thirty-meter pixels into a single summary row, shrinking a multi-gigabyte raster by orders of magnitude on disk.
 * **Preserves Rich Surface Distributions**: Rather than losing nuance to a simple average, the engine captures the full distribution per cell—including mean, variance/ruggedness, and min/max for continuous terrain, plus class purity and Shannon entropy (landscape fragmentation) for categorical maps.
-* **Unlocks Relational SQL Joins**: Every hexagon is addressed by a compact 64-bit integer (`UBIGINT` / hex string). Once pixels become H3 cells, rigid 2D raster matrices become standard relational tables joinable directly with tabular business data: `JOIN ON r.h3_index = v.h3_index`.
+* **Unlocks Relational Joins**: Every hexagon is addressed by a compact 64-bit integer (`UBIGINT` / `UInt64` / hex string). Once pixels become H3 cells, rigid 2D raster matrices become standard relational tables joinable directly with tabular business data: `JOIN ON r.h3_index = v.h3_index`.
 
 For more details on the grid system and its mathematical design, see the [official H3 documentation](https://h3geo.org/docs/) and the [Uber engineering blog](https://www.uber.com/blog/h3/).
 
@@ -118,9 +71,14 @@ A city planning department has two datasets:
 
 **The question**: *Which low-income, densely populated neighborhoods have the least tree canopy coverage?*
 
-Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid:
+Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in two engines:
+
+#### DuckDB (SQL)
 
 ```sql
+-- Polyfilling uses DuckDB's spatial and community h3 extensions alongside raster_h3:
+-- INSTALL spatial; LOAD spatial; INSTALL h3 FROM community; LOAD h3;
+
 -- 1. Aggregate the 30m land cover raster into H3 hexagons (with budgeted aggregation)
 CREATE TABLE canopy_h3 AS
 SELECT h3_index, majority_class, majority_fraction AS canopy_purity
@@ -136,7 +94,7 @@ CREATE TABLE census_tracts_h3 AS
 SELECT 
     tract_name,
     median_income,
-    round(total_population / (ST_Area(geom) / 1000000.0), 0) 
+    round(total_population / (ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 1000000.0), 0) 
         AS pop_density_per_sqkm,
     unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8))
         AS h3_index
@@ -159,7 +117,50 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
-> No Python. No GDAL. No intermediate files. The raster *becomes* a queryable table source.
+#### Python & Polars
+
+```python
+# pip install "./crates/raster-h3-python[polars]" geopandas h3
+import geopandas as gpd
+import h3
+import polars as pl
+import raster_h3
+
+# 1. Aggregate the 30m land cover raster into H3 hexagons (a lazy Polars scan)
+canopy_h3 = raster_h3.scan_raster_h3(
+    "nlcd_landcover_2021.tif", 8, categorical=True,
+    columns=["h3_index", "majority_class", "majority_fraction"],
+).rename({"majority_fraction": "canopy_purity"})
+
+# 2. Polyfill vector census tracts into H3 cells & compute population density
+#    (h3.geo_to_cells indexes hexagons whose centroids fall inside the polygon)
+tracts = gpd.read_file("census_tracts.geojson").to_crs(4326)
+area_sqkm = tracts.to_crs(tracts.estimate_utm_crs()).area / 1e6
+census_tracts_h3 = pl.DataFrame({
+    "tract_name": tracts["tract_name"].tolist(),
+    "median_income": tracts["median_income"].tolist(),
+    "pop_density_per_sqkm": (tracts["total_population"] / area_sqkm).round(0).tolist(),
+    "h3_index": [[h3.str_to_int(c) for c in h3.geo_to_cells(g, 8)] for g in tracts.geometry],
+}).explode("h3_index").with_columns(pl.col("h3_index").cast(pl.UInt64))
+
+# 3. JOIN raster results with census tracts on the shared H3 index
+result = (
+    census_tracts_h3.lazy()
+    .join(canopy_h3, on="h3_index")
+    .filter(
+        (pl.col("majority_class") == 41)            # Deciduous forest (NLCD code)
+        & (pl.col("canopy_purity") < 0.30)          # Less than 30% tree canopy
+        & (pl.col("median_income") < 45_000)        # Low-income tracts
+        & (pl.col("pop_density_per_sqkm") > 3_000)  # Densely populated neighborhoods
+    )
+    .select("tract_name", "median_income", "pop_density_per_sqkm",
+            pl.col("majority_class").alias("dominant_landcover"), "canopy_purity")
+    .sort("canopy_purity")
+    .collect()
+)
+```
+
+> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars.
 
 ### Why Intermediate H3 Aggregations Change Everything
 
@@ -172,25 +173,34 @@ Materializing both raster and vector datasets into intermediate H3 tables (or Pa
 
 #### 2. Benefits for Raster Ingestion
 * **Scan Once, Query Everywhere**: Decompressing and processing an 8–50 GB GeoTIFF (billions of pixels) is an intensive operation you only want to do once. Once aggregated into `canopy_h3` or exported to Parquet, downstream analyses query in milliseconds without touching raw raster pixels again.
-* **Drastic Storage Reduction**: A multi-gigabyte raster compresses into a compact, columnar H3 table that is 50×–100× smaller on disk. You can easily version-control it, store it in your cloud data lake (S3/R2), or query it via DuckDB, Snowflake, or BigQuery.
+* **Drastic Storage Reduction**: A multi-gigabyte raster compresses into a compact, columnar H3 table that is 50×–100× smaller on disk. You can easily version-control it, store it in your cloud data lake (S3/R2), or query it from DuckDB, Polars, PostgreSQL, Snowflake, or BigQuery.
 
 #### 3. Benefits for Spatial Joining & Visualization
 * **$O(1)$ Hash Joins vs $O(N \times M)$ Geometry Math**: Converting both raster pixels and vector polygons to 64-bit integer H3 cells replaces expensive topological intersection algorithms with hardware-speed **integer equality hash joins** (`JOIN ON c.h3_index = t.h3_index`).
-* **Universal Lingua Franca**: Any number of disparate rasters (elevation, temperature, canopy) and vector layers (demographics, parcels, sensor points) can be joined together in a single multi-way SQL query—eliminating projection mismatches, resolution differences, and resampling errors.
-* **Direct PMTiles from Vector Parquet**: Intermediate H3 vector tables stored in Parquet can be transcoded directly into multi-zoom web map pyramids via `h3_parquet_to_pmtiles` without Tippecanoe, GDAL, or GeoJSON scratch files.
+* **Universal Lingua Franca**: Any number of disparate rasters (elevation, temperature, canopy) and vector layers (demographics, parcels, sensor points) can be joined together in a single multi-way query—eliminating projection mismatches, resolution differences, and resampling errors.
+* **Direct PMTiles from Vector Parquet**: Intermediate H3 vector tables stored in Parquet can be transcoded directly into multi-zoom web map pyramids (DuckDB `h3_parquet_to_pmtiles`) without Tippecanoe, GDAL, or GeoJSON scratch files.
 
 ### From Query to Web Map in One Step
 
 `raster_h3` can export results directly to a **PMTiles v3** single-file vector tile archive — a multi-resolution pyramid ready for MapLibre, Kepler.gl, or Felt with zero intermediate files and zero tile servers:
 
+```bash
+raster-h3-cli pmtiles nlcd_landcover_2021.tif -c -r 5,6,7,8 -o landcover_canopy.pmtiles
+```
+
+```python
+raster_h3.raster_to_pmtiles("nlcd_landcover_2021.tif", "landcover_canopy.pmtiles", [5, 6, 7, 8], categorical=True)
+```
+
 ```sql
+-- DuckDB
 SELECT * FROM h3_raster_to_pmtiles(
     'nlcd_landcover_2021.tif', 'landcover_canopy.pmtiles',
     min_resolution := 5, max_resolution := 8, categorical := true
 );
--- Upload landcover_canopy.pmtiles to S3, R2, or GitHub Pages.
--- Open in MapLibre GL JS — done. Zoom from state-level to city-block.
 ```
+
+Upload `landcover_canopy.pmtiles` to S3, R2, or GitHub Pages, open it in MapLibre GL JS, and zoom from state level to city block.
 
 A web map needs tiles at every zoom level — from hemispheric overview down to street-level detail. `raster_h3` builds this entire multi-resolution pyramid in a single pass over the raster, aggregating pixels simultaneously across all requested H3 resolutions. See [PMTiles & Multi-Resolution](docs/pmtiles.md) for the full deep dive.
 
@@ -198,7 +208,8 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 
 | Principle | What It Means |
 | :--- | :--- |
-| **Pure Rust, Zero Dependencies** | Single `.dylib` / `.so` / `.dll` — no Python, no GDAL C++ |
+| **Pure Rust, Zero C++ Dependencies** | No GDAL, PROJ or Python runtime; each engine ships as one native library or binary |
+| **One Core, Many Engines** | DuckDB, DataFusion, Python/Polars, PostgreSQL and the CLI all drive the same streamers and return the same cells |
 | **Budgeted aggregation** | Configurable accumulator budget with disk spilling; total RAM also includes decoding and prefetch buffers |
 | **Hardware-Saturating Throughput** | Work-stealing parallelism across all CPU cores |
 | **Native PMTiles v3 Export** | Single-file web maps — zero Tippecanoe, zero tile servers |
@@ -228,7 +239,7 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 
 ### Direct Web-Ready Map Tiles
 
-Generates single-file **PMTiles v3** vector pyramids directly inside DuckDB in a single query:
+Generates single-file **PMTiles v3** vector pyramids directly from DuckDB SQL, Python or the CLI:
 - **Zero Intermediate Tooling**: Eliminates C++ Tippecanoe, GeoJSON scratch files, and dedicated tile server infrastructure.
 - **Serverless Map Delivery**: Upload the `.pmtiles` archive directly to Amazon S3, Cloudflare R2, or GitHub Pages and render with zero backend infrastructure.
 
@@ -240,321 +251,105 @@ assignment, avoiding accumulated coordinate drift. Each candidate is indexed
 with H3; contiguous equal-cell runs share accumulation work. Supersampling evaluates each sample once and combines same-cell weights per pixel,
 replaying stored assignments when samples split across cells.
 
-### In-Database Streaming
+### In-Engine Streaming
 
-Aggregated cells feed DuckDB queries, joins, and exports directly. When active
-accumulators exceed their budget, temporary spill files hold partial results for
-merging. Projected inputs without certified bounds may defer output until EOF.
-
----
-
-## Installation & Docker Quickstart
-
-### Pre-Compiled Binaries
-
-Pre-compiled binaries are published for all major platforms:
-
-| Platform | Compatible Environments | Asset Filename |
-| :--- | :--- | :--- |
-| **`osx_arm64`** | macOS Apple Silicon (M1/M2/M3/M4) | `raster_h3-osx_arm64.duckdb_extension.gz` |
-| **`osx_amd64`** | macOS Intel x86_64 | `raster_h3-osx_amd64.duckdb_extension.gz` |
-| **`linux_amd64_gcc4`** | Ubuntu, Debian, CentOS, Fedora (glibc) | `raster_h3-linux_amd64_gcc4.duckdb_extension.gz` |
-| **`linux_arm64`** | AWS Graviton, Raspberry Pi 4/5, AArch64 | `raster_h3-linux_arm64.duckdb_extension.gz` |
-| **`windows_amd64`** | Windows 10/11, Windows Server (x64) | `raster_h3-windows_amd64.duckdb_extension.gz` |
-
-#### Option A: Install via Release URL
-
-```sql
-SET allow_unsigned_extensions = true;
-
--- Replace <platform> with your platform identifier (e.g. osx_arm64)
-INSTALL 'https://github.com/dmuldrew/raster_h3_hexification/releases/latest/download/raster_h3-<platform>.duckdb_extension.gz';
-LOAD 'raster_h3';
-
-SELECT raster_h3_version();
-```
-
-#### Option B: Install via Custom Repository
-
-```sql
-SET allow_unsigned_extensions = true;
-SET custom_extension_repository = 'https://github.com/dmuldrew/raster_h3_hexification/releases/latest/download';
-INSTALL raster_h3;
-LOAD raster_h3;
-```
-
-#### Option C: Manual Download & Local Load
-
-Download from [Releases](https://github.com/dmuldrew/raster_h3_hexification/releases), then:
-```sql
-LOAD '/path/to/raster_h3-<platform>.duckdb_extension';
-```
+Aggregated cells stream into the host engine as they complete — DuckDB `DataChunk`s,
+Arrow `RecordBatch`es for DataFusion and Polars, PostgreSQL rows, or NDJSON / `RH3IPC01` on
+stdout — so queries, joins and exports start before the raster is fully read. Every engine
+pulls on demand, so a `LIMIT` stops aggregation early. When active accumulators exceed
+their budget, temporary spill files hold partial results for merging. Projected inputs
+without certified bounds may defer output until EOF.
 
 ---
 
-### Docker Quickstart
+## Engines
 
-#### Build the Container
-```bash
-docker build -t raster_h3:latest .
-```
+The repository is a Cargo workspace: `raster-h3-core` does all decoding, reprojection,
+aggregation and export, and each engine crate is a thin adapter over it, so every engine
+returns the same cells and statistics for the same input.
 
-#### Run Interactive Session
-```bash
-docker run -it raster_h3:latest
-```
+| Engine | Crate | Get it | Docs |
+| :--- | :--- | :--- | :--- |
+| **DuckDB** | `raster-h3-duckdb` | Pre-built `.duckdb_extension` from [Releases](https://github.com/dmuldrew/raster_h3_hexification/releases), Docker, or `cargo build --release` → `libraster_h3.{so,dylib,dll}` | [DuckDB deep dive](docs/engines/duckdb.md) · [SQL API Reference](docs/api-reference.md) |
+| **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) |
+| **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
+| **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
+| **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
+| **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 
-#### Run SQL 1-Liners
-```bash
-# Continuous raster aggregation
-docker run --rm -v $(pwd):/data raster_h3:latest \
-  "SELECT h3_hex, round(mean, 2) AS avg_elevation, count FROM h3_raster_continuous_aggregate('/data/sample_sf.tif', resolution := 8) LIMIT 5;"
+Feature coverage differs per engine: DuckDB exposes every parameter (sampling, bands,
+spectral formulas, quantiles, remapping, budgets), DataFusion exposes most of them through
+builders, and PostgreSQL, Python and the CLI expose the common subset (resolutions, CRS,
+NoData, bbox, categorical layout). The [Engines Overview](docs/engines/README.md) has the
+full capability matrix, shared output schemas, a side-by-side cheat sheet and the
+cross-engine parity tests. Each engine deep dive covers install, recipes (basic and
+advanced scans, scalar helpers, joins, exports, remote COGs, mosaics, categorical queries),
+internals and troubleshooting.
 
-# Categorical aggregation
-docker run --rm -v $(pwd):/data raster_h3:latest \
-  "SELECT h3_hex, majority_class, round(majority_fraction * 100, 1) AS dominance_pct, total_count FROM h3_raster_categorical_aggregate('/data/sample_sf.tif', resolution := 8) LIMIT 5;"
+### Quick Start
 
-# PMTiles v3 export
-docker run --rm -v $(pwd):/data raster_h3:latest \
-  "SELECT * FROM h3_raster_to_pmtiles('/data/sample_sf.tif', '/data/sample_sf.pmtiles', min_resolution := 6, max_resolution := 8);"
-```
+**DuckDB**
 
-#### Pipe SQL Scripts
-```bash
-cat my_analysis.sql | docker run --rm -i -v $(pwd):/data raster_h3:latest
-```
-
-#### Standalone CLI Converters
-```bash
-# GeoTIFF → PMTiles
-docker run --rm -v $(pwd):/data raster_h3:latest \
-  raster_to_pmtiles \
-    --input /data/sample_sf.tif \
-    --output /data/sample_sf.pmtiles \
-    --resolutions 6,7,8 \
-    --sampling rgss
-
-# Parquet → PMTiles
-docker run --rm -v $(pwd):/data raster_h3:latest \
-  parquet_to_pmtiles \
-    --input /data/demographics_h3.parquet \
-    --output /data/demographics.pmtiles \
-    --h3-col h3_index
-```
-
-#### Launch the PMTiles Web Viewer
-
-Using Docker Compose (recommended):
-```bash
-docker compose up viewer        # foreground
-docker compose up -d viewer     # detached
-```
-
-Using standalone Docker:
-```bash
-docker run --rm -p 8080:8080 -v $(pwd):/app python:3.11-slim python3 -u /app/pmtiles_viewer/server.py 8080
-```
-
-Open **`http://localhost:8080/pmtiles_viewer/`** to visualize any `.pmtiles` file.
-
----
-
-## SQL Usage & Practical Recipes
-
-### Load the Extension
 ```sql
-LOAD 'target/release/libraster_h3.dylib'; -- macOS (.so on Linux, .dll on Windows)
+LOAD 'target/release/libraster_h3.dylib'; -- or INSTALL from a release, see the DuckDB deep dive
+SELECT h3_hex, mean, count
+FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8)
+LIMIT 5;
 ```
 
-### Basic Continuous Aggregation
-```sql
-SELECT h3_index, h3_hex, mean, count, min, max, sum
-FROM h3_raster_continuous_aggregate('elevation.tif', resolution := 8);
-```
+**Python / Polars**
 
-### Advanced Parameters
-```sql
-SELECT
-    h3_hex,
-    round(mean, 2) AS avg_temp_c,
-    round(count, 2) AS weighted_pixel_count
-FROM h3_raster_continuous_aggregate(
-    'temperature_global.tif',
-    resolution := 9,
-    source_crs := 'EPSG:4326',
-    nodata := -9999.0,
-    sampling := 'rgss',
-    min_lon := -122.50, min_lat := 37.70,
-    max_lon := -122.35, max_lat := 37.85
-)
-ORDER BY weighted_pixel_count DESC;
-```
-
-### Helper Scalar Functions
-```sql
-SELECT
-    h3_to_string(h3_index) AS h3_str,
-    string_to_h3('8828308281fffff') AS h3_int,
-    h3_to_lat(h3_index) AS center_lat,
-    h3_to_lng(h3_index) AS center_lng,
-    h3_get_resolution(h3_index) AS res,
-    mean
-FROM h3_raster_continuous_aggregate('elevation.tif', 8);
-
--- Polyfill a WKB polygon: list of UBIGINT cells; containment defaults to 'contains_centroid'
-SELECT h3_polygon_to_cells(ST_AsWKB(geom), 8, 'covers') AS cells FROM areas;
-```
-
-See [`h3_polygon_to_cells`](docs/api-reference.md#h3_polygon_to_cells) for the containment modes.
-
-### Spatial Joins
-```sql
-SELECT
-    r.h3_hex,
-    r.mean AS avg_elevation,
-    p.total_population,
-    p.median_income
-FROM h3_raster_continuous_aggregate('california_elevation.tif', resolution := 8) r
-JOIN population_h3_table p ON r.h3_index = p.h3_index
-WHERE r.mean > 500.0;
-```
-
-### Export to GeoParquet
-```sql
-COPY (
-    SELECT h3_index, h3_hex, mean, count, min, max,
-           h3_to_lat(h3_index) AS centroid_lat,
-           h3_to_lng(h3_index) AS centroid_lng
-    FROM h3_raster_continuous_aggregate('elevation.tif', resolution := 8, sampling := 'rgss')
-) TO 'elevation_h3.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
-```
-
-### Remote COG & S3 Streaming
-```sql
--- HTTPS
-SELECT * FROM h3_raster_continuous_aggregate(
-    'https://example.com/rasters/cog_elevation.tif',
-    resolution := 8, sampling := 'rgss'
-);
-
--- AWS S3
-SELECT * FROM h3_raster_continuous_aggregate(
-    's3://my-geospatial-bucket/landsat/scene_01.tif',
-    resolution := 9
-);
-```
-
-> 💡 **Tip**: For optimal remote streaming and maximum local throughput, source rasters should be formatted as tiled WGS84 COGs with $512 \times 512$ blocks. See [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
-
-
-### Multi-File Mosaics
-```sql
--- Voronoi cutline partitioning (zero double-counting)
-SELECT * FROM h3_raster_continuous_aggregate(
-    'tiles/tile_*.tif', resolution := 8, overlap_rule := 'cutline'
-);
-
--- Painter's Algorithm (first tile takes precedence)
-SELECT * FROM h3_raster_categorical_aggregate(
-    'tile_west.tif,tile_east.tif', resolution := 8, overlap_rule := 'first'
-);
-```
-
-### Spectral Indices (NDVI, NBR, NDWI, EVI)
-```sql
-SELECT * FROM h3_raster_continuous_aggregate(
-    'sentinel2_l2a.tif', resolution := 9, formula := 'ndvi'
-);
-```
-
-### Categorical Aggregation
-
-#### Majority Class & Dominance (Wide Format)
-```sql
-SELECT h3_hex, majority_class,
-       round(majority_fraction * 100, 1) AS dominance_pct,
-       unique_classes, total_count, histogram
-FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8);
-```
-
-#### JSON Histogram Queries
-```sql
-SELECT h3_hex, majority_class,
-       json_extract(histogram, '$."10"') AS forest_fraction,
-       json_extract(histogram, '$."50"') AS urban_fraction
-FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8)
-WHERE json_extract(histogram, '$."50"') IS NOT NULL;
-```
-
-#### Long-Form Filtering
-```sql
-SELECT h3_hex, category AS urban_class, count AS urban_pixel_count,
-       round(fraction * 100, 2) AS urban_coverage_pct
-FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8, format := 'long')
-WHERE category = 50 AND fraction >= 0.25
-ORDER BY fraction DESC;
-```
-
-### PMTiles v3 Export
-```sql
-SELECT * FROM h3_raster_to_pmtiles(
-    'california_elevation.tif', 'california_elevation.pmtiles',
-    min_resolution := 6, max_resolution := 8, sampling := 'rgss'
-);
-```
-
-### Python, Node.js, and R Integration
-
-These examples load the DuckDB extension from each language's DuckDB client. For a native
-Python package without DuckDB (Arrow streams, Polars `LazyFrame`s), see
-[Python & Polars](docs/engines/python-polars.md).
-
-#### Python
 ```python
-import duckdb
+import polars as pl
+import raster_h3
 
-con = duckdb.connect(config={'allow_unsigned_extensions': 'true'})
-con.load_extension('target/release/libraster_h3.dylib')
-
-df = con.execute("""
-    SELECT h3_hex, round(mean, 2) AS mean_elevation, count AS pixel_count
-    FROM h3_raster_continuous_aggregate('california_elevation.tif', resolution := 8, sampling := 'rgss')
-    ORDER BY pixel_count DESC LIMIT 10;
-""").df()
-
-print(df)
+df = (raster_h3.scan_raster_h3("dem.tif", 8)
+        .filter(pl.col("count") > 10)
+        .select("h3_hex", "mean", "count")
+        .collect())
 ```
 
-#### Node.js
-```javascript
-const duckdb = require('duckdb');
-const db = new duckdb.Database(':memory:', { allow_unsigned_extensions: 'true' });
+**PostgreSQL**
 
-db.all("LOAD 'target/release/libraster_h3.dylib';", (err) => {
-  if (err) throw err;
-  db.all(`SELECT h3_hex, round(mean, 2) AS avg_elevation, count
-    FROM h3_raster_continuous_aggregate('california_elevation.tif', resolution := 8) LIMIT 5;`,
-    (err, rows) => { if (err) throw err; console.table(rows); });
-});
+```sql
+CREATE EXTENSION raster_h3;
+SELECT h3_hex, mean, count FROM h3_raster_continuous_aggregate('/data/dem.tif', 8) LIMIT 5;
 ```
 
-#### R
-```r
-library(DBI); library(duckdb)
-con <- dbConnect(duckdb::duckdb(), config = list("allow_unsigned_extensions" = "true"))
-dbExecute(con, "LOAD 'target/release/libraster_h3.dylib';")
-res <- dbGetQuery(con, "SELECT h3_hex, majority_class, majority_fraction, total_count
-    FROM h3_raster_categorical_aggregate('worldcover_2021.tif', resolution := 8) LIMIT 10;")
-print(res)
+**CLI**
+
+```bash
+raster-h3-cli jsonl dem.tif -r 8 --columns h3_hex,mean,count --limit 5
+raster-h3-cli parquet dem.tif -r 7,8 -o dem_h3.parquet
 ```
 
-> 📖 **Full API Reference** — See [docs/api-reference.md](docs/api-reference.md) for complete parameter tables, output schemas, and mathematical definitions for all functions.
+**DataFusion-style Rust API**
+
+```rust
+use raster_h3_datafusion::{FilterPredicate, RasterH3SessionCatalog, TableProvider};
+
+let ctx = RasterH3SessionCatalog::new();
+let provider = ctx.h3_raster_continuous_aggregate("dem.tif", vec![8])?;
+let plan = provider.scan(Some(&[0, 2]), &[FilterPredicate::MinCount(10.0)], Some(1000))?;
+for batch in plan.execute()? { /* RecordBatch with h3_index, mean */ }
+```
+
+**Rust library**
+
+```rust
+use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
+use raster_h3_core::columnar::ContinuousBatchReader;
+use raster_h3_core::raster::mosaic::resolve_raster_sources;
+
+let paths = resolve_raster_sources("dem.tif")?;
+let reader = ContinuousBatchReader::open(&paths, &MultiResolutionConfig::new(vec![8]), None, 2048, None)?;
+```
 
 ---
 
 ## Core Engineering Architecture
 
-`raster_h3` achieves near-hardware-limit throughput through these architectural principles:
+`raster_h3` achieves near-hardware-limit throughput through these architectural principles, shared by every engine:
 
 | # | Engineering Pillar | Impact |
 | :---: | :--- | :--- |
@@ -567,7 +362,7 @@ print(res)
 | 7 | **Zero-Copy `memmap2` & Async Prefetching** | Direct virtual memory mapping with background decompression |
 | 8 | **Zero-Allocation Hex Formatting** | Stack-based 16-byte LUT for H3 index formatting |
 | 9 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before decompression |
-| 10 | **Native DuckDB Parallelism (`init_local`)** | Work-stealing chunk distribution across all CPU threads |
+| 10 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
 | 11 | **Lock-Free Buffer Pool** | Zero-allocation buffer recycling via `crossbeam_deque::Injector` |
 | 12 | **Single-Hop In-Order Prefetcher** | Direct worker-to-ring-buffer queue, zero context switches |
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
@@ -582,16 +377,12 @@ print(res)
 
 ```mermaid
 flowchart TD
-    subgraph DuckDB ["DuckDB SQL Execution Engine"]
-        SQL1["h3_raster_continuous_aggregate (mean, stddev, min, max, sum)"]
-        SQL2["h3_raster_categorical_aggregate (majority, histogram, long)"]
-        SQL3["h3_raster_to_parquet (OGC GeoParquet 1.1 WKB)"]
-        SQL4["h3_raster_to_pmtiles (PMTiles v3 Vector Pyramids)"]
-        TF["Table Function C API: bind -> init_local -> scan"]
-        SQL1 --> TF
-        SQL2 --> TF
-        SQL3 --> TF
-        SQL4 --> TF
+    subgraph ENGINES ["Engine Adapters"]
+        DUCK["DuckDB table functions<br/>bind -> init_local -> scan"]
+        PY["Python / Polars<br/>Arrow PyCapsule + IO source"]
+        DF["DataFusion-style<br/>TableProvider / ExecutionPlan"]
+        PG["PostgreSQL<br/>value-per-call SRFs"]
+        CLI["CLI<br/>jsonl / ipc / parquet / pmtiles"]
     end
 
     subgraph IO ["Zero-Copy Disk, Cloud & Buffer Layer"]
@@ -603,7 +394,7 @@ flowchart TD
         POOL <.->|"Steal / Recycle"| QUEUE
     end
 
-    subgraph PIPELINE ["Scanline Horizon Processing Engine"]
+    subgraph PIPELINE ["raster-h3-core: Scanline Horizon Processing Engine"]
         CHUNK["Decompressed Strip / Tile Batch Stream"]
         QUEUE --> CHUNK
 
@@ -629,16 +420,19 @@ flowchart TD
         end
     end
 
-    subgraph OUTPUT ["Vectorized Streaming Sink"]
-        BUFFER["Completed Hexagon Buffer (VecDeque)"]
+    subgraph OUTPUT ["Streaming Sinks"]
+        BUFFER["Completed Hexagon Buffer"]
         POP --> BUFFER
-        CHUNK_OUT["DuckDB DataChunk (STANDARD_VECTOR_SIZE = 2048)"]
-        BUFFER -->|"Stream 2048 rows"| CHUNK_OUT
-        CHUNK_OUT --> TF
+        BATCH["Columnar batches: DuckDB DataChunk / Arrow RecordBatch / PG rows / NDJSON / RH3IPC01"]
+        FILES["File exporters: GeoParquet 1.1 / PMTiles v3"]
+        BUFFER -->|"drain on demand"| BATCH
+        BUFFER --> FILES
     end
+
+    BATCH --> ENGINES
 ```
 
-> 🗺️ **Looking for source file responsibilities?** See the complete [Source Module Architecture](docs/module-architecture.md) for a guide to every file in `src/`.
+> 🗺️ **Looking for source file responsibilities?** See the complete [Source Module Architecture](docs/module-architecture.md) for a guide to every file in the workspace.
 
 ---
 
@@ -663,16 +457,11 @@ flowchart TD
 
 ## Troubleshooting & Common Pitfalls
 
-### Unsigned Extension Loading Errors
-
-`Error: Extension ".../libraster_h3.dylib" is not signed by DuckDB`
-
-**Resolution**: Launch DuckDB with `-unsigned`, or set the config flag before loading:
-
-```python
-con = duckdb.connect(config={'allow_unsigned_extensions': 'true'})
-con.load_extension('target/release/libraster_h3.dylib')
-```
+These apply to every engine. Engine-specific issues (DuckDB unsigned extensions, the
+Python native library path, PostgreSQL privileges and version mismatches) are in each
+deep dive's troubleshooting section: [DuckDB](docs/engines/duckdb.md#troubleshooting),
+[Python](docs/engines/python-polars.md#troubleshooting),
+[PostgreSQL](docs/engines/postgresql.md#troubleshooting).
 
 ### Missing or Non-Standard CRS
 
@@ -683,11 +472,13 @@ CRS transformation error: No CRS detected in raster metadata. A CRS must be spec
 
 This prevents silent spatial corruption — meter-based coordinates treated as degrees would place hexagons in the wrong location. Specify the CRS explicitly:
 
-```sql
-SELECT * FROM h3_raster_continuous_aggregate(
-    'unprojected_grid.tif', resolution := 8, crs := 'EPSG:32610'
-);
-```
+| Engine | Override |
+| :--- | :--- |
+| DuckDB | `h3_raster_continuous_aggregate('grid.tif', resolution := 8, source_crs := 'EPSG:32610')` |
+| Python | `raster_h3.scan_raster_h3("grid.tif", 8, crs="EPSG:32610")` |
+| PostgreSQL | `h3_raster_continuous_aggregate('/data/grid.tif', 8, source_crs => 'EPSG:32610')` |
+| CLI | `raster-h3-cli jsonl grid.tif -r 8 --crs EPSG:32610` |
+| DataFusion | `ContinuousRasterTableProvider::try_new("grid.tif", vec![8])?.with_crs("EPSG:32610")` |
 
 For supported projection families, see [Supported CRS](docs/crs-and-projection.md). To convert your dataset into zero-trig native WGS84 for maximum throughput, see [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
 
@@ -705,7 +496,6 @@ gdal_translate -co COMPRESS=DEFLATE input.tif output.tif
 
 For maximum ingestion throughput (up to 6× faster) and optimal L2 cache residency, see the recommended GDAL conversion recipes in the [Optimal Raster Format Deep Dive](docs/optimal-raster-format.md).
 
-
 ### Container Memory Mapping
 
 `raster_h3` uses `memmap2` for virtual memory mapping. Ensure container runtimes allow `mmap` system calls.
@@ -716,7 +506,7 @@ For maximum ingestion throughput (up to 6× faster) and optimal L2 cache residen
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (Edition 2021+, stable toolchain)
-- [DuckDB CLI](https://duckdb.org/) (Version 1.0.0+)
+- Optional, for the engine tests that use them: [DuckDB CLI](https://duckdb.org/) 1.0.0+ on `PATH`, `python3` (with Polars/PyArrow for the Python tests), Docker (real PostgreSQL servers)
 
 ### Build
 ```bash
@@ -764,6 +554,24 @@ cargo run --release --example benchmark_bottleneck path/to/raster.tif
 cargo run --release --example benchmark_scaling
 cargo run --release --example raster_to_pmtiles -- --input data/sample_sf.tif --output data/sample_sf.pmtiles
 ```
+
+---
+
+## 📖 Deep Dives
+
+Topic guides that apply to every engine. Engine-specific documentation is listed under
+[Engines](#engines).
+
+| Document | What It Covers |
+| :--- | :--- |
+| [Engineering Architecture](docs/engineering.md) | Streaming, memory budgets, disk spilling, and throughput |
+| [Module Architecture](docs/module-architecture.md) | File-by-file source code map with GitHub links |
+| [PMTiles & Multi-Resolution](docs/pmtiles.md) | Multi-resolution pyramids, zoom mapping, zero-server web maps |
+| [Optimal Raster Formats](docs/optimal-raster-format.md) | Why tiled WGS84 COGs are 4.5–6× faster, GDAL recipes |
+| [Super-Sampling](docs/super-sampling.md) | RGSS, Hex, Gaussian boundary anti-aliasing presets |
+| [CRS & Projections](docs/crs-and-projection.md) | Supported projections, detection, 3-tier transform hierarchy |
+| [Architecture Comparison](docs/architecture-comparison.md) | Benchmarks vs Python/PostGIS/GDAL, environment trade-offs |
+| [Test Coverage](docs/testing.md) | Every test suite grouped by category (geodetic, threading, eviction, codecs, engines…), gated tests, CI coverage |
 
 ---
 

@@ -79,6 +79,93 @@ raster-h3-cli parquet dem.tif -r 7,8 -o dem_h3.parquet
 raster-h3-cli pmtiles landcover.tif -c -r 5,6,7,8 -o landcover.pmtiles
 ```
 
+## Recipes
+
+These mirror the [DuckDB SQL recipes](duckdb.md#sql-usage--recipes) for the options the CLI
+exposes.
+
+### Basic continuous aggregation
+
+```bash
+raster-h3-cli jsonl elevation.tif -r 8 --columns h3_index,h3_hex,mean,count,min,max,sum
+```
+
+### CRS, NoData and bounding box
+
+```bash
+raster-h3-cli jsonl temperature_global.tif -r 9 \
+  --crs EPSG:4326 --nodata -9999 \
+  --bbox -122.50,37.70,-122.35,37.85 \
+  --columns h3_hex,mean,count
+```
+
+### Multiple resolutions in one pass
+
+```bash
+raster-h3-cli jsonl elevation.tif -r 6,7,8 --columns resolution,h3_hex,mean \
+  | jq -c 'select(.resolution == 8)'
+```
+
+### Sampling the output
+
+```bash
+raster-h3-cli jsonl elevation.tif -r 8 --limit 5      # stops aggregation after 5 rows
+```
+
+### Categorical aggregation
+
+```bash
+# Wide: majority class, dominance and the JSON histogram
+raster-h3-cli jsonl worldcover_2021.tif -c -r 8 \
+  --columns h3_hex,majority_class,majority_fraction,unique_classes,total_count,histogram
+
+# Histogram lookups with jq (histogram is a JSON string)
+raster-h3-cli jsonl worldcover_2021.tif -c -r 8 --columns h3_hex,histogram \
+  | jq -c '{h3_hex, urban: (.histogram | fromjson | .["50"])} | select(.urban != null)'
+
+# Long: one row per (cell, class)
+raster-h3-cli jsonl worldcover_2021.tif -c --format long -r 8 \
+  --columns h3_hex,category,count,fraction \
+  | jq -c 'select(.category == 50 and .fraction >= 0.25)'
+```
+
+### Export to GeoParquet and PMTiles
+
+```bash
+raster-h3-cli parquet elevation.tif -r 8 -o elevation_h3.parquet
+raster-h3-cli pmtiles california_elevation.tif -r 6,7,8 -o california_elevation.pmtiles
+raster-h3-cli pmtiles worldcover_2021.tif -c -r 5,6,7,8 -o worldcover.pmtiles
+```
+
+### Remote COG & S3 streaming
+
+```bash
+raster-h3-cli jsonl https://example.com/rasters/cog_elevation.tif -r 8 --limit 10
+raster-h3-cli parquet s3://my-geospatial-bucket/landsat/scene_01.tif -r 9 -o scene_01_h3.parquet
+```
+
+### Multi-file mosaics
+
+Quote globs so the shell does not expand them; overlaps use the `cutline` rule.
+
+```bash
+raster-h3-cli jsonl 'tiles/tile_*.tif' -r 8
+raster-h3-cli jsonl tile_west.tif,tile_east.tif -c -r 8
+```
+
+### Joins
+
+The CLI has no join of its own; stream into an engine that does. With DuckDB (no extension
+needed):
+
+```bash
+raster-h3-cli jsonl california_elevation.tif -r 8 --columns h3_index,mean | duckdb -c "
+  SELECT r.h3_index, r.mean, p.total_population
+  FROM read_ndjson_auto('/dev/stdin') r
+  JOIN 'population_h3.parquet' p USING (h3_index)
+  WHERE r.mean > 500"
+```
+
 ## Integrations
 
 ### ClickHouse executable table function

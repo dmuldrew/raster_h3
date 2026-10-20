@@ -129,6 +129,167 @@ values; for whole columns use the Arrow stream or a Polars expression such as
 
 Errors raise `RuntimeError` with the engine's message.
 
+## Recipes
+
+These mirror the [DuckDB SQL recipes](duckdb.md#sql-usage--recipes) for the parameters the
+Python API exposes. Every scan below returns a `LazyFrame` when Polars is installed.
+
+### Basic continuous aggregation
+
+```python
+import polars as pl
+import raster_h3
+
+df = raster_h3.read_raster_h3("elevation.tif", 8)
+df.select("h3_index", "h3_hex", "mean", "count", "min", "max", "sum")
+```
+
+### CRS, NoData and bounding box
+
+```python
+lf = raster_h3.scan_raster_h3(
+    "temperature_global.tif",
+    9,
+    crs="EPSG:4326",
+    nodata=-9999.0,
+    bbox=(-122.50, 37.70, -122.35, 37.85),   # min_lon, min_lat, max_lon, max_lat
+)
+top = (
+    lf.select("h3_hex", pl.col("mean").round(2).alias("avg_temp_c"), "count")
+      .sort("count", descending=True)
+      .collect()
+)
+```
+
+### Multiple resolutions in one pass
+
+```python
+lf = raster_h3.scan_raster_h3("elevation.tif", [6, 7, 8])
+per_res = lf.group_by("resolution").agg(pl.len().alias("cells"), pl.col("mean").mean()).collect()
+res8 = lf.filter(pl.col("resolution") == 8).collect()
+```
+
+### Helper scalar functions
+
+The helpers take single values; apply them to a column with `map_elements`:
+
+```python
+df = raster_h3.read_raster_h3("elevation.tif", 8, columns=["h3_index", "mean"])
+df = df.with_columns(
+    pl.col("h3_index").map_elements(raster_h3.h3_to_lat, return_dtype=pl.Float64).alias("center_lat"),
+    pl.col("h3_index").map_elements(raster_h3.h3_to_lng, return_dtype=pl.Float64).alias("center_lng"),
+    pl.col("h3_index").map_elements(lambda c: raster_h3.h3_cell_to_parent(c, 6),
+                                    return_dtype=pl.UInt64).alias("parent"),
+)
+raster_h3.string_to_h3("8828308281fffff")   # 613196570331971583
+```
+
+### Joins
+
+`h3_index` is `UInt64`, so it joins directly with any other H3-indexed Polars frame:
+
+```python
+population = pl.scan_parquet("population_h3.parquet")   # h3_index: UInt64
+joined = (
+    raster_h3.scan_raster_h3("california_elevation.tif", 8, columns=["h3_index", "h3_hex", "mean"])
+    .join(population, on="h3_index")
+    .filter(pl.col("mean") > 500.0)
+    .select("h3_hex", pl.col("mean").alias("avg_elevation"), "total_population", "median_income")
+    .collect()
+)
+```
+
+See the README's [worked example](../../README.md#raster-meets-table-a-worked-example) for a
+full raster × census-tract join in Polars.
+
+### Export to Parquet / GeoParquet
+
+```python
+# Streaming exporter: WKB geometry + GeoParquet 1.1 metadata
+raster_h3.raster_to_parquet("elevation.tif", "elevation_h3.parquet", 8)
+
+# Or write a projected frame with Polars itself
+(raster_h3.scan_raster_h3("elevation.tif", 8, columns=["h3_index", "mean", "count"])
+    .sink_parquet("elevation_h3_slim.parquet"))
+```
+
+### Remote COG & S3 streaming
+
+```python
+lf = raster_h3.scan_raster_h3("https://example.com/rasters/cog_elevation.tif", 8)
+lf = raster_h3.scan_raster_h3("s3://my-geospatial-bucket/landsat/scene_01.tif", 9)
+```
+
+### Multi-file mosaics
+
+Globs, comma-separated lists and VRTs are accepted; overlaps use the `cutline` rule.
+
+```python
+lf = raster_h3.scan_raster_h3("tiles/tile_*.tif", 8)
+lf = raster_h3.scan_raster_h3("tile_west.tif,tile_east.tif", 8, categorical=True)
+```
+
+### Categorical aggregation
+
+```python
+# Wide: majority class and dominance
+wide = raster_h3.read_raster_h3("worldcover_2021.tif", 8, categorical=True)
+wide.select(
+    "h3_hex", "majority_class",
+    (pl.col("majority_fraction") * 100).round(1).alias("dominance_pct"),
+    "unique_classes", "total_count", "histogram",
+)
+
+# The histogram is JSON text keyed by class code
+wide.with_columns(
+    pl.col("histogram").str.json_path_match("$['10']").cast(pl.Float64).alias("forest_fraction"),
+    pl.col("histogram").str.json_path_match("$['50']").cast(pl.Float64).alias("urban_fraction"),
+).filter(pl.col("urban_fraction").is_not_null())
+
+# Long: one row per (cell, class)
+urban = (
+    raster_h3.scan_raster_h3("worldcover_2021.tif", 8, categorical=True, format="long")
+    .filter((pl.col("category") == 50) & (pl.col("fraction") >= 0.25))
+    .sort("fraction", descending=True)
+    .collect()
+)
+```
+
+### PMTiles v3 export
+
+```python
+raster_h3.raster_to_pmtiles("california_elevation.tif", "california_elevation.pmtiles", [6, 7, 8])
+raster_h3.raster_to_pmtiles("worldcover_2021.tif", "worldcover.pmtiles", [5, 6, 7, 8], categorical=True)
+```
+
+### PyArrow, DuckDB and GeoPandas interop
+
+```python
+import duckdb
+import geopandas as gpd
+
+stream = raster_h3.RasterH3ArrowStream("elevation.tif", 8)
+
+tbl = stream.to_pyarrow()                                  # pyarrow.Table
+duckdb.sql("SELECT avg(mean) FROM tbl").show()            # DuckDB reads the Arrow table
+
+df = stream.to_polars()
+gdf = gpd.GeoDataFrame(
+    df.drop("wkb").to_pandas(),
+    geometry=gpd.GeoSeries.from_wkb(df["wkb"].to_list()),
+    crs="EPSG:4326",
+)
+```
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+| :--- | :--- |
+| `RuntimeError: Could not locate libraster_h3_python shared library` on first call | The native library is not next to the package. Install a wheel, run `cargo build --release -p raster-h3-python` in the workspace, or set `RASTER_H3_PYTHON_LIB` to the library path. |
+| `scan_raster_h3` returns a `RasterH3ArrowStream`, not a `LazyFrame` | Polars is not installed or is too old to have `polars.io.plugins.register_io_source`. Install the `polars` extra. |
+| `RuntimeError: ... No CRS detected ...` | Pass `crs="EPSG:…"`. See the README's [Troubleshooting](../../README.md#troubleshooting--common-pitfalls). |
+| Need sampling, bands, spectral formulas, quantiles or remapping | Not exposed in Python. Use [DuckDB](duckdb.md) (for example via `duckdb` from Python) or the Rust [DataFusion](datafusion.md) / [Core](core.md) APIs. |
+
 ## Native C ABI
 
 The wrapper calls these exports from `libraster_h3_python`
