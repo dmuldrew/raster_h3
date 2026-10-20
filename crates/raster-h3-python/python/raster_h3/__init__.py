@@ -212,14 +212,26 @@ ctypes.pythonapi.PyCapsule_New.argtypes = [
 ]
 ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
 
-ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+ctypes.pythonapi.PyCapsule_GetName.argtypes = [ctypes.c_void_p]
+ctypes.pythonapi.PyCapsule_GetName.restype = ctypes.c_void_p
+
+ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+
+
+def _capsule_pointer(capsule_ptr: int) -> Optional[int]:
+    # Consumers may rename a capsule once they take ownership (e.g. to
+    # `used_arrow_array_stream`), so look it up by whatever name it has now.
+    # The outer struct is still ours to free; a consumed payload has its
+    # `release` set to NULL, which the native free skips.
+    name = ctypes.pythonapi.PyCapsule_GetName(capsule_ptr)
+    return ctypes.pythonapi.PyCapsule_GetPointer(capsule_ptr, name)
 
 
 @_PYCAPSULE_DESTRUCTOR
 def _schema_capsule_destructor(capsule_ptr: int) -> None:
     if capsule_ptr and _LIB is not None:
-        ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule_ptr, b"arrow_schema")
+        ptr = _capsule_pointer(capsule_ptr)
         if ptr:
             _LIB.raster_h3_py_free_arrow_schema(ptr)
 
@@ -227,7 +239,7 @@ def _schema_capsule_destructor(capsule_ptr: int) -> None:
 @_PYCAPSULE_DESTRUCTOR
 def _stream_capsule_destructor(capsule_ptr: int) -> None:
     if capsule_ptr and _LIB is not None:
-        ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule_ptr, b"arrow_array_stream")
+        ptr = _capsule_pointer(capsule_ptr)
         if ptr:
             _LIB.raster_h3_py_free_arrow_stream(ptr)
 
@@ -546,7 +558,10 @@ def scan_raster_h3(
             # `n_rows` can only be pushed into the scan when no predicate runs after it;
             # otherwise it caps the rows that survive the filter.
             if predicate is None:
-                scan_limit = n_rows if n_rows is not None else limit
+                # Narrow, never widen, the caller's explicit `limit`.
+                scan_limit = (
+                    limit if n_rows is None else n_rows if limit is None else min(limit, n_rows)
+                )
                 remaining = None
             else:
                 scan_limit = limit

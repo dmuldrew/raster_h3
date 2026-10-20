@@ -279,7 +279,15 @@ unsafe fn build_py_scan_config(
     };
     let crs_opt = opt_cstr(crs);
     let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
-    let bbox_opt = opt_cstr(bbox).and_then(|s| parse_bbox_str(&s));
+    let bbox_opt = opt_cstr(bbox)
+        .map(|s| {
+            parse_bbox_str(&s).ok_or_else(|| {
+                RasterH3Error::InvalidParameter(format!(
+                    "bbox must be 'min_lon,min_lat,max_lon,max_lat', got '{s}'"
+                ))
+            })
+        })
+        .transpose()?;
     let cols_opt = opt_cstr(columns).map(|s| {
         s.split(',')
             .map(|c| c.trim().to_string())
@@ -838,6 +846,35 @@ mod tests {
         let data = vec![val; (width * height) as usize];
         img.write_data(&data).unwrap();
         tmp
+    }
+
+    #[test]
+    fn test_py_scan_config_rejects_malformed_bbox() {
+        let path_c = CString::new("/tmp/does_not_matter.tif").unwrap();
+        let bad_bbox = CString::new("1,garbage,2,3,4").unwrap();
+        let good_bbox = CString::new("-122.5,37.5,-122.0,38.0").unwrap();
+        unsafe {
+            let build = |bbox: *const c_char| {
+                build_py_scan_config(
+                    path_c.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    0.0,
+                    bbox,
+                    ptr::null(),
+                    -1,
+                )
+            };
+            assert!(build(bad_bbox.as_ptr()).is_err());
+            assert_eq!(
+                build(good_bbox.as_ptr()).unwrap().bbox,
+                Some([-122.5, 37.5, -122.0, 38.0])
+            );
+            assert_eq!(build(ptr::null()).unwrap().bbox, None);
+        }
     }
 
     #[test]

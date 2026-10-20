@@ -348,12 +348,12 @@ fn continuous_c_abi_srf_matches_core_with_options() {
     assert_eq!(got, core_continuous(&path, &cfg));
     assert!(got.values().any(|r| r[6] == "9"));
 
-    // An unparsable bbox is ignored rather than rejected by the C-ABI entry point.
     let bad_bbox = CSrf {
         bbox: Some(CString::new("1,2,3").unwrap()),
         ..CSrf::new(&path)
     };
-    assert_eq!(bad_bbox.rows().unwrap(), plain);
+    let err = bad_bbox.rows().unwrap_err();
+    assert!(err.contains("bbox"), "{err}");
 }
 
 #[test]

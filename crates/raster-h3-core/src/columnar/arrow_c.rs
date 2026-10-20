@@ -290,18 +290,49 @@ fn pack_var_width(
 }
 
 /// Unpack an LSB-first Arrow bitmap of length `len`.
-unsafe fn unpack_bits(ptr: *const u8, len: usize) -> Vec<bool> {
+unsafe fn unpack_bits(ptr: *const u8, offset: usize, len: usize) -> Vec<bool> {
     if ptr.is_null() {
         return vec![true; len];
     }
-    let n_bytes = len.div_ceil(8);
+    let n_bytes = (offset + len).div_ceil(8);
     let bytes = std::slice::from_raw_parts(ptr, n_bytes);
     let mut out = Vec::with_capacity(len);
-    for i in 0..len {
+    for i in offset..offset + len {
         let bit = (bytes[i / 8] >> (i % 8)) & 1 != 0;
         out.push(bit);
     }
     out
+}
+
+/// Copy `len` fixed-width values starting at logical index `start`.
+unsafe fn read_values<T: Copy>(ptr: *const T, start: usize, len: usize) -> Vec<T> {
+    if len == 0 || ptr.is_null() {
+        return Vec::new();
+    }
+    std::slice::from_raw_parts(ptr.add(start), len).to_vec()
+}
+
+/// Borrow `len` variable-length values (Utf8/Binary layout) starting at logical index `start`.
+/// Offsets are absolute positions into the data buffer, so slicing only shifts the offsets window.
+unsafe fn read_var_len<'a>(
+    off_ptr: *const i32,
+    data_ptr: *const u8,
+    start: usize,
+    len: usize,
+) -> Vec<&'a [u8]> {
+    if len == 0 || off_ptr.is_null() {
+        return Vec::new();
+    }
+    let offsets = std::slice::from_raw_parts(off_ptr.add(start), len + 1);
+    let total_bytes = offsets[len].max(0) as usize;
+    let bytes = if total_bytes == 0 || data_ptr.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(data_ptr, total_bytes)
+    };
+    (0..len)
+        .map(|r| &bytes[offsets[r].max(0) as usize..offsets[r + 1].max(0) as usize])
+        .collect()
 }
 
 impl ArrowArray {
@@ -462,106 +493,79 @@ impl ArrowArray {
             )));
         }
         let num_rows = self.length.max(0) as usize;
+        let parent_offset = self.offset.max(0) as usize;
         let mut columns = Vec::with_capacity(schema.fields.len());
 
         for (i, field) in schema.fields.iter().enumerate() {
             let child_ptr = *self.children.add(i);
             let child = &*child_ptr;
-            let len = child.length.max(0) as usize;
-            let validity = if child.null_count > 0 && child.n_buffers >= 1 {
+            // A struct's offset applies to its children on top of their own offsets, and the
+            // struct's length bounds how many child rows are visible.
+            let start = child.offset.max(0) as usize + parent_offset;
+            let len = num_rows;
+            if (child.length.max(0) as usize) < parent_offset + len {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "ArrowArray child {i} length ({}) is shorter than parent offset + length ({})",
+                    child.length,
+                    parent_offset + len
+                )));
+            }
+            // `null_count == -1` means the count was not computed, so the bitmap must be read.
+            let validity = if child.null_count != 0 && child.n_buffers >= 1 {
                 let bmp_ptr = *child.buffers as *const u8;
                 if bmp_ptr.is_null() {
                     None
                 } else {
-                    Some(unpack_bits(bmp_ptr, len))
+                    Some(unpack_bits(bmp_ptr, start, len))
                 }
             } else {
                 None
             };
 
             let col = match field.data_type {
-                ArrowDataType::UInt64 => {
-                    let data_ptr = *child.buffers.add(1) as *const u64;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::UInt64 { values, validity }
-                }
-                ArrowDataType::Int64 => {
-                    let data_ptr = *child.buffers.add(1) as *const i64;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::Int64 { values, validity }
-                }
-                ArrowDataType::UInt8 => {
-                    let data_ptr = *child.buffers.add(1) as *const u8;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::UInt8 { values, validity }
-                }
-                ArrowDataType::Float64 => {
-                    let data_ptr = *child.buffers.add(1) as *const f64;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::Float64 { values, validity }
-                }
+                ArrowDataType::UInt64 => ColumnArray::UInt64 {
+                    values: read_values(*child.buffers.add(1) as *const u64, start, len),
+                    validity,
+                },
+                ArrowDataType::Int64 => ColumnArray::Int64 {
+                    values: read_values(*child.buffers.add(1) as *const i64, start, len),
+                    validity,
+                },
+                ArrowDataType::UInt8 => ColumnArray::UInt8 {
+                    values: read_values(*child.buffers.add(1) as *const u8, start, len),
+                    validity,
+                },
+                ArrowDataType::Float64 => ColumnArray::Float64 {
+                    values: read_values(*child.buffers.add(1) as *const f64, start, len),
+                    validity,
+                },
                 ArrowDataType::Boolean => {
                     let data_ptr = *child.buffers.add(1) as *const u8;
-                    let values = unpack_bits(data_ptr, len);
+                    let values = unpack_bits(data_ptr, start, len);
                     ColumnArray::Boolean { values, validity }
                 }
                 ArrowDataType::Utf8 => {
-                    let off_ptr = *child.buffers.add(1) as *const i32;
-                    let data_ptr = *child.buffers.add(2) as *const u8;
-                    let mut values = Vec::with_capacity(len);
-                    if len > 0 && !off_ptr.is_null() {
-                        let offsets = std::slice::from_raw_parts(off_ptr, len + 1);
-                        let total_bytes = offsets[len].max(0) as usize;
-                        let bytes = if total_bytes == 0 || data_ptr.is_null() {
-                            &[][..]
-                        } else {
-                            std::slice::from_raw_parts(data_ptr, total_bytes)
-                        };
-                        for r in 0..len {
-                            let start = offsets[r].max(0) as usize;
-                            let end = offsets[r + 1].max(0) as usize;
-                            let s = std::str::from_utf8(&bytes[start..end])
-                                .unwrap_or_default()
-                                .to_owned();
-                            values.push(s);
-                        }
-                    }
+                    let values = read_var_len(
+                        *child.buffers.add(1) as *const i32,
+                        *child.buffers.add(2) as *const u8,
+                        start,
+                        len,
+                    )
+                    .into_iter()
+                    .map(|b| std::str::from_utf8(b).unwrap_or_default().to_owned())
+                    .collect();
                     ColumnArray::Utf8 { values, validity }
                 }
                 ArrowDataType::Binary => {
-                    let off_ptr = *child.buffers.add(1) as *const i32;
-                    let data_ptr = *child.buffers.add(2) as *const u8;
-                    let mut values = Vec::with_capacity(len);
-                    if len > 0 && !off_ptr.is_null() {
-                        let offsets = std::slice::from_raw_parts(off_ptr, len + 1);
-                        let total_bytes = offsets[len].max(0) as usize;
-                        let bytes = if total_bytes == 0 || data_ptr.is_null() {
-                            &[][..]
-                        } else {
-                            std::slice::from_raw_parts(data_ptr, total_bytes)
-                        };
-                        for r in 0..len {
-                            let start = offsets[r].max(0) as usize;
-                            let end = offsets[r + 1].max(0) as usize;
-                            values.push(bytes[start..end].to_vec());
-                        }
-                    }
+                    let values = read_var_len(
+                        *child.buffers.add(1) as *const i32,
+                        *child.buffers.add(2) as *const u8,
+                        start,
+                        len,
+                    )
+                    .into_iter()
+                    .map(<[u8]>::to_vec)
+                    .collect();
                     ColumnArray::Binary { values, validity }
                 }
             };
@@ -817,5 +821,82 @@ mod tests {
         assert_eq!(*out_schema, *schema);
         assert_eq!(out_batches.len(), 1);
         assert_eq!(out_batches[0], batch);
+    }
+
+    fn sliceable_batch() -> (Arc<ColumnSchema>, RecordBatch) {
+        let schema = Arc::new(ColumnSchema::new(vec![
+            ColumnField::new("v", ArrowDataType::Int64, true),
+            ColumnField::new("s", ArrowDataType::Utf8, false),
+            ColumnField::new("b", ArrowDataType::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                ColumnArray::Int64 {
+                    values: vec![10, 20, 30],
+                    validity: Some(vec![true, false, true]),
+                },
+                ColumnArray::Utf8 {
+                    values: vec!["a".into(), "bb".into(), "ccc".into()],
+                    validity: None,
+                },
+                ColumnArray::Boolean {
+                    values: vec![true, false, true],
+                    validity: None,
+                },
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    #[test]
+    fn test_import_respects_parent_and_child_offsets() {
+        let (schema, batch) = sliceable_batch();
+        let expected = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                ColumnArray::Int64 {
+                    values: vec![20, 30],
+                    validity: Some(vec![false, true]),
+                },
+                ColumnArray::Utf8 {
+                    values: vec!["bb".into(), "ccc".into()],
+                    validity: None,
+                },
+                ColumnArray::Boolean {
+                    values: vec![false, true],
+                    validity: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        // Slice via the struct's offset.
+        let mut arr = ArrowArray::from_record_batch(batch.clone());
+        arr.offset = 1;
+        arr.length = 2;
+        let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
+        assert_eq!(got, expected);
+
+        // Slice via each child's offset.
+        let mut arr = ArrowArray::from_record_batch(batch);
+        arr.length = 2;
+        for i in 0..arr.n_children as usize {
+            let child = unsafe { &mut **arr.children.add(i) };
+            child.offset = 1;
+            child.length = 2;
+        }
+        let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_import_reads_validity_when_null_count_unknown() {
+        let (schema, batch) = sliceable_batch();
+        let arr = ArrowArray::from_record_batch(batch.clone());
+        unsafe { (**arr.children).null_count = -1 };
+        let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
+        assert_eq!(got, batch);
     }
 }

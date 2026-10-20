@@ -535,7 +535,15 @@ pub struct PgCContinuousRow {
     pub sum: f64,
     pub resolution: i16,
     pub wkb_len: usize,
-    pub wkb: [u8; 128],
+    /// Sized to hold any H3 cell polygon, including 10-vertex odd-resolution pentagons.
+    pub wkb: WkbBuf,
+}
+
+/// Copy a full WKB geometry into the C row. Rows are built from a [`WkbBuf`], so they always fit.
+fn fill_c_wkb(out: &mut PgCContinuousRow, wkb: &[u8]) {
+    out.wkb = [0u8; WKB_BUF_LEN];
+    out.wkb[..wkb.len()].copy_from_slice(wkb);
+    out.wkb_len = wkb.len();
 }
 
 unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
@@ -574,7 +582,15 @@ pub unsafe extern "C" fn pg_srf_continuous_open(
                 .unwrap_or_else(|| vec![8]);
             let crs_opt = opt_cstr(source_crs);
             let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
-            let bbox_opt = opt_cstr(bbox).and_then(|s| parse_bbox_str(&s));
+            let bbox_opt = opt_cstr(bbox)
+                .map(|s| {
+                    parse_bbox_str(&s).ok_or_else(|| {
+                        RasterH3Error::InvalidParameter(format!(
+                            "bbox must be 'min_lon,min_lat,max_lon,max_lat', got '{s}'"
+                        ))
+                    })
+                })
+                .transpose()?;
             PgContinuousSrf::open(&path_str, res_vec, crs_opt, nodata_opt, bbox_opt)
         },
     ));
@@ -633,10 +649,7 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
             out.max = row.max;
             out.sum = row.sum;
             out.resolution = row.resolution;
-            let wlen = row.wkb.len().min(128);
-            out.wkb_len = wlen;
-            out.wkb = [0u8; 128];
-            out.wkb[..wlen].copy_from_slice(&row.wkb[..wlen]);
+            fill_c_wkb(out, &row.wkb);
             1
         }
         Ok(None) => 0,
@@ -693,6 +706,29 @@ mod tests {
         let data = vec![val; (width * height) as usize];
         img.write_data(&data).unwrap();
         tmp
+    }
+
+    #[test]
+    fn test_pg_srf_continuous_open_rejects_malformed_bbox() {
+        let tif = write_test_tif(16, 16, 25.5);
+        let path_c = CString::new(tif.path().to_string_lossy().as_bytes()).unwrap();
+        let bad_bbox = CString::new("1,garbage,2,3,4").unwrap();
+        unsafe {
+            let mut err: *mut c_char = ptr::null_mut();
+            let srf = pg_srf_continuous_open(
+                path_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                0.0,
+                bad_bbox.as_ptr(),
+                &mut err,
+            );
+            assert!(srf.is_null());
+            assert!(!err.is_null());
+            let msg = CString::from_raw(err).into_string().unwrap();
+            assert!(msg.contains("bbox"), "{msg}");
+        }
     }
 
     #[test]
@@ -812,5 +848,19 @@ mod tests {
             assert_eq!(count, rows.len());
             pg_srf_continuous_close(handle);
         }
+    }
+
+    #[test]
+    fn test_c_row_holds_full_pentagon_wkb() {
+        // Odd-resolution pentagons have 10 vertices: the largest H3 polygon (189 bytes).
+        let pentagon = h3o::Resolution::One.pentagons().next().unwrap();
+        let mut buf = [0u8; WKB_BUF_LEN];
+        let len = h3_index_to_wkb(u64::from(pentagon), &mut buf).unwrap();
+        assert!(len > 128, "pentagon WKB is {len} bytes");
+
+        let mut out: PgCContinuousRow = unsafe { std::mem::zeroed() };
+        fill_c_wkb(&mut out, &buf[..len]);
+        assert_eq!(out.wkb_len, len);
+        assert_eq!(&out.wkb[..out.wkb_len], &buf[..len]);
     }
 }
