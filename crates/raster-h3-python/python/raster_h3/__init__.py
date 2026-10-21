@@ -7,7 +7,7 @@ Provides:
 - `scan_raster_h3()` / `read_raster_h3()`: Polars IO plugin (`register_io_source`) with column projection
   and row-limit pushdown.
 - Scalar and vectorized H3 helpers (`h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`,
-  `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`).
+  `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_polygon_to_cells`).
 - Direct file exporters (`raster_to_parquet`, `raster_to_pmtiles`).
 """
 
@@ -172,6 +172,19 @@ def _get_lib() -> ctypes.CDLL:
         ctypes.c_size_t,
     ]
     lib.raster_h3_py_h3_to_wkb.restype = ctypes.c_size_t
+
+    lib.raster_h3_py_h3_polygon_to_cells.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_int64,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.raster_h3_py_h3_polygon_to_cells.restype = ctypes.c_int
+
+    lib.raster_h3_py_free_cells.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+    lib.raster_h3_py_free_cells.restype = None
 
     # Exporters
     lib.raster_h3_py_export_parquet.argtypes = [
@@ -679,6 +692,47 @@ def h3_cell_to_parent(
     return res if res != 0 else None
 
 
+def h3_polygon_to_cells(
+    wkb: bytes, resolution: int, containment: str = "contains_centroid"
+) -> Optional[List[int]]:
+    """Fill a WKB POLYGON / MULTIPOLYGON (WGS84 lon/lat degrees) with H3 cells.
+
+    Returns the cells sorted ascending and deduplicated, or ``None`` if ``wkb`` is not a
+    valid polygonal WKB or ``resolution`` is outside 0..15. ``containment`` is one of
+    ``contains_centroid`` (default, alias ``center``), ``contains_boundary`` (``full``),
+    ``intersects_boundary`` or ``covers`` (``overlapping``); an unknown name, or a polygon
+    that would exceed 10,000,000 cells, raises ``ValueError``.
+    """
+    resolution = int(resolution)
+    if not 0 <= resolution <= 15:
+        return None
+    lib = _get_lib()
+    data = bytes(wkb)
+    out_cells = ctypes.POINTER(ctypes.c_uint64)()
+    out_len = ctypes.c_size_t(0)
+    status = lib.raster_h3_py_h3_polygon_to_cells(
+        data,
+        len(data),
+        resolution,
+        containment.encode("utf-8"),
+        ctypes.byref(out_cells),
+        ctypes.byref(out_len),
+    )
+    if status == 0:
+        try:
+            return [int(out_cells[i]) for i in range(out_len.value)]
+        finally:
+            lib.raster_h3_py_free_cells(out_cells, out_len.value)
+    if status == 2:
+        raise ValueError(f"unknown containment mode {containment!r}")
+    if status == 3:
+        raise ValueError(
+            "polygon would produce more than 10,000,000 cells; "
+            "use a coarser resolution or split the polygon"
+        )
+    return None
+
+
 def raster_to_parquet(
     input_path: Union[str, Path],
     output_path: Union[str, Path],
@@ -737,6 +791,7 @@ __all__ = [
     "h3_is_valid",
     "h3_to_wkb",
     "h3_cell_to_parent",
+    "h3_polygon_to_cells",
     "raster_to_parquet",
     "raster_to_pmtiles",
 ]

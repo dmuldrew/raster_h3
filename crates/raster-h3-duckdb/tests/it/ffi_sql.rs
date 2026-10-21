@@ -247,6 +247,13 @@ pub unsafe extern "C" fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn duckdb_create_list_type(
+    _child: duckdb_logical_type,
+) -> duckdb_logical_type {
+    duckdb_create_logical_type(DuckDBType::List)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn duckdb_destroy_logical_type(type_: *mut duckdb_logical_type) {
     if !type_.is_null() && !(*type_).is_null() {
         drop(Box::from_raw(*type_ as *mut MockLogicalType));
@@ -784,6 +791,64 @@ pub unsafe extern "C" fn duckdb_register_scalar_function(
     DuckDBState::Success
 }
 
+struct MockScalarFunctionSet {
+    name: String,
+    functions: Vec<RegisteredScalarFn>,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_create_scalar_function_set(
+    name: *const c_char,
+) -> duckdb_scalar_function_set {
+    Box::into_raw(Box::new(MockScalarFunctionSet {
+        name: CStr::from_ptr(name).to_string_lossy().into_owned(),
+        functions: Vec::new(),
+    })) as duckdb_scalar_function_set
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_destroy_scalar_function_set(set: *mut duckdb_scalar_function_set) {
+    if !set.is_null() && !(*set).is_null() {
+        drop(Box::from_raw(*set as *mut MockScalarFunctionSet));
+        *set = ptr::null_mut();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_add_scalar_function_to_set(
+    set: duckdb_scalar_function_set,
+    function: duckdb_scalar_function,
+) -> DuckDBState {
+    let set = &mut *(set as *mut MockScalarFunctionSet);
+    let sf = &*(function as *const MockScalarFunction);
+    set.functions.push(RegisteredScalarFn {
+        name: set.name.clone(),
+        params: sf.params.clone(),
+        ret: sf.ret,
+    });
+    DuckDBState::Success
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_register_scalar_function_set(
+    con: duckdb_connection,
+    set: duckdb_scalar_function_set,
+) -> DuckDBState {
+    let c = &mut *(con as *mut MockConnection);
+    let set = &*(set as *const MockScalarFunctionSet);
+    // Mirrors DuckDB < 1.5, which rejects a second registration under an existing name.
+    if c.scalar_functions.iter().any(|f| f.name == set.name) {
+        return DuckDBState::Error;
+    }
+    c.scalar_functions
+        .extend(set.functions.iter().map(|f| RegisteredScalarFn {
+            name: f.name.clone(),
+            params: f.params.clone(),
+            ret: f.ret,
+        }));
+    DuckDBState::Success
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_library_version() -> *const c_char {
     c"v1.2.0".as_ptr()
@@ -843,8 +908,11 @@ fn install_mock_api() {
         duckdb_bind_set_error,
         duckdb_column_count,
         duckdb_connect,
+        duckdb_create_list_type,
         duckdb_create_logical_type,
+        duckdb_add_scalar_function_to_set,
         duckdb_create_scalar_function,
+        duckdb_create_scalar_function_set,
         duckdb_create_table_function,
         duckdb_data_chunk_get_column_count,
         duckdb_data_chunk_get_size,
@@ -854,6 +922,7 @@ fn install_mock_api() {
         duckdb_destroy_logical_type,
         duckdb_destroy_result,
         duckdb_destroy_scalar_function,
+        duckdb_destroy_scalar_function_set,
         duckdb_destroy_table_function,
         duckdb_destroy_value,
         duckdb_disconnect,
@@ -878,6 +947,7 @@ fn install_mock_api() {
         duckdb_logical_type_set_alias,
         duckdb_query,
         duckdb_register_scalar_function,
+        duckdb_register_scalar_function_set,
         duckdb_register_table_function,
         duckdb_result_error,
         duckdb_scalar_function_add_parameter,
@@ -947,7 +1017,19 @@ fn test_extension_init_and_registration_completeness() {
         raster_h3_duckdb::functions::register_parquet_table_function(con_ptr).unwrap();
     }
 
-    assert_eq!(con.scalar_functions.len(), 15);
+    // The mock reports DuckDB v1.2.0, so h3_polygon_to_cells registers only its BLOB overloads.
+    assert_eq!(con.scalar_functions.len(), 17);
+    let polygon_fns: Vec<_> = con
+        .scalar_functions
+        .iter()
+        .filter(|f| f.name == "h3_polygon_to_cells")
+        .collect();
+    assert_eq!(polygon_fns.len(), 2);
+    for sf in &polygon_fns {
+        assert_eq!(sf.params[..2], [DuckDBType::Blob, DuckDBType::BigInt]);
+        assert_eq!(sf.ret, DuckDBType::List);
+    }
+    assert_eq!(polygon_fns[1].params.get(2), Some(&DuckDBType::Varchar));
     for sf in &con.scalar_functions {
         assert!(!sf.name.is_empty());
         assert!(!sf.params.is_empty());

@@ -3,9 +3,13 @@
 
 use std::path::PathBuf;
 
+pub use h3o::geom::ContainmentMode;
+use h3o::geom::{MultiPolygon, PolyfillConfig, ToCells};
 use h3o::{CellIndex, LatLng, Resolution};
 
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf, WKB_BUF_LEN};
+use crate::encoding::{
+    fast_hex_u64, h3_index_to_wkb, parse_hex_u64, wkb_to_multipolygon, WkbBuf, WKB_BUF_LEN,
+};
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 /// Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation.
@@ -192,6 +196,86 @@ pub fn h3_cell_to_parent_str(hex: &str, parent_res: i64) -> Option<String> {
     h3_to_string(parent)
 }
 
+/// Upper bound on the number of cells a single `h3_polygon_to_cells` call may return
+/// (80 MB of `u64`s). Checked against h3o's pre-tiling estimate, so a polygon far too large
+/// for the requested resolution fails fast instead of exhausting memory.
+pub const H3_POLYGON_TO_CELLS_MAX_CELLS: usize = 10_000_000;
+
+/// Containment modes accepted by [`h3_polygon_to_cells_wkb`], as `(name, mode)` pairs.
+///
+/// The first group are h3o's names; `center`, `full` and `overlapping` are the H3 C library
+/// (`polygonToCellsExperimental`) names for the same behaviour.
+pub const H3_CONTAINMENT_MODES: [(&str, ContainmentMode); 7] = [
+    ("contains_centroid", ContainmentMode::ContainsCentroid),
+    ("contains_boundary", ContainmentMode::ContainsBoundary),
+    ("intersects_boundary", ContainmentMode::IntersectsBoundary),
+    ("covers", ContainmentMode::Covers),
+    ("center", ContainmentMode::ContainsCentroid),
+    ("full", ContainmentMode::ContainsBoundary),
+    ("overlapping", ContainmentMode::Covers),
+];
+
+/// Parse a containment mode name (case-insensitive, `-` and `_` interchangeable).
+/// See [`H3_CONTAINMENT_MODES`] for the accepted names.
+pub fn parse_containment_mode(s: &str) -> Option<ContainmentMode> {
+    let norm = s.trim().to_ascii_lowercase().replace('-', "_");
+    H3_CONTAINMENT_MODES
+        .iter()
+        .find(|(name, _)| *name == norm)
+        .map(|&(_, mode)| mode)
+}
+
+/// Why [`h3_polygon_to_cells_wkb`] produced no cell list.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PolygonToCellsError {
+    /// Resolution outside `0..=15`.
+    #[error("resolution {0} is outside 0..=15")]
+    InvalidResolution(i64),
+    /// Input is not a valid WKB `POLYGON` / `MULTIPOLYGON` with finite coordinates.
+    #[error("invalid polygon geometry: {0}")]
+    InvalidGeometry(&'static str),
+    /// h3o's estimate exceeds [`H3_POLYGON_TO_CELLS_MAX_CELLS`].
+    #[error(
+        "polygon would produce up to {estimate} cells, above the limit of {limit}; \
+         use a coarser resolution or split the polygon"
+    )]
+    TooManyCells { estimate: usize, limit: usize },
+}
+
+/// Fill a WKB `POLYGON` / `MULTIPOLYGON` (WGS84 longitude/latitude degrees) with H3 cells
+/// at `res` (`0..=15`) using h3o's polyfill and the given containment `mode`.
+///
+/// Returns the cells sorted ascending and deduplicated; an empty geometry yields an empty list.
+pub fn h3_polygon_to_cells_wkb(
+    wkb: &[u8],
+    res: i64,
+    mode: ContainmentMode,
+) -> Result<Vec<u64>, PolygonToCellsError> {
+    let resolution = u8::try_from(res)
+        .ok()
+        .and_then(|r| Resolution::try_from(r).ok())
+        .ok_or(PolygonToCellsError::InvalidResolution(res))?;
+    let multi = wkb_to_multipolygon(wkb).map_err(PolygonToCellsError::InvalidGeometry)?;
+    if multi.0.is_empty() {
+        return Ok(Vec::new());
+    }
+    let shape = MultiPolygon::from_degrees(multi)
+        .map_err(|_| PolygonToCellsError::InvalidGeometry("non-finite coordinates"))?;
+    let config = PolyfillConfig::new(resolution).containment_mode(mode);
+    let estimate = shape.max_cells_count(config);
+    if estimate > H3_POLYGON_TO_CELLS_MAX_CELLS {
+        return Err(PolygonToCellsError::TooManyCells {
+            estimate,
+            limit: H3_POLYGON_TO_CELLS_MAX_CELLS,
+        });
+    }
+    let mut cells: Vec<u64> = shape.to_cells(config).map(u64::from).collect();
+    // Overlapping members of a MULTIPOLYGON (and some modes) can emit a cell twice.
+    cells.sort_unstable();
+    cells.dedup();
+    Ok(cells)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +310,144 @@ mod tests {
         let parent_hex = h3_cell_to_parent_str(&hex, 5).unwrap();
         assert_eq!(string_to_h3(&parent_hex), parent);
         assert!(h3_cell_to_parent_u64(valid_u64, 12).is_none());
+    }
+
+    /// Little-endian WKB `POLYGON` with one ring of `(lng, lat)` points.
+    fn polygon_wkb(ring: &[(f64, f64)]) -> Vec<u8> {
+        let mut wkb = vec![1u8];
+        wkb.extend(3u32.to_le_bytes());
+        wkb.extend(1u32.to_le_bytes());
+        wkb.extend((ring.len() as u32).to_le_bytes());
+        for &(x, y) in ring {
+            wkb.extend(x.to_le_bytes());
+            wkb.extend(y.to_le_bytes());
+        }
+        wkb
+    }
+
+    fn rect_wkb(min_lng: f64, min_lat: f64, max_lng: f64, max_lat: f64) -> Vec<u8> {
+        polygon_wkb(&[
+            (min_lng, min_lat),
+            (max_lng, min_lat),
+            (max_lng, max_lat),
+            (min_lng, max_lat),
+            (min_lng, min_lat),
+        ])
+    }
+
+    #[test]
+    fn test_parse_containment_mode() {
+        assert_eq!(
+            parse_containment_mode("contains_centroid"),
+            Some(ContainmentMode::ContainsCentroid)
+        );
+        assert_eq!(
+            parse_containment_mode(" Contains-Boundary "),
+            Some(ContainmentMode::ContainsBoundary)
+        );
+        assert_eq!(
+            parse_containment_mode("INTERSECTS_BOUNDARY"),
+            Some(ContainmentMode::IntersectsBoundary)
+        );
+        assert_eq!(
+            parse_containment_mode("covers"),
+            Some(ContainmentMode::Covers)
+        );
+        assert_eq!(
+            parse_containment_mode("center"),
+            Some(ContainmentMode::ContainsCentroid)
+        );
+        assert_eq!(
+            parse_containment_mode("full"),
+            Some(ContainmentMode::ContainsBoundary)
+        );
+        assert_eq!(
+            parse_containment_mode("overlapping"),
+            Some(ContainmentMode::Covers)
+        );
+        assert_eq!(parse_containment_mode("overlap_bbox"), None);
+        assert_eq!(parse_containment_mode(""), None);
+    }
+
+    #[test]
+    fn test_polygon_to_cells_containment_modes() {
+        // ~0.1° box over San Francisco.
+        let wkb = rect_wkb(-122.47, 37.73, -122.37, 37.81);
+        let run = |mode| h3_polygon_to_cells_wkb(&wkb, 8, mode).unwrap();
+        let centroid = run(ContainmentMode::ContainsCentroid);
+        let boundary = run(ContainmentMode::ContainsBoundary);
+        let intersects = run(ContainmentMode::IntersectsBoundary);
+        let covers = run(ContainmentMode::Covers);
+
+        assert!(!boundary.is_empty());
+        assert!(boundary.len() < centroid.len() && centroid.len() < intersects.len());
+        assert!(boundary.iter().all(|c| centroid.binary_search(c).is_ok()));
+        assert!(centroid.iter().all(|c| intersects.binary_search(c).is_ok()));
+        assert_eq!(intersects, covers);
+        for cells in [&centroid, &boundary, &intersects] {
+            assert!(cells.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+            assert!(cells.iter().all(|&c| h3_get_resolution(c) == 8));
+        }
+
+        // Centroid-mode cells have centroids inside the box.
+        for &c in &centroid {
+            let (lat, lng) = (h3_to_lat(c), h3_to_lng(c));
+            assert!((37.73..=37.81).contains(&lat) && (-122.47..=-122.37).contains(&lng));
+        }
+    }
+
+    #[test]
+    fn test_polygon_to_cells_polygon_inside_one_cell() {
+        // A ~10 m triangle well inside a single resolution-5 cell.
+        let wkb = polygon_wkb(&[
+            (-122.4194, 37.7749),
+            (-122.4193, 37.7749),
+            (-122.4194, 37.7750),
+            (-122.4194, 37.7749),
+        ]);
+        let mode = |m| h3_polygon_to_cells_wkb(&wkb, 5, m).unwrap();
+        assert!(mode(ContainmentMode::IntersectsBoundary).is_empty());
+        assert!(mode(ContainmentMode::ContainsBoundary).is_empty());
+        let covers = mode(ContainmentMode::Covers);
+        assert_eq!(covers.len(), 1);
+        let expected = u64::from(
+            LatLng::new(37.7749, -122.4194)
+                .unwrap()
+                .to_cell(Resolution::Five),
+        );
+        assert_eq!(covers[0], expected);
+    }
+
+    #[test]
+    fn test_polygon_to_cells_errors() {
+        let wkb = rect_wkb(-122.47, 37.73, -122.37, 37.81);
+        let mode = ContainmentMode::ContainsCentroid;
+        assert_eq!(
+            h3_polygon_to_cells_wkb(&wkb, 16, mode),
+            Err(PolygonToCellsError::InvalidResolution(16))
+        );
+        assert_eq!(
+            h3_polygon_to_cells_wkb(&wkb, -1, mode),
+            Err(PolygonToCellsError::InvalidResolution(-1))
+        );
+        assert!(matches!(
+            h3_polygon_to_cells_wkb(b"not wkb", 5, mode),
+            Err(PolygonToCellsError::InvalidGeometry(_))
+        ));
+        assert!(matches!(
+            h3_polygon_to_cells_wkb(&rect_wkb(0.0, 0.0, f64::NAN, 1.0), 5, mode),
+            Err(PolygonToCellsError::InvalidGeometry(_))
+        ));
+        assert!(matches!(
+            h3_polygon_to_cells_wkb(&rect_wkb(-10.0, -10.0, 10.0, 10.0), 15, mode),
+            Err(PolygonToCellsError::TooManyCells { .. })
+        ));
+
+        // POLYGON EMPTY
+        let mut empty = vec![1u8];
+        empty.extend(3u32.to_le_bytes());
+        empty.extend(0u32.to_le_bytes());
+        assert_eq!(h3_polygon_to_cells_wkb(&empty, 5, mode), Ok(Vec::new()));
     }
 
     #[test]

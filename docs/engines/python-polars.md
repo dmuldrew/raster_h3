@@ -110,8 +110,13 @@ falling back to the stream object if Polars is missing.
 
 `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`,
 `h3_is_valid(int | str)`, `h3_to_wkb(int | str) -> bytes | None` and
-`h3_cell_to_parent(int | str, res)` call the shared core helpers (behaviour on invalid input
-is listed in the [overview](README.md#scalar-helpers)). They operate on single Python
+`h3_cell_to_parent(int | str, res)` and
+`h3_polygon_to_cells(wkb: bytes, resolution, containment="contains_centroid") -> list[int] | None`
+call the shared core helpers (behaviour on invalid input is listed in the
+[overview](README.md#scalar-helpers); containment modes are described in the
+[API reference](../api-reference.md#containment-modes)). `h3_polygon_to_cells` takes WKB,
+e.g. `shapely.to_wkb(geom)`; it raises `ValueError` for an unknown mode or a polygon over the
+10,000,000-cell limit. They operate on single Python
 values; for whole columns use the Arrow stream or a Polars expression such as
 `map_elements`.
 

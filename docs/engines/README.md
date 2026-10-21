@@ -118,6 +118,7 @@ differences that remain:
 | `h3_is_valid(cell \| hex)` | `false` | — |
 | `h3_to_wkb(cell \| hex)` (aliases `h3_to_geometry`, `h3_cell_to_geometry`) | `None` | PostgreSQL has the `bigint` overload only |
 | `h3_cell_to_parent(cell, res)` | `None` when `res` is outside `0..=15` or finer than the cell | DuckDB returns `0` |
+| `h3_polygon_to_cells(wkb, res[, containment])` ([modes](../api-reference.md#h3_polygon_to_cells)) | `Err` for invalid WKB, a resolution outside `0..=15`, or more than `H3_POLYGON_TO_CELLS_MAX_CELLS` (10,000,000) cells | DuckDB and Python only. Both return `NULL` / `None` for invalid geometry or resolution, and raise a query error / `ValueError` for an unknown mode or too many cells. Not yet in DataFusion (no list column type) or PostgreSQL |
 
 ## Cross-Engine Parity Testing
 

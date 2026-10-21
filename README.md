@@ -295,7 +295,13 @@ LOAD 'target/release/libraster_h3.dylib'; -- or INSTALL from a release, see the 
 SELECT h3_hex, mean, count
 FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8)
 LIMIT 5;
+
+-- Polyfill a WKB polygon: list of UBIGINT cells; containment defaults to 'contains_centroid'
+SELECT h3_polygon_to_cells(ST_AsWKB(geom), 8, 'covers') AS cells FROM areas;
 ```
+
+See [`h3_polygon_to_cells`](docs/api-reference.md#h3_polygon_to_cells) for the containment modes
+(also available in Python as `raster_h3.h3_polygon_to_cells`).
 
 **Python / Polars**
 

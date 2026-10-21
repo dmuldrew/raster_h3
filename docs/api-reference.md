@@ -273,4 +273,65 @@ Returns the same 7-column summary schema as `h3_raster_to_pmtiles` (`total_hexag
 | `h3_to_geometry` | `(UBIGINT)` / `(VARCHAR)` | `GEOMETRY` | Converts H3 index directly to native DuckDB Spatial polygon geometry (compatible with `ST_Area`, `ST_Intersects`, etc.). |
 | `h3_cell_to_geometry` | `(UBIGINT)` / `(VARCHAR)` | `GEOMETRY` | Standard DuckDB spatial compatibility alias for `h3_to_geometry`. |
 | `h3_cell_to_parent` | `(UBIGINT, BIGINT)` / `(VARCHAR, BIGINT)` | `UBIGINT` / `VARCHAR` | Truncates H3 cell to coarser parent resolution level. Returns null if requested resolution is finer. |
+| `h3_polygon_to_cells` | `(BLOB, BIGINT)` / `(BLOB, BIGINT, VARCHAR)`; also `GEOMETRY` on DuckDB ≥ 1.5 | `UBIGINT[]` | Fills a polygon or multipolygon with H3 cells using h3o's polyfill. See [below](#h3_polygon_to_cells). |
 | `raster_h3_version` | `()` | `VARCHAR` | Returns the compiled extension version string (e.g. `'0.2.0'`). |
+
+### `h3_polygon_to_cells`
+
+```sql
+h3_polygon_to_cells(geometry, resolution [, containment]) -> UBIGINT[]
+```
+
+Returns every H3 cell at `resolution` that belongs to the polygon, as a list sorted
+ascending with duplicates removed. It wraps h3o's
+[`ToCells`](https://docs.rs/h3o/0.6/h3o/geom/trait.ToCells.html) polyfill (the h3o
+counterpart of H3's `polygonToCells`).
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `geometry` | `BLOB` (WKB) or `GEOMETRY` | A `POLYGON` or `MULTIPOLYGON` in WGS84 longitude/latitude degrees (x = longitude, y = latitude). The `BLOB` form accepts ISO/OGC WKB (2D, Z, M, ZM) and PostGIS EWKB (including an embedded SRID) in either byte order. Z/M values are ignored and the SRID is not checked, so reproject other CRSs to EPSG:4326 first. Holes (interior rings) are respected. The `GEOMETRY` overload is registered on DuckDB 1.5+, where `GEOMETRY` is a built-in type. On older versions with the spatial extension, pass `ST_AsWKB(geom)`. |
+| `resolution` | `BIGINT` | H3 resolution `0` (coarsest) to `15` (finest). |
+| `containment` | `VARCHAR`, optional | How to decide whether a cell belongs to the polygon. Defaults to `'contains_centroid'`. Case-insensitive; `-` and `_` are interchangeable. |
+
+#### Containment modes
+
+| Mode | Alias (H3 C API name) | A cell is returned when… | Coverage | Shared cells between adjacent polygons |
+| :--- | :--- | :--- | :--- | :--- |
+| `contains_centroid` (default) | `center` | its centroid lies inside the polygon | Can overshoot the edge and leave slivers uncovered | None. Each cell goes to exactly one of two polygons that touch without overlapping |
+| `contains_boundary` | `full` | its whole boundary lies inside the polygon | Never overshoots; leaves the most area uncovered | None |
+| `intersects_boundary` | — | any part of it overlaps the polygon | Covers the polygon completely and overshoots the edge | Possible |
+| `covers` | `overlapping` | same as `intersects_boundary`, and also returns the single enclosing cell when the polygon lies entirely inside one cell | Complete, even for polygons smaller than a cell | Possible |
+
+The result sets are nested: `contains_boundary` ⊆ `contains_centroid` ⊆ `intersects_boundary` ⊆
+`covers`. They differ only for a polygon that fits inside one cell: `intersects_boundary` (and
+`contains_boundary`) returns an empty list, while `covers` returns that one cell. H3's
+`CONTAINMENT_OVERLAPPING_BBOX` mode has no h3o equivalent and is not supported.
+
+#### NULLs, invalid input and limits
+
+| Input | Result |
+| :--- | :--- |
+| Any argument `NULL` | `NULL` |
+| `geometry` is not a valid WKB `POLYGON`/`MULTIPOLYGON` (e.g. a `POINT`), or has non-finite coordinates | `NULL` |
+| `resolution` outside `0..=15` | `NULL` |
+| `POLYGON EMPTY` / `MULTIPOLYGON EMPTY` | `[]` |
+| Unknown `containment` name | Query error that lists the accepted names |
+| h3o's pre-tiling estimate exceeds 10,000,000 cells for a row | Query error. Use a coarser resolution or split the polygon (for example with `ST_Subdivide`-style tiling) |
+
+#### Examples
+
+```sql
+-- Cells whose centroid falls in a bounding box (DuckDB 1.5+ GEOMETRY literal)
+SELECT unnest(h3_polygon_to_cells(
+    'POLYGON((-122.47 37.73, -122.37 37.73, -122.37 37.81, -122.47 37.81, -122.47 37.73))'::GEOMETRY,
+    8)) AS h3_index;
+
+-- Full coverage of each county, one row per (county, cell), via the spatial extension
+SELECT name, unnest(h3_polygon_to_cells(ST_AsWKB(geom), 7, 'covers')) AS h3_index
+FROM counties;
+
+-- Join raster aggregates to the cells inside an area of interest
+SELECT r.*
+FROM h3_raster_continuous_aggregate('elevation.tif', 8) r
+WHERE r.h3_index IN (SELECT unnest(h3_polygon_to_cells(ST_AsWKB(aoi.geom), 8)) FROM aoi);
+```

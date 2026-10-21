@@ -28,8 +28,9 @@ use raster_h3_core::pmtiles::H3PmtilesTiler;
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 use raster_h3_core::scalar_ops::{
     h3_cell_to_parent_str, h3_cell_to_parent_u64, h3_get_resolution, h3_is_valid_str,
-    h3_is_valid_u64, h3_to_lat, h3_to_lng, h3_to_string, h3_to_wkb_u64, parse_bbox_str,
-    parse_resolutions_str, string_to_h3,
+    h3_is_valid_u64, h3_polygon_to_cells_wkb, h3_to_lat, h3_to_lng, h3_to_string, h3_to_wkb_u64,
+    parse_bbox_str, parse_containment_mode, parse_resolutions_str, string_to_h3, ContainmentMode,
+    PolygonToCellsError,
 };
 
 /// Configuration for a Python / Polars H3 raster scan.
@@ -693,6 +694,60 @@ pub unsafe extern "C" fn raster_h3_py_h3_to_wkb(
     }
     ptr::copy_nonoverlapping(wkb.as_ptr(), out_buf, wkb.len());
     wkb.len()
+}
+
+/// C-ABI scalar helper: `h3_polygon_to_cells(wkb, res, containment)`.
+///
+/// On success (`0`) writes a heap array of `*out_len` cells to `*out_cells`; release it with
+/// [`raster_h3_py_free_cells`]. A NULL `containment` means `contains_centroid`. Other return
+/// codes leave the outputs untouched: `1` invalid geometry or resolution, `2` unknown
+/// containment mode, `3` more cells than `H3_POLYGON_TO_CELLS_MAX_CELLS`, `-1` NULL pointers.
+///
+/// # Safety
+/// `wkb` must point to `wkb_len` readable bytes, `containment` must be NULL or a valid
+/// NUL-terminated string, and `out_cells` / `out_len` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_h3_polygon_to_cells(
+    wkb: *const u8,
+    wkb_len: usize,
+    res: i64,
+    containment: *const c_char,
+    out_cells: *mut *mut u64,
+    out_len: *mut usize,
+) -> c_int {
+    if wkb.is_null() || out_cells.is_null() || out_len.is_null() {
+        return -1;
+    }
+    let mode = match opt_cstr(containment) {
+        None => ContainmentMode::ContainsCentroid,
+        Some(name) => match parse_containment_mode(&name) {
+            Some(mode) => mode,
+            None => return 2,
+        },
+    };
+    let bytes = std::slice::from_raw_parts(wkb, wkb_len);
+    match h3_polygon_to_cells_wkb(bytes, res, mode) {
+        Ok(cells) => {
+            let cells = cells.into_boxed_slice();
+            *out_len = cells.len();
+            *out_cells = Box::into_raw(cells) as *mut u64;
+            0
+        }
+        Err(PolygonToCellsError::TooManyCells { .. }) => 3,
+        Err(_) => 1,
+    }
+}
+
+/// Free a cell array returned by [`raster_h3_py_h3_polygon_to_cells`].
+///
+/// # Safety
+/// `cells` / `len` must come from one successful `raster_h3_py_h3_polygon_to_cells` call
+/// and not have been freed already.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_free_cells(cells: *mut u64, len: usize) {
+    if !cells.is_null() {
+        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(cells, len)));
+    }
 }
 
 /// C-ABI direct Parquet exporter (`h3_raster_to_parquet`). Returns number of hexagons written, or `-1` on error.

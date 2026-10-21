@@ -407,7 +407,7 @@ The root crate keeps these symbols in the shared library through
 | `h3_raster_categorical_aggregate` | table (`format := 'wide' \| 'long'`) | [`categorical_table_function.rs`](../../crates/raster-h3-duckdb/src/functions/categorical_table_function.rs) |
 | `h3_raster_to_parquet` | table (1 summary row) | [`parquet_table_function.rs`](../../crates/raster-h3-duckdb/src/functions/parquet_table_function.rs) |
 | `h3_raster_to_pmtiles`, `h3_parquet_to_pmtiles` | table (1 summary row) | [`pmtiles_table_function.rs`](../../crates/raster-h3-duckdb/src/functions/pmtiles_table_function.rs) |
-| `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid` (UBIGINT/VARCHAR), `h3_to_wkb` (UBIGINT/VARCHAR), `h3_cell_to_parent` (UBIGINT/VARCHAR), `h3_to_geometry` / `h3_cell_to_geometry` (UBIGINT/VARCHAR) | scalar | [`scalar.rs`](../../crates/raster-h3-duckdb/src/functions/scalar.rs) |
+| `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid` (UBIGINT/VARCHAR), `h3_to_wkb` (UBIGINT/VARCHAR), `h3_cell_to_parent` (UBIGINT/VARCHAR), `h3_to_geometry` / `h3_cell_to_geometry` (UBIGINT/VARCHAR), `h3_polygon_to_cells` (BLOB, plus GEOMETRY on DuckDB ≥ 1.5; returns `UBIGINT[]`) | scalar | [`scalar.rs`](../../crates/raster-h3-duckdb/src/functions/scalar.rs) |
 
 The scalar kernels call `raster_h3_core::scalar_ops`, so their results match the other
 engines (with the `0` vs `NULL` differences listed in the

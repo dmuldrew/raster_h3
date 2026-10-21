@@ -174,6 +174,7 @@ pub type duckdb_vector = *mut c_void;
 pub type duckdb_logical_type = *mut c_void;
 pub type duckdb_value = *mut c_void;
 pub type duckdb_scalar_function = *mut c_void;
+pub type duckdb_scalar_function_set = *mut c_void;
 pub type duckdb_extension_info = *mut c_void;
 
 #[repr(C)]
@@ -253,28 +254,44 @@ impl duckdb_string_t {
         self.inlined.length
     }
 
-    /// Borrows the string data as a Rust string slice.
+    /// Borrows the raw bytes (VARCHAR or BLOB payload).
     ///
     /// # Safety
     /// The caller must ensure that the underlying DuckDB vector is live and
     /// valid for the duration of the returned reference. For external strings
     /// (length > 12), `pointer.ptr` must point to at least `length` initialized
-    /// UTF-8 bytes.
+    /// bytes.
     #[inline(always)]
-    pub unsafe fn as_str(&self) -> &str {
+    pub unsafe fn as_bytes(&self) -> &[u8] {
         let len = self.length() as usize;
         if len <= 12 {
-            std::str::from_utf8(&self.inlined.inlined[..len]).unwrap_or("")
+            &self.inlined.inlined[..len]
         } else {
             let ptr = self.pointer.ptr as *const u8;
             if ptr.is_null() {
-                ""
+                &[]
             } else {
-                let slice = std::slice::from_raw_parts(ptr, len);
-                std::str::from_utf8(slice).unwrap_or("")
+                std::slice::from_raw_parts(ptr, len)
             }
         }
     }
+
+    /// Borrows the string data as a Rust string slice (`""` if not UTF-8).
+    ///
+    /// # Safety
+    /// Same as [`Self::as_bytes`].
+    #[inline(always)]
+    pub unsafe fn as_str(&self) -> &str {
+        std::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
+}
+
+/// Element of a LIST vector's data buffer: a slice of its child vector.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct duckdb_list_entry {
+    pub offset: u64,
+    pub length: u64,
 }
 
 pub type duckdb_table_function_bind_t = unsafe extern "C" fn(info: duckdb_bind_info);
@@ -298,6 +315,7 @@ duckdb_api! {
     // Logical types
     [156] pub fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb_logical_type;
     [184] pub fn duckdb_destroy_logical_type(type_: *mut duckdb_logical_type);
+    [159] pub fn duckdb_create_list_type(type_: duckdb_logical_type) -> duckdb_logical_type;
     [158] pub fn duckdb_logical_type_set_alias(type_: duckdb_logical_type, alias: *const c_char);
     [157] pub fn duckdb_logical_type_get_alias(type_: duckdb_logical_type) -> *mut c_char;
 
@@ -399,6 +417,14 @@ duckdb_api! {
         str_len: idx_t,
     );
 
+    // List vectors
+    [199] pub fn duckdb_list_vector_get_child(vector: duckdb_vector) -> duckdb_vector;
+    [201] pub fn duckdb_list_vector_set_size(vector: duckdb_vector, size: idx_t) -> DuckDBState;
+    [202] pub fn duckdb_list_vector_reserve(
+        vector: duckdb_vector,
+        required_capacity: idx_t,
+    ) -> DuckDBState;
+
     // Validity mask
     [195] pub fn duckdb_vector_get_validity(vector: duckdb_vector) -> *mut u64;
     [196] pub fn duckdb_vector_ensure_validity_writable(vector: duckdb_vector);
@@ -441,6 +467,16 @@ duckdb_api! {
     [219] pub fn duckdb_register_scalar_function(
         con: duckdb_connection,
         scalar_function: duckdb_scalar_function,
+    ) -> DuckDBState;
+    [222] pub fn duckdb_create_scalar_function_set(name: *const c_char) -> duckdb_scalar_function_set;
+    [223] pub fn duckdb_destroy_scalar_function_set(scalar_function_set: *mut duckdb_scalar_function_set);
+    [224] pub fn duckdb_add_scalar_function_to_set(
+        set: duckdb_scalar_function_set,
+        function: duckdb_scalar_function,
+    ) -> DuckDBState;
+    [225] pub fn duckdb_register_scalar_function_set(
+        con: duckdb_connection,
+        set: duckdb_scalar_function_set,
     ) -> DuckDBState;
 
     [7] pub fn duckdb_library_version() -> *const c_char;
