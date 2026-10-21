@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-21
+
 ### Added
+- DuckDB community-extension build scaffolding: root `Makefile` and `extension-ci-tools` submodule (DuckDB's `c_api_extensions` makefiles), so `make configure && make release` produces `build/release/raster_h3.duckdb_extension` (stable C API, minimum DuckDB v1.2.0); `test/sql/raster_h3.test` sqllogictest run by `make test_release` ([DuckDB](docs/engines/duckdb.md#community-extension-build)).
 - `h3_polygon_to_cells(geometry, resolution [, containment])` scalar (h3o polyfill) in DuckDB (`BLOB`/`GEOMETRY` → `UBIGINT[]`) and Python, with the `contains_centroid` (default), `contains_boundary`, `intersects_boundary` and `covers` containment modes ([API Reference](docs/api-reference.md#h3_polygon_to_cells)). Backed by `raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb` and a new WKB polygon reader.
 - **Multi-engine Cargo workspace** ([Engines Overview](docs/engines/README.md)): the engine moved to `crates/raster-h3-core`; the DuckDB extension to `crates/raster-h3-duckdb`. The root `raster_h3` crate re-exports every member and still builds `libraster_h3` for DuckDB.
 - `raster-h3-core` `columnar` module: `RecordBatch`/`ColumnSchema` model, `ContinuousBatchReader` / `CategoricalBatchReader`, Arrow C Data and C Stream interface, `RH3IPC01` binary stream and NDJSON writer; `scalar_ops` module with H3 helpers shared by all engines ([Core](docs/engines/core.md)).
@@ -19,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in European national-grid EPSG codes with Helmert datum shifts: `27700` (OSGB36), `28992` (Amersfoort / RD New), `31466`–`31469` (DHDN Gauss-Kruger), `23028`–`23038` (ED50 / UTM); and ETRS89 codes treated as WGS84: `2154`, `3035`, `25828`–`25838` ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 
 ### Changed
+- Workspace, Python package and PostgreSQL extension versions bumped to `0.4.0` (PostgreSQL install script renamed to `sql/raster_h3--0.4.0.sql`; there is no 0.3.0 release).
+- The DuckDB community-extension manifest moved from `community_extension/` to `packaging/duckdb-community/description.yml`; it now points at `dmuldrew/raster_h3`, declares version `0.4.0` and excludes the opt-in musl and `windows_amd64_rtools` platforms.
+- Repository and homepage URLs point to `github.com/dmuldrew/raster_h3` (previously `raster_h3_hexification`).
 - `h3_parquet_to_pmtiles` (and `process_parquet_to_pmtiles` / `convert_to_pmtiles`) now return an error naming the available columns when an explicit `h3_column` is not found, instead of silently falling back to auto-detection or column 0.
 - PROJ strings with 3- or 7-parameter Helmert shifts (`+towgs84=...`, or a named datum that implies one such as `+datum=OSGB36`) are now transformed via proj4rs instead of rejected. Grid-based datums (`+nadgrids` other than `@null`, `+datum=NAD27`) and unknown `+datum` names are still rejected with `CrsError`; a non-zero shift never takes a fast path ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 - Bound decoded chunk memory in bytes, not only by queue length: the mosaic prefetcher charges buffers being decoded, queued, aggregated and idle against `decode_budget_bytes` (SQL `decode_budget_mb`, default 256 MiB). Reservations are granted in job order before decoding; a chunk larger than the budget is decoded only when no other is held. Peak usage is reported as `StreamProfile::peak_decoded_bytes`.
@@ -169,6 +175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docker container** with multi-stage build, bundled DuckDB CLI, and demo script
 - **Query planner integration**: cardinality estimation and parallel `init_local` distribution
 
-[Unreleased]: https://github.com/dmuldrew/raster_h3_hexification/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/dmuldrew/raster_h3_hexification/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dmuldrew/raster_h3_hexification/releases/tag/v0.1.0
+[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dmuldrew/raster_h3/compare/v0.2.0...v0.4.0
+[0.2.0]: https://github.com/dmuldrew/raster_h3/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dmuldrew/raster_h3/releases/tag/v0.1.0

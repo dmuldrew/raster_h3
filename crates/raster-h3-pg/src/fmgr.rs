@@ -1,7 +1,7 @@
 //! Loadable-module glue for a real PostgreSQL server (`pg-extension` feature).
 //!
 //! Provides the `PG_MODULE_MAGIC` block, the `text`/`bytea` scalar functions and the
-//! value-per-call set-returning functions declared in `sql/raster_h3--0.2.0.sql`.
+//! value-per-call set-returning functions declared in `sql/raster_h3--0.4.0.sql`.
 //! These call into the server (`palloc`, `ereport`, `funcapi`), so they are only
 //! compiled when building the extension library itself.
 //!
@@ -142,7 +142,7 @@ static PG_MAGIC: Pg_magic_struct = Pg_magic_struct {
         abi_extra: abi_extra(),
     },
     name: c"raster_h3".as_ptr(),
-    version: c"0.2.0".as_ptr(),
+    version: c"0.4.0".as_ptr(),
 };
 
 /// `PG_MODULE_MAGIC`: lets the server verify the module was built for its ABI.

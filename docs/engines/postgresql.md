@@ -34,7 +34,7 @@ Install the three files where the server looks for them:
 ```bash
 cp target/release/libraster_h3_pg.so  "$(pg_config --pkglibdir)/raster_h3_pg.so"
 cp crates/raster-h3-pg/raster_h3.control       "$(pg_config --sharedir)/extension/"
-cp crates/raster-h3-pg/sql/raster_h3--0.2.0.sql "$(pg_config --sharedir)/extension/"
+cp crates/raster-h3-pg/sql/raster_h3--0.4.0.sql "$(pg_config --sharedir)/extension/"
 ```
 
 On macOS the library is `libraster_h3_pg.dylib`; install it as `raster_h3_pg.dylib` (or
@@ -44,7 +44,7 @@ the suffix your server expects). Then:
 CREATE EXTENSION raster_h3;
 ```
 
-[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.2.0`,
+[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.4.0`,
 `module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = true`.
 
 The raster aggregation functions read files with the server's OS privileges, so `EXECUTE` on
@@ -60,7 +60,7 @@ other targets fail to compile.
 
 ## SQL API
 
-All definitions are in [`sql/raster_h3--0.2.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.2.0.sql).
+All definitions are in [`sql/raster_h3--0.4.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.4.0.sql).
 
 ### Raster aggregation
 

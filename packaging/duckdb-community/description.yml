@@ -1,17 +1,17 @@
 extension:
   name: raster_h3
   description: High-performance GeoTIFF to H3 hexagonal aggregation and PMTiles v3 vector pyramids
-  version: 0.1.0
+  version: 0.4.0
   language: Rust
   build: cargo
   license: MIT
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;linux_amd64_musl"
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl;linux_arm64_musl"
   requires_toolchains: "rust;python3"
   maintainers:
     - dmuldrew
 
 repo:
-  github: dmuldrew/raster_h3_hexification
+  github: dmuldrew/raster_h3
   ref: 9467749021da5d947aa5ba4d67394dbe149dc8ec
 
 docs:

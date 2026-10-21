@@ -221,6 +221,37 @@ jobs:
             dist/v1.2.0/${{ matrix.platform }}/*
           if-no-files-found: error
 
+  # Builds through the extension-ci-tools Makefile the way duckdb/community-extensions
+  # does for `build: cargo`, then runs test/sql with DuckDB's sqllogictest runner.
+  community-build:
+    name: Community Extension Build (linux_amd64)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-community-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: make configure release
+        run: make configure release
+
+      # extension-ci-tools skips tests on linux_amd64, so invoke its runner directly.
+      - name: Run test/sql
+        run: ./configure/venv/bin/python3 -m duckdb_sqllogictest --test-dir test/sql --external-extension build/release/raster_h3.duckdb_extension
+
   release:
     name: Publish GitHub Release
     needs: [build]

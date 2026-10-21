@@ -1025,7 +1025,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raster-h3-cli"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "h3o",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-core"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crossbeam-deque",
  "flate2",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-datafusion"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "h3o",
  "raster-h3-core",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-duckdb"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crossbeam-deque",
  "h3o",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-pg"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "h3o",
  "libc",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-python"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "h3o",
  "libc",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "raster_h3"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "crossbeam-deque",
  "flate2",

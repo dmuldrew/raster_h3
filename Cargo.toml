@@ -11,12 +11,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["raster_h3 contributors"]
 license = "MIT"
-repository = "https://github.com/dmuldrew/raster_h3_hexification"
-homepage = "https://github.com/dmuldrew/raster_h3_hexification"
+repository = "https://github.com/dmuldrew/raster_h3"
+homepage = "https://github.com/dmuldrew/raster_h3"
 
 [workspace.dependencies]
 h3o = "0.6"

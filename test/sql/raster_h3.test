@@ -1,0 +1,15 @@
+# name: test/sql/raster_h3.test
+# description: smoke test for the raster_h3 loadable extension
+# group: [raster_h3]
+
+statement error
+SELECT h3_to_string(599686042433355775);
+----
+Catalog Error
+
+require raster_h3
+
+query T
+SELECT h3_to_string(599686042433355775);
+----
+85283473fffffff
