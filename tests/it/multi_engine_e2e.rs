@@ -1005,3 +1005,146 @@ fn test_cross_engine_categorical_e2e_parity() {
         }
     }
 }
+
+#[test]
+fn test_h3_polygon_to_cells_cross_engine_parity() {
+    use h3o::geom::ContainmentMode;
+    use raster_h3::core::scalar_ops::h3_polygon_to_cells_wkb;
+
+    let outer: [(f64, f64); 5] = [
+        (-122.49, 37.71),
+        (-122.35, 37.71),
+        (-122.35, 37.83),
+        (-122.49, 37.83),
+        (-122.49, 37.71),
+    ];
+    let hole: [(f64, f64); 5] = [
+        (-122.45, 37.75),
+        (-122.40, 37.75),
+        (-122.40, 37.79),
+        (-122.45, 37.79),
+        (-122.45, 37.75),
+    ];
+    let mut wkb = vec![1u8];
+    wkb.extend(3u32.to_le_bytes());
+    wkb.extend(2u32.to_le_bytes());
+    for ring in [&outer[..], &hole[..]] {
+        wkb.extend((ring.len() as u32).to_le_bytes());
+        for &(x, y) in ring {
+            wkb.extend(x.to_le_bytes());
+            wkb.extend(y.to_le_bytes());
+        }
+    }
+    let wkb_hex: String = wkb.iter().map(|byte| format!("{byte:02x}")).collect();
+    let modes = [
+        ("contains_centroid", ContainmentMode::ContainsCentroid),
+        ("contains_boundary", ContainmentMode::ContainsBoundary),
+        ("intersects_boundary", ContainmentMode::IntersectsBoundary),
+        ("covers", ContainmentMode::Covers),
+    ];
+    let mut core_results = BTreeMap::new();
+    for (name, mode) in modes {
+        let cells = h3_polygon_to_cells_wkb(&wkb, 8, mode).unwrap();
+        assert!(!cells.is_empty(), "{name} produced no cells");
+        core_results.insert(name, cells);
+    }
+
+    let py_lib = ensure_cdylib_built("raster-h3-python", "raster_h3_python");
+    let py_pkg_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/raster-h3-python/python");
+    let py_script = r#"
+import json, sys
+import raster_h3
+
+wkb = bytes.fromhex(sys.argv[1])
+modes = ["contains_centroid", "contains_boundary", "intersects_boundary", "covers"]
+cells = {mode: raster_h3.h3_polygon_to_cells(wkb, 8, mode) for mode in modes}
+aliases = {
+    "center": "contains_centroid",
+    "full": "contains_boundary",
+    "overlapping": "covers",
+}
+for alias, canonical in aliases.items():
+    assert raster_h3.h3_polygon_to_cells(wkb, 8, alias) == cells[canonical]
+print(json.dumps(cells, sort_keys=True))
+"#;
+    let py_out = Command::new(python_exe())
+        .env("PYTHONPATH", &py_pkg_dir)
+        .env("RASTER_H3_PYTHON_LIB", &py_lib)
+        .args(["-c", py_script, &wkb_hex])
+        .output()
+        .expect("run Python polygon parity test");
+    assert!(
+        py_out.status.success(),
+        "Python polygon parity failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&py_out.stdout),
+        String::from_utf8_lossy(&py_out.stderr)
+    );
+    let py_json: serde_json::Value = serde_json::from_slice(&py_out.stdout).unwrap();
+    for (name, expected) in &core_results {
+        let actual: Vec<u64> = py_json[*name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.as_u64().unwrap())
+            .collect();
+        assert_eq!(&actual, expected, "Python mismatch for {name}");
+    }
+
+    let duckdb = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".into());
+    if let Ok(version_output) = Command::new(&duckdb).arg("--version").output() {
+        if version_output.status.success() {
+            let temp = tempfile::tempdir().unwrap();
+            let library = ensure_cdylib_built("raster_h3", "raster_h3");
+            let platform_output = Command::new(&duckdb)
+                .args(["-batch", "-csv", "-noheader", "-c", "PRAGMA platform"])
+                .output()
+                .expect("read DuckDB platform");
+            assert!(
+                platform_output.status.success(),
+                "DuckDB PRAGMA platform failed: {}",
+                String::from_utf8_lossy(&platform_output.stderr)
+            );
+            let platform = String::from_utf8(platform_output.stdout).unwrap();
+            let extension = temp.path().join("raster_h3.duckdb_extension");
+            let duckdb_version =
+                std::env::var("DUCKDB_VERSION").unwrap_or_else(|_| "v1.2.0".into());
+            let package_output = Command::new(env!("CARGO_BIN_EXE_package_extension"))
+                .arg("-i")
+                .arg(&library)
+                .arg("-o")
+                .arg(&extension)
+                .args(["-p", platform.trim(), "-d", &duckdb_version])
+                .output()
+                .unwrap();
+            assert!(
+                package_output.status.success(),
+                "extension packaging failed: {}",
+                String::from_utf8_lossy(&package_output.stderr)
+            );
+
+            for (name, expected) in &core_results {
+                let sql = format!(
+                    "LOAD '{}'; SELECT cell FROM unnest(h3_polygon_to_cells(\
+                     from_hex('{wkb_hex}'), 8, '{name}')) AS cells(cell) ORDER BY cell;",
+                    extension.display()
+                );
+                let output = Command::new(&duckdb)
+                    .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", &sql])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "DuckDB polygon query failed for {name}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let actual: Vec<u64> = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| line.parse().unwrap())
+                    .collect();
+                assert_eq!(&actual, expected, "DuckDB mismatch for {name}");
+            }
+        }
+    }
+}
