@@ -11,6 +11,7 @@ mod codecs;
 mod compaction_streaming;
 mod conic_horizon_soundness;
 mod conus_pipeline;
+mod datum_shifts;
 mod exact_cell_assignment;
 mod geodetic_reference;
 mod geoparquet;
