@@ -24,6 +24,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use h3o::{CellIndex, LatLng};
 use helpers::TestGeoTiffBuilder;
 use raster_h3::core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3::core::columnar::ipc::read_ipc_stream;
@@ -310,14 +311,27 @@ fn test_cross_engine_continuous_e2e_parity() {
         .with_geokeys(true)
         .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
 
-    let resolutions = vec![7u8, 8u8];
+    run_continuous_parity(&tif_path, "EPSG:4326", &[7, 8]);
+}
+
+fn run_continuous_parity(
+    tif_path: &Path,
+    crs: &str,
+    resolutions: &[u8],
+) -> BTreeMap<u64, ContinuousCellSummary> {
+    let resolution_arg = resolutions
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
 
     // =========================================================================
     // Engine 1: raster-h3-core (ContinuousBatchReader + ArrowArrayStream C-ABI)
     // =========================================================================
-    let cfg = MultiResolutionConfig::new(resolutions.clone());
-    let reader =
-        ContinuousBatchReader::open(std::slice::from_ref(&tif_path), &cfg, None, 64, None).unwrap();
+    let mut cfg = MultiResolutionConfig::new(resolutions.to_vec());
+    cfg.custom_crs = Some(crs.to_string());
+    let tif_paths = [tif_path.to_path_buf()];
+    let reader = ContinuousBatchReader::open(&tif_paths, &cfg, None, 64, None).unwrap();
     let schema = reader.schema();
     let mut stream = ArrowArrayStream::from_iterator(schema, reader);
     let (_imported_schema, core_batches) = unsafe { stream.collect_batches().unwrap() };
@@ -338,9 +352,9 @@ fn test_cross_engine_continuous_e2e_parity() {
             "ipc",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "--crs",
-            "EPSG:4326",
+            crs,
         ])
         .output()
         .expect("run raster-h3 ipc");
@@ -360,9 +374,9 @@ fn test_cross_engine_continuous_e2e_parity() {
             "jsonl",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "--crs",
-            "EPSG:4326",
+            crs,
             "--columns",
             "h3_index,mean,count,min,max,sum,resolution",
         ])
@@ -399,9 +413,11 @@ fn test_cross_engine_continuous_e2e_parity() {
             "parquet",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "-o",
             cli_pq.to_str().unwrap(),
+            "--crs",
+            crs,
         ])
         .status()
         .unwrap();
@@ -411,9 +427,11 @@ fn test_cross_engine_continuous_e2e_parity() {
             "pmtiles",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "-o",
             cli_pm.to_str().unwrap(),
+            "--crs",
+            crs,
         ])
         .status()
         .unwrap();
@@ -424,9 +442,9 @@ fn test_cross_engine_continuous_e2e_parity() {
     // =========================================================================
     let catalog = RasterH3SessionCatalog::new();
     let provider = catalog
-        .h3_raster_continuous_aggregate(tif_path.to_str().unwrap(), vec![7, 8])
+        .h3_raster_continuous_aggregate(tif_path.to_str().unwrap(), resolutions.to_vec())
         .unwrap()
-        .with_crs("EPSG:4326");
+        .with_crs(crs);
 
     // Full scan via Arrow C Stream
     let plan = provider.scan(None, &[], None).unwrap();
@@ -476,9 +494,12 @@ import raster_h3
 tif_path = sys.argv[1]
 pq_path = sys.argv[2]
 pm_path = sys.argv[3]
+crs = sys.argv[4]
+resolutions = [int(r) for r in sys.argv[5].split(",")]
+resolution_arg = ",".join(str(r) for r in resolutions)
 
 # 1. Stream via RasterH3ArrowStream.to_dict()
-stream = raster_h3.RasterH3ArrowStream(tif_path, resolutions=[7, 8], crs="EPSG:4326")
+stream = raster_h3.RasterH3ArrowStream(tif_path, resolutions=resolutions, crs=crs)
 d = stream.to_dict()
 
 # 2. Verify __arrow_c_schema__() and __arrow_c_stream__() PyCapsules and consume C stream
@@ -549,8 +570,8 @@ for idx, hex_s, res in zip(d["h3_index"], d["h3_hex"], d["resolution"]):
     assert wkb is not None and len(wkb) == 125
 
 # 4. Verify direct Parquet and PMTiles exporters from Python
-pq_count = raster_h3.raster_to_parquet(tif_path, pq_path, resolutions="7,8", crs="EPSG:4326")
-pm_count = raster_h3.raster_to_pmtiles(tif_path, pm_path, resolutions="7,8", crs="EPSG:4326")
+pq_count = raster_h3.raster_to_parquet(tif_path, pq_path, resolutions=resolution_arg, crs=crs)
+pm_count = raster_h3.raster_to_pmtiles(tif_path, pm_path, resolutions=resolution_arg, crs=crs)
 assert pq_count == len(d["h3_index"])
 assert pm_count == len(d["h3_index"])
 
@@ -566,6 +587,8 @@ print(json.dumps(d))
             tif_path.to_str().unwrap(),
             py_pq.to_str().unwrap(),
             py_pm.to_str().unwrap(),
+            crs,
+            &resolution_arg,
         ])
         .output()
         .expect("run python3 E2E script");
@@ -599,8 +622,8 @@ print(json.dumps(d))
     let mut pg_map = BTreeMap::new();
     unsafe {
         let c_path = CString::new(tif_path.to_str().unwrap()).unwrap();
-        let c_res = CString::new("7,8").unwrap();
-        let c_crs = CString::new("EPSG:4326").unwrap();
+        let c_res = CString::new(resolution_arg.as_str()).unwrap();
+        let c_crs = CString::new(crs).unwrap();
         let mut err_ptr: *mut std::ffi::c_char = std::ptr::null_mut();
         let srf_ptr = pg_srf_continuous_open(
             c_path.as_ptr(),
@@ -645,7 +668,9 @@ print(json.dumps(d))
             let lng_d = pg_h3_to_lng(&mut fc1);
             let lat = datum_to_float8(lat_d);
             let lng = datum_to_float8(lng_d);
-            assert!(!fc1.isnull && (37.0..38.5).contains(&lat) && (-123.0..-122.0).contains(&lng));
+            assert!(
+                !fc1.isnull && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng)
+            );
 
             let mut fc_parent = FunctionCallInfoBaseData::with_args(&[
                 NullableDatum {
@@ -707,9 +732,11 @@ print(json.dumps(d))
             let sql = format!(
                 "LOAD '{}'; \
                  SELECT h3_index, mean, count, min, max, sum, resolution \
-                 FROM h3_raster_continuous_aggregate('{}', resolutions := '7,8', crs := 'EPSG:4326');",
+                 FROM h3_raster_continuous_aggregate('{}', resolutions := '{}', crs := '{}');",
                 ext_path.display(),
-                tif_path.display()
+                tif_path.display(),
+                resolution_arg,
+                crs
             );
             let duck_out = Command::new("duckdb")
                 .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", &sql])
@@ -741,6 +768,54 @@ print(json.dumps(d))
             assert_continuous_maps_equal("raster-h3-duckdb (DuckDB CLI)", &core_map, &duck_map);
         }
     }
+    core_map
+}
+
+fn assert_core_cells_near(
+    cells: &BTreeMap<u64, ContinuousCellSummary>,
+    expected_lon: f64,
+    expected_lat: f64,
+    max_distance_m: f64,
+) {
+    assert!(
+        !cells.is_empty(),
+        "core projected aggregation must be non-empty"
+    );
+    for &cell in cells.keys() {
+        let center = LatLng::from(CellIndex::try_from(cell).unwrap());
+        let d_lat = (center.lat() - expected_lat).to_radians() * 6_378_137.0;
+        let d_lon = (center.lng() - expected_lon).to_radians()
+            * 6_378_137.0
+            * expected_lat.to_radians().cos();
+        let distance = d_lat.hypot(d_lon);
+        assert!(
+            distance <= max_distance_m,
+            "core cell {cell:#x} at ({}, {}) is {distance:.0} m from expected location ({expected_lon}, {expected_lat})",
+            center.lng(),
+            center.lat()
+        );
+    }
+}
+
+#[test]
+fn test_cross_engine_projected_continuous_parity() {
+    let (_dc_file, dc_tif) = TestGeoTiffBuilder::new(40, 40)
+        .epsg(5070)
+        .origin(1_614_000.0, 1_930_000.0)
+        .pixel_size_xy(300.0, 300.0)
+        .with_geokeys(true)
+        .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
+    let dc_cells = run_continuous_parity(&dc_tif, "EPSG:5070", &[7, 8]);
+    assert_core_cells_near(&dc_cells, -77.0369, 38.9072, 20_000.0);
+
+    let (_london_file, london_tif) = TestGeoTiffBuilder::new(40, 40)
+        .epsg(27700)
+        .origin(526_000.0, 184_000.0)
+        .pixel_size_xy(300.0, 300.0)
+        .with_geokeys(true)
+        .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
+    let london_cells = run_continuous_parity(&london_tif, "EPSG:27700", &[7, 8]);
+    assert_core_cells_near(&london_cells, -0.1276, 51.5072, 20_000.0);
 }
 
 #[test]
