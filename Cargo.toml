@@ -1,44 +1,30 @@
-[package]
-name = "raster_h3"
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/raster-h3-core",
+    "crates/raster-h3-cli",
+    "crates/raster-h3-duckdb",
+    "crates/raster-h3-datafusion",
+    "crates/raster-h3-python",
+    "crates/raster-h3-pg",
+]
+
+[workspace.package]
 version = "0.2.0"
 edition = "2021"
 authors = ["raster_h3 contributors"]
-description = "High-performance DuckDB extension in Rust to aggregate raster pixels to H3 hexagonal indices"
 license = "MIT"
 repository = "https://github.com/dmuldrew/raster_h3_hexification"
 homepage = "https://github.com/dmuldrew/raster_h3_hexification"
-readme = "README.md"
-keywords = ["geospatial", "duckdb", "h3", "raster", "geotiff"]
-categories = ["science::geo", "database-implementations"]
-exclude = ["data/*", "assets/*", "pmtiles_viewer/debug/*", "tests/data/*"]
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = []
-stream-profile = []
-
-[dependencies]
-# Fast pure-Rust H3 indexing library
+[workspace.dependencies]
 h3o = "0.6"
-
-# Data parallelism across raster chunks
 rayon = "1.10"
-
-# Pure Rust TIFF / GeoTIFF decoder
 tiff = "0.9"
-
-# Pure Rust coordinate reference system transformation
 proj4rs = { version = "0.1", features = ["esri"] }
-
-# Zero-copy memory-mapped file I/O
 memmap2 = "0.9"
-
-# Fast non-cryptographic hasher for 64-bit integer H3 cell keys
 fxhash = "0.2"
-
-# Error handling and utility
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -51,6 +37,58 @@ url = "2.5"
 weezl = "0.1"
 libc = "0.2"
 crossbeam-deque = "0.8"
+
+[package]
+name = "raster_h3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "High-performance multi-engine Rust toolkit (DuckDB, Polars, DataFusion, PostgreSQL, CLI) to aggregate raster pixels to H3 hexagonal indices"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["geospatial", "duckdb", "polars", "datafusion", "h3"]
+categories = ["science::geo", "database-implementations"]
+exclude = ["data/*", "assets/*", "pmtiles_viewer/debug/*", "tests/data/*"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "raster-h3"
+path = "crates/raster-h3-cli/src/bin/raster_h3.rs"
+
+[features]
+default = []
+stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
+
+[dependencies]
+raster-h3-core = { path = "crates/raster-h3-core" }
+raster-h3-cli = { path = "crates/raster-h3-cli" }
+raster-h3-duckdb = { path = "crates/raster-h3-duckdb" }
+raster-h3-datafusion = { path = "crates/raster-h3-datafusion" }
+raster-h3-python = { path = "crates/raster-h3-python" }
+raster-h3-pg = { path = "crates/raster-h3-pg" }
+
+h3o.workspace = true
+rayon.workspace = true
+tiff.workspace = true
+proj4rs.workspace = true
+memmap2.workspace = true
+fxhash.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+libdeflater.workspace = true
+parquet.workspace = true
+tempfile.workspace = true
+ureq.workspace = true
+url.workspace = true
+weezl.workspace = true
+libc.workspace = true
+crossbeam-deque.workspace = true
 
 [profile.release]
 opt-level = 3

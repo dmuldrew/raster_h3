@@ -1,0 +1,25 @@
+[package]
+name = "raster-h3-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Python, Polars (register_io_source + expressions), and Arrow PyCapsule (__arrow_c_stream__) bindings for raster_h3"
+
+[lib]
+name = "raster_h3_python"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+raster-h3-core = { path = "../raster-h3-core" }
+raster-h3-datafusion = { path = "../raster-h3-datafusion" }
+h3o.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tiff.workspace = true

@@ -1,0 +1,257 @@
+//! Multi-Resolution Scanline Horizon Streamer for Categorical Data
+//!
+//! Provides single-pass streaming aggregation across multiple H3 resolution levels simultaneously
+//! for discrete integer / land cover categories and classification maps.
+
+use crate::aggregator::cell_hash::H3BuildHasher;
+use h3o::Resolution;
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use tiff::decoder::DecodingResult;
+
+use crate::aggregator::categorical::CategoricalAccumulator;
+use crate::aggregator::remap::CategoryRemapper;
+use crate::error::Result;
+use crate::raster::geotiff::GeoTiffStreamReader;
+use crate::raster::mosaic::MosaicReader;
+
+use super::categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
+use super::config::MultiResolutionConfig;
+use super::controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
+use super::walker::WalkContext;
+
+pub use super::sharded_map::{get_shard as pub_get_shard, NUM_SHARDS as PUB_NUM_SHARDS};
+
+/// Kernel implementation for categorical/classified raster aggregation
+#[derive(Clone)]
+pub struct CategoricalKernel {
+    pub band: usize,
+    pub min_count: Option<f64>,
+    pub min_majority_fraction: Option<f64>,
+    pub remapper: Option<Arc<CategoryRemapper>>,
+}
+
+impl HorizonStreamKernel for CategoricalKernel {
+    type Accumulator = CategoricalAccumulator;
+    type Record = MultiCategoricalRecord;
+
+    #[inline(always)]
+    fn new_parent_accumulator(&self) -> Self::Accumulator {
+        CategoricalAccumulator::default()
+    }
+
+    #[inline(always)]
+    fn passes_filter(&self, acc: &Self::Accumulator) -> bool {
+        if let Some(min_c) = self.min_count {
+            if acc.total_count < min_c {
+                return false;
+            }
+        }
+        if let Some(min_frac) = self.min_majority_fraction {
+            let (_, _, frac) = acc.majority();
+            if frac < min_frac {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn make_record(&self, resolution: u8, cell_u64: u64, acc: Self::Accumulator) -> Self::Record {
+        MultiCategoricalRecord {
+            resolution,
+            h3_index: cell_u64,
+            accumulator: acc,
+        }
+    }
+
+    #[inline(always)]
+    fn process_chunk(
+        &self,
+        window: &WalkContext,
+        decoding_result: &mut DecodingResult,
+        nodata: Option<f64>,
+        local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
+    ) -> bool {
+        process_categorical_chunk_payload_into(
+            window,
+            decoding_result,
+            nodata,
+            self.band,
+            self.remapper.as_deref(),
+            local_maps,
+        )
+    }
+
+    #[inline(always)]
+    fn process_window(
+        &self,
+        window: &WalkContext,
+        samples: super::borrowed::BorrowedSamples<'_>,
+        nodata: Option<f64>,
+        local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
+    ) -> bool {
+        super::categorical::process_categorical_borrowed_into(
+            window,
+            samples,
+            nodata,
+            self.band,
+            self.remapper.as_deref(),
+            local_maps,
+        )
+    }
+}
+
+/// Single-pass streaming aggregator across multiple H3 resolutions (Categorical Data)
+pub struct MultiCategoricalHorizonStreamer {
+    inner: MultiHorizonStreamer<CategoricalKernel>,
+    remapper: Option<Arc<CategoryRemapper>>,
+}
+
+impl MultiCategoricalHorizonStreamer {
+    /// Category remapping applied before aggregation, if configured
+    pub fn remapper(&self) -> Option<&CategoryRemapper> {
+        self.remapper.as_deref()
+    }
+
+    /// Initialize a new MultiCategoricalHorizonStreamer from a single GeoTIFF reader
+    pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
+        let kernel = CategoricalKernel {
+            band: config.band,
+            min_count: config.min_count,
+            min_majority_fraction: config.min_majority_fraction,
+            remapper: config.remapper.clone(),
+        };
+        let remapper = kernel.remapper.clone();
+        let inner = MultiHorizonStreamer::new(reader, config, kernel)?;
+        Ok(Self { inner, remapper })
+    }
+
+    /// Initialize a new MultiCategoricalHorizonStreamer from a multi-file MosaicReader
+    pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
+        let kernel = CategoricalKernel {
+            band: config.band,
+            min_count: config.min_count,
+            min_majority_fraction: config.min_majority_fraction,
+            remapper: config.remapper.clone(),
+        };
+        let remapper = kernel.remapper.clone();
+        let inner = MultiHorizonStreamer::new_mosaic(mosaic, config, kernel)?;
+        Ok(Self { inner, remapper })
+    }
+
+    /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
+    #[inline(always)]
+    pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<MultiCategoricalRecord>> {
+        self.inner.fetch_next_batch(max_rows)
+    }
+
+    /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
+    #[inline(always)]
+    pub fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
+    where
+        F: FnMut(usize, MultiCategoricalRecord),
+    {
+        self.inner.drain_completed_into(max_rows, consumer)
+    }
+
+    /// Advance scanline horizon until at least `min_rows` completed records are available or finished
+    #[inline(always)]
+    pub fn advance_until_completed(&mut self, min_rows: usize) -> Result<()> {
+        self.inner.advance_until_completed(min_rows)
+    }
+
+    /// Return current southernmost latitude reached by scanline horizon
+    #[inline(always)]
+    pub fn current_lat_horizon(&self) -> f64 {
+        self.inner.current_lat_horizon()
+    }
+
+    /// Target H3 resolutions
+    #[inline(always)]
+    pub fn resolutions(&self) -> &[Resolution] {
+        self.inner.resolutions()
+    }
+
+    /// Target H3 resolution integer levels
+    #[inline(always)]
+    pub fn resolution_u8s(&self) -> &[u8] {
+        self.inner.resolution_u8s()
+    }
+
+    /// Number of partial aggregation runs persisted under memory pressure.
+    pub fn spill_run_count(&self) -> u64 {
+        self.inner.spill_run_count()
+    }
+
+    /// Peak active-map allocation estimate (not whole-process memory).
+    pub fn peak_active_bytes(&self) -> usize {
+        self.inner.peak_active_bytes()
+    }
+
+    /// Return total active in-flight cells across all resolutions
+    #[inline(always)]
+    pub fn active_cell_count(&self) -> usize {
+        self.inner.active_cell_count()
+    }
+
+    /// Check if stream is fully drained and finished
+    #[inline(always)]
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+}
+
+impl Deref for MultiCategoricalHorizonStreamer {
+    type Target = MultiHorizonStreamer<CategoricalKernel>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for MultiCategoricalHorizonStreamer {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl RecordStreamer for MultiCategoricalHorizonStreamer {
+    type Record = MultiCategoricalRecord;
+
+    #[inline(always)]
+    fn drain_completed_into<F>(&mut self, max_rows: usize, consumer: F) -> Result<usize>
+    where
+        F: FnMut(usize, Self::Record),
+    {
+        self.inner.drain_completed_into(max_rows, consumer)
+    }
+
+    #[inline(always)]
+    fn current_lat_horizon(&self) -> f64 {
+        self.inner.current_lat_horizon()
+    }
+
+    #[inline(always)]
+    fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
+    #[inline(always)]
+    fn bounds_wgs84(&self) -> Option<[f64; 4]> {
+        Some(self.inner.mosaic().mosaic_bounds_wgs84)
+    }
+
+    #[inline(always)]
+    fn compacts_children(&self) -> bool {
+        self.inner.compacts_children()
+    }
+
+    #[inline(always)]
+    fn resolution_u8s(&self) -> &[u8] {
+        self.inner.resolution_u8s()
+    }
+}

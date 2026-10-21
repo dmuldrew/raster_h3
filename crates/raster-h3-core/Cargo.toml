@@ -1,0 +1,42 @@
+[package]
+name = "raster-h3-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core pure-Rust engine for GeoTIFF/COG to H3 hexagonal aggregation, Arrow C stream export, Parquet, and PMTiles"
+
+[lib]
+name = "raster_h3_core"
+crate-type = ["rlib"]
+
+[features]
+default = []
+stream-profile = []
+# Exposes test-only synchronization handshakes (e.g. `OrderedPrefetchQueue::wait_for_blocked_job`)
+# to other workspace crates' tests without compiling them into release builds.
+test-hooks = []
+
+[dependencies]
+# `geo` enables h3o's polygon-to-cells tiling (`h3o::geom`).
+h3o = { workspace = true, features = ["geo"] }
+geo-types = "0.7"
+rayon.workspace = true
+tiff.workspace = true
+proj4rs.workspace = true
+memmap2.workspace = true
+fxhash.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+libdeflater.workspace = true
+parquet.workspace = true
+tempfile.workspace = true
+ureq.workspace = true
+url.workspace = true
+weezl.workspace = true
+libc.workspace = true
+crossbeam-deque.workspace = true

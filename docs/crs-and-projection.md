@@ -67,7 +67,7 @@ Coordinates end up on WGS84 in one of three ways:
 | :--- | :--- | :--- |
 | **Helmert shift** (`+towgs84`, 3 or 7 parameters) | Any PROJ string with `+towgs84=...`, named datums that imply one (`+datum=OSGB36`, `potsdam`, `ire65`, ...), and the built-in codes below | The accuracy of the chosen parameters, typically 1–10 m |
 | **Treated as WGS84** (no shift) | WGS84, NAD83 (`EPSG:4269`, `5070`, `3338`), ETRS89 (`2154`, `3035`, `25828`–`25838`), GDA2020 (`7846`–`7859`), and `+towgs84=0,0,0` | Metre-level for NAD83; sub-metre and growing with time for ETRS89 and GDA2020. This matches PROJ's default for these datums. |
-| **Rejected** | Grid-based datums: `+nadgrids=...` (other than `@null`) and `+datum=NAD27` | Grid files are not bundled; supply a `+towgs84` approximation explicitly if one is acceptable |
+| **Rejected** | Grid-based datums: `+nadgrids=...` (other than `@null`) and `+datum=NAD27`; unrecognised `+datum` names | Grid files are not bundled; supply a `+towgs84` approximation explicitly if one is acceptable |
 
 Built-in codes with a Helmert shift, chosen from the EPSG registry:
 
@@ -80,7 +80,7 @@ Built-in codes with a Helmert shift, chosen from the EPSG registry:
 
 PROJ itself may prefer a different transformation for these CRSs, for example
 a national grid (OSTN15 for OSGB36) or a regional ED50 Helmert. The tests in
-`tests/test_datum_shifts.rs` check agreement with PROJ for the same parameters
+`crates/raster-h3-core/tests/it/datum_shifts.rs` check agreement with PROJ for the same parameters
 (≤ 0.01 m) and with PROJ's preferred transformation (within the published
 accuracy above).
 

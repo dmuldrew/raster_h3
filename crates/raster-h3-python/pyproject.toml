@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "raster-h3"
+version = "0.2.0"
+description = "High-performance GeoTIFF/COG to H3 hexagonal aggregation for Polars, PyArrow, DuckDB, and DataFusion"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["geospatial", "h3", "polars", "arrow", "geotiff", "pmtiles", "geoparquet"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+[project.optional-dependencies]
+polars = ["polars>=1.0"]
+pyarrow = ["pyarrow>=14.0"]
+
+# The native library is loaded with ctypes and never links against libpython, so each
+# wheel is tagged `py3-none-<platform>` and serves every Python 3 version. The build hook
+# compiles `raster-h3-python` (shared library) and `raster-h3-cli` (installed onto PATH)
+# from the Cargo workspace two directories up; building requires a Rust toolchain.
+[tool.hatch.build.targets.wheel]
+packages = ["python/raster_h3"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+# One wheel per platform: build with a single interpreter, then repair/retag
+# (auditwheel -> manylinux_2_28, delocate -> macosx_*) and smoke-test the result.
+[tool.cibuildwheel]
+build = "cp312-*"
+skip = "*-musllinux_*"
+build-verbosity = 1
+test-requires = ["polars>=1.0", "pyarrow>=14.0"]
+test-command = "python {package}/tests/wheel_smoke.py"
+
+[tool.cibuildwheel.linux]
+# 64-bit only: polars/pyarrow publish no i686 wheels, so the smoke test cannot install there.
+archs = ["auto64"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[[tool.cibuildwheel.overrides]]
+select = "*-macosx_x86_64"
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.12" }
+
+[[tool.cibuildwheel.overrides]]
+select = "*-macosx_arm64"
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

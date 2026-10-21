@@ -11,14 +11,24 @@ Thank you for your interest in contributing! This guide will help you get starte
 
 ### Build & Test
 ```bash
-# Build the extension
+# Build the DuckDB extension (root crate) and the `raster-h3` CLI
 cargo build --release
 
-# Run the full test suite
-cargo test --release
+# Run the full workspace test suite
+cargo test --release --workspace
+
+# Core engine only (does not compile DuckDB, DataFusion, PostgreSQL or Python)
+cargo test -p raster-h3-core
+
+# One module of a crate's integration binary (tests/it/<module>.rs)
+cargo test -p raster-h3-core --test it pmtiles
+
+# Cross-engine parity and the Docker-based PostgreSQL test (root crate)
+cargo test -p raster_h3 --test it multi_engine_e2e
+cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture
 
 # Run tests with output visible
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 ```
 
 ### Docker
@@ -35,7 +45,27 @@ docker run -it --rm raster_h3:latest
 ## Project Structure
 
 ```
-src/
+Cargo.toml                   # Workspace manifest + root `raster_h3` facade crate
+src/                         # Root crate: libraster_h3 (DuckDB extension) and `raster-h3` CLI binary
+├── lib.rs                   # Re-exports workspace crates, keeps DuckDB entry symbols
+└── bin/                     # Standalone CLI utilities
+    ├── conus_batch_and_evict.rs  # CONUS-scale batch ingestion with eviction tracking
+    ├── convert_to_pmtiles.rs     # High-speed standalone TIFF-to-PMTiles converter
+    ├── download_burn_probability.rs # USFS Burn Probability tile downloader
+    ├── inspect_tif.rs       # GeoTIFF metadata & CRS inspection tool
+    └── package_extension.rs # Pure-Rust DuckDB extension packager & footer generator
+
+crates/
+├── raster-h3-core/          # Engine: raster I/O, CRS, aggregation, columnar, Parquet, PMTiles
+├── raster-h3-duckdb/        # DuckDB C-API extension (ffi/, functions/)
+├── raster-h3-datafusion/    # TableProvider / ExecutionPlan / ScalarUDF adapters
+├── raster-h3-python/        # C-ABI cdylib, python/raster_h3 package, hatch wheel build
+├── raster-h3-pg/            # PostgreSQL fmgr extension, raster_h3.control, sql/
+└── raster-h3-cli/           # raster-h3-cli executable (ipc, jsonl, parquet, pmtiles)
+
+scripts/pg_e2e.sh            # Build + run the PostgreSQL extension in Docker
+
+crates/raster-h3-core/src/
 ├── aggregator/              # Core aggregation & scanline horizon streaming
 │   ├── accumulator.rs       # Welford online statistics (continuous)
 │   ├── categorical.rs       # Categorical frequency accumulator & streamer
@@ -56,12 +86,6 @@ src/
 │   ├── remap.rs             # CategoryRemapper: exact, range, wildcard mapping rules
 │   ├── sampling.rs          # Sub-pixel super-sampling presets (RGSS, Hex, 8-Rooks, Gaussian)
 │   └── simd.rs              # SIMD-vectorized span accumulation for Welford statistics
-├── bin/                     # Standalone CLI utilities
-│   ├── conus_batch_and_evict.rs  # CONUS-scale batch ingestion with eviction tracking
-│   ├── convert_to_pmtiles.rs     # High-speed standalone TIFF-to-PMTiles converter
-│   ├── download_burn_probability.rs # USFS Burn Probability tile downloader
-│   ├── inspect_tif.rs       # GeoTIFF metadata & CRS inspection tool
-│   └── package_extension.rs # Pure-Rust DuckDB extension packager & footer generator
 ├── crs/                     # Geodetic reprojection layer
 │   ├── mod.rs
 │   └── transformer.rs       # 3-tier CRS reprojection (Identity → Analytical → PROJ4)
@@ -69,25 +93,6 @@ src/
 │   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter & parser
 │   ├── wkb.rs               # Stack-allocated OGC WKB 2D Polygon hexagon geometry serialization
 │   └── mod.rs
-├── ffi/                     # DuckDB C-FFI bindings
-│   ├── duckdb_c.rs          # Low-level DuckDB C API types & function pointers
-│   ├── spatial_detect.rs    # DuckDB Spatial extension detection & geometry interop
-│   └── mod.rs
-├── functions/               # DuckDB table & scalar function registrations
-│   ├── bind_utils/          # Shared bind state management & parameter infrastructure
-│   │   ├── bind_helper.rs   # BindHelper: common bind lifecycle and parameter extraction
-│   │   ├── chunk_writer.rs  # ChunkWriter: DuckDB DataChunk row emission
-│   │   ├── lifecycle.rs     # Init/cleanup state management & thread-local allocation
-│   │   ├── parsing.rs       # Parameter parsing (CRS, bbox, sampling, spectral formulas)
-│   │   ├── record_queue.rs  # Bounded record queue for streaming row emission
-│   │   ├── registration.rs  # Named/positional parameter registration helpers
-│   │   └── mod.rs
-│   ├── categorical_table_function.rs  # h3_raster_categorical_aggregate registration
-│   ├── parquet_table_function.rs      # h3_raster_to_parquet registration
-│   ├── pmtiles_table_function.rs      # h3_raster_to_pmtiles registration
-│   ├── scalar.rs            # Scalar helper functions (h3_to_string, string_to_h3, etc.)
-│   ├── table_function.rs    # h3_raster_continuous_aggregate registration
-│   └── mod.rs               # Re-exports fast_hex and wkb from crate::encoding
 ├── parquet/                 # Native OGC GeoParquet 1.1 streaming exporter
 │   ├── geoparquet_metadata.rs # Specification-compliant GeoParquet 1.1 JSON metadata builder
 │   ├── pipeline.rs          # Double-buffered channel streaming pipeline & row-group buffers
@@ -113,28 +118,82 @@ src/
 ├── transcode/               # Cross-format dataset transcoding pipelines
 │   ├── parquet_tiler.rs     # Parquet-to-PMTiles conversion with streaming horizon eviction
 │   └── mod.rs
+├── columnar/                # RecordBatch model, Arrow C Data/Stream, RH3IPC01 & NDJSON
+│   ├── arrow_c.rs           # ArrowSchema / ArrowArray / ArrowArrayStream
+│   ├── ipc.rs               # RH3IPC01 binary stream + JSONEachRow writer
+│   └── mod.rs               # Schemas, ColumnArray, Continuous/CategoricalBatchReader
+├── scalar_ops.rs            # Engine-neutral H3 helpers & parameter parsers
 ├── error.rs                 # Error types & conversions
-└── lib.rs                   # Extension entry point & registration
+└── lib.rs                   # Engine module declarations
 
-tests/                       # Integration test suites (18 files)
-├── helpers.rs               # TestGeoTiffBuilder & shared fixture generators
-├── test_categorical_remap.rs    # Category remapping engine tests
-├── test_conus_pipeline.rs       # CONUS-scale pipeline smoke tests
-├── test_deflate_simd.rs         # SIMD Deflate decompression & corruption fuzzing
-├── test_geoparquet.rs           # OGC GeoParquet 1.1 metadata & geometry tests
-├── test_lzw_fast.rs             # Accelerated LZW decompression tests
-├── test_mosaic_and_overlap.rs   # Multi-file mosaic & overlap rule tests
-├── test_multi_resolution.rs     # Multi-resolution fusion & conservation tests
-├── test_multiband_and_query_pushdown.rs  # Multi-band & predicate pushdown tests
-├── test_package_extension.rs    # DuckDB extension packaging tests
-├── test_performance.rs          # Performance regression guards
-├── test_pmtiles.rs              # PMTiles v3 archive & MVT encoding tests
-├── test_quantiles.rs            # Streaming quantile sketch tests
-├── test_raster_h3.rs            # Core H3 aggregation & CRS tests
-├── test_remote_cog.rs           # Remote COG/S3 streaming tests
-├── test_spatial_geometry.rs     # WKB geometry emission tests
-├── test_super_sampling_lookahead.rs  # Super-sampling conservation tests
-└── test_threading.rs            # Multi-threaded determinism & stress tests
+crates/raster-h3-duckdb/src/
+├── ffi/                     # DuckDB C-FFI bindings
+│   ├── duckdb_c.rs          # Low-level DuckDB C API types & function pointers
+│   ├── spatial_detect.rs    # DuckDB Spatial extension detection & geometry interop
+│   └── mod.rs
+├── functions/               # DuckDB table & scalar function registrations
+│   ├── bind_utils/          # Shared bind state management & parameter infrastructure
+│   │   ├── bind_helper.rs   # BindHelper: common bind lifecycle and parameter extraction
+│   │   ├── chunk_writer.rs  # ChunkWriter: DuckDB DataChunk row emission
+│   │   ├── lifecycle.rs     # Init/cleanup state management & thread-local allocation
+│   │   ├── parsing.rs       # Parameter parsing (CRS, bbox, sampling, spectral formulas)
+│   │   ├── record_queue.rs  # Bounded record queue for streaming row emission
+│   │   ├── registration.rs  # Named/positional parameter registration helpers
+│   │   └── mod.rs
+│   ├── categorical_table_function.rs  # h3_raster_categorical_aggregate registration
+│   ├── parquet_table_function.rs      # h3_raster_to_parquet registration
+│   ├── pmtiles_table_function.rs      # h3_raster_to_pmtiles registration
+│   ├── scalar.rs            # Scalar helper functions (h3_to_string, string_to_h3, etc.)
+│   ├── table_function.rs    # h3_raster_continuous_aggregate registration
+│   └── mod.rs               # Re-exports fast_hex and wkb from crate::encoding
+└── lib.rs                   # DuckDB entry points (raster_h3_init, raster_h3_init_c_api, raster_h3_version)
+
+crates/raster-h3-core/tests/it/      # Core engine suites (no DuckDB/DataFusion/pg)
+├── main.rs                  # One test binary per crate: declares every module below
+├── helpers.rs               # TestGeoTiffBuilder & shared fixtures (also used by duckdb and root)
+├── support/mvt.rs           # MVT protobuf decoder for PMTiles assertions
+├── accumulators.rs          # Welford/SIMD span and categorical accumulators
+├── analytic_south_lat.rs    # Cell south-latitude bounds for eviction
+├── antimeridian_bbox.rs     # ±180° bboxes, tile wrap and polar clamping
+├── categorical_remap.rs     # Category remapping engine tests
+├── chunks_and_prefetch.rs   # Chunk layout, bbox chunk pruning, prefetched readers
+├── codecs.rs                # SIMD Deflate and fast LZW decompression parity
+├── compaction_streaming.rs  # Compacted stream eviction
+├── conic_horizon_soundness.rs  # Albers/conic horizon bounds
+├── conus_pipeline.rs        # CONUS-scale pipeline smoke tests
+├── exact_cell_assignment.rs # Exhaustive per-sample cell assignment reference
+├── geodetic_reference.rs    # PROJ golden points within 0.01 m
+├── geoparquet.rs            # OGC GeoParquet 1.1 metadata & geometry tests
+├── geotiff_crs.rs           # GeoTransform and CRS detection/reprojection
+├── horizon_streaming.rs     # Scan-horizon streaming, NoData and error paths
+├── memory_budgets.rs        # Decoded-chunk and compaction budgets
+├── mosaic.rs                # Multi-file mosaics, overlap rules and footprints
+├── multi_resolution.rs      # Multi-resolution fusion & conservation tests
+├── multiband_and_query_pushdown.rs  # Multi-band, spectral formulas & predicate pushdown
+├── performance.rs           # Performance regression guards
+├── pmtiles.rs               # PMTiles v3 archive & MVT encoding tests
+├── projected_eviction.rs    # Projected-CRS eviction soundness
+├── quantiles.rs             # Streaming quantile sketch tests
+├── remote_cog.rs            # Remote COG/S3 streaming tests
+├── rotated_grid_correctness.rs  # Sheared/rotated grids vs exhaustive reference
+├── sharding.rs              # H3 shard balance and sharded merges
+├── sparse_chunks_and_spilling.rs  # Sparse COG chunks and aggregation spilling
+├── streaming_failures.rs    # Corrupt chunks reach stream consumers and exporters
+├── super_sampling.rs        # Super-sampling conservation & fused path parity
+└── threading.rs             # Multi-threaded determinism & stress tests
+
+crates/raster-h3-duckdb/tests/it/    # DuckDB binding suites
+├── cell_bbox_pushdown.rs    # cell_wgs84_bbox pushdown soundness
+├── ffi_sql.rs               # Mock C-API callbacks for every registered function
+├── prefetch_resilience.rs   # Prefetch queues under panics and remote mosaics
+├── record_queue.rs          # Bind-side record queue propagates stream failures
+└── spatial_geometry.rs      # WKB geometry emission and hex formatting
+
+tests/it/                    # Root crate: needs the raster_h3 cdylib or bins
+├── duckdb_sql_smoke.rs      # Real SQL through the DuckDB CLI (ignored by default)
+├── multi_engine_e2e.rs      # Cross-engine parity (core, CLI, DataFusion, Python, PostgreSQL, DuckDB)
+├── package_extension.rs     # DuckDB extension packaging tests
+└── pg_extension_e2e.rs      # Real PostgreSQL servers in Docker (ignored by default)
 
 examples/                    # CLI conversion & benchmark examples
 ├── benchmark_deflate.rs     # SIMD Deflate vs flate2 benchmark
@@ -177,24 +236,24 @@ Open a GitHub Issue describing:
 
 ### Submitting Pull Requests
 1. Fork the repository and create a feature branch from `main`
-2. Write or update tests in the appropriate `tests/test_*.rs` file (see project tree above for the 18 modular test suites)
+2. Write or update tests in the matching module of the owning crate's `tests/it/` binary (add a `mod` line to its `main.rs` for a new suite) ([Test Coverage](docs/testing.md) lists each suite by category)
 3. Ensure all tests pass:
    ```bash
-   cargo test
+   cargo test --workspace
    ```
 4. Ensure no compiler warnings or clippy lints:
    ```bash
-   cargo clippy --all-targets
+   cargo clippy --workspace --all-targets
    ```
 5. Ensure documentation builds cleanly:
    ```bash
-   cargo doc --no-deps
+   cargo doc --workspace --no-deps
    ```
 6. If modifying `pmtiles_viewer/`, run the browser debug suite:
    ```bash
    cd pmtiles_viewer/debug && npm test
    ```
-7. Update `README.md` and `CHANGELOG.md` if your change affects the public API
+7. Update `README.md`, `CHANGELOG.md` and the affected [engine deep dive](docs/engines/README.md) if your change affects a public API
 8. Open a pull request with a clear description of what changed and why
 
 ### Code Style

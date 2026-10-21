@@ -7,12 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `h3_polygon_to_cells(geometry, resolution [, containment])` scalar (h3o polyfill) in DuckDB (`BLOB`/`GEOMETRY` → `UBIGINT[]`) and Python, with the `contains_centroid` (default), `contains_boundary`, `intersects_boundary` and `covers` containment modes ([API Reference](docs/api-reference.md#h3_polygon_to_cells)). Backed by `raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb` and a new WKB polygon reader.
+- **Multi-engine Cargo workspace** ([Engines Overview](docs/engines/README.md)): the engine moved to `crates/raster-h3-core`; the DuckDB extension to `crates/raster-h3-duckdb`. The root `raster_h3` crate re-exports every member and still builds `libraster_h3` for DuckDB.
+- `raster-h3-core` `columnar` module: `RecordBatch`/`ColumnSchema` model, `ContinuousBatchReader` / `CategoricalBatchReader`, Arrow C Data and C Stream interface, `RH3IPC01` binary stream and NDJSON writer; `scalar_ops` module with H3 helpers shared by all engines ([Core](docs/engines/core.md)).
+- `raster-h3-datafusion`: DataFusion-style `TableProvider` / `ExecutionPlan` / `ScalarUDFImpl` with projection, filter and limit pushdown ([DataFusion](docs/engines/datafusion.md)).
+- `raster-h3-python` and the `raster-h3` Python package: Arrow PyCapsule stream, Polars IO source (`scan_raster_h3`, `read_raster_h3`), H3 helpers, Parquet/PMTiles exporters; `py3-none-<platform>` wheels built by `.github/workflows/wheels.yml` ([Python & Polars](docs/engines/python-polars.md)).
+- `raster-h3-pg`: PostgreSQL 13–18 extension with `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` SRFs and H3 scalar functions, plus a Docker-based real-server test (`scripts/pg_e2e.sh`, `tests/it/pg_extension_e2e.rs`) ([PostgreSQL](docs/engines/postgresql.md)).
+- `raster-h3-cli`: `ipc`, `jsonl`, `parquet` and `pmtiles` subcommands with strict argument validation ([CLI](docs/engines/cli.md)).
+- `tests/it/multi_engine_e2e.rs`: cross-engine parity on shared synthetic rasters.
+
 ### Changed
+- Bound decoded chunk memory in bytes, not only by queue length: the mosaic prefetcher charges buffers being decoded, queued, aggregated and idle against `decode_budget_bytes` (SQL `decode_budget_mb`, default 256 MiB). Reservations are granted in job order before decoding; a chunk larger than the budget is decoded only when no other is held. Peak usage is reported as `StreamProfile::peak_decoded_bytes`.
+- Account pending compaction groups in bytes; they now count toward `peak_active_bytes`, and `StreamProfile` reports `peak_compaction_bytes` and `forced_compaction_flushes`. An opt-in `compaction_budget_bytes` (SQL `compaction_budget_mb`) decomposes the groups nearest completion into child records once exceeded. Samples and totals are unchanged, but which groups compact then depends on batch timing and can vary between runs; unset, compaction stays deterministic.
+- Index pending compaction groups with per-resolution heaps, so streaming completion checks and the published horizon cost O(log n) per finished group instead of a scan of every pending group per batch. Streaming completion flushes stop once the output buffer reaches its byte limit and resume on the next call.
 - Fuse supersample projection, H3 assignment, and accumulation with reusable per-pixel scratch buffers; avoid repeated certification work and preserve individual quantile sample updates.
 - Use absolute pixel coordinates consistently for indexing, sequential span discovery, and supersampling; remove incremental coordinate stepping and obsolete width-prediction state.
 - Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
 - Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.
 - Document aggregation budgets, spill behavior, and uncertified projected eviction without unconditional process-memory or geometric-skip claims.
+- DuckDB scalar overloads (`h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_to_geometry`, `h3_cell_to_geometry`, `h3_polygon_to_cells`) are registered as scalar function sets. DuckDB before 1.5 rejected the second registration under a name, so only the first overload (e.g. `h3_is_valid(UBIGINT)`) was available there.
+- Reorganise the documentation for the multi-engine workspace: the README is engine-neutral (Engines section after the introduction, topic deep dives at the end), the worked example has DuckDB and Polars versions, DuckDB install/Docker/SQL recipes/client examples moved to the [DuckDB deep dive](docs/engines/duckdb.md), and the Python, PostgreSQL, CLI and DataFusion deep dives gained matching recipes and troubleshooting sections. `docs/api-reference.md` is now titled the DuckDB SQL API Reference.
 
 ### Fixed
 - Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.

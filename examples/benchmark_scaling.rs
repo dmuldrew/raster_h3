@@ -139,47 +139,50 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
         .build()
         .unwrap();
     let mt_4_start = Instant::now();
-    let chunks_res_4: Vec<std::collections::HashMap<u64, H3Accumulator, fxhash::FxBuildHasher>> =
-        pool_4.install(|| {
-            let reader_mt = GeoTiffStreamReader::open(&path).unwrap();
-            let total_chunks = reader_mt.chunk_layout.total_chunks;
-            (0..total_chunks)
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let chunk_reader = GeoTiffStreamReader::open(&path).unwrap();
-                    let mut map =
-                        std::collections::HashMap::with_hasher(fxhash::FxBuildHasher::default());
-                    if let Ok((chunk, decoding)) = chunk_reader.read_chunk(chunk_idx) {
-                        let gt = chunk_reader.metadata.geotransform;
-                        if let tiff::decoder::DecodingResult::F32(ref slice) = decoding {
-                            for r in 0..chunk.height {
-                                let row_y = chunk.row_offset + r;
-                                let row_start = (r * chunk.width) as usize;
-                                for c in 0..chunk.width {
-                                    let col_x = chunk.col_offset + c;
-                                    let val = slice[row_start + c as usize] as f64;
-                                    if val.is_finite() {
-                                        let (lon, lat) =
-                                            gt.pixel_to_coord(col_x as f64, row_y as f64);
-                                        if let Ok(ll) = h3o::LatLng::new(lat, lon) {
-                                            let cell = ll.to_cell(
-                                                h3o::Resolution::try_from(resolution).unwrap(),
-                                            );
-                                            map.entry(u64::from(cell))
-                                                .and_modify(|acc: &mut H3Accumulator| {
-                                                    acc.update(val)
-                                                })
-                                                .or_insert_with(|| H3Accumulator::new(val));
-                                        }
+    let chunks_res_4: Vec<
+        std::collections::HashMap<
+            u64,
+            H3Accumulator,
+            raster_h3::aggregator::cell_hash::H3BuildHasher,
+        >,
+    > = pool_4.install(|| {
+        let reader_mt = GeoTiffStreamReader::open(&path).unwrap();
+        let total_chunks = reader_mt.chunk_layout.total_chunks;
+        (0..total_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let chunk_reader = GeoTiffStreamReader::open(&path).unwrap();
+                let mut map = std::collections::HashMap::with_hasher(
+                    raster_h3::aggregator::cell_hash::H3BuildHasher,
+                );
+                if let Ok((chunk, decoding)) = chunk_reader.read_chunk(chunk_idx) {
+                    let gt = chunk_reader.metadata.geotransform;
+                    if let tiff::decoder::DecodingResult::F32(ref slice) = decoding {
+                        for r in 0..chunk.height {
+                            let row_y = chunk.row_offset + r;
+                            let row_start = (r * chunk.width) as usize;
+                            for c in 0..chunk.width {
+                                let col_x = chunk.col_offset + c;
+                                let val = slice[row_start + c as usize] as f64;
+                                if val.is_finite() {
+                                    let (lon, lat) = gt.pixel_to_coord(col_x as f64, row_y as f64);
+                                    if let Ok(ll) = h3o::LatLng::new(lat, lon) {
+                                        let cell = ll.to_cell(
+                                            h3o::Resolution::try_from(resolution).unwrap(),
+                                        );
+                                        map.entry(u64::from(cell))
+                                            .and_modify(|acc: &mut H3Accumulator| acc.update(val))
+                                            .or_insert_with(|| H3Accumulator::new(val));
                                     }
                                 }
                             }
                         }
                     }
-                    map
-                })
-                .collect()
-        });
+                }
+                map
+            })
+            .collect()
+    });
     let mt_4_duration = mt_4_start.elapsed();
     let mt_4_time_ms = mt_4_duration.as_secs_f64() * 1000.0;
     let mt_4_mpps = (total_pixels as f64 / mt_4_duration.as_secs_f64()) / 1_000_000.0;
@@ -191,47 +194,50 @@ fn run_scaling_benchmark(width: u32, height: u32, resolution: u8) -> BenchmarkRe
         .build()
         .unwrap();
     let mt_8_start = Instant::now();
-    let chunks_res_8: Vec<std::collections::HashMap<u64, H3Accumulator, fxhash::FxBuildHasher>> =
-        pool_8.install(|| {
-            let reader_mt = GeoTiffStreamReader::open(&path).unwrap();
-            let total_chunks = reader_mt.chunk_layout.total_chunks;
-            (0..total_chunks)
-                .into_par_iter()
-                .map(|chunk_idx| {
-                    let chunk_reader = GeoTiffStreamReader::open(&path).unwrap();
-                    let mut map =
-                        std::collections::HashMap::with_hasher(fxhash::FxBuildHasher::default());
-                    if let Ok((chunk, decoding)) = chunk_reader.read_chunk(chunk_idx) {
-                        let gt = chunk_reader.metadata.geotransform;
-                        if let tiff::decoder::DecodingResult::F32(ref slice) = decoding {
-                            for r in 0..chunk.height {
-                                let row_y = chunk.row_offset + r;
-                                let row_start = (r * chunk.width) as usize;
-                                for c in 0..chunk.width {
-                                    let col_x = chunk.col_offset + c;
-                                    let val = slice[row_start + c as usize] as f64;
-                                    if val.is_finite() {
-                                        let (lon, lat) =
-                                            gt.pixel_to_coord(col_x as f64, row_y as f64);
-                                        if let Ok(ll) = h3o::LatLng::new(lat, lon) {
-                                            let cell = ll.to_cell(
-                                                h3o::Resolution::try_from(resolution).unwrap(),
-                                            );
-                                            map.entry(u64::from(cell))
-                                                .and_modify(|acc: &mut H3Accumulator| {
-                                                    acc.update(val)
-                                                })
-                                                .or_insert_with(|| H3Accumulator::new(val));
-                                        }
+    let chunks_res_8: Vec<
+        std::collections::HashMap<
+            u64,
+            H3Accumulator,
+            raster_h3::aggregator::cell_hash::H3BuildHasher,
+        >,
+    > = pool_8.install(|| {
+        let reader_mt = GeoTiffStreamReader::open(&path).unwrap();
+        let total_chunks = reader_mt.chunk_layout.total_chunks;
+        (0..total_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let chunk_reader = GeoTiffStreamReader::open(&path).unwrap();
+                let mut map = std::collections::HashMap::with_hasher(
+                    raster_h3::aggregator::cell_hash::H3BuildHasher,
+                );
+                if let Ok((chunk, decoding)) = chunk_reader.read_chunk(chunk_idx) {
+                    let gt = chunk_reader.metadata.geotransform;
+                    if let tiff::decoder::DecodingResult::F32(ref slice) = decoding {
+                        for r in 0..chunk.height {
+                            let row_y = chunk.row_offset + r;
+                            let row_start = (r * chunk.width) as usize;
+                            for c in 0..chunk.width {
+                                let col_x = chunk.col_offset + c;
+                                let val = slice[row_start + c as usize] as f64;
+                                if val.is_finite() {
+                                    let (lon, lat) = gt.pixel_to_coord(col_x as f64, row_y as f64);
+                                    if let Ok(ll) = h3o::LatLng::new(lat, lon) {
+                                        let cell = ll.to_cell(
+                                            h3o::Resolution::try_from(resolution).unwrap(),
+                                        );
+                                        map.entry(u64::from(cell))
+                                            .and_modify(|acc: &mut H3Accumulator| acc.update(val))
+                                            .or_insert_with(|| H3Accumulator::new(val));
                                     }
                                 }
                             }
                         }
                     }
-                    map
-                })
-                .collect()
-        });
+                }
+                map
+            })
+            .collect()
+    });
     let mt_8_duration = mt_8_start.elapsed();
     let mt_8_time_ms = mt_8_duration.as_secs_f64() * 1000.0;
     let mt_8_mpps = (total_pixels as f64 / mt_8_duration.as_secs_f64()) / 1_000_000.0;
