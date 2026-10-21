@@ -277,25 +277,25 @@ fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
         lib_stem,
         std::env::consts::DLL_SUFFIX
     ));
-    if !lib_path.exists() {
-        // Build into the same profile directory the test executable runs from.
-        let mut cmd = Command::new("cargo");
-        cmd.args(["build", "-p", pkg, "--lib"]);
-        if dir.file_name().is_some_and(|n| n == "release") {
-            cmd.arg("--release");
-        }
-        // With `--target <triple>`, artifacts land in `target/<triple>/<profile>`.
-        if let Some(triple) = dir
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .filter(|n| n.matches('-').count() >= 2)
-        {
-            cmd.args(["--target", triple]);
-        }
-        let status = cmd.status().expect("invoke cargo build");
-        assert!(status.success(), "cargo build -p {pkg} failed");
+    // Always build, even when the file exists: `cargo test` refreshes the cdylib only under
+    // `deps/`, so a copy left in the profile directory by an earlier build can be stale.
+    // Cargo makes this a no-op when the library is already up to date.
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", pkg, "--lib"]);
+    if dir.file_name().is_some_and(|n| n == "release") {
+        cmd.arg("--release");
     }
+    // With `--target <triple>`, artifacts land in `target/<triple>/<profile>`.
+    if let Some(triple) = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| n.matches('-').count() >= 2)
+    {
+        cmd.args(["--target", triple]);
+    }
+    let status = cmd.status().expect("invoke cargo build");
+    assert!(status.success(), "cargo build -p {pkg} failed");
     assert!(
         lib_path.exists(),
         "Expected shared library at {}",
