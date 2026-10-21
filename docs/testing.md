@@ -8,13 +8,13 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 31 modules, 1 binary | 277 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 32 modules, 1 binary | 278 |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
 | [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 10 |
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 10 (7 need `pg-extension`) |
-| [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 7 |
+| [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
 | Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 188 |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
@@ -202,6 +202,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | :--- | :--- |
 | [`duckdb/spatial_geometry.rs`](../crates/raster-h3-duckdb/tests/it/spatial_geometry.rs) (10) | WKB for every resolution, Class III pentagons and edge-crossing cells; WKB vs `GEOMETRY` byte equality; hex-string input; invalid cells; DuckDB version parsing and geometry column indices under projection. |
 | [`core/geodetic_reference.rs`](../crates/raster-h3-core/tests/it/geodetic_reference.rs) | `wkb_buffer_capacity_all_resolutions_pentagons_and_icosahedron_edges`. |
+| [`core/polygon_to_cells.rs`](../crates/raster-h3-core/tests/it/polygon_to_cells.rs) (1) | POLYGON/MULTIPOLYGON WKB polyfill against direct `h3o` output, including holes, overlapping members, four containment modes and two resolutions. |
 | [`duckdb/spatial_geometry.rs`](../crates/raster-h3-duckdb/tests/it/spatial_geometry.rs) | `test_wkb_ogc_compliance`, `test_fast_hex_formatting`. |
 | [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) | `h3_to_wkb_returns_core_wkb_including_pentagons`: the `bytea` from `pg_h3_to_wkb` equals the core WKB, including 10-vertex pentagons. |
 | Unit: `encoding/wkb.rs` (6), `encoding/fast_hex.rs` (2) | Ring construction, dateline unwrapping, hex formatting/parsing. |
@@ -227,8 +228,8 @@ See [PMTiles & Multi-Resolution](pmtiles.md).
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (5) | Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, continuous scans with projection pushdown, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
-| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (1, ignored) | Real SQL through the DuckDB CLI against the built library: export parameters and results; `h3_polygon_to_cells` checks all four containment modes and invalid WKB returns NULL. |
+| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (5) | Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
+| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (4, ignored) | Real SQL through DuckDB v1.2.0 and v1.5.6: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 to serialize native geometry as WKB. |
 | [`root/package_extension.rs`](../tests/it/package_extension.rs) (2) | Extension footer layout: custom section headers, ABI fields, version and platform strings, zeroed signature, gzip output. |
 | Unit: `raster-h3-duckdb` (28) | `ffi/duckdb_c.rs` (9: `duckdb_string_t` layout), `ffi/mod.rs` (3), `bind_utils/parsing.rs` (6), `bind_helper.rs` (2), `chunk_writer.rs` (3), `record_queue.rs` (1), `scalar.rs` (4). |
 
@@ -238,7 +239,7 @@ See [DuckDB](engines/duckdb.md).
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (3) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters. |
+| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
 | [`root/pg_extension_e2e.rs`](../tests/it/pg_extension_e2e.rs) (1, ignored) | Builds the PostgreSQL module in Docker, loads it into `postgres:<major>` for each `RASTER_H3_PG_VERSIONS`, compares `psql` output with in-process SRFs and checks that bad `bbox`/`h3_res` raise SQL errors without breaking the session. |
 | Unit: `raster-h3-core` columnar (4), `scalar_ops.rs` (6) | Arrow C stream round trip, `RH3IPC01` round trip, scalar helpers. |
 | [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) (8) | Each `ContinuousRasterTableProvider` builder option equals a core `ContinuousBatchReader` run with the same config and changes the output: `with_nodata` (drops exactly the matching pixels), `with_sampling`, `with_band` (0 clamps to 1), `with_spectral_formula`, `with_quantiles` (extra columns, projectable), `with_min_count`/`with_min_mean`/`with_max_mean` intersected with pushed `MinCount`/`MinMean`/`MaxMean` (the stricter bound wins), `with_compact` (mass conserved; adjacent resolutions rejected), `with_overlap_rule` on a two-file source. |
@@ -290,7 +291,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 
 | Test | Gate | How to run |
 | :--- | :--- | :--- |
-| `duckdb_sql_smoke::real_sql_export_parameters_and_results` (root) | `#[ignore]`; needs the DuckDB CLI and a built library | `cargo build --release --lib && cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` (`DUCKDB_BIN`, `RASTER_H3_LIBRARY` select the binary and library) |
+| `duckdb_sql_smoke` (4 root tests) | `#[ignore]`; needs the DuckDB CLI and a built library; v1.5.6 needs network access to install DuckDB Spatial | `cargo build --release --lib && DUCKDB_BIN=/path/to/duckdb cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` (`DUCKDB_VERSION`, `DUCKDB_BIN`, and `RASTER_H3_LIBRARY` select the footer version, CLI, and library) |
 | `pg_extension_e2e::pg_extension_in_real_server` (root) | `#[ignore]`; needs Docker | `cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture` (`RASTER_H3_PG_VERSIONS=14,16,18`, `RASTER_H3_PG_E2E_KEEP=1`) |
 | 4 × `codecs` LZW Hawaii parity, 2 × `horizon_streaming` Hawaii aggregation (core) | `#[ignore]`; need `data/CFL_HI.tif` / `data/LF2024_FBFM40_HI.tif` | Download the datasets into the workspace-root `data/`, then `-- --ignored`. They fail explicitly if the files are missing. |
 | `super_sampling::benchmark_supersampling` (core) | `#[ignore]` | `cargo test --release -p raster-h3-core --test it benchmark_supersampling -- --ignored --nocapture` |
@@ -303,7 +304,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | Workflow | Command | Covers |
 | :--- | :--- | :--- |
 | [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded) |
-| `ci.yml` | `cargo build --release --lib` then `cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` | Real-SQL DuckDB smoke test against the CLI CI downloads (v1.2.0) |
+| `ci.yml` | `cargo build --release --lib` then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs | Real-SQL coverage on both DuckDB versions, packaging with each CLI's `PRAGMA platform` tag |
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
 | [`manual-tests.yml`](../.github/workflows/manual-tests.yml) (manual) | `cargo test [--release] --no-fail-fast -p <engine>` plus `--features pg-extension` for `pg`/`all` (not on Windows) | Any engine (`all`, `core`, `duckdb`, `datafusion`, `cli`, `python`, `pg`, `root`) on one or all of Linux amd64/arm64, macOS arm64 and Windows, for any branch, tag or SHA, with optional libtest arguments |
@@ -326,8 +327,5 @@ name any branch, even one without the file.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - No Python-side test covers `scan_raster_h3` projection, predicate or `n_rows` pushdown
   into Polars; it needs `polars` installed.
-- Real DuckDB SQL tests only run against DuckDB v1.2.0.
-- `h3_parquet_to_pmtiles` and the raster scans are tested through the mock C API, not real SQL.
-- `h3_cell_to_geometry` has no test.
-- `h3_polygon_to_cells` has no cross-engine or `h3o` reference check.
+- `h3_parquet_to_pmtiles` with a nonexistent `h3_column` silently falls back to auto-detect/column 0 (`parquet_tiler.rs`) instead of erroring; untested pending a decision.
 - EPSG:6933 and EPSG:7856 have no coverage tests.

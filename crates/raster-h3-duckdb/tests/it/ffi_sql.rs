@@ -1030,6 +1030,21 @@ fn test_extension_init_and_registration_completeness() {
         assert_eq!(sf.ret, DuckDBType::List);
     }
     assert_eq!(polygon_fns[1].params.get(2), Some(&DuckDBType::Varchar));
+    let geometry_aliases: Vec<_> = con
+        .scalar_functions
+        .iter()
+        .filter(|f| f.name == "h3_cell_to_geometry")
+        .collect();
+    assert_eq!(geometry_aliases.len(), 2);
+    assert!(geometry_aliases
+        .iter()
+        .any(|f| f.params == [DuckDBType::UBigInt]));
+    assert!(geometry_aliases
+        .iter()
+        .any(|f| f.params == [DuckDBType::Varchar]));
+    assert!(geometry_aliases
+        .iter()
+        .all(|f| f.ret != DuckDBType::Invalid));
     for sf in &con.scalar_functions {
         assert!(!sf.name.is_empty());
         assert!(!sf.params.is_empty());
@@ -1133,6 +1148,7 @@ fn test_all_scalar_functions_and_null_propagation() {
     let mut out_valid = MockVector::new(4);
     let mut out_wkb = MockVector::new(4);
     let mut out_geom = MockVector::new(4);
+    let mut out_cell_geom = MockVector::new(4);
     unsafe {
         let in_ptr = &mut chunk_u64 as *mut MockDataChunk as duckdb_data_chunk;
         scalar_h3_to_lat(
@@ -1165,6 +1181,11 @@ fn test_all_scalar_functions_and_null_propagation() {
             in_ptr,
             &mut out_geom as *mut MockVector as duckdb_vector,
         );
+        scalar_h3_to_geometry_u64(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_cell_geom as *mut MockVector as duckdb_vector,
+        );
     }
     unsafe {
         let lats = out_lat.data.as_ptr() as *const f64;
@@ -1185,6 +1206,8 @@ fn test_all_scalar_functions_and_null_propagation() {
             "Invalid H3 cell must produce NULL WKB"
         );
         assert_eq!(out_geom.strings[0], out_wkb.strings[0]);
+        assert_eq!(out_cell_geom.strings[0], out_geom.strings[0]);
+        assert!(!out_cell_geom.is_valid(2));
     }
 
     // 3. String scalar functions: string_to_h3, h3_is_valid(VARCHAR), h3_to_wkb(VARCHAR), h3_to_geometry(VARCHAR)
@@ -1197,6 +1220,7 @@ fn test_all_scalar_functions_and_null_propagation() {
     let mut out_valid_s = MockVector::new(4);
     let mut out_wkb_s = MockVector::new(4);
     let mut out_geom_s = MockVector::new(4);
+    let mut out_cell_geom_s = MockVector::new(4);
     unsafe {
         let in_ptr = &mut chunk_str as *mut MockDataChunk as duckdb_data_chunk;
         scalar_string_to_h3(
@@ -1219,6 +1243,11 @@ fn test_all_scalar_functions_and_null_propagation() {
             in_ptr,
             &mut out_geom_s as *mut MockVector as duckdb_vector,
         );
+        scalar_h3_to_geometry_str(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_cell_geom_s as *mut MockVector as duckdb_vector,
+        );
         let parsed = out_u64.data.as_ptr();
         let valid_s = out_valid_s.data.as_ptr() as *const bool;
         assert_eq!(*parsed.add(0), valid_cell);
@@ -1228,6 +1257,8 @@ fn test_all_scalar_functions_and_null_propagation() {
         assert_eq!(out_wkb_s.strings[0].len(), 125);
         assert!(!out_wkb_s.is_valid(1));
         assert_eq!(out_geom_s.strings[0].len(), 125);
+        assert_eq!(out_cell_geom_s.strings[0], out_geom_s.strings[0]);
+        assert!(!out_cell_geom_s.is_valid(1));
     }
 
     // 4. Binary scalar functions: h3_cell_to_parent(u64, i64) and h3_cell_to_parent(VARCHAR, i64)

@@ -23,6 +23,7 @@ mod multi_resolution;
 mod multiband_and_query_pushdown;
 mod performance;
 mod pmtiles;
+mod polygon_to_cells;
 mod projected_eviction;
 mod quantiles;
 mod remote_cog;
