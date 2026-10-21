@@ -120,9 +120,8 @@ ORDER BY t.canopy_purity ASC;
 #### Python & Polars
 
 ```python
-# pip install "./crates/raster-h3-python[polars]" geopandas h3
+# pip install "./crates/raster-h3-python[polars]" geopandas
 import geopandas as gpd
-import h3
 import polars as pl
 import raster_h3
 
@@ -133,14 +132,15 @@ canopy_h3 = raster_h3.scan_raster_h3(
 ).rename({"majority_fraction": "canopy_purity"})
 
 # 2. Polyfill vector census tracts into H3 cells & compute population density
-#    (h3.geo_to_cells indexes hexagons whose centroids fall inside the polygon)
+#    (h3_polygon_to_cells defaults to "contains_centroid": hexagons whose centroids fall
+#    inside the polygon; pass "covers" to also catch tracts smaller than a hexagon)
 tracts = gpd.read_file("census_tracts.geojson").to_crs(4326)
 area_sqkm = tracts.to_crs(tracts.estimate_utm_crs()).area / 1e6
 census_tracts_h3 = pl.DataFrame({
     "tract_name": tracts["tract_name"].tolist(),
     "median_income": tracts["median_income"].tolist(),
     "pop_density_per_sqkm": (tracts["total_population"] / area_sqkm).round(0).tolist(),
-    "h3_index": [[h3.str_to_int(c) for c in h3.geo_to_cells(g, 8)] for g in tracts.geometry],
+    "h3_index": [raster_h3.h3_polygon_to_cells(g.wkb, 8) for g in tracts.geometry],
 }).explode("h3_index").with_columns(pl.col("h3_index").cast(pl.UInt64))
 
 # 3. JOIN raster results with census tracts on the shared H3 index
