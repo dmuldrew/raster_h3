@@ -132,6 +132,7 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
 }
 
 /// Export a raster directly to a Parquet / GeoParquet file.
+#[allow(clippy::too_many_arguments)]
 pub fn export_raster_to_parquet(
     input_path: &str,
     output_path: &Path,
@@ -155,9 +156,11 @@ pub fn export_raster_to_parquet(
         OverlapRule::Cutline,
     )?);
 
-    let mut pq_cfg = ParquetExportConfig::default();
-    pq_cfg.geoparquet = geoparquet;
-    pq_cfg.is_categorical = categorical;
+    let pq_cfg = ParquetExportConfig {
+        geoparquet,
+        is_categorical: categorical,
+        ..Default::default()
+    };
 
     if !categorical {
         let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;

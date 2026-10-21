@@ -116,6 +116,7 @@ fn test_duckdb_extension_footer_layout() {
 }
 
 /// Packages `dummy.so` without `--platform` and returns the footer's platform tag.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn default_platform_tag(duckdb_version: &str) -> String {
     let dir = tempdir().unwrap();
     let so_path = dir.path().join("dummy.so");

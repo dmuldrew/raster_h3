@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CI `lint` job (rustfmt, Clippy with `-D warnings` including the `pg-extension` feature, rustdoc with `-D warnings`) and `msrv` job.
+- Workspace `rust-version = "1.88"` and shared `[workspace.lints]`.
+- `SECURITY.md` and Dependabot configuration for Cargo, GitHub Actions and pip.
+- `raster_h3_core::error::catch_unwind_or` for panic-safe `extern "C"` entry points.
+
+### Fixed
+
+- PostgreSQL scalar functions, `pg_srf_continuous_next`, the `fmgr` text/bytea functions, Python scalar and `h3_polygon_to_cells` exports, and Arrow stream / batch-reader release no longer abort the host process if Rust code panics.
+- Replaced `AtomicUsize::try_update` (Rust 1.95) with `fetch_update` so the crate builds on its declared MSRV.
+- Broken rustdoc link in `RemoteHttpSource::read_exact_range`; all Clippy warnings.
+
 ## [0.4.0] - 2026-10-21
 
 ### Added

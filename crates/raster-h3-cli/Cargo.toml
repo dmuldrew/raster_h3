@@ -2,11 +2,15 @@
 name = "raster-h3-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Command-line utilities for raster_h3 (Arrow IPC / JSONL stdout streaming, Parquet, PMTiles, and GeoTIFF inspection)"
+
+[lints]
+workspace = true
 
 [lib]
 name = "raster_h3_cli"

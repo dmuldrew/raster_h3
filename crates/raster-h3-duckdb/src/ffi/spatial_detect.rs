@@ -76,8 +76,8 @@ pub unsafe fn dlsym_duckdb_symbol(symbol: &[u8]) -> *mut std::ffi::c_void {
 /// Checks if the runtime DuckDB library version is at least (req_major, req_minor)
 pub fn is_duckdb_version_at_least(req_major: u32, req_minor: u32) -> bool {
     unsafe {
-        let sym = crate::ffi::duckdb_c::lookup_api_fn(
-            crate::ffi::duckdb_c::api_index::duckdb_library_version,
+        let sym = lookup_api_fn(
+            api_index::duckdb_library_version,
             "duckdb_library_version\0",
         );
         if !sym.is_null() {

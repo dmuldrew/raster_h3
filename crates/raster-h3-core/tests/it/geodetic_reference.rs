@@ -300,6 +300,8 @@ fn epsg_aliases_match_their_canonical_codes() {
 }
 
 #[test]
+// Golden values keep PROJ's printed form: grouped integer part, ungrouped fraction.
+#[allow(clippy::inconsistent_digit_grouping)]
 fn golden_inverse_wgs84_to_source_all_projections() {
     let cases: &[(u32, &[GoldenCase])] = &[
         (

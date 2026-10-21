@@ -72,16 +72,16 @@ impl<'a> BorrowedSamples<'a> {
     }
     pub fn bytes(self) -> usize {
         match self {
-            Self::U8(v) => std::mem::size_of_val(v),
-            Self::U16(v) => std::mem::size_of_val(v),
-            Self::U32(v) => std::mem::size_of_val(v),
-            Self::U64(v) => std::mem::size_of_val(v),
-            Self::I8(v) => std::mem::size_of_val(v),
-            Self::I16(v) => std::mem::size_of_val(v),
-            Self::I32(v) => std::mem::size_of_val(v),
-            Self::I64(v) => std::mem::size_of_val(v),
-            Self::F32(v) => std::mem::size_of_val(v),
-            Self::F64(v) => std::mem::size_of_val(v),
+            Self::U8(v) => size_of_val(v),
+            Self::U16(v) => size_of_val(v),
+            Self::U32(v) => size_of_val(v),
+            Self::U64(v) => size_of_val(v),
+            Self::I8(v) => size_of_val(v),
+            Self::I16(v) => size_of_val(v),
+            Self::I32(v) => size_of_val(v),
+            Self::I64(v) => size_of_val(v),
+            Self::F32(v) => size_of_val(v),
+            Self::F64(v) => size_of_val(v),
         }
     }
     pub fn all_nodata(self, nodata: Option<f64>) -> bool {

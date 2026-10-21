@@ -76,8 +76,8 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
     match result {
         Ok(success) => success,
         Err(payload) => {
-            let msg = crate::ffi::safe_panic_payload_to_string(payload);
-            crate::ffi::safe_eprintln("[raster_h3] raster_h3_init panicked", &msg);
+            let msg = safe_panic_payload_to_string(payload);
+            safe_eprintln("[raster_h3] raster_h3_init panicked", &msg);
             false
         }
     }
@@ -90,20 +90,20 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
 /// DuckDB passes to this entry point.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_init_c_api(
-    info: crate::ffi::duckdb_c::duckdb_extension_info,
-    access: *const crate::ffi::duckdb_c::duckdb_extension_access,
+    info: duckdb_extension_info,
+    access: *const duckdb_extension_access,
 ) -> bool {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if access.is_null() {
             return false;
         }
         if let Some(get_api) = (*access).get_api {
-            let api = get_api(info, crate::ffi::duckdb_c::DUCKDB_C_API_VERSION.as_ptr());
+            let api = get_api(info, DUCKDB_C_API_VERSION.as_ptr());
             if api.is_null() {
                 // DuckDB has already reported the version mismatch via set_error.
                 return false;
             }
-            crate::ffi::duckdb_c::install_api_table(api);
+            install_api_table(api);
         }
         let get_db = match (*access).get_database {
             Some(f) => f,
@@ -121,8 +121,8 @@ pub unsafe extern "C" fn raster_h3_init_c_api(
         Ok(success) => success,
         Err(payload) => {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let msg = crate::ffi::safe_panic_payload_to_string(payload);
-                crate::ffi::safe_eprintln("[raster_h3] raster_h3_init_c_api panicked", &msg);
+                let msg = safe_panic_payload_to_string(payload);
+                safe_eprintln("[raster_h3] raster_h3_init_c_api panicked", &msg);
                 if !access.is_null() {
                     if let Some(set_err) = (*access).set_error {
                         let err_c =

@@ -1012,7 +1012,7 @@ fn test_extension_init_and_registration_completeness() {
     unsafe {
         raster_h3_duckdb::functions::register_table_function(con_ptr).unwrap();
         raster_h3_duckdb::functions::register_categorical_table_function(con_ptr).unwrap();
-        raster_h3_duckdb::functions::register_scalar_functions(con_ptr).unwrap();
+        register_scalar_functions(con_ptr).unwrap();
         raster_h3_duckdb::functions::register_pmtiles_table_function(con_ptr).unwrap();
         raster_h3_duckdb::functions::register_parquet_table_function(con_ptr).unwrap();
     }

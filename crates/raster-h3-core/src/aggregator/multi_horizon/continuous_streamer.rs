@@ -88,7 +88,7 @@ impl HorizonStreamKernel for ContinuousKernel {
     #[inline(always)]
     fn process_chunk(
         &self,
-        window: &WalkContext,
+        window: &WalkContext<'_>,
         decoding_result: &mut DecodingResult,
         nodata: Option<f64>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
@@ -105,7 +105,7 @@ impl HorizonStreamKernel for ContinuousKernel {
     #[inline(always)]
     fn process_window(
         &self,
-        window: &WalkContext,
+        window: &WalkContext<'_>,
         samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],

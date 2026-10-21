@@ -114,7 +114,7 @@ pub fn apply_horizontal_predictor_u16(data: &mut [u16], data_w: usize, data_h: u
 
 /// Trait abstracting endian decoding and photometric inversion for primitive TIFF samples
 pub trait TiffSample: Copy + Default + 'static {
-    const BYTES: usize = std::mem::size_of::<Self>();
+    const BYTES: usize = size_of::<Self>();
     fn from_le_bytes(bytes: &[u8]) -> Self;
     fn from_be_bytes(bytes: &[u8]) -> Self;
     fn invert_white_is_zero(self) -> Self;
@@ -801,7 +801,7 @@ mod tests {
             let mut out_scalar = vec![0.0f32; size];
             let mut out_neon = vec![0.0f32; size];
 
-            tiff::decoder::fp_predict_f32(&mut raw_bytes_scalar, &mut out_scalar, 1);
+            fp_predict_f32(&mut raw_bytes_scalar, &mut out_scalar, 1);
             decode_fp_predict_f32(&mut raw_bytes_neon, &mut out_neon, 1);
 
             assert_eq!(
@@ -835,7 +835,7 @@ mod tests {
             let mut out_scalar = vec![0.0f64; size];
             let mut out_neon = vec![0.0f64; size];
 
-            tiff::decoder::fp_predict_f64(&mut raw_bytes_scalar, &mut out_scalar, 1);
+            fp_predict_f64(&mut raw_bytes_scalar, &mut out_scalar, 1);
             decode_fp_predict_f64(&mut raw_bytes_neon, &mut out_neon, 1);
 
             assert_eq!(

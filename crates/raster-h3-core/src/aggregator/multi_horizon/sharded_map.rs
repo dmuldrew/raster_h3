@@ -36,7 +36,7 @@ pub trait AccumulatorMerge: Clone + Send + Sync + 'static {
 impl AccumulatorMerge for H3Accumulator {
     fn heap_bytes(&self) -> usize {
         self.quantiles.as_ref().map_or(0, |q| {
-            std::mem::size_of::<QuantileSketch>()
+            size_of::<QuantileSketch>()
                 + table_bytes::<i32, f64>(q.pos_bins.capacity())
                 + table_bytes::<i32, f64>(q.neg_bins.capacity())
         })
@@ -51,7 +51,7 @@ impl AccumulatorMerge for H3Accumulator {
 impl AccumulatorMerge for CategoricalAccumulator {
     fn heap_bytes(&self) -> usize {
         self.heap_counts.as_ref().map_or(0, |h| {
-            std::mem::size_of_val(&**h) + table_bytes::<i64, f64>(h.capacity())
+            size_of_val(&**h) + table_bytes::<i64, f64>(h.capacity())
         })
     }
 
@@ -102,8 +102,8 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
 
     #[inline]
     fn shard_bytes(&self, s: usize) -> usize {
-        super::spill::table_bytes::<u64, A>(self.shards[s].capacity())
-            + self.eviction[s].capacity() * std::mem::size_of::<HexEvictionEntry>()
+        table_bytes::<u64, A>(self.shards[s].capacity())
+            + self.eviction[s].capacity() * size_of::<HexEvictionEntry>()
     }
 
     fn recount_structure(&mut self) {

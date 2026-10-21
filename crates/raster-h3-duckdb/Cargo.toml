@@ -2,11 +2,15 @@
 name = "raster-h3-duckdb"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "DuckDB C-API loadable extension for raster_h3 GeoTIFF to H3 hexagonal aggregation"
+
+[lints]
+workspace = true
 
 [lib]
 name = "raster_h3_duckdb"

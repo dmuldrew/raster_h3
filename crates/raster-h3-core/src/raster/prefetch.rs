@@ -242,7 +242,7 @@ impl<T> OrderedPrefetchQueue<T> {
 /// Allocated bytes of a decoded chunk buffer.
 pub fn decoded_buffer_bytes(buf: &DecodingResult) -> usize {
     fn cap<T>(v: &Vec<T>) -> usize {
-        v.capacity() * std::mem::size_of::<T>()
+        v.capacity() * size_of::<T>()
     }
     match buf {
         DecodingResult::U8(v) => cap(v),
@@ -411,9 +411,11 @@ impl DecodingBufferPool {
         loop {
             match self.pool.steal() {
                 crossbeam_deque::Steal::Success(buf) => {
+                    // `try_update` replaces this on Rust 1.95+, but rust-version is 1.88.
+                    #[allow(deprecated)]
                     let _ = self
                         .count
-                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                             Some(c.saturating_sub(1))
                         });
                     return Some(buf);
@@ -498,7 +500,7 @@ impl PrefetchedChunkReader {
         } else if chunk_indices.len() <= 4 {
             1
         } else {
-            std::thread::available_parallelism()
+            thread::available_parallelism()
                 .map(|p| (p.get().saturating_sub(2)).clamp(4, 12))
                 .unwrap_or(6)
         };
@@ -681,7 +683,7 @@ impl PrefetchedMosaicReader {
         } else if mosaic.chunk_refs.len() <= 4 {
             1
         } else {
-            std::thread::available_parallelism()
+            thread::available_parallelism()
                 .map(|p| (p.get().saturating_sub(2)).clamp(4, 12))
                 .unwrap_or(6)
         };
@@ -777,7 +779,7 @@ impl PrefetchedMosaicReader {
                 };
 
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut decoders: Vec<Option<ChunkDecoder>> =
+                    let mut decoders: Vec<Option<ChunkDecoder<'_>>> =
                         (0..worker_mosaic.tiles.len()).map(|_| None).collect();
 
                     loop {
@@ -925,14 +927,14 @@ mod tests {
         };
         let second = spawn(2);
         let first = spawn(1);
-        thread::sleep(std::time::Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         assert!(order.lock().unwrap().is_empty());
         assert_eq!(budget.used_bytes(), 60);
 
         // Returning job 0's buffer frees room for job 1 only.
         budget.settle(60, 0);
         let charged1 = first.join().unwrap();
-        thread::sleep(std::time::Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         assert_eq!(*order.lock().unwrap(), vec![1]);
         budget.settle(charged1, 0);
         second.join().unwrap();
@@ -993,7 +995,7 @@ mod tests {
             let budget = Arc::clone(&budget);
             thread::spawn(move || budget.acquire(2, 1).is_none())
         };
-        thread::sleep(std::time::Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(20));
         budget.close();
         assert!(waiter.join().unwrap());
         assert!(later.join().unwrap());
@@ -1011,7 +1013,7 @@ mod tests {
         });
         queue.push(5, Ok::<_, &str>(5));
         queue.fail(Err("decoder could not open"));
-        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let result = rx.recv_timeout(Duration::from_secs(2));
         // Also unblock the consumer if this regresses, so a failed test leaves no waiter.
         queue.close();
         consumer.join().unwrap();
@@ -1241,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_lock_free_buffer_pool_concurrency() {
-        let pool = Arc::new(crossbeam_deque::Injector::new());
+        let pool = Arc::new(Injector::new());
         let num_threads = 8;
         let iters_per_thread = 2000;
 

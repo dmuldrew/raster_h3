@@ -362,7 +362,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 ///
 /// # Safety
 /// `con` must be a valid, open DuckDB connection.
-pub unsafe fn register_table_function(con: duckdb_connection) -> std::result::Result<(), String> {
+pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), String> {
     let names = [
         "h3_raster_continuous_aggregate",
         "h3_raster_continuous",

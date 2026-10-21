@@ -71,7 +71,7 @@ impl<A: SpillAccumulator> AccumulatorMerge for TileCells<A> {
         self.0.extend(other.0.iter().cloned());
     }
     fn heap_bytes(&self) -> usize {
-        self.0.capacity() * std::mem::size_of::<(u64, A)>()
+        self.0.capacity() * size_of::<(u64, A)>()
             + self.0.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>()
     }
 }
@@ -91,7 +91,7 @@ impl<A: SpillAccumulator> SpillAccumulator for TileCells<A> {
         let count = usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "overview tile length overflow")
         })?;
-        if count > limit / std::mem::size_of::<(u64, A)>() {
+        if count > limit / size_of::<(u64, A)>() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "overview tile exceeds budget",

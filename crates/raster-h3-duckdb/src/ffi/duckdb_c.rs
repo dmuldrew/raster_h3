@@ -212,15 +212,10 @@ pub struct duckdb_extension_access {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<duckdb_extension_access>() == 3 * std::mem::size_of::<usize>());
+    assert!(size_of::<duckdb_extension_access>() == 3 * size_of::<usize>());
     assert!(core::mem::offset_of!(duckdb_extension_access, set_error) == 0);
-    assert!(
-        core::mem::offset_of!(duckdb_extension_access, get_database)
-            == std::mem::size_of::<usize>()
-    );
-    assert!(
-        core::mem::offset_of!(duckdb_extension_access, get_api) == 2 * std::mem::size_of::<usize>()
-    );
+    assert!(core::mem::offset_of!(duckdb_extension_access, get_database) == size_of::<usize>());
+    assert!(core::mem::offset_of!(duckdb_extension_access, get_api) == 2 * size_of::<usize>());
 };
 
 #[repr(C)]
@@ -550,18 +545,15 @@ mod tests {
 
     #[test]
     fn test_duckdb_extension_access_layout_and_offsets() {
-        assert_eq!(
-            std::mem::size_of::<duckdb_extension_access>(),
-            3 * std::mem::size_of::<usize>()
-        );
+        assert_eq!(size_of::<duckdb_extension_access>(), 3 * size_of::<usize>());
         assert_eq!(core::mem::offset_of!(duckdb_extension_access, set_error), 0);
         assert_eq!(
             core::mem::offset_of!(duckdb_extension_access, get_database),
-            std::mem::size_of::<usize>()
+            size_of::<usize>()
         );
         assert_eq!(
             core::mem::offset_of!(duckdb_extension_access, get_api),
-            2 * std::mem::size_of::<usize>()
+            2 * size_of::<usize>()
         );
     }
 
@@ -580,10 +572,10 @@ mod tests {
 
     #[test]
     fn test_duckdb_string_t_memory_layout_and_alignment() {
-        assert_eq!(std::mem::size_of::<duckdb_string_t>(), 16);
-        assert_eq!(std::mem::size_of::<DuckDbStringInlined>(), 16);
-        assert_eq!(std::mem::size_of::<DuckDbStringPointer>(), 16);
-        assert_eq!(std::mem::align_of::<duckdb_string_t>(), 8);
+        assert_eq!(size_of::<duckdb_string_t>(), 16);
+        assert_eq!(size_of::<DuckDbStringInlined>(), 16);
+        assert_eq!(size_of::<DuckDbStringPointer>(), 16);
+        assert_eq!(align_of::<duckdb_string_t>(), 8);
     }
 
     #[test]

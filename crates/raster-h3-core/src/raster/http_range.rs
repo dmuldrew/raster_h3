@@ -663,7 +663,7 @@ impl RemoteHttpSource {
     /// Read exactly `len` bytes starting at `offset`.
     ///
     /// # Strict Read Contract
-    /// Unlike [`read_range`], this method guarantees returning exactly `len` bytes.
+    /// Unlike [`read_range`](Self::read_range), this method guarantees returning exactly `len` bytes.
     /// If `offset + len > total_size` or if the underlying transport fails to read
     /// the full requested range, it returns an error rather than a partial buffer.
     pub fn read_exact_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
