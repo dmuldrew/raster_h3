@@ -350,10 +350,18 @@ fn test_parquet_to_pmtiles_end_to_end() {
     assert_eq!(&header[0..7], b"PMTiles");
     assert_eq!(header[7], 3);
 
-    let case_insensitive_summary =
-        H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, Some("H3_INDEX"))
-            .unwrap();
+    let case_insensitive_output_dir = tempfile::tempdir().unwrap();
+    let case_insensitive_pmtiles_path = case_insensitive_output_dir
+        .path()
+        .join("case-insensitive.pmtiles");
+    let case_insensitive_summary = H3PmtilesTiler::process_parquet_to_pmtiles(
+        &parquet_path,
+        &case_insensitive_pmtiles_path,
+        Some("H3_INDEX"),
+    )
+    .unwrap();
     assert_eq!(case_insensitive_summary.total_features, 2);
+    assert!(case_insensitive_pmtiles_path.exists());
 }
 
 #[test]
