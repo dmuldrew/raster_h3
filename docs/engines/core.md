@@ -47,6 +47,12 @@ Every adapter follows the same steps:
    it returns `Ok(0)` (end of stream) or an error. Errors latch: a failed stream keeps
    returning the error instead of reporting a clean EOF.
 
+`custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
+or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
+accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`,
+`31466`–`31469`, `23028`–`23038`) and any PROJ string with `+towgs84`. Grid shifts
+(`+nadgrids`, `+datum=NAD27`) are rejected. See [Datum Shifts](../crs-and-projection.md#datum-shifts).
+
 ## Columnar Model
 
 | Type | Role |
