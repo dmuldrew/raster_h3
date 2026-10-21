@@ -252,7 +252,7 @@ SELECT * FROM h3_parquet_to_pmtiles(
 ### Named Parameters
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `h3_column` | `VARCHAR` | `None` (auto-detect) | Name of the H3 index column (supports BIGINT/UBIGINT integer or hex VARCHAR). Alias: `h3_col`. |
+| `h3_column` | `VARCHAR` | `None` (auto-detect) | Name of the H3 index column (supports BIGINT/UBIGINT integer or hex VARCHAR; matching is case-insensitive). An explicitly named column that is not found is an error listing available columns. Alias: `h3_col`. |
 
 ### Output Schema (1 Summary Row)
 Returns the same 7-column summary schema as `h3_raster_to_pmtiles` (`total_hexagons`, `pmtiles_size_bytes`, `min_zoom`, `max_zoom`, `elapsed_ms`, `output_path`, `status`).

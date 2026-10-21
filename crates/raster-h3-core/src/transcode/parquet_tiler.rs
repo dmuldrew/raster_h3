@@ -162,33 +162,37 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
     let schema = reader.metadata().file_metadata().schema_descr();
 
     // Identify H3 index column
-    let mut h3_col_idx = None;
-    if let Some(target) = h3_column_name {
-        for (idx, field) in schema.columns().iter().enumerate() {
-            if field.name().eq_ignore_ascii_case(target) {
-                h3_col_idx = Some(idx);
-                break;
-            }
-        }
-    }
-
-    if h3_col_idx.is_none() {
-        // Auto-detect common H3 column names: h3_index, h3_hex, h3, cell, hex, or column 0
-        for (idx, field) in schema.columns().iter().enumerate() {
-            let name = field.name().to_ascii_lowercase();
-            if name == "h3_index"
-                || name == "h3_hex"
-                || name == "h3"
-                || name == "cell"
-                || name == "hex"
-            {
-                h3_col_idx = Some(idx);
-                break;
-            }
-        }
-    }
-
-    let h3_idx = h3_col_idx.unwrap_or(0);
+    let h3_idx = if let Some(target) = h3_column_name {
+        schema
+            .columns()
+            .iter()
+            .position(|field| field.name().eq_ignore_ascii_case(target))
+            .ok_or_else(|| {
+                let available = schema
+                    .columns()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "H3 column '{target}' not found in Parquet file; available columns: {available}"
+                    ),
+                )
+            })?
+    } else {
+        schema
+            .columns()
+            .iter()
+            .position(|field| {
+                matches!(
+                    field.name().to_ascii_lowercase().as_str(),
+                    "h3_index" | "h3_hex" | "h3" | "cell" | "hex"
+                )
+            })
+            .unwrap_or(0)
+    };
 
     // Pre-scan row group extents to compute global bounds and row group horizons
     let mut rg_extents = Vec::with_capacity(num_rgs);

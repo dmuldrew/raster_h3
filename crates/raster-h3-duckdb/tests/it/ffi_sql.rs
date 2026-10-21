@@ -1727,4 +1727,57 @@ fn test_export_table_functions_with_crs_override() {
     let transcoded_count = unsafe { *(pp_chunk.vectors[0].data.as_ptr() as *const i64) };
     assert_eq!(transcoded_count, pq_hex_count);
     assert!(transcode_pmtiles_path.exists());
+
+    let invalid_transcode_pmtiles_path = out_dir.path().join("invalid-column.pmtiles");
+    let mut invalid_pp_named = HashMap::new();
+    invalid_pp_named.insert(
+        "h3_column".to_string(),
+        MockVal::Str("missing_h3_column".to_string()),
+    );
+    let mut invalid_pp_bind = MockBindContext::new(
+        vec![
+            MockVal::Str(parquet_path.to_string_lossy().into_owned()),
+            MockVal::Str(
+                invalid_transcode_pmtiles_path
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ],
+        invalid_pp_named,
+    );
+    unsafe {
+        parquet_pmtiles_bind(&mut invalid_pp_bind as *mut MockBindContext as duckdb_bind_info);
+    }
+    assert!(invalid_pp_bind.error.is_none());
+
+    let mut invalid_pp_init = MockInitContext::new(invalid_pp_bind.bind_data, (0..7).collect());
+    unsafe {
+        parquet_pmtiles_init(&mut invalid_pp_init as *mut MockInitContext as duckdb_init_info);
+    }
+    let mut invalid_pp_func = MockFuncContext {
+        bind_data: invalid_pp_bind.bind_data,
+        init_data: invalid_pp_init.init_data,
+        local_init_data: ptr::null_mut(),
+        error: None,
+    };
+    let mut invalid_pp_chunk = MockDataChunk::new(7, 2048);
+    unsafe {
+        parquet_pmtiles_scan(
+            &mut invalid_pp_func as *mut MockFuncContext as duckdb_function_info,
+            &mut invalid_pp_chunk as *mut MockDataChunk as duckdb_data_chunk,
+        );
+    }
+    assert_eq!(invalid_pp_chunk.size, 1);
+    let invalid_pp_status = std::str::from_utf8(&invalid_pp_chunk.vectors[6].strings[0]).unwrap();
+    assert!(
+        invalid_pp_status.starts_with("ERROR:"),
+        "{invalid_pp_status}"
+    );
+    assert!(
+        invalid_pp_status.contains("missing_h3_column"),
+        "{invalid_pp_status}"
+    );
+    let invalid_count = unsafe { *(invalid_pp_chunk.vectors[0].data.as_ptr() as *const i64) };
+    assert_eq!(invalid_count, 0);
+    assert!(!invalid_transcode_pmtiles_path.exists());
 }

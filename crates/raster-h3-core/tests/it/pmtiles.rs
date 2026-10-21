@@ -316,6 +316,23 @@ fn test_parquet_to_pmtiles_end_to_end() {
     writer.close().unwrap();
 
     // Test process_parquet_to_pmtiles
+    let invalid_output_dir = tempfile::tempdir().unwrap();
+    let invalid_pmtiles_path = invalid_output_dir.path().join("missing-column.pmtiles");
+    let error = H3PmtilesTiler::process_parquet_to_pmtiles(
+        &parquet_path,
+        &invalid_pmtiles_path,
+        Some("missing_h3_column"),
+    )
+    .err()
+    .unwrap();
+    let error_message = error.to_string();
+    assert!(
+        error_message.contains("missing_h3_column"),
+        "{error_message}"
+    );
+    assert!(error_message.contains("h3_index"), "{error_message}");
+    assert!(!invalid_pmtiles_path.exists());
+
     let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
     let pmtiles_path = pmtiles_tmp.to_str().unwrap().to_string();
 
@@ -332,6 +349,11 @@ fn test_parquet_to_pmtiles_end_to_end() {
     f.read_exact(&mut header).unwrap();
     assert_eq!(&header[0..7], b"PMTiles");
     assert_eq!(header[7], 3);
+
+    let case_insensitive_summary =
+        H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, Some("H3_INDEX"))
+            .unwrap();
+    assert_eq!(case_insensitive_summary.total_features, 2);
 }
 
 #[test]
