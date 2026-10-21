@@ -26,7 +26,11 @@ pub unsafe fn install_api_table(table: *const c_void) {
         API_TABLE_INSTALLED.store(false, Ordering::Release);
         return;
     }
-    let entries = std::slice::from_raw_parts(table as *const *mut c_void, API_TABLE_LEN);
+    // SAFETY: per the caller contract `table` points to at least `API_TABLE_LEN`
+    // pointer-sized, pointer-aligned function slots (a `duckdb_ext_api_v1`). We
+    // copy them out immediately because DuckDB only keeps the table alive
+    // during extension init.
+    let entries = unsafe { std::slice::from_raw_parts(table as *const *mut c_void, API_TABLE_LEN) };
     for (slot, &func) in API_TABLE.iter().zip(entries) {
         slot.store(func, Ordering::Relaxed);
     }
@@ -36,6 +40,10 @@ pub unsafe fn install_api_table(table: *const c_void) {
 /// Resolves the DuckDB C API function at `index` of `duckdb_ext_api_v1`.
 /// Without an installed table (unit tests, hosts that export the C API)
 /// it falls back to looking `name` up in the running process.
+///
+/// # Safety
+/// `name` must be NUL-terminated and `index` must be its position in
+/// `duckdb_ext_api_v1`.
 #[inline(always)]
 unsafe fn resolve_api_fn(
     index: usize,
@@ -45,7 +53,9 @@ unsafe fn resolve_api_fn(
     let func = if !API_TABLE_INSTALLED.load(Ordering::Acquire) {
         let mut func = fallback.load(Ordering::Relaxed);
         if func.is_null() {
-            func = crate::ffi::spatial_detect::dlsym_duckdb_symbol(name.as_bytes());
+            // SAFETY: `name` is NUL-terminated (caller contract); the caller is
+            // responsible for transmuting the result to the matching signature.
+            func = unsafe { crate::ffi::spatial_detect::dlsym_duckdb_symbol(name.as_bytes()) };
             fallback.store(func, Ordering::Relaxed);
         }
         func
@@ -66,7 +76,8 @@ unsafe fn resolve_api_fn(
 /// `duckdb_ext_api_v1`.
 pub unsafe fn lookup_api_fn(index: usize, name: &str) -> *mut c_void {
     if !API_TABLE_INSTALLED.load(Ordering::Acquire) {
-        crate::ffi::spatial_detect::dlsym_duckdb_symbol(name.as_bytes())
+        // SAFETY: `name` is NUL-terminated (caller contract).
+        unsafe { crate::ffi::spatial_detect::dlsym_duckdb_symbol(name.as_bytes()) }
     } else {
         API_TABLE[index].load(Ordering::Relaxed)
     }
@@ -95,10 +106,18 @@ macro_rules! duckdb_api {
             #[inline(always)]
             pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
                 static FALLBACK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-                let func: unsafe extern "C" fn($($ty),*) $(-> $ret)? = std::mem::transmute(
-                    resolve_api_fn($index, concat!(stringify!($name), "\0"), &FALLBACK),
-                );
-                func($($arg),*)
+                // SAFETY: `resolve_api_fn` never returns null (it panics
+                // instead), and slot `$index` of `duckdb_ext_api_v1` v1.2.0 (or
+                // the exported symbol of the same name) has exactly this C
+                // signature, as transcribed from `duckdb_extension.h`. The name
+                // literal is NUL-terminated by `concat!`. Calling it is then
+                // sound under this wrapper's own contract, which is DuckDB's.
+                unsafe {
+                    let func: unsafe extern "C" fn($($ty),*) $(-> $ret)? = std::mem::transmute(
+                        resolve_api_fn($index, concat!(stringify!($name), "\0"), &FALLBACK),
+                    );
+                    func($($arg),*)
+                }
             }
         )*
 
@@ -246,7 +265,10 @@ impl duckdb_string_t {
     /// variants begin with the length, so either may be active.
     #[inline(always)]
     pub unsafe fn length(&self) -> u32 {
-        self.inlined.length
+        // SAFETY: both variants are `repr(C)` and start with the same `u32`
+        // length at offset 0, so reading it through either is valid once DuckDB
+        // has initialized the value (caller contract).
+        unsafe { self.inlined.length }
     }
 
     /// Borrows the raw bytes (VARCHAR or BLOB payload).
@@ -258,15 +280,21 @@ impl duckdb_string_t {
     /// bytes.
     #[inline(always)]
     pub unsafe fn as_bytes(&self) -> &[u8] {
-        let len = self.length() as usize;
+        // SAFETY: the value was initialized by DuckDB (caller contract).
+        let len = unsafe { self.length() } as usize;
         if len <= 12 {
-            &self.inlined.inlined[..len]
+            // SAFETY: DuckDB stores strings of at most 12 bytes inline, so the
+            // `inlined` variant is the active one.
+            unsafe { &self.inlined.inlined[..len] }
         } else {
-            let ptr = self.pointer.ptr as *const u8;
+            // SAFETY: longer strings use the `pointer` variant.
+            let ptr = unsafe { self.pointer.ptr } as *const u8;
             if ptr.is_null() {
                 &[]
             } else {
-                std::slice::from_raw_parts(ptr, len)
+                // SAFETY: the caller guarantees `ptr` addresses `len` initialized
+                // bytes owned by a vector that outlives the returned borrow.
+                unsafe { std::slice::from_raw_parts(ptr, len) }
             }
         }
     }
@@ -277,7 +305,8 @@ impl duckdb_string_t {
     /// Same as [`Self::as_bytes`].
     #[inline(always)]
     pub unsafe fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).unwrap_or("")
+        // SAFETY: same contract as `as_bytes`, forwarded from our caller.
+        std::str::from_utf8(unsafe { self.as_bytes() }).unwrap_or("")
     }
 }
 
@@ -499,7 +528,9 @@ pub unsafe fn duckdb_validity_is_valid(validity: *mut u64, row: idx_t) -> bool {
     if validity.is_null() {
         true
     } else {
-        duckdb_validity_row_is_valid(validity, row)
+        // SAFETY: non-null mask of a live vector with `row` below its capacity
+        // (caller contract), so the bit DuckDB reads is in bounds.
+        unsafe { duckdb_validity_row_is_valid(validity, row) }
     }
 }
 
@@ -513,16 +544,24 @@ pub unsafe fn duckdb_vector_set_row_invalid(vector: duckdb_vector, row: idx_t) {
     if vector.is_null() {
         return;
     }
-    duckdb_vector_ensure_validity_writable(vector);
-    let validity = duckdb_vector_get_validity(vector);
-    if !validity.is_null() {
-        duckdb_validity_set_row_invalid(validity, row);
+    // SAFETY: `vector` is a live, writable vector and `row` is below its
+    // capacity (caller contract). `ensure_validity_writable` allocates the mask
+    // if needed, and the mask returned afterwards covers the full capacity.
+    unsafe {
+        duckdb_vector_ensure_validity_writable(vector);
+        let validity = duckdb_vector_get_validity(vector);
+        if !validity.is_null() {
+            duckdb_validity_set_row_invalid(validity, row);
+        }
     }
 }
 
 /// Optional lookup of duckdb_vector_size with a fallback, allowing safe execution
 /// inside DuckDB processes and safe testing outside of DuckDB.
 pub fn get_vector_size() -> usize {
+    // SAFETY: the name is NUL-terminated and slot 26 of `duckdb_ext_api_v1` is
+    // `idx_t duckdb_vector_size(void)`, so a non-null result can be transmuted
+    // to that signature and called with no preconditions.
     unsafe {
         // 26: duckdb_vector_size in duckdb_ext_api_v1 (not wrapped; optional here).
         let sym = lookup_api_fn(26, "duckdb_vector_size\0");
@@ -560,7 +599,9 @@ mod tests {
     #[test]
     fn test_duckdb_validity_null_pointer_is_valid() {
         // If validity is NULL, all rows are treated as valid
+        // SAFETY: a null mask is never dereferenced.
         assert!(unsafe { duckdb_validity_is_valid(std::ptr::null_mut(), 0) });
+        // SAFETY: as above.
         assert!(unsafe { duckdb_validity_is_valid(std::ptr::null_mut(), 100) });
     }
 
@@ -587,7 +628,11 @@ mod tests {
                 inlined: [0u8; 12],
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s0.as_str() }, "");
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s0.length() }, 0);
 
         // 2. Lengths 1 to 12 (inlined strings)
@@ -601,8 +646,11 @@ mod tests {
                     inlined,
                 },
             };
+            // SAFETY: the test built this value with the variant matching its length; any
+            // out-of-line pointer refers to a live local buffer of at least `length` bytes.
             assert_eq!(unsafe { s.length() }, len as u32);
             assert_eq!(
+                // SAFETY: inline variant with `length <= 12`.
                 unsafe { s.as_str() },
                 std::str::from_utf8(&raw[..len]).unwrap()
             );
@@ -617,7 +665,11 @@ mod tests {
                 ptr: raw13.as_ptr() as *const c_char,
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s13.length() }, 13);
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s13.as_str() }, "1234567890123");
 
         // 4. Length 15 (standard H3 hex string, e.g. "8828308281fffff")
@@ -629,7 +681,11 @@ mod tests {
                 ptr: h3_hex.as_ptr() as *const c_char,
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s15.length() }, 15);
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s15.as_str() }, "8828308281fffff");
 
         // 5. Length 32 (longer pointer string)
@@ -641,7 +697,11 @@ mod tests {
                 ptr: long_str.as_ptr() as *const c_char,
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s32.length() }, 32);
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s32.as_str() }, "this_is_a_longer_32_byte_string!");
     }
 
@@ -655,6 +715,8 @@ mod tests {
                 ptr: std::ptr::null(),
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s_null.as_str() }, "");
 
         // 2. Inlined string with invalid UTF-8 bytes (should gracefully return "" without panicking)
@@ -664,6 +726,8 @@ mod tests {
                 inlined: [0xFF, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s_invalid_inline.as_str() }, "");
 
         // 3. Pointer string with invalid UTF-8 bytes
@@ -677,6 +741,8 @@ mod tests {
                 ptr: invalid_bytes.as_ptr() as *const c_char,
             },
         };
+        // SAFETY: the test built this value with the variant matching its length; any
+        // out-of-line pointer refers to a live local buffer of at least `length` bytes.
         assert_eq!(unsafe { s_invalid_ptr.as_str() }, "");
     }
 
@@ -700,6 +766,8 @@ mod tests {
         let raw_ptr = Box::into_raw(tracker) as *mut c_void;
         assert!(!flag.load(Ordering::SeqCst));
 
+        // SAFETY: `raw_ptr` came from `Box::into_raw(Box<DropTracker>)` and is
+        // freed exactly once here.
         unsafe {
             crate::functions::bind_utils::delete_boxed::<DropTracker>(raw_ptr);
         }
@@ -709,6 +777,7 @@ mod tests {
         );
 
         // 2. Verify delete_boxed handles null pointer safely without panic
+        // SAFETY: null is explicitly allowed and ignored.
         unsafe {
             crate::functions::bind_utils::delete_boxed::<DropTracker>(std::ptr::null_mut());
         }

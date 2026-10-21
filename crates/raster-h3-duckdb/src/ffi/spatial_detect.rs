@@ -51,12 +51,19 @@ extern "system" {
 /// `symbol` must be NUL-terminated. Transmuting the returned pointer to a
 /// function type is only sound if it matches the symbol's C signature.
 pub unsafe fn dlsym_duckdb_symbol(symbol: &[u8]) -> *mut std::ffi::c_void {
+    debug_assert_eq!(symbol.last(), Some(&0), "symbol must be NUL-terminated");
     #[cfg(unix)]
-    {
+    // SAFETY: `symbol` is NUL-terminated (caller contract) and `RTLD_DEFAULT` is
+    // the platform's pseudo-handle for the global symbol scope; `dlsym` only
+    // reads the name and returns null when the symbol is absent.
+    unsafe {
         dlsym(RTLD_DEFAULT, symbol.as_ptr() as *const _)
     }
     #[cfg(windows)]
-    {
+    // SAFETY: `symbol` is NUL-terminated (caller contract), as is the
+    // "duckdb.dll" literal; `GetModuleHandleA(NULL)` returns the host executable
+    // and neither call takes ownership of anything; both return null on failure.
+    unsafe {
         let mut handle = GetModuleHandleA(std::ptr::null());
         let mut sym = if !handle.is_null() {
             GetProcAddress(handle, symbol.as_ptr() as *const _)
@@ -75,6 +82,9 @@ pub unsafe fn dlsym_duckdb_symbol(symbol: &[u8]) -> *mut std::ffi::c_void {
 
 /// Checks if the runtime DuckDB library version is at least (req_major, req_minor)
 pub fn is_duckdb_version_at_least(req_major: u32, req_minor: u32) -> bool {
+    // SAFETY: the name is NUL-terminated and matches its table index, and
+    // `duckdb_library_version` has signature `const char *(void)`, returning a
+    // static NUL-terminated string (or null, which is checked).
     unsafe {
         let sym = lookup_api_fn(
             api_index::duckdb_library_version,
@@ -113,21 +123,28 @@ pub unsafe fn is_spatial_loaded_query(con: duckdb_connection) -> bool {
         "SELECT 1 FROM duckdb_extensions() WHERE extension_name = 'spatial' AND loaded = true \
          UNION SELECT 1 FROM duckdb_types() WHERE type_name = 'GEOMETRY' LIMIT 1;",
     );
-    let state = duckdb_query(con, query.as_ptr(), &mut result);
-    let is_loaded = if state == DuckDBState::Success {
-        let mut chunk = duckdb_fetch_chunk(result);
-        if chunk.is_null() {
-            false
+    // SAFETY: `con` is a valid open connection (caller contract), `query` is a
+    // NUL-terminated string outliving the call, and `result` is a local the
+    // query fills in. A non-null fetched chunk is owned by us and destroyed
+    // once; `result` is destroyed once on every path, which DuckDB requires
+    // even when the query fails.
+    unsafe {
+        let state = duckdb_query(con, query.as_ptr(), &mut result);
+        let is_loaded = if state == DuckDBState::Success {
+            let mut chunk = duckdb_fetch_chunk(result);
+            if chunk.is_null() {
+                false
+            } else {
+                let has_rows = duckdb_data_chunk_get_size(chunk) > 0;
+                duckdb_destroy_data_chunk(&mut chunk);
+                has_rows
+            }
         } else {
-            let has_rows = duckdb_data_chunk_get_size(chunk) > 0;
-            duckdb_destroy_data_chunk(&mut chunk);
-            has_rows
-        }
-    } else {
-        false
-    };
-    duckdb_destroy_result(&mut result);
-    is_loaded
+            false
+        };
+        duckdb_destroy_result(&mut result);
+        is_loaded
+    }
 }
 
 /// Creates a DuckDB GEOMETRY logical type using the appropriate strategy:
@@ -139,14 +156,19 @@ pub unsafe fn is_spatial_loaded_query(con: duckdb_connection) -> bool {
 /// The DuckDB C API must be initialized. The caller owns the returned
 /// type and must release it with `duckdb_destroy_logical_type`.
 pub unsafe fn create_geometry_logical_type() -> duckdb_logical_type {
-    if is_duckdb_version_at_least(1, 5) {
-        let geom_type = duckdb_create_logical_type(DuckDBType::Geometry);
-        if !geom_type.is_null() {
-            return geom_type;
+    // SAFETY: the C API is initialized (caller contract). `Geometry` (40) is only
+    // requested from DuckDB >= 1.5, which defines it; ownership of the returned
+    // type passes to the caller. `set_alias` copies the NUL-terminated alias.
+    unsafe {
+        if is_duckdb_version_at_least(1, 5) {
+            let geom_type = duckdb_create_logical_type(DuckDBType::Geometry);
+            if !geom_type.is_null() {
+                return geom_type;
+            }
         }
+        let blob_type = duckdb_create_logical_type(DuckDBType::Blob);
+        let alias = to_c_string("GEOMETRY");
+        duckdb_logical_type_set_alias(blob_type, alias.as_ptr());
+        blob_type
     }
-    let blob_type = duckdb_create_logical_type(DuckDBType::Blob);
-    let alias = to_c_string("GEOMETRY");
-    duckdb_logical_type_set_alias(blob_type, alias.as_ptr());
-    blob_type
 }

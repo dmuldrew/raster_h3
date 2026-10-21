@@ -58,7 +58,9 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
 pub unsafe extern "C" fn delete_boxed<T>(data: *mut c_void) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !data.is_null() {
-            drop(Box::from_raw(data.cast::<T>()));
+            // SAFETY: non-null `data` came from `Box::<T>::into_raw` and DuckDB
+            // invokes this destructor exactly once, so it is reclaimed only here.
+            drop(unsafe { Box::from_raw(data.cast::<T>()) });
         }
     })) {
         if let Err(secondary) =
@@ -78,11 +80,17 @@ pub unsafe fn set_table_function_init_data<T: Send + Sync + 'static>(
     info: duckdb_init_info,
     data: T,
 ) {
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(Box::new(data)) as *mut c_void,
-        Some(delete_boxed::<T>),
-    );
+    // SAFETY: `info` is the live init handle (caller contract). DuckDB takes
+    // ownership of the boxed pointer and frees it once via `delete_boxed::<T>`,
+    // the matching type; `Send`/`Sync` bounds cover DuckDB's worker threads
+    // reading the state concurrently (global) or moving it (local).
+    unsafe {
+        duckdb_init_set_init_data(
+            info,
+            Box::into_raw(Box::new(data)) as *mut c_void,
+            Some(delete_boxed::<T>),
+        );
+    }
 }
 
 /// Attach boxed thread-local init state to DuckDB table function lifecycle with Send enforcement
@@ -94,11 +102,17 @@ pub unsafe fn set_table_function_local_init_data<T: Send + 'static>(
     info: duckdb_init_info,
     data: T,
 ) {
-    duckdb_init_set_init_data(
-        info,
-        Box::into_raw(Box::new(data)) as *mut c_void,
-        Some(delete_boxed::<T>),
-    );
+    // SAFETY: `info` is the live init handle (caller contract). DuckDB takes
+    // ownership of the boxed pointer and frees it once via `delete_boxed::<T>`,
+    // the matching type; `Send`/`Sync` bounds cover DuckDB's worker threads
+    // reading the state concurrently (global) or moving it (local).
+    unsafe {
+        duckdb_init_set_init_data(
+            info,
+            Box::into_raw(Box::new(data)) as *mut c_void,
+            Some(delete_boxed::<T>),
+        );
+    }
 }
 
 /// Open a raster mosaic reader from resolved paths, setting DuckDB init error on failure
@@ -118,7 +132,9 @@ pub unsafe fn open_mosaic_or_set_error(
         Err(e) => {
             let err_msg = CString::new(format!("Failed to open raster mosaic: {}", e))
                 .unwrap_or_else(|_| CString::new("Failed to open raster mosaic").unwrap());
-            duckdb_init_set_error(info, err_msg.as_ptr());
+            // SAFETY: `info` is the live init handle (caller contract) and DuckDB
+            // copies the NUL-terminated message before `err_msg` drops.
+            unsafe { duckdb_init_set_error(info, err_msg.as_ptr()) };
             None
         }
     }
@@ -154,7 +170,10 @@ impl TableFunctionLocalData {
         fallback_wkb: &'a mut crate::encoding::WkbBuf,
     ) -> (&'a mut [u8; 16], &'a mut crate::encoding::WkbBuf) {
         if !ptr.is_null() {
-            (&mut (*ptr).hex_buf, &mut (*ptr).wkb_buf)
+            // SAFETY: non-null `ptr` is a live `TableFunctionLocalData` with no
+            // other borrows for `'a` (caller contract); the two fields are
+            // disjoint, so the two `&mut` borrows don't alias.
+            unsafe { (&mut (*ptr).hex_buf, &mut (*ptr).wkb_buf) }
         } else {
             (fallback_hex, fallback_wkb)
         }
@@ -166,10 +185,13 @@ impl TableFunctionLocalData {
 /// # Safety
 /// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn init_table_function_local(info: duckdb_init_info) {
-    crate::ffi::ffi_init_guard(info, || {
-        let local_data = TableFunctionLocalData::default();
-        set_table_function_local_init_data(info, local_data);
-    });
+    // SAFETY: DuckDB passes this local-init callback a live `info` handle.
+    unsafe {
+        crate::ffi::ffi_init_guard(info, || {
+            let local_data = TableFunctionLocalData::default();
+            set_table_function_local_init_data(info, local_data);
+        });
+    }
 }
 
 /// Extract projected column indices requested by DuckDB projection pushdown
@@ -178,10 +200,13 @@ pub unsafe extern "C" fn init_table_function_local(info: duckdb_init_info) {
 /// `info` must be the valid init info DuckDB passed to the current init
 /// callback.
 pub unsafe fn extract_projected_columns(info: duckdb_init_info) -> Vec<usize> {
-    let col_count = duckdb_init_get_column_count(info);
+    // SAFETY: `info` is the live init handle (caller contract) and every index
+    // queried is below the column count DuckDB just reported.
+    let col_count = unsafe { duckdb_init_get_column_count(info) };
     let mut projected_columns = Vec::with_capacity(col_count as usize);
     for i in 0..col_count {
-        projected_columns.push(duckdb_init_get_column_index(info, i) as usize);
+        // SAFETY: as above, `i < col_count`.
+        projected_columns.push(unsafe { duckdb_init_get_column_index(info, i) } as usize);
     }
     projected_columns
 }

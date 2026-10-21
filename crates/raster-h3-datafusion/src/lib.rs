@@ -179,6 +179,7 @@ mod tests {
         assert_eq!(plan.schema().fields[1].name, "mean");
 
         let mut stream = plan.execute_arrow_c_stream().unwrap();
+        // SAFETY: `execute_arrow_c_stream` returns a freshly built, unreleased stream owned here.
         let (schema, batches) = unsafe { stream.collect_batches().unwrap() };
         assert_eq!(schema.fields.len(), 2);
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();

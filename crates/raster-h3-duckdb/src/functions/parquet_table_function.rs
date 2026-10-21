@@ -58,102 +58,109 @@ pub struct ParquetGlobalData {
 /// # Safety
 /// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
-    ffi_bind_guard(info, || {
-        let bind = BindHelper::new(info);
+    // SAFETY: DuckDB passes this bind callback a live `info` (contract above), and the
+    // `BindHelper` wrapping it is only used inside this callback. Logical types we create
+    // are destroyed once after DuckDB copies them. The boxed `ParquetBindData` is handed to
+    // DuckDB together with `delete_boxed::<ParquetBindData>`, its matching destructor,
+    // which DuckDB calls exactly once.
+    unsafe {
+        ffi_bind_guard(info, || {
+            let bind = BindHelper::new(info);
 
-        if bind.parameter_count() < 2 {
-            bind.set_error(
-                "h3_raster_to_parquet requires at least 2 arguments: file_path and output_parquet",
+            if bind.parameter_count() < 2 {
+                bind.set_error(
+                    "h3_raster_to_parquet requires at least 2 arguments: file_path and output_parquet",
+                );
+                return;
+            }
+
+            // 0: file_path (VARCHAR)
+            let file_path = match bind.get_string_param(0) {
+                Some(s) => s,
+                None => {
+                    bind.set_error("Invalid file_path parameter");
+                    return;
+                }
+            };
+
+            // 1: output_parquet (VARCHAR)
+            let output_parquet = match bind.get_string_param(1) {
+                Some(s) => s,
+                None => {
+                    bind.set_error("Invalid output_parquet parameter");
+                    return;
+                }
+            };
+
+            let resolutions = bind.parse_resolutions(8, None);
+            let source_crs = bind.parse_source_crs();
+            let sampling = bind.parse_sampling();
+            let overlap_rule = bind.parse_overlap_rule();
+            let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
+            let custom_nodata = bind.get_named_double("nodata");
+            let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
+            let compact = bind.get_named_bool("compact").unwrap_or(true);
+            let geoparquet = bind
+                .get_named_bool("geoparquet")
+                .or_else(|| bind.get_named_bool("geom"))
+                .unwrap_or(false);
+            let Some(execution) = bind.parse_execution() else {
+                return;
+            };
+
+            let mut compression = Compression::SNAPPY;
+            if let Some(s) = bind.get_named_string("compression") {
+                match s.to_lowercase().as_str() {
+                    "snappy" => compression = Compression::SNAPPY,
+                    "zstd" => compression = Compression::ZSTD(Default::default()),
+                    "gzip" | "flate" => compression = Compression::GZIP(Default::default()),
+                    "lz4" => compression = Compression::LZ4,
+                    "uncompressed" | "none" => compression = Compression::UNCOMPRESSED,
+                    _ => {}
+                }
+            }
+
+            let row_group_size = bind
+                .get_named_int("row_group_size")
+                .unwrap_or(131_072)
+                .max(1) as usize;
+            let bbox = bind.parse_bbox();
+
+            // Declare output summary schema:
+            bind.add_result_column("total_hexagons", DuckDBType::BigInt);
+            bind.add_result_column("parquet_size_bytes", DuckDBType::BigInt);
+            bind.add_result_column("elapsed_ms", DuckDBType::Double);
+            bind.add_result_column("hexagons_per_sec", DuckDBType::Double);
+            bind.add_result_column("output_path", DuckDBType::Varchar);
+            bind.add_result_column("status", DuckDBType::Varchar);
+
+            // Cardinality is always 1 summary row
+            duckdb_bind_set_cardinality(info, 1, true);
+
+            let bind_data = Box::new(ParquetBindData {
+                file_path,
+                output_parquet,
+                resolutions,
+                band,
+                source_crs,
+                custom_nodata,
+                sampling,
+                overlap_rule,
+                is_categorical,
+                compact,
+                compression,
+                row_group_size,
+                bbox,
+                geoparquet,
+                execution,
+            });
+            duckdb_bind_set_bind_data(
+                info,
+                Box::into_raw(bind_data) as *mut c_void,
+                Some(delete_boxed::<ParquetBindData>),
             );
-            return;
-        }
-
-        // 0: file_path (VARCHAR)
-        let file_path = match bind.get_string_param(0) {
-            Some(s) => s,
-            None => {
-                bind.set_error("Invalid file_path parameter");
-                return;
-            }
-        };
-
-        // 1: output_parquet (VARCHAR)
-        let output_parquet = match bind.get_string_param(1) {
-            Some(s) => s,
-            None => {
-                bind.set_error("Invalid output_parquet parameter");
-                return;
-            }
-        };
-
-        let resolutions = bind.parse_resolutions(8, None);
-        let source_crs = bind.parse_source_crs();
-        let sampling = bind.parse_sampling();
-        let overlap_rule = bind.parse_overlap_rule();
-        let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
-        let custom_nodata = bind.get_named_double("nodata");
-        let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
-        let compact = bind.get_named_bool("compact").unwrap_or(true);
-        let geoparquet = bind
-            .get_named_bool("geoparquet")
-            .or_else(|| bind.get_named_bool("geom"))
-            .unwrap_or(false);
-        let Some(execution) = bind.parse_execution() else {
-            return;
-        };
-
-        let mut compression = Compression::SNAPPY;
-        if let Some(s) = bind.get_named_string("compression") {
-            match s.to_lowercase().as_str() {
-                "snappy" => compression = Compression::SNAPPY,
-                "zstd" => compression = Compression::ZSTD(Default::default()),
-                "gzip" | "flate" => compression = Compression::GZIP(Default::default()),
-                "lz4" => compression = Compression::LZ4,
-                "uncompressed" | "none" => compression = Compression::UNCOMPRESSED,
-                _ => {}
-            }
-        }
-
-        let row_group_size = bind
-            .get_named_int("row_group_size")
-            .unwrap_or(131_072)
-            .max(1) as usize;
-        let bbox = bind.parse_bbox();
-
-        // Declare output summary schema:
-        bind.add_result_column("total_hexagons", DuckDBType::BigInt);
-        bind.add_result_column("parquet_size_bytes", DuckDBType::BigInt);
-        bind.add_result_column("elapsed_ms", DuckDBType::Double);
-        bind.add_result_column("hexagons_per_sec", DuckDBType::Double);
-        bind.add_result_column("output_path", DuckDBType::Varchar);
-        bind.add_result_column("status", DuckDBType::Varchar);
-
-        // Cardinality is always 1 summary row
-        duckdb_bind_set_cardinality(info, 1, true);
-
-        let bind_data = Box::new(ParquetBindData {
-            file_path,
-            output_parquet,
-            resolutions,
-            band,
-            source_crs,
-            custom_nodata,
-            sampling,
-            overlap_rule,
-            is_categorical,
-            compact,
-            compression,
-            row_group_size,
-            bbox,
-            geoparquet,
-            execution,
         });
-        duckdb_bind_set_bind_data(
-            info,
-            Box::into_raw(bind_data) as *mut c_void,
-            Some(delete_boxed::<ParquetBindData>),
-        );
-    });
+    }
 }
 
 /// Init callback
@@ -161,14 +168,18 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
 /// # Safety
 /// `info` must be the valid init info DuckDB passes to this callback.
 pub unsafe extern "C" fn parquet_init(info: duckdb_init_info) {
-    ffi_init_guard(info, || {
-        set_table_function_init_data(
-            info,
-            ParquetGlobalData {
-                executed: AtomicBool::new(false),
-            },
-        );
-    });
+    // SAFETY: DuckDB passes this init callback a live `info`; the `ParquetGlobalData`
+    // handed over is `Send + Sync` (only an atomic flag).
+    unsafe {
+        ffi_init_guard(info, || {
+            set_table_function_init_data(
+                info,
+                ParquetGlobalData {
+                    executed: AtomicBool::new(false),
+                },
+            );
+        });
+    }
 }
 
 /// Scan callback: runs GeoTIFF-to-Parquet conversion and streams the single summary row
@@ -177,69 +188,83 @@ pub unsafe extern "C" fn parquet_init(info: duckdb_init_info) {
 /// `info` and `output` must be the handles DuckDB passes to this scan
 /// callback, with `output` laid out as the columns declared at bind time.
 pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
-    ffi_scan_guard(info, output, || {
-        let bind_data = &*(duckdb_function_get_bind_data(info) as *const ParquetBindData);
-        let global_data = &*(duckdb_function_get_init_data(info) as *const ParquetGlobalData);
-
-        if global_data.executed.swap(true, Ordering::SeqCst) {
-            duckdb_data_chunk_set_size(output, 0);
-            return;
-        }
-
-        let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
-        config.band = bind_data.band;
-        config.custom_crs = bind_data.source_crs.clone();
-        config.custom_nodata = bind_data.custom_nodata;
-        config.sampling = bind_data.sampling.clone();
-        config.overlap_rule = bind_data.overlap_rule;
-        config.bbox = bind_data.bbox;
-        bind_data.execution.apply(&mut config);
-
-        let parquet_config = ParquetExportConfig {
-            omit_redundant_columns: bind_data.compact,
-            compact: bind_data.compact,
-            compression: bind_data.compression,
-            row_group_size: bind_data.row_group_size,
-            is_categorical: bind_data.is_categorical,
-            geoparquet: bind_data.geoparquet,
-        };
-
-        let start = Instant::now();
-        let result = H3ParquetWriter::process_raster_source_to_parquet(
-            &bind_data.file_path,
-            &bind_data.output_parquet,
-            config,
-            parquet_config,
-        );
-        let elapsed = start.elapsed();
-        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-
-        let (total_hexagons, size_bytes, rate, status) = match result {
-            Ok(count) => {
-                let sz = File::open(&bind_data.output_parquet)
-                    .and_then(|f| f.metadata())
-                    .map(|m| m.len() as i64)
-                    .unwrap_or(0);
-                let hex_rate = if elapsed.as_secs_f64() > 0.0 {
-                    count as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                (count as i64, sz, hex_rate, "SUCCESS".to_string())
+    // SAFETY: DuckDB passes this scan callback live `info`/`output` handles. The bind/init
+    // pointers are the `Box<ParquetBindData>`/`Box<ParquetGlobalData>` installed earlier
+    // (null-checked), alive until the query ends and only borrowed immutably;
+    // `ParquetGlobalData` synchronizes its own mutable state. `output` has the summary
+    // columns declared at bind, and the single row's values match their declared types
+    // (BIGINT `i64`, DOUBLE `f64`, VARCHAR strings).
+    unsafe {
+        ffi_scan_guard(info, output, || {
+            let bind_data_ptr = duckdb_function_get_bind_data(info) as *const ParquetBindData;
+            let global_data_ptr = duckdb_function_get_init_data(info) as *const ParquetGlobalData;
+            if bind_data_ptr.is_null() || global_data_ptr.is_null() {
+                duckdb_data_chunk_set_size(output, 0);
+                return;
             }
-            Err(e) => (0i64, 0i64, 0.0, format!("ERROR: {}", e)),
-        };
+            let bind_data = &*bind_data_ptr;
+            let global_data = &*global_data_ptr;
 
-        // Populate the 1 output summary row
-        let writer = ChunkWriter::new(output);
-        writer.set_int64(0, 0, total_hexagons);
-        writer.set_int64(1, 0, size_bytes);
-        writer.set_double(2, 0, elapsed_ms);
-        writer.set_double(3, 0, rate);
-        writer.set_string(4, 0, &bind_data.output_parquet);
-        writer.set_string(5, 0, &status);
-        writer.set_size(1);
-    });
+            if global_data.executed.swap(true, Ordering::SeqCst) {
+                duckdb_data_chunk_set_size(output, 0);
+                return;
+            }
+
+            let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
+            config.band = bind_data.band;
+            config.custom_crs = bind_data.source_crs.clone();
+            config.custom_nodata = bind_data.custom_nodata;
+            config.sampling = bind_data.sampling.clone();
+            config.overlap_rule = bind_data.overlap_rule;
+            config.bbox = bind_data.bbox;
+            bind_data.execution.apply(&mut config);
+
+            let parquet_config = ParquetExportConfig {
+                omit_redundant_columns: bind_data.compact,
+                compact: bind_data.compact,
+                compression: bind_data.compression,
+                row_group_size: bind_data.row_group_size,
+                is_categorical: bind_data.is_categorical,
+                geoparquet: bind_data.geoparquet,
+            };
+
+            let start = Instant::now();
+            let result = H3ParquetWriter::process_raster_source_to_parquet(
+                &bind_data.file_path,
+                &bind_data.output_parquet,
+                config,
+                parquet_config,
+            );
+            let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+
+            let (total_hexagons, size_bytes, rate, status) = match result {
+                Ok(count) => {
+                    let sz = File::open(&bind_data.output_parquet)
+                        .and_then(|f| f.metadata())
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(0);
+                    let hex_rate = if elapsed.as_secs_f64() > 0.0 {
+                        count as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    (count as i64, sz, hex_rate, "SUCCESS".to_string())
+                }
+                Err(e) => (0i64, 0i64, 0.0, format!("ERROR: {}", e)),
+            };
+
+            // Populate the 1 output summary row
+            let writer = ChunkWriter::new(output);
+            writer.set_int64(0, 0, total_hexagons);
+            writer.set_int64(1, 0, size_bytes);
+            writer.set_double(2, 0, elapsed_ms);
+            writer.set_double(3, 0, rate);
+            writer.set_string(4, 0, &bind_data.output_parquet);
+            writer.set_string(5, 0, &status);
+            writer.set_size(1);
+        });
+    }
 }
 
 /// Register `h3_raster_to_parquet` Table Function in DuckDB connection
@@ -247,35 +272,42 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
 /// # Safety
 /// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_parquet_table_function(con: duckdb_connection) -> Result<(), String> {
-    let fn_name = to_c_string("h3_raster_to_parquet");
-    let tf = duckdb_create_table_function();
-    duckdb_table_function_set_name(tf, fn_name.as_ptr());
+    // SAFETY: `con` is a live connection (caller contract). Each table function created
+    // here is configured with NUL-terminated names that outlive the calls, parameter types
+    // that DuckDB copies, and callbacks with the C ABI DuckDB expects (bind/init/scan). It
+    // is destroyed exactly once after `duckdb_register_table_function` has copied it into
+    // the catalog.
+    unsafe {
+        let fn_name = to_c_string("h3_raster_to_parquet");
+        let tf = duckdb_create_table_function();
+        duckdb_table_function_set_name(tf, fn_name.as_ptr());
 
-    // Positional parameters:
-    add_positional_parameter(tf, DuckDBType::Varchar);
-    add_positional_parameter(tf, DuckDBType::Varchar);
+        // Positional parameters:
+        add_positional_parameter(tf, DuckDBType::Varchar);
+        add_positional_parameter(tf, DuckDBType::Varchar);
 
-    // Named parameters:
-    register_common_raster_named_parameters(tf);
-    add_named_parameter(tf, "categorical", DuckDBType::Boolean);
-    add_named_parameter(tf, "compression", DuckDBType::Varchar);
-    add_named_parameter(tf, "row_group_size", DuckDBType::BigInt);
-    add_named_parameter(tf, "geoparquet", DuckDBType::Boolean);
-    add_named_parameter(tf, "geom", DuckDBType::Boolean);
+        // Named parameters:
+        register_common_raster_named_parameters(tf);
+        add_named_parameter(tf, "categorical", DuckDBType::Boolean);
+        add_named_parameter(tf, "compression", DuckDBType::Varchar);
+        add_named_parameter(tf, "row_group_size", DuckDBType::BigInt);
+        add_named_parameter(tf, "geoparquet", DuckDBType::Boolean);
+        add_named_parameter(tf, "geom", DuckDBType::Boolean);
 
-    // Set callbacks
-    duckdb_table_function_set_bind(tf, parquet_bind);
-    duckdb_table_function_set_init(tf, parquet_init);
-    duckdb_table_function_set_function(tf, parquet_scan);
+        // Set callbacks
+        duckdb_table_function_set_bind(tf, parquet_bind);
+        duckdb_table_function_set_init(tf, parquet_init);
+        duckdb_table_function_set_function(tf, parquet_scan);
 
-    let state = duckdb_register_table_function(con, tf);
+        let state = duckdb_register_table_function(con, tf);
 
-    let mut tf_mut = tf;
-    duckdb_destroy_table_function(&mut tf_mut);
+        let mut tf_mut = tf;
+        duckdb_destroy_table_function(&mut tf_mut);
 
-    if state != DuckDBState::Success {
-        return Err("Failed to register h3_raster_to_parquet table function".to_string());
+        if state != DuckDBState::Success {
+            return Err("Failed to register h3_raster_to_parquet table function".to_string());
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
