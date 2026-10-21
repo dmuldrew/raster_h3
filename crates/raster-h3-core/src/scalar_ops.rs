@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 pub use h3o::geom::ContainmentMode;
-use h3o::geom::{MultiPolygon, PolyfillConfig, ToCells};
+use h3o::geom::TilerBuilder;
 use h3o::{CellIndex, LatLng, Resolution};
 
 use crate::encoding::{
@@ -259,17 +259,18 @@ pub fn h3_polygon_to_cells_wkb(
     if multi.0.is_empty() {
         return Ok(Vec::new());
     }
-    let shape = MultiPolygon::from_degrees(multi)
+    let mut tiler = TilerBuilder::new(resolution).containment_mode(mode).build();
+    tiler
+        .add_batch(multi)
         .map_err(|_| PolygonToCellsError::InvalidGeometry("non-finite coordinates"))?;
-    let config = PolyfillConfig::new(resolution).containment_mode(mode);
-    let estimate = shape.max_cells_count(config);
+    let estimate = tiler.coverage_size_hint();
     if estimate > H3_POLYGON_TO_CELLS_MAX_CELLS {
         return Err(PolygonToCellsError::TooManyCells {
             estimate,
             limit: H3_POLYGON_TO_CELLS_MAX_CELLS,
         });
     }
-    let mut cells: Vec<u64> = shape.to_cells(config).map(u64::from).collect();
+    let mut cells: Vec<u64> = tiler.into_coverage().map(u64::from).collect();
     // Overlapping members of a MULTIPOLYGON (and some modes) can emit a cell twice.
     cells.sort_unstable();
     cells.dedup();
@@ -406,16 +407,15 @@ mod tests {
             (-122.4194, 37.7749),
         ]);
         let mode = |m| h3_polygon_to_cells_wkb(&wkb, 5, m).unwrap();
-        assert!(mode(ContainmentMode::IntersectsBoundary).is_empty());
         assert!(mode(ContainmentMode::ContainsBoundary).is_empty());
-        let covers = mode(ContainmentMode::Covers);
-        assert_eq!(covers.len(), 1);
-        let expected = u64::from(
+        let expected = vec![u64::from(
             LatLng::new(37.7749, -122.4194)
                 .unwrap()
                 .to_cell(Resolution::Five),
-        );
-        assert_eq!(covers[0], expected);
+        )];
+        // h3o >= 0.11 tests intersection against the whole cell, so the enclosing cell matches.
+        assert_eq!(mode(ContainmentMode::IntersectsBoundary), expected);
+        assert_eq!(mode(ContainmentMode::Covers), expected);
     }
 
     #[test]

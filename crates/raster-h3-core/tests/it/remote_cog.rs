@@ -190,7 +190,7 @@ impl MockHttpServer {
         request_count.fetch_add(1, Ordering::SeqCst);
 
         // Check for simulated transient failure (HTTP 503 Slow Down)
-        // `try_update` replaces this on Rust 1.95+, but rust-version is 1.88.
+        // `try_update` replaces this on Rust 1.95+, but rust-version is 1.94.
         #[allow(deprecated)]
         let fail_hit =
             transient_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {

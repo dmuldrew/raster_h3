@@ -300,12 +300,14 @@ counterpart of H3's `polygonToCells`).
 | `contains_centroid` (default) | `center` | its centroid lies inside the polygon | Can overshoot the edge and leave slivers uncovered | None. Each cell goes to exactly one of two polygons that touch without overlapping |
 | `contains_boundary` | `full` | its whole boundary lies inside the polygon | Never overshoots; leaves the most area uncovered | None |
 | `intersects_boundary` | — | any part of it overlaps the polygon | Covers the polygon completely and overshoots the edge | Possible |
-| `covers` | `overlapping` | same as `intersects_boundary`, and also returns the single enclosing cell when the polygon lies entirely inside one cell | Complete, even for polygons smaller than a cell | Possible |
+| `covers` | `overlapping` | same as `intersects_boundary` | Complete, even for polygons smaller than a cell | Possible |
 
 The result sets are nested: `contains_boundary` ⊆ `contains_centroid` ⊆ `intersects_boundary` ⊆
-`covers`. They differ only for a polygon that fits inside one cell: `intersects_boundary` (and
-`contains_boundary`) returns an empty list, while `covers` returns that one cell. H3's
-`CONTAINMENT_OVERLAPPING_BBOX` mode has no h3o equivalent and is not supported.
+`covers`. Since h3o 0.11, `intersects_boundary` tests overlap with the whole cell rather than with
+its edges, so a polygon that fits inside one cell returns that cell under both `intersects_boundary`
+and `covers` (and an empty list under `contains_boundary`); the two modes are kept as distinct
+names for compatibility. H3's `CONTAINMENT_OVERLAPPING_BBOX` mode has no h3o equivalent and is
+not supported.
 
 #### NULLs, invalid input and limits
 
