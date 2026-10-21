@@ -18,6 +18,7 @@ pre-aggregated Parquet into PMTiles. For every parameter and output column, see 
 - [SQL Usage & Recipes](#sql-usage--recipes)
 - [Client Languages (Python, Node.js, R)](#client-languages-python-nodejs-r)
 - [Build, Package, Load](#build-package-load)
+  - [Community Extension Build](#community-extension-build)
 - [Internals](#entry-points) — entry points, registered functions, table function lifecycle, geometry output, FFI safety
 - [Troubleshooting](#troubleshooting)
 - [Testing](#testing)
@@ -42,7 +43,7 @@ Pre-compiled extensions are published for all major platforms:
 SET allow_unsigned_extensions = true;
 
 -- Replace <platform> with your platform identifier (e.g. osx_arm64)
-INSTALL 'https://github.com/dmuldrew/raster_h3_hexification/releases/latest/download/raster_h3-<platform>.duckdb_extension.gz';
+INSTALL 'https://github.com/dmuldrew/raster_h3/releases/latest/download/raster_h3-<platform>.duckdb_extension.gz';
 LOAD 'raster_h3';
 
 SELECT raster_h3_version();
@@ -52,14 +53,14 @@ SELECT raster_h3_version();
 
 ```sql
 SET allow_unsigned_extensions = true;
-SET custom_extension_repository = 'https://github.com/dmuldrew/raster_h3_hexification/releases/latest/download';
+SET custom_extension_repository = 'https://github.com/dmuldrew/raster_h3/releases/latest/download';
 INSTALL raster_h3;
 LOAD raster_h3;
 ```
 
 #### Option C: Manual download & local load
 
-Download from [Releases](https://github.com/dmuldrew/raster_h3_hexification/releases), then:
+Download from [Releases](https://github.com/dmuldrew/raster_h3/releases), then:
 
 ```sql
 LOAD '/path/to/raster_h3-<platform>.duckdb_extension';
@@ -392,6 +393,27 @@ cargo run --release --bin package_extension -- \
 LOAD 'target/release/libraster_h3.dylib';
 SELECT * FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8) LIMIT 5;
 ```
+
+### Community Extension Build
+
+The root [`Makefile`](../../Makefile) wraps DuckDB's
+[`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools) `c_api_extensions`
+makefiles (git submodule), which is what the
+[DuckDB community-extensions](https://github.com/duckdb/community-extensions) CI runs for
+`build: cargo`. It builds the root crate and appends the footer with DuckDB's own
+`append_extension_metadata.py` (stable `C_STRUCT` ABI, minimum DuckDB `v1.2.0`).
+
+```bash
+git submodule update --init
+make configure      # Python venv (duckdb + sqllogictest runner), platform and version detection
+make release        # -> build/release/raster_h3.duckdb_extension
+make test_release   # runs test/sql/*.test (skipped on linux_amd64 by extension-ci-tools)
+```
+
+The submission manifest is [`packaging/duckdb-community/description.yml`](../../packaging/duckdb-community/description.yml).
+It is a copy of the file submitted to `duckdb/community-extensions` as
+`extensions/raster_h3/description.yml`; `repo.ref` must name a commit on this repository that
+contains the `Makefile` and submodule.
 
 ## Entry Points
 

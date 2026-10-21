@@ -50,3 +50,6 @@ Thumbs.db
 *.log
 *.tmp
 *.temp
+# DuckDB extension-ci-tools (make configure / make test)
+configure/
+duckdb_unittest_tempdir/
