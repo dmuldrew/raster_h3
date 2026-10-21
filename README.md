@@ -76,8 +76,8 @@ Without a shared spatial index, answering this requires an expensive GIS overlay
 #### DuckDB (SQL)
 
 ```sql
--- Polyfilling uses DuckDB's spatial and community h3 extensions alongside raster_h3:
--- INSTALL spatial; LOAD spatial; INSTALL h3 FROM community; LOAD h3;
+-- Reading and polyfilling the tracts uses DuckDB's spatial extension alongside raster_h3:
+-- INSTALL spatial; LOAD spatial;
 
 -- 1. Aggregate the 30m land cover raster into H3 hexagons (with budgeted aggregation)
 CREATE TABLE canopy_h3 AS
@@ -87,8 +87,8 @@ FROM h3_raster_categorical_aggregate(
 );
 
 -- 2. Polyfill vector census tracts into H3 cells & compute population density
--- h3_polygon_wkt_to_cells indexes hexagons whose centroids fall inside the polygon;
--- for small tracts, use Res 9 or fall back to h3_latlng_to_cell(ST_Centroid(geom), 8).
+-- 'covers' returns every hexagon that overlaps the tract, plus the enclosing hexagon for tracts
+-- smaller than one cell, so no tract drops out (border hexagons count for both neighbours).
 
 CREATE TABLE census_tracts_h3 AS
 SELECT 
@@ -96,7 +96,7 @@ SELECT
     median_income,
     round(total_population / (ST_Area_Spheroid(ST_FlipCoordinates(geom)) / 1000000.0), 0) 
         AS pop_density_per_sqkm,
-    unnest(h3_polygon_wkt_to_cells(ST_AsText(geom), 8))
+    unnest(h3_polygon_to_cells(ST_AsWKB(geom), 8, 'covers'))
         AS h3_index
 FROM ST_Read('census_tracts.geojson');
 
@@ -132,15 +132,15 @@ canopy_h3 = raster_h3.scan_raster_h3(
 ).rename({"majority_fraction": "canopy_purity"})
 
 # 2. Polyfill vector census tracts into H3 cells & compute population density
-#    (h3_polygon_to_cells defaults to "contains_centroid": hexagons whose centroids fall
-#    inside the polygon; pass "covers" to also catch tracts smaller than a hexagon)
+#    ("covers" returns every hexagon that overlaps the tract, plus the enclosing hexagon for
+#    tracts smaller than one cell, so no tract drops out; border hexagons count for both neighbours)
 tracts = gpd.read_file("census_tracts.geojson").to_crs(4326)
 area_sqkm = tracts.to_crs(tracts.estimate_utm_crs()).area / 1e6
 census_tracts_h3 = pl.DataFrame({
     "tract_name": tracts["tract_name"].tolist(),
     "median_income": tracts["median_income"].tolist(),
     "pop_density_per_sqkm": (tracts["total_population"] / area_sqkm).round(0).tolist(),
-    "h3_index": [raster_h3.h3_polygon_to_cells(g.wkb, 8) for g in tracts.geometry],
+    "h3_index": [raster_h3.h3_polygon_to_cells(g.wkb, 8, "covers") for g in tracts.geometry],
 }).explode("h3_index").with_columns(pl.col("h3_index").cast(pl.UInt64))
 
 # 3. JOIN raster results with census tracts on the shared H3 index
