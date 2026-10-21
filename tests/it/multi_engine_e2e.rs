@@ -311,13 +311,14 @@ fn test_cross_engine_continuous_e2e_parity() {
         .with_geokeys(true)
         .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
 
-    run_continuous_parity(&tif_path, "EPSG:4326", &[7, 8]);
+    run_continuous_parity(&tif_path, "EPSG:4326", &[7, 8], (-122.5, 37.75));
 }
 
 fn run_continuous_parity(
     tif_path: &Path,
     crs: &str,
     resolutions: &[u8],
+    expected_lon_lat: (f64, f64),
 ) -> BTreeMap<u64, ContinuousCellSummary> {
     let resolution_arg = resolutions
         .iter()
@@ -669,7 +670,9 @@ print(json.dumps(d))
             let lat = datum_to_float8(lat_d);
             let lng = datum_to_float8(lng_d);
             assert!(
-                !fc1.isnull && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng)
+                !fc1.isnull
+                    && (lat - expected_lon_lat.1).abs() <= 0.5
+                    && (lng - expected_lon_lat.0).abs() <= 0.5
             );
 
             let mut fc_parent = FunctionCallInfoBaseData::with_args(&[
@@ -773,10 +776,10 @@ print(json.dumps(d))
 
 fn assert_core_cells_near(
     cells: &BTreeMap<u64, ContinuousCellSummary>,
-    expected_lon: f64,
-    expected_lat: f64,
+    expected_lon_lat: (f64, f64),
     max_distance_m: f64,
 ) {
+    let (expected_lon, expected_lat) = expected_lon_lat;
     assert!(
         !cells.is_empty(),
         "core projected aggregation must be non-empty"
@@ -805,8 +808,9 @@ fn test_cross_engine_projected_continuous_parity() {
         .pixel_size_xy(300.0, 300.0)
         .with_geokeys(true)
         .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
-    let dc_cells = run_continuous_parity(&dc_tif, "EPSG:5070", &[7, 8]);
-    assert_core_cells_near(&dc_cells, -77.0369, 38.9072, 20_000.0);
+    let dc_lon_lat = (-77.0369, 38.9072);
+    let dc_cells = run_continuous_parity(&dc_tif, "EPSG:5070", &[7, 8], dc_lon_lat);
+    assert_core_cells_near(&dc_cells, dc_lon_lat, 20_000.0);
 
     let (_london_file, london_tif) = TestGeoTiffBuilder::new(40, 40)
         .epsg(27700)
@@ -814,8 +818,9 @@ fn test_cross_engine_projected_continuous_parity() {
         .pixel_size_xy(300.0, 300.0)
         .with_geokeys(true)
         .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
-    let london_cells = run_continuous_parity(&london_tif, "EPSG:27700", &[7, 8]);
-    assert_core_cells_near(&london_cells, -0.1276, 51.5072, 20_000.0);
+    let london_lon_lat = (-0.1276, 51.5072);
+    let london_cells = run_continuous_parity(&london_tif, "EPSG:27700", &[7, 8], london_lon_lat);
+    assert_core_cells_near(&london_cells, london_lon_lat, 20_000.0);
 }
 
 #[test]
