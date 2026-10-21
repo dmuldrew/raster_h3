@@ -228,8 +228,8 @@ impl Wgs84BoundsAccumulator {
     pub fn record_cell(&mut self, cell: CellIndex) {
         self.count += 1;
         let res = cell.resolution();
-        let is_north_pole = cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(res);
-        let is_south_pole = cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
+        let is_north_pole = cell == LatLng::new(90.0, 0.0).expect("valid").to_cell(res);
+        let is_south_pole = cell == LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
         if is_north_pole {
             self.max_lat = 90.0;
             self.full_lon = true;

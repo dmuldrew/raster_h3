@@ -22,7 +22,7 @@ use raster_h3_core::columnar::{
     ArrowArrayStream, ArrowSchema, CategoricalBatchReader, CategoricalFormat, ColumnArray,
     ColumnSchema, ContinuousBatchReader, RecordBatch,
 };
-use raster_h3_core::error::{safe_panic_payload_to_string, RasterH3Error, Result};
+use raster_h3_core::error::{catch_unwind_or, safe_panic_payload_to_string, RasterH3Error, Result};
 use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3_core::pmtiles::H3PmtilesTiler;
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
@@ -256,6 +256,7 @@ unsafe fn set_c_err(out_err: *mut *mut c_char, msg: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn build_py_scan_config(
     path: *const c_char,
     resolutions: *const c_char,
@@ -526,7 +527,8 @@ pub unsafe extern "C" fn raster_h3_py_batch_reader_next(
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_py_free_batch_reader(reader: *mut PyBatchReader) {
     if !reader.is_null() {
-        drop(Box::from_raw(reader));
+        let reader = Box::from_raw(reader);
+        catch_unwind_or((), || drop(reader));
     }
 }
 
@@ -593,10 +595,10 @@ pub unsafe extern "C" fn raster_h3_py_free_string(ptr: *mut c_char) {
 /// C-ABI scalar helper: `h3_to_string(cell) -> *mut c_char` (NULL if invalid/0).
 #[no_mangle]
 pub extern "C" fn raster_h3_py_h3_to_string(cell: u64) -> *mut c_char {
-    match h3_to_string(cell) {
+    catch_unwind_or(ptr::null_mut(), || match h3_to_string(cell) {
         Some(s) => CString::new(s).unwrap_or_default().into_raw(),
         None => ptr::null_mut(),
-    }
+    })
 }
 
 /// C-ABI scalar helper: `string_to_h3(hex) -> u64`.
@@ -605,34 +607,34 @@ pub extern "C" fn raster_h3_py_h3_to_string(cell: u64) -> *mut c_char {
 /// `hex` must be a valid NUL-terminated string or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_py_string_to_h3(hex: *const c_char) -> u64 {
-    match opt_cstr(hex) {
+    catch_unwind_or(0, || match opt_cstr(hex) {
         Some(s) => string_to_h3(&s),
         None => 0,
-    }
+    })
 }
 
 /// C-ABI scalar helper: `h3_to_lat(cell) -> f64`.
 #[no_mangle]
 pub extern "C" fn raster_h3_py_h3_to_lat(cell: u64) -> f64 {
-    h3_to_lat(cell)
+    catch_unwind_or(f64::NAN, || h3_to_lat(cell))
 }
 
 /// C-ABI scalar helper: `h3_to_lng(cell) -> f64`.
 #[no_mangle]
 pub extern "C" fn raster_h3_py_h3_to_lng(cell: u64) -> f64 {
-    h3_to_lng(cell)
+    catch_unwind_or(f64::NAN, || h3_to_lng(cell))
 }
 
 /// C-ABI scalar helper: `h3_get_resolution(cell) -> i64`.
 #[no_mangle]
 pub extern "C" fn raster_h3_py_h3_get_resolution(cell: u64) -> i64 {
-    h3_get_resolution(cell)
+    catch_unwind_or(-1, || h3_get_resolution(cell))
 }
 
 /// C-ABI scalar helper: `h3_is_valid_u64(cell) -> i32`.
 #[no_mangle]
 pub extern "C" fn raster_h3_py_h3_is_valid_u64(cell: u64) -> c_int {
-    c_int::from(h3_is_valid_u64(cell))
+    catch_unwind_or(0, || c_int::from(h3_is_valid_u64(cell)))
 }
 
 /// C-ABI scalar helper: `h3_is_valid_str(hex) -> i32`.
@@ -641,16 +643,16 @@ pub extern "C" fn raster_h3_py_h3_is_valid_u64(cell: u64) -> c_int {
 /// `hex` must be a valid NUL-terminated string or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_py_h3_is_valid_str(hex: *const c_char) -> c_int {
-    match opt_cstr(hex) {
+    catch_unwind_or(0, || match opt_cstr(hex) {
         Some(s) => c_int::from(h3_is_valid_str(&s)),
         None => 0,
-    }
+    })
 }
 
 /// C-ABI scalar helper: `h3_cell_to_parent_u64(cell, parent_res) -> u64` (0 if invalid).
 #[no_mangle]
 pub extern "C" fn raster_h3_py_h3_cell_to_parent_u64(cell: u64, parent_res: i64) -> u64 {
-    h3_cell_to_parent_u64(cell, parent_res).unwrap_or(0)
+    catch_unwind_or(0, || h3_cell_to_parent_u64(cell, parent_res).unwrap_or(0))
 }
 
 /// C-ABI scalar helper: `h3_cell_to_parent_str(hex, parent_res) -> *mut c_char`.
@@ -662,13 +664,15 @@ pub unsafe extern "C" fn raster_h3_py_h3_cell_to_parent_str(
     hex: *const c_char,
     parent_res: i64,
 ) -> *mut c_char {
-    let Some(s) = opt_cstr(hex) else {
-        return ptr::null_mut();
-    };
-    match h3_cell_to_parent_str(&s, parent_res) {
-        Some(out) => CString::new(out).unwrap_or_default().into_raw(),
-        None => ptr::null_mut(),
-    }
+    catch_unwind_or(ptr::null_mut(), || {
+        let Some(s) = opt_cstr(hex) else {
+            return ptr::null_mut();
+        };
+        match h3_cell_to_parent_str(&s, parent_res) {
+            Some(out) => CString::new(out).unwrap_or_default().into_raw(),
+            None => ptr::null_mut(),
+        }
+    })
 }
 
 /// C-ABI helper: write WKB polygon for `cell` into `out_buf` (capacity of
@@ -686,7 +690,7 @@ pub unsafe extern "C" fn raster_h3_py_h3_to_wkb(
     if out_buf.is_null() {
         return 0;
     }
-    let Some(wkb) = h3_to_wkb_u64(cell) else {
+    let Some(wkb) = catch_unwind_or(None, || h3_to_wkb_u64(cell)) else {
         return 0;
     };
     if wkb.len() > buf_cap {
@@ -700,8 +704,9 @@ pub unsafe extern "C" fn raster_h3_py_h3_to_wkb(
 ///
 /// On success (`0`) writes a heap array of `*out_len` cells to `*out_cells`; release it with
 /// [`raster_h3_py_free_cells`]. A NULL `containment` means `contains_centroid`. Other return
-/// codes leave the outputs untouched: `1` invalid geometry or resolution, `2` unknown
-/// containment mode, `3` more cells than `H3_POLYGON_TO_CELLS_MAX_CELLS`, `-1` NULL pointers.
+/// codes leave the outputs untouched: `1` invalid geometry or resolution (or an internal
+/// panic), `2` unknown containment mode, `3` more cells than `H3_POLYGON_TO_CELLS_MAX_CELLS`,
+/// `-1` NULL pointers.
 ///
 /// # Safety
 /// `wkb` must point to `wkb_len` readable bytes, `containment` must be NULL or a valid
@@ -726,7 +731,11 @@ pub unsafe extern "C" fn raster_h3_py_h3_polygon_to_cells(
         },
     };
     let bytes = std::slice::from_raw_parts(wkb, wkb_len);
-    match h3_polygon_to_cells_wkb(bytes, res, mode) {
+    let Some(result) = catch_unwind_or(None, || Some(h3_polygon_to_cells_wkb(bytes, res, mode)))
+    else {
+        return 1;
+    };
+    match result {
         Ok(cells) => {
             let cells = cells.into_boxed_slice();
             *out_len = cells.len();
@@ -784,9 +793,11 @@ pub unsafe extern "C" fn raster_h3_py_export_parquet(
             crs_opt.as_deref(),
             OverlapRule::Cutline,
         )?);
-        let mut pq_cfg = ParquetExportConfig::default();
-        pq_cfg.geoparquet = geoparquet != 0;
-        pq_cfg.is_categorical = categorical != 0;
+        let pq_cfg = ParquetExportConfig {
+            geoparquet: geoparquet != 0,
+            is_categorical: categorical != 0,
+            ..Default::default()
+        };
 
         if categorical == 0 {
             let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;

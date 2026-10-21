@@ -222,8 +222,8 @@ fn test_invalid_and_degenerate_cells() {
 
 #[test]
 fn test_compute_cell_south_lat() {
-    let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
-    let cell = lat_lng.to_cell(h3o::Resolution::Eight);
+    let lat_lng = LatLng::new(37.7749, -122.4194).unwrap();
+    let cell = lat_lng.to_cell(Resolution::Eight);
     let cell_u64: u64 = cell.into();
 
     // Now returns center lat as a fast proxy (always >= true south vertex lat)

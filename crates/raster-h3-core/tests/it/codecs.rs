@@ -624,8 +624,8 @@ fn test_deflate_exact_bitwise_equivalence_with_tiff_decoder() {
     let mmap = reader.mmap().unwrap();
 
     // 1. Decode with standard tiff Decoder (using flate2/miniz_oxide)
-    let cursor = std::io::Cursor::new(&mmap[..]);
-    let mut standard_decoder = tiff::decoder::Decoder::new(cursor).unwrap();
+    let cursor = Cursor::new(&mmap[..]);
+    let mut standard_decoder = Decoder::new(cursor).unwrap();
 
     // 2. Decode with SIMD libdeflater ChunkDecoder
     let mut simd_decoder = reader.open_decoder().unwrap();

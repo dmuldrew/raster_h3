@@ -564,9 +564,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 ///
 /// # Safety
 /// `con` must be a valid, open DuckDB connection.
-pub unsafe fn register_categorical_table_function(
-    con: duckdb_connection,
-) -> std::result::Result<(), String> {
+pub unsafe fn register_categorical_table_function(con: duckdb_connection) -> Result<(), String> {
     for name in &["h3_raster_categorical_aggregate", "h3_raster_categorical"] {
         let fn_name = to_c_string(name);
         let tf = duckdb_create_table_function();

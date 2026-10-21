@@ -681,7 +681,9 @@ unsafe extern "C" fn release_arrow_stream(stream: *mut ArrowArrayStream) {
         return;
     }
     if !s.private_data.is_null() {
-        drop(Box::from_raw(s.private_data as *mut StreamPrivateData));
+        // Dropping the iterator may join worker threads; never unwind into the consumer.
+        let priv_data = Box::from_raw(s.private_data as *mut StreamPrivateData);
+        crate::error::catch_unwind_or((), || drop(priv_data));
         s.private_data = ptr::null_mut();
     }
     s.get_schema = None;

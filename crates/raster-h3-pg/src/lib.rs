@@ -26,7 +26,7 @@ use raster_h3_core::aggregator::multi_horizon::{
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3_core::encoding::{fast_hex_u64, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
-use raster_h3_core::error::{safe_panic_payload_to_string, RasterH3Error, Result};
+use raster_h3_core::error::{catch_unwind_or, safe_panic_payload_to_string, RasterH3Error, Result};
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 use raster_h3_core::scalar_ops::{
     h3_cell_to_parent_u64, h3_get_resolution, h3_is_valid_u64, h3_to_lat, h3_to_lng,
@@ -90,7 +90,7 @@ impl FunctionCallInfoBaseData {
     }
 
     #[inline]
-    pub unsafe fn arg_i64(&self, idx: usize) -> Option<i64> {
+    pub fn arg_i64(&self, idx: usize) -> Option<i64> {
         if idx >= self.nargs as usize || self.args[idx].isnull {
             None
         } else {
@@ -129,6 +129,25 @@ pub fn datum_to_int64(d: Datum) -> i64 {
 // PostgreSQL V1 Scalar Function Entry Points
 // =============================================================================
 
+/// Runs a scalar function body on `fcinfo`, returning SQL NULL for a NULL `fcinfo` or a panic.
+///
+/// # Safety
+/// `fcinfo` must be null or point to a valid `FunctionCallInfoBaseData`.
+unsafe fn scalar_call(
+    fcinfo: pg_func_call_info,
+    body: impl FnOnce(&mut FunctionCallInfoBaseData) -> Datum,
+) -> Datum {
+    if fcinfo.is_null() {
+        return 0;
+    }
+    let info = &mut *fcinfo;
+    let out = catch_unwind_or(None, || Some(body(&mut *info)));
+    out.unwrap_or_else(|| {
+        info.isnull = true;
+        0
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn pg_finfo_pg_h3_to_lat() -> *const Pg_finfo_record {
     &PG_FINFO_V1
@@ -140,21 +159,19 @@ pub extern "C" fn pg_finfo_pg_h3_to_lat() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_to_lat(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    let lat = h3_to_lat(cell_i64 as u64);
-    if lat.is_nan() {
-        info.isnull = true;
-        0
-    } else {
-        float8_to_datum(lat)
-    }
+    scalar_call(fcinfo, |info| {
+        let Some(cell_i64) = info.arg_i64(0) else {
+            info.isnull = true;
+            return 0;
+        };
+        let lat = h3_to_lat(cell_i64 as u64);
+        if lat.is_nan() {
+            info.isnull = true;
+            0
+        } else {
+            float8_to_datum(lat)
+        }
+    })
 }
 
 #[no_mangle]
@@ -168,21 +185,19 @@ pub extern "C" fn pg_finfo_pg_h3_to_lng() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_to_lng(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    let lng = h3_to_lng(cell_i64 as u64);
-    if lng.is_nan() {
-        info.isnull = true;
-        0
-    } else {
-        float8_to_datum(lng)
-    }
+    scalar_call(fcinfo, |info| {
+        let Some(cell_i64) = info.arg_i64(0) else {
+            info.isnull = true;
+            return 0;
+        };
+        let lng = h3_to_lng(cell_i64 as u64);
+        if lng.is_nan() {
+            info.isnull = true;
+            0
+        } else {
+            float8_to_datum(lng)
+        }
+    })
 }
 
 #[no_mangle]
@@ -196,21 +211,19 @@ pub extern "C" fn pg_finfo_pg_h3_get_resolution() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_get_resolution(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    let res = h3_get_resolution(cell_i64 as u64);
-    if res < 0 {
-        info.isnull = true;
-        0
-    } else {
-        int64_to_datum(res)
-    }
+    scalar_call(fcinfo, |info| {
+        let Some(cell_i64) = info.arg_i64(0) else {
+            info.isnull = true;
+            return 0;
+        };
+        let res = h3_get_resolution(cell_i64 as u64);
+        if res < 0 {
+            info.isnull = true;
+            0
+        } else {
+            int64_to_datum(res)
+        }
+    })
 }
 
 #[no_mangle]
@@ -224,15 +237,13 @@ pub extern "C" fn pg_finfo_pg_h3_is_valid() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_is_valid(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    usize::from(h3_is_valid_u64(cell_i64 as u64))
+    scalar_call(fcinfo, |info| {
+        let Some(cell_i64) = info.arg_i64(0) else {
+            info.isnull = true;
+            return 0;
+        };
+        usize::from(h3_is_valid_u64(cell_i64 as u64))
+    })
 }
 
 #[no_mangle]
@@ -246,21 +257,19 @@ pub extern "C" fn pg_finfo_pg_h3_cell_to_parent() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_cell_to_parent(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let (Some(cell_i64), Some(parent_res)) = (info.arg_i64(0), info.arg_i64(1)) else {
-        info.isnull = true;
-        return 0;
-    };
-    match h3_cell_to_parent_u64(cell_i64 as u64, parent_res) {
-        Some(parent) => int64_to_datum(parent as i64),
-        None => {
+    scalar_call(fcinfo, |info| {
+        let (Some(cell_i64), Some(parent_res)) = (info.arg_i64(0), info.arg_i64(1)) else {
             info.isnull = true;
-            0
+            return 0;
+        };
+        match h3_cell_to_parent_u64(cell_i64 as u64, parent_res) {
+            Some(parent) => int64_to_datum(parent as i64),
+            None => {
+                info.isnull = true;
+                0
+            }
         }
-    }
+    })
 }
 
 // =============================================================================
@@ -628,7 +637,11 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
     if srf.is_null() || out_row.is_null() {
         return -1;
     }
-    match (*srf).next_row() {
+    let srf = &mut *srf;
+    let panicked = Err(RasterH3Error::StreamFailed(
+        "panic in pg_srf_continuous_next".into(),
+    ));
+    match catch_unwind_or(panicked, || srf.next_row()) {
         Ok(Some(row)) => {
             let out = &mut *out_row;
             out.h3_index = row.h3_index;
@@ -664,7 +677,8 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
 #[no_mangle]
 pub unsafe extern "C" fn pg_srf_continuous_close(srf: *mut PgContinuousSrf) {
     if !srf.is_null() {
-        drop(Box::from_raw(srf));
+        let srf = Box::from_raw(srf);
+        catch_unwind_or((), || drop(srf));
     }
 }
 

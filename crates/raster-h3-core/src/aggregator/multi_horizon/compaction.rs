@@ -44,7 +44,7 @@ struct Group<A> {
 
 impl<A: AccumulatorMerge> Group<A> {
     fn owned_bytes(&self) -> usize {
-        self.children.capacity() * std::mem::size_of::<(u64, A)>()
+        self.children.capacity() * size_of::<(u64, A)>()
             + self.parent_acc.heap_bytes()
             + self
                 .children
@@ -142,7 +142,7 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
                 .sum::<usize>();
         table_bytes::<u64, Group<K::Accumulator>>(self.pending.capacity())
             + self.group_bytes
-            + heap_entries * std::mem::size_of::<HeapEntry>()
+            + heap_entries * size_of::<HeapEntry>()
     }
 
     /// Highest `estimated_bytes` observed.

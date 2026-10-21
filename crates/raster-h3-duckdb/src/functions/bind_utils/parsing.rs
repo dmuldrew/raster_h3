@@ -59,7 +59,7 @@ mod tests {
         struct TestDropCounter(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for TestDropCounter {
             fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.0.store(true, Ordering::SeqCst);
             }
         }
 
@@ -70,7 +70,7 @@ mod tests {
             delete_boxed::<TestDropCounter>(raw);
             delete_boxed::<TestDropCounter>(std::ptr::null_mut());
         }
-        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(dropped.load(Ordering::SeqCst));
 
         let local = TableFunctionLocalData::default();
         assert_eq!(local.thread_id, 0);

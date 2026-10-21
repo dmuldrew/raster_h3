@@ -264,9 +264,7 @@ unsafe fn raise_error(msg: *const c_char) -> ! {
 }
 
 /// Run `f`, turning errors and panics into a `palloc`'d message for [`raise_error`].
-fn guarded<T>(
-    f: impl FnOnce() -> std::result::Result<T, String>,
-) -> std::result::Result<T, *mut c_char> {
+fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, *mut c_char> {
     let msg = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(Ok(v)) => return Ok(v),
         Ok(Err(m)) => m,
@@ -350,8 +348,12 @@ pub unsafe extern "C" fn pg_h3_to_string(fcinfo: pg_func_call_info) -> Datum {
     let Some(cell) = arg(fcinfo, 0) else {
         return return_null(fcinfo);
     };
+    let hex = match guarded(|| Ok(h3_to_string(cell as u64))) {
+        Ok(hex) => hex,
+        Err(msg) => raise_error(msg),
+    };
     let mut buf = [0u8; 16];
-    match h3_to_string(cell as u64) {
+    match hex {
         Some(s) => {
             let n = s.len().min(16);
             buf[..n].copy_from_slice(&s.as_bytes()[..n]);
@@ -373,10 +375,13 @@ pub extern "C" fn pg_finfo_pg_string_to_h3() -> *const Pg_finfo_record {
 /// Called by the PostgreSQL function manager with a valid `fcinfo`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_string_to_h3(fcinfo: pg_func_call_info) -> Datum {
-    let parsed = arg_str(fcinfo, 0)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(try_string_to_h3);
-    match parsed {
+    let text = arg_str(fcinfo, 0);
+    let parsed = guarded(|| {
+        Ok(text
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(try_string_to_h3))
+    });
+    match parsed.unwrap_or_else(|msg| raise_error(msg)) {
         Some(v) => v as i64 as Datum,
         None => return_null(fcinfo),
     }
@@ -393,9 +398,16 @@ pub extern "C" fn pg_finfo_pg_h3_is_valid_text() -> *const Pg_finfo_record {
 /// Called by the PostgreSQL function manager with a valid `fcinfo`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_is_valid_text(fcinfo: pg_func_call_info) -> Datum {
-    match arg_str(fcinfo, 0) {
-        Some(b) => usize::from(std::str::from_utf8(b).map(h3_is_valid_str).unwrap_or(false)),
-        None => return_null(fcinfo),
+    let Some(text) = arg_str(fcinfo, 0) else {
+        return return_null(fcinfo);
+    };
+    match guarded(|| {
+        Ok(std::str::from_utf8(text)
+            .map(h3_is_valid_str)
+            .unwrap_or(false))
+    }) {
+        Ok(valid) => usize::from(valid),
+        Err(msg) => raise_error(msg),
     }
 }
 
@@ -413,7 +425,11 @@ pub unsafe extern "C" fn pg_h3_to_wkb(fcinfo: pg_func_call_info) -> Datum {
     let Some(cell) = arg(fcinfo, 0) else {
         return return_null(fcinfo);
     };
-    match h3_to_wkb_u64(cell as u64) {
+    let wkb = match guarded(|| Ok(h3_to_wkb_u64(cell as u64))) {
+        Ok(wkb) => wkb,
+        Err(msg) => raise_error(msg),
+    };
+    match wkb {
         Some(wkb) => {
             let d = varlena_datum(&wkb);
             drop(wkb);
@@ -453,7 +469,7 @@ impl SrfArgs<'_> {
     #[allow(clippy::type_complexity)]
     fn parse(
         &self,
-    ) -> std::result::Result<
+    ) -> Result<
         (
             String,
             Vec<u8>,
@@ -568,8 +584,8 @@ unsafe fn set_is_done(fcinfo: pg_func_call_info, is_done: c_int) {
 /// `SRF_RETURN_NEXT` / `SRF_RETURN_DONE`).
 unsafe fn run_srf<S: 'static>(
     fcinfo: pg_func_call_info,
-    open: fn(&SrfArgs) -> std::result::Result<S, String>,
-    next: fn(&mut S) -> std::result::Result<Option<RowText>, String>,
+    open: fn(&SrfArgs<'_>) -> Result<S, String>,
+    next: fn(&mut S) -> Result<Option<RowText>, String>,
 ) -> Datum {
     let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
     if (*flinfo).fn_extra.is_null() {
@@ -626,23 +642,23 @@ unsafe fn run_srf<S: 'static>(
     }
 }
 
-fn open_continuous(args: &SrfArgs) -> std::result::Result<PgContinuousSrf, String> {
+fn open_continuous(args: &SrfArgs<'_>) -> Result<PgContinuousSrf, String> {
     let (path, res, crs, nodata, bbox) = args.parse()?;
     PgContinuousSrf::open(&path, res, crs, nodata, bbox).map_err(|e| e.to_string())
 }
 
-fn next_continuous(srf: &mut PgContinuousSrf) -> std::result::Result<Option<RowText>, String> {
+fn next_continuous(srf: &mut PgContinuousSrf) -> Result<Option<RowText>, String> {
     srf.next_row()
         .map(|row| row.map(continuous_values))
         .map_err(|e| e.to_string())
 }
 
-fn open_categorical(args: &SrfArgs) -> std::result::Result<PgCategoricalSrf, String> {
+fn open_categorical(args: &SrfArgs<'_>) -> Result<PgCategoricalSrf, String> {
     let (path, res, crs, nodata, bbox) = args.parse()?;
     PgCategoricalSrf::open(&path, res, crs, nodata, bbox).map_err(|e| e.to_string())
 }
 
-fn next_categorical(srf: &mut PgCategoricalSrf) -> std::result::Result<Option<RowText>, String> {
+fn next_categorical(srf: &mut PgCategoricalSrf) -> Result<Option<RowText>, String> {
     srf.next_row()
         .map(|row| row.map(categorical_values))
         .map_err(|e| e.to_string())

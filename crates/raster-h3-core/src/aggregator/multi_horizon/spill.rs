@@ -14,7 +14,7 @@ pub trait SpillAccumulator: AccumulatorMerge {
     fn write_state(&self, out: &mut impl Write) -> io::Result<()>;
     fn read_state(input: &mut impl Read, limit: usize) -> io::Result<Self>;
     fn memory_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.heap_bytes()
+        size_of::<Self>() + self.heap_bytes()
     }
 }
 
@@ -23,7 +23,7 @@ pub(crate) fn table_bytes<K, V>(capacity: usize) -> usize {
     if capacity == 0 {
         0
     } else {
-        (capacity + 1).saturating_mul(2 * (std::mem::size_of::<(K, V)>() + 1)) + 64
+        (capacity + 1).saturating_mul(2 * (size_of::<(K, V)>() + 1)) + 64
     }
 }
 fn invalid(message: &str) -> io::Error {

@@ -2,11 +2,15 @@
 name = "raster-h3-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Core pure-Rust engine for GeoTIFF/COG to H3 hexagonal aggregation, Arrow C stream export, Parquet, and PMTiles"
+
+[lints]
+workspace = true
 
 [lib]
 name = "raster_h3_core"

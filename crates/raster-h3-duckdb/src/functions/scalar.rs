@@ -714,7 +714,7 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     let type_bigint = duckdb_create_logical_type(DuckDBType::BigInt);
     let type_bool = duckdb_create_logical_type(DuckDBType::Boolean);
     let type_blob = duckdb_create_logical_type(DuckDBType::Blob);
-    let type_geom = crate::ffi::create_geometry_logical_type();
+    let type_geom = create_geometry_logical_type();
 
     // 1. h3_to_string(UBIGINT) -> VARCHAR
     register_unary_scalar_fn(
@@ -817,7 +817,7 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
     // GEOMETRY overloads only on DuckDB >= 1.5, whose native GEOMETRY vectors hold WKB.
     let type_cell_list = duckdb_create_list_type(type_ubigint);
     let mut geom_inputs = vec![type_blob];
-    if crate::ffi::is_duckdb_version_at_least(1, 5) {
+    if is_duckdb_version_at_least(1, 5) {
         geom_inputs.push(type_geom);
     }
     let polygon_params: Vec<[duckdb_logical_type; 3]> = geom_inputs
@@ -913,16 +913,16 @@ mod tests {
     fn test_h3_cell_to_parent_logic() {
         let valid_u64 = 0x8828308281fffffu64; // Res 8
         let cell = CellIndex::try_from(valid_u64).unwrap();
-        assert_eq!(cell.resolution(), h3o::Resolution::Eight);
+        assert_eq!(cell.resolution(), Resolution::Eight);
 
-        let parent_res7 = cell.parent(h3o::Resolution::Seven).unwrap();
-        assert_eq!(parent_res7.resolution(), h3o::Resolution::Seven);
+        let parent_res7 = cell.parent(Resolution::Seven).unwrap();
+        assert_eq!(parent_res7.resolution(), Resolution::Seven);
 
-        let parent_res6 = cell.parent(h3o::Resolution::Six).unwrap();
-        assert_eq!(parent_res6.resolution(), h3o::Resolution::Six);
+        let parent_res6 = cell.parent(Resolution::Six).unwrap();
+        assert_eq!(parent_res6.resolution(), Resolution::Six);
 
         // Child cannot have parent at higher resolution
-        assert!(cell.parent(h3o::Resolution::Nine).is_none());
+        assert!(cell.parent(Resolution::Nine).is_none());
     }
 
     #[test]

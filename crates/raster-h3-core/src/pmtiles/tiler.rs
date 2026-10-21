@@ -127,7 +127,7 @@ pub fn evict_and_write_tiles(
         tile_buckets: std::mem::take(tile_buckets),
         tile_eviction_queue: std::mem::take(tile_eviction_queue),
         safety_margin: 0.0,
-        layer_name: std::borrow::Cow::Borrowed("h3_hexagons"),
+        layer_name: Cow::Borrowed("h3_hexagons"),
         property_filter: None,
     };
     let count = acc.evict_and_write_tiles(lat_horizon, writer)?;
@@ -146,7 +146,7 @@ pub fn flush_all_tiles(
         tile_buckets,
         tile_eviction_queue: BinaryHeap::new(),
         safety_margin: 0.0,
-        layer_name: std::borrow::Cow::Borrowed("h3_hexagons"),
+        layer_name: Cow::Borrowed("h3_hexagons"),
         property_filter: None,
     };
     acc.flush_all(writer)

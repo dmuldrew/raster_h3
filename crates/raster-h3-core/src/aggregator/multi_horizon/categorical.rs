@@ -19,7 +19,7 @@ pub struct MultiCategoricalRecord {
 
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
 fn process_categorical_slice_into_maps<T: CategoricalUniformity>(
-    ctx: &WalkContext,
+    ctx: &WalkContext<'_>,
     slice: &[T],
     native_nodata: Option<T>,
     band: usize,
@@ -207,7 +207,7 @@ impl<'a, T: CategoricalUniformity> ScanlineEngine<T, CategoricalAccumulator>
 /// Process a categorical chunk across all resolutions into thread-local hash maps.
 /// Returns false when a single-band chunk is entirely nodata.
 pub fn process_categorical_chunk_payload_into(
-    window: &WalkContext,
+    window: &WalkContext<'_>,
     decoding_result: &DecodingResult,
     nodata: Option<f64>,
     band: usize,
@@ -226,7 +226,7 @@ pub fn process_categorical_chunk_payload_into(
 
 /// Borrowed-window form of [`process_categorical_chunk_payload_into`].
 pub fn process_categorical_borrowed_into(
-    window: &WalkContext,
+    window: &WalkContext<'_>,
     samples: super::borrowed::BorrowedSamples<'_>,
     nodata: Option<f64>,
     band: usize,

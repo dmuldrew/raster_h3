@@ -111,8 +111,8 @@ fn test_invalid_h3_geometry_emission() {
 fn test_all_resolutions_geometry_emission() {
     // Verify valid WKB geometry emission across all resolutions from 0 to 15
     for res in 0..=15 {
-        let lat_lng = h3o::LatLng::new(37.7749, -122.4194).unwrap();
-        let cell = lat_lng.to_cell(h3o::Resolution::try_from(res as u8).unwrap());
+        let lat_lng = LatLng::new(37.7749, -122.4194).unwrap();
+        let cell = lat_lng.to_cell(Resolution::try_from(res as u8).unwrap());
         let cell_u64: u64 = cell.into();
 
         let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
@@ -156,7 +156,7 @@ fn test_fast_hex_formatting() {
     assert_eq!(hex_str, format!("{:x}", cell_u64));
 
     // Test bidirectional parsing
-    let parsed = raster_h3_duckdb::functions::parse_hex_u64(hex_str).unwrap();
+    let parsed = parse_hex_u64(hex_str).unwrap();
     assert_eq!(parsed, cell_u64);
 }
 

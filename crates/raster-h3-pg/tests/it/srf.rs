@@ -181,7 +181,7 @@ fn categorical_srf_matches_core_with_options() {
     let bbox = [-122.45, 37.775, -122.425, 37.795];
 
     type Case<'a> = (Vec<u8>, Option<&'a str>, Option<f64>, Option<[f64; 4]>);
-    let cases: [Case; 4] = [
+    let cases: [Case<'_>; 4] = [
         (vec![8], None, None, None),
         (vec![7, 8], Some("EPSG:4326"), None, None),
         (vec![8], None, Some(3.0), None),
