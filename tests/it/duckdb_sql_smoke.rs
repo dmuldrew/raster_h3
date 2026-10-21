@@ -265,6 +265,7 @@ fn real_sql_parquet_to_pmtiles() {
         .create_constant_tempfile(42.0_f32);
     let parquet = duckdb.path("pmtiles-input.parquet");
     let pmtiles = duckdb.path("from-parquet.pmtiles");
+    let invalid_pmtiles = duckdb.path("missing-column.pmtiles");
     let sql = format!(
         r#"
         SELECT status = 'SUCCESS'
@@ -275,17 +276,22 @@ fn real_sql_parquet_to_pmtiles() {
         )
         FROM h3_parquet_to_pmtiles({parquet}, {pmtiles},
             h3_column := 'h3_index', properties := 'avg_value,pixel_count');
+        SELECT status LIKE 'ERROR:%missing_h3_column%' AND total_hexagons = 0
+        FROM h3_parquet_to_pmtiles({parquet}, {invalid_pmtiles},
+            h3_column := 'missing_h3_column');
         "#,
         tif = quoted(&tif),
         parquet = quoted(&parquet),
         pmtiles = quoted(&pmtiles),
+        invalid_pmtiles = quoted(&invalid_pmtiles),
     );
     assert_eq!(
         duckdb.query(&sql).lines().collect::<Vec<_>>(),
-        vec!["true"; 2]
+        vec!["true"; 3]
     );
     let archive = std::fs::read(&pmtiles).unwrap();
     assert_eq!(&archive[..7], b"PMTiles");
+    assert!(!invalid_pmtiles.exists());
 }
 
 #[test]

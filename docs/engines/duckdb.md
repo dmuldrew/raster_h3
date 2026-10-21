@@ -319,6 +319,11 @@ SELECT * FROM h3_raster_to_pmtiles(
 SELECT * FROM h3_parquet_to_pmtiles('demographics_h3.parquet', 'demographics.pmtiles');
 ```
 
+`h3_column` (alias `h3_col`) selects the H3 column case-insensitively; if omitted,
+`h3_index`/`h3_hex`/`h3`/`cell`/`hex` is auto-detected, else column 0; an explicit
+name that doesn't exist returns `status = 'ERROR: H3 column ... not found ...; available columns: ...'`
+with `total_hexagons = 0` and writes no file.
+
 See [PMTiles & Multi-Resolution](../pmtiles.md) for zoom mapping and viewer setup.
 
 ## Client Languages (Python, Node.js, R)

@@ -327,5 +327,4 @@ name any branch, even one without the file.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - No Python-side test covers `scan_raster_h3` projection, predicate or `n_rows` pushdown
   into Polars; it needs `polars` installed.
-- `h3_parquet_to_pmtiles` with a nonexistent `h3_column` silently falls back to auto-detect/column 0 (`parquet_tiler.rs`) instead of erroring; untested pending a decision.
 - EPSG:6933 and EPSG:7856 have no coverage tests.
