@@ -411,6 +411,8 @@ impl DecodingBufferPool {
         loop {
             match self.pool.steal() {
                 crossbeam_deque::Steal::Success(buf) => {
+                    // `try_update` replaces this on Rust 1.95+, but rust-version is 1.88.
+                    #[allow(deprecated)]
                     let _ = self
                         .count
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
