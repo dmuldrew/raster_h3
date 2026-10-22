@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace `rust-version = "1.94"` (required by h3o 0.11) and shared `[workspace.lints]`.
 - `SECURITY.md` and Dependabot configuration for Cargo, GitHub Actions and pip.
 - `raster_h3_core::error::catch_unwind_or` for panic-safe `extern "C"` entry points.
+- `CrsTransformer::bounds_certified` and certified (Lipschitz-enclosure) WGS84 bounds for transverse Mercator sources (`utm`, `etmerc`, exact `tmerc` on named ellipsoids), so bbox pruning stays sound for them.
 
 ### Changed
 
@@ -31,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PostgreSQL scalar functions, `pg_srf_continuous_next`, the `fmgr` text/bytea functions, Python scalar and `h3_polygon_to_cells` exports, and Arrow stream / batch-reader release no longer abort the host process if Rust code panics.
 - Replaced `AtomicUsize::try_update` (Rust 1.95) with `fetch_update` so the crate builds on its declared MSRV.
 - Broken rustdoc link in `RemoteHttpSource::read_exact_range`; all Clippy warnings.
+- `GeoTransform::coord_to_pixel` used an absolute determinant cutoff that rejected valid fine-resolution grids (e.g. 1e-8 degree pixels); it is now scale-relative and rejects non-finite affines.
+- Sampled PROJ bounds could reject valid data: `transform_rect_bounds` now returns the whole globe if any probe fails, and `rejection_bounds` fails open for uncertified bounds instead of padding them by 10%.
 
 ## [0.4.0] - 2026-10-21
 
