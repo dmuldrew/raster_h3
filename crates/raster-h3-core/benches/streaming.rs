@@ -3,10 +3,12 @@
 #[path = "../tests/it/helpers.rs"]
 mod helpers;
 
+use std::collections::HashMap;
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use raster_h3_core::aggregator::categorical::CategoricalAccumulator;
+use raster_h3_core::aggregator::cell_hash::H3BuildHasher;
 use raster_h3_core::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
@@ -99,5 +101,30 @@ fn hash_sensitive(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, streaming, hash_sensitive);
+fn h3_map(c: &mut Criterion) {
+    let cells: Vec<_> = h3o::CellIndex::try_from(0x8a2a1072b59ffffu64)
+        .unwrap()
+        .parent(h3o::Resolution::Three)
+        .unwrap()
+        .children(h3o::Resolution::Ten)
+        .map(u64::from)
+        .collect();
+    let mut group = c.benchmark_group("h3_map");
+    group.throughput(Throughput::Elements((cells.len() * 2) as u64));
+    group.bench_function("res10_insert_remove", |b| {
+        b.iter(|| {
+            let mut map: HashMap<u64, u64, H3BuildHasher> = HashMap::default();
+            for &cell in &cells {
+                map.insert(cell, cell);
+            }
+            for cell in &cells {
+                black_box(map.remove(cell));
+            }
+            black_box(map);
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, streaming, hash_sensitive, h3_map);
 criterion_main!(benches);
