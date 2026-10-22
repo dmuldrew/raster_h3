@@ -552,6 +552,7 @@ fn for_each_hawaii_reference_pixel(path: &Path, mut visit: impl FnMut(f64, f64, 
             DecodingResult::I64(v) => visit_pixels!(v, i64),
             DecodingResult::F32(v) => visit_pixels!(v, f32),
             DecodingResult::F64(v) => visit_pixels!(v, f64),
+            DecodingResult::F16(_) => unreachable!("ChunkDecoder widens F16 to F32"),
         }
     }
 }

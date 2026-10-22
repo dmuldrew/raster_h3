@@ -444,14 +444,10 @@ pub fn data_path(rel: &str) -> PathBuf {
 pub fn corrupt_strip_geotiff() -> NamedTempFile {
     let file = NamedTempFile::new().unwrap();
     {
-        let mut encoder = TiffEncoder::new(File::create(file.path()).unwrap()).unwrap();
-        let mut image = encoder
-            .new_image_with_compression::<colortype::Gray32Float, tiff::encoder::compression::Deflate>(
-                32,
-                32,
-                tiff::encoder::compression::Deflate::default(),
-            )
-            .unwrap();
+        let mut encoder = TiffEncoder::new(File::create(file.path()).unwrap())
+            .unwrap()
+            .with_compression(tiff::encoder::Compression::Deflate(Default::default()));
+        let mut image = encoder.new_image::<colortype::Gray32Float>(32, 32).unwrap();
         image.rows_per_strip(8).unwrap();
         image
             .encoder()

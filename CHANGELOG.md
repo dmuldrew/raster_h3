@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in European national-grid EPSG codes with Helmert datum shifts: `27700` (OSGB36), `28992` (Amersfoort / RD New), `31466`–`31469` (DHDN Gauss-Kruger), `23028`–`23038` (ED50 / UTM); and ETRS89 codes treated as WGS84: `2154`, `3035`, `25828`–`25838` ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 
 ### Changed
+- Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
 - Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
 - Workspace, Python package and PostgreSQL extension versions bumped to `0.4.0` (PostgreSQL install script renamed to `sql/raster_h3--0.4.0.sql`; there is no 0.3.0 release).
 - The DuckDB community-extension manifest moved from `community_extension/` to `packaging/duckdb-community/description.yml`; it now points at `dmuldrew/raster_h3`, declares version `0.4.0` and excludes the opt-in musl and `windows_amd64_rtools` platforms.

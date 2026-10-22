@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tiff::decoder::{ChunkType, Decoder, DecodingBuffer, DecodingResult};
+use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 use tiff::tags::{CompressionMethod, PhotometricInterpretation, Predictor, SampleFormat, Tag};
 
 use crate::error::{RasterH3Error, Result};
@@ -264,23 +264,38 @@ impl<'a> InnerDecoder<'a> {
 
     #[inline]
     fn read_chunk(&mut self, chunk: u32) -> Result<DecodingResult> {
-        match self {
-            InnerDecoder::Local(d) => Ok(d.read_chunk(chunk)?),
-            InnerDecoder::Remote(d) => Ok(d.read_chunk(chunk)?),
-        }
+        let data = match self {
+            InnerDecoder::Local(d) => d.read_chunk(chunk)?,
+            InnerDecoder::Remote(d) => d.read_chunk(chunk)?,
+        };
+        Ok(widen_f16(data))
     }
 
+    /// Decode `chunk` into `buffer`; tiff reshapes it to the chunk's sample type and length.
     #[inline]
     fn read_chunk_to_buffer(
         &mut self,
-        buffer: DecodingBuffer<'_>,
+        buffer: &mut DecodingResult,
         chunk: u32,
         width: usize,
     ) -> tiff::TiffResult<()> {
         match self {
-            InnerDecoder::Local(d) => d.read_chunk_to_buffer(buffer, chunk, width),
-            InnerDecoder::Remote(d) => d.read_chunk_to_buffer(buffer, chunk, width),
+            InnerDecoder::Local(d) => d.read_chunk_to_buffer(buffer, chunk, width)?,
+            InnerDecoder::Remote(d) => d.read_chunk_to_buffer(buffer, chunk, width)?,
         }
+        if matches!(buffer, DecodingResult::F16(_)) {
+            *buffer = widen_f16(std::mem::replace(buffer, DecodingResult::U8(Vec::new())));
+        }
+        Ok(())
+    }
+}
+
+/// Widen tiff's half-precision results to `F32`, so the rest of the pipeline only sees the
+/// sample types it has native kernels for.
+fn widen_f16(data: DecodingResult) -> DecodingResult {
+    match data {
+        DecodingResult::F16(v) => DecodingResult::F32(v.into_iter().map(f32::from).collect()),
+        other => other,
     }
 }
 
@@ -423,6 +438,10 @@ impl<'a> ChunkDecoder<'a> {
                         let fill = self.nodata.unwrap_or(f64::NAN);
                         v.resize(total_samples, fill);
                     }
+                    DecodingResult::F16(_) => {
+                        let fill = self.nodata.map(|n| n as f32).unwrap_or(f32::NAN);
+                        buf = DecodingResult::F32(vec![fill; total_samples]);
+                    }
                 }
                 return Ok((chunk_bounds, buf));
             } else if let Some(ref info) = self.chunk_info {
@@ -515,47 +534,11 @@ impl<'a> ChunkDecoder<'a> {
         mut buffer: DecodingResult,
     ) -> Result<(RasterChunk, DecodingResult)> {
         let data_dims = self.inner.chunk_data_dimensions(chunk_index);
-        let spp = self.samples_per_pixel.max(1) as usize;
-        let required_len = (data_dims.0 as usize) * (data_dims.1 as usize) * spp;
-
-        macro_rules! decode_into_buf {
-            ($buf:expr, $( ($variant:ident, $default:expr) ),* $(,)?) => {
-                match $buf {
-                    $(
-                        DecodingResult::$variant(ref mut v) => {
-                            if v.capacity() >= required_len {
-                                v.resize(required_len, $default);
-                                self.inner
-                                    .read_chunk_to_buffer(
-                                        DecodingBuffer::$variant(&mut v[..required_len]),
-                                        chunk_index,
-                                        data_dims.0 as usize,
-                                    )
-                                    .is_ok()
-                            } else {
-                                false
-                            }
-                        }
-                    )*
-                }
-            };
-        }
-
-        let decoded_ok = decode_into_buf!(
-            &mut buffer,
-            (U8, 0),
-            (U16, 0),
-            (U32, 0),
-            (U64, 0),
-            (I8, 0),
-            (I16, 0),
-            (I32, 0),
-            (I64, 0),
-            (F32, 0.0),
-            (F64, 0.0),
-        );
-
-        if decoded_ok {
+        if self
+            .inner
+            .read_chunk_to_buffer(&mut buffer, chunk_index, data_dims.0 as usize)
+            .is_ok()
+        {
             Ok((chunk_bounds, buffer))
         } else {
             let data = self.inner.read_chunk(chunk_index)?;

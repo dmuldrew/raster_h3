@@ -253,6 +253,7 @@ pub fn decoded_buffer_bytes(buf: &DecodingResult) -> usize {
         DecodingResult::I16(v) => cap(v),
         DecodingResult::I32(v) => cap(v),
         DecodingResult::I64(v) => cap(v),
+        DecodingResult::F16(v) => cap(v),
         DecodingResult::F32(v) => cap(v),
         DecodingResult::F64(v) => cap(v),
     }
