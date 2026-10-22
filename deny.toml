@@ -8,14 +8,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # fxhash is unmaintained but has no known vulnerability; it is a direct dependency of
-    # raster_h3 and raster-h3-core. Replacing it with rustc-hash is tracked separately.
-    { id = "RUSTSEC-2025-0057", reason = "unmaintained, no vulnerability; swap for rustc-hash is a follow-up" },
-    # paste is unmaintained (archived) but sound; it only arrives as a proc-macro through
-    # parquet 53. Goes away when parquet is upgraded.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro pulled in by parquet; no vulnerability" },
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -34,13 +27,14 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+# LLVM's libFuzzer is NCSA-licensed; this permissive license is used only by the fuzz harness.
+allow = ["NCSA"]
+
 [bans]
 multiple-versions = "warn"
-# The only wildcards are the workspace crates' versionless `path = "../raster-h3-core"`
-# dependencies. allow-wildcard-paths only exempts crates marked `publish = false`, which
-# these are not yet, so allow them here; tighten to "deny" once the manifests set
-# `publish = false` (or give the path dependencies a version).
-wildcards = "allow"
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

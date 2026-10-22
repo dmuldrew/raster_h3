@@ -214,7 +214,7 @@ pub const PROP_ALL_CATEGORICAL: u16 = (1 << 8) - 1;
 pub struct PropertyFilter {
     pub continuous_mask: u16,
     pub categorical_mask: u16,
-    pub generic_whitelist: Option<fxhash::FxHashSet<String>>,
+    pub generic_whitelist: Option<rustc_hash::FxHashSet<String>>,
     pub is_custom: bool,
 }
 
@@ -244,7 +244,7 @@ impl PropertyFilter {
 
         let mut cont_mask = 0u16;
         let mut cat_mask = 0u16;
-        let mut generic_set = fxhash::FxHashSet::default();
+        let mut generic_set = rustc_hash::FxHashSet::default();
 
         for part in trimmed.split(',') {
             let token = part.trim().to_ascii_lowercase();
@@ -808,8 +808,9 @@ impl MvtLayer {
 
     /// Encode this layer and its features into MVT Protobuf binary bytes
     pub fn encode(&self) -> Vec<u8> {
-        let mut key_map: fxhash::FxHashMap<Cow<'static, str>, u32> = fxhash::FxHashMap::default();
-        let mut val_map: fxhash::FxHashMap<MvtValue, u32> = fxhash::FxHashMap::default();
+        let mut key_map: rustc_hash::FxHashMap<Cow<'static, str>, u32> =
+            rustc_hash::FxHashMap::default();
+        let mut val_map: rustc_hash::FxHashMap<MvtValue, u32> = rustc_hash::FxHashMap::default();
         let mut keys: Vec<String> = Vec::new();
         let mut values: Vec<MvtValue> = Vec::new();
 

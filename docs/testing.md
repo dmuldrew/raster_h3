@@ -8,14 +8,14 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 32 modules, 1 binary | 278 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 33 modules, 1 binary | 283 |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
 | [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 10 |
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 10 (7 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 188 |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 191 |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -178,7 +178,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | [`core/codecs.rs`](../crates/raster-h3-core/tests/it/codecs.rs) (9) | Fast LZW parity with the `tiff` decoder on synthetic tiled data with predictors and edge padding; corrupted and truncated streams; buffer resizing. Four parity/recycling tests use the Hawaii datasets and are ignored by default. |
 | [`core/conus_pipeline.rs`](../crates/raster-h3-core/tests/it/conus_pipeline.rs) | `test_tiff_magic_validation_edge_cases`. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs), [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_u16_raster_streaming`, `test_f64_raster_streaming`, `test_tiled_chunk_layout_calculation`, `test_tiled_uneven_chunk_layout_and_bounds`. |
-| Unit: `raster/predictor.rs` (8) | Predictor 2 (including NEON) and predictor 3 unpacking. |
+| Unit: `raster/predictor.rs` (9) | Predictor 2 (including NEON), predictor 3 unpacking, and rejection of truncated buffers and invalid/overflowing layouts. |
 
 ## 13. Remote COG & cloud streaming
 
@@ -242,7 +242,7 @@ See [DuckDB](engines/duckdb.md).
 | :--- | :--- |
 | [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
 | [`root/pg_extension_e2e.rs`](../tests/it/pg_extension_e2e.rs) (1, ignored) | Builds the PostgreSQL module in Docker, loads it into `postgres:<major>` for each `RASTER_H3_PG_VERSIONS`, compares `psql` output with in-process SRFs and checks that bad `bbox`/`h3_res` raise SQL errors without breaking the session. |
-| Unit: `raster-h3-core` columnar (4), `scalar_ops.rs` (6) | Arrow C stream round trip, `RH3IPC01` round trip, scalar helpers. |
+| Unit: `raster-h3-core` columnar (6), `scalar_ops.rs` (6) | Arrow C stream round trip, release callback null-safety/idempotence, cross-thread owned export release, `RH3IPC01` round trip, scalar helpers. |
 | [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) (8) | Each `ContinuousRasterTableProvider` builder option equals a core `ContinuousBatchReader` run with the same config and changes the output: `with_nodata` (drops exactly the matching pixels), `with_sampling`, `with_band` (0 clamps to 1), `with_spectral_formula`, `with_quantiles` (extra columns, projectable), `with_min_count`/`with_min_mean`/`with_max_mean` intersected with pushed `MinCount`/`MinMean`/`MaxMean` (the stricter bound wins), `with_compact` (mass conserved; adjacent resolutions rejected), `with_overlap_rule` on a two-file source. |
 | [`datafusion/categorical_options.rs`](../crates/raster-h3-datafusion/tests/it/categorical_options.rs) (3) | `CategoricalRasterTableProvider` `with_nodata`, `with_remapper` (wide and long) and `with_min_majority_fraction` / `with_min_count` intersected with pushed filters, against `CategoricalBatchReader`. |
 | [`datafusion/statistics.rs`](../crates/raster-h3-datafusion/tests/it/statistics.rs) (3) | `statistics()` returns the inexact core cardinality estimate for both providers, grows with resolution, resolution count and mosaic files, stays within 4× of the real row count, and falls back to 10 000 per resolution for unreadable rasters. |
@@ -265,12 +265,43 @@ See the [engine deep dives](engines/README.md).
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/performance.rs`](../crates/raster-h3-core/tests/it/performance.rs) (4) | Continuous, multi-resolution, categorical and supersampled streaming of small synthetic rasters each finish in **under 2 s** and conserve pixel mass. These are coarse regression guards and run best with `--release`. |
+| [`core/performance.rs`](../crates/raster-h3-core/tests/it/performance.rs) (4) | Continuous, multi-resolution, categorical and supersampled streaming conserve pixel mass, with no wall-clock pass/fail thresholds. |
+| [`core/properties.rs`](../crates/raster-h3-core/tests/it/properties.rs) (5 generated tests) | Weighted merge equivalence, WKB validity/truncation, affine and Mercator round trips, and nodata/supersampled conservation plus cell uniqueness across the antimeridian. |
+| [`core/benches/streaming.rs`](../crates/raster-h3-core/benches/streaming.rs) | Criterion baselines for continuous, multi-resolution, categorical and supersampled streaming; hash-sensitive quantile and 8-class inline / 64-class heap categorical accumulators; raw res-10 H3 map insertion/removal. Fixture/input creation is not timed. |
 | [`core/super_sampling.rs`](../crates/raster-h3-core/tests/it/super_sampling.rs) | `benchmark_supersampling` (ignored): manual release throughput comparison. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs) | `test_parallel_chunk_aggregation_hawaii_dataset`, `test_parallel_categorical_aggregation_hawaii_dataset` (ignored, need data). |
 
-Throughput benchmarks proper live in [`examples/`](../examples) (`benchmark_*`); see
-[Architecture Comparison](architecture-comparison.md).
+Run `cargo bench --locked -p raster-h3-core --bench streaming`. To compare a local change
+on the same machine, first pass `-- --save-baseline before`, then run the changed code
+with `-- --baseline before`. Scheduled/manual benchmark runs preserve Criterion results
+as workflow artifacts; shared-runner timings are informational, not release gates.
+Additional workload demonstrations live in [`examples/`](../examples) (`benchmark_*`);
+see [Architecture Comparison](architecture-comparison.md).
+
+### Fuzzing and unsafe-code validation
+
+The [safety workflow](../.github/workflows/safety.yml) runs a short coverage-guided,
+AddressSanitizer-enabled fuzz smoke test on code changes and tags, and longer weekly runs.
+Targets cover the core WKB/EWKB parser, GeoTIFF metadata reader, and integer/floating-point
+chunk unpacking and predictors. Dimensions and allocations in the predictor harness are bounded;
+GeoTIFF metadata fuzzing deliberately does not decode attacker-controlled image dimensions.
+These are not exhaustive CRS or database ABI fuzzers.
+
+```bash
+cargo install cargo-fuzz --version 0.13.1 --locked
+cargo +nightly run --locked --manifest-path fuzz/Cargo.toml --example seed_corpus
+cargo +nightly fuzz run wkb -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run geotiff -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run predictor -- -max_total_time=60 -max_len=65536
+rustup component add --toolchain nightly miri rust-src
+cargo +nightly miri test --locked -p raster-h3-core --lib columnar::arrow_c::tests
+```
+
+Miri checks Arrow schema/array/stream ownership, callbacks, round trips and slicing; it
+does not run the external DuckDB/PostgreSQL/Python hosts. Existing real-host smoke tests
+remain necessary. Fuzz crash artifacts are retained on CI failure. Minimize a reproducer
+with `cargo +nightly fuzz tmin <target> <artifact>` and add a deterministic regression test;
+report security-sensitive findings privately per [SECURITY.md](../SECURITY.md).
 
 ---
 
@@ -285,8 +316,7 @@ cargo test --release --workspace -- --ignored       # only the gated tests
 RASTER_H3_PG_MAJOR=16 cargo test --release -p raster-h3-pg --features pg-extension  # adds the fmgr suites
 ```
 
-Use `--release` for anything that streams real data; debug builds are much slower and
-`core/performance.rs` can exceed its time limits.
+Use `--release` for anything that streams real data; debug builds are much slower.
 
 ### Gated tests
 
@@ -307,6 +337,10 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded) |
 | `ci.yml` | `cargo build --release --lib` then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs | Real-SQL coverage on both DuckDB versions, packaging with each CLI's `PRAGMA platform` tag |
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
+| `ci.yml` (`test-crates`, Linux) | `cargo test --release -p raster-h3-core -p raster-h3-duckdb -p raster-h3-datafusion -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
+| `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
+| [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets and scoped Arrow Miri tests | Malformed input, sanitizer smoke checks, and FFI ownership; longer fuzz runs weekly |
+| [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
 | [`manual-tests.yml`](../.github/workflows/manual-tests.yml) (manual) | `cargo test [--release] --no-fail-fast -p <engine>` plus `--features pg-extension` for `pg`/`all` (not on Windows) | Any engine (`all`, `core`, `duckdb`, `datafusion`, `cli`, `python`, `pg`, `root`) on one or all of Linux amd64/arm64, macOS arm64 and Windows, for any branch, tag or SHA, with optional libtest arguments |
@@ -322,9 +356,8 @@ name any branch, even one without the file.
 
 ### Gaps
 
-- **CLI, DataFusion, Python and PostgreSQL unit and integration tests are not run in CI.**
-  The test step selects the root, core and DuckDB packages; adding `--workspace` would
-  cover the rest (they still build, and run in-process, through `root/multi_engine_e2e.rs`).
+- CLI, DataFusion, Python and PostgreSQL unit/integration suites run on Linux in CI;
+  their cross-platform coverage is through the root parity tests or the manual workflow.
 - The real PostgreSQL test and the Hawaii-dataset tests never run in CI.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - No Python-side test covers `scan_raster_h3` projection, predicate or `n_rows` pushdown

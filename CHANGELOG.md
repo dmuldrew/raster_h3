@@ -9,12 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Release quality gates covering lint, MSRV, engine/community builds, blocking dependency policy, package/version checks, wheels, fuzzing and Miri; weekly advisory and safety checks.
+- GitHub release SHA-256 checksums and build provenance, validated wheel assets, contributor issue forms and PR checklist.
+- WKB/EWKB, GeoTIFF metadata and chunk-predictor fuzz targets, generated conservation/merge/CRS tests, scoped Arrow Miri checks and Criterion streaming baselines.
+- Core-only crates.io package policy and automated release metadata consistency checks (without publishing packages).
+
 - CI `lint` job (rustfmt, Clippy with `-D warnings` including the `pg-extension` feature, rustdoc with `-D warnings`) and `msrv` job.
 - Workspace `rust-version = "1.94"` (required by h3o 0.11) and shared `[workspace.lints]`.
 - `SECURITY.md` and Dependabot configuration for Cargo, GitHub Actions and pip.
 - `raster_h3_core::error::catch_unwind_or` for panic-safe `extern "C"` entry points.
 
+### Changed
+
+- Replaced unmaintained `fxhash` with maintained `rustc-hash`, removed obsolete advisory exceptions, and denied wildcard dependency requirements.
+- Replaced brittle two-second streaming test assertions with correctness-only tests and separate informational benchmarks.
+
 ### Fixed
+
+- TIFF sample unpacking now rejects truncated buffers, overflowing dimensions, invalid strides and undersized destinations before indexing or copying; the new fuzz target caught the truncated-input regression.
 
 - PostgreSQL scalar functions, `pg_srf_continuous_next`, the `fmgr` text/bytea functions, Python scalar and `h3_polygon_to_cells` exports, and Arrow stream / batch-reader release no longer abort the host process if Rust code panics.
 - Replaced `AtomicUsize::try_update` (Rust 1.95) with `fetch_update` so the crate builds on its declared MSRV.

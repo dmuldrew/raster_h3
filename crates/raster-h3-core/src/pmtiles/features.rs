@@ -1,7 +1,7 @@
 //! PMTiles Feature Definitions, Layer Metadata, and Export Summaries.
 
-use fxhash::FxBuildHasher;
 use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
@@ -235,7 +235,7 @@ impl TilePyramidAccumulator {
     /// Create a new tile pyramid accumulator with a custom layer name and safety margin
     pub fn with_layer<S: Into<Cow<'static, str>>>(layer_name: S, safety_margin: f64) -> Self {
         Self {
-            tile_buckets: HashMap::with_hasher(FxBuildHasher::default()),
+            tile_buckets: HashMap::with_hasher(FxBuildHasher),
             tile_eviction_queue: BinaryHeap::new(),
             safety_margin,
             layer_name: layer_name.into(),

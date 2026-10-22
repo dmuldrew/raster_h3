@@ -244,6 +244,39 @@ pub struct ChunkEncoding {
     pub photometric: PhotometricInterpretation,
 }
 
+impl ChunkEncoding {
+    fn validate(self, src_len: usize, dst_len: usize, sample_bytes: usize) -> Result<()> {
+        let invalid = || {
+            RasterH3Error::InvalidMetadata("invalid or truncated decoded TIFF chunk layout".into())
+        };
+        if self.spp == 0 || self.data_w == 0 || self.data_h == 0 || self.data_w > self.tile_w {
+            return Err(invalid());
+        }
+        let src_stride = self
+            .tile_w
+            .checked_mul(self.spp)
+            .and_then(|n| n.checked_mul(sample_bytes))
+            .ok_or_else(invalid)?;
+        let dst_stride = self.data_w.checked_mul(self.spp).ok_or_else(invalid)?;
+        let dst_bytes = dst_stride.checked_mul(sample_bytes).ok_or_else(invalid)?;
+        let samples = dst_stride.checked_mul(self.data_h).ok_or_else(invalid)?;
+        // Predictor 3 needs all byte planes, including the padding in the last row.
+        let last_row = if self.predictor == Predictor::FloatingPoint {
+            src_stride
+        } else {
+            dst_bytes
+        };
+        let required = src_stride
+            .checked_mul(self.data_h - 1)
+            .and_then(|n| n.checked_add(last_row))
+            .ok_or_else(invalid)?;
+        if src_len < required || dst_len < samples {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 /// Unpack generic integer samples from decompressed TIFF chunk bytes.
 ///
 /// Handles:
@@ -256,6 +289,7 @@ pub fn unpack_integer_samples<T: TiffSample + WrappingAdd>(
     dst: &mut [T],
     encoding: ChunkEncoding,
 ) -> Result<()> {
+    encoding.validate(src.len(), dst.len(), T::BYTES)?;
     let ChunkEncoding {
         tile_w,
         data_w,
@@ -604,6 +638,7 @@ pub fn decode_fp_predict_f64(input: &mut [u8], output: &mut [f64], spp: usize) {
 
 /// Unpack 32-bit floating point samples from decompressed TIFF chunk bytes.
 pub fn unpack_f32(src: &mut [u8], dst: &mut [f32], encoding: ChunkEncoding) -> Result<()> {
+    encoding.validate(src.len(), dst.len(), 4)?;
     let ChunkEncoding {
         tile_w,
         data_w,
@@ -717,6 +752,7 @@ pub fn unpack_f32(src: &mut [u8], dst: &mut [f32], encoding: ChunkEncoding) -> R
 
 /// Unpack 64-bit floating point samples from decompressed TIFF chunk bytes.
 pub fn unpack_f64(src: &mut [u8], dst: &mut [f64], encoding: ChunkEncoding) -> Result<()> {
+    encoding.validate(src.len(), dst.len(), 8)?;
     let ChunkEncoding {
         tile_w,
         data_w,
@@ -839,6 +875,45 @@ pub fn unpack_f64(src: &mut [u8], dst: &mut [f64], encoding: ChunkEncoding) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpack_rejects_truncated_buffers_and_invalid_layouts() {
+        let base = ChunkEncoding {
+            tile_w: 1,
+            data_w: 1,
+            data_h: 1,
+            spp: 1,
+            byte_order: TiffByteOrder::LittleEndian,
+            predictor: Predictor::None,
+            photometric: PhotometricInterpretation::BlackIsZero,
+        };
+        for encoding in [
+            base,
+            ChunkEncoding { spp: 0, ..base },
+            ChunkEncoding { data_w: 2, ..base },
+            ChunkEncoding {
+                tile_w: usize::MAX,
+                spp: 2,
+                ..base
+            },
+            ChunkEncoding {
+                data_h: usize::MAX,
+                ..base
+            },
+            ChunkEncoding {
+                predictor: Predictor::FloatingPoint,
+                ..base
+            },
+        ] {
+            assert!(unpack_integer_samples(&[0], &mut [0u16], encoding).is_err());
+            assert!(unpack_f32(&mut [0; 3], &mut [0.0], encoding).is_err());
+            // Reproduces the first truncated-input failure found by the fuzz target.
+            assert!(unpack_f64(&mut [0, 8, 0, 0, 37, 0], &mut [0.0], encoding).is_err());
+        }
+        assert!(unpack_integer_samples::<u16>(&[0; 2], &mut [], base).is_err());
+        assert!(unpack_f32(&mut [0; 4], &mut [], base).is_err());
+        assert!(unpack_f64(&mut [0; 8], &mut [], base).is_err());
+    }
 
     #[test]
     fn test_apply_horizontal_predictor_u8() {

@@ -1,5 +1,5 @@
 use crate::error::{RasterH3Error, Result};
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 /// Action to take for categories not explicitly matched by any remapping rule

@@ -1,5 +1,6 @@
 [package]
 name = "raster-h3-python"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,8 +18,8 @@ name = "raster_h3_python"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-raster-h3-core = { path = "../raster-h3-core" }
-raster-h3-datafusion = { path = "../raster-h3-datafusion" }
+raster-h3-core = { version = "0.4.0", path = "../raster-h3-core" }
+raster-h3-datafusion = { version = "0.4.0", path = "../raster-h3-datafusion" }
 h3o.workspace = true
 libc.workspace = true
 serde.workspace = true

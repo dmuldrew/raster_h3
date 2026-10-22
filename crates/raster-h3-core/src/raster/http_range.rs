@@ -24,7 +24,7 @@
 //!   byte count is satisfied. If the requested range extends past `total_size` or if fewer bytes are
 //!   returned, an explicit error is returned.
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
 use ureq::Agent;

@@ -1,4 +1,4 @@
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -96,7 +96,7 @@ impl CategoricalAccumulator {
         } else {
             // Spill to heap
             let mut map: HashMap<i64, f64, FxBuildHasher> =
-                HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
+                HashMap::with_capacity_and_hasher(32, FxBuildHasher);
             for i in 0..INLINE_CAPACITY {
                 map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
             }

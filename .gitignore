@@ -53,3 +53,8 @@ Thumbs.db
 # DuckDB extension-ci-tools (make configure / make test)
 configure/
 duckdb_unittest_tempdir/
+
+# Coverage-guided fuzzing output (seed corpora are generated locally)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/

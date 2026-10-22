@@ -1,5 +1,6 @@
 [package]
 name = "raster-h3-core"
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -31,7 +32,7 @@ rayon.workspace = true
 tiff.workspace = true
 proj4rs.workspace = true
 memmap2.workspace = true
-fxhash.workspace = true
+rustc-hash.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -44,3 +45,11 @@ url.workspace = true
 weezl.workspace = true
 libc.workspace = true
 crossbeam-deque.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "1.6", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "streaming"
+harness = false
