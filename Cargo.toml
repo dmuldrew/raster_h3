@@ -36,7 +36,7 @@ undocumented_unsafe_blocks = "warn"
 broken_intra_doc_links = "warn"
 
 [workspace.dependencies]
-h3o = "0.6"
+h3o = "0.11"
 rayon = "1.10"
 tiff = "0.9"
 proj4rs = { version = "0.1", features = ["esri"] }
