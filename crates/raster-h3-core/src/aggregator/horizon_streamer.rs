@@ -103,9 +103,12 @@ pub fn chunk_intersects_bbox(
     bbox: &[f64; 4],
 ) -> bool {
     // Uncertified estimates are discarded by rejection_bounds anyway.
-    // Avoid projecting 121 probes just to return a whole-globe candidate.
+    // Avoid projecting 121 probes just to test the whole globe.
     if !transformer.bounds_certified() {
-        return true;
+        return crate::aggregator::multi_horizon::coordinates::rect_intersects_bbox(
+            &[-180.0, -90.0, 180.0, 90.0],
+            bbox,
+        );
     }
     let bounds = transformer.transform_rect_bounds(
         gt,
@@ -114,6 +117,16 @@ pub fn chunk_intersects_bbox(
         chunk.width as f64,
         chunk.height as f64,
     );
+    bounds_intersect_bbox(transformer, bounds, bbox)
+}
+
+/// [`chunk_intersects_bbox`] for bounds the caller already computed with
+/// [`CrsTransformer::transform_rect_bounds`].
+pub(crate) fn bounds_intersect_bbox(
+    transformer: &CrsTransformer,
+    bounds: [f64; 4],
+    bbox: &[f64; 4],
+) -> bool {
     if !bounds[0].is_finite() {
         return true;
     }

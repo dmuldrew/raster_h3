@@ -285,6 +285,28 @@ fn uncertified_projections_fail_open_for_rejection() {
     let lcc = CrsTransformer::from_epsg_code(2154).unwrap();
     assert!(!lcc.bounds_certified());
     assert_eq!(lcc.rejection_bounds([10.0, 70.0, 20.0, 80.0]), GLOBE);
+
+    // Failing open keeps every bbox the globe can meet, but still rejects
+    // one lying entirely off it.
+    let gt = north_up(700_000.0, 6_600_000.0, 1000.0);
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 10,
+        height: 10,
+    };
+    assert!(chunk_intersects_bbox(
+        &chunk,
+        &gt,
+        &lcc,
+        &[100.0, -50.0, 101.0, -49.0]
+    ));
+    assert!(!chunk_intersects_bbox(
+        &chunk,
+        &gt,
+        &lcc,
+        &[185.0, 10.0, 190.0, 20.0]
+    ));
 }
 
 #[test]

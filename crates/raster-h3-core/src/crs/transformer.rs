@@ -581,6 +581,16 @@ impl GeoFrame {
     }
 }
 
+/// Marks a [`CrsTransformer::Proj4`] as one of the built-in EPSG:3413/3031
+/// polar stereographic definitions, whose rectangle bounds come from
+/// radial/angular extrema (see [`CrsTransformer::bounds_certified`]). It can
+/// only be created inside this crate, so a caller cannot certify an arbitrary
+/// PROJ string.
+#[derive(Debug, Clone, Copy)]
+pub struct PolarCertificate {
+    _private: (),
+}
+
 /// High-performance CRS to WGS84 coordinate transformer
 #[derive(Clone)]
 pub enum CrsTransformer {
@@ -604,7 +614,7 @@ pub enum CrsTransformer {
 
         /// Analytic radial/angular bounds for the built-in EPSG:3413/3031
         /// definitions only. Arbitrary PROJ strings keep failing open.
-        polar_bounds: bool,
+        polar: Option<PolarCertificate>,
     },
 }
 
@@ -663,22 +673,12 @@ impl CrsTransformer {
                 );
                 Self::from_proj_string(&p_str)
             }
-            3413 => {
-                let p_str = "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                let mut transformer = Self::from_proj_string(p_str)?;
-                if let Self::Proj4 { polar_bounds, .. } = &mut transformer {
-                    *polar_bounds = true;
-                }
-                Ok(transformer)
-            }
-            3031 => {
-                let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                let mut transformer = Self::from_proj_string(p_str)?;
-                if let Self::Proj4 { polar_bounds, .. } = &mut transformer {
-                    *polar_bounds = true;
-                }
-                Ok(transformer)
-            }
+            3413 => Self::polar_stereographic(
+                "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            ),
+            3031 => Self::polar_stereographic(
+                "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            ),
             // Codes below carry a Helmert datum shift chosen from the EPSG
             // registry (accuracy as published there); see
             // docs/crs-and-projection.md.
@@ -939,8 +939,18 @@ impl CrsTransformer {
             to: Box::new(to),
             geo,
             tm,
-            polar_bounds: false,
+            polar: None,
         })
+    }
+
+    /// A built-in WGS84 polar stereographic definition centred on the pole
+    /// with no false origin, the geometry [`Self::polar_rect_bounds`] assumes.
+    fn polar_stereographic(p_str: &str) -> Result<Self> {
+        let mut transformer = Self::from_proj_string(p_str)?;
+        if let Self::Proj4 { polar, .. } = &mut transformer {
+            *polar = Some(PolarCertificate { _private: () });
+        }
+        Ok(transformer)
     }
 
     /// Transform a single (x, y) point to (lon, lat) in WGS84 degrees
@@ -1049,7 +1059,7 @@ impl CrsTransformer {
             self,
             Self::Proj4 {
                 tm: None,
-                polar_bounds: false,
+                polar: None,
                 ..
             }
         )
@@ -1280,10 +1290,7 @@ impl CrsTransformer {
         if let Self::Proj4 { tm: Some(tm), .. } = self {
             return self.tm_rect_bounds(tm, gt, col, row, width, height);
         }
-        if let Self::Proj4 {
-            polar_bounds: true, ..
-        } = self
-        {
+        if let Self::Proj4 { polar: Some(_), .. } = self {
             return self.polar_rect_bounds(gt, col, row, width, height);
         }
         let p0 = gt.pixel_to_coord(col, row);
