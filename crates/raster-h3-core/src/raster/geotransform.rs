@@ -102,6 +102,22 @@ impl GeoTransform {
         self.pixel_to_coord(col as f64 + 0.5, row as f64 + 0.5)
     }
 
+    /// Whether the affine part is finite and non-singular. The singularity
+    /// test is relative to the magnitude of the products forming the
+    /// determinant, so it does not depend on coordinate units.
+    #[inline]
+    pub fn is_invertible(&self) -> bool {
+        let det = self.a * self.e - self.b * self.d;
+        let scale = (self.a * self.e).abs() + (self.b * self.d).abs();
+        det.is_finite() && scale.is_finite() && det.abs() > scale * 1e-12
+    }
+
+    /// Whether every coefficient is finite and the affine part is invertible:
+    /// the transform maps pixels to distinct, finite coordinates.
+    pub fn is_valid(&self) -> bool {
+        self.c0.is_finite() && self.f0.is_finite() && self.is_invertible()
+    }
+
     /// Map spatial coordinates (x, y) back to pixel (col, row)
     ///
     /// Returns `None` when the affine part is singular or non-finite. The
@@ -110,11 +126,10 @@ impl GeoTransform {
     /// degree geographic grid (|det| = 1e-16) is as invertible as a 10 m one.
     #[inline(always)]
     pub fn coord_to_pixel(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        let det = self.a * self.e - self.b * self.d;
-        let scale = (self.a * self.e).abs() + (self.b * self.d).abs();
-        if !det.is_finite() || !scale.is_finite() || det.abs() <= scale * 1e-12 {
+        if !self.is_invertible() {
             return None;
         }
+        let det = self.a * self.e - self.b * self.d;
         let dx = x - self.c0;
         let dy = y - self.f0;
         let col = (dx * self.e - dy * self.b) / det;

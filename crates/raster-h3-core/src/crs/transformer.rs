@@ -388,10 +388,47 @@ impl AlbersConicFast {
 /// Lower bound on the meridional radius of curvature (and hence on the
 /// normal radius, which is never smaller) of every named ellipsoid proj4rs
 /// knows; the extremes are CPM (a = 6375.7 km) and Maupertius (f = 1/191),
-/// both above 6.33e6 m. A `+towgs84` Helmert shift moves points by at
-/// most a few hundred metres and changes scale by parts per million, which
-/// this margin also absorbs.
+/// both above 6.33e6 m.
+///
+/// With a datum shift, latitude and longitude are read on WGS84 (M >= 6.335e6 m)
+/// for a point lifted off it by at most a few tens of kilometres: the
+/// [`TM_MAX_HELMERT_*`](TM_MAX_HELMERT_TRANSLATION_M) limits, plus the gap
+/// between the source ellipsoid and WGS84 (under 35 km for the extreme
+/// named ellipsoids). Lengths grow by at most the Helmert scale. Both effects
+/// stay inside this margin and the 0.1% reduction of `k0`.
 const TM_MIN_RADIUS_M: f64 = 6.3e6;
+
+/// Largest Helmert translation (metres, vector norm) a certified transverse
+/// Mercator source may carry. Every named datum in proj4rs is under 800 m.
+const TM_MAX_HELMERT_TRANSLATION_M: f64 = 1500.0;
+/// Largest Helmert rotation (arc-seconds, per axis); named datums reach 5.3".
+const TM_MAX_HELMERT_ROTATION_ARCSEC: f64 = 10.0;
+/// Largest Helmert scale change (ppm); named datums reach 20.5 ppm.
+const TM_MAX_HELMERT_SCALE_PPM: f64 = 50.0;
+
+/// Whether a `+towgs84` value is a 3- or 7-parameter Helmert shift within the
+/// limits above. Larger shifts can move points far from the target
+/// ellipsoid's surface, where latitude and longitude change much faster than
+/// the certificate's radius bound allows.
+fn helmert_within_tm_limits(towgs84: &str) -> bool {
+    let p: Option<Vec<f64>> = towgs84
+        .split(',')
+        .map(|v| v.trim().parse::<f64>().ok().filter(|x| x.is_finite()))
+        .collect();
+    let Some(p) = p else {
+        return false;
+    };
+    let (shift, rot, scale) = match p.as_slice() {
+        [x, y, z] => ([*x, *y, *z], [0.0; 3], 0.0),
+        [x, y, z, rx, ry, rz, s] => ([*x, *y, *z], [*rx, *ry, *rz], *s),
+        _ => return false,
+    };
+    shift.iter().map(|v| v * v).sum::<f64>().sqrt() <= TM_MAX_HELMERT_TRANSLATION_M
+        && rot
+            .iter()
+            .all(|r| r.abs() <= TM_MAX_HELMERT_ROTATION_ARCSEC)
+        && scale.abs() <= TM_MAX_HELMERT_SCALE_PPM
+}
 
 /// Certified transverse Mercator bounds hold within this many metres of
 /// the central meridian, measured in projection-plane metres divided by
@@ -430,7 +467,8 @@ impl TmCertificate {
     /// Build a certificate for `from` when it is an ellipsoidal transverse
     /// Mercator on a named ellipsoid with standard axes; `None` otherwise
     /// (spherical or Evenden/Snyder variants, custom ellipsoid sizes, swapped
-    /// axes), leaving its bounds uncertified.
+    /// axes, `+towgs84` shifts beyond the Helmert limits), leaving its bounds
+    /// uncertified.
     fn new(from: &Proj, tokens: &std::collections::HashMap<String, String>) -> Option<Self> {
         let utm = match from.projname() {
             "utm" => true,
@@ -445,6 +483,11 @@ impl TmCertificate {
             || tokens.keys().any(|k| k.starts_with("r_"))
             || tokens.get("ellps").is_some_and(|e| e == "sphere")
             || tokens.get("algo").is_some_and(|a| a != "poder_engsager")
+            // Named datums imply Helmert shifts inside the limits; explicit
+            // ones must be checked.
+            || tokens
+                .get("towgs84")
+                .is_some_and(|t| !helmert_within_tm_limits(t))
             || !from.is_normalized_axis()
         {
             return None;
@@ -2214,6 +2257,9 @@ mod tests {
             "+proj=tmerc +lon_0=9 +ellps=sphere",
             "+proj=tmerc +lon_0=9 +a=6378137 +rf=298.257223563",
             "+proj=tmerc +lon_0=9 +k=0.9996 +k_0=0.9999 +ellps=WGS84",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=-6000000,0,0",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,0,0,0,5000",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,60,0,0,0",
         ] {
             let tf = CrsTransformer::from_crs_or_epsg(None, Some(crs)).unwrap();
             assert!(!tf.bounds_certified(), "{crs}");
@@ -2221,6 +2267,8 @@ mod tests {
         for crs in [
             "+proj=utm +zone=10 +ellps=GRS80",
             "+proj=tmerc +lon_0=9 +datum=WGS84",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=-87,-98,-121",
+            "+proj=tmerc +lon_0=-2 +datum=OSGB36",
         ] {
             let tf = CrsTransformer::from_crs_or_epsg(None, Some(crs)).unwrap();
             assert!(tf.bounds_certified(), "{crs}");
