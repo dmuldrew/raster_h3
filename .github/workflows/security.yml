@@ -21,4 +21,4 @@ jobs:
         with:
           command: check
           manifest-path: ${{ matrix.manifest }}
-          command-arguments: --config deny.toml
+          arguments: --all-features --config deny.toml
