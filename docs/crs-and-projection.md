@@ -83,7 +83,11 @@ the radii of curvature (6.3e6 m is used, below every named ellipsoid). The
 rectangle is sampled on an 11×11 grid and widened by these amounts. For a
 512 px × 30 m chunk the widening is about 0.01–0.02°. Explicit `+towgs84`
 shifts are certified up to 1.5 km translation, 10″ rotation and 50 ppm scale,
-which covers every named datum.
+which covers every named datum. Certification fails open for duplicate parameters,
+quoted values, non-lowercase keys, or whitespace around `=`; projection still
+uses proj4rs normally. Scale follows the backend's effective parameters:
+proj4rs 0.1.10 uses `+k0` before `+k` and ignores `+k_0`. This rule also applies
+when several scale aliases occur together. UTM retains its fixed scale.
 
 If any probe of a rectangle fails to project (part of it lies outside the
 projection's domain), its bounds are the whole globe. GeoTIFFs whose affine

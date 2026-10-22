@@ -469,15 +469,34 @@ impl TmCertificate {
     /// (spherical or Evenden/Snyder variants, custom ellipsoid sizes, swapped
     /// axes, `+towgs84` shifts beyond the Helmert limits), leaving its bounds
     /// uncertified.
-    fn new(from: &Proj, tokens: &std::collections::HashMap<String, String>) -> Option<Self> {
+    fn new(from: &Proj, src: &str) -> Option<Self> {
         let utm = match from.projname() {
             "utm" => true,
             "etmerc" | "tmerc" => false,
             _ => return None,
         };
+        // Certify only simple PROJ syntax we can interpret like proj4rs.
+        // Its parser is case-sensitive, accepts quotes and whitespace around
+        // '=', and keeps the FIRST duplicate. The fast-path tokenizer
+        // lowercases and keeps the LAST, so cannot establish a certificate.
+        let mut tokens = std::collections::HashMap::new();
+        for token in src.split_whitespace() {
+            let token = token.strip_prefix('+')?;
+            let (key, value) = token.split_once('=').unwrap_or((token, ""));
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                || value.contains('"')
+                || (token.contains('=') && value.is_empty())
+                || tokens.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                return None;
+            }
+        }
         // `tmerc` falls back to the Evenden/Snyder series on a sphere or on
-        // request; custom ellipsoid sizes escape the radius bound. Token keys
-        // are lowercased, so `+R` and `+R_A`... arrive as `r` and `r_*`.
+        // request; custom ellipsoid sizes escape the radius bound. Parameters
+        // with uppercase keys (including `+R` / `+R_A`) fail the syntax gate above.
         let blocked = ["approx", "a", "b", "rf", "f", "es", "e", "r"];
         if blocked.iter().any(|k| tokens.contains_key(*k))
             || tokens.keys().any(|k| k.starts_with("r_"))
@@ -496,17 +515,12 @@ impl TmCertificate {
             // proj4rs fixes these for UTM regardless of +k / +x_0.
             (0.9996, 500_000.0)
         } else {
-            if tokens.contains_key("k") && tokens.contains_key("k_0") {
-                return None;
-            }
-            let key = if tokens.contains_key("k_0") {
-                "k_0"
-            } else {
-                "k"
-            };
+            // proj4rs 0.1.10 reads `k0` first, then `k`; it ignores `k_0`.
+            // Match the effective projection, including coexisting aliases.
+            let key = if tokens.contains_key("k0") { "k0" } else { "k" };
             (
-                parse_opt_f64(tokens, key, 1.0)?,
-                parse_opt_f64(tokens, "x_0", 0.0)?,
+                parse_opt_f64(&tokens, key, 1.0)?,
+                parse_opt_f64(&tokens, "x_0", 0.0)?,
             )
         };
         let to_meter = from.to_meter();
@@ -907,7 +921,7 @@ impl CrsTransformer {
             ))
         })?;
 
-        let tm = TmCertificate::new(&from, &tokens);
+        let tm = TmCertificate::new(&from, src_proj);
         Ok(Self::Proj4 {
             from: Box::new(from),
             to: Box::new(to),
@@ -2256,7 +2270,6 @@ mod tests {
             "+proj=tmerc +lon_0=9 +R=6371000",
             "+proj=tmerc +lon_0=9 +ellps=sphere",
             "+proj=tmerc +lon_0=9 +a=6378137 +rf=298.257223563",
-            "+proj=tmerc +lon_0=9 +k=0.9996 +k_0=0.9999 +ellps=WGS84",
             "+proj=utm +zone=33 +ellps=intl +towgs84=-6000000,0,0",
             "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,0,0,0,5000",
             "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,60,0,0,0",

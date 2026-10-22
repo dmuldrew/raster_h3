@@ -186,3 +186,72 @@ fn opening_a_geotiff_rejects_singular_or_non_finite_affines() {
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     assert!(reader.metadata.geotransform.is_valid());
 }
+
+#[test]
+fn tm_certificate_matches_effective_scale_parameters() {
+    for (params, effective_scale) in [
+        ("+k_0=100", 1.0), // ignored by proj4rs, not a scale of 100
+        ("+k0=0.01", 0.01),
+        ("+k=0.01", 0.01),
+        ("+k=100 +k0=0.01 +k_0=200", 0.01),
+        ("+k0=0.01 +k=100", 0.01),
+    ] {
+        let tf = CrsTransformer::from_proj_string(&format!("+proj=tmerc +ellps=WGS84 {params}"))
+            .unwrap();
+        assert!(tf.bounds_certified(), "{params}");
+        // Pole lies between probes; incorrect scale padding misses its latitude.
+        let gt = north_up(
+            -20_000.0 * effective_scale,
+            10_021_000.0 * effective_scale,
+            1000.0 * effective_scale,
+        );
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 40.0, 60.0);
+        assert_eq!(b[3], 90.0, "{params}: {b:?}");
+        assert_encloses(&tf, &gt, 40.0, 60.0, b);
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 40,
+            height: 60,
+        };
+        assert!(chunk_intersects_bbox(
+            &chunk,
+            &gt,
+            &tf,
+            &[-180.0, 89.995, 180.0, 90.0]
+        ));
+    }
+}
+
+#[test]
+fn ambiguous_tm_parameters_cannot_certify_rejection_bounds() {
+    for params in [
+        "+towgs84=-6370000,0,0 +towgs84=0,0,0",
+        "+towgs84=0,0,0 +towgs84=-6370000,0,0",
+        "+k=1 +k=100",
+        "+k0=0.01 +k0=100",
+        "+x_0=1000000 +x_0=0",
+        "+K=100",
+        "+k=\"0.01\"",
+        "+k = 0.01",
+    ] {
+        let tf = CrsTransformer::from_proj_string(&format!("+proj=tmerc +ellps=WGS84 {params}"))
+            .unwrap();
+        assert!(!tf.bounds_certified(), "{params}");
+        let gt = north_up(-20_000.0, 10_021_000.0, 1000.0);
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 40.0, 60.0);
+        assert_eq!(tf.rejection_bounds(b), GLOBE, "{params}");
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 40,
+            height: 60,
+        };
+        assert!(chunk_intersects_bbox(
+            &chunk,
+            &gt,
+            &tf,
+            &[-180.0, 89.995, 180.0, 90.0]
+        ));
+    }
+}
