@@ -267,7 +267,7 @@ See the [engine deep dives](engines/README.md).
 | :--- | :--- |
 | [`core/performance.rs`](../crates/raster-h3-core/tests/it/performance.rs) (4) | Continuous, multi-resolution, categorical and supersampled streaming conserve pixel mass, with no wall-clock pass/fail thresholds. |
 | [`core/properties.rs`](../crates/raster-h3-core/tests/it/properties.rs) (5 generated tests) | Weighted merge equivalence, WKB validity/truncation, affine and Mercator round trips, and nodata/supersampled conservation plus cell uniqueness across the antimeridian. |
-| [`core/benches/streaming.rs`](../crates/raster-h3-core/benches/streaming.rs) | Criterion baselines for continuous, multi-resolution, categorical and supersampled streaming. Fixture creation is not timed. |
+| [`core/benches/streaming.rs`](../crates/raster-h3-core/benches/streaming.rs) | Criterion baselines for continuous, multi-resolution, categorical and supersampled streaming; hash-sensitive quantile and 8-class inline / 64-class heap categorical accumulators. Fixture/input creation is not timed. |
 | [`core/super_sampling.rs`](../crates/raster-h3-core/tests/it/super_sampling.rs) | `benchmark_supersampling` (ignored): manual release throughput comparison. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs) | `test_parallel_chunk_aggregation_hawaii_dataset`, `test_parallel_categorical_aggregation_hawaii_dataset` (ignored, need data). |
 

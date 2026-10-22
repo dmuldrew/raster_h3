@@ -6,9 +6,11 @@ mod helpers;
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use raster_h3_core::aggregator::categorical::CategoricalAccumulator;
 use raster_h3_core::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
 };
+use raster_h3_core::aggregator::quantiles::QuantileSketch;
 use raster_h3_core::aggregator::sampling::SamplingPattern;
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 
@@ -61,5 +63,41 @@ fn streaming(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, streaming);
+fn hash_sensitive(c: &mut Criterion) {
+    let categories: Vec<_> = (0..65536).map(|i| i64::from(i % 64)).collect();
+    let values: Vec<_> = (0..65536).map(|i| f64::from(i % 4096 + 1)).collect();
+    let mut group = c.benchmark_group("hash_sensitive");
+    group.throughput(Throughput::Elements(65536));
+    for classes in [8, 64] {
+        let inputs: Vec<_> = categories
+            .iter()
+            .map(|category| category % classes)
+            .collect();
+        group.bench_with_input(
+            BenchmarkId::new("categorical", classes),
+            &classes,
+            |b, _| {
+                b.iter(|| {
+                    let mut accumulator = CategoricalAccumulator::new();
+                    for &category in &inputs {
+                        accumulator.update(black_box(category));
+                    }
+                    black_box(accumulator);
+                });
+            },
+        );
+    }
+    group.bench_function("quantile_sketch", |b| {
+        b.iter(|| {
+            let mut sketch = QuantileSketch::new();
+            for &value in &values {
+                sketch.insert(black_box(value));
+            }
+            black_box(sketch);
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, streaming, hash_sensitive);
 criterion_main!(benches);

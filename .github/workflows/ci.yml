@@ -412,6 +412,7 @@ jobs:
     uses: ./.github/workflows/wheels.yml
     permissions:
       contents: read
+      pull-requests: read
 
   safety:
     needs: [changes]
