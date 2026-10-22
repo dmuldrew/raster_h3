@@ -407,6 +407,9 @@ impl PmtilesWriter {
         // Stream tile data from spill_file to out_file in sorted Hilbert order via zero-copy memory map
         self.spill_file.flush()?;
         if self.current_spill_offset > 0 {
+            // SAFETY: `spill_file` is an anonymous `tempfile::tempfile()` (unlinked,
+            // so no other process can open it) and we hold `&mut self`, so nothing
+            // writes to or truncates it while the map is alive; it was flushed above.
             let mmap = unsafe { memmap2::Mmap::map(&self.spill_file)? };
             for e in &self.entries {
                 let start = e.spill_offset as usize;

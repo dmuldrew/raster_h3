@@ -24,10 +24,10 @@ jobs:
     outputs:
       code: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || steps.filter.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch' }}
 
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch' }}
         with:
@@ -111,21 +111,29 @@ jobs:
             platform: linux_amd64_gcc4
             lib_file: libraster_h3.so
             cli_arch: linux-amd64
+            cli_sha256: 5221744caf224994bf563bff8e8bd039a9b63437ef05ccfdcc14d2c1cece8d3e
+            cli_v156_sha256: 6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux_arm64
             lib_file: libraster_h3.so
             cli_arch: linux-aarch64
+            cli_sha256: 324bd819153c685b7e8153e73d34cbd590b48e096680fd68c8b16a7035206323
+            cli_v156_sha256: c544e92c9b7c31fc53c2139802cabd8e2d1b2b3e3f933117f31611239c1402db
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: osx_arm64
             lib_file: libraster_h3.dylib
             cli_arch: osx-universal
+            cli_sha256: 09c57c5065decc254f64e51e7b1de94d262ec13fcd8d1a96a16f08f67ee2ed9f
+            cli_v156_sha256: 80a80c68736bd7dea53e8b02447e9759db0c8596ea156476ba396c44f54c5810
           - os: macos-latest
             target: x86_64-apple-darwin
             platform: osx_amd64
             lib_file: libraster_h3.dylib
             cli_arch: osx-universal
+            cli_sha256: 09c57c5065decc254f64e51e7b1de94d262ec13fcd8d1a96a16f08f67ee2ed9f
+            cli_v156_sha256: 80a80c68736bd7dea53e8b02447e9759db0c8596ea156476ba396c44f54c5810
             # Cross-compiled on an arm64 runner: run the universal CLI's x86_64 slice
             cli_prefix: arch -x86_64
           - os: windows-latest
@@ -133,18 +141,24 @@ jobs:
             platform: windows_amd64
             lib_file: raster_h3.dll
             cli_arch: windows-amd64
+            cli_sha256: 3f3194799c1f289ff570cef9191168ea5d6743202d4445dd6d5ee669a8586435
+            cli_v156_sha256: 798eae475d07c645ff3b914f7b0e676d06502b5412dd7552638fafed81f9e916
+    permissions:
+      contents: read
     env:
       LIB_NAME: ${{ matrix.lib_file }}
+      # SHA-256 of DuckDB v1.2.0's libduckdb-windows-amd64.zip
+      LIBDUCKDB_WINDOWS_SHA256: 6327f8443ff8744a6753819e1ca874a82f1944a603d6dbc3bc564dada39b6337
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           targets: ${{ matrix.target }}
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
@@ -158,7 +172,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/duckdb_lib
-          curl -sLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          curl -fsSLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          scripts/verify_sha256.sh libduckdb-windows-amd64.zip "$LIBDUCKDB_WINDOWS_SHA256"
           unzip -o -q libduckdb-windows-amd64.zip -d target/duckdb_lib
           WIN_LIB_DIR=$(cygpath -w "$(pwd)/target/duckdb_lib")
           echo "LIB=$WIN_LIB_DIR;$LIB" >> $GITHUB_ENV
@@ -208,7 +223,8 @@ jobs:
         run: |
           CLI_URL="https://github.com/duckdb/duckdb/releases/download/v1.2.0/duckdb_cli-${{ matrix.cli_arch }}.zip"
           echo "Downloading DuckDB CLI from $CLI_URL..."
-          curl -sLO "$CLI_URL"
+          curl -fsSLO "$CLI_URL"
+          scripts/verify_sha256.sh "duckdb_cli-${{ matrix.cli_arch }}.zip" "${{ matrix.cli_sha256 }}"
           unzip -o -q "duckdb_cli-${{ matrix.cli_arch }}.zip"
           
           DUCKDB_BIN="./duckdb"
@@ -252,7 +268,8 @@ jobs:
           fi
           CLI_URL="https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-${CLI_ARCH}.zip"
           echo "Downloading DuckDB CLI from $CLI_URL..."
-          curl -sL "$CLI_URL" -o "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip"
+          curl -fsSL "$CLI_URL" -o "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip"
+          scripts/verify_sha256.sh "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip" "${{ matrix.cli_v156_sha256 }}"
           unzip -o -q "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip" -d duckdb-1.5
 
           DUCKDB_BIN="$(pwd)/duckdb-1.5/duckdb"
@@ -265,7 +282,7 @@ jobs:
           cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
 
       - name: Upload Extension Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: duckdb-extension-${{ matrix.platform }}
           path: |
@@ -283,16 +300,18 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -307,6 +326,56 @@ jobs:
       - name: Run test/sql
         run: ./configure/venv/bin/python3 -m duckdb_sqllogictest --test-dir test/sql --external-extension build/release/raster_h3.duckdb_extension
 
+  # The build matrix tests the root, core and DuckDB crates; this covers the remaining
+  # workspace crates on Linux, including the pg fmgr suites behind `pg-extension`.
+  test-crates:
+    name: Tests (cli, datafusion, python, pg)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # The pg fmgr suites need a target major; they run against in-process stand-ins.
+      RASTER_H3_PG_MAJOR: '16'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Run tests
+        run: cargo test --release --no-fail-fast -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg
+
+      - name: Run pg-extension tests
+        run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
+
+  # Supply-chain checks configured in deny.toml. New RustSEC advisories can land at any
+  # time without a code change, so they are reported but do not fail the PR.
+  deny:
+    name: cargo-deny (${{ matrix.checks }})
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check ${{ matrix.checks }}
+
   release:
     name: Publish GitHub Release
     needs: [build]
@@ -315,10 +384,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Download all extension artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: all-artifacts
           pattern: duckdb-extension-*
@@ -347,7 +416,7 @@ jobs:
           ls -la release-assets/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release-assets/*
           generate_release_notes: true

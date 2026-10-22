@@ -126,6 +126,9 @@ pub fn reset_context(ctx: *mut c_void) {
         run
     });
     for (_, cb) in cbs {
+        // SAFETY: `cb` was registered by the extension via
+        // `MemoryContextRegisterResetCallback`, points to a palloc'd (never freed) callback
+        // record, and was just removed from the list, so its function runs exactly once.
         unsafe {
             if let Some(func) = (*cb).func {
                 func((*cb).arg);
@@ -158,8 +161,14 @@ pub unsafe extern "C" fn errstart(_elevel: c_int, _domain: *const c_char) -> boo
 /// Declared variadic by the extension; only the format string is read here.
 #[no_mangle]
 pub unsafe extern "C" fn errmsg(fmt: *const c_char) -> c_int {
-    eprintln!("ereport: {}", CStr::from_ptr(fmt).to_string_lossy());
-    0
+    // SAFETY: test stand-in for the PostgreSQL backend, called by the extension on this
+    // test's thread: `fmt` is the extension's NUL-terminated `"%s"` literal. The extension
+    // declares `errmsg` as variadic, but the format string is the first fixed argument,
+    // which variadic and non-variadic calls pass identically on supported ABIs.
+    unsafe {
+        eprintln!("ereport: {}", CStr::from_ptr(fmt).to_string_lossy());
+        0
+    }
 }
 
 #[no_mangle]
@@ -176,33 +185,43 @@ pub unsafe extern "C" fn errfinish(
 pub unsafe extern "C" fn init_MultiFuncCall(
     fcinfo: raster_h3_pg::pg_func_call_info,
 ) -> *mut c_void {
-    let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
-    assert!(
-        (*flinfo).fn_extra.is_null(),
-        "init_MultiFuncCall called twice"
-    );
-    let ctx = Box::into_raw(Box::new(0u64)) as *mut c_void;
-    let funcctx = Box::into_raw(Box::new(FuncCallContext {
-        call_cntr: 0,
-        max_calls: 0,
-        user_fctx: ptr::null_mut(),
-        attinmeta: ptr::null_mut(),
-        multi_call_memory_ctx: ctx,
-        tuple_desc: ptr::null_mut(),
-    }));
-    (*flinfo).fn_extra = funcctx as *mut c_void;
-    SERVER.with_borrow_mut(|s| s.contexts_live += 1);
-    funcctx as *mut c_void
+    // SAFETY: test stand-in for the PostgreSQL backend, called by the extension on this
+    // test's thread: `fcinfo` is the test's live call info, whose `flinfo` points to the
+    // test's `FmgrInfo`.
+    unsafe {
+        let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
+        assert!(
+            (*flinfo).fn_extra.is_null(),
+            "init_MultiFuncCall called twice"
+        );
+        let ctx = Box::into_raw(Box::new(0u64)) as *mut c_void;
+        let funcctx = Box::into_raw(Box::new(FuncCallContext {
+            call_cntr: 0,
+            max_calls: 0,
+            user_fctx: ptr::null_mut(),
+            attinmeta: ptr::null_mut(),
+            multi_call_memory_ctx: ctx,
+            tuple_desc: ptr::null_mut(),
+        }));
+        (*flinfo).fn_extra = funcctx as *mut c_void;
+        SERVER.with_borrow_mut(|s| s.contexts_live += 1);
+        funcctx as *mut c_void
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn per_MultiFuncCall(fcinfo: raster_h3_pg::pg_func_call_info) -> *mut c_void {
-    let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
-    assert!(
-        !(*flinfo).fn_extra.is_null(),
-        "per_MultiFuncCall before init"
-    );
-    (*flinfo).fn_extra
+    // SAFETY: test stand-in for the PostgreSQL backend, called by the extension on this
+    // test's thread: `fcinfo` is the test's live call info, whose `flinfo` points to the
+    // test's `FmgrInfo`.
+    unsafe {
+        let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
+        assert!(
+            !(*flinfo).fn_extra.is_null(),
+            "per_MultiFuncCall before init"
+        );
+        (*flinfo).fn_extra
+    }
 }
 
 #[no_mangle]
@@ -210,12 +229,18 @@ pub unsafe extern "C" fn end_MultiFuncCall(
     fcinfo: raster_h3_pg::pg_func_call_info,
     funcctx: *mut c_void,
 ) {
-    let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
-    (*flinfo).fn_extra = ptr::null_mut();
-    let funcctx = Box::from_raw(funcctx as *mut FuncCallContext);
-    reset_context(funcctx.multi_call_memory_ctx);
-    drop(Box::from_raw(funcctx.multi_call_memory_ctx as *mut u64));
-    SERVER.with_borrow_mut(|s| s.contexts_live -= 1);
+    // SAFETY: test stand-in for the PostgreSQL backend, called by the extension on this
+    // test's thread: `fcinfo`/`flinfo` are the test's live structs, and `funcctx` plus its
+    // context are the boxes `init_MultiFuncCall` created; each is reclaimed once, since
+    // `fn_extra` is cleared first.
+    unsafe {
+        let flinfo = (*fcinfo).flinfo as *mut FmgrInfo;
+        (*flinfo).fn_extra = ptr::null_mut();
+        let funcctx = Box::from_raw(funcctx as *mut FuncCallContext);
+        reset_context(funcctx.multi_call_memory_ctx);
+        drop(Box::from_raw(funcctx.multi_call_memory_ctx as *mut u64));
+        SERVER.with_borrow_mut(|s| s.contexts_live -= 1);
+    }
 }
 
 /// Every caller in these tests declares a composite result type.
@@ -225,8 +250,12 @@ pub unsafe extern "C" fn get_call_result_type(
     _result_type_id: *mut Oid,
     result_tuple_desc: *mut *mut c_void,
 ) -> c_int {
-    *result_tuple_desc = 0x7475_706c as *mut c_void;
-    1 // TYPEFUNC_COMPOSITE
+    // SAFETY: test stand-in for the PostgreSQL backend, called by the extension on this
+    // test's thread: `result_tuple_desc` is the extension's writable out-parameter.
+    unsafe {
+        *result_tuple_desc = 0x7475_706c as *mut c_void;
+        1 // TYPEFUNC_COMPOSITE
+    }
 }
 
 #[no_mangle]
@@ -239,22 +268,27 @@ pub unsafe extern "C" fn BuildTupleFromCStrings(
     _attinmeta: *mut c_void,
     values: *mut *mut c_char,
 ) -> *mut c_void {
-    let row = SERVER.with_borrow_mut(|s| {
-        let row: Vec<Option<String>> = (0..s.natts)
-            .map(|i| {
-                let p = *values.add(i);
-                (!p.is_null()).then(|| CStr::from_ptr(p).to_str().unwrap().to_string())
-            })
-            .collect();
-        s.rows.push(row);
-        s.rows.len()
-    });
-    Box::into_raw(Box::new(HeapTupleData {
-        t_len: 0,
-        t_self: [0; 3],
-        t_table_oid: 0,
-        t_data: row as *mut c_void,
-    })) as *mut c_void
+    // SAFETY: test stand-in for the PostgreSQL backend, called by the extension on this
+    // test's thread: `values` is the extension's palloc'd array with one slot per declared
+    // attribute (`natts`), each null or a NUL-terminated string.
+    unsafe {
+        let row = SERVER.with_borrow_mut(|s| {
+            let row: Vec<Option<String>> = (0..s.natts)
+                .map(|i| {
+                    let p = *values.add(i);
+                    (!p.is_null()).then(|| CStr::from_ptr(p).to_str().unwrap().to_string())
+                })
+                .collect();
+            s.rows.push(row);
+            s.rows.len()
+        });
+        Box::into_raw(Box::new(HeapTupleData {
+            t_len: 0,
+            t_self: [0; 3],
+            t_table_oid: 0,
+            t_data: row as *mut c_void,
+        })) as *mut c_void
+    }
 }
 
 /// Returns the row number recorded by `BuildTupleFromCStrings` as the tuple Datum.

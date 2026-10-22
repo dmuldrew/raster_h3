@@ -66,6 +66,7 @@ mod tests {
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let boxed = Box::new(TestDropCounter(dropped.clone()));
         let raw = Box::into_raw(boxed) as *mut c_void;
+        // SAFETY: `raw` is a fresh `Box::into_raw` freed exactly once; null is ignored.
         unsafe {
             delete_boxed::<TestDropCounter>(raw);
             delete_boxed::<TestDropCounter>(std::ptr::null_mut());
@@ -89,6 +90,7 @@ mod tests {
 
         let boxed = Box::new(PanickingDrop);
         let raw = Box::into_raw(boxed) as *mut c_void;
+        // SAFETY: `raw` is a fresh `Box::into_raw` freed exactly once.
         unsafe {
             // Must catch panic and not abort
             delete_boxed::<PanickingDrop>(raw);

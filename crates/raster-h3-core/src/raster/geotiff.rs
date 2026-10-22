@@ -673,6 +673,10 @@ impl<'a> ChunkDecoder<'a> {
                     match target_buffer {
                         Some(DecodingResult::$variant(ref mut v)) => {
                             v.resize(total_samples, $default);
+                            // SAFETY: `v` holds exactly `total_samples` elements of `$type`
+                            // (a primitive number), so its buffer spans `byte_len` bytes;
+                            // `u8` needs no alignment, every byte pattern is a valid
+                            // `$type`, and `v` is not otherwise used while `b` lives.
                             let b = unsafe {
                                 std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, byte_len)
                             };
@@ -687,6 +691,10 @@ impl<'a> ChunkDecoder<'a> {
                         }
                         _ => {
                             let mut v = vec![$default; total_samples];
+                            // SAFETY: `v` holds exactly `total_samples` elements of `$type`
+                            // (a primitive number), so its buffer spans `byte_len` bytes;
+                            // `u8` needs no alignment, every byte pattern is a valid
+                            // `$type`, and `v` is not otherwise used while `b` lives.
                             let b = unsafe {
                                 std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, byte_len)
                             };
@@ -998,6 +1006,10 @@ impl GeoTiffStreamReader {
         }
 
         let file = File::open(&path_buf)?;
+        // SAFETY: the map is read-only, and GeoTIFFs are treated as immutable inputs.
+        // If another process truncates or rewrites the file while it is mapped,
+        // reads may fault or see torn data. That is the standard `mmap` caveat,
+        // accepted here for zero-copy reads.
         let mmap = unsafe { Mmap::map(&file)? };
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);

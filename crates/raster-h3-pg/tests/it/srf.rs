@@ -262,6 +262,10 @@ impl CSrf {
 
     /// Drains the C-ABI SRF into the same shape as [`core_continuous`].
     fn rows(&self) -> Result<BTreeMap<i64, Vec<String>>, String> {
+        // SAFETY: string arguments are this struct's live CStrings or null; an error string
+        // comes from `CString::into_raw` and is reclaimed once; `row` is an all-zero
+        // `PgCContinuousRow` (plain numbers and byte arrays), and the handle is used only
+        // between open and close.
         unsafe {
             let mut err: *mut c_char = ptr::null_mut();
             let srf = pg_srf_continuous_open(
@@ -375,6 +379,8 @@ fn continuous_c_abi_srf_errors() {
         "next returned -1"
     );
 
+    // SAFETY: null string arguments are allowed; the returned error string comes from
+    // `CString::into_raw` and is reclaimed exactly once.
     unsafe {
         let mut err: *mut c_char = ptr::null_mut();
         let srf = pg_srf_continuous_open(

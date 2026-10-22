@@ -94,11 +94,17 @@ pub fn cell_wgs84_bbox(cell: h3o::CellIndex) -> [f64; 4] {
 }
 
 /// RAII guard ensuring DuckDB allocated value handle is destroyed
-pub struct OwnedValue(pub duckdb_value);
+///
+/// The handle is private so that only this module, which takes it straight
+/// from a DuckDB getter, can construct one; `Drop` relies on that.
+pub struct OwnedValue(duckdb_value);
 
 impl Drop for OwnedValue {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: a non-null handle was returned by `duckdb_bind_get_*parameter`,
+            // which transfers ownership to us, and this guard is its only owner,
+            // so it is destroyed exactly once.
             unsafe {
                 duckdb_destroy_value(&mut self.0);
             }
@@ -107,19 +113,32 @@ impl Drop for OwnedValue {
 }
 
 /// Ergonomic, safe wrapper around DuckDB's `duckdb_bind_info`
+///
+/// Invariant: `info` is the live bind handle of the bind callback that
+/// created the helper (see [`BindHelper::new`]); every safe method relies on it.
 pub struct BindHelper {
-    pub info: duckdb_bind_info,
+    info: duckdb_bind_info,
 }
 
 impl BindHelper {
+    /// # Safety
+    /// `info` must be the `duckdb_bind_info` DuckDB passed to the current bind
+    /// callback, and the helper must not be used after that callback returns.
     #[inline(always)]
-    pub fn new(info: duckdb_bind_info) -> Self {
+    pub unsafe fn new(info: duckdb_bind_info) -> Self {
         Self { info }
+    }
+
+    /// The wrapped bind handle.
+    #[inline(always)]
+    pub fn info(&self) -> duckdb_bind_info {
+        self.info
     }
 
     /// Number of positional parameters passed to the function
     #[inline(always)]
     pub fn parameter_count(&self) -> usize {
+        // SAFETY: `self.info` is the live bind handle (struct invariant).
         unsafe { duckdb_bind_get_parameter_count(self.info) as usize }
     }
 
@@ -129,6 +148,8 @@ impl BindHelper {
         if index >= self.parameter_count() {
             return None;
         }
+        // SAFETY: `self.info` is the live bind handle (struct invariant) and `index` is below the
+        // parameter count; ownership of the returned value passes to `OwnedValue`.
         let val = unsafe { duckdb_bind_get_parameter(self.info, index as u64) };
         if val.is_null() {
             None
@@ -137,27 +158,34 @@ impl BindHelper {
         }
     }
 
-    /// Get a positional parameter value by index
+    /// Get a positional parameter value by index. The caller owns the returned
+    /// handle and must release it with `duckdb_destroy_value`.
     #[inline(always)]
     pub fn get_parameter(&self, index: usize) -> duckdb_value {
+        // SAFETY: `self.info` is the live bind handle (struct invariant); DuckDB
+        // returns null for an out-of-range index rather than reading past the end.
         unsafe { duckdb_bind_get_parameter(self.info, index as u64) }
     }
 
     /// Extract a positional VARCHAR parameter as a Rust `String`
     pub fn get_string_param(&self, index: usize) -> Option<String> {
         let val = self.get_owned_parameter(index)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; `duckdb_get_varchar` returns a fresh DuckDB-allocated string
+        // (or null) that `from_duckdb_string` copies and frees.
         unsafe { from_duckdb_string(duckdb_get_varchar(val.0)) }
     }
 
     /// Extract a positional BIGINT parameter as `i64`
     pub fn get_int_param(&self, index: usize) -> Option<i64> {
         let val = self.get_owned_parameter(index)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; the getter only reads it.
         unsafe { Some(duckdb_get_int64(val.0)) }
     }
 
     /// Extract a positional DOUBLE parameter as `f64`
     pub fn get_double_param(&self, index: usize) -> Option<f64> {
         let val = self.get_owned_parameter(index)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; the getter only reads it.
         unsafe { Some(duckdb_get_double(val.0)) }
     }
 
@@ -165,6 +193,8 @@ impl BindHelper {
     #[inline(always)]
     pub fn get_owned_named_parameter(&self, name: &str) -> Option<OwnedValue> {
         let c_name = to_c_string(name);
+        // SAFETY: `self.info` is the live bind handle (struct invariant) and `c_name` is NUL-terminated
+        // for the call; ownership of the returned value passes to `OwnedValue`.
         let val = unsafe { duckdb_bind_get_named_parameter(self.info, c_name.as_ptr()) };
         if val.is_null() {
             None
@@ -173,39 +203,48 @@ impl BindHelper {
         }
     }
 
-    /// Get a named parameter by name
+    /// Get a named parameter by name. The caller owns the returned handle and
+    /// must release it with `duckdb_destroy_value`.
     pub fn get_named_parameter(&self, name: &str) -> duckdb_value {
         let c_name = to_c_string(name);
+        // SAFETY: `self.info` is the live bind handle (struct invariant) and
+        // `c_name` is NUL-terminated for the call.
         unsafe { duckdb_bind_get_named_parameter(self.info, c_name.as_ptr()) }
     }
 
     /// Extract a named VARCHAR parameter as `String`
     pub fn get_named_string(&self, name: &str) -> Option<String> {
         let val = self.get_owned_named_parameter(name)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; `duckdb_get_varchar` returns a fresh DuckDB-allocated string
+        // (or null) that `from_duckdb_string` copies and frees.
         unsafe { from_duckdb_string(duckdb_get_varchar(val.0)) }
     }
 
     /// Extract a named BIGINT parameter as `i64`
     pub fn get_named_int(&self, name: &str) -> Option<i64> {
         let val = self.get_owned_named_parameter(name)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; the getter only reads it.
         unsafe { Some(duckdb_get_int64(val.0)) }
     }
 
     /// Extract a named UBIGINT parameter as `u64`
     pub fn get_named_uint(&self, name: &str) -> Option<u64> {
         let val = self.get_owned_named_parameter(name)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; the getter only reads it.
         unsafe { Some(duckdb_get_uint64(val.0)) }
     }
 
     /// Extract a named DOUBLE parameter as `f64`
     pub fn get_named_double(&self, name: &str) -> Option<f64> {
         let val = self.get_owned_named_parameter(name)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; the getter only reads it.
         unsafe { Some(duckdb_get_double(val.0)) }
     }
 
     /// Extract a named BOOLEAN parameter as `bool`
     pub fn get_named_bool(&self, name: &str) -> Option<bool> {
         let val = self.get_owned_named_parameter(name)?;
+        // SAFETY: `val` owns a live `duckdb_value` until it drops at the end of this function; the getter only reads it.
         unsafe { Some(duckdb_get_bool(val.0)) }
     }
 
@@ -213,6 +252,8 @@ impl BindHelper {
     pub fn set_error(&self, msg: &str) {
         let c_err = CString::new(msg)
             .unwrap_or_else(|_| CString::new("Error in table function bind").unwrap());
+        // SAFETY: `self.info` is the live bind handle (struct invariant); DuckDB copies the
+        // NUL-terminated message before `c_err` drops.
         unsafe {
             duckdb_bind_set_error(self.info, c_err.as_ptr());
         }
@@ -220,6 +261,8 @@ impl BindHelper {
 
     /// Add a result column to the output schema with automated logical type lifecycle management
     pub fn add_result_column(&self, name: &str, duckdb_type: DuckDBType) {
+        // SAFETY: `self.info` is the live bind handle (struct invariant). DuckDB copies the
+        // name and logical type, so the type we created is destroyed once here.
         unsafe {
             let col_name = to_c_string(name);
             let mut logical_type = duckdb_create_logical_type(duckdb_type);
@@ -233,6 +276,8 @@ impl BindHelper {
     /// # Safety
     /// `logical_type` must be a live DuckDB logical type for the duration of this call.
     pub unsafe fn add_custom_result_column(&self, name: &str, logical_type: duckdb_logical_type) {
+        // SAFETY: `self.info` is the live bind handle (struct invariant), `logical_type` is
+        // live for the call (caller contract), and DuckDB copies both arguments.
         unsafe {
             let col_name = to_c_string(name);
             duckdb_bind_add_result_column(self.info, col_name.as_ptr(), logical_type);

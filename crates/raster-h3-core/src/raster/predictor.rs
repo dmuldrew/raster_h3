@@ -60,6 +60,8 @@ pub fn apply_horizontal_predictor_u8(data: &mut [u8], data_w: usize, data_h: usi
     {
         for r in 0..data_h {
             let row = &mut data[r * data_w..(r + 1) * data_w];
+            // SAFETY: NEON is a baseline feature of every aarch64 target, and the
+            // kernel only touches `row` within its bounds.
             unsafe {
                 rev_hpredict_neon_u8_spp1(row);
             }
@@ -83,11 +85,16 @@ pub fn apply_horizontal_predictor_u16(data: &mut [u16], data_w: usize, data_h: u
     {
         use std::arch::aarch64::*;
         let chunks = data_w / 8;
+        // SAFETY: NEON is a baseline feature of every aarch64 target.
         let zero = unsafe { vdupq_n_u16(0) };
         for r in 0..data_h {
             let row = &mut data[r * data_w..(r + 1) * data_w];
             let mut prev_carry = 0u16;
             let ptr = row.as_mut_ptr();
+            // SAFETY: NEON is baseline on aarch64. `row` has `data_w` elements and
+            // each iteration loads/stores the 8 `u16`s at `offset..offset + 8`,
+            // where `offset + 8 <= chunks * 8 <= data_w`; `vld1q`/`vst1q` only
+            // need `u16` alignment, which `row`'s pointer has.
             unsafe {
                 for i in 0..chunks {
                     let offset = i * 8;
@@ -112,7 +119,11 @@ pub fn apply_horizontal_predictor_u16(data: &mut [u16], data_w: usize, data_h: u
 }
 
 /// Trait abstracting endian decoding and photometric inversion for primitive TIFF samples
-pub trait TiffSample: Copy + Default + 'static {
+///
+/// Sealed: [`unpack_integer_samples`] memcpys raw bytes into `[Self]`, which is
+/// only sound for primitive integers (every bit pattern valid, `BYTES` equal to
+/// `size_of::<Self>()`), so outside implementations are not allowed.
+pub trait TiffSample: sealed::Sealed + Copy + Default + 'static {
     const BYTES: usize = size_of::<Self>();
     fn from_le_bytes(bytes: &[u8]) -> Self;
     fn from_be_bytes(bytes: &[u8]) -> Self;
@@ -123,6 +134,18 @@ pub trait TiffSample: Copy + Default + 'static {
     {
         apply_horizontal_predictor(data, data_w, data_h, spp);
     }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for i8 {}
+    impl Sealed for u16 {}
+    impl Sealed for i16 {}
+    impl Sealed for u32 {}
+    impl Sealed for i32 {}
+    impl Sealed for u64 {}
+    impl Sealed for i64 {}
 }
 
 impl TiffSample for u8 {
@@ -254,18 +277,25 @@ pub fn unpack_integer_samples<T: TiffSample + WrappingAdd>(
 
     if is_native_endian {
         if src_stride_bytes == dst_stride_bytes {
-            let total_bytes = data_w * data_h * spp * sample_bytes;
+            let total_samples = data_w * data_h * spp;
+            let s = &src[..total_samples * sample_bytes];
+            let d = &mut dst[..total_samples];
+            // SAFETY: both slices were bounds-checked above to span exactly
+            // `total_samples * sample_bytes` bytes (`TiffSample` is sealed to
+            // primitive integers, so `BYTES == size_of::<T>()`); they are distinct
+            // borrows so cannot overlap; `u8` copies need no alignment; and every
+            // byte pattern is a valid primitive integer.
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    dst.as_mut_ptr() as *mut u8,
-                    total_bytes,
-                );
+                std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_mut_ptr() as *mut u8, s.len());
             }
         } else {
             for r in 0..data_h {
                 let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
                 let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                // SAFETY: `s` is `dst_stride_bytes` long and `d` holds `dst_stride`
+                // samples of `sample_bytes == size_of::<T>()` each, so both span
+                // `dst_stride_bytes`; distinct borrows, byte-wise copy, and any bit
+                // pattern is a valid primitive integer.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         s.as_ptr(),
@@ -314,28 +344,38 @@ pub fn unpack_integer_samples<T: TiffSample + WrappingAdd>(
 }
 
 /// NEON Kogge-Stone parallel prefix addition on 8-bit bytes with step 1.
+///
+/// # Safety
+/// The CPU must support NEON (always true on aarch64 targets). Memory accesses
+/// stay within `input`, so there are no other requirements.
 #[cfg(target_arch = "aarch64")]
 pub(crate) unsafe fn rev_hpredict_neon_u8_spp1(input: &mut [u8]) {
     use std::arch::aarch64::*;
     let len = input.len();
     let chunks = len / 16;
-    let zero = vdupq_n_u8(0);
+    // SAFETY: NEON availability is this function's precondition.
+    let zero = unsafe { vdupq_n_u8(0) };
     let mut prev_carry = 0u8;
 
     let ptr = input.as_mut_ptr();
-    for i in 0..chunks {
-        let offset = i * 16;
-        let mut v = vld1q_u8(ptr.add(offset));
+    // SAFETY: NEON is available (precondition). Each iteration loads and stores
+    // the 16 bytes at `offset..offset + 16 <= chunks * 16 <= len`, all inside
+    // `input`, and `u8` vectors need no alignment.
+    unsafe {
+        for i in 0..chunks {
+            let offset = i * 16;
+            let mut v = vld1q_u8(ptr.add(offset));
 
-        v = vaddq_u8(v, vextq_u8(zero, v, 15));
-        v = vaddq_u8(v, vextq_u8(zero, v, 14));
-        v = vaddq_u8(v, vextq_u8(zero, v, 12));
-        v = vaddq_u8(v, vextq_u8(zero, v, 8));
+            v = vaddq_u8(v, vextq_u8(zero, v, 15));
+            v = vaddq_u8(v, vextq_u8(zero, v, 14));
+            v = vaddq_u8(v, vextq_u8(zero, v, 12));
+            v = vaddq_u8(v, vextq_u8(zero, v, 8));
 
-        v = vaddq_u8(v, vdupq_n_u8(prev_carry));
+            v = vaddq_u8(v, vdupq_n_u8(prev_carry));
 
-        vst1q_u8(ptr.add(offset), v);
-        prev_carry = vgetq_lane_u8::<15>(v);
+            vst1q_u8(ptr.add(offset), v);
+            prev_carry = vgetq_lane_u8::<15>(v);
+        }
     }
 
     for col in (chunks * 16).max(1)..len {
@@ -344,31 +384,45 @@ pub(crate) unsafe fn rev_hpredict_neon_u8_spp1(input: &mut [u8]) {
 }
 
 /// NEON accelerated TIFF Predictor 3 for 32-bit floating point samples when spp == 1.
+///
+/// # Safety
+/// The CPU must support NEON, and `output.len() <= input.len() / 4` (each of the
+/// four byte planes in `input` must hold at least one byte per output sample).
 #[cfg(target_arch = "aarch64")]
 pub(crate) unsafe fn fp_predict_f32_neon_spp1(input: &mut [u8], output: &mut [f32]) {
     use std::arch::aarch64::*;
-    rev_hpredict_neon_u8_spp1(input);
+    debug_assert!(output.len() <= input.len() / 4);
+    // SAFETY: NEON availability is forwarded from our own precondition.
+    unsafe { rev_hpredict_neon_u8_spp1(input) };
 
     let plane_stride = input.len() / 4;
     let out_len = output.len();
     let chunks = out_len / 16;
 
-    let p0 = input.as_ptr();
-    let p1 = p0.add(plane_stride);
-    let p2 = p0.add(plane_stride * 2);
-    let p3 = p0.add(plane_stride * 3);
-    let out_ptr = output.as_mut_ptr() as *mut u8;
+    // SAFETY: NEON is available (precondition). Plane `k` starts at
+    // `k * plane_stride` and reads `offset..offset + 16 <= chunks * 16 <= out_len
+    // <= plane_stride` (precondition), so every load stays inside `input`. Each
+    // store writes 64 bytes at `offset * 4`, ending at or before `out_len * 4`,
+    // the byte length of `output`. Byte vectors need no alignment, and any byte
+    // pattern is a valid `f32`.
+    unsafe {
+        let p0 = input.as_ptr();
+        let p1 = p0.add(plane_stride);
+        let p2 = p0.add(plane_stride * 2);
+        let p3 = p0.add(plane_stride * 3);
+        let out_ptr = output.as_mut_ptr() as *mut u8;
 
-    for i in 0..chunks {
-        let offset = i * 16;
-        let v0 = vld1q_u8(p0.add(offset));
-        let v1 = vld1q_u8(p1.add(offset));
-        let v2 = vld1q_u8(p2.add(offset));
-        let v3 = vld1q_u8(p3.add(offset));
+        for i in 0..chunks {
+            let offset = i * 16;
+            let v0 = vld1q_u8(p0.add(offset));
+            let v1 = vld1q_u8(p1.add(offset));
+            let v2 = vld1q_u8(p2.add(offset));
+            let v3 = vld1q_u8(p3.add(offset));
 
-        // Little-endian memory representation for big-endian IEEE 754 f32 is [p3, p2, p1, p0]
-        let interleaved = uint8x16x4_t(v3, v2, v1, v0);
-        vst4q_u8(out_ptr.add(offset * 4), interleaved);
+            // Little-endian memory representation for big-endian IEEE 754 f32 is [p3, p2, p1, p0]
+            let interleaved = uint8x16x4_t(v3, v2, v1, v0);
+            vst4q_u8(out_ptr.add(offset * 4), interleaved);
+        }
     }
 
     for i in (chunks * 16)..out_len {
@@ -382,78 +436,92 @@ pub(crate) unsafe fn fp_predict_f32_neon_spp1(input: &mut [u8], output: &mut [f3
 }
 
 /// NEON accelerated TIFF Predictor 3 for 64-bit floating point samples when spp == 1.
+///
+/// # Safety
+/// The CPU must support NEON, and `output.len() <= input.len() / 8` (each of the
+/// eight byte planes in `input` must hold at least one byte per output sample).
 #[cfg(target_arch = "aarch64")]
 pub(crate) unsafe fn fp_predict_f64_neon_spp1(input: &mut [u8], output: &mut [f64]) {
     use std::arch::aarch64::*;
-    rev_hpredict_neon_u8_spp1(input);
+    debug_assert!(output.len() <= input.len() / 8);
+    // SAFETY: NEON availability is forwarded from our own precondition.
+    unsafe { rev_hpredict_neon_u8_spp1(input) };
 
     let plane_stride = input.len() / 8;
     let out_len = output.len();
     let chunks = out_len / 16;
 
-    let p0 = input.as_ptr();
-    let p1 = p0.add(plane_stride);
-    let p2 = p0.add(plane_stride * 2);
-    let p3 = p0.add(plane_stride * 3);
-    let p4 = p0.add(plane_stride * 4);
-    let p5 = p0.add(plane_stride * 5);
-    let p6 = p0.add(plane_stride * 6);
-    let p7 = p0.add(plane_stride * 7);
-    let out_ptr = output.as_mut_ptr() as *mut u8;
+    // SAFETY: NEON is available (precondition). Plane `k` starts at
+    // `k * plane_stride` and reads `offset..offset + 16 <= chunks * 16 <= out_len
+    // <= plane_stride` (precondition), so every load stays inside `input`. Each
+    // iteration stores 128 bytes at `offset * 8`, ending at or before
+    // `out_len * 8`, the byte length of `output`. Byte vectors need no alignment,
+    // and any byte pattern is a valid `f64`.
+    unsafe {
+        let p0 = input.as_ptr();
+        let p1 = p0.add(plane_stride);
+        let p2 = p0.add(plane_stride * 2);
+        let p3 = p0.add(plane_stride * 3);
+        let p4 = p0.add(plane_stride * 4);
+        let p5 = p0.add(plane_stride * 5);
+        let p6 = p0.add(plane_stride * 6);
+        let p7 = p0.add(plane_stride * 7);
+        let out_ptr = output.as_mut_ptr() as *mut u8;
 
-    for i in 0..chunks {
-        let offset = i * 16;
-        let v0 = vld1q_u8(p0.add(offset));
-        let v1 = vld1q_u8(p1.add(offset));
-        let v2 = vld1q_u8(p2.add(offset));
-        let v3 = vld1q_u8(p3.add(offset));
-        let v4 = vld1q_u8(p4.add(offset));
-        let v5 = vld1q_u8(p5.add(offset));
-        let v6 = vld1q_u8(p6.add(offset));
-        let v7 = vld1q_u8(p7.add(offset));
+        for i in 0..chunks {
+            let offset = i * 16;
+            let v0 = vld1q_u8(p0.add(offset));
+            let v1 = vld1q_u8(p1.add(offset));
+            let v2 = vld1q_u8(p2.add(offset));
+            let v3 = vld1q_u8(p3.add(offset));
+            let v4 = vld1q_u8(p4.add(offset));
+            let v5 = vld1q_u8(p5.add(offset));
+            let v6 = vld1q_u8(p6.add(offset));
+            let v7 = vld1q_u8(p7.add(offset));
 
-        // Interleave into 16-bit pairs: (v7, v6), (v5, v4), (v3, v2), (v1, v0)
-        let p76_lo = vreinterpretq_u16_u8(vzip1q_u8(v7, v6));
-        let p76_hi = vreinterpretq_u16_u8(vzip2q_u8(v7, v6));
-        let p54_lo = vreinterpretq_u16_u8(vzip1q_u8(v5, v4));
-        let p54_hi = vreinterpretq_u16_u8(vzip2q_u8(v5, v4));
+            // Interleave into 16-bit pairs: (v7, v6), (v5, v4), (v3, v2), (v1, v0)
+            let p76_lo = vreinterpretq_u16_u8(vzip1q_u8(v7, v6));
+            let p76_hi = vreinterpretq_u16_u8(vzip2q_u8(v7, v6));
+            let p54_lo = vreinterpretq_u16_u8(vzip1q_u8(v5, v4));
+            let p54_hi = vreinterpretq_u16_u8(vzip2q_u8(v5, v4));
 
-        let p32_lo = vreinterpretq_u16_u8(vzip1q_u8(v3, v2));
-        let p32_hi = vreinterpretq_u16_u8(vzip2q_u8(v3, v2));
-        let p10_lo = vreinterpretq_u16_u8(vzip1q_u8(v1, v0));
-        let p10_hi = vreinterpretq_u16_u8(vzip2q_u8(v1, v0));
+            let p32_lo = vreinterpretq_u16_u8(vzip1q_u8(v3, v2));
+            let p32_hi = vreinterpretq_u16_u8(vzip2q_u8(v3, v2));
+            let p10_lo = vreinterpretq_u16_u8(vzip1q_u8(v1, v0));
+            let p10_hi = vreinterpretq_u16_u8(vzip2q_u8(v1, v0));
 
-        // Interleave 16-bit pairs into 32-bit words
-        let w_lo_0 = vreinterpretq_u32_u16(vzip1q_u16(p76_lo, p54_lo));
-        let w_lo_1 = vreinterpretq_u32_u16(vzip2q_u16(p76_lo, p54_lo));
-        let w_hi_0 = vreinterpretq_u32_u16(vzip1q_u16(p32_lo, p10_lo));
-        let w_hi_1 = vreinterpretq_u32_u16(vzip2q_u16(p32_lo, p10_lo));
+            // Interleave 16-bit pairs into 32-bit words
+            let w_lo_0 = vreinterpretq_u32_u16(vzip1q_u16(p76_lo, p54_lo));
+            let w_lo_1 = vreinterpretq_u32_u16(vzip2q_u16(p76_lo, p54_lo));
+            let w_hi_0 = vreinterpretq_u32_u16(vzip1q_u16(p32_lo, p10_lo));
+            let w_hi_1 = vreinterpretq_u32_u16(vzip2q_u16(p32_lo, p10_lo));
 
-        let w_lo_2 = vreinterpretq_u32_u16(vzip1q_u16(p76_hi, p54_hi));
-        let w_lo_3 = vreinterpretq_u32_u16(vzip2q_u16(p76_hi, p54_hi));
-        let w_hi_2 = vreinterpretq_u32_u16(vzip1q_u16(p32_hi, p10_hi));
-        let w_hi_3 = vreinterpretq_u32_u16(vzip2q_u16(p32_hi, p10_hi));
+            let w_lo_2 = vreinterpretq_u32_u16(vzip1q_u16(p76_hi, p54_hi));
+            let w_lo_3 = vreinterpretq_u32_u16(vzip2q_u16(p76_hi, p54_hi));
+            let w_hi_2 = vreinterpretq_u32_u16(vzip1q_u16(p32_hi, p10_hi));
+            let w_hi_3 = vreinterpretq_u32_u16(vzip2q_u16(p32_hi, p10_hi));
 
-        // Interleave 32-bit into 64-bit and store
-        let d0 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_0, w_hi_0));
-        let d1 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_0, w_hi_0));
-        let d2 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_1, w_hi_1));
-        let d3 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_1, w_hi_1));
+            // Interleave 32-bit into 64-bit and store
+            let d0 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_0, w_hi_0));
+            let d1 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_0, w_hi_0));
+            let d2 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_1, w_hi_1));
+            let d3 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_1, w_hi_1));
 
-        let d4 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_2, w_hi_2));
-        let d5 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_2, w_hi_2));
-        let d6 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_3, w_hi_3));
-        let d7 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_3, w_hi_3));
+            let d4 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_2, w_hi_2));
+            let d5 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_2, w_hi_2));
+            let d6 = vreinterpretq_u8_u32(vzip1q_u32(w_lo_3, w_hi_3));
+            let d7 = vreinterpretq_u8_u32(vzip2q_u32(w_lo_3, w_hi_3));
 
-        let dst_chunk = out_ptr.add(offset * 8);
-        vst1q_u8(dst_chunk, d0);
-        vst1q_u8(dst_chunk.add(16), d1);
-        vst1q_u8(dst_chunk.add(32), d2);
-        vst1q_u8(dst_chunk.add(48), d3);
-        vst1q_u8(dst_chunk.add(64), d4);
-        vst1q_u8(dst_chunk.add(80), d5);
-        vst1q_u8(dst_chunk.add(96), d6);
-        vst1q_u8(dst_chunk.add(112), d7);
+            let dst_chunk = out_ptr.add(offset * 8);
+            vst1q_u8(dst_chunk, d0);
+            vst1q_u8(dst_chunk.add(16), d1);
+            vst1q_u8(dst_chunk.add(32), d2);
+            vst1q_u8(dst_chunk.add(48), d3);
+            vst1q_u8(dst_chunk.add(64), d4);
+            vst1q_u8(dst_chunk.add(80), d5);
+            vst1q_u8(dst_chunk.add(96), d6);
+            vst1q_u8(dst_chunk.add(112), d7);
+        }
     }
 
     for i in (chunks * 16)..out_len {
@@ -503,8 +571,11 @@ pub(crate) fn fp_predict_f64(input: &mut [u8], output: &mut [f64], spp: usize) {
 /// Decode TIFF floating point predictor for 32-bit floats with NEON acceleration when available.
 #[inline]
 pub fn decode_fp_predict_f32(input: &mut [u8], output: &mut [f32], spp: usize) {
+    // Shorter inputs fall through to the scalar path, which bounds-checks.
     #[cfg(target_arch = "aarch64")]
-    if spp == 1 {
+    if spp == 1 && output.len() <= input.len() / 4 {
+        // SAFETY: NEON is baseline on aarch64 and the length precondition was
+        // just checked.
         unsafe {
             fp_predict_f32_neon_spp1(input, output);
         }
@@ -517,8 +588,11 @@ pub fn decode_fp_predict_f32(input: &mut [u8], output: &mut [f32], spp: usize) {
 /// Decode TIFF floating point predictor for 64-bit floats with NEON acceleration when available.
 #[inline]
 pub fn decode_fp_predict_f64(input: &mut [u8], output: &mut [f64], spp: usize) {
+    // Shorter inputs fall through to the scalar path, which bounds-checks.
     #[cfg(target_arch = "aarch64")]
-    if spp == 1 {
+    if spp == 1 && output.len() <= input.len() / 8 {
+        // SAFETY: NEON is baseline on aarch64 and the length precondition was
+        // just checked.
         unsafe {
             fp_predict_f64_neon_spp1(input, output);
         }
@@ -564,18 +638,26 @@ pub fn unpack_f32(src: &mut [u8], dst: &mut [f32], encoding: ChunkEncoding) -> R
 
             if is_native_endian {
                 if src_stride_bytes == dst_stride_bytes {
-                    let total_bytes = data_w * data_h * spp * 4;
+                    let total_samples = data_w * data_h * spp;
+                    let s = &src[..total_samples * 4];
+                    let d = &mut dst[..total_samples];
+                    // SAFETY: both slices were bounds-checked above to span
+                    // `total_samples * 4` bytes; distinct borrows cannot overlap;
+                    // the copy is byte-wise; any bit pattern is a valid `f32`.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            src.as_ptr(),
-                            dst.as_mut_ptr() as *mut u8,
-                            total_bytes,
+                            s.as_ptr(),
+                            d.as_mut_ptr() as *mut u8,
+                            s.len(),
                         );
                     }
                 } else {
                     for r in 0..data_h {
                         let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
                         let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                        // SAFETY: `s` and `d` both span `dst_stride_bytes` bytes
+                        // (slice-checked above), don't overlap, and any bit pattern
+                        // is a valid `f32`.
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 s.as_ptr(),
@@ -669,18 +751,26 @@ pub fn unpack_f64(src: &mut [u8], dst: &mut [f64], encoding: ChunkEncoding) -> R
 
             if is_native_endian {
                 if src_stride_bytes == dst_stride_bytes {
-                    let total_bytes = data_w * data_h * spp * 8;
+                    let total_samples = data_w * data_h * spp;
+                    let s = &src[..total_samples * 8];
+                    let d = &mut dst[..total_samples];
+                    // SAFETY: both slices were bounds-checked above to span
+                    // `total_samples * 8` bytes; distinct borrows cannot overlap;
+                    // the copy is byte-wise; any bit pattern is a valid `f64`.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            src.as_ptr(),
-                            dst.as_mut_ptr() as *mut u8,
-                            total_bytes,
+                            s.as_ptr(),
+                            d.as_mut_ptr() as *mut u8,
+                            s.len(),
                         );
                     }
                 } else {
                     for r in 0..data_h {
                         let s = &src[r * src_stride_bytes..r * src_stride_bytes + dst_stride_bytes];
                         let d = &mut dst[r * dst_stride..(r + 1) * dst_stride];
+                        // SAFETY: `s` and `d` both span `dst_stride_bytes` bytes
+                        // (slice-checked above), don't overlap, and any bit pattern
+                        // is a valid `f64`.
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 s.as_ptr(),

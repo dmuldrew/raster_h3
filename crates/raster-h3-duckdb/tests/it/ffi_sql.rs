@@ -109,6 +109,9 @@ impl Drop for MockBindContext {
     fn drop(&mut self) {
         if !self.bind_data.is_null() {
             if let Some(dtor) = self.bind_destroy {
+                // SAFETY: `bind_data` was installed by the extension together with
+                // `bind_destroy`, its matching destructor, and is nulled right after, so it
+                // is freed exactly once.
                 unsafe { dtor(self.bind_data) };
             }
             self.bind_data = ptr::null_mut();
@@ -140,6 +143,9 @@ impl Drop for MockInitContext {
     fn drop(&mut self) {
         if !self.init_data.is_null() {
             if let Some(dtor) = self.init_destroy {
+                // SAFETY: `init_data` was installed by the extension together with
+                // `init_destroy`, its matching destructor, and is nulled right after, so it
+                // is freed exactly once.
                 unsafe { dtor(self.init_data) };
             }
             self.init_data = ptr::null_mut();
@@ -174,6 +180,9 @@ impl MockVector {
     fn set_str_input(&mut self, row: usize, s: &str) {
         let bytes = s.as_bytes();
         self.strings[row] = bytes.to_vec();
+        // SAFETY: `data` holds `capacity * 2` 8-aligned `u64`s, i.e. 16 bytes per row, and
+        // `row < capacity`, so slot `row` of the 16-byte, 8-aligned `duckdb_string_t` is in
+        // bounds; `&mut self` makes the borrow exclusive.
         let slot = unsafe { &mut *(self.data.as_mut_ptr() as *mut duckdb_string_t).add(row) };
         if bytes.len() <= 12 {
             let mut inlined = [0u8; 12];
@@ -222,19 +231,28 @@ pub unsafe extern "C" fn duckdb_connect(
     database: duckdb_database,
     out_connection: *mut duckdb_connection,
 ) -> DuckDBState {
-    if database.is_null() || out_connection.is_null() {
-        return DuckDBState::Error;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `out_connection` is a writable out-parameter.
+    unsafe {
+        if database.is_null() || out_connection.is_null() {
+            return DuckDBState::Error;
+        }
+        let con = Box::new(MockConnection::default());
+        *out_connection = Box::into_raw(con) as duckdb_connection;
+        DuckDBState::Success
     }
-    let con = Box::new(MockConnection::default());
-    *out_connection = Box::into_raw(con) as duckdb_connection;
-    DuckDBState::Success
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_disconnect(connection: *mut duckdb_connection) {
-    if !connection.is_null() && !(*connection).is_null() {
-        drop(Box::from_raw(*connection as *mut MockConnection));
-        *connection = ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: a handle freed here came from this mock's own `Box::into_raw` and the
+    // out-pointer is nulled so it cannot be freed twice.
+    unsafe {
+        if !connection.is_null() && !(*connection).is_null() {
+            drop(Box::from_raw(*connection as *mut MockConnection));
+            *connection = ptr::null_mut();
+        }
     }
 }
 
@@ -250,14 +268,21 @@ pub unsafe extern "C" fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb
 pub unsafe extern "C" fn duckdb_create_list_type(
     _child: duckdb_logical_type,
 ) -> duckdb_logical_type {
-    duckdb_create_logical_type(DuckDBType::List)
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: forwards its arguments unchanged to another mock with the same contract.
+    unsafe { duckdb_create_logical_type(DuckDBType::List) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_destroy_logical_type(type_: *mut duckdb_logical_type) {
-    if !type_.is_null() && !(*type_).is_null() {
-        drop(Box::from_raw(*type_ as *mut MockLogicalType));
-        *type_ = ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: a handle freed here came from this mock's own `Box::into_raw` and the
+    // out-pointer is nulled so it cannot be freed twice.
+    unsafe {
+        if !type_.is_null() && !(*type_).is_null() {
+            drop(Box::from_raw(*type_ as *mut MockLogicalType));
+            *type_ = ptr::null_mut();
+        }
     }
 }
 
@@ -266,21 +291,32 @@ pub unsafe extern "C" fn duckdb_logical_type_set_alias(
     type_: duckdb_logical_type,
     alias: *const c_char,
 ) {
-    if !type_.is_null() && !alias.is_null() {
-        let lt = &mut *(type_ as *mut MockLogicalType);
-        lt.alias = Some(CStr::from_ptr(alias).to_string_lossy().into_owned());
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `type_` points to a live `MockLogicalType` created by this mock or by the
+    // test, and no other reference to it is active during the call; C strings passed in are
+    // NUL-terminated, as the C API requires.
+    unsafe {
+        if !type_.is_null() && !alias.is_null() {
+            let lt = &mut *(type_ as *mut MockLogicalType);
+            lt.alias = Some(CStr::from_ptr(alias).to_string_lossy().into_owned());
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_logical_type_get_alias(type_: duckdb_logical_type) -> *mut c_char {
-    if type_.is_null() {
-        return ptr::null_mut();
-    }
-    let lt = &*(type_ as *const MockLogicalType);
-    match &lt.alias {
-        Some(a) => CString::new(a.as_str()).unwrap().into_raw(),
-        None => ptr::null_mut(),
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `type_` points to a live `MockLogicalType` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        if type_.is_null() {
+            return ptr::null_mut();
+        }
+        let lt = &*(type_ as *const MockLogicalType);
+        match &lt.alias {
+            Some(a) => CString::new(a.as_str()).unwrap().into_raw(),
+            None => ptr::null_mut(),
+        }
     }
 }
 
@@ -296,9 +332,14 @@ pub unsafe extern "C" fn duckdb_create_table_function() -> duckdb_table_function
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_destroy_table_function(table_function: *mut duckdb_table_function) {
-    if !table_function.is_null() && !(*table_function).is_null() {
-        drop(Box::from_raw(*table_function as *mut MockTableFunction));
-        *table_function = ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: a handle freed here came from this mock's own `Box::into_raw` and the
+    // out-pointer is nulled so it cannot be freed twice.
+    unsafe {
+        if !table_function.is_null() && !(*table_function).is_null() {
+            drop(Box::from_raw(*table_function as *mut MockTableFunction));
+            *table_function = ptr::null_mut();
+        }
     }
 }
 
@@ -307,8 +348,14 @@ pub unsafe extern "C" fn duckdb_table_function_set_name(
     table_function: duckdb_table_function,
     name: *const c_char,
 ) {
-    let tf = &mut *(table_function as *mut MockTableFunction);
-    tf.name = CStr::from_ptr(name).to_string_lossy().into_owned();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `table_function` points to a live `MockTableFunction` created by this
+    // mock or by the test, and no other reference to it is active during the call; C
+    // strings passed in are NUL-terminated, as the C API requires.
+    unsafe {
+        let tf = &mut *(table_function as *mut MockTableFunction);
+        tf.name = CStr::from_ptr(name).to_string_lossy().into_owned();
+    }
 }
 
 #[no_mangle]
@@ -316,9 +363,15 @@ pub unsafe extern "C" fn duckdb_table_function_add_parameter(
     table_function: duckdb_table_function,
     type_: duckdb_logical_type,
 ) {
-    let tf = &mut *(table_function as *mut MockTableFunction);
-    let lt = &*(type_ as *const MockLogicalType);
-    tf.positional_params.push(lt.ty);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `table_function` points to a live `MockTableFunction`, `type_` points to
+    // a live `MockLogicalType` created by this mock or by the test, and no other reference
+    // to it is active during the call.
+    unsafe {
+        let tf = &mut *(table_function as *mut MockTableFunction);
+        let lt = &*(type_ as *const MockLogicalType);
+        tf.positional_params.push(lt.ty);
+    }
 }
 
 #[no_mangle]
@@ -327,10 +380,17 @@ pub unsafe extern "C" fn duckdb_table_function_add_named_parameter(
     name: *const c_char,
     type_: duckdb_logical_type,
 ) {
-    let tf = &mut *(table_function as *mut MockTableFunction);
-    let lt = &*(type_ as *const MockLogicalType);
-    let param_name = CStr::from_ptr(name).to_string_lossy().into_owned();
-    tf.named_params.insert(param_name, lt.ty);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `table_function` points to a live `MockTableFunction`, `type_` points to
+    // a live `MockLogicalType` created by this mock or by the test, and no other reference
+    // to it is active during the call; C strings passed in are NUL-terminated, as the C API
+    // requires.
+    unsafe {
+        let tf = &mut *(table_function as *mut MockTableFunction);
+        let lt = &*(type_ as *const MockLogicalType);
+        let param_name = CStr::from_ptr(name).to_string_lossy().into_owned();
+        tf.named_params.insert(param_name, lt.ty);
+    }
 }
 
 #[no_mangle]
@@ -366,8 +426,13 @@ pub unsafe extern "C" fn duckdb_table_function_supports_projection_pushdown(
     table_function: duckdb_table_function,
     pushdown: bool,
 ) {
-    let tf = &mut *(table_function as *mut MockTableFunction);
-    tf.projection_pushdown = pushdown;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `table_function` points to a live `MockTableFunction` created by this
+    // mock or by the test, and no other reference to it is active during the call.
+    unsafe {
+        let tf = &mut *(table_function as *mut MockTableFunction);
+        tf.projection_pushdown = pushdown;
+    }
 }
 
 #[no_mangle]
@@ -375,24 +440,35 @@ pub unsafe extern "C" fn duckdb_register_table_function(
     con: duckdb_connection,
     table_function: duckdb_table_function,
 ) -> DuckDBState {
-    if con.is_null() || table_function.is_null() {
-        return DuckDBState::Error;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `con` points to a live `MockConnection`, `table_function` points to a
+    // live `MockTableFunction` created by this mock or by the test, and no other reference
+    // to it is active during the call.
+    unsafe {
+        if con.is_null() || table_function.is_null() {
+            return DuckDBState::Error;
+        }
+        let c = &mut *(con as *mut MockConnection);
+        let tf = &*(table_function as *const MockTableFunction);
+        c.table_functions.push(RegisteredTableFn {
+            name: tf.name.clone(),
+            positional_params: tf.positional_params.clone(),
+            named_params: tf.named_params.clone(),
+            projection_pushdown: tf.projection_pushdown,
+        });
+        DuckDBState::Success
     }
-    let c = &mut *(con as *mut MockConnection);
-    let tf = &*(table_function as *const MockTableFunction);
-    c.table_functions.push(RegisteredTableFn {
-        name: tf.name.clone(),
-        positional_params: tf.positional_params.clone(),
-        named_params: tf.named_params.clone(),
-        projection_pushdown: tf.projection_pushdown,
-    });
-    DuckDBState::Success
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_bind_get_parameter_count(info: duckdb_bind_info) -> idx_t {
-    let b = &*(info as *const MockBindContext);
-    b.positional.len() as idx_t
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let b = &*(info as *const MockBindContext);
+        b.positional.len() as idx_t
+    }
 }
 
 #[no_mangle]
@@ -400,10 +476,15 @@ pub unsafe extern "C" fn duckdb_bind_get_parameter(
     info: duckdb_bind_info,
     index: idx_t,
 ) -> duckdb_value {
-    let b = &*(info as *const MockBindContext);
-    match b.positional.get(index as usize) {
-        Some(v) => Box::into_raw(Box::new(v.clone())) as duckdb_value,
-        None => ptr::null_mut(),
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let b = &*(info as *const MockBindContext);
+        match b.positional.get(index as usize) {
+            Some(v) => Box::into_raw(Box::new(v.clone())) as duckdb_value,
+            None => ptr::null_mut(),
+        }
     }
 }
 
@@ -412,11 +493,17 @@ pub unsafe extern "C" fn duckdb_bind_get_named_parameter(
     info: duckdb_bind_info,
     name: *const c_char,
 ) -> duckdb_value {
-    let b = &*(info as *const MockBindContext);
-    let key = CStr::from_ptr(name).to_string_lossy();
-    match b.named.get(key.as_ref()) {
-        Some(v) => Box::into_raw(Box::new(v.clone())) as duckdb_value,
-        None => ptr::null_mut(),
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext` created by this mock or by the
+    // test, and no other reference to it is active during the call; C strings passed in are
+    // NUL-terminated, as the C API requires.
+    unsafe {
+        let b = &*(info as *const MockBindContext);
+        let key = CStr::from_ptr(name).to_string_lossy();
+        match b.named.get(key.as_ref()) {
+            Some(v) => Box::into_raw(Box::new(v.clone())) as duckdb_value,
+            None => ptr::null_mut(),
+        }
     }
 }
 
@@ -426,10 +513,17 @@ pub unsafe extern "C" fn duckdb_bind_add_result_column(
     name: *const c_char,
     type_: duckdb_logical_type,
 ) {
-    let b = &mut *(info as *mut MockBindContext);
-    let col_name = CStr::from_ptr(name).to_string_lossy().into_owned();
-    let lt = &*(type_ as *const MockLogicalType);
-    b.result_columns.push((col_name, lt.ty, lt.alias.clone()));
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext`, `type_` points to a live
+    // `MockLogicalType` created by this mock or by the test, and no other reference to it
+    // is active during the call; C strings passed in are NUL-terminated, as the C API
+    // requires.
+    unsafe {
+        let b = &mut *(info as *mut MockBindContext);
+        let col_name = CStr::from_ptr(name).to_string_lossy().into_owned();
+        let lt = &*(type_ as *const MockLogicalType);
+        b.result_columns.push((col_name, lt.ty, lt.alias.clone()));
+    }
 }
 
 #[no_mangle]
@@ -438,9 +532,14 @@ pub unsafe extern "C" fn duckdb_bind_set_bind_data(
     extra_data: *mut c_void,
     destroy: Option<duckdb_delete_callback_t>,
 ) {
-    let b = &mut *(info as *mut MockBindContext);
-    b.bind_data = extra_data;
-    b.bind_destroy = destroy;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let b = &mut *(info as *mut MockBindContext);
+        b.bind_data = extra_data;
+        b.bind_destroy = destroy;
+    }
 }
 
 #[no_mangle]
@@ -449,20 +548,36 @@ pub unsafe extern "C" fn duckdb_bind_set_cardinality(
     cardinality: idx_t,
     is_exact: bool,
 ) {
-    let b = &mut *(info as *mut MockBindContext);
-    b.cardinality = (cardinality, is_exact);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let b = &mut *(info as *mut MockBindContext);
+        b.cardinality = (cardinality, is_exact);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_bind_set_error(info: duckdb_bind_info, error: *const c_char) {
-    let b = &mut *(info as *mut MockBindContext);
-    b.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockBindContext` created by this mock or by the
+    // test, and no other reference to it is active during the call; C strings passed in are
+    // NUL-terminated, as the C API requires.
+    unsafe {
+        let b = &mut *(info as *mut MockBindContext);
+        b.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_init_get_bind_data(info: duckdb_init_info) -> *mut c_void {
-    let i = &*(info as *const MockInitContext);
-    i.bind_data
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockInitContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let i = &*(info as *const MockInitContext);
+        i.bind_data
+    }
 }
 
 #[no_mangle]
@@ -471,15 +586,25 @@ pub unsafe extern "C" fn duckdb_init_set_init_data(
     extra_data: *mut c_void,
     destroy: Option<duckdb_delete_callback_t>,
 ) {
-    let i = &mut *(info as *mut MockInitContext);
-    i.init_data = extra_data;
-    i.init_destroy = destroy;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockInitContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let i = &mut *(info as *mut MockInitContext);
+        i.init_data = extra_data;
+        i.init_destroy = destroy;
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_init_get_column_count(info: duckdb_init_info) -> idx_t {
-    let i = &*(info as *const MockInitContext);
-    i.projected_columns.len() as idx_t
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockInitContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let i = &*(info as *const MockInitContext);
+        i.projected_columns.len() as idx_t
+    }
 }
 
 #[no_mangle]
@@ -487,34 +612,60 @@ pub unsafe extern "C" fn duckdb_init_get_column_index(
     info: duckdb_init_info,
     column_index: idx_t,
 ) -> idx_t {
-    let i = &*(info as *const MockInitContext);
-    i.projected_columns[column_index as usize] as idx_t
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockInitContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let i = &*(info as *const MockInitContext);
+        i.projected_columns[column_index as usize] as idx_t
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_init_set_error(info: duckdb_init_info, error: *const c_char) {
-    let i = &mut *(info as *mut MockInitContext);
-    i.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockInitContext` created by this mock or by the
+    // test, and no other reference to it is active during the call; C strings passed in are
+    // NUL-terminated, as the C API requires.
+    unsafe {
+        let i = &mut *(info as *mut MockInitContext);
+        i.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_function_get_bind_data(info: duckdb_function_info) -> *mut c_void {
-    let f = &*(info as *const MockFuncContext);
-    f.bind_data
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockFuncContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let f = &*(info as *const MockFuncContext);
+        f.bind_data
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_function_get_init_data(info: duckdb_function_info) -> *mut c_void {
-    let f = &*(info as *const MockFuncContext);
-    f.init_data
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockFuncContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let f = &*(info as *const MockFuncContext);
+        f.init_data
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_function_get_local_init_data(
     info: duckdb_function_info,
 ) -> *mut c_void {
-    let f = &*(info as *const MockFuncContext);
-    f.local_init_data
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockFuncContext` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let f = &*(info as *const MockFuncContext);
+        f.local_init_data
+    }
 }
 
 #[no_mangle]
@@ -522,8 +673,14 @@ pub unsafe extern "C" fn duckdb_function_set_error(
     info: duckdb_function_info,
     error: *const c_char,
 ) {
-    let f = &mut *(info as *mut MockFuncContext);
-    f.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockFuncContext` created by this mock or by the
+    // test, and no other reference to it is active during the call; C strings passed in are
+    // NUL-terminated, as the C API requires.
+    unsafe {
+        let f = &mut *(info as *mut MockFuncContext);
+        f.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    }
 }
 
 #[no_mangle]
@@ -531,16 +688,27 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_error(
     info: duckdb_function_info,
     error: *const c_char,
 ) {
-    if !info.is_null() {
-        let f = &mut *(info as *mut MockFuncContext);
-        f.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `info` points to a live `MockFuncContext` created by this mock or by the
+    // test, and no other reference to it is active during the call; C strings passed in are
+    // NUL-terminated, as the C API requires.
+    unsafe {
+        if !info.is_null() {
+            let f = &mut *(info as *mut MockFuncContext);
+            f.error = Some(CStr::from_ptr(error).to_string_lossy().into_owned());
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_data_chunk_get_column_count(chunk: duckdb_data_chunk) -> idx_t {
-    let c = &*(chunk as *const MockDataChunk);
-    c.vectors.len() as idx_t
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `chunk` points to a live `MockDataChunk` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let c = &*(chunk as *const MockDataChunk);
+        c.vectors.len() as idx_t
+    }
 }
 
 #[no_mangle]
@@ -548,34 +716,54 @@ pub unsafe extern "C" fn duckdb_data_chunk_get_vector(
     chunk: duckdb_data_chunk,
     col_idx: idx_t,
 ) -> duckdb_vector {
-    let c = &mut *(chunk as *mut MockDataChunk);
-    c.vectors
-        .get_mut(col_idx as usize)
-        .map(|v| v as *mut MockVector as duckdb_vector)
-        .unwrap_or(ptr::null_mut())
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `chunk` points to a live `MockDataChunk` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let c = &mut *(chunk as *mut MockDataChunk);
+        c.vectors
+            .get_mut(col_idx as usize)
+            .map(|v| v as *mut MockVector as duckdb_vector)
+            .unwrap_or(ptr::null_mut())
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_data_chunk_get_size(chunk: duckdb_data_chunk) -> idx_t {
-    let c = &*(chunk as *const MockDataChunk);
-    c.size as idx_t
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `chunk` points to a live `MockDataChunk` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let c = &*(chunk as *const MockDataChunk);
+        c.size as idx_t
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_data_chunk_set_size(chunk: duckdb_data_chunk, size: idx_t) {
-    if !chunk.is_null() {
-        let c = &mut *(chunk as *mut MockDataChunk);
-        c.size = size as usize;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `chunk` points to a live `MockDataChunk` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        if !chunk.is_null() {
+            let c = &mut *(chunk as *mut MockDataChunk);
+            c.size = size as usize;
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_vector_get_data(vector: duckdb_vector) -> *mut c_void {
-    if vector.is_null() {
-        return ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `vector` points to a live `MockVector` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        if vector.is_null() {
+            return ptr::null_mut();
+        }
+        let v = &mut *(vector as *mut MockVector);
+        v.data.as_mut_ptr() as *mut c_void
     }
-    let v = &mut *(vector as *mut MockVector);
-    v.data.as_mut_ptr() as *mut c_void
 }
 
 #[no_mangle]
@@ -584,8 +772,12 @@ pub unsafe extern "C" fn duckdb_vector_assign_string_element(
     index: idx_t,
     str_ptr: *const c_char,
 ) {
-    let bytes = CStr::from_ptr(str_ptr).to_bytes();
-    duckdb_vector_assign_string_element_len(vector, index, str_ptr, bytes.len() as idx_t);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: C strings passed in are NUL-terminated, as the C API requires.
+    unsafe {
+        let bytes = CStr::from_ptr(str_ptr).to_bytes();
+        duckdb_vector_assign_string_element_len(vector, index, str_ptr, bytes.len() as idx_t);
+    }
 }
 
 #[no_mangle]
@@ -595,52 +787,83 @@ pub unsafe extern "C" fn duckdb_vector_assign_string_element_len(
     str_ptr: *const c_char,
     str_len: idx_t,
 ) {
-    let v = &mut *(vector as *mut MockVector);
-    let bytes = std::slice::from_raw_parts(str_ptr as *const u8, str_len as usize);
-    v.strings[index as usize] = bytes.to_vec();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `vector` points to a live `MockVector` created by this mock or by the
+    // test, and no other reference to it is active during the call; `str_ptr` addresses
+    // `str_len` readable bytes, as the C API requires.
+    unsafe {
+        let v = &mut *(vector as *mut MockVector);
+        let bytes = std::slice::from_raw_parts(str_ptr as *const u8, str_len as usize);
+        v.strings[index as usize] = bytes.to_vec();
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_vector_get_validity(vector: duckdb_vector) -> *mut u64 {
-    let v = &mut *(vector as *mut MockVector);
-    if v.has_validity {
-        v.validity.as_mut_ptr()
-    } else {
-        ptr::null_mut()
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `vector` points to a live `MockVector` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let v = &mut *(vector as *mut MockVector);
+        if v.has_validity {
+            v.validity.as_mut_ptr()
+        } else {
+            ptr::null_mut()
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_vector_ensure_validity_writable(vector: duckdb_vector) {
-    let v = &mut *(vector as *mut MockVector);
-    v.has_validity = true;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `vector` points to a live `MockVector` created by this mock or by the
+    // test, and no other reference to it is active during the call.
+    unsafe {
+        let v = &mut *(vector as *mut MockVector);
+        v.has_validity = true;
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_validity_row_is_valid(validity: *mut u64, row: idx_t) -> bool {
-    if validity.is_null() {
-        return true;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `validity` is a mock mask sized for the vector capacity and `row` is
+    // below that capacity.
+    unsafe {
+        if validity.is_null() {
+            return true;
+        }
+        let entry = (row / 64) as usize;
+        let bit = row % 64;
+        (*validity.add(entry) & (1u64 << bit)) != 0
     }
-    let entry = (row / 64) as usize;
-    let bit = row % 64;
-    (*validity.add(entry) & (1u64 << bit)) != 0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_validity_set_row_valid(validity: *mut u64, row: idx_t) {
-    if !validity.is_null() {
-        let entry = (row / 64) as usize;
-        let bit = row % 64;
-        *validity.add(entry) |= 1u64 << bit;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `validity` is a mock mask sized for the vector capacity and `row` is
+    // below that capacity.
+    unsafe {
+        if !validity.is_null() {
+            let entry = (row / 64) as usize;
+            let bit = row % 64;
+            *validity.add(entry) |= 1u64 << bit;
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_validity_set_row_invalid(validity: *mut u64, row: idx_t) {
-    if !validity.is_null() {
-        let entry = (row / 64) as usize;
-        let bit = row % 64;
-        *validity.add(entry) &= !(1u64 << bit);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `validity` is a mock mask sized for the vector capacity and `row` is
+    // below that capacity.
+    unsafe {
+        if !validity.is_null() {
+            let entry = (row / 64) as usize;
+            let bit = row % 64;
+            *validity.add(entry) &= !(1u64 << bit);
+        }
     }
 }
 
@@ -650,10 +873,14 @@ pub unsafe extern "C" fn duckdb_validity_set_row_validity(
     row: idx_t,
     valid: bool,
 ) {
-    if valid {
-        duckdb_validity_set_row_valid(validity, row);
-    } else {
-        duckdb_validity_set_row_invalid(validity, row);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: forwards its arguments unchanged to another mock with the same contract.
+    unsafe {
+        if valid {
+            duckdb_validity_set_row_valid(validity, row);
+        } else {
+            duckdb_validity_set_row_invalid(validity, row);
+        }
     }
 }
 
@@ -664,60 +891,96 @@ pub unsafe extern "C" fn duckdb_vector_size() -> idx_t {
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_get_varchar(val: duckdb_value) -> *mut c_char {
-    let v = &*(val as *const MockVal);
-    match v {
-        MockVal::Str(s) => CString::new(s.as_str()).unwrap().into_raw(),
-        _ => ptr::null_mut(),
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `val` points to a live `MockVal` created by this mock or by the test, and
+    // no other reference to it is active during the call.
+    unsafe {
+        let v = &*(val as *const MockVal);
+        match v {
+            MockVal::Str(s) => CString::new(s.as_str()).unwrap().into_raw(),
+            _ => ptr::null_mut(),
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_get_int64(val: duckdb_value) -> i64 {
-    match &*(val as *const MockVal) {
-        MockVal::Int(i) => *i,
-        MockVal::UInt(u) => *u as i64,
-        _ => 0,
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `val` points to a live `MockVal` created by this mock or by the test, and
+    // no other reference to it is active during the call.
+    unsafe {
+        match &*(val as *const MockVal) {
+            MockVal::Int(i) => *i,
+            MockVal::UInt(u) => *u as i64,
+            _ => 0,
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_get_uint64(val: duckdb_value) -> u64 {
-    match &*(val as *const MockVal) {
-        MockVal::UInt(u) => *u,
-        MockVal::Int(i) => *i as u64,
-        _ => 0,
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `val` points to a live `MockVal` created by this mock or by the test, and
+    // no other reference to it is active during the call.
+    unsafe {
+        match &*(val as *const MockVal) {
+            MockVal::UInt(u) => *u,
+            MockVal::Int(i) => *i as u64,
+            _ => 0,
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_get_double(val: duckdb_value) -> f64 {
-    match &*(val as *const MockVal) {
-        MockVal::Double(d) => *d,
-        MockVal::Int(i) => *i as f64,
-        _ => 0.0,
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `val` points to a live `MockVal` created by this mock or by the test, and
+    // no other reference to it is active during the call.
+    unsafe {
+        match &*(val as *const MockVal) {
+            MockVal::Double(d) => *d,
+            MockVal::Int(i) => *i as f64,
+            _ => 0.0,
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_get_bool(val: duckdb_value) -> bool {
-    match &*(val as *const MockVal) {
-        MockVal::Bool(b) => *b,
-        _ => false,
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `val` points to a live `MockVal` created by this mock or by the test, and
+    // no other reference to it is active during the call.
+    unsafe {
+        match &*(val as *const MockVal) {
+            MockVal::Bool(b) => *b,
+            _ => false,
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_free(ptr: *mut c_void) {
-    if !ptr.is_null() {
-        drop(CString::from_raw(ptr as *mut c_char));
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: every string the mock hands out (`duckdb_get_varchar`,
+    // `duckdb_logical_type_get_alias`) comes from `CString::into_raw`, so this is the
+    // matching deallocator.
+    unsafe {
+        if !ptr.is_null() {
+            drop(CString::from_raw(ptr as *mut c_char));
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_destroy_value(val: *mut duckdb_value) {
-    if !val.is_null() && !(*val).is_null() {
-        drop(Box::from_raw(*val as *mut MockVal));
-        *val = ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: a handle freed here came from this mock's own `Box::into_raw` and the
+    // out-pointer is nulled so it cannot be freed twice.
+    unsafe {
+        if !val.is_null() && !(*val).is_null() {
+            drop(Box::from_raw(*val as *mut MockVal));
+            *val = ptr::null_mut();
+        }
     }
 }
 
@@ -734,9 +997,14 @@ pub unsafe extern "C" fn duckdb_create_scalar_function() -> duckdb_scalar_functi
 pub unsafe extern "C" fn duckdb_destroy_scalar_function(
     scalar_function: *mut duckdb_scalar_function,
 ) {
-    if !scalar_function.is_null() && !(*scalar_function).is_null() {
-        drop(Box::from_raw(*scalar_function as *mut MockScalarFunction));
-        *scalar_function = ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: a handle freed here came from this mock's own `Box::into_raw` and the
+    // out-pointer is nulled so it cannot be freed twice.
+    unsafe {
+        if !scalar_function.is_null() && !(*scalar_function).is_null() {
+            drop(Box::from_raw(*scalar_function as *mut MockScalarFunction));
+            *scalar_function = ptr::null_mut();
+        }
     }
 }
 
@@ -745,8 +1013,14 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_name(
     scalar_function: duckdb_scalar_function,
     name: *const c_char,
 ) {
-    let sf = &mut *(scalar_function as *mut MockScalarFunction);
-    sf.name = CStr::from_ptr(name).to_string_lossy().into_owned();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `scalar_function` points to a live `MockScalarFunction` created by this
+    // mock or by the test, and no other reference to it is active during the call; C
+    // strings passed in are NUL-terminated, as the C API requires.
+    unsafe {
+        let sf = &mut *(scalar_function as *mut MockScalarFunction);
+        sf.name = CStr::from_ptr(name).to_string_lossy().into_owned();
+    }
 }
 
 #[no_mangle]
@@ -754,9 +1028,15 @@ pub unsafe extern "C" fn duckdb_scalar_function_add_parameter(
     scalar_function: duckdb_scalar_function,
     type_: duckdb_logical_type,
 ) {
-    let sf = &mut *(scalar_function as *mut MockScalarFunction);
-    let lt = &*(type_ as *const MockLogicalType);
-    sf.params.push(lt.ty);
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `scalar_function` points to a live `MockScalarFunction`, `type_` points
+    // to a live `MockLogicalType` created by this mock or by the test, and no other
+    // reference to it is active during the call.
+    unsafe {
+        let sf = &mut *(scalar_function as *mut MockScalarFunction);
+        let lt = &*(type_ as *const MockLogicalType);
+        sf.params.push(lt.ty);
+    }
 }
 
 #[no_mangle]
@@ -764,9 +1044,15 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_return_type(
     scalar_function: duckdb_scalar_function,
     type_: duckdb_logical_type,
 ) {
-    let sf = &mut *(scalar_function as *mut MockScalarFunction);
-    let lt = &*(type_ as *const MockLogicalType);
-    sf.ret = lt.ty;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `scalar_function` points to a live `MockScalarFunction`, `type_` points
+    // to a live `MockLogicalType` created by this mock or by the test, and no other
+    // reference to it is active during the call.
+    unsafe {
+        let sf = &mut *(scalar_function as *mut MockScalarFunction);
+        let lt = &*(type_ as *const MockLogicalType);
+        sf.ret = lt.ty;
+    }
 }
 
 #[no_mangle]
@@ -781,14 +1067,20 @@ pub unsafe extern "C" fn duckdb_register_scalar_function(
     con: duckdb_connection,
     scalar_function: duckdb_scalar_function,
 ) -> DuckDBState {
-    let c = &mut *(con as *mut MockConnection);
-    let sf = &*(scalar_function as *const MockScalarFunction);
-    c.scalar_functions.push(RegisteredScalarFn {
-        name: sf.name.clone(),
-        params: sf.params.clone(),
-        ret: sf.ret,
-    });
-    DuckDBState::Success
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `con` points to a live `MockConnection`, `scalar_function` points to a
+    // live `MockScalarFunction` created by this mock or by the test, and no other reference
+    // to it is active during the call.
+    unsafe {
+        let c = &mut *(con as *mut MockConnection);
+        let sf = &*(scalar_function as *const MockScalarFunction);
+        c.scalar_functions.push(RegisteredScalarFn {
+            name: sf.name.clone(),
+            params: sf.params.clone(),
+            ret: sf.ret,
+        });
+        DuckDBState::Success
+    }
 }
 
 struct MockScalarFunctionSet {
@@ -800,17 +1092,26 @@ struct MockScalarFunctionSet {
 pub unsafe extern "C" fn duckdb_create_scalar_function_set(
     name: *const c_char,
 ) -> duckdb_scalar_function_set {
-    Box::into_raw(Box::new(MockScalarFunctionSet {
-        name: CStr::from_ptr(name).to_string_lossy().into_owned(),
-        functions: Vec::new(),
-    })) as duckdb_scalar_function_set
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: C strings passed in are NUL-terminated, as the C API requires.
+    unsafe {
+        Box::into_raw(Box::new(MockScalarFunctionSet {
+            name: CStr::from_ptr(name).to_string_lossy().into_owned(),
+            functions: Vec::new(),
+        })) as duckdb_scalar_function_set
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn duckdb_destroy_scalar_function_set(set: *mut duckdb_scalar_function_set) {
-    if !set.is_null() && !(*set).is_null() {
-        drop(Box::from_raw(*set as *mut MockScalarFunctionSet));
-        *set = ptr::null_mut();
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: a handle freed here came from this mock's own `Box::into_raw` and the
+    // out-pointer is nulled so it cannot be freed twice.
+    unsafe {
+        if !set.is_null() && !(*set).is_null() {
+            drop(Box::from_raw(*set as *mut MockScalarFunctionSet));
+            *set = ptr::null_mut();
+        }
     }
 }
 
@@ -819,14 +1120,20 @@ pub unsafe extern "C" fn duckdb_add_scalar_function_to_set(
     set: duckdb_scalar_function_set,
     function: duckdb_scalar_function,
 ) -> DuckDBState {
-    let set = &mut *(set as *mut MockScalarFunctionSet);
-    let sf = &*(function as *const MockScalarFunction);
-    set.functions.push(RegisteredScalarFn {
-        name: set.name.clone(),
-        params: sf.params.clone(),
-        ret: sf.ret,
-    });
-    DuckDBState::Success
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `function` points to a live `MockScalarFunction`, `set` points to a live
+    // `MockScalarFunctionSet` created by this mock or by the test, and no other reference
+    // to it is active during the call.
+    unsafe {
+        let set = &mut *(set as *mut MockScalarFunctionSet);
+        let sf = &*(function as *const MockScalarFunction);
+        set.functions.push(RegisteredScalarFn {
+            name: set.name.clone(),
+            params: sf.params.clone(),
+            ret: sf.ret,
+        });
+        DuckDBState::Success
+    }
 }
 
 #[no_mangle]
@@ -834,19 +1141,25 @@ pub unsafe extern "C" fn duckdb_register_scalar_function_set(
     con: duckdb_connection,
     set: duckdb_scalar_function_set,
 ) -> DuckDBState {
-    let c = &mut *(con as *mut MockConnection);
-    let set = &*(set as *const MockScalarFunctionSet);
-    // Mirrors DuckDB < 1.5, which rejects a second registration under an existing name.
-    if c.scalar_functions.iter().any(|f| f.name == set.name) {
-        return DuckDBState::Error;
+    // SAFETY: test mock of the DuckDB C API, driven single-threaded by the extension code
+    // under test: `con` points to a live `MockConnection`, `set` points to a live
+    // `MockScalarFunctionSet` created by this mock or by the test, and no other reference
+    // to it is active during the call.
+    unsafe {
+        let c = &mut *(con as *mut MockConnection);
+        let set = &*(set as *const MockScalarFunctionSet);
+        // Mirrors DuckDB < 1.5, which rejects a second registration under an existing name.
+        if c.scalar_functions.iter().any(|f| f.name == set.name) {
+            return DuckDBState::Error;
+        }
+        c.scalar_functions
+            .extend(set.functions.iter().map(|f| RegisteredScalarFn {
+                name: f.name.clone(),
+                params: f.params.clone(),
+                ret: f.ret,
+            }));
+        DuckDBState::Success
     }
-    c.scalar_functions
-        .extend(set.functions.iter().map(|f| RegisteredScalarFn {
-            name: f.name.clone(),
-            params: f.params.clone(),
-            ret: f.ret,
-        }));
-    DuckDBState::Success
 }
 
 #[no_mangle]
@@ -976,17 +1289,22 @@ fn install_mock_api() {
         }
         Box::leak(table.into_boxed_slice()).as_ptr() as usize
     });
+    // SAFETY: `table` is a leaked (never freed) array of `API_TABLE_LEN` pointers whose
+    // filled slots hold mocks with exactly the signatures of those slots.
     unsafe { install_api_table(table as *const c_void) };
 }
 
 #[test]
 fn test_extension_init_and_registration_completeness() {
     install_mock_api();
+    // SAFETY: `raster_h3_version` returns a static NUL-terminated literal.
     let ver = unsafe { CStr::from_ptr(raster_h3_duckdb::raster_h3_version()).to_string_lossy() };
     assert_eq!(ver, "v0.0.1");
 
     let mut dummy_db = 1usize;
     let db_ptr = &mut dummy_db as *mut usize as duckdb_database;
+    // SAFETY: the mock C API is installed, and the mock `duckdb_connect` only needs a non-
+    // null database handle.
     assert!(unsafe { raster_h3_duckdb::raster_h3_init(db_ptr) });
 
     // Also test C API entrypoint
@@ -999,6 +1317,8 @@ fn test_extension_init_and_registration_completeness() {
         get_database: Some(get_db),
         get_api: None,
     };
+    // SAFETY: `access` is a fully initialized table on the stack and `get_db` returns the
+    // extension-info pointer, which points to `db_handle`, a valid `duckdb_database`.
     assert!(unsafe {
         raster_h3_duckdb::raster_h3_init_c_api(
             &mut db_handle as *mut duckdb_database as duckdb_extension_info,
@@ -1009,6 +1329,8 @@ fn test_extension_init_and_registration_completeness() {
     // Inspect registered functions on a connection
     let mut con = MockConnection::default();
     let con_ptr = &mut con as *mut MockConnection as duckdb_connection;
+    // SAFETY: `con_ptr` points to a live `MockConnection`, which is what the installed mock
+    // C API expects as a connection.
     unsafe {
         raster_h3_duckdb::functions::register_table_function(con_ptr).unwrap();
         raster_h3_duckdb::functions::register_categorical_table_function(con_ptr).unwrap();
@@ -1114,6 +1436,9 @@ fn test_all_scalar_functions_and_null_propagation() {
     // 1. h3_to_string & string_to_h3 with NULL row at index 1
     let mut chunk_u64 = MockDataChunk::new(1, 4);
     chunk_u64.size = 3;
+    // SAFETY: mock vector buffers are 8-aligned `u64` storage with two slots per row and
+    // capacity 4, so writing `u64`/`i64` rows 0..3 is in bounds; the validity mask covers
+    // that capacity.
     unsafe {
         let data = chunk_u64.vectors[0].data.as_mut_ptr();
         *data.add(0) = valid_cell;
@@ -1124,6 +1449,8 @@ fn test_all_scalar_functions_and_null_propagation() {
     }
 
     let mut out_str = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
     unsafe {
         scalar_h3_to_string(
             ptr::null_mut(),
@@ -1149,6 +1476,8 @@ fn test_all_scalar_functions_and_null_propagation() {
     let mut out_wkb = MockVector::new(4);
     let mut out_geom = MockVector::new(4);
     let mut out_cell_geom = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
     unsafe {
         let in_ptr = &mut chunk_u64 as *mut MockDataChunk as duckdb_data_chunk;
         scalar_h3_to_lat(
@@ -1187,6 +1516,8 @@ fn test_all_scalar_functions_and_null_propagation() {
             &mut out_cell_geom as *mut MockVector as duckdb_vector,
         );
     }
+    // SAFETY: the callbacks above wrote values of these columns' declared types for rows
+    // `0..size` into 8-aligned buffers with room for at least that many rows.
     unsafe {
         let lats = out_lat.data.as_ptr() as *const f64;
         let lngs = out_lng.data.as_ptr() as *const f64;
@@ -1221,6 +1552,8 @@ fn test_all_scalar_functions_and_null_propagation() {
     let mut out_wkb_s = MockVector::new(4);
     let mut out_geom_s = MockVector::new(4);
     let mut out_cell_geom_s = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
     unsafe {
         let in_ptr = &mut chunk_str as *mut MockDataChunk as duckdb_data_chunk;
         scalar_string_to_h3(
@@ -1264,6 +1597,9 @@ fn test_all_scalar_functions_and_null_propagation() {
     // 4. Binary scalar functions: h3_cell_to_parent(u64, i64) and h3_cell_to_parent(VARCHAR, i64)
     let mut chunk_bin_u64 = MockDataChunk::new(2, 4);
     chunk_bin_u64.size = 2;
+    // SAFETY: mock vector buffers are 8-aligned `u64` storage with two slots per row and
+    // capacity 4, so writing `u64`/`i64` rows 0..3 is in bounds; the validity mask covers
+    // that capacity.
     unsafe {
         *chunk_bin_u64.vectors[0].data.as_mut_ptr().add(0) = valid_cell;
         *chunk_bin_u64.vectors[0].data.as_mut_ptr().add(1) = valid_cell;
@@ -1271,6 +1607,8 @@ fn test_all_scalar_functions_and_null_propagation() {
         *(chunk_bin_u64.vectors[1].data.as_mut_ptr() as *mut i64).add(1) = 9; // invalid coarser > 8
     }
     let mut out_parent_u64 = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
     unsafe {
         scalar_h3_cell_to_parent_u64(
             ptr::null_mut(),
@@ -1291,11 +1629,16 @@ fn test_all_scalar_functions_and_null_propagation() {
     chunk_bin_str.size = 2;
     chunk_bin_str.vectors[0].set_str_input(0, "8828308281fffff");
     chunk_bin_str.vectors[0].set_str_input(1, "8828308281fffff");
+    // SAFETY: mock vector buffers are 8-aligned `u64` storage with two slots per row and
+    // capacity 4, so writing `u64`/`i64` rows 0..3 is in bounds; the validity mask covers
+    // that capacity.
     unsafe {
         *(chunk_bin_str.vectors[1].data.as_mut_ptr() as *mut i64).add(0) = 7;
         *(chunk_bin_str.vectors[1].data.as_mut_ptr() as *mut i64).add(1) = 9;
     }
     let mut out_parent_str = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
     unsafe {
         scalar_h3_cell_to_parent_str(
             ptr::null_mut(),
@@ -1333,6 +1676,8 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
         vec![MockVal::Str(path.to_string_lossy().into_owned())],
         named,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         raster_h3_bind(&mut bind_ctx as *mut MockBindContext as duckdb_bind_info);
     }
@@ -1350,6 +1695,8 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
     let all_cols: Vec<usize> = (0..13).collect();
     let mut init_ctx = MockInitContext::new(bind_ctx.bind_data, all_cols);
     let mut local_ctx = MockInitContext::new(bind_ctx.bind_data, Vec::new());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         raster_h3_init(&mut init_ctx as *mut MockInitContext as duckdb_init_info);
         raster_h3_init_local(&mut local_ctx as *mut MockInitContext as duckdb_init_info);
@@ -1367,6 +1714,9 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
     let mut total_pixel_count = 0.0f64;
     loop {
         let mut chunk = MockDataChunk::new(13, 2048);
+        // SAFETY: the function context carries bind/init/local data installed above (still
+        // owned by their live contexts), and the chunk has one 2048-row mock vector per
+        // projected column.
         unsafe {
             raster_h3_scan(
                 &mut func_ctx as *mut MockFuncContext as duckdb_function_info,
@@ -1378,6 +1728,8 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
             break;
         }
         total_rows += chunk.size;
+        // SAFETY: the callbacks above wrote values of these columns' declared types for
+        // rows `0..size` into 8-aligned buffers with room for at least that many rows.
         unsafe {
             let counts = chunk.vectors[4].data.as_ptr() as *const f64;
             let p50s = chunk.vectors[11].data.as_ptr() as *const f64;
@@ -1396,6 +1748,8 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
 
     // Zero-column projection pushdown (SELECT count(*))
     let mut init_zero = MockInitContext::new(bind_ctx.bind_data, Vec::new());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         raster_h3_init(&mut init_zero as *mut MockInitContext as duckdb_init_info);
     }
@@ -1408,6 +1762,9 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
     let mut zero_col_rows = 0usize;
     loop {
         let mut chunk = MockDataChunk::new(0, 2048);
+        // SAFETY: the function context carries bind/init/local data installed above (still
+        // owned by their live contexts), and the chunk has one 2048-row mock vector per
+        // projected column.
         unsafe {
             raster_h3_scan(
                 &mut func_zero as *mut MockFuncContext as duckdb_function_info,
@@ -1440,6 +1797,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
         vec![MockVal::Str(path.to_string_lossy().into_owned())],
         bad_remap,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         raster_h3_categorical_bind(&mut bind_bad as *mut MockBindContext as duckdb_bind_info);
     }
@@ -1459,6 +1818,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
         vec![MockVal::Str(path.to_string_lossy().into_owned())],
         named_wide,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         raster_h3_categorical_bind(&mut bind_wide as *mut MockBindContext as duckdb_bind_info);
     }
@@ -1468,6 +1829,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
     let wide_cols: Vec<usize> = (0..14).collect();
     let mut init_wide = MockInitContext::new(bind_wide.bind_data, wide_cols);
     let mut local_wide = MockInitContext::new(bind_wide.bind_data, Vec::new());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         raster_h3_categorical_init(&mut init_wide as *mut MockInitContext as duckdb_init_info);
         raster_h3_categorical_init_local(
@@ -1485,6 +1848,9 @@ fn test_categorical_table_function_wide_and_long_formats() {
     let mut wide_total_pixels = 0.0f64;
     loop {
         let mut chunk = MockDataChunk::new(14, 2048);
+        // SAFETY: the function context carries bind/init/local data installed above (still
+        // owned by their live contexts), and the chunk has one 2048-row mock vector per
+        // projected column.
         unsafe {
             raster_h3_categorical_scan(
                 &mut func_wide as *mut MockFuncContext as duckdb_function_info,
@@ -1495,6 +1861,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
             break;
         }
         wide_cells += chunk.size;
+        // SAFETY: the callbacks above wrote values of these columns' declared types for
+        // rows `0..size` into 8-aligned buffers with room for at least that many rows.
         unsafe {
             let maj_classes = chunk.vectors[2].data.as_ptr() as *const i64;
             let totals = chunk.vectors[6].data.as_ptr() as *const f64;
@@ -1527,6 +1895,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
         vec![MockVal::Str(path.to_string_lossy().into_owned())],
         named_long,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         raster_h3_categorical_bind(&mut bind_long as *mut MockBindContext as duckdb_bind_info);
     }
@@ -1536,6 +1906,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
     let long_cols: Vec<usize> = (0..13).collect();
     let mut init_long = MockInitContext::new(bind_long.bind_data, long_cols);
     let mut local_long = MockInitContext::new(bind_long.bind_data, Vec::new());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         raster_h3_categorical_init(&mut init_long as *mut MockInitContext as duckdb_init_info);
         raster_h3_categorical_init_local(
@@ -1553,6 +1925,9 @@ fn test_categorical_table_function_wide_and_long_formats() {
     let mut long_total_pixels = 0.0f64;
     loop {
         let mut chunk = MockDataChunk::new(13, 2048);
+        // SAFETY: the function context carries bind/init/local data installed above (still
+        // owned by their live contexts), and the chunk has one 2048-row mock vector per
+        // projected column.
         unsafe {
             raster_h3_categorical_scan(
                 &mut func_long as *mut MockFuncContext as duckdb_function_info,
@@ -1563,6 +1938,8 @@ fn test_categorical_table_function_wide_and_long_formats() {
             break;
         }
         long_rows += chunk.size;
+        // SAFETY: the callbacks above wrote values of these columns' declared types for
+        // rows `0..size` into 8-aligned buffers with room for at least that many rows.
         unsafe {
             let cats = chunk.vectors[2].data.as_ptr() as *const i64;
             let counts = chunk.vectors[3].data.as_ptr() as *const f64;
@@ -1616,12 +1993,16 @@ fn test_export_table_functions_with_crs_override() {
         ],
         pq_named,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         parquet_bind(&mut pq_bind as *mut MockBindContext as duckdb_bind_info);
     }
     assert!(pq_bind.error.is_none());
 
     let mut pq_init = MockInitContext::new(pq_bind.bind_data, (0..6).collect());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         parquet_init(&mut pq_init as *mut MockInitContext as duckdb_init_info);
     }
@@ -1632,6 +2013,9 @@ fn test_export_table_functions_with_crs_override() {
         error: None,
     };
     let mut pq_chunk = MockDataChunk::new(6, 2048);
+    // SAFETY: the function context carries bind/init/local data installed above (still
+    // owned by their live contexts), and the chunk has one 2048-row mock vector per
+    // projected column.
     unsafe {
         parquet_scan(
             &mut pq_func as *mut MockFuncContext as duckdb_function_info,
@@ -1641,6 +2025,8 @@ fn test_export_table_functions_with_crs_override() {
     assert_eq!(pq_chunk.size, 1);
     let pq_status = std::str::from_utf8(&pq_chunk.vectors[5].strings[0]).unwrap();
     assert_eq!(pq_status, "SUCCESS", "Parquet export failed: {pq_status}");
+    // SAFETY: the callbacks above wrote values of these columns' declared types for rows
+    // `0..size` into 8-aligned buffers with room for at least that many rows.
     let pq_hex_count = unsafe { *(pq_chunk.vectors[0].data.as_ptr() as *const i64) };
     assert!(pq_hex_count > 0);
     assert!(parquet_path.exists());
@@ -1664,12 +2050,16 @@ fn test_export_table_functions_with_crs_override() {
         ],
         pm_named,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         pmtiles_bind(&mut pm_bind as *mut MockBindContext as duckdb_bind_info);
     }
     assert!(pm_bind.error.is_none());
 
     let mut pm_init = MockInitContext::new(pm_bind.bind_data, (0..7).collect());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         pmtiles_init(&mut pm_init as *mut MockInitContext as duckdb_init_info);
     }
@@ -1680,6 +2070,9 @@ fn test_export_table_functions_with_crs_override() {
         error: None,
     };
     let mut pm_chunk = MockDataChunk::new(7, 2048);
+    // SAFETY: the function context carries bind/init/local data installed above (still
+    // owned by their live contexts), and the chunk has one 2048-row mock vector per
+    // projected column.
     unsafe {
         pmtiles_scan(
             &mut pm_func as *mut MockFuncContext as duckdb_function_info,
@@ -1699,12 +2092,16 @@ fn test_export_table_functions_with_crs_override() {
         ],
         HashMap::new(),
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         parquet_pmtiles_bind(&mut pp_bind as *mut MockBindContext as duckdb_bind_info);
     }
     assert!(pp_bind.error.is_none());
 
     let mut pp_init = MockInitContext::new(pp_bind.bind_data, (0..7).collect());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         parquet_pmtiles_init(&mut pp_init as *mut MockInitContext as duckdb_init_info);
     }
@@ -1715,6 +2112,9 @@ fn test_export_table_functions_with_crs_override() {
         error: None,
     };
     let mut pp_chunk = MockDataChunk::new(7, 2048);
+    // SAFETY: the function context carries bind/init/local data installed above (still
+    // owned by their live contexts), and the chunk has one 2048-row mock vector per
+    // projected column.
     unsafe {
         parquet_pmtiles_scan(
             &mut pp_func as *mut MockFuncContext as duckdb_function_info,
@@ -1724,6 +2124,8 @@ fn test_export_table_functions_with_crs_override() {
     assert_eq!(pp_chunk.size, 1);
     let pp_status = std::str::from_utf8(&pp_chunk.vectors[6].strings[0]).unwrap();
     assert_eq!(pp_status, "SUCCESS", "Parquet->PMTiles failed: {pp_status}");
+    // SAFETY: the callbacks above wrote values of these columns' declared types for rows
+    // `0..size` into 8-aligned buffers with room for at least that many rows.
     let transcoded_count = unsafe { *(pp_chunk.vectors[0].data.as_ptr() as *const i64) };
     assert_eq!(transcoded_count, pq_hex_count);
     assert!(transcode_pmtiles_path.exists());
@@ -1745,12 +2147,16 @@ fn test_export_table_functions_with_crs_override() {
         ],
         invalid_pp_named,
     );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
     unsafe {
         parquet_pmtiles_bind(&mut invalid_pp_bind as *mut MockBindContext as duckdb_bind_info);
     }
     assert!(invalid_pp_bind.error.is_none());
 
     let mut invalid_pp_init = MockInitContext::new(invalid_pp_bind.bind_data, (0..7).collect());
+    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+    // by the bind callback, which is still owned by its bind context.
     unsafe {
         parquet_pmtiles_init(&mut invalid_pp_init as *mut MockInitContext as duckdb_init_info);
     }
@@ -1761,6 +2167,9 @@ fn test_export_table_functions_with_crs_override() {
         error: None,
     };
     let mut invalid_pp_chunk = MockDataChunk::new(7, 2048);
+    // SAFETY: the function context carries bind/init/local data installed above (still
+    // owned by their live contexts), and the chunk has one 2048-row mock vector per
+    // projected column.
     unsafe {
         parquet_pmtiles_scan(
             &mut invalid_pp_func as *mut MockFuncContext as duckdb_function_info,
@@ -1777,6 +2186,8 @@ fn test_export_table_functions_with_crs_override() {
         invalid_pp_status.contains("missing_h3_column"),
         "{invalid_pp_status}"
     );
+    // SAFETY: the callbacks above wrote values of these columns' declared types for rows
+    // `0..size` into 8-aligned buffers with room for at least that many rows.
     let invalid_count = unsafe { *(invalid_pp_chunk.vectors[0].data.as_ptr() as *const i64) };
     assert_eq!(invalid_count, 0);
     assert!(!invalid_transcode_pmtiles_path.exists());

@@ -335,6 +335,7 @@ fn run_continuous_parity(
     let reader = ContinuousBatchReader::open(&tif_paths, &cfg, None, 64, None).unwrap();
     let schema = reader.schema();
     let mut stream = ArrowArrayStream::from_iterator(schema, reader);
+    // SAFETY: `stream` was just built by `from_iterator`, so it is valid and unreleased.
     let (_imported_schema, core_batches) = unsafe { stream.collect_batches().unwrap() };
     let core_map = collect_continuous_from_batches(&core_batches);
     assert!(
@@ -450,6 +451,7 @@ fn run_continuous_parity(
     // Full scan via Arrow C Stream
     let plan = provider.scan(None, &[], None).unwrap();
     let mut df_stream = plan.execute_arrow_c_stream().unwrap();
+    // SAFETY: `execute_arrow_c_stream` returns a freshly built, unreleased stream owned here.
     let (_df_schema, df_batches) = unsafe { df_stream.collect_batches().unwrap() };
     let df_map = collect_continuous_from_batches(&df_batches);
     assert_continuous_maps_equal("raster-h3-datafusion", &core_map, &df_map);
@@ -621,6 +623,9 @@ print(json.dumps(d))
     // Engine 5: raster-h3-pg (C-ABI SRF + Postgres V1 fmgr C-ABI scalars)
     // =========================================================================
     let mut pg_map = BTreeMap::new();
+    // SAFETY: string arguments are live CStrings (or null), the SRF handle is used only between
+    // its open and single close, `c_row` is a fully initialized row, and each `fc*` is a local
+    // call info with all 8 argument slots allocated.
     unsafe {
         let c_path = CString::new(tif_path.to_str().unwrap()).unwrap();
         let c_res = CString::new(resolution_arg.as_str()).unwrap();

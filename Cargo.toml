@@ -24,11 +24,13 @@ rust-version = "1.94"
 rust_2018_idioms = { level = "warn", priority = -1 }
 unused_lifetimes = "warn"
 unused_qualifications = "warn"
+unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+undocumented_unsafe_blocks = "warn"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "warn"
@@ -40,7 +42,7 @@ tiff = "0.11"
 proj4rs = { version = "0.1", features = ["esri"] }
 memmap2 = "0.9"
 fxhash = "0.2"
-thiserror = "1.0"
+thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 flate2 = "1.0"
@@ -49,7 +51,7 @@ parquet = { version = "60", default-features = false, features = ["flate2-rust_b
 tempfile = "3.10"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"
-weezl = "0.1"
+weezl = "0.2"
 libc = "0.2"
 crossbeam-deque = "0.8"
 
