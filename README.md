@@ -257,8 +257,9 @@ Aggregated cells stream into the host engine as they complete — DuckDB `DataCh
 Arrow `RecordBatch`es for DataFusion and Polars, PostgreSQL rows, or NDJSON / `RH3IPC01` on
 stdout — so queries, joins and exports start before the raster is fully read. Every engine
 pulls on demand, so a `LIMIT` stops aggregation early. When active accumulators exceed
-their budget, temporary spill files hold partial results for merging. Projected inputs
-without certified bounds may defer output until EOF.
+their budget, temporary spill files hold partial results for merging; the core streamers
+report the runs written in total (`spill_run_count()`) and per resolution
+(`spill_run_counts()`). Projected inputs without certified bounds may defer output until EOF.
 
 ---
 
