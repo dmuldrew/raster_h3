@@ -250,6 +250,36 @@ proptest! {
 }
 
 #[test]
+fn chunk_ending_at_or_just_below_the_antimeridian_keeps_its_interior() {
+    // One ulp below 180 wraps to -180; the wrapped corners must not reverse
+    // the bounds and reject a bbox over the chunk's interior samples.
+    let tf = CrsTransformer::Wgs84Identity;
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 1,
+        height: 1,
+    };
+    let interior = [179.4, 10.0, 179.6, 11.0];
+    for east in [180.0, 180.0_f64.next_down()] {
+        let gt = GeoTransform {
+            a: east - 179.0,
+            ..north_up(179.0, 11.0, 1.0)
+        };
+        assert_eq!(gt.pixel_to_coord(1.0, 0.0).0, east);
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 1.0, 1.0);
+        assert!(b[0] <= b[2], "east edge {east}: reversed bounds {b:?}");
+        assert!(
+            chunk_intersects_bbox(&chunk, &gt, &tf, &interior),
+            "east edge {east}: chunk rejected by {interior:?}"
+        );
+    }
+    // Pixel interiors never reach an edge at exactly 180, so it stays tight.
+    let gt = north_up(179.0, 11.0, 1.0);
+    assert_eq!(tf.transform_rect_bounds(&gt, 0.0, 0.0, 1.0, 1.0)[2], 180.0);
+}
+
+#[test]
 fn uncertified_projections_fail_open_for_rejection() {
     let polar = CrsTransformer::from_epsg_code(3413).unwrap();
     assert!(!polar.bounds_certified());
