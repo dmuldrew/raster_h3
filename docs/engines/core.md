@@ -51,6 +51,16 @@ Every adapter follows the same steps:
    it returns `Ok(0)` (end of stream) or an error. Errors latch: a failed stream keeps
    returning the error instead of reporting a clean EOF.
 
+### Spill diagnostics
+
+Both streamers report spilling after or during a stream: `spill_run_count()` is the
+number of partial sorted runs written to disk, `spill_run_counts()` the same per
+configured resolution (in `resolutions` order), and `peak_active_bytes()` the peak
+active-map allocation estimate. The budget is split evenly between
+resolutions, so a fine resolution can spill while a coarse one stays in memory. Once any
+resolution has spilled, the eviction horizon stops advancing: cells of in-memory
+resolutions south of it are held until EOF and then emitted from memory, never from runs.
+
 `custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
 or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
 accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`,
