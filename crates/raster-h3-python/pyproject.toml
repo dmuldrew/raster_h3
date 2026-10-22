@@ -48,7 +48,7 @@ test-command = "python {package}/tests/wheel_smoke.py"
 archs = ["auto64"]
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
-before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.97.1"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 
 [tool.cibuildwheel.macos]

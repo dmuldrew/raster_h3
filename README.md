@@ -444,24 +444,29 @@ flowchart TD
 
 ## Core Dependencies & Architectural Contributions
 
+Version requirements live in [Cargo.toml](Cargo.toml); resolved versions live in [Cargo.lock](Cargo.lock).
+
 | Dependency | Purpose | Contribution |
 | :--- | :--- | :--- |
-| [`h3o`](https://crates.io/crates/h3o) `v0.6` | Pure-Rust H3 Engine | 100% Rust H3 DGGS — no C/C++ FFI overhead |
-| [`memmap2`](https://crates.io/crates/memmap2) `v0.9` | Virtual Memory I/O | Zero-copy GeoTIFF mapping with sequential readahead |
-| [`crossbeam-deque`](https://crates.io/crates/crossbeam-deque) `v0.8` | Lock-Free Buffer Pool | Concurrent work-stealing buffer recycling |
-| [`libdeflater`](https://crates.io/crates/libdeflater) `v1.23` | SIMD Deflate | Hardware-accelerated decompression (AVX-512, NEON) |
-| [`weezl`](https://crates.io/crates/weezl) `v0.1` | LZW Decoder | Fast streaming LZW for legacy GeoTIFFs |
-| [`parquet`](https://crates.io/crates/parquet) `v53` | GeoParquet Engine | Streaming row-group writer with OGC GeoParquet 1.1 |
-| [`tiff`](https://crates.io/crates/tiff) `v0.9` | GeoTIFF Decoder | Baseline TIFF, tiled TIFF, and BigTIFF support |
-| [`proj4rs`](https://crates.io/crates/proj4rs) `v0.1` | Geodetic Reprojection | Pure-Rust PROJ.4 (UTM, Lambert, Albers → WGS84) |
-| [`fxhash`](https://crates.io/crates/fxhash) `v0.2` | Fast Hasher | Near-identity-hash for 64-bit H3 cell keys |
-| [`rayon`](https://crates.io/crates/rayon) `v1.10` | Work-Stealing Parallelism | Lock-free data parallelism across CPU cores |
-| [`flate2`](https://crates.io/crates/flate2) `v1.0` | Tile Compression | Gzip for MVT payloads and PMTiles directories |
+| [`h3o`](https://crates.io/crates/h3o) | Pure-Rust H3 Engine | 100% Rust H3 DGGS — no C/C++ FFI overhead |
+| [`memmap2`](https://crates.io/crates/memmap2) | Virtual Memory I/O | Zero-copy GeoTIFF mapping with sequential readahead |
+| [`crossbeam-deque`](https://crates.io/crates/crossbeam-deque) | Lock-Free Buffer Pool | Concurrent work-stealing buffer recycling |
+| [`libdeflater`](https://crates.io/crates/libdeflater) | SIMD Deflate | Hardware-accelerated decompression (AVX-512, NEON) |
+| [`weezl`](https://crates.io/crates/weezl) | LZW Decoder | Fast streaming LZW for legacy GeoTIFFs |
+| [`parquet`](https://crates.io/crates/parquet) | GeoParquet Engine | Streaming row-group writer with OGC GeoParquet 1.1 |
+| [`tiff`](https://crates.io/crates/tiff) | GeoTIFF Decoder | Baseline TIFF, tiled TIFF, and BigTIFF support |
+| [`proj4rs`](https://crates.io/crates/proj4rs) | Geodetic Reprojection | Pure-Rust PROJ.4 (UTM, Lambert, Albers → WGS84) |
+| [`rustc-hash`](https://crates.io/crates/rustc-hash) | Fast Hasher | Maintained Fx hashing for numeric H3 cell keys (not a cryptographic hasher) |
+| [`rayon`](https://crates.io/crates/rayon) | Work-Stealing Parallelism | Lock-free data parallelism across CPU cores |
+| [`flate2`](https://crates.io/crates/flate2) | Tile Compression | Gzip for MVT payloads and PMTiles directories |
 | [`thiserror`](https://crates.io/crates/thiserror) & [`serde`](https://crates.io/crates/serde) | Error & Serialization | Typed error propagation and JSON formatting |
 
 ---
 
 ## Troubleshooting & Common Pitfalls
+
+Decoded TIFF chunks with invalid dimensions, overflowed layouts, or truncated source/destination
+buffers return an error before sample unpacking rather than indexing unchecked layouts.
 
 These apply to every engine. Engine-specific issues (DuckDB unsigned extensions, the
 Python native library path, PostgreSQL privileges and version mismatches) are in each

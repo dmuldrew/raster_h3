@@ -9,6 +9,7 @@ members = [
     "crates/raster-h3-python",
     "crates/raster-h3-pg",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.4.0"
@@ -41,7 +42,7 @@ rayon = "1.10"
 tiff = "0.11"
 proj4rs = { version = "0.1", features = ["esri"] }
 memmap2 = "0.9"
-fxhash = "0.2"
+rustc-hash = "2.1.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -57,6 +58,7 @@ crossbeam-deque = "0.8"
 
 [package]
 name = "raster_h3"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -85,19 +87,19 @@ default = []
 stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
 
 [dependencies]
-raster-h3-core = { path = "crates/raster-h3-core" }
-raster-h3-cli = { path = "crates/raster-h3-cli" }
-raster-h3-duckdb = { path = "crates/raster-h3-duckdb" }
-raster-h3-datafusion = { path = "crates/raster-h3-datafusion" }
-raster-h3-python = { path = "crates/raster-h3-python" }
-raster-h3-pg = { path = "crates/raster-h3-pg" }
+raster-h3-core = { version = "0.4.0", path = "crates/raster-h3-core" }
+raster-h3-cli = { version = "0.4.0", path = "crates/raster-h3-cli" }
+raster-h3-duckdb = { version = "0.4.0", path = "crates/raster-h3-duckdb" }
+raster-h3-datafusion = { version = "0.4.0", path = "crates/raster-h3-datafusion" }
+raster-h3-python = { version = "0.4.0", path = "crates/raster-h3-python" }
+raster-h3-pg = { version = "0.4.0", path = "crates/raster-h3-pg" }
 
 h3o.workspace = true
 rayon.workspace = true
 tiff.workspace = true
 proj4rs.workspace = true
 memmap2.workspace = true
-fxhash.workspace = true
+rustc-hash.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

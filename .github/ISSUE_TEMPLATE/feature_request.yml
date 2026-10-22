@@ -1,0 +1,17 @@
+name: Feature request
+description: Propose an improvement and explain the use case.
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Problem and use case
+      description: Which engine/workflow is affected, and what cannot be done today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed interface and alternatives
+      description: Example SQL/CLI/API, expected output, alternatives, and relevant geospatial standards.
+    validations:
+      required: true

@@ -25,6 +25,7 @@ mod performance;
 mod pmtiles;
 mod polygon_to_cells;
 mod projected_eviction;
+mod properties;
 mod quantiles;
 mod remote_cog;
 mod rotated_grid_correctness;

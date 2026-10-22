@@ -23,6 +23,7 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || steps.filter.outputs.code == 'true' }}
+      wheels: ${{ startsWith(github.ref, 'refs/tags/') || steps.filter.outputs.code == 'true' || steps.filter.outputs.wheel_readme == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch' }}
@@ -40,6 +41,8 @@ jobs:
               - '!docs/**'
               - '!assets/**'
               - '!LICENSE'
+            wheel_readme:
+              - 'crates/raster-h3-python/README.md'
 
   lint:
     name: Format, Clippy & Docs
@@ -52,29 +55,30 @@ jobs:
       # Compiles the feature-gated PostgreSQL module without a local server install.
       RASTER_H3_PG_MAJOR: 16
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Clippy (pg-extension)
-        run: cargo clippy -p raster-h3-pg --features pg-extension --all-targets -- -D warnings
+        run: cargo clippy -p raster-h3-pg --features pg-extension --all-targets --locked -- -D warnings
 
       - name: Rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
   msrv:
     name: MSRV (rust-version)
@@ -84,14 +88,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Keep in sync with `rust-version` in the root Cargo.toml.
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.94'
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check
         run: cargo check --workspace --all-targets --locked
@@ -155,6 +161,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
+          toolchain: '1.97.1'
           targets: ${{ matrix.target }}
 
       - name: Rust Cache
@@ -187,10 +194,10 @@ jobs:
       # Root (cross-engine/packaging), core and DuckDB integration binaries plus
       # their unit tests; each crate links a single tests/it binary.
       - name: Run Tests
-        run: cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb
+        run: cargo test --locked --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb
 
       - name: Build Dynamic Library & Binaries
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package DuckDB Extension (Uncompressed & Gzipped)
         shell: bash
@@ -353,8 +360,7 @@ jobs:
       - name: Run pg-extension tests
         run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
 
-  # Supply-chain checks configured in deny.toml. New RustSEC advisories can land at any
-  # time without a code change, so they are reported but do not fail the PR.
+  # All supply-chain checks are blocking; exceptions belong in deny.toml with a reason.
   deny:
     name: cargo-deny (${{ matrix.checks }})
     needs: [changes]
@@ -368,7 +374,6 @@ jobs:
         checks:
           - advisories
           - bans licenses sources
-    continue-on-error: ${{ matrix.checks == 'advisories' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -376,13 +381,54 @@ jobs:
         with:
           command: check ${{ matrix.checks }}
 
+  metadata:
+    name: Version Consistency
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 scripts/check_versions.py
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  package-check:
+    name: Package core crate
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo package --locked -p raster-h3-core
+
+  wheel-validation:
+    needs: [changes]
+    if: needs.changes.outputs.wheels == 'true'
+    uses: ./.github/workflows/wheels.yml
+    permissions:
+      contents: read
+
+  safety:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/safety.yml
+    permissions:
+      contents: read
+
   release:
     name: Publish GitHub Release
-    needs: [build]
+    needs: [build, lint, msrv, community-build, test-crates, deny, metadata, package-check, wheel-validation, safety]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -392,6 +438,13 @@ jobs:
           path: all-artifacts
           pattern: duckdb-extension-*
           merge-multiple: false
+
+      - name: Download validated wheels
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: all-wheels
+          pattern: wheels-*
+          merge-multiple: true
 
       - name: Prepare Release Assets and Repository Bundle
         shell: bash
@@ -412,8 +465,16 @@ jobs:
           # Archive repository bundle for custom_extension_repository distribution
           (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0)
 
+          cp all-wheels/*.whl release-assets/
+          (cd release-assets && sha256sum * > SHA256SUMS)
+
           echo "Staged release assets:"
           ls -la release-assets/
+
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release-assets/*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

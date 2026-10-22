@@ -243,11 +243,11 @@ Open a GitHub Issue describing:
    ```
 4. Ensure no compiler warnings or clippy lints:
    ```bash
-   cargo clippy --workspace --all-targets
+   cargo clippy --workspace --all-targets --locked -- -D warnings
    ```
 5. Ensure documentation builds cleanly:
    ```bash
-   cargo doc --workspace --no-deps
+   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
    ```
 6. If modifying `pmtiles_viewer/`, run the browser debug suite:
    ```bash
@@ -262,6 +262,43 @@ Open a GitHub Issue describing:
 - Prefer zero-allocation patterns in hot paths (scan loop, hex formatting)
 - Document public APIs with `///` doc comments
 - Add `//!` module-level documentation when creating new modules
+
+### Dependency and package policy
+
+- Only `raster-h3-core` is intended to be packageable for crates.io. The facade, CLI,
+  and database/Python adapters are `publish = false`; distribute them through GitHub
+  release assets and Python wheels, not independent crates.io packages.
+- Package verification does **not** publish anything: run `cargo package --locked -p raster-h3-core`.
+  Publishing the core is a separate maintainer decision; no workflow publishes to crates.io or PyPI.
+- Workspace path dependencies also carry the workspace version. Run
+  `python3 scripts/check_versions.py` before a version bump PR.
+- Dependency policy is enforced by `deny.toml`. Do not blanket-ignore advisories or
+  enable `continue-on-error`; any temporary exception must identify the advisory,
+  explain its applicability/mitigation, and state the removal condition.
+- Parser/ownership changes should extend the generated tests or fuzz corpus and the
+  scoped Miri tests as appropriate; see [test coverage](docs/testing.md#fuzzing-and-unsafe-code-validation).
+- Keep throughput thresholds out of correctness tests. Use Criterion baselines on
+  comparable hardware rather than treating shared CI runner timing as a guarantee.
+
+### Release checklist
+
+1. Bump the workspace version, every internal path requirement, Python wheel metadata,
+   PostgreSQL control/magic/install SQL, and community-extension manifest together.
+   DuckDB's C-API `raster_h3_version()` is separate and must not be synchronized blindly.
+2. Update the changelog and run `python3 scripts/check_versions.py`, package verification,
+   formatting, strict Clippy/rustdoc, and tests (including the PostgreSQL feature).
+3. Merge the reviewed release PR, then tag that commit `v<workspace version>`.
+   Tag CI must pass lint, MSRV, platform builds/tests, community-extension validation,
+   adapter tests, cargo-deny, package/version checks, wheel build/smoke tests, and safety checks
+   before the GitHub release is created. Do not bypass these gates to ship a failing release.
+4. The release includes validated wheels, extension bundles, CLI binaries, `SHA256SUMS`,
+   and GitHub artifact attestations. After downloading assets, verify:
+   ```bash
+   sha256sum --check SHA256SUMS
+   gh attestation verify <downloaded-asset> --repo dmuldrew/raster_h3
+   ```
+   Checksums detect corruption; attestations establish the publishing workflow's identity,
+   not a guarantee of correctness. PyPI/crates.io publication remains a separate decision.
 
 ## Architecture Notes
 

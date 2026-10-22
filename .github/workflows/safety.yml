@@ -1,0 +1,65 @@
+name: Parser & Unsafe-Code Checks
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wkb, geotiff, predictor]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fuzz-${{ matrix.target }}
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command-arguments: --config deny.toml
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      - run: cargo run --locked --manifest-path fuzz/Cargo.toml --example seed_corpus
+      - name: Fuzz with AddressSanitizer
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '300' || '20' }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time="$FUZZ_SECONDS" -max_len=65536 -rss_limit_mb=2048 -timeout=10
+      - name: Preserve crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  miri:
+    name: Miri (Arrow ownership)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: miri
+      - run: cargo miri setup
+      - run: cargo miri test --locked -p raster-h3-core --lib columnar::arrow_c::tests

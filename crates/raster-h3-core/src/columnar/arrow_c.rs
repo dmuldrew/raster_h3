@@ -1019,6 +1019,44 @@ mod tests {
     }
 
     #[test]
+    fn release_callbacks_are_null_safe_and_idempotent() {
+        let (schema, batch) = sliceable_batch();
+        let mut raw_schema = ArrowSchema::from_column_schema(&schema);
+        let mut array = ArrowArray::from_record_batch(batch.clone());
+        let mut stream = ArrowArrayStream::from_iterator(schema, vec![Ok(batch)].into_iter());
+        // SAFETY: null is supported; each non-null argument is owned and produced
+        // by the matching constructor, and remains live until after both releases.
+        unsafe {
+            release_arrow_schema(ptr::null_mut());
+            release_arrow_array(ptr::null_mut());
+            release_arrow_stream(ptr::null_mut());
+            for _ in 0..2 {
+                release_arrow_schema(&mut raw_schema);
+                release_arrow_array(&mut array);
+                release_arrow_stream(&mut stream);
+            }
+        }
+        assert!(raw_schema.release.is_none() && raw_schema.private_data.is_null());
+        assert!(array.release.is_none() && array.private_data.is_null());
+        assert!(stream.release.is_none() && stream.private_data.is_null());
+    }
+
+    #[test]
+    fn owned_exports_can_be_released_on_another_thread() {
+        let (schema, batch) = sliceable_batch();
+        let raw_schema = ArrowSchema::from_column_schema(&schema);
+        let array = ArrowArray::from_record_batch(batch.clone());
+        let stream = ArrowArrayStream::from_iterator(schema, vec![Ok(batch)].into_iter());
+        std::thread::spawn(move || {
+            drop(raw_schema);
+            drop(array);
+            drop(stream);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn test_import_respects_parent_and_child_offsets() {
         let (schema, batch) = sliceable_batch();
         let expected = RecordBatch::try_new(

@@ -5,7 +5,7 @@
 //!
 //! Fully commutative and associative across multi-core Rayon threads and multi-tile chunks.
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 /// Bounded relative error alpha (1% relative error guarantee)
 pub const QUANTILE_ALPHA: f64 = 0.01;

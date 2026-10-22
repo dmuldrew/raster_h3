@@ -1,5 +1,6 @@
 [package]
 name = "raster-h3-pg"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,7 +24,7 @@ default = []
 pg-extension = []
 
 [dependencies]
-raster-h3-core = { path = "../raster-h3-core" }
+raster-h3-core = { version = "0.4.0", path = "../raster-h3-core" }
 h3o.workspace = true
 libc.workspace = true
 

@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible correctness, performance, or integration problem.
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities involving untrusted files or host-process safety, follow SECURITY.md instead of posting publicly."
+  - type: input
+    id: environment
+    attributes:
+      label: Version and environment
+      description: raster_h3 version, engine/version, OS, architecture, and Rust version if building from source.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: SQL, CLI command, or Python/Rust code; include a small public input or synthetic fixture when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: raster
+    attributes:
+      label: Raster details
+      description: Dimensions, CRS/EPSG, bands, sample type, compression, nodata, and local/remote source. Do not include credentials or signed private URLs.
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual results
+      description: Include complete error text and, for aggregation issues, the expected conservation/count behaviour.
+    validations:
+      required: true

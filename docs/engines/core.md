@@ -25,6 +25,10 @@ raster-h3-core = { path = "crates/raster-h3-core" }
 
 ## Pipeline
 
+The sample-unpacking boundary checks TIFF chunk dimensions, arithmetic overflow, source
+length and destination capacity. Invalid or truncated decoded chunks return `InvalidMetadata`
+before indexing/copying, including the floating-point predictor path.
+
 ```mermaid
 flowchart LR
     SRC["resolve_raster_sources(path | glob | list | VRT)"] --> MOSAIC["MosaicReader::open(paths, bbox, crs, overlap_rule)"]

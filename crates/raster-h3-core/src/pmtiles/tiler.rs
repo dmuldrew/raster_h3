@@ -3,9 +3,9 @@
 //! Orchestrates the streaming aggregation of GeoTIFF rasters across multiple H3 resolutions
 //! and packages the resulting vector hexagons directly into a single PMTiles v3 archive.
 
-use fxhash::FxBuildHasher;
 use h3o::{CellIndex, LatLng};
 use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
@@ -334,7 +334,7 @@ impl H3PmtilesTiler {
         let mut bounds_acc = Wgs84BoundsAccumulator::new();
 
         let mut res_stats: HashMap<u8, ResolutionAccumulatorStats, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let min_res_zooms = zooms_for_h3_res(min_res, min_res);
         let mut coarse_res_list: Vec<u8> = min_res_zooms
             .iter()
@@ -639,17 +639,17 @@ impl H3PmtilesTiler {
         let mut bounds_acc = Wgs84BoundsAccumulator::new();
 
         let mut res_cell_counts: HashMap<u8, usize, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let mut res_purity_sums: HashMap<u8, f64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let mut res_class_counts: HashMap<u8, HashMap<i64, u64, FxBuildHasher>, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let mut res_entropy_sums: HashMap<u8, f64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let mut res_distinct_sums: HashMap<u8, f64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let mut res_pixel_sums: HashMap<u8, f64, FxBuildHasher> =
-            HashMap::with_hasher(FxBuildHasher::default());
+            HashMap::with_hasher(FxBuildHasher);
         let min_res_zooms = zooms_for_h3_res(min_res, min_res);
         let mut coarse_res_list: Vec<u8> = min_res_zooms
             .iter()
@@ -780,7 +780,7 @@ impl H3PmtilesTiler {
 
                 let class_map = res_class_counts
                     .entry(hex.resolution)
-                    .or_insert_with(|| HashMap::with_hasher(FxBuildHasher::default()));
+                    .or_insert_with(|| HashMap::with_hasher(FxBuildHasher));
                 hex.accumulator.for_each_class(|cls, cnt| {
                     *class_map.entry(cls).or_insert(0) += cnt as u64;
                 });
