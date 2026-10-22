@@ -73,6 +73,7 @@ uncertified bounds:
 | CRS | Bounds | Pruning |
 | :--- | :--- | :--- |
 | EPSG:4326, Web Mercator, Albers fast path | Analytic | Yes |
+| EPSG:3413 / EPSG:3031 (built-in definitions) | Analytic radial/angular enclosure | Yes |
 | Transverse Mercator: `utm`, `etmerc`, exact `tmerc` on a named ellipsoid | Certified (see below) | Yes, within 2,500 km of the central meridian (divided by `k0`) |
 | Other `proj4rs` projections, spherical/approximate `tmerc`, custom ellipsoid sizes, `+towgs84` beyond the limits below | Sampled estimate | No: every tile and chunk is read and checked exactly |
 
@@ -88,6 +89,26 @@ quoted values, non-lowercase keys, or whitespace around `=`; projection still
 uses proj4rs normally. Scale follows the backend's effective parameters:
 proj4rs 0.1.10 uses `+k0` before `+k` and ignores `+k_0`. This rule also applies
 when several scale aliases occur together. UTM retains its fixed scale.
+
+For the built-in WGS84 north/south polar stereographic definitions
+(EPSG:3413 and EPSG:3031), the inverse latitude is monotonic in distance
+from the projected origin, and longitude is the angle around that origin.
+We enclose the affine pixel rectangle in a source-axis rectangle, then
+project its four corners and its closest point to the origin. These five
+points include both radial extrema and the angular extrema. Rectangles
+containing the origin, or whose longitude bounds cross the antimeridian,
+get full longitude. A 1e-7 degree margin exceeds the inverse iteration's
+1e-10 radian stopping tolerance. See the [PROJ polar stereographic definition](https://proj.org/en/stable/operations/projections/stere.html)
+and proj4rs 0.1.10's `stere::Projection::e_inverse` for the radial/atan2 form.
+Rotated and sheared grids may get wider bounds because of the source-axis
+enclosure; pruning still never relies on sampled interior extrema.
+
+Only the built-in EPSG constructors enable this polar certificate. Custom
+stereographic strings, shifted datums, LCC and LAEA remain uncertified.
+Uncertified bbox tests now return immediately instead of computing an
+estimate they would discard. This saves planning work, but does not
+restore tile/chunk pruning or bypass ownership checks for those CRSs.
+See [pruning benchmarks](pruning-performance.md) for measured scope and limits.
 
 If any probe of a rectangle fails to project (part of it lies outside the
 projection's domain), its bounds are the whole globe. GeoTIFFs whose affine

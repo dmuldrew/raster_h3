@@ -282,9 +282,31 @@ fn chunk_ending_at_or_just_below_the_antimeridian_keeps_its_interior() {
 
 #[test]
 fn uncertified_projections_fail_open_for_rejection() {
-    let polar = CrsTransformer::from_epsg_code(3413).unwrap();
-    assert!(!polar.bounds_certified());
-    assert_eq!(polar.rejection_bounds([10.0, 70.0, 20.0, 80.0]), GLOBE);
+    let lcc = CrsTransformer::from_epsg_code(2154).unwrap();
+    assert!(!lcc.bounds_certified());
+    assert_eq!(lcc.rejection_bounds([10.0, 70.0, 20.0, 80.0]), GLOBE);
+
+    // Failing open keeps every bbox the globe can meet, but still rejects
+    // one lying entirely off it.
+    let gt = north_up(700_000.0, 6_600_000.0, 1000.0);
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 10,
+        height: 10,
+    };
+    assert!(chunk_intersects_bbox(
+        &chunk,
+        &gt,
+        &lcc,
+        &[100.0, -50.0, 101.0, -49.0]
+    ));
+    assert!(!chunk_intersects_bbox(
+        &chunk,
+        &gt,
+        &lcc,
+        &[185.0, 10.0, 190.0, 20.0]
+    ));
 }
 
 #[test]
@@ -436,5 +458,131 @@ fn ambiguous_tm_parameters_cannot_certify_rejection_bounds() {
             &tf,
             &[-180.0, 89.995, 180.0, 90.0]
         ));
+    }
+}
+
+fn polar_definition(epsg: u32) -> &'static str {
+    if epsg == 3413 {
+        "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    } else {
+        "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    }
+}
+
+#[test]
+fn polar_bounds_enclose_rotated_sheared_and_pole_crossing_rectangles() {
+    for epsg in [3413, 3031] {
+        let tf = CrsTransformer::from_epsg_code(epsg).unwrap();
+        assert!(tf.bounds_certified());
+        let generic = CrsTransformer::from_proj_string(polar_definition(epsg)).unwrap();
+        assert!(!generic.bounds_certified());
+        for (x, y, size) in [
+            (1e6, -2e6, 1000.),
+            (-2e6, -1e6, 1000.),
+            (-2e6, 1e6, 1000.),
+            (1e6, 2e6, 1000.),
+            (-1000., 1000., 100.),
+            (-100_000., 2_000_000., 2000.),
+            (-100_000., -2_000_000., 5000.),
+            (-1_020_000., 1_020_000., 2000.),
+            (1e8, -1e8, 1e5),
+        ] {
+            for angle in [0.0f64, 17., 73., 135.] {
+                let (sin, cos) = angle.to_radians().sin_cos();
+                let gt = GeoTransform {
+                    c0: x,
+                    f0: y,
+                    a: size * cos,
+                    b: size * (sin + 0.3),
+                    d: size * sin,
+                    e: -size * cos,
+                };
+                let b = tf.transform_rect_bounds(&gt, 0., 0., 40., 60.);
+                assert_eq!(tf.rejection_bounds(b), b);
+                assert_encloses(&generic, &gt, 40., 60., b);
+            }
+        }
+        let pole = north_up(-1000., 1000., 100.);
+        let b = tf.transform_rect_bounds(&pole, 0., 0., 40., 60.);
+        assert_eq!((b[0], b[2]), (-180., 180.));
+        assert_eq!(
+            if epsg == 3413 { b[3] } else { b[1] },
+            if epsg == 3413 { 90. } else { -90. }
+        );
+        let invalid = GeoTransform {
+            c0: f64::NAN,
+            ..pole
+        };
+        assert_eq!(tf.transform_rect_bounds(&invalid, 0., 0., 40., 60.), GLOBE);
+    }
+}
+
+#[test]
+fn polar_pruning_preserves_full_and_bbox_mosaic_aggregation() {
+    use crate::helpers::TestGeoTiffBuilder;
+    use raster_h3_core::aggregator::multi_horizon::{
+        MultiResolutionConfig, MultiScanHorizonStreamer,
+    };
+    use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
+    use std::{collections::BTreeMap, sync::Arc};
+    for epsg in [3413, 3031] {
+        let y = if epsg == 3413 { -2e6 } else { 2e6 };
+        for spacing in [250_000., 1600.] {
+            // disjoint and 50% overlap
+            let files: Vec<_> = (0..4)
+                .map(|i| {
+                    TestGeoTiffBuilder::new(32, 32)
+                        .epsg(epsg)
+                        .origin(1e6 + i as f64 * spacing, y)
+                        .pixel_size(100.)
+                        .create_constant_tempfile((i + 1) as f32)
+                })
+                .collect();
+            let paths: Vec<_> = files.iter().map(|(_, p)| p.clone()).collect();
+            let tf = CrsTransformer::from_epsg_code(epsg as u32).unwrap();
+            let (lon, lat) = tf.transform_point(1e6 + 1600., y - 1600.).unwrap();
+            for bbox in [None, Some([lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01])] {
+                for rule in [
+                    OverlapRule::First,
+                    OverlapRule::Cutline,
+                    OverlapRule::Average,
+                ] {
+                    let mut outputs = Vec::new();
+                    for custom in [None, Some(polar_definition(epsg as u32))] {
+                        let mosaic = MosaicReader::open(&paths, bbox, custom, rule).unwrap();
+                        if custom.is_none() && spacing > 100_000. {
+                            assert!(mosaic.chunk_refs.iter().all(|c| !c.has_overlap));
+                            if bbox.is_some() {
+                                assert_eq!(mosaic.tiles.len(), 1);
+                            }
+                        }
+                        let mut config = MultiResolutionConfig::single(7);
+                        config.bbox = bbox;
+                        config.aggregation_workers = Some(1);
+                        let mut stream =
+                            MultiScanHorizonStreamer::new_mosaic(Arc::new(mosaic), &config)
+                                .unwrap();
+                        let mut cells = BTreeMap::new();
+                        loop {
+                            let batch = stream.fetch_next_batch(4096).unwrap();
+                            if batch.is_empty() {
+                                break;
+                            }
+                            for record in batch {
+                                let stats = cells.entry(record.h3_index).or_insert((0., 0.));
+                                stats.0 += record.accumulator.count;
+                                stats.1 += record.accumulator.sum;
+                            }
+                        }
+                        assert!(!cells.is_empty());
+                        outputs.push(cells);
+                    }
+                    assert_eq!(
+                        outputs[0], outputs[1],
+                        "EPSG:{epsg}, spacing={spacing}, bbox={bbox:?}, rule={rule:?}"
+                    );
+                }
+            }
+        }
     }
 }

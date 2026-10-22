@@ -126,5 +126,71 @@ fn h3_map(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, streaming, hash_sensitive, h3_map);
+criterion_group!(benches, streaming, hash_sensitive, h3_map, pruning);
 criterion_main!(benches);
+
+/// Local uncompressed synthetic tiles. Includes open/planning/decode/aggregation;
+/// fixtures are created outside timing. One worker makes comparisons repeatable.
+fn pruning(c: &mut Criterion) {
+    use raster_h3_core::crs::transformer::CrsTransformer;
+    use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
+    use std::sync::Arc;
+    let mut group = c.benchmark_group("pruning");
+    for (epsg, x, y) in [
+        (3413, 1_000_000.0, -2_000_000.0),
+        (3031, 1_000_000.0, 2_000_000.0),
+        (2154, 700_000.0, 6_600_000.0),
+        (3035, 4_000_000.0, 3_000_000.0),
+    ] {
+        let fixtures: Vec<_> = (0..16)
+            .map(|i| {
+                helpers::TestGeoTiffBuilder::new(128, 128)
+                    .epsg(epsg)
+                    .origin(
+                        x + (i % 4) as f64 * 250_000.0,
+                        y + (i / 4) as f64 * 250_000.0,
+                    )
+                    .pixel_size(100.0)
+                    .create_constant_tempfile(1.0f32)
+            })
+            .collect();
+        let paths: Vec<_> = fixtures.iter().map(|(_, p)| p.clone()).collect();
+        let tf = CrsTransformer::from_epsg_code(epsg as u32).unwrap();
+        let (lon, lat) = tf.transform_point(x + 6400.0, y - 6400.0).unwrap();
+        for (name, rule, bbox) in [
+            (
+                "small_bbox",
+                OverlapRule::First,
+                Some([lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01]),
+            ),
+            ("disjoint_first", OverlapRule::First, None),
+            ("disjoint_average", OverlapRule::Average, None),
+        ] {
+            let mut config = MultiResolutionConfig::single(7);
+            config.aggregation_workers = Some(1);
+            config.decode_workers = 1;
+            config.bbox = bbox;
+            let plan = MosaicReader::open(&paths, bbox, None, rule).unwrap();
+            eprintln!(
+                "pruning/{name}/{epsg}: tiles={} chunks={} overlaps={}",
+                plan.tiles.len(),
+                plan.chunk_refs.len(),
+                plan.chunk_refs.iter().filter(|c| c.has_overlap).count()
+            );
+            group.bench_function(BenchmarkId::new(name, epsg), |b| {
+                b.iter(|| {
+                    let mosaic = Arc::new(MosaicReader::open(&paths, bbox, None, rule).unwrap());
+                    let mut stream = MultiScanHorizonStreamer::new_mosaic(mosaic, &config).unwrap();
+                    loop {
+                        let batch = stream.fetch_next_batch(4096).unwrap();
+                        if batch.is_empty() {
+                            break;
+                        }
+                        black_box(batch);
+                    }
+                })
+            });
+        }
+    }
+    group.finish();
+}

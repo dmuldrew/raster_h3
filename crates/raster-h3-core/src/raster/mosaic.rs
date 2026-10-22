@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::aggregator::horizon_streamer::chunk_intersects_bbox;
+use crate::aggregator::horizon_streamer::bounds_intersect_bbox;
 use crate::aggregator::multi_horizon::coordinates::{is_point_in_bbox, rect_intersects_bbox};
 use crate::crs::transformer::CrsTransformer;
 use crate::error::{RasterH3Error, Result};
@@ -418,12 +418,6 @@ impl MosaicReader {
                 tile.reader.metadata.height,
             );
 
-            if let Some(ref b) = bbox {
-                if !chunk_intersects_bbox(&chunk_bounds, gt, crs_trans, b) {
-                    continue;
-                }
-            }
-
             let bounds = crs_trans.transform_rect_bounds(
                 gt,
                 chunk_bounds.col_offset as f64,
@@ -431,6 +425,12 @@ impl MosaicReader {
                 chunk_bounds.width as f64,
                 chunk_bounds.height as f64,
             );
+
+            if let Some(ref b) = bbox {
+                if !bounds_intersect_bbox(crs_trans, bounds, b) {
+                    continue;
+                }
+            }
 
             chunk_refs.push(MosaicChunkRef {
                 tile_idx: 0,
@@ -505,6 +505,10 @@ impl MosaicReader {
         }
 
         // Build globally latitude-sorted chunk list across all tiles
+        let tile_rejection_bounds: Vec<[f64; 4]> = tiles
+            .iter()
+            .map(|t| t.crs_transformer.rejection_bounds(t.bounds_wgs84))
+            .collect();
         let mut chunk_refs = Vec::new();
         for (tile_idx, tile) in tiles.iter().enumerate() {
             let total_chunks = tile.reader.chunk_layout.total_chunks;
@@ -518,12 +522,6 @@ impl MosaicReader {
                     tile.reader.metadata.height,
                 );
 
-                if let Some(ref b) = bbox {
-                    if !chunk_intersects_bbox(&chunk_bounds, gt, crs_trans, b) {
-                        continue;
-                    }
-                }
-
                 let bounds = crs_trans.transform_rect_bounds(
                     gt,
                     chunk_bounds.col_offset as f64,
@@ -531,20 +529,24 @@ impl MosaicReader {
                     chunk_bounds.width as f64,
                     chunk_bounds.height as f64,
                 );
+
+                if let Some(ref b) = bbox {
+                    if !bounds_intersect_bbox(crs_trans, bounds, b) {
+                        continue;
+                    }
+                }
+
                 let c_min_lat = bounds[1];
                 let c_max_lat = bounds[3];
 
                 let mut has_overlap = false;
                 if tiles.len() > 1 && overlap_rule != OverlapRule::Average {
                     let cb = crs_trans.rejection_bounds(bounds);
-                    for (other_idx, other_tile) in tiles.iter().enumerate() {
+                    for (other_idx, ob) in tile_rejection_bounds.iter().enumerate() {
                         if other_idx == tile_idx {
                             continue;
                         }
-                        let ob = other_tile
-                            .crs_transformer
-                            .rejection_bounds(other_tile.bounds_wgs84);
-                        if rect_intersects_bbox(&cb, &ob) {
+                        if rect_intersects_bbox(&cb, ob) {
                             has_overlap = true;
                             break;
                         }

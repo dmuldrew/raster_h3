@@ -368,7 +368,7 @@ let reader = ContinuousBatchReader::open(&paths, &MultiResolutionConfig::new(vec
 | 6 | **Branchless Hardware Min/Max** | Zero branch misprediction penalties (`minsd`/`maxsd`) |
 | 7 | **Zero-Copy `memmap2` & Async Prefetching** | Direct virtual memory mapping with background decompression |
 | 8 | **Zero-Allocation Hex Formatting** | Stack-based 16-byte LUT for H3 index formatting |
-| 9 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before decompression, for CRSs with certified, unambiguous parameters ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
+| 9 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before decompression, for CRSs with certified bounds, including EPSG:3413/3031 polar grids ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
 | 10 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
 | 11 | **Lock-Free Buffer Pool** | Zero-allocation buffer recycling via `crossbeam_deque::Injector` |
 | 12 | **Single-Hop In-Order Prefetcher** | Direct worker-to-ring-buffer queue, zero context switches |
