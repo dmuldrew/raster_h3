@@ -47,7 +47,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 flate2 = "1.0"
 libdeflater = "1.23"
-parquet = { version = "53", default-features = false, features = ["flate2", "snap", "zstd", "lz4", "brotli"] }
+parquet = { version = "60", default-features = false, features = ["flate2", "snap", "zstd", "lz4", "brotli"] }
 tempfile = "3.10"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"
