@@ -815,6 +815,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         self.spill_runs.iter().map(|r| r.runs_written).sum()
     }
 
+    /// [`Self::spill_run_count`] for each configured resolution, in order.
+    pub fn spill_run_counts(&self) -> Vec<u64> {
+        self.spill_runs.iter().map(|r| r.runs_written).collect()
+    }
+
     /// Peak estimate of active table/heap allocation, including pending
     /// compaction groups; excludes decoded chunks and output memory.
     pub fn peak_active_bytes(&self) -> usize {

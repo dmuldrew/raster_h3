@@ -4,8 +4,10 @@
 //! rectangles, scale-independent affine inversion, and rejection of invalid
 //! affines when a GeoTIFF is opened.
 
+use proptest::prelude::*;
 use raster_h3_core::aggregator::chunk_intersects_bbox;
-use raster_h3_core::crs::transformer::CrsTransformer;
+use raster_h3_core::aggregator::multi_horizon::coordinates::eviction_north_bound;
+use raster_h3_core::crs::transformer::{wrap_lon, CrsTransformer};
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 use raster_h3_core::raster::{GeoTransform, RasterChunk};
 use std::fs::File;
@@ -95,6 +97,187 @@ fn helmert_shifted_national_grid_is_certified_but_huge_shifts_are_not() {
             .unwrap();
     assert!(!huge.bounds_certified());
     assert_eq!(huge.rejection_bounds([10.0, 40.0, 11.0, 41.0]), GLOBE);
+}
+
+#[test]
+fn transverse_mercator_scale_and_datum_edge_cases_still_enclose() {
+    // Extreme scale factors stay certified; duplicated parameters and a datum
+    // shift too large for the Helmert bound fall back to whole-globe
+    // rejection bounds.
+    let cases = [
+        ("+proj=tmerc +ellps=WGS84 +k_0=100", true),
+        ("+proj=tmerc +ellps=WGS84 +k0=0.01", true),
+        ("+proj=tmerc +ellps=WGS84 +k=1 +k=100", false),
+        ("+proj=tmerc +ellps=WGS84 +towgs84=-6000000,0,0", false),
+    ];
+    for (crs, certified) in cases {
+        let tf = CrsTransformer::from_proj_string(crs).unwrap();
+        assert_eq!(tf.bounds_certified(), certified, "{crs}");
+        let (gt, w, h) = if crs.contains("towgs84") {
+            (north_up(-20_000.0, 2_250_000.0, 1000.0), 40.0, 100.0)
+        } else {
+            (north_up(-20_000.0, 10_020_000.0, 1000.0), 40.0, 60.0)
+        };
+        let b = tf.rejection_bounds(tf.transform_rect_bounds(&gt, 0.0, 0.0, w, h));
+        if !certified {
+            assert_eq!(b, GLOBE, "{crs}");
+        }
+        assert_encloses(&tf, &gt, w, h, b);
+    }
+}
+
+/// A certified CRS for the generated enclosure property, with the region
+/// chunk centres are drawn from.
+struct CertifiedCase {
+    name: &'static str,
+    tf: CrsTransformer,
+    /// Source units per metre.
+    per_m: f64,
+    lon_0: f64,
+    /// Half-width of the longitude band around `lon_0`.
+    lon_span: f64,
+    lat_range: (f64, f64),
+}
+
+fn certified_cases() -> Vec<CertifiedCase> {
+    let case = |name, tf, per_m, lon_0, lon_span, lat_range| CertifiedCase {
+        name,
+        tf,
+        per_m,
+        lon_0,
+        lon_span,
+        lat_range,
+    };
+    let epsg = |code| CrsTransformer::from_epsg_code(code).unwrap();
+    let proj = |s: &str| CrsTransformer::from_proj_string(s).unwrap();
+    let australia = "+proj=aea +lat_1=-18 +lat_2=-36 +lat_0=0 +lon_0=132 +x_0=0 +y_0=0 \
+                     +ellps=GRS80 +units=m +no_defs";
+    let florida_east = "+proj=tmerc +lat_0=24.3333333333333 +lon_0=-81 +k=0.999941177 \
+                        +x_0=200000.0001016 +y_0=0 +ellps=GRS80 +units=us-ft +no_defs";
+    vec![
+        case(
+            "EPSG:4326",
+            epsg(4326),
+            1.0 / 111_000.0,
+            0.0,
+            180.0,
+            (-89.0, 89.0),
+        ),
+        case("EPSG:3857", epsg(3857), 1.0, 0.0, 180.0, (-84.0, 84.0)),
+        case("EPSG:5070", epsg(5070), 1.0, -96.0, 179.0, (-80.0, 89.0)),
+        // Alaska Albers: the Aleutians cross the antimeridian.
+        case("EPSG:3338", epsg(3338), 1.0, -154.0, 179.0, (-80.0, 89.0)),
+        // Southern cone (n < 0): the apex is the South Pole.
+        case(
+            "EPSG:3577",
+            proj(australia),
+            1.0,
+            132.0,
+            179.0,
+            (-89.0, 80.0),
+        ),
+        // US survey feet; chunks leaving the certified band fail open.
+        case(
+            "EPSG:2236",
+            proj(florida_east),
+            1.0 / 0.3048006096012192,
+            -81.0,
+            12.0,
+            (-80.0, 80.0),
+        ),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// For every certified CRS, rotated and sheared chunks of any size and
+    /// position (including ones around a cone apex, across the antimeridian
+    /// or past the cut opposite the central meridian) have rect bounds that
+    /// contain every sample the per-pixel path computes, and an eviction
+    /// bound above every sample's latitude.
+    #[test]
+    fn certified_rect_bounds_enclose_rotated_and_sheared_chunks(
+        case in 0usize..6,
+        dlon in -1.0f64..1.0, lat_t in 0.0f64..1.0,
+        size_m in 10.0f64..200_000.0, aspect in 0.25f64..4.0,
+        angle in 0.0f64..std::f64::consts::TAU, shear in -0.5f64..0.5,
+        flip in any::<bool>(), w in 1u32..64, h in 1u32..64,
+    ) {
+        let cases = certified_cases();
+        let CertifiedCase { name, tf, per_m, lon_0, lon_span, lat_range: (lat_lo, lat_hi) } =
+            &cases[case];
+        prop_assert!(tf.bounds_certified());
+        let (cx, cy) = tf
+            .wgs84_to_source(lon_0 + dlon * lon_span, lat_lo + lat_t * (lat_hi - lat_lo))
+            .unwrap();
+        let (sx, sy) = (size_m * per_m, size_m * per_m * aspect);
+        let (sin, cos) = angle.sin_cos();
+        let ey = if flip { sy } else { -sy };
+        // Columns step along (cos, sin), rows along a sheared perpendicular.
+        let (a, d) = (sx * cos, sx * sin);
+        let (b, e) = (-ey * sin + shear * sx * cos, ey * cos + shear * sx * sin);
+        let (wf, hf) = (f64::from(w), f64::from(h));
+        let gt = GeoTransform {
+            c0: cx - (a * wf + b * hf) / 2.0,
+            a,
+            b,
+            f0: cy - (d * wf + e * hf) / 2.0,
+            d,
+            e,
+        };
+        prop_assume!(gt.is_valid());
+        let bounds = tf.rejection_bounds(tf.transform_rect_bounds(&gt, 0.0, 0.0, wf, hf));
+        let chunk = RasterChunk { col_offset: 0, row_offset: 0, width: w, height: h };
+        let north = eviction_north_bound(&chunk, &gt, tf);
+        const N: u32 = 48;
+        for j in 0..=N {
+            for i in 0..=N {
+                let (x, y) = gt.pixel_to_coord(wf * f64::from(i) / f64::from(N), hf * f64::from(j) / f64::from(N));
+                let Ok((lon, lat)) = tf.transform_point(x, y) else { continue };
+                if !(lon.is_finite() && lat.is_finite()) {
+                    continue;
+                }
+                // Wrapped as the per-sample bbox test wraps it.
+                let lon = wrap_lon(lon);
+                prop_assert!(bounds[1] <= lat && lat <= bounds[3],
+                    "{name}: lat {lat} outside {bounds:?} at pixel ({i},{j})/{N}, gt {gt:?}");
+                prop_assert!((bounds[0] <= lon && lon <= bounds[2]) || (lon == -180.0 && bounds[2] == 180.0),
+                    "{name}: lon {lon} outside {bounds:?} at pixel ({i},{j})/{N}, gt {gt:?}");
+                prop_assert!(lat <= north, "{name}: lat {lat} above eviction bound {north}, gt {gt:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn chunk_ending_at_or_just_below_the_antimeridian_keeps_its_interior() {
+    // One ulp below 180 wraps to -180; the wrapped corners must not reverse
+    // the bounds and reject a bbox over the chunk's interior samples.
+    let tf = CrsTransformer::Wgs84Identity;
+    let chunk = RasterChunk {
+        col_offset: 0,
+        row_offset: 0,
+        width: 1,
+        height: 1,
+    };
+    let interior = [179.4, 10.0, 179.6, 11.0];
+    for east in [180.0, 180.0_f64.next_down()] {
+        let gt = GeoTransform {
+            a: east - 179.0,
+            ..north_up(179.0, 11.0, 1.0)
+        };
+        assert_eq!(gt.pixel_to_coord(1.0, 0.0).0, east);
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 1.0, 1.0);
+        assert!(b[0] <= b[2], "east edge {east}: reversed bounds {b:?}");
+        assert!(
+            chunk_intersects_bbox(&chunk, &gt, &tf, &interior),
+            "east edge {east}: chunk rejected by {interior:?}"
+        );
+    }
+    // Pixel interiors never reach an edge at exactly 180, so it stays tight.
+    let gt = north_up(179.0, 11.0, 1.0);
+    assert_eq!(tf.transform_rect_bounds(&gt, 0.0, 0.0, 1.0, 1.0)[2], 180.0);
 }
 
 #[test]
