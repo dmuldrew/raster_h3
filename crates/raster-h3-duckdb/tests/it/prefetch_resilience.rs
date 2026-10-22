@@ -297,19 +297,15 @@ fn test_prefetched_chunk_reader_corrupt_chunk_unblocks_without_hanging() {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom};
     use tempfile::NamedTempFile;
-    use tiff::encoder::{colortype, compression::Deflate, TiffEncoder};
+    use tiff::encoder::{colortype, TiffEncoder};
     use tiff::tags::Tag;
 
     let file = NamedTempFile::new().unwrap();
     {
-        let mut encoder = TiffEncoder::new(File::create(file.path()).unwrap()).unwrap();
-        let mut image = encoder
-            .new_image_with_compression::<colortype::Gray32Float, Deflate>(
-                32,
-                32,
-                Deflate::default(),
-            )
-            .unwrap();
+        let mut encoder = TiffEncoder::new(File::create(file.path()).unwrap())
+            .unwrap()
+            .with_compression(tiff::encoder::Compression::Deflate(Default::default()));
+        let mut image = encoder.new_image::<colortype::Gray32Float>(32, 32).unwrap();
         image.rows_per_strip(8).unwrap();
         image
             .encoder()

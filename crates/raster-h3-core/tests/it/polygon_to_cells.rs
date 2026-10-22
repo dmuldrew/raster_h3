@@ -1,7 +1,5 @@
 use geo_types::{Coord, LineString, MultiPolygon, Polygon};
-use h3o::geom::{
-    ContainmentMode, MultiPolygon as H3MultiPolygon, PolyfillConfig, Polygon as H3Polygon, ToCells,
-};
+use h3o::geom::{ContainmentMode, TilerBuilder};
 use h3o::Resolution;
 use raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb;
 
@@ -27,19 +25,14 @@ impl TestGeometry {
     }
 
     fn reference_cells(&self, resolution: Resolution, containment: ContainmentMode) -> Vec<u64> {
-        let config = PolyfillConfig::new(resolution).containment_mode(containment);
-        let cells = match self {
-            Self::Polygon(polygon) => H3Polygon::from_degrees(polygon.clone())
-                .unwrap()
-                .to_cells(config)
-                .map(u64::from)
-                .collect(),
-            Self::MultiPolygon(multipolygon) => H3MultiPolygon::from_degrees(multipolygon.clone())
-                .unwrap()
-                .to_cells(config)
-                .map(u64::from)
-                .collect(),
-        };
+        let mut tiler = TilerBuilder::new(resolution)
+            .containment_mode(containment)
+            .build();
+        match self {
+            Self::Polygon(polygon) => tiler.add(polygon.clone()).unwrap(),
+            Self::MultiPolygon(multipolygon) => tiler.add_batch(multipolygon.clone()).unwrap(),
+        }
+        let cells = tiler.into_coverage().map(u64::from).collect();
         sorted_unique(cells)
     }
 }

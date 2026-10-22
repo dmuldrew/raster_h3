@@ -29,6 +29,8 @@ impl<'a> From<&'a DecodingResult> for BorrowedSamples<'a> {
             DecodingResult::I64(v) => Self::I64(v),
             DecodingResult::F32(v) => Self::F32(v),
             DecodingResult::F64(v) => Self::F64(v),
+            // `ChunkDecoder` widens tiff's F16 output to F32 before it reaches a kernel.
+            DecodingResult::F16(_) => unreachable!("F16 chunks are widened to F32 at decode time"),
         }
     }
 }

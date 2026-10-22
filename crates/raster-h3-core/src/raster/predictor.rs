@@ -3,7 +3,6 @@
 //! Centralizes TIFF Predictor 2 (Horizontal Differencing), Predictor 3 (Floating Point Differencing),
 //! and sample unpacking across integer and floating-point types.
 
-use tiff::decoder::{fp_predict_f32, fp_predict_f64};
 use tiff::tags::{PhotometricInterpretation, Predictor};
 
 use crate::error::{RasterH3Error, Result};
@@ -536,6 +535,36 @@ pub(crate) unsafe fn fp_predict_f64_neon_spp1(input: &mut [u8], output: &mut [f6
             input[plane_stride * 6 + i],
             input[plane_stride * 7 + i],
         ]));
+    }
+}
+
+/// Scalar TIFF Predictor 3 for 32-bit floats: undo byte-wise horizontal differencing, then
+/// reassemble each float from its four big-endian byte planes.
+///
+/// Vendored from `tiff` 0.9, which stopped exporting it in 0.11.
+pub(crate) fn fp_predict_f32(input: &mut [u8], output: &mut [f32], spp: usize) {
+    for i in spp..input.len() {
+        input[i] = input[i].wrapping_add(input[i - spp]);
+    }
+    let plane = input.len() / 4;
+    for (i, out) in output.iter_mut().enumerate() {
+        *out = f32::from_be_bytes([
+            input[i],
+            input[plane + i],
+            input[plane * 2 + i],
+            input[plane * 3 + i],
+        ]);
+    }
+}
+
+/// Scalar TIFF Predictor 3 for 64-bit floats; see [`fp_predict_f32`].
+pub(crate) fn fp_predict_f64(input: &mut [u8], output: &mut [f64], spp: usize) {
+    for i in spp..input.len() {
+        input[i] = input[i].wrapping_add(input[i - spp]);
+    }
+    let plane = input.len() / 8;
+    for (i, out) in output.iter_mut().enumerate() {
+        *out = f64::from_be_bytes(std::array::from_fn(|b| input[plane * b + i]));
     }
 }
 

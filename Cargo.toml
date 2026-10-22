@@ -17,8 +17,8 @@ authors = ["raster_h3 contributors"]
 license = "MIT"
 repository = "https://github.com/dmuldrew/raster_h3"
 homepage = "https://github.com/dmuldrew/raster_h3"
-# Floor set by dependencies (url -> idna -> icu_* 2.x); checked by the `msrv` CI job.
-rust-version = "1.88"
+# Floor set by dependencies (h3o 0.11 const float math); checked by the `msrv` CI job.
+rust-version = "1.94"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
@@ -36,9 +36,9 @@ undocumented_unsafe_blocks = "warn"
 broken_intra_doc_links = "warn"
 
 [workspace.dependencies]
-h3o = "0.6"
+h3o = "0.11"
 rayon = "1.10"
-tiff = "0.9"
+tiff = "0.11"
 proj4rs = { version = "0.1", features = ["esri"] }
 memmap2 = "0.9"
 fxhash = "0.2"
@@ -47,7 +47,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 flate2 = "1.0"
 libdeflater = "1.23"
-parquet = { version = "53", default-features = false, features = ["flate2", "snap", "zstd", "lz4", "brotli"] }
+parquet = { version = "60", default-features = false, features = ["flate2-rust_backend", "snap", "zstd", "lz4", "brotli"] }
 tempfile = "3.10"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"
