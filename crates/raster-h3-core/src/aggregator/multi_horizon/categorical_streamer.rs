@@ -185,6 +185,11 @@ impl MultiCategoricalHorizonStreamer {
         self.inner.spill_run_count()
     }
 
+    /// Spill runs for each configured resolution, in order.
+    pub fn spill_run_counts(&self) -> Vec<u64> {
+        self.inner.spill_run_counts()
+    }
+
     /// Peak active-map allocation estimate (not whole-process memory).
     pub fn peak_active_bytes(&self) -> usize {
         self.inner.peak_active_bytes()
