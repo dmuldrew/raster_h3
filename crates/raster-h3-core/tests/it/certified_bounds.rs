@@ -101,12 +101,13 @@ fn helmert_shifted_national_grid_is_certified_but_huge_shifts_are_not() {
 
 #[test]
 fn transverse_mercator_scale_and_datum_edge_cases_still_enclose() {
-    // Extreme or duplicated scale factors stay certified; a datum shift too
-    // large for the Helmert bound falls back to whole-globe rejection bounds.
+    // Extreme scale factors stay certified; duplicated parameters and a datum
+    // shift too large for the Helmert bound fall back to whole-globe
+    // rejection bounds.
     let cases = [
         ("+proj=tmerc +ellps=WGS84 +k_0=100", true),
         ("+proj=tmerc +ellps=WGS84 +k0=0.01", true),
-        ("+proj=tmerc +ellps=WGS84 +k=1 +k=100", true),
+        ("+proj=tmerc +ellps=WGS84 +k=1 +k=100", false),
         ("+proj=tmerc +ellps=WGS84 +towgs84=-6000000,0,0", false),
     ];
     for (crs, certified) in cases {
@@ -367,4 +368,73 @@ fn opening_a_geotiff_rejects_singular_or_non_finite_affines() {
     write_with_model_transformation(&path, m);
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     assert!(reader.metadata.geotransform.is_valid());
+}
+
+#[test]
+fn tm_certificate_matches_effective_scale_parameters() {
+    for (params, effective_scale) in [
+        ("+k_0=100", 1.0), // ignored by proj4rs, not a scale of 100
+        ("+k0=0.01", 0.01),
+        ("+k=0.01", 0.01),
+        ("+k=100 +k0=0.01 +k_0=200", 0.01),
+        ("+k0=0.01 +k=100", 0.01),
+    ] {
+        let tf = CrsTransformer::from_proj_string(&format!("+proj=tmerc +ellps=WGS84 {params}"))
+            .unwrap();
+        assert!(tf.bounds_certified(), "{params}");
+        // Pole lies between probes; incorrect scale padding misses its latitude.
+        let gt = north_up(
+            -20_000.0 * effective_scale,
+            10_021_000.0 * effective_scale,
+            1000.0 * effective_scale,
+        );
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 40.0, 60.0);
+        assert_eq!(b[3], 90.0, "{params}: {b:?}");
+        assert_encloses(&tf, &gt, 40.0, 60.0, b);
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 40,
+            height: 60,
+        };
+        assert!(chunk_intersects_bbox(
+            &chunk,
+            &gt,
+            &tf,
+            &[-180.0, 89.995, 180.0, 90.0]
+        ));
+    }
+}
+
+#[test]
+fn ambiguous_tm_parameters_cannot_certify_rejection_bounds() {
+    for params in [
+        "+towgs84=-6370000,0,0 +towgs84=0,0,0",
+        "+towgs84=0,0,0 +towgs84=-6370000,0,0",
+        "+k=1 +k=100",
+        "+k0=0.01 +k0=100",
+        "+x_0=1000000 +x_0=0",
+        "+K=100",
+        "+k=\"0.01\"",
+        "+k = 0.01",
+    ] {
+        let tf = CrsTransformer::from_proj_string(&format!("+proj=tmerc +ellps=WGS84 {params}"))
+            .unwrap();
+        assert!(!tf.bounds_certified(), "{params}");
+        let gt = north_up(-20_000.0, 10_021_000.0, 1000.0);
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 40.0, 60.0);
+        assert_eq!(tf.rejection_bounds(b), GLOBE, "{params}");
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 40,
+            height: 60,
+        };
+        assert!(chunk_intersects_bbox(
+            &chunk,
+            &gt,
+            &tf,
+            &[-180.0, 89.995, 180.0, 90.0]
+        ));
+    }
 }
