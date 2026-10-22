@@ -258,7 +258,7 @@ fn unusable_spill_directory_fails_streams_and_latches() {
 }
 
 #[test]
-fn spill_runs_never_appear_as_files_in_the_spill_directory() {
+fn spill_runs_leave_no_files_in_the_spill_directory() {
     let dir = tempfile::tempdir().unwrap();
     let (_file, path) = TestGeoTiffBuilder::new(300, 1200)
         .origin(-120.0, 45.0)
@@ -275,9 +275,12 @@ fn spill_runs_never_appear_as_files_in_the_spill_directory() {
         if batch.is_empty() {
             break;
         }
-        // Runs are unnamed files: nothing to leak if the process dies.
+        // Unix unlinks runs on creation, so nothing can leak even if the
+        // process dies; Windows deletes them when their handles close.
         if stream.spill_run_count() > 0 && !stream.is_finished() {
-            assert_eq!(entries(), 0);
+            if cfg!(unix) {
+                assert_eq!(entries(), 0);
+            }
             checked_mid_stream = true;
         }
     }
