@@ -59,6 +59,36 @@ inverse fails, or yields a non-finite or out-of-range latitude) is skipped,
 not aborted on and not counted. Successful transforms always return finite
 latitudes in [-90, 90].
 
+### Bounding boxes and pruning
+
+Tiles and chunks are pruned against a query `bbox`, and mosaic overlap is
+pre-filtered, using WGS84 bounds of each pixel rectangle
+(`CrsTransformer::transform_rect_bounds`). Data dropped by such a test never
+reaches the exact per-sample check, so the bounds used for rejection must
+enclose the rectangle's true image. `CrsTransformer::bounds_certified` reports
+whether they do, and callers prune only with
+`CrsTransformer::rejection_bounds`, which returns the whole globe for
+uncertified bounds:
+
+| CRS | Bounds | Pruning |
+| :--- | :--- | :--- |
+| EPSG:4326, Web Mercator, Albers fast path | Analytic | Yes |
+| Transverse Mercator: `utm`, `etmerc`, exact `tmerc` on a named ellipsoid | Certified (see below) | Yes, within 2,500 km of the central meridian (divided by `k0`) |
+| Other `proj4rs` projections, spherical/approximate `tmerc`, custom ellipsoid sizes, `+towgs84` beyond the limits below | Sampled estimate | No: every tile and chunk is read and checked exactly |
+
+Transverse Mercator bounds rest on the projection being conformal with point
+scale at least `k0`: a segment of length `L` maps to a ground path no longer
+than `L / k0`, so latitude and longitude change by at most that length over
+the radii of curvature (6.3e6 m is used, below every named ellipsoid). The
+rectangle is sampled on an 11×11 grid and widened by these amounts. For a
+512 px × 30 m chunk the widening is about 0.01–0.02°. Explicit `+towgs84`
+shifts are certified up to 1.5 km translation, 10″ rotation and 50 ppm scale,
+which covers every named datum.
+
+If any probe of a rectangle fails to project (part of it lies outside the
+projection's domain), its bounds are the whole globe. GeoTIFFs whose affine
+transform is non-finite or singular are rejected when opened.
+
 ## Datum Shifts
 
 Coordinates end up on WGS84 in one of three ways:

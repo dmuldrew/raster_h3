@@ -57,6 +57,13 @@ accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`
 `31466`–`31469`, `23028`–`23038`) and any PROJ string with `+towgs84`. Grid shifts
 (`+nadgrids`, `+datum=NAD27`) are rejected. See [Datum Shifts](../crs-and-projection.md#datum-shifts).
 
+Bounds from `CrsTransformer::transform_rect_bounds` are certified only when
+`bounds_certified()` is true: analytic for the fast paths, a Lipschitz enclosure
+for transverse Mercator, a sampled estimate otherwise. Code that rejects data
+from bounds (bbox pruning, overlap filtering) must pass them through
+`rejection_bounds()`, which returns the whole globe for uncertified bounds. See
+[Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
+
 ## Columnar Model
 
 | Type | Role |

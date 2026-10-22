@@ -71,6 +71,14 @@ pub fn extract_geotransform<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<
         }
     }
 
+    // A non-finite or singular affine would surface later as whole-globe
+    // bounds or an empty footprint; reject it here with a clear message.
+    if !gt.is_valid() {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "GeoTIFF georeferencing is not a finite, invertible affine transform: {gt:?}"
+        )));
+    }
+
     Ok(gt)
 }
 

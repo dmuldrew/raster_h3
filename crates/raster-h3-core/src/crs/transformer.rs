@@ -385,7 +385,143 @@ impl AlbersConicFast {
     }
 }
 
-/// Axis order and prime meridian of a geographic source CRS.
+/// Lower bound on the meridional radius of curvature (and hence on the
+/// normal radius, which is never smaller) of every named ellipsoid proj4rs
+/// knows; the extremes are CPM (a = 6375.7 km) and Maupertius (f = 1/191),
+/// both above 6.33e6 m.
+///
+/// With a datum shift, latitude and longitude are read on WGS84 (M >= 6.335e6 m)
+/// for a point lifted off it by at most a few tens of kilometres: the
+/// [`TM_MAX_HELMERT_*`](TM_MAX_HELMERT_TRANSLATION_M) limits, plus the gap
+/// between the source ellipsoid and WGS84 (under 35 km for the extreme
+/// named ellipsoids). Lengths grow by at most the Helmert scale. Both effects
+/// stay inside this margin and the 0.1% reduction of `k0`.
+const TM_MIN_RADIUS_M: f64 = 6.3e6;
+
+/// Largest Helmert translation (metres, vector norm) a certified transverse
+/// Mercator source may carry. Every named datum in proj4rs is under 800 m.
+const TM_MAX_HELMERT_TRANSLATION_M: f64 = 1500.0;
+/// Largest Helmert rotation (arc-seconds, per axis); named datums reach 5.3".
+const TM_MAX_HELMERT_ROTATION_ARCSEC: f64 = 10.0;
+/// Largest Helmert scale change (ppm); named datums reach 20.5 ppm.
+const TM_MAX_HELMERT_SCALE_PPM: f64 = 50.0;
+
+/// Whether a `+towgs84` value is a 3- or 7-parameter Helmert shift within the
+/// limits above. Larger shifts can move points far from the target
+/// ellipsoid's surface, where latitude and longitude change much faster than
+/// the certificate's radius bound allows.
+fn helmert_within_tm_limits(towgs84: &str) -> bool {
+    let p: Option<Vec<f64>> = towgs84
+        .split(',')
+        .map(|v| v.trim().parse::<f64>().ok().filter(|x| x.is_finite()))
+        .collect();
+    let Some(p) = p else {
+        return false;
+    };
+    let (shift, rot, scale) = match p.as_slice() {
+        [x, y, z] => ([*x, *y, *z], [0.0; 3], 0.0),
+        [x, y, z, rx, ry, rz, s] => ([*x, *y, *z], [*rx, *ry, *rz], *s),
+        _ => return false,
+    };
+    shift.iter().map(|v| v * v).sum::<f64>().sqrt() <= TM_MAX_HELMERT_TRANSLATION_M
+        && rot
+            .iter()
+            .all(|r| r.abs() <= TM_MAX_HELMERT_ROTATION_ARCSEC)
+        && scale.abs() <= TM_MAX_HELMERT_SCALE_PPM
+}
+
+/// Certified transverse Mercator bounds hold within this many metres of
+/// the central meridian, measured in projection-plane metres divided by
+/// `k0` (about 22 degrees of arc). There the Poder/Engsager series used by
+/// proj4rs agrees with the exact conformal map to well below a millimetre,
+/// and the point scale is at least `k0`.
+const TM_MAX_EASTING_M: f64 = 2.5e6;
+
+/// Samples per rectangle edge for certified transverse Mercator bounds.
+const TM_GRID: usize = 10;
+
+/// Constants for certified bounds of an ellipsoidal transverse Mercator
+/// source (`+proj=utm`, `+proj=etmerc`, exact `+proj=tmerc`).
+///
+/// Transverse Mercator is conformal with point scale `k >= k0`, so a
+/// straight segment of length `L` source units maps to a ground curve no
+/// longer than `L * to_meter / k0`. Along such a curve latitude changes by at
+/// most `length / M` and longitude by at most `length / (N cos(lat))`, with
+/// `M <= N` the ellipsoid's radii of curvature. Sampling the rectangle on a
+/// grid and widening by these Lipschitz bounds therefore encloses its image
+/// exactly, not just approximately.
+#[derive(Debug, Clone, Copy)]
+pub struct TmCertificate {
+    /// Upper bound on ground metres per source unit: `to_meter / k0`, with
+    /// `k0` reduced by 0.1% as a safety margin.
+    ground_per_unit: f64,
+    /// Source units to projection-plane metres.
+    to_meter: f64,
+    /// False easting in metres.
+    x0: f64,
+    /// Central scale factor.
+    k0: f64,
+}
+
+impl TmCertificate {
+    /// Build a certificate for `from` when it is an ellipsoidal transverse
+    /// Mercator on a named ellipsoid with standard axes; `None` otherwise
+    /// (spherical or Evenden/Snyder variants, custom ellipsoid sizes, swapped
+    /// axes, `+towgs84` shifts beyond the Helmert limits), leaving its bounds
+    /// uncertified.
+    fn new(from: &Proj, tokens: &std::collections::HashMap<String, String>) -> Option<Self> {
+        let utm = match from.projname() {
+            "utm" => true,
+            "etmerc" | "tmerc" => false,
+            _ => return None,
+        };
+        // `tmerc` falls back to the Evenden/Snyder series on a sphere or on
+        // request; custom ellipsoid sizes escape the radius bound. Token keys
+        // are lowercased, so `+R` and `+R_A`... arrive as `r` and `r_*`.
+        let blocked = ["approx", "a", "b", "rf", "f", "es", "e", "r"];
+        if blocked.iter().any(|k| tokens.contains_key(*k))
+            || tokens.keys().any(|k| k.starts_with("r_"))
+            || tokens.get("ellps").is_some_and(|e| e == "sphere")
+            || tokens.get("algo").is_some_and(|a| a != "poder_engsager")
+            // Named datums imply Helmert shifts inside the limits; explicit
+            // ones must be checked.
+            || tokens
+                .get("towgs84")
+                .is_some_and(|t| !helmert_within_tm_limits(t))
+            || !from.is_normalized_axis()
+        {
+            return None;
+        }
+        let (k0, x0) = if utm {
+            // proj4rs fixes these for UTM regardless of +k / +x_0.
+            (0.9996, 500_000.0)
+        } else {
+            if tokens.contains_key("k") && tokens.contains_key("k_0") {
+                return None;
+            }
+            let key = if tokens.contains_key("k_0") {
+                "k_0"
+            } else {
+                "k"
+            };
+            (
+                parse_opt_f64(tokens, key, 1.0)?,
+                parse_opt_f64(tokens, "x_0", 0.0)?,
+            )
+        };
+        let to_meter = from.to_meter();
+        if !(k0 > 0.0 && k0.is_finite() && to_meter > 0.0 && to_meter.is_finite()) {
+            return None;
+        }
+        Some(Self {
+            ground_per_unit: to_meter / (0.999 * k0),
+            to_meter,
+            x0,
+            k0,
+        })
+    }
+}
+
 ///
 /// proj4rs normalizes axes but skips the prime-meridian shift for geographic
 /// sources, so the shift cannot simply be added to the raw input: it belongs
@@ -448,6 +584,9 @@ pub enum CrsTransformer {
         /// Axis order and prime meridian of a geographic source, applied by
         /// this wrapper; `from` is then built without `+axis`/`+pm`.
         geo: Option<GeoFrame>,
+
+        /// Certified-bounds constants when the source is transverse Mercator.
+        tm: Option<TmCertificate>,
     },
 }
 
@@ -768,10 +907,12 @@ impl CrsTransformer {
             ))
         })?;
 
+        let tm = TmCertificate::new(&from, &tokens);
         Ok(Self::Proj4 {
             from: Box::new(from),
             to: Box::new(to),
             geo,
+            tm,
         })
     }
 
@@ -782,7 +923,7 @@ impl CrsTransformer {
             Self::Wgs84Identity => Ok((x, y)),
             Self::WebMercatorFast => Ok((web_mercator_lon(x), web_mercator_lat(y))),
             Self::AlbersConic(albers) => Ok(albers.transform_point(x, y)),
-            Self::Proj4 { from, to, geo } => {
+            Self::Proj4 { from, to, geo, .. } => {
                 // proj4rs reads and writes geographic coordinates in radians.
                 let mut point_3d = match geo {
                     Some(g) => {
@@ -825,7 +966,7 @@ impl CrsTransformer {
                 ))
             }
             Self::AlbersConic(albers) => Ok(albers.project_point(lon, lat)),
-            Self::Proj4 { from, to, geo } => {
+            Self::Proj4 { from, to, geo, .. } => {
                 let mut point_3d = (lon / RAD_TO_DEG, lat / RAD_TO_DEG, 0.0);
                 proj4rs::transform::transform(to, from, &mut point_3d).map_err(|e| {
                     RasterH3Error::CrsError(format!(
@@ -869,37 +1010,131 @@ impl CrsTransformer {
         Ok(())
     }
 
-    /// Widen bounds from [`Self::transform_rect_bounds`] before they are used
-    /// to *reject* data (bbox pruning). Identity, Web Mercator and Albers
-    /// bounds are analytic; generic PROJ bounds come from sampled edges and an
-    /// interior grid, so they are padded by a tenth of their span (at least
-    /// 0.01 degree) in each axis. Sampling is not a certificate, so this keeps
-    /// borderline tiles and chunks and leaves the exact decision to the
-    /// per-sample bbox test.
+    /// Whether [`Self::transform_rect_bounds`] is a proven enclosure of the
+    /// rectangle's image. Identity, Web Mercator and Albers bounds are
+    /// analytic and transverse Mercator bounds carry a Lipschitz certificate
+    /// (see [`TmCertificate`]); other PROJ bounds come from finitely many
+    /// samples, which can miss interior extrema and singularities however
+    /// densely they are placed.
+    pub fn bounds_certified(&self) -> bool {
+        !matches!(self, Self::Proj4 { tm: None, .. })
+    }
+
+    /// Bounds from [`Self::transform_rect_bounds`] that are safe to use to
+    /// *reject* data (bbox pruning, mosaic overlap filtering). Data dropped by
+    /// a rejection test never reaches the exact per-sample test, so
+    /// uncertified bounds fail open to the whole globe and leave the decision
+    /// to that exact test.
     pub fn rejection_bounds(&self, b: [f64; 4]) -> [f64; 4] {
-        if !matches!(self, Self::Proj4 { .. }) {
-            return b;
+        if self.bounds_certified() {
+            b
+        } else {
+            [-180.0, -90.0, 180.0, 90.0]
         }
-        let pad_lon = ((b[2] - b[0]) * 0.1).max(0.01);
-        let pad_lat = ((b[3] - b[1]) * 0.1).max(0.01);
-        let (min_lon, max_lon) = if b[2] - b[0] + 2.0 * pad_lon >= 360.0 {
-            (-180.0, 180.0)
-        } else {
-            (b[0] - pad_lon, b[2] + pad_lon)
-        };
-        // Spill past the antimeridian is folded into a full-longitude range so
-        // the rectangle stays non-crossing.
-        let (min_lon, max_lon) = if min_lon < -180.0 || max_lon > 180.0 {
-            (-180.0, 180.0)
-        } else {
-            (min_lon, max_lon)
-        };
-        [
-            min_lon,
-            (b[1] - pad_lat).max(-90.0),
-            max_lon,
-            (b[3] + pad_lat).min(90.0),
-        ]
+    }
+
+    /// Certified bounds for a transverse Mercator source; see
+    /// [`TmCertificate`]. Returns the whole globe when the rectangle leaves
+    /// the certified band around the central meridian or any sample fails, so
+    /// the result is always safe for rejection.
+    fn tm_rect_bounds(
+        &self,
+        tm: &TmCertificate,
+        gt: &GeoTransform,
+        col: f64,
+        row: f64,
+        width: f64,
+        height: f64,
+    ) -> [f64; 4] {
+        const GLOBE: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
+        const N: usize = TM_GRID;
+        // Easting is affine in pixel space, so the corners bound it.
+        for (c, r) in [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)] {
+            let (x, _) = gt.pixel_to_coord(col + c, row + r);
+            let off = (x * tm.to_meter - tm.x0).abs() / tm.k0;
+            if off.is_nan() || off > TM_MAX_EASTING_M {
+                return GLOBE;
+            }
+        }
+
+        let mut lons = [[0.0f64; N + 1]; N + 1];
+        let mut lats = [[0.0f64; N + 1]; N + 1];
+        let (mut lat_min, mut lat_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for j in 0..=N {
+            for i in 0..=N {
+                let (x, y) = gt.pixel_to_coord(
+                    col + width * i as f64 / N as f64,
+                    row + height * j as f64 / N as f64,
+                );
+                match self.transform_point(x, y) {
+                    Ok((lon, lat)) if lon.is_finite() && lat.is_finite() => {
+                        lons[j][i] = lon;
+                        lats[j][i] = lat;
+                        lat_min = lat_min.min(lat);
+                        lat_max = lat_max.max(lat);
+                    }
+                    _ => return GLOBE,
+                }
+            }
+        }
+
+        // Grid cell edge vectors in source units. Every point of a cell lies
+        // within (|u| + |v|) / 2 of one of its corners, and adjacent samples
+        // are at most max(|u|, |v|) apart.
+        let u = (gt.a * width / N as f64).hypot(gt.d * width / N as f64);
+        let v = (gt.b * height / N as f64).hypot(gt.e * height / N as f64);
+        let reach_m = 0.5 * (u + v) * tm.ground_per_unit;
+        let edge_m = u.max(v) * tm.ground_per_unit;
+        // Absolute slack for floating-point error in the projection itself.
+        const EPS_DEG: f64 = 1e-9;
+
+        let dlat = reach_m / TM_MIN_RADIUS_M * RAD_TO_DEG + EPS_DEG;
+        let south = (lat_min - dlat).max(-90.0);
+        let north = (lat_max + dlat).min(90.0);
+        let abs_lat = north.max(-south);
+        if abs_lat >= 89.9 {
+            return [-180.0, south, 180.0, north];
+        }
+        let lon_scale = RAD_TO_DEG / (TM_MIN_RADIUS_M * abs_lat.to_radians().cos());
+        let dlon = reach_m * lon_scale + EPS_DEG;
+        let dlon_edge = edge_m * lon_scale + EPS_DEG;
+        if dlon_edge >= 90.0 {
+            return [-180.0, south, 180.0, north];
+        }
+
+        // Lift sampled longitudes onto one continuous branch: each sample is
+        // unwrapped against an already-lifted neighbour, then every adjacent
+        // pair is checked against the Lipschitz bound, which proves the lift
+        // follows the continuous image rather than a wrapped copy.
+        let unwrap = |d: f64| d - 360.0 * (d / 360.0).round();
+        let mut lifted = [[0.0f64; N + 1]; N + 1];
+        for j in 0..=N {
+            for i in 0..=N {
+                lifted[j][i] = match (i, j) {
+                    (0, 0) => wrap_lon(lons[0][0]),
+                    (0, _) => lifted[j - 1][0] + unwrap(lons[j][0] - lons[j - 1][0]),
+                    _ => lifted[j][i - 1] + unwrap(lons[j][i] - lons[j][i - 1]),
+                };
+            }
+        }
+        let (mut lon_min, mut lon_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for j in 0..=N {
+            for i in 0..=N {
+                let l = lifted[j][i];
+                let far = |o: f64| (l - o).abs() > dlon_edge;
+                if (i < N && far(lifted[j][i + 1])) || (j < N && far(lifted[j + 1][i])) {
+                    return [-180.0, south, 180.0, north];
+                }
+                lon_min = lon_min.min(l);
+                lon_max = lon_max.max(l);
+            }
+        }
+        let (west, east) = (lon_min - dlon, lon_max + dlon);
+        // Rectangles stay non-crossing, as in the sampled path.
+        if west < -180.0 || east > 180.0 || east - west > 180.0 {
+            return [-180.0, south, 180.0, north];
+        }
+        [west, south, east, north]
     }
 
     /// Calculate WGS84 [min_lon, min_lat, max_lon, max_lat] spatial bounds for a raster pixel rectangle.
@@ -912,7 +1147,11 @@ impl CrsTransformer {
     /// minimizing distance to the apex, capturing the true maximum latitude at the central meridian.
     ///
     /// For arbitrary PROJ4 projections, boundary edges are densified with interior samples
-    /// and a conservative safety headroom is applied to guarantee that `max_lat` is a sound upper bound.
+    /// and a small latitude headroom is applied. This is an estimate, not a certificate
+    /// (see [`Self::bounds_certified`]); use [`Self::rejection_bounds`] before rejecting data.
+    ///
+    /// If any probe fails to project or yields a non-finite coordinate, the whole globe
+    /// is returned.
     pub fn transform_rect_bounds(
         &self,
         gt: &GeoTransform,
@@ -921,6 +1160,9 @@ impl CrsTransformer {
         width: f64,
         height: f64,
     ) -> [f64; 4] {
+        if let Self::Proj4 { tm: Some(tm), .. } = self {
+            return self.tm_rect_bounds(tm, gt, col, row, width, height);
+        }
         let p0 = gt.pixel_to_coord(col, row);
         let p1 = gt.pixel_to_coord(col + width, row);
         let p2 = gt.pixel_to_coord(col + width, row + height);
@@ -928,13 +1170,25 @@ impl CrsTransformer {
 
         let corners = [p0, p1, p2, p3];
 
+        // Any probe that fails or is non-finite means part of the rectangle is
+        // outside the projection's domain or numerically unstable; the
+        // surviving probes would then under-report the extent.
+        let mut failed = false;
+        let mut probe = |x: f64, y: f64| match self.transform_point(x, y) {
+            Ok((lon, lat)) if lon.is_finite() && lat.is_finite() => Some((lon, lat)),
+            _ => {
+                failed = true;
+                None
+            }
+        };
+
         let mut min_lon = f64::INFINITY;
         let mut min_lat = f64::INFINITY;
         let mut max_lon = f64::NEG_INFINITY;
         let mut max_lat = f64::NEG_INFINITY;
 
         for &(x, y) in &corners {
-            if let Ok((lon, lat)) = self.transform_point(x, y) {
+            if let Some((lon, lat)) = probe(x, y) {
                 let w_lon = wrap_lon(lon);
                 min_lon = min_lon.min(w_lon);
                 max_lon = max_lon.max(w_lon);
@@ -959,7 +1213,7 @@ impl CrsTransformer {
                             let t = step as f64 / steps as f64;
                             let px = x1 + t * dx;
                             let py = y1 + t * dy;
-                            if let Ok((lon, lat)) = self.transform_point(px, py) {
+                            if let Some((lon, lat)) = probe(px, py) {
                                 let w_lon = wrap_lon(lon);
                                 min_lon = min_lon.min(w_lon);
                                 max_lon = max_lon.max(w_lon);
@@ -1007,7 +1261,7 @@ impl CrsTransformer {
                         if t > 0.0 && t < 1.0 {
                             let cx = x1 + t * dx;
                             let cy = y1 + t * dy;
-                            if let Ok((lon, lat)) = self.transform_point(cx, cy) {
+                            if let Some((lon, lat)) = probe(cx, cy) {
                                 let w_lon = wrap_lon(lon);
                                 min_lon = min_lon.min(w_lon);
                                 max_lon = max_lon.max(w_lon);
@@ -1033,7 +1287,7 @@ impl CrsTransformer {
                         let t = step as f64 / steps as f64;
                         let px = x1 + t * dx;
                         let py = y1 + t * dy;
-                        if let Ok((lon, lat)) = self.transform_point(px, py) {
+                        if let Some((lon, lat)) = probe(px, py) {
                             let w_lon = wrap_lon(lon);
                             min_lon = min_lon.min(w_lon);
                             max_lon = max_lon.max(w_lon);
@@ -1057,7 +1311,7 @@ impl CrsTransformer {
                             + p1.1 * tx * (1.0 - ty)
                             + p2.1 * tx * ty
                             + p3.1 * (1.0 - tx) * ty;
-                        if let Ok((lon, lat)) = self.transform_point(px, py) {
+                        if let Some((lon, lat)) = probe(px, py) {
                             let w_lon = wrap_lon(lon);
                             min_lon = min_lon.min(w_lon);
                             max_lon = max_lon.max(w_lon);
@@ -1118,11 +1372,12 @@ impl CrsTransformer {
             max_lon = 180.0;
         }
 
-        if max_lat == f64::NEG_INFINITY {
-            // Every probe failed to project. Return the whole globe rather than a
-            // plausible-looking `[0,0,0,0]`: this keeps bbox pruning conservative and
-            // sorts the chunk first in the north-to-south horizon order, so no cell can
-            // be evicted before the chunk is processed.
+        if failed || max_lat == f64::NEG_INFINITY {
+            // Some probe failed to project. Return the whole globe rather than
+            // bounds built from the survivors (or a plausible-looking `[0,0,0,0]`):
+            // this keeps bbox pruning conservative and sorts the chunk first in the
+            // north-to-south horizon order, so no cell can be evicted before the
+            // chunk is processed.
             [-180.0, -90.0, 180.0, 90.0]
         } else {
             [min_lon, min_lat, max_lon, max_lat]
@@ -1812,5 +2067,237 @@ mod tests {
             let res = CrsTransformer::from_proj_string(bad);
             assert!(res.is_err(), "Expected CrsError for '{bad}'");
         }
+    }
+
+    #[test]
+    fn test_rejection_bounds_fail_open_when_uncertified() {
+        let b = [10.0, 20.0, 11.0, 21.0];
+        let globe = [-180.0, -90.0, 180.0, 90.0];
+        for code in [4326, 3857, 5070] {
+            let tf = CrsTransformer::from_epsg_code(code).unwrap();
+            assert!(tf.bounds_certified(), "EPSG:{code}");
+            assert_eq!(tf.rejection_bounds(b), b, "EPSG:{code}");
+        }
+        let polar = CrsTransformer::from_epsg_code(3413).unwrap();
+        assert!(!polar.bounds_certified());
+        assert_eq!(polar.rejection_bounds(b), globe);
+    }
+
+    /// Deterministic uniform samples in [0, 1).
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Assert that `b` encloses the image of the pixel rectangle, checked on
+    /// a dense grid plus random interior points.
+    fn assert_encloses(tf: &CrsTransformer, gt: &GeoTransform, w: f64, h: f64, b: [f64; 4]) {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut pts: Vec<(f64, f64)> = (0..=120)
+            .flat_map(|j| (0..=120).map(move |i| (w * i as f64 / 120.0, h * j as f64 / 120.0)))
+            .collect();
+        pts.extend((0..4000).map(|_| (w * lcg(&mut seed), h * lcg(&mut seed))));
+        for (c, r) in pts {
+            let (x, y) = gt.pixel_to_coord(c, r);
+            let Ok((lon, lat)) = tf.transform_point(x, y) else {
+                assert_eq!(b, [-180.0, -90.0, 180.0, 90.0], "failed sample needs globe");
+                continue;
+            };
+            assert!(
+                b[1] <= lat && lat <= b[3],
+                "lat {lat} outside {b:?} at ({c}, {r})"
+            );
+            let lon = wrap_lon(lon);
+            let lon_ok = b[0] <= lon && lon <= b[2] || (b[2] - b[0] >= 360.0);
+            assert!(
+                lon_ok || (lon == -180.0 && b[2] == 180.0),
+                "lon {lon} outside {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tm_bounds_are_certified_and_enclose_dense_samples() {
+        let rot = |s: f64, deg: f64, c0: f64, f0: f64| {
+            let (sin, cos) = deg.to_radians().sin_cos();
+            GeoTransform {
+                c0,
+                a: s * cos,
+                b: s * sin,
+                f0,
+                d: s * sin,
+                e: -s * cos,
+            }
+        };
+        let cases: Vec<(&str, GeoTransform, f64, f64)> = vec![
+            // Typical UTM chunk and whole tile.
+            (
+                "EPSG:32633",
+                rot(30.0, 0.0, 400_000.0, 5_600_000.0),
+                512.0,
+                512.0,
+            ),
+            (
+                "EPSG:32633",
+                rot(10.0, 0.0, 300_000.0, 5_600_000.0),
+                10980.0,
+                10980.0,
+            ),
+            // Rotated grid, far edge of the zone, high latitude.
+            (
+                "EPSG:32633",
+                rot(250.0, 17.0, 50_000.0, 8_000_000.0),
+                400.0,
+                300.0,
+            ),
+            // Rectangle around the North Pole.
+            (
+                "EPSG:32633",
+                rot(1000.0, 0.0, 480_000.0, 10_020_000.0),
+                40.0,
+                60.0,
+            ),
+            // Southern hemisphere, near the antimeridian.
+            (
+                "EPSG:32760",
+                rot(100.0, -8.0, 650_000.0, 5_000_000.0),
+                2000.0,
+                2000.0,
+            ),
+            // Zone 1 chunk crossing the antimeridian.
+            (
+                "EPSG:32601",
+                rot(500.0, 0.0, 150_000.0, 1_500_000.0),
+                600.0,
+                400.0,
+            ),
+            // Helmert-shifted national grid.
+            (
+                "EPSG:27700",
+                rot(50.0, 0.0, 300_000.0, 700_000.0),
+                4000.0,
+                4000.0,
+            ),
+            // US survey feet, non-UTM scale factor.
+            (
+                "+proj=tmerc +lat_0=31 +lon_0=-110.1666667 +k=0.9999 +x_0=213360 +y_0=0 \
+                 +ellps=GRS80 +to_meter=0.3048006096012192 +no_defs",
+                rot(100.0, 3.0, 500_000.0, 1_000_000.0),
+                3000.0,
+                3000.0,
+            ),
+            (
+                "+proj=etmerc +lon_0=12 +ellps=bessel",
+                rot(20.0, 0.0, -50_000.0, 6_000_000.0),
+                5000.0,
+                500.0,
+            ),
+        ];
+        for (crs, gt, w, h) in cases {
+            let tf = CrsTransformer::from_crs_or_epsg(None, Some(crs)).unwrap();
+            assert!(tf.bounds_certified(), "{crs}");
+            let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, w, h);
+            assert_eq!(tf.rejection_bounds(b), b, "{crs}");
+            assert_encloses(&tf, &gt, w, h, b);
+        }
+    }
+
+    #[test]
+    fn test_tm_bounds_are_tight_enough_to_prune() {
+        let tf = CrsTransformer::from_epsg_code(32633).unwrap();
+        let gt = GeoTransform {
+            c0: 400_000.0,
+            a: 30.0,
+            b: 0.0,
+            f0: 5_600_000.0,
+            d: 0.0,
+            e: -30.0,
+        };
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 512.0, 512.0);
+        let (lon0, lat0) = tf.transform_point(400_000.0, 5_600_000.0).unwrap();
+        let (lon1, lat1) = tf.transform_point(415_360.0, 5_584_640.0).unwrap();
+        // Corner-to-corner extent plus at most ~0.03 degree of certificate padding.
+        assert!(
+            b[0] > lon0.min(lon1) - 0.03 && b[2] < lon0.max(lon1) + 0.03,
+            "{b:?}"
+        );
+        assert!(b[1] > lat1 - 0.03 && b[3] < lat0 + 0.03, "{b:?}");
+        // A bbox a degree away is rejected; one over the chunk is not.
+        let r = tf.rejection_bounds(b);
+        let far = [b[2] + 1.0, b[1], b[2] + 2.0, b[3]];
+        let near = [b[0], b[1], b[0] + 0.01, b[1] + 0.01];
+        let hit = |q: [f64; 4]| r[0] <= q[2] && q[0] <= r[2] && r[1] <= q[3] && q[1] <= r[3];
+        assert!(!hit(far) && hit(near));
+    }
+
+    #[test]
+    fn test_tm_bounds_fail_open_outside_certified_band() {
+        let tf = CrsTransformer::from_epsg_code(32633).unwrap();
+        // 4000 km east of the central meridian.
+        let gt = GeoTransform {
+            c0: 4_500_000.0,
+            a: 100.0,
+            b: 0.0,
+            f0: 5_000_000.0,
+            d: 0.0,
+            e: -100.0,
+        };
+        let b = tf.transform_rect_bounds(&gt, 0.0, 0.0, 100.0, 100.0);
+        assert_eq!(b, [-180.0, -90.0, 180.0, 90.0]);
+    }
+
+    #[test]
+    fn test_tm_certificate_only_for_exact_named_ellipsoid_variants() {
+        for crs in [
+            "+proj=tmerc +lon_0=9 +approx +ellps=WGS84",
+            "+proj=tmerc +lon_0=9 +algo=evenden_snyder +ellps=WGS84",
+            "+proj=tmerc +lon_0=9 +R=6371000",
+            "+proj=tmerc +lon_0=9 +ellps=sphere",
+            "+proj=tmerc +lon_0=9 +a=6378137 +rf=298.257223563",
+            "+proj=tmerc +lon_0=9 +k=0.9996 +k_0=0.9999 +ellps=WGS84",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=-6000000,0,0",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,0,0,0,5000",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,60,0,0,0",
+        ] {
+            let tf = CrsTransformer::from_crs_or_epsg(None, Some(crs)).unwrap();
+            assert!(!tf.bounds_certified(), "{crs}");
+        }
+        for crs in [
+            "+proj=utm +zone=10 +ellps=GRS80",
+            "+proj=tmerc +lon_0=9 +datum=WGS84",
+            "+proj=utm +zone=33 +ellps=intl +towgs84=-87,-98,-121",
+            "+proj=tmerc +lon_0=-2 +datum=OSGB36",
+        ] {
+            let tf = CrsTransformer::from_crs_or_epsg(None, Some(crs)).unwrap();
+            assert!(tf.bounds_certified(), "{crs}");
+        }
+    }
+
+    #[test]
+    fn test_transform_rect_bounds_fail_open_when_a_probe_fails() {
+        // Geostationary view: the visible Earth disk has radius ~5.4e6 m. The
+        // rectangle reaches past the disk edge, so its outer probes cannot be
+        // projected while the inner ones can.
+        let tf =
+            CrsTransformer::from_proj_string("+proj=geos +h=35785831 +lon_0=0 +R=6378137").unwrap();
+        assert!(tf.transform_point(7_000_000.0, 0.0).is_err());
+        assert!(tf.transform_point(1_000_000.0, 0.0).is_ok());
+        let gt = GeoTransform {
+            c0: 0.0,
+            a: 100_000.0,
+            b: 0.0,
+            f0: 1_000_000.0,
+            d: 0.0,
+            e: -100_000.0,
+        };
+        let partial = tf.transform_rect_bounds(&gt, 0.0, 0.0, 70.0, 20.0);
+        assert_eq!(partial, [-180.0, -90.0, 180.0, 90.0]);
+
+        // Fully inside the disk: ordinary finite bounds.
+        let inside = tf.transform_rect_bounds(&gt, 0.0, 0.0, 20.0, 20.0);
+        assert!(inside[0] > -1.0 && inside[2] < 30.0, "{inside:?}");
+        assert!(inside[1] > -15.0 && inside[3] < 15.0, "{inside:?}");
     }
 }

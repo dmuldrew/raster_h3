@@ -6,6 +6,7 @@ mod accumulators;
 mod analytic_south_lat;
 mod antimeridian_bbox;
 mod categorical_remap;
+mod certified_bounds;
 mod chunks_and_prefetch;
 mod codecs;
 mod compaction_streaming;
