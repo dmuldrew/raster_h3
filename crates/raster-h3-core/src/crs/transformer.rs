@@ -1361,7 +1361,11 @@ impl CrsTransformer {
                 if lo < -180.0 || hi > 180.0 {
                     (min_lon, max_lon) = (-180.0, 180.0);
                 } else if matches!(self, Self::Wgs84Identity | Self::WebMercatorFast) {
-                    (min_lon, max_lon) = (lo, hi);
+                    // Per-sample bbox tests wrap every longitude, which can move
+                    // an in-range value by an ulp; wrapping is monotone, so the
+                    // wrapped corners still bound the wrapped samples.
+                    min_lon = wrap_lon(lo);
+                    max_lon = if hi == 180.0 { hi } else { wrap_lon(hi) };
                 }
             }
         }

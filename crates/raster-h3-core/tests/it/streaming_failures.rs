@@ -8,7 +8,7 @@ use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
 use raster_h3_core::pmtiles::tiler::H3PmtilesTiler;
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 
-use crate::helpers::corrupt_strip_geotiff as corrupt_payload;
+use crate::helpers::{corrupt_strip_geotiff as corrupt_payload, TestGeoTiffBuilder};
 
 #[test]
 fn corrupt_chunk_errors_are_latched_for_both_streamers() {
@@ -183,4 +183,105 @@ fn premature_prefetch_termination_is_an_error() {
         .unwrap_err()
         .to_string()
         .contains("Prefetch ended after 0 of 4 chunks"));
+}
+
+/// A low budget over many res-8 cells, so the stream spills within its
+/// first few chunks.
+fn spilling_config(spill_directory: std::path::PathBuf) -> MultiResolutionConfig {
+    let mut config = MultiResolutionConfig::new(vec![6, 8]);
+    config.aggregation_budget_bytes = 1 << 20;
+    config.aggregation_workers = Some(4);
+    config.spill_directory = Some(spill_directory);
+    config
+}
+
+#[test]
+fn unusable_spill_directory_fails_streams_and_latches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_file, path) = TestGeoTiffBuilder::new(300, 1200)
+        .origin(-120.0, 45.0)
+        .pixel_size(0.002)
+        .create_f32_tempfile(|c, r| (c + r) as f32);
+    let not_a_directory = dir.path().join("file");
+    fs::write(&not_a_directory, b"").unwrap();
+
+    for spill_directory in [dir.path().join("missing"), not_a_directory] {
+        let config = spilling_config(spill_directory.clone());
+        let mut continuous =
+            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config)
+                .unwrap();
+        let mut failure = None;
+        for _ in 0..1024 {
+            match continuous.fetch_next_batch(2048) {
+                Ok(batch) => assert!(!batch.is_empty(), "spill failure must not become EOF"),
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let first = failure.unwrap_or_else(|| panic!("{spill_directory:?} must fail"));
+        assert!(first.contains("Raster stream failed"), "{first}");
+        assert_eq!(
+            continuous.fetch_next_batch(2048).unwrap_err().to_string(),
+            first
+        );
+        let mut emitted = 0;
+        assert!(continuous
+            .drain_completed_into(2048, |_, _| emitted += 1)
+            .is_err());
+        assert_eq!(emitted, 0);
+        assert!(!continuous.is_finished());
+
+        let mut categorical = MultiCategoricalHorizonStreamer::new(
+            GeoTiffStreamReader::open(&path).unwrap(),
+            &config,
+        )
+        .unwrap();
+        let mut failed = false;
+        for _ in 0..1024 {
+            match categorical.fetch_next_batch(2048) {
+                Ok(batch) => assert!(!batch.is_empty(), "spill failure must not become EOF"),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            failed,
+            "{spill_directory:?} must fail the categorical stream"
+        );
+        assert!(categorical.fetch_next_batch(2048).is_err());
+    }
+    assert!(!dir.path().join("missing").exists());
+}
+
+#[test]
+fn spill_runs_never_appear_as_files_in_the_spill_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_file, path) = TestGeoTiffBuilder::new(300, 1200)
+        .origin(-120.0, 45.0)
+        .pixel_size(0.002)
+        .create_f32_tempfile(|c, r| (c + r) as f32);
+    let entries = || fs::read_dir(dir.path()).unwrap().count();
+
+    let config = spilling_config(dir.path().to_path_buf());
+    let mut stream =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config).unwrap();
+    let mut checked_mid_stream = false;
+    loop {
+        let batch = stream.fetch_next_batch(256).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        // Runs are unnamed files: nothing to leak if the process dies.
+        if stream.spill_run_count() > 0 && !stream.is_finished() {
+            assert_eq!(entries(), 0);
+            checked_mid_stream = true;
+        }
+    }
+    assert!(checked_mid_stream && stream.spill_run_count() > 0);
+    drop(stream);
+    assert_eq!(entries(), 0);
 }

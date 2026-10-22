@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Broken rustdoc link in `RemoteHttpSource::read_exact_range`; all Clippy warnings.
 - `GeoTransform::coord_to_pixel` used an absolute determinant cutoff that rejected valid fine-resolution grids (e.g. 1e-8 degree pixels); it is now scale-relative and rejects non-finite affines. Opening a GeoTIFF now rejects a non-finite or singular affine transform.
 - Sampled PROJ bounds could reject valid data: `transform_rect_bounds` now returns the whole globe if any probe fails, and `rejection_bounds` fails open for uncertified bounds instead of padding them by 10%.
+- WGS84 and Web Mercator rect bounds kept unwrapped corner longitudes while per-sample bbox tests wrap every longitude, so a sample on a chunk edge could fall one ulp outside its chunk's rejection bounds; the corners are now wrapped the same way.
 
 ## [0.4.0] - 2026-10-21
 
