@@ -601,6 +601,10 @@ pub enum CrsTransformer {
 
         /// Certified-bounds constants when the source is transverse Mercator.
         tm: Option<TmCertificate>,
+
+        /// Analytic radial/angular bounds for the built-in EPSG:3413/3031
+        /// definitions only. Arbitrary PROJ strings keep failing open.
+        polar_bounds: bool,
     },
 }
 
@@ -661,11 +665,19 @@ impl CrsTransformer {
             }
             3413 => {
                 let p_str = "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                Self::from_proj_string(p_str)
+                let mut transformer = Self::from_proj_string(p_str)?;
+                if let Self::Proj4 { polar_bounds, .. } = &mut transformer {
+                    *polar_bounds = true;
+                }
+                Ok(transformer)
             }
             3031 => {
                 let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                Self::from_proj_string(p_str)
+                let mut transformer = Self::from_proj_string(p_str)?;
+                if let Self::Proj4 { polar_bounds, .. } = &mut transformer {
+                    *polar_bounds = true;
+                }
+                Ok(transformer)
             }
             // Codes below carry a Helmert datum shift chosen from the EPSG
             // registry (accuracy as published there); see
@@ -927,6 +939,7 @@ impl CrsTransformer {
             to: Box::new(to),
             geo,
             tm,
+            polar_bounds: false,
         })
     }
 
@@ -1026,12 +1039,20 @@ impl CrsTransformer {
 
     /// Whether [`Self::transform_rect_bounds`] is a proven enclosure of the
     /// rectangle's image. Identity, Web Mercator and Albers bounds are
-    /// analytic and transverse Mercator bounds carry a Lipschitz certificate
+    /// analytic, built-in polar stereographic bounds use radial/angular extrema,
+    /// and transverse Mercator bounds carry a Lipschitz certificate
     /// (see [`TmCertificate`]); other PROJ bounds come from finitely many
     /// samples, which can miss interior extrema and singularities however
     /// densely they are placed.
     pub fn bounds_certified(&self) -> bool {
-        !matches!(self, Self::Proj4 { tm: None, .. })
+        !matches!(
+            self,
+            Self::Proj4 {
+                tm: None,
+                polar_bounds: false,
+                ..
+            }
+        )
     }
 
     /// Bounds from [`Self::transform_rect_bounds`] that are safe to use to
@@ -1151,6 +1172,88 @@ impl CrsTransformer {
         [west, south, east, north]
     }
 
+    /// Polar stereographic inverse latitude is monotonic in radius, while
+    /// longitude is atan2(x, +/-y) plus a constant. Enclose the affine image
+    /// in a source-axis rectangle: radius is minimized at the point nearest
+    /// the origin, maximized at a corner, and angular extrema occur at
+    /// corners unless the rectangle contains the origin. This includes
+    /// rotated/sheared rasters conservatively. Only the fixed WGS84 polar
+    /// definitions may use this proof (no datum shift, offsets or axis swap).
+    fn polar_rect_bounds(
+        &self,
+        gt: &GeoTransform,
+        col: f64,
+        row: f64,
+        width: f64,
+        height: f64,
+    ) -> [f64; 4] {
+        const GLOBE: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
+        // proj4rs' inverse iteration stops at 1e-10 radians; this slack is
+        // larger in degrees and also covers floating-point corner evaluation.
+        const SLACK: f64 = 1e-7;
+        let (mut xmin, mut xmax, mut ymin, mut ymax) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for (c, r) in [
+            (col, row),
+            (col + width, row),
+            (col, row + height),
+            (col + width, row + height),
+        ] {
+            let (x, y) = gt.pixel_to_coord(c, r);
+            if !x.is_finite() || !y.is_finite() {
+                return GLOBE;
+            }
+            xmin = xmin.min(x);
+            xmax = xmax.max(x);
+            ymin = ymin.min(y);
+            ymax = ymax.max(y);
+        }
+        let closest = (0.0f64.clamp(xmin, xmax), 0.0f64.clamp(ymin, ymax));
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (x, y) in [
+            (xmin, ymin),
+            (xmin, ymax),
+            (xmax, ymin),
+            (xmax, ymax),
+            closest,
+        ] {
+            let Ok((lon, lat)) = self.transform_point(x, y) else {
+                return GLOBE;
+            };
+            if !lon.is_finite() || !lat.is_finite() {
+                return GLOBE;
+            }
+            let lon = wrap_lon(lon);
+            bounds[0] = bounds[0].min(lon);
+            bounds[2] = bounds[2].max(lon);
+            bounds[1] = bounds[1].min(lat);
+            bounds[3] = bounds[3].max(lat);
+        }
+        bounds[1] = (bounds[1] - SLACK).max(-90.0);
+        bounds[3] = (bounds[3] + SLACK).min(90.0);
+        if closest == (0.0, 0.0)
+            || bounds[2] - bounds[0] >= 180.0
+            || bounds[0] - SLACK <= -180.0
+            || bounds[2] + SLACK >= 180.0
+        {
+            bounds[0] = -180.0;
+            bounds[2] = 180.0;
+        } else {
+            bounds[0] -= SLACK;
+            bounds[2] += SLACK;
+        }
+        bounds
+    }
+
     /// Calculate WGS84 [min_lon, min_lat, max_lon, max_lat] spatial bounds for a raster pixel rectangle.
     ///
     /// For EPSG:4326 and EPSG:3857 (Web Mercator), latitude is affine or monotonic in y,
@@ -1176,6 +1279,12 @@ impl CrsTransformer {
     ) -> [f64; 4] {
         if let Self::Proj4 { tm: Some(tm), .. } = self {
             return self.tm_rect_bounds(tm, gt, col, row, width, height);
+        }
+        if let Self::Proj4 {
+            polar_bounds: true, ..
+        } = self
+        {
+            return self.polar_rect_bounds(gt, col, row, width, height);
         }
         let p0 = gt.pixel_to_coord(col, row);
         let p1 = gt.pixel_to_coord(col + width, row);
@@ -2092,9 +2201,9 @@ mod tests {
             assert!(tf.bounds_certified(), "EPSG:{code}");
             assert_eq!(tf.rejection_bounds(b), b, "EPSG:{code}");
         }
-        let polar = CrsTransformer::from_epsg_code(3413).unwrap();
-        assert!(!polar.bounds_certified());
-        assert_eq!(polar.rejection_bounds(b), globe);
+        let lcc = CrsTransformer::from_epsg_code(2154).unwrap();
+        assert!(!lcc.bounds_certified());
+        assert_eq!(lcc.rejection_bounds(b), globe);
     }
 
     /// Deterministic uniform samples in [0, 1).

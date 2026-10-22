@@ -102,6 +102,11 @@ pub fn chunk_intersects_bbox(
     transformer: &CrsTransformer,
     bbox: &[f64; 4],
 ) -> bool {
+    // Uncertified estimates are discarded by rejection_bounds anyway.
+    // Avoid projecting 121 probes just to return a whole-globe candidate.
+    if !transformer.bounds_certified() {
+        return true;
+    }
     let bounds = transformer.transform_rect_bounds(
         gt,
         chunk.col_offset as f64,
