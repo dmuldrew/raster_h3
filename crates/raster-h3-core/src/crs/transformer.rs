@@ -493,15 +493,34 @@ impl TmCertificate {
     /// (spherical or Evenden/Snyder variants, custom ellipsoid sizes, swapped
     /// axes, `+towgs84` shifts beyond the Helmert limits), leaving its bounds
     /// uncertified.
-    fn new(from: &Proj, tokens: &std::collections::HashMap<String, String>) -> Option<Self> {
+    fn new(from: &Proj, src: &str) -> Option<Self> {
         let utm = match from.projname() {
             "utm" => true,
             "etmerc" | "tmerc" => false,
             _ => return None,
         };
+        // Certify only simple PROJ syntax we can interpret like proj4rs.
+        // Its parser is case-sensitive, accepts quotes and whitespace around
+        // '=', and keeps the FIRST duplicate. The fast-path tokenizer
+        // lowercases and keeps the LAST, so cannot establish a certificate.
+        let mut tokens = std::collections::HashMap::new();
+        for token in src.split_whitespace() {
+            let token = token.strip_prefix('+')?;
+            let (key, value) = token.split_once('=').unwrap_or((token, ""));
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                || value.contains('"')
+                || (token.contains('=') && value.is_empty())
+                || tokens.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                return None;
+            }
+        }
         // `tmerc` falls back to the Evenden/Snyder series on a sphere or on
-        // request; custom ellipsoid sizes escape the radius bound. Token keys
-        // are lowercased, so `+R` and `+R_A`... arrive as `r` and `r_*`.
+        // request; custom ellipsoid sizes escape the radius bound. Parameters
+        // with uppercase keys (including `+R` / `+R_A`) fail the syntax gate above.
         let blocked = ["approx", "a", "b", "rf", "f", "es", "e", "r"];
         if blocked.iter().any(|k| tokens.contains_key(*k))
             || tokens.keys().any(|k| k.starts_with("r_"))
@@ -520,17 +539,12 @@ impl TmCertificate {
             // proj4rs fixes these for UTM regardless of +k / +x_0.
             (0.9996, 500_000.0)
         } else {
-            if tokens.contains_key("k") && tokens.contains_key("k_0") {
-                return None;
-            }
-            let key = if tokens.contains_key("k_0") {
-                "k_0"
-            } else {
-                "k"
-            };
+            // proj4rs 0.1.10 reads `k0` first, then `k`; it ignores `k_0`.
+            // Match the effective projection, including coexisting aliases.
+            let key = if tokens.contains_key("k0") { "k0" } else { "k" };
             (
-                parse_opt_f64(tokens, key, 1.0)?,
-                parse_opt_f64(tokens, "x_0", 0.0)?,
+                parse_opt_f64(&tokens, key, 1.0)?,
+                parse_opt_f64(&tokens, "x_0", 0.0)?,
             )
         };
         let to_meter = from.to_meter();
@@ -591,6 +605,16 @@ impl GeoFrame {
     }
 }
 
+/// Marks a [`CrsTransformer::Proj4`] as one of the built-in EPSG:3413/3031
+/// polar stereographic definitions, whose rectangle bounds come from
+/// radial/angular extrema (see [`CrsTransformer::bounds_certified`]). It can
+/// only be created inside this crate, so a caller cannot certify an arbitrary
+/// PROJ string.
+#[derive(Debug, Clone, Copy)]
+pub struct PolarCertificate {
+    _private: (),
+}
+
 /// High-performance CRS to WGS84 coordinate transformer
 #[derive(Clone)]
 pub enum CrsTransformer {
@@ -611,6 +635,10 @@ pub enum CrsTransformer {
 
         /// Certified-bounds constants when the source is transverse Mercator.
         tm: Option<TmCertificate>,
+
+        /// Analytic radial/angular bounds for the built-in EPSG:3413/3031
+        /// definitions only. Arbitrary PROJ strings keep failing open.
+        polar: Option<PolarCertificate>,
     },
 }
 
@@ -669,14 +697,12 @@ impl CrsTransformer {
                 );
                 Self::from_proj_string(&p_str)
             }
-            3413 => {
-                let p_str = "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                Self::from_proj_string(p_str)
-            }
-            3031 => {
-                let p_str = "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
-                Self::from_proj_string(p_str)
-            }
+            3413 => Self::polar_stereographic(
+                "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            ),
+            3031 => Self::polar_stereographic(
+                "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            ),
             // Codes below carry a Helmert datum shift chosen from the EPSG
             // registry (accuracy as published there); see
             // docs/crs-and-projection.md.
@@ -931,13 +957,24 @@ impl CrsTransformer {
             ))
         })?;
 
-        let tm = TmCertificate::new(&from, &tokens);
+        let tm = TmCertificate::new(&from, src_proj);
         Ok(Self::Proj4 {
             from: Box::new(from),
             to: Box::new(to),
             geo,
             tm,
+            polar: None,
         })
+    }
+
+    /// A built-in WGS84 polar stereographic definition centred on the pole
+    /// with no false origin, the geometry [`Self::polar_rect_bounds`] assumes.
+    fn polar_stereographic(p_str: &str) -> Result<Self> {
+        let mut transformer = Self::from_proj_string(p_str)?;
+        if let Self::Proj4 { polar, .. } = &mut transformer {
+            *polar = Some(PolarCertificate { _private: () });
+        }
+        Ok(transformer)
     }
 
     /// Transform a single (x, y) point to (lon, lat) in WGS84 degrees
@@ -1036,12 +1073,20 @@ impl CrsTransformer {
 
     /// Whether [`Self::transform_rect_bounds`] is a proven enclosure of the
     /// rectangle's image. Identity, Web Mercator and Albers bounds are
-    /// analytic and transverse Mercator bounds carry a Lipschitz certificate
+    /// analytic, built-in polar stereographic bounds use radial/angular extrema,
+    /// and transverse Mercator bounds carry a Lipschitz certificate
     /// (see [`TmCertificate`]); other PROJ bounds come from finitely many
     /// samples, which can miss interior extrema and singularities however
     /// densely they are placed.
     pub fn bounds_certified(&self) -> bool {
-        !matches!(self, Self::Proj4 { tm: None, .. })
+        !matches!(
+            self,
+            Self::Proj4 {
+                tm: None,
+                polar: None,
+                ..
+            }
+        )
     }
 
     /// Bounds from [`Self::transform_rect_bounds`] that are safe to use to
@@ -1161,6 +1206,88 @@ impl CrsTransformer {
         [west, south, east, north]
     }
 
+    /// Polar stereographic inverse latitude is monotonic in radius, while
+    /// longitude is atan2(x, +/-y) plus a constant. Enclose the affine image
+    /// in a source-axis rectangle: radius is minimized at the point nearest
+    /// the origin, maximized at a corner, and angular extrema occur at
+    /// corners unless the rectangle contains the origin. This includes
+    /// rotated/sheared rasters conservatively. Only the fixed WGS84 polar
+    /// definitions may use this proof (no datum shift, offsets or axis swap).
+    fn polar_rect_bounds(
+        &self,
+        gt: &GeoTransform,
+        col: f64,
+        row: f64,
+        width: f64,
+        height: f64,
+    ) -> [f64; 4] {
+        const GLOBE: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
+        // proj4rs' inverse iteration stops at 1e-10 radians; this slack is
+        // larger in degrees and also covers floating-point corner evaluation.
+        const SLACK: f64 = 1e-7;
+        let (mut xmin, mut xmax, mut ymin, mut ymax) = (
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for (c, r) in [
+            (col, row),
+            (col + width, row),
+            (col, row + height),
+            (col + width, row + height),
+        ] {
+            let (x, y) = gt.pixel_to_coord(c, r);
+            if !x.is_finite() || !y.is_finite() {
+                return GLOBE;
+            }
+            xmin = xmin.min(x);
+            xmax = xmax.max(x);
+            ymin = ymin.min(y);
+            ymax = ymax.max(y);
+        }
+        let closest = (0.0f64.clamp(xmin, xmax), 0.0f64.clamp(ymin, ymax));
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (x, y) in [
+            (xmin, ymin),
+            (xmin, ymax),
+            (xmax, ymin),
+            (xmax, ymax),
+            closest,
+        ] {
+            let Ok((lon, lat)) = self.transform_point(x, y) else {
+                return GLOBE;
+            };
+            if !lon.is_finite() || !lat.is_finite() {
+                return GLOBE;
+            }
+            let lon = wrap_lon(lon);
+            bounds[0] = bounds[0].min(lon);
+            bounds[2] = bounds[2].max(lon);
+            bounds[1] = bounds[1].min(lat);
+            bounds[3] = bounds[3].max(lat);
+        }
+        bounds[1] = (bounds[1] - SLACK).max(-90.0);
+        bounds[3] = (bounds[3] + SLACK).min(90.0);
+        if closest == (0.0, 0.0)
+            || bounds[2] - bounds[0] >= 180.0
+            || bounds[0] - SLACK <= -180.0
+            || bounds[2] + SLACK >= 180.0
+        {
+            bounds[0] = -180.0;
+            bounds[2] = 180.0;
+        } else {
+            bounds[0] -= SLACK;
+            bounds[2] += SLACK;
+        }
+        bounds
+    }
+
     /// Calculate WGS84 [min_lon, min_lat, max_lon, max_lat] spatial bounds for a raster pixel rectangle.
     ///
     /// For EPSG:4326 and EPSG:3857 (Web Mercator), latitude is affine or monotonic in y,
@@ -1186,6 +1313,9 @@ impl CrsTransformer {
     ) -> [f64; 4] {
         if let Self::Proj4 { tm: Some(tm), .. } = self {
             return self.tm_rect_bounds(tm, gt, col, row, width, height);
+        }
+        if let Self::Proj4 { polar: Some(_), .. } = self {
+            return self.polar_rect_bounds(gt, col, row, width, height);
         }
         let p0 = gt.pixel_to_coord(col, row);
         let p1 = gt.pixel_to_coord(col + width, row);
@@ -2113,9 +2243,9 @@ mod tests {
             assert!(tf.bounds_certified(), "EPSG:{code}");
             assert_eq!(tf.rejection_bounds(b), b, "EPSG:{code}");
         }
-        let polar = CrsTransformer::from_epsg_code(3413).unwrap();
-        assert!(!polar.bounds_certified());
-        assert_eq!(polar.rejection_bounds(b), globe);
+        let lcc = CrsTransformer::from_epsg_code(2154).unwrap();
+        assert!(!lcc.bounds_certified());
+        assert_eq!(lcc.rejection_bounds(b), globe);
     }
 
     /// Deterministic uniform samples in [0, 1).
@@ -2291,7 +2421,6 @@ mod tests {
             "+proj=tmerc +lon_0=9 +R=6371000",
             "+proj=tmerc +lon_0=9 +ellps=sphere",
             "+proj=tmerc +lon_0=9 +a=6378137 +rf=298.257223563",
-            "+proj=tmerc +lon_0=9 +k=0.9996 +k_0=0.9999 +ellps=WGS84",
             "+proj=utm +zone=33 +ellps=intl +towgs84=-6000000,0,0",
             "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,0,0,0,5000",
             "+proj=utm +zone=33 +ellps=intl +towgs84=0,0,0,60,0,0,0",

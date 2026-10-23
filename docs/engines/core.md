@@ -68,10 +68,12 @@ accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`
 (`+nadgrids`, `+datum=NAD27`) are rejected. See [Datum Shifts](../crs-and-projection.md#datum-shifts).
 
 Bounds from `CrsTransformer::transform_rect_bounds` are certified only when
-`bounds_certified()` is true: analytic for the fast paths, a Lipschitz enclosure
+`bounds_certified()` is true: analytic for the fast paths and built-in EPSG:3413/3031 polar definitions, a Lipschitz enclosure
 for transverse Mercator, a sampled estimate otherwise. Code that rejects data
 from bounds (bbox pruning, overlap filtering) must pass them through
-`rejection_bounds()`, which returns the whole globe for uncertified bounds. See
+`rejection_bounds()`, which returns the whole globe for uncertified bounds.
+TM certification follows proj4rs scale precedence (`k0`, then `k`) and fails
+open for duplicate parameters or syntax it cannot interpret unambiguously. See
 [Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
 
 ## Columnar Model
