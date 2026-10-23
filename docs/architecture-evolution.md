@@ -206,7 +206,7 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 | Priority | Optimization | Target Workload | Expected Speedup | Effort |
 | :---: | :--- | :--- | :--- | :---: |
 | **P0** | **Snyder Authalic Series + `rho_sq` in `AlbersConicFast`** | Projected rasters (`EPSG:5070`) | **+20–30%** (~200–250s saved on CONUS) | Low (~50 LOC) |
-| **P1** | **2/4-Pixel Safe Stride Probing (No Binary Search)** | Fine-pixel rasters ($\text{Res} \le 9$) | **+30–45%** across WGS84 & Albers | Medium (~120 LOC) |
+| **P1 (withdrawn)** | **Endpoint-Only Stride Probing** | Not safe without a geometric certificate | Not applicable | Requires a correctness proof |
 | **P2** | **Row-Latitude Hoisting for `Wgs84Identity` + Specialized Single-Point Loop** | Native `EPSG:4326` / `EPSG:3857` | **+8–15%** (~45–75s saved on CONUS) | Low (~80 LOC) |
 | **P3** | **Parallel Column Encoding + `BYTE_STREAM_SPLIT` in CLI Parquet** | CLI Parquet export | **+10–15% speed, 6× smaller files** | Medium (~150 LOC) |
 | **P4** | **Row-Shared Trigonometric Precomputation in H3 Indexing** | North-up `EPSG:4326` / `EPSG:3857` | **+8–12%** on H3 indexing math | Medium (~150 LOC) |
@@ -223,18 +223,14 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
   2. Two iterations of Newton-Raphson, invoking **6 transcendental functions per pixel** (`2× sin`, `2× cos`, `2× ln`) in addition to `atan2` and `asin`.
 * **The Fix:**
   - Compute `rho_sq = x_p * x_p + y_p * y_p` directly, eliminating the hardware `fsqrt` instruction per pixel.
-  - Replace the 2-iteration Newton-Raphson solver with **Snyder's (1987, eq. 3-16) 3-term authalic latitude series** using precomputed ellipsoid constants $(C_1, C_2, C_3)$ evaluated via Chebyshev/angle-doubling polynomials in $\sin\beta = q / q_p$ and $\cos\beta = \sqrt{1 - \sin^2\beta}$.
-  - This replaces `2× sin`, `2× cos`, and `2× ln` with **1 `sqrt` and 6 fused multiply-adds (FMAs)** while preserving $< 0.05\text{ mm}$ geodetic accuracy on GRS80/WGS84.
+  - Replace the 2-iteration Newton-Raphson solver with a **4-term authalic latitude series** using precomputed ellipsoid constants evaluated via Chebyshev/angle-doubling polynomials in $\sin\beta = q / q_p$ and $\cos\beta = \sqrt{1 - \sin^2\beta}$.
+  - This removes the iterative `sin`, `cos`, and `ln` calls. Independent PROJ 9.5.1 forward-reference points verify inverse errors below **0.01 m**, including both signs of latitude through **89.9999°**, northern/southern parallels and false offsets. This is a tested range, not a uniform accuracy guarantee arbitrarily close to the poles, where inversion is ill-conditioned in floating point.
 
-#### 2. Safe 2-Pixel / 4-Pixel Stride Probing (Exact Endpoint Verification, No Binary Search) (`P1`)
+#### 2. Endpoint-Only Stride Probing (`P1`, withdrawn)
 * **Where:** [`crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs)
-* **Why This Differs from the Retired Binary Search Lookahead:**
-  - The retired `H3ScanlineLookahead` failed because it jumped 8–64 pixels ahead across curved scanlines where a scanline could graze, exit, and re-enter a hexagon, and used branch-heavy binary search to find boundaries.
-  - Because an H3 cell is strictly convex in gnomonic face space (and at Resolution $\le 11$, a hexagon is $\ge 50\text{ m}$ wide while CONUS pixels are $30\text{ m}$), a short 2-pixel or 4-pixel span on a single raster row cannot exit and re-enter the same cell (the chord sagitta over 4 pixels $= 120\text{ m}$ on Albers is $< 10^{-4}\text{ mm}$).
-* **The Fix:**
-  - When two consecutive pixels `(c - 1, c)` land in the same H3 cell `H`, probe `c + 2` (or `c + 4` when pixel scale is $\le \frac{1}{4}$ of the H3 edge length).
-  - If `cell_at(c + 2) == H` and intermediate pixels are valid, accumulate `[c..=c+2]` directly via `accumulate_span`; if `cell_at(c + 2) != H`, fall back to evaluating `c + 1` directly (zero binary search loop, predictable branches, zero re-entry risk).
-* **Estimated Impact:** Cuts `h3o::LatLng::to_cell` and CRS projection invocations by **2× to 3.5×** on fine-pixel rasters at Resolution $\le 9$.
+* **Correctness finding:** Short probes have the same re-entry problem as the retired binary-search lookahead. A five-pixel scanline can index as `A, A, B, A, A`, including at resolution 9; equal endpoints do not certify intermediate assignments. Convexity in gnomonic face space does not make a projected raster row a straight line in that space.
+* **Boundary finding:** Bisecting a three-column probe also cannot infer an unchecked pixel's cell from the midpoint and endpoint. For `A, A, A, A, A, B, A, C, C`, the midpoint is `A` and the next probe agrees with the `C` endpoint, but skipping the unchecked `B` still misassigns it to `A`.
+* **Current implementation:** Index every valid sample at every requested resolution, then batch only verified same-cell spans. Keep the Albers authalic series, row-invariant projection hoisting, and single-point loop specialization. Any future skipping requires a conservative geometric certificate, not endpoint equality.
 
 #### 3. Extend Row-Invariant Latitude Hoisting to `Wgs84Identity` & Specialize the Single-Point `walk` Loop (`P2`)
 * **Where:** [`crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs) (`SampleProjector` and `walk`)
@@ -274,9 +270,9 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 
 ---
 
-### Measured Results: `P0` + `P1` Implementation (`perf/p0-p1-snyder-stride`)
+### Historical Results: Original `P0` + `P1` Implementation (`perf/p0-p1-snyder-stride`)
 
-Implementing **P0** (4-term Chebyshev Horner authalic series + `rho_sq` + row-hoisted `y_p` in [`transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs)) and **P1** (safe 2/3-pixel bisected stride probing + row-hoisted `Wgs84Identity` latitude in [`walker.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs)) delivered the following measured improvements with **100% exact H3 cell and statistical parity**:
+These reported measurements used the original endpoint-probing implementation, which was subsequently found to misassign pixels and removed. They are retained as historical data, **not performance results for the corrected implementation or evidence of general exactness**. Matching row counts alone does not prove matching cell statistics; the reported Hawaii parity applies only to those sampled workloads. The corrected implementation retains **P0** (the 4-term authalic series and `rho_sq`) and row-invariant projection hoisting, but indexes every sample exactly. Updated end-to-end benchmarks are needed before claiming its speedup.
 
 #### 1. Full CONUS Resolution 9 Benchmarks (Polars 2.0, `/usr/bin/time -l`)
 
@@ -300,5 +296,3 @@ Implementing **P0** (4-term Chebyshev Horner authalic series + `rho_sq` + row-ho
 | **CFL WGS84 (`EPSG:4326`), Res 9 [Parquet]** | 2.642 s | **1.925 s** | **1.37×** | **-27.1%** | 212,042 (`exact=True`) |
 | **FBFM40 Categorical Albers, Res 8 [Parquet]** | 22.484 s | **8.848 s** | **2.54×** | **-60.6%** | 273,840 (`exact=True`) |
 | **FBFM40 Categorical WGS84, Res 8 [Parquet]** | 18.214 s | **10.053 s** | **1.81×** | **-44.8%** | 273,840 (`exact=True`) |
-
-
