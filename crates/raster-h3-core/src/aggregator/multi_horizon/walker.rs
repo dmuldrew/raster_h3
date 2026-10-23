@@ -224,6 +224,274 @@ fn walk<T, Acc, E, N, R>(
         // Invalid pixels may sit inside a span; the span kernels skip them.
         let mut span_start: Option<usize> = None;
 
+        if batch && ctx.owner.is_none() && ctx.bbox.is_none() && !cfg!(feature = "stream-profile") {
+            let sp = ctx.sampling.points[0];
+            let col_offset = chunk.col_offset as usize;
+            if num_res == 1 {
+                let res0 = ctx.resolutions[0];
+                let map0 = &mut maps[0];
+                let mut same_cell_streak: usize = 0;
+                let mut c = cols.start;
+                let project_cell =
+                    |col_idx: usize, projector: &SampleProjector<'_>| -> Option<u64> {
+                        let (lon, lat) = projector.project(col_idx, row_idx, 0, sp)?;
+                        if !(-90.0..=90.0).contains(&lat) {
+                            return None;
+                        }
+                        let ll = LatLng::new(lat, lon).ok()?;
+                        Some(u64::from(super::profile::index(ll, res0)))
+                    };
+
+                while c < cols.end {
+                    if read(&row[c * spp..(c + 1) * spp]).is_none() {
+                        c += 1;
+                        continue;
+                    }
+
+                    if same_cell_streak >= 2 && span_start.is_some() {
+                        let cur_cell = runs.cells[0].unwrap();
+                        let stride_step = if same_cell_streak >= 5 { 3 } else { 2 };
+                        let c_probe = c + stride_step;
+                        if c_probe < cols.end
+                            && (c + 1..=c_probe)
+                                .all(|idx| read(&row[idx * spp..(idx + 1) * spp]).is_some())
+                        {
+                            if let Some(probe_cell) = project_cell(col_offset + c_probe, &projector)
+                            {
+                                if probe_cell == cur_cell {
+                                    same_cell_streak += stride_step + 1;
+                                    c = c_probe + 1;
+                                    continue;
+                                }
+                                // Boundary lies inside c..=c_probe. Bisect at c + 1:
+                                if let Some(mid_cell) = project_cell(col_offset + c + 1, &projector)
+                                {
+                                    if mid_cell == cur_cell {
+                                        // c and c + 1 are both in cur_cell (skip c!).
+                                        if stride_step == 2 {
+                                            if let Some(s) = span_start.take() {
+                                                runs.add_span(&row[s..c + 2], engine);
+                                            }
+                                            runs.restart(0, probe_cell, engine, map0);
+                                            span_start = Some(c + 2);
+                                            same_cell_streak = 1;
+                                            c = c_probe + 1;
+                                            continue;
+                                        } else if let Some(cell_c2) =
+                                            project_cell(col_offset + c + 2, &projector)
+                                        {
+                                            if cell_c2 == cur_cell {
+                                                if let Some(s) = span_start.take() {
+                                                    runs.add_span(&row[s..c + 3], engine);
+                                                }
+                                                runs.restart(0, probe_cell, engine, map0);
+                                                span_start = Some(c + 3);
+                                                same_cell_streak = 1;
+                                                c = c_probe + 1;
+                                                continue;
+                                            } else if cell_c2 == probe_cell {
+                                                if let Some(s) = span_start.take() {
+                                                    runs.add_span(&row[s..c + 2], engine);
+                                                }
+                                                runs.restart(0, probe_cell, engine, map0);
+                                                span_start = Some(c + 2);
+                                                same_cell_streak = 2;
+                                                c = c_probe + 1;
+                                                continue;
+                                            }
+                                        }
+                                    } else if mid_cell == probe_cell {
+                                        // c + 1 ..= c_probe are all in probe_cell (skip c + 2 when stride_step == 3!).
+                                        if let Some(cell_c0) =
+                                            project_cell(col_offset + c, &projector)
+                                        {
+                                            if cell_c0 == cur_cell {
+                                                if let Some(s) = span_start.take() {
+                                                    runs.add_span(&row[s..c + 1], engine);
+                                                }
+                                                runs.restart(0, probe_cell, engine, map0);
+                                                span_start = Some(c + 1);
+                                                same_cell_streak = stride_step;
+                                                c = c_probe + 1;
+                                                continue;
+                                            } else if cell_c0 == probe_cell {
+                                                if let Some(s) = span_start.take() {
+                                                    runs.add_span(&row[s..c], engine);
+                                                }
+                                                runs.restart(0, probe_cell, engine, map0);
+                                                span_start = Some(c);
+                                                same_cell_streak = stride_step + 1;
+                                                c = c_probe + 1;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let Some(cell) = project_cell(col_offset + c, &projector) else {
+                        if let Some(s) = span_start.take() {
+                            runs.add_span(&row[s..c], engine);
+                        }
+                        same_cell_streak = 0;
+                        c += 1;
+                        continue;
+                    };
+                    if Some(cell) != runs.cells[0] {
+                        if let Some(s) = span_start.take() {
+                            runs.add_span(&row[s..c], engine);
+                        }
+                        runs.restart(0, cell, engine, map0);
+                        same_cell_streak = 1;
+                    } else {
+                        same_cell_streak += 1;
+                    }
+                    span_start.get_or_insert(c);
+                    c += 1;
+                }
+                if let Some(s) = span_start {
+                    runs.add_span(&row[s..cols.end], engine);
+                }
+                continue;
+            }
+
+            let mut probe_cells = vec![0u64; num_res];
+            let mut same_cell_streak: usize = 0;
+            let mut c = cols.start;
+
+            while c < cols.end {
+                if read(&row[c * spp..(c + 1) * spp]).is_none() {
+                    c += 1;
+                    continue;
+                }
+
+                // Safe 2/3-pixel stride probing once inside a verified cell interior run (>= 2 px).
+                if same_cell_streak >= 2 && span_start.is_some() {
+                    let stride_step = if same_cell_streak >= 5 { 3 } else { 2 };
+                    let c_probe = c + stride_step;
+                    if c_probe < cols.end
+                        && (c + 1..=c_probe)
+                            .all(|idx| read(&row[idx * spp..(idx + 1) * spp]).is_some())
+                    {
+                        let col_probe = col_offset + c_probe;
+                        let probe_ok = projector
+                            .project(col_probe, row_idx, 0, sp)
+                            .filter(|&(_, lat)| (-90.0..=90.0).contains(&lat))
+                            .and_then(|(lon, lat)| LatLng::new(lat, lon).ok());
+                        if let Some(ll_probe) = probe_ok {
+                            let mut probe_changed = false;
+                            for (i, &res) in ctx.resolutions.iter().enumerate() {
+                                let cell = u64::from(super::profile::index(ll_probe, res));
+                                probe_cells[i] = cell;
+                                probe_changed |= Some(cell) != runs.cells[i];
+                            }
+                            if !probe_changed {
+                                same_cell_streak += stride_step + 1;
+                                c = c_probe + 1;
+                                continue;
+                            }
+                            // Probe crossed a cell boundary: resolve intermediate pixels c..c_probe
+                            // exactly and then reuse `probe_cells` at `c_probe` with zero wasted work.
+                            for k in c..c_probe {
+                                let col_k = col_offset + k;
+                                let Some(ll_k) = projector
+                                    .project(col_k, row_idx, 0, sp)
+                                    .filter(|&(_, lat)| (-90.0..=90.0).contains(&lat))
+                                    .and_then(|(lon, lat)| LatLng::new(lat, lon).ok())
+                                else {
+                                    if let Some(s) = span_start.take() {
+                                        runs.add_span(&row[s..k], engine);
+                                    }
+                                    same_cell_streak = 0;
+                                    continue;
+                                };
+                                let mut changed_k = false;
+                                for (i, &res) in ctx.resolutions.iter().enumerate() {
+                                    cells[i] = u64::from(super::profile::index(ll_k, res));
+                                    changed_k |= Some(cells[i]) != runs.cells[i];
+                                }
+                                if changed_k {
+                                    if let Some(s) = span_start.take() {
+                                        runs.add_span(&row[s..k], engine);
+                                    }
+                                    for (i, map) in maps.iter_mut().enumerate() {
+                                        if Some(cells[i]) != runs.cells[i] {
+                                            runs.restart(i, cells[i], engine, map);
+                                        }
+                                    }
+                                    same_cell_streak = 1;
+                                } else {
+                                    same_cell_streak += 1;
+                                }
+                                span_start.get_or_insert(k);
+                            }
+                            // Apply precomputed `probe_cells` at `c_probe`
+                            let mut changed_probe = false;
+                            for i in 0..num_res {
+                                changed_probe |= Some(probe_cells[i]) != runs.cells[i];
+                            }
+                            if changed_probe {
+                                if let Some(s) = span_start.take() {
+                                    runs.add_span(&row[s..c_probe], engine);
+                                }
+                                for (i, map) in maps.iter_mut().enumerate() {
+                                    if Some(probe_cells[i]) != runs.cells[i] {
+                                        runs.restart(i, probe_cells[i], engine, map);
+                                    }
+                                }
+                                same_cell_streak = 1;
+                            } else {
+                                same_cell_streak += 1;
+                            }
+                            span_start.get_or_insert(c_probe);
+                            c = c_probe + 1;
+                            continue;
+                        }
+                    }
+                }
+
+                let col = col_offset + c;
+                let Some(ll) = projector
+                    .project(col, row_idx, 0, sp)
+                    .filter(|&(_, lat)| (-90.0..=90.0).contains(&lat))
+                    .and_then(|(lon, lat)| LatLng::new(lat, lon).ok())
+                else {
+                    if let Some(s) = span_start.take() {
+                        runs.add_span(&row[s..c], engine);
+                    }
+                    same_cell_streak = 0;
+                    c += 1;
+                    continue;
+                };
+                let mut changed = false;
+                for (i, &res) in ctx.resolutions.iter().enumerate() {
+                    cells[i] = u64::from(super::profile::index(ll, res));
+                    changed |= Some(cells[i]) != runs.cells[i];
+                }
+                if changed {
+                    if let Some(s) = span_start.take() {
+                        runs.add_span(&row[s..c], engine);
+                    }
+                    for (i, map) in maps.iter_mut().enumerate() {
+                        if Some(cells[i]) != runs.cells[i] {
+                            runs.restart(i, cells[i], engine, map);
+                        }
+                    }
+                    same_cell_streak = 1;
+                } else {
+                    same_cell_streak += 1;
+                }
+                span_start.get_or_insert(c);
+                c += 1;
+            }
+            if let Some(s) = span_start {
+                runs.add_span(&row[s..cols.end], engine);
+            }
+            continue;
+        }
+
         for c in cols.clone() {
             let Some(sample) = read(&row[c * spp..(c + 1) * spp]) else {
                 continue;
@@ -307,26 +575,36 @@ fn walk<T, Acc, E, N, R>(
     runs.finish(engine, maps);
 }
 
-/// Projects sample positions to WGS84. On north-up Web Mercator grids a
-/// sample's latitude depends only on its row and vertical offset, so it is
-/// computed once per row and offset rather than per sample. Both paths
-/// evaluate identical expressions, so results are bit-for-bit equal.
+/// Projects sample positions to WGS84. On north-up WGS84, Web Mercator, and
+/// Albers Conic grids, row-dependent terms (`lat` or Albers `y_p`) depend only
+/// on the row and vertical offset, so they are computed once per row rather
+/// than per sample.
 struct SampleProjector<'a> {
     transformer: CoordinateTransformer<'a>,
     gt: &'a GeoTransform,
-    /// Latitude of each sampling point on the current row (Web Mercator only).
+    /// Latitude of each sampling point on the current row (Web Mercator or WGS84).
     row_lats: Option<Vec<f64>>,
+    is_wgs84: bool,
+    /// Precomputed `(y_p, y_p^2)` per sampling point on the current row (Albers Conic).
+    row_albers_yp: Option<Vec<(f64, f64)>>,
 }
 
 impl<'a> SampleProjector<'a> {
     fn new(ctx: &WalkContext<'a>) -> Self {
-        let mercator = matches!(ctx.crs, CrsTransformer::WebMercatorFast)
-            && ctx.gt.b == 0.0
-            && ctx.gt.d == 0.0;
+        let ortho = ctx.gt.b == 0.0 && ctx.gt.d == 0.0;
+        let mercator = ortho && matches!(ctx.crs, CrsTransformer::WebMercatorFast);
+        let wgs84 = ortho
+            && !cfg!(feature = "stream-profile")
+            && matches!(ctx.crs, CrsTransformer::Wgs84Identity);
+        let albers = ortho
+            && !cfg!(feature = "stream-profile")
+            && matches!(ctx.crs, CrsTransformer::AlbersConic(_));
         Self {
             transformer: CoordinateTransformer::new(ctx.gt, ctx.crs),
             gt: ctx.gt,
-            row_lats: mercator.then(|| Vec::with_capacity(ctx.sampling.points.len())),
+            row_lats: (mercator || wgs84).then(|| Vec::with_capacity(ctx.sampling.points.len())),
+            is_wgs84: wgs84,
+            row_albers_yp: albers.then(|| Vec::with_capacity(ctx.sampling.points.len())),
         }
     }
 
@@ -334,9 +612,25 @@ impl<'a> SampleProjector<'a> {
         if let Some(lats) = &mut self.row_lats {
             lats.clear();
             // With no column rotation (d == 0), y does not depend on the column.
-            lats.extend(ctx.sampling.points.iter().map(|sp| {
+            if self.is_wgs84 {
+                lats.extend(ctx.sampling.points.iter().map(|sp| {
+                    let (_, y) = self.gt.pixel_to_coord(0.0, row_idx as f64 + sp.dy);
+                    y
+                }));
+            } else {
+                lats.extend(ctx.sampling.points.iter().map(|sp| {
+                    let (_, y) = self.gt.pixel_to_coord(0.0, row_idx as f64 + sp.dy);
+                    web_mercator_lat(y)
+                }));
+            }
+        }
+        if let (Some(yps), CrsTransformer::AlbersConic(albers)) = (&mut self.row_albers_yp, ctx.crs)
+        {
+            yps.clear();
+            yps.extend(ctx.sampling.points.iter().map(|sp| {
                 let (_, y) = self.gt.pixel_to_coord(0.0, row_idx as f64 + sp.dy);
-                web_mercator_lat(y)
+                let y_p = albers.rho0 - (y - albers.y_0);
+                (y_p, y_p * y_p)
             }));
         }
     }
@@ -347,15 +641,28 @@ impl<'a> SampleProjector<'a> {
     /// succeed always return a finite latitude in [-90, 90].
     #[inline(always)]
     fn project(&self, col: usize, row_idx: usize, k: usize, sp: SamplePoint) -> Option<(f64, f64)> {
-        match &self.row_lats {
-            Some(lats) => {
-                let (x, _) = self
-                    .gt
-                    .pixel_to_coord(col as f64 + sp.dx, row_idx as f64 + sp.dy);
-                Some((web_mercator_lon(x), lats[k]))
-            }
-            None => self.transformer.subpixel_to_wgs84(col, row_idx, sp).ok(),
+        if let Some(lats) = &self.row_lats {
+            let (x, _) = self
+                .gt
+                .pixel_to_coord(col as f64 + sp.dx, row_idx as f64 + sp.dy);
+            let lon = if self.is_wgs84 {
+                x
+            } else {
+                web_mercator_lon(x)
+            };
+            return Some((lon, lats[k]));
         }
+        if let (Some(yps), CrsTransformer::AlbersConic(albers)) =
+            (&self.row_albers_yp, self.transformer.crs_transformer)
+        {
+            let (x, _) = self
+                .gt
+                .pixel_to_coord(col as f64 + sp.dx, row_idx as f64 + sp.dy);
+            let (y_p, y_p_sq) = yps[k];
+            let (lon, lat) = albers.transform_with_yp(x, y_p, y_p_sq);
+            return (lon.is_finite() && lat.is_finite()).then_some((lon, lat));
+        }
+        self.transformer.subpixel_to_wgs84(col, row_idx, sp).ok()
     }
 }
 

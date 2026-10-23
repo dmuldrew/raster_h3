@@ -56,6 +56,14 @@ pub struct AlbersConicFast {
     pub a: f64,
     /// Authalic latitude parameter at poles.
     pub qp: f64,
+    /// Precomputed 1 / n.
+    pub inv_n: f64,
+    /// Precomputed (n / a)^2.
+    pub n_over_a_sq: f64,
+    /// Precomputed 1 / qp.
+    pub inv_qp: f64,
+    /// Horner coefficients for 4-term authalic-to-geodetic latitude series in cos(2*beta).
+    pub apa: [f64; 4],
 }
 
 /// Tokenize a PROJ string into key-value pairs.
@@ -184,6 +192,23 @@ impl AlbersConicFast {
         let c = m1 * m1 + n * q1;
         let rho0 = a * (c - n * q0).max(0.0).sqrt() / n;
 
+        let e4 = e2 * e2;
+        let e6 = e4 * e2;
+        let e8 = e4 * e4;
+        // 4-term authalic-to-geodetic latitude series (Snyder 1987 eq. 3-16 + e^8 term):
+        // phi = beta + p1*sin(2*beta) + p2*sin(4*beta) + p3*sin(6*beta) + p4*sin(8*beta)
+        let p1 = (1.0 / 3.0) * e2
+            + (31.0 / 180.0) * e4
+            + (517.0 / 5040.0) * e6
+            + (120389.0 / 1814400.0) * e8;
+        let p2 = (23.0 / 360.0) * e4 + (251.0 / 3780.0) * e6 + (102283.0 / 1814400.0) * e8;
+        let p3 = (761.0 / 45360.0) * e6 + (47561.0 / 1814400.0) * e8;
+        let p4 = (6059.0 / 1209600.0) * e8;
+        // Chebyshev Horner form in c2 = cos(2*beta) = 1 - 2*sin^2(beta):
+        // sum = sin(2*beta) * (apa[0] + c2 * (apa[1] + c2 * (apa[2] + c2 * apa[3])))
+        let apa = [p1 - p3, 2.0 * p2 - 4.0 * p4, 4.0 * p3, 8.0 * p4];
+        let n_over_a = n / a;
+
         Self {
             lat_origin_rad: phi0,
             lon_origin_rad: lam0,
@@ -196,6 +221,10 @@ impl AlbersConicFast {
             e2,
             a,
             qp,
+            inv_n: 1.0 / n,
+            n_over_a_sq: n_over_a * n_over_a,
+            inv_qp: 1.0 / qp,
+            apa,
         }
     }
 
@@ -343,41 +372,36 @@ impl AlbersConicFast {
     /// Analytical inverse transformation from projected (x, y) to (lon, lat) in WGS84 degrees
     #[inline(always)]
     pub fn transform_point(&self, x: f64, y: f64) -> (f64, f64) {
-        let x_p = x - self.x_0;
         let y_p = self.rho0 - (y - self.y_0);
-        let rho = (x_p * x_p + y_p * y_p).sqrt();
+        self.transform_with_yp(x, y_p, y_p * y_p)
+    }
+
+    /// Analytical inverse transformation when `y_p = rho0 - (y - y_0)` and `y_p_sq = y_p * y_p`
+    /// have already been hoisted for a constant-Y scanline row.
+    #[inline(always)]
+    pub fn transform_with_yp(&self, x: f64, y_p: f64, y_p_sq: f64) -> (f64, f64) {
+        let x_p = x - self.x_0;
+        let rho_sq = x_p.mul_add(x_p, y_p_sq);
         let theta = if self.n >= 0.0 {
             x_p.atan2(y_p)
         } else {
             (-x_p).atan2(-y_p)
         };
 
-        let lon_rad = self.lon_origin_rad + theta / self.n;
-        let q = (self.c - (rho * rho * self.n * self.n) / (self.a * self.a)) / self.n;
+        let lon_rad = self.lon_origin_rad + theta * self.inv_n;
+        let q = (self.c - rho_sq * self.n_over_a_sq) * self.inv_n;
 
-        // Newton-Raphson inverse for latitude from q
-        let sin_beta = (q / self.qp).clamp(-1.0, 1.0);
-        let mut phi = sin_beta.asin();
-
-        // 2 iterations of Newton-Raphson provide nanometer precision
-        for _ in 0..2 {
-            let sin_phi = phi.sin();
-            let cos_phi = phi.cos();
-            if cos_phi.abs() < 1e-12 {
-                break;
-            }
-            let e_sin = self.e * sin_phi;
-            let one_minus_e2_sin2 = 1.0 - e_sin * e_sin;
-            let ratio: f64 = (1.0 - e_sin) / (1.0 + e_sin);
-            let q_curr = (1.0 - self.e2)
-                * (sin_phi / one_minus_e2_sin2 - (1.0 / (2.0 * self.e)) * ratio.ln());
-            let dq_dphi = 2.0 * (1.0 - self.e2) * cos_phi / (one_minus_e2_sin2 * one_minus_e2_sin2);
-            let delta = (q - q_curr) / dq_dphi;
-            phi += delta;
-            if delta.abs() < 1e-12 {
-                break;
-            }
-        }
+        // 4-term Chebyshev Horner series from authalic sin(beta) = q / qp to geodetic phi
+        let sin_beta = (q * self.inv_qp).clamp(-1.0, 1.0);
+        let sin2_beta = sin_beta * sin_beta;
+        let cos_beta = (1.0 - sin2_beta).sqrt();
+        let s2 = 2.0 * sin_beta * cos_beta;
+        let c2 = 1.0 - 2.0 * sin2_beta;
+        let poly = self.apa[3]
+            .mul_add(c2, self.apa[2])
+            .mul_add(c2, self.apa[1])
+            .mul_add(c2, self.apa[0]);
+        let phi = s2.mul_add(poly, sin_beta.asin());
 
         let lon_deg = lon_rad * RAD_TO_DEG;
         let lat_deg = phi * RAD_TO_DEG;

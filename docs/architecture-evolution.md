@@ -272,3 +272,33 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 * **The Fix:**
   - Evict from `ShardedEvictionMap` directly into columnar SoA slabs (`ColumnBatchSlab`) with column projection pushed down into eviction (e.g., when a query only selects `h3_index, min, max, mean`, never compute or copy `stddev`, `variance`, `sum`, `ValidCount`, or `Coverage`).
 
+---
+
+### Measured Results: `P0` + `P1` Implementation (`perf/p0-p1-snyder-stride`)
+
+Implementing **P0** (4-term Chebyshev Horner authalic series + `rho_sq` + row-hoisted `y_p` in [`transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs)) and **P1** (safe 2/3-pixel bisected stride probing + row-hoisted `Wgs84Identity` latitude in [`walker.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs)) delivered the following measured improvements with **100% exact H3 cell and statistical parity**:
+
+#### 1. Full CONUS Resolution 9 Benchmarks (Polars 2.0, `/usr/bin/time -l`)
+
+| Dataset | Metric | Baseline (`v0.4.0`) | P0 + P1 (`perf/p0-p1-snyder-stride`) | Measured Improvement |
+| :--- | :--- | ---: | ---: | :--- |
+| **`BP_CONUS.tif`**<br/>*(Albers `EPSG:5070`, 24.4 GB, 15.87B px)* | **Wall-Clock Time**<br/>**User CPU Time**<br/>**Sustained Throughput**<br/>**Peak RSS**<br/>**H3 Row Count** | 908.05 s (~15.1 min)<br/>4,333.14 s<br/>17.48 Mpix/s<br/>2,458.6 MB<br/>74,440,878 | **578.76 s (~9.6 min)**<br/>**1,983.15 s**<br/>**27.42 Mpix/s**<br/>**2,307.4 MB**<br/>**74,440,878** | **1.57× faster (-36.3% / -329.3 s)**<br/>**2.18× less User CPU (-54.2%)**<br/>**+56.9% throughput**<br/>**-6.2% (-151 MB)**<br/>**100% Exact Match** |
+| **`BP_CONUS_wgs84_tiled.tif`**<br/>*(WGS84 `EPSG:4326`, 21.0 GB, 18.22B px)* | **Wall-Clock Time**<br/>**User CPU Time**<br/>**Sustained Throughput**<br/>**Peak RSS**<br/>**H3 Row Count** | 532.40 s (~8.9 min)<br/>2,794.64 s<br/>34.23 Mpix/s<br/>4,239.8 MB<br/>74,441,152 | **421.11 s (~7.0 min)**<br/>**1,555.86 s**<br/>**43.27 Mpix/s**<br/>**2,193.9 MB**<br/>**74,441,152** | **1.26× faster (-20.9% / -111.3 s)**<br/>**1.80× less User CPU (-44.3%)**<br/>**+26.4% throughput**<br/>**-48.3% (-2.05 GB)**<br/>**100% Exact Match** |
+
+#### 2. Hawaii Continuous & Categorical Benchmark Suite (Median of 3 Runs)
+
+| Workload | Baseline (`v0.4.0`) | P0 + P1 (`perf/p0-p1-snyder-stride`) | Speedup | Runtime Reduction | H3 Row Parity |
+| :--- | ---: | ---: | :---: | :---: | :---: |
+| **CFL Albers (`EPSG:5070`), Res 8 [IPC]** | 3.312 s | **1.554 s** | **2.13×** | **-53.1%** | — |
+| **CFL Albers (`EPSG:5070`), Res 9 [IPC]** | 4.069 s | **2.073 s** | **1.96×** | **-49.1%** | — |
+| **CFL Albers (`EPSG:5070`), Res 6,8,10 [IPC]** | 10.941 s | **9.194 s** | **1.19×** | **-16.0%** | — |
+| **CFL WGS84 (`EPSG:4326`), Res 8 [IPC]** | 2.224 s | **1.300 s** | **1.71×** | **-41.5%** | — |
+| **CFL WGS84 (`EPSG:4326`), Res 9 [IPC]** | 2.636 s | **1.944 s** | **1.36×** | **-26.3%** | — |
+| **CFL Albers (`EPSG:5070`), Res 8 [Parquet]** | 3.176 s | **1.474 s** | **2.15×** | **-53.6%** | 30,958 (`exact=True`) |
+| **CFL Albers (`EPSG:5070`), Res 9 [Parquet]** | 3.738 s | **2.237 s** | **1.67×** | **-40.1%** | 212,029 (`exact=True`) |
+| **CFL WGS84 (`EPSG:4326`), Res 8 [Parquet]** | 2.337 s | **1.294 s** | **1.81×** | **-44.6%** | 30,959 (`exact=True`) |
+| **CFL WGS84 (`EPSG:4326`), Res 9 [Parquet]** | 2.642 s | **1.925 s** | **1.37×** | **-27.1%** | 212,042 (`exact=True`) |
+| **FBFM40 Categorical Albers, Res 8 [Parquet]** | 22.484 s | **8.848 s** | **2.54×** | **-60.6%** | 273,840 (`exact=True`) |
+| **FBFM40 Categorical WGS84, Res 8 [Parquet]** | 18.214 s | **10.053 s** | **1.81×** | **-44.8%** | 273,840 (`exact=True`) |
+
+
