@@ -251,6 +251,16 @@ impl LatLng {
         self,
         resolutions: impl IntoIterator<Item = Resolution>,
     ) -> impl Iterator<Item = CellIndex> {
+        self.to_face_ijks(resolutions)
+            .map(|(fijk, resolution)| fijk.to_cell(resolution))
+    }
+
+    /// Returns the `FaceIJK` address of the location at each resolution,
+    /// sharing the resolution-independent projection work.
+    fn to_face_ijks(
+        self,
+        resolutions: impl IntoIterator<Item = Resolution>,
+    ) -> impl Iterator<Item = (FaceIJK, Resolution)> {
         let value = Vec3d::from(self);
         let (face, distance) = value.closest_face();
         let projection = FaceProjection::new(value, face, distance);
@@ -262,7 +272,7 @@ impl LatLng {
             let coord = projection.to_vec2d_with(resolution, |theta| {
                 *sin_cos_by_class[class].get_or_insert_with(|| sin_cos(theta))
             });
-            FaceIJK::new(face, coord.into()).to_cell(resolution)
+            (FaceIJK::new(face, coord.into()), resolution)
         })
     }
 
@@ -271,6 +281,74 @@ impl LatLng {
         debug_assert!(lat.is_finite() && lng.is_finite());
 
         Self { lat, lng }
+    }
+}
+
+/// Indexes a sequence of nearby locations, such as the pixels of a raster
+/// scanline.
+///
+/// The cell index of a location is a function of the face-centered `IJK`
+/// coordinates of its containing cell, which consecutive nearby locations
+/// usually share. The indexer remembers the last coordinates and cell at each
+/// resolution and only encodes a new cell index when they change. Every
+/// returned cell is identical to [`LatLng::to_cell`].
+///
+/// # Example
+///
+/// ```
+/// use h3o::{LatLng, LatLngIndexer, Resolution};
+///
+/// let mut indexer = LatLngIndexer::new();
+/// for lng in [2.3490, 2.3491, 2.3492] {
+///     let ll = LatLng::new(48.8647, lng)?;
+///     let cell = indexer.to_cell(ll, Resolution::Nine);
+///     assert_eq!(cell, ll.to_cell(Resolution::Nine));
+/// }
+/// # Ok::<(), h3o::error::InvalidLatLng>(())
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct LatLngIndexer {
+    /// Last `FaceIJK` address and cell at each resolution.
+    last: [Option<(FaceIJK, CellIndex)>; h3o_bit::MAX_RESOLUTION as usize + 1],
+}
+
+impl LatLngIndexer {
+    /// Initializes an indexer with no remembered cells.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Indexes the location at the specified resolution.
+    ///
+    /// Equivalent to [`LatLng::to_cell`].
+    pub fn to_cell(&mut self, ll: LatLng, resolution: Resolution) -> CellIndex {
+        let fijk = FaceIJK::from_vec3d(Vec3d::from(ll), resolution);
+        self.encode(fijk, resolution)
+    }
+
+    /// Indexes the location at each of the specified resolutions.
+    ///
+    /// Equivalent to [`LatLng::to_cells`].
+    pub fn to_cells(
+        &mut self,
+        ll: LatLng,
+        resolutions: impl IntoIterator<Item = Resolution>,
+    ) -> impl Iterator<Item = CellIndex> {
+        ll.to_face_ijks(resolutions)
+            .map(|(fijk, resolution)| self.encode(fijk, resolution))
+    }
+
+    fn encode(&mut self, fijk: FaceIJK, resolution: Resolution) -> CellIndex {
+        let last = &mut self.last[usize::from(resolution)];
+        match *last {
+            Some((last_fijk, cell)) if last_fijk == fijk => cell,
+            _ => {
+                let cell = fijk.to_cell(resolution);
+                *last = Some((fijk, cell));
+                cell
+            }
+        }
     }
 }
 

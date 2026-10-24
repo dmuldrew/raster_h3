@@ -1,6 +1,6 @@
 //! Per-worker instrumentation. Enable `stream-profile` for counters and stage
 //! timers; normal builds compile hot-path measurement out entirely.
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution};
 use serde::Serialize;
 #[cfg(feature = "stream-profile")]
 use std::cell::Cell;
@@ -70,14 +70,20 @@ pub fn index(ll: LatLng, res: Resolution) -> CellIndex {
     });
     result
 }
-/// Index one point at every resolution, sharing h3o's projection work.
+/// Index one point at every resolution, sharing h3o's projection work and
+/// reusing the indexer's last cell where the point's grid cell is unchanged.
 #[inline(always)]
-pub fn index_all(ll: LatLng, resolutions: &[Resolution], cells: &mut [u64]) {
+pub fn index_all(
+    indexer: &mut LatLngIndexer,
+    ll: LatLng,
+    resolutions: &[Resolution],
+    cells: &mut [u64],
+) {
     #[cfg(feature = "stream-profile")]
     let start = std::time::Instant::now();
     for (cell, index) in cells
         .iter_mut()
-        .zip(ll.to_cells(resolutions.iter().copied()))
+        .zip(indexer.to_cells(ll, resolutions.iter().copied()))
     {
         *cell = u64::from(index);
     }

@@ -1,7 +1,14 @@
 diff --git a/benches/h3/latlng_to_cell.rs b/benches/h3/latlng_to_cell.rs
-index 3a99eac..82c9001 100644
+index 3a99eac..f2771a1 100644
 --- a/benches/h3/latlng_to_cell.rs
 +++ b/benches/h3/latlng_to_cell.rs
+@@ -1,5 +1,5 @@
+ use criterion::{Bencher, BenchmarkId, Criterion};
+-use h3o::{LatLng, Resolution};
++use h3o::{LatLng, LatLngIndexer, Resolution};
+ use std::hint::black_box;
+ 
+ pub fn bench(c: &mut Criterion) {
 @@ -34,6 +34,43 @@ pub fn bench(c: &mut Criterion) {
      }
  
@@ -46,8 +53,87 @@ index 3a99eac..82c9001 100644
  }
  
  // -----------------------------------------------------------------------------
+@@ -57,3 +94,66 @@ fn bench_h3(b: &mut Bencher<'_>, ll: LatLng, resolution: u8) {
+         )
+     })
+ }
++
++pub fn bench_scanline(c: &mut Criterion) {
++    // One 30 m raster scanline of 1000 points.
++    let row = (0..1000)
++        .map(|col| {
++            LatLng::new(39.7, -105.0 + f64::from(col) * 3.5e-4).expect("ll")
++        })
++        .collect::<Vec<_>>();
++    let mut group = c.benchmark_group("latLngScanline");
++    for resolutions in [&[9][..], &[6, 8, 10]] {
++        let resolutions = resolutions
++            .iter()
++            .map(|&res| Resolution::try_from(res).expect("resolution"))
++            .collect::<Vec<_>>();
++        let id = format!("{resolutions:?}");
++        group.bench_with_input(
++            BenchmarkId::new("h3o/to_cell", &id),
++            &resolutions,
++            |b, resolutions| {
++                b.iter(|| {
++                    for &ll in &row {
++                        for &res in resolutions {
++                            black_box(black_box(ll).to_cell(res));
++                        }
++                    }
++                });
++            },
++        );
++        group.bench_with_input(
++            BenchmarkId::new("h3o/to_cells", &id),
++            &resolutions,
++            |b, resolutions| {
++                b.iter(|| {
++                    for &ll in &row {
++                        for cell in
++                            black_box(ll).to_cells(resolutions.iter().copied())
++                        {
++                            black_box(cell);
++                        }
++                    }
++                });
++            },
++        );
++        group.bench_with_input(
++            BenchmarkId::new("h3o/LatLngIndexer", &id),
++            &resolutions,
++            |b, resolutions| {
++                b.iter(|| {
++                    let mut indexer = LatLngIndexer::new();
++                    for &ll in &row {
++                        for cell in indexer.to_cells(
++                            black_box(ll),
++                            resolutions.iter().copied(),
++                        ) {
++                            black_box(cell);
++                        }
++                    }
++                });
++            },
++        );
++    }
++    group.finish();
++}
+diff --git a/benches/h3/main.rs b/benches/h3/main.rs
+index 7573af3..bc5e3d7 100644
+--- a/benches/h3/main.rs
++++ b/benches/h3/main.rs
+@@ -131,6 +131,7 @@ criterion_group!(
+     is_valid_directed_edge::bench,
+     is_valid_vertex::bench,
+     latlng_to_cell::bench,
++    latlng_to_cell::bench_scanline,
+     local_ij_to_cell::bench,
+     max_face_count::bench,
+     max_grid_disk_size::bench,
 diff --git a/src/coord/latlng.rs b/src/coord/latlng.rs
-index 79c7003..b0aaae2 100644
+index 79c7003..22691bc 100644
 --- a/src/coord/latlng.rs
 +++ b/src/coord/latlng.rs
 @@ -1,8 +1,8 @@
@@ -61,7 +147,7 @@ index 79c7003..b0aaae2 100644
  };
  use core::fmt;
  use float_eq::float_eq;
-@@ -228,6 +228,44 @@ impl LatLng {
+@@ -228,6 +228,54 @@ impl LatLng {
          Vec3d::from(self).to_cell(resolution)
      }
  
@@ -88,6 +174,16 @@ index 79c7003..b0aaae2 100644
 +        self,
 +        resolutions: impl IntoIterator<Item = Resolution>,
 +    ) -> impl Iterator<Item = CellIndex> {
++        self.to_face_ijks(resolutions)
++            .map(|(fijk, resolution)| fijk.to_cell(resolution))
++    }
++
++    /// Returns the `FaceIJK` address of the location at each resolution,
++    /// sharing the resolution-independent projection work.
++    fn to_face_ijks(
++        self,
++        resolutions: impl IntoIterator<Item = Resolution>,
++    ) -> impl Iterator<Item = (FaceIJK, Resolution)> {
 +        let value = Vec3d::from(self);
 +        let (face, distance) = value.closest_face();
 +        let projection = FaceProjection::new(value, face, distance);
@@ -99,18 +195,98 @@ index 79c7003..b0aaae2 100644
 +            let coord = projection.to_vec2d_with(resolution, |theta| {
 +                *sin_cos_by_class[class].get_or_insert_with(|| sin_cos(theta))
 +            });
-+            FaceIJK::new(face, coord.into()).to_cell(resolution)
++            (FaceIJK::new(face, coord.into()), resolution)
 +        })
 +    }
 +
      #[cfg(any(test, feature = "typed_floats"))]
      pub(crate) const fn new_unchecked(lat: f64, lng: f64) -> Self {
          debug_assert!(lat.is_finite() && lng.is_finite());
+@@ -236,6 +284,74 @@ impl LatLng {
+     }
+ }
+ 
++/// Indexes a sequence of nearby locations, such as the pixels of a raster
++/// scanline.
++///
++/// The cell index of a location is a function of the face-centered `IJK`
++/// coordinates of its containing cell, which consecutive nearby locations
++/// usually share. The indexer remembers the last coordinates and cell at each
++/// resolution and only encodes a new cell index when they change. Every
++/// returned cell is identical to [`LatLng::to_cell`].
++///
++/// # Example
++///
++/// ```
++/// use h3o::{LatLng, LatLngIndexer, Resolution};
++///
++/// let mut indexer = LatLngIndexer::new();
++/// for lng in [2.3490, 2.3491, 2.3492] {
++///     let ll = LatLng::new(48.8647, lng)?;
++///     let cell = indexer.to_cell(ll, Resolution::Nine);
++///     assert_eq!(cell, ll.to_cell(Resolution::Nine));
++/// }
++/// # Ok::<(), h3o::error::InvalidLatLng>(())
++/// ```
++#[derive(Debug, Clone, Default)]
++pub struct LatLngIndexer {
++    /// Last `FaceIJK` address and cell at each resolution.
++    last: [Option<(FaceIJK, CellIndex)>; h3o_bit::MAX_RESOLUTION as usize + 1],
++}
++
++impl LatLngIndexer {
++    /// Initializes an indexer with no remembered cells.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Indexes the location at the specified resolution.
++    ///
++    /// Equivalent to [`LatLng::to_cell`].
++    pub fn to_cell(&mut self, ll: LatLng, resolution: Resolution) -> CellIndex {
++        let fijk = FaceIJK::from_vec3d(Vec3d::from(ll), resolution);
++        self.encode(fijk, resolution)
++    }
++
++    /// Indexes the location at each of the specified resolutions.
++    ///
++    /// Equivalent to [`LatLng::to_cells`].
++    pub fn to_cells(
++        &mut self,
++        ll: LatLng,
++        resolutions: impl IntoIterator<Item = Resolution>,
++    ) -> impl Iterator<Item = CellIndex> {
++        ll.to_face_ijks(resolutions)
++            .map(|(fijk, resolution)| self.encode(fijk, resolution))
++    }
++
++    fn encode(&mut self, fijk: FaceIJK, resolution: Resolution) -> CellIndex {
++        let last = &mut self.last[usize::from(resolution)];
++        match *last {
++            Some((last_fijk, cell)) if last_fijk == fijk => cell,
++            _ => {
++                let cell = fijk.to_cell(resolution);
++                *last = Some((fijk, cell));
++                cell
++            }
++        }
++    }
++}
++
+ impl PartialEq for LatLng {
+     fn eq(&self, other: &Self) -> bool {
+         float_eq!(self.lat, other.lat, abs <= EPSILON_RAD)
 diff --git a/src/coord/mod.rs b/src/coord/mod.rs
-index 940a605..1ced97c 100644
+index 940a605..b920cb2 100644
 --- a/src/coord/mod.rs
 +++ b/src/coord/mod.rs
-@@ -17,7 +17,7 @@ pub use latlng::LatLng;
+@@ -13,11 +13,11 @@ mod vec3d;
+ pub use cube::CoordCube;
+ pub use faceijk::{FaceIJK, Overage};
+ pub use ijk::{CoordIJ, CoordIJK};
+-pub use latlng::LatLng;
++pub use latlng::{LatLng, LatLngIndexer};
  pub use localij::{LocalIJ, LocalIJK};
  pub use vec3d::Vec3d;
  
@@ -257,11 +433,31 @@ index f5c0e00..502c65e 100644
      }
  
      /// Calculates the magnitude.
+diff --git a/src/lib.rs b/src/lib.rs
+index 74111cd..6d21b4a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -264,7 +264,7 @@ mod resolution;
+ 
+ pub use base_cell::BaseCell;
+ pub use boundary::Boundary;
+-pub use coord::{CoordIJ, LatLng, LocalIJ};
++pub use coord::{CoordIJ, LatLng, LatLngIndexer, LocalIJ};
+ pub use direction::Direction;
+ pub use face::{Face, FaceSet};
+ pub use index::{
 diff --git a/tests/api/latlng.rs b/tests/api/latlng.rs
-index fb5e990..a6b0d5a 100644
+index fb5e990..65dc36b 100644
 --- a/tests/api/latlng.rs
 +++ b/tests/api/latlng.rs
-@@ -157,3 +157,57 @@ fn geo_traits_support_panic_on_invalid_access() {
+@@ -1,5 +1,5 @@
+ use float_eq::assert_float_eq;
+-use h3o::{CellIndex, LatLng, Resolution};
++use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution};
+ use std::f64::consts::{FRAC_PI_2, PI};
+ 
+ const EPSILON: f64 = 1e-9 * PI / 180.0;
+@@ -157,3 +157,116 @@ fn geo_traits_support_panic_on_invalid_access() {
      let ll = LatLng::from_coord(&(-45., 10.)).unwrap();
      ll.nth_or_panic(42);
  }
@@ -318,4 +514,63 @@ index fb5e990..a6b0d5a 100644
 +            assert_eq!(result, expected, "{ll}");
 +        }
 +    }
++}
++
++#[test]
++fn indexer_matches_to_cell() {
++    // Scanlines of ~30 m steps crossing many cells, with jumps between rows
++    // (including across faces, near a pentagon and over the antimeridian).
++    let origins = [
++        (39.7, -105.0),
++        (64.7, 10.536),
++        (0.0, 179.9),
++        (-45.0, 0.0),
++        (89.99, 30.0),
++        (46.0425, 71.52),
++    ];
++    let resolutions = [
++        Resolution::Six,
++        Resolution::Nine,
++        Resolution::Ten,
++        Resolution::Fifteen,
++    ];
++    let mut indexer = LatLngIndexer::new();
++    // Per resolution: consecutive locations in the same / a different cell.
++    let mut same = [0; 4];
++    let mut changed = [0; 4];
++    for (row, &(lat0, lng0)) in origins.iter().cycle().take(24).enumerate() {
++        let lat = lat0 + row as f64 * 2.7e-4;
++        let mut previous = None;
++        for col in 0..3000 {
++            let ll = LatLng::new(lat, lng0 + f64::from(col) * 3.5e-4)
++                .expect("valid coordinate");
++            let expected = resolutions
++                .iter()
++                .map(|&res| ll.to_cell(res))
++                .collect::<Vec<_>>();
++            let result = if col % 2 == 0 {
++                indexer.to_cells(ll, resolutions).collect::<Vec<_>>()
++            } else {
++                resolutions
++                    .iter()
++                    .map(|&res| indexer.to_cell(ll, res))
++                    .collect()
++            };
++            assert_eq!(result, expected, "{ll}");
++            if let Some(previous) = &previous {
++                for (i, (cell, last)) in
++                    expected.iter().zip(previous).enumerate()
++                {
++                    if cell == last {
++                        same[i] += 1;
++                    } else {
++                        changed[i] += 1;
++                    }
++                }
++            }
++            previous = Some(expected);
++        }
++    }
++    // Make sure both the remembered and the encoding paths ran.
++    assert!(same.iter().chain(&changed).all(|&count| count > 0));
 +}

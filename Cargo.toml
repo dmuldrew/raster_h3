@@ -119,7 +119,7 @@ lto = "thin"
 codegen-units = 1
 panic = "unwind"
 
-# Vendored h3o 0.11.0 plus `LatLng::to_cells` (multi-resolution indexing with
-# shared projection work), pending upstream. See vendor/h3o/VENDORED.md.
+# Vendored h3o 0.11.0 plus `LatLng::to_cells` and `LatLngIndexer` (shared
+# and cached H3 indexing work), pending upstream. See vendor/h3o/VENDORED.md.
 [patch.crates-io]
 h3o = { path = "vendor/h3o" }

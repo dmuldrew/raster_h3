@@ -9,7 +9,7 @@
 //! pattern and resolution count, not by row or raster size.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
-use h3o::{LatLng, Resolution};
+use h3o::{LatLng, LatLngIndexer, Resolution};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -304,7 +304,7 @@ fn walk<T, Acc, E, N, R>(
                 .iter()
                 .zip(position_cells.chunks_exact_mut(num_res))
             {
-                super::profile::index_all(ll, ctx.resolutions, cells);
+                super::profile::index_all(&mut runs.indexer, ll, ctx.resolutions, cells);
             }
             for i in 0..num_res {
                 assignments.clear();
@@ -431,11 +431,13 @@ impl<'a> SampleProjector<'a> {
     }
 }
 
-/// Current cell (None before the first) and partial accumulator per resolution.
+/// Current cell (None before the first) and partial accumulator per
+/// resolution, and the indexer that remembers recent cells across samples.
 struct Runs<Acc> {
     cells: Vec<Option<u64>>,
     next_cells: Vec<u64>,
     accs: Vec<Acc>,
+    indexer: LatLngIndexer,
 }
 
 impl<Acc: Clone> Runs<Acc> {
@@ -444,6 +446,7 @@ impl<Acc: Clone> Runs<Acc> {
             cells: vec![None; num_res],
             next_cells: vec![0; num_res],
             accs: (0..num_res).map(|_| engine.new_acc()).collect(),
+            indexer: LatLngIndexer::new(),
         }
     }
 
@@ -458,7 +461,7 @@ impl<Acc: Clone> Runs<Acc> {
         engine: &E,
         maps: &mut [CellMap<Acc>],
     ) {
-        super::profile::index_all(ll, resolutions, &mut self.next_cells);
+        super::profile::index_all(&mut self.indexer, ll, resolutions, &mut self.next_cells);
         let changed = self
             .next_cells
             .iter()
