@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Keep Albers inverse constants in an immutable walker-local prepared projection, preserving public source-field construction and mutation without stale caches. Use portable multiply/add series evaluation, share row terms and exact cell-run advancement, and retain row hoisting for horizontal shear and `stream-profile` builds.
+- Label withdrawn stride-probing benchmark results as historical row-count comparisons only; use a monotonic benchmark timer and the direct Parquet exporter when the Polars IO plugin is unavailable.
+
 - Restore safe bbox and mosaic-overlap pruning for built-in EPSG:3413/3031 using analytic radial/angular bounds; skip discarded bounds estimates for uncertified bbox tests. Add end-to-end pruning benchmarks with Lambert/LAEA controls.
 
 - TM rejection certificates now follow proj4rs scale precedence (`k0`, then `k`) and fail open for duplicate or non-canonical PROJ parameters, preventing incorrect bbox pruning.
