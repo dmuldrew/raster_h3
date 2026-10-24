@@ -203,11 +203,11 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 
 ### Priority Matrix
 
-| Priority | Optimization | Target Workload | Expected Speedup | Effort |
+| Priority | Optimization | Target Workload | Expected / Measured Speedup | Effort |
 | :---: | :--- | :--- | :--- | :---: |
-| **P0** | **Snyder Authalic Series + `rho_sq` in `AlbersConicFast`** | Projected rasters (`EPSG:5070`) | **+20–30%** (~200–250s saved on CONUS) | Low (~50 LOC) |
+| **P0** | **Snyder Authalic Series + `rho_sq` + Row-Hoisted `y_p` in `AlbersConicFast`** | Projected rasters (`EPSG:5070`) | **1.19×–1.26×** (-20.3% User CPU / -879s CPU on CONUS; -41.1% Albers cycle overhead) | Low (~50 LOC) |
 | **P1 (withdrawn)** | **Endpoint-Only Stride Probing** | Not safe without a geometric certificate | Not applicable | Requires a correctness proof |
-| **P2** | **Row-Latitude Hoisting for `Wgs84Identity` + Specialized Single-Point Loop** | Native `EPSG:4326` / `EPSG:3857` | **+8–15%** (~45–75s saved on CONUS) | Low (~80 LOC) |
+| **P2** | **Row-Latitude Hoisting for `Wgs84Identity` + Specialized Single-Point Loop** | Native `EPSG:4326` / `EPSG:3857` | **1.01×–1.03×** (-0.7% cycles / -3.6 cyc/px on CONUS WGS84) | Low (~80 LOC) |
 | **P3** | **Parallel Column Encoding + `BYTE_STREAM_SPLIT` in CLI Parquet** | CLI Parquet export | **+10–15% speed, 6× smaller files** | Medium (~150 LOC) |
 | **P4** | **Row-Shared Trigonometric Precomputation in H3 Indexing** | North-up `EPSG:4326` / `EPSG:3857` | **+8–12%** on H3 indexing math | Medium (~150 LOC) |
 | **P5** | **Projected SoA Eviction Slabs (Skip AoS `OutputBuffer`)** | DuckDB / Polars / DataFusion | **+5% speed, -25% Peak RSS (~1.2 GB)** | Medium (~200 LOC) |
@@ -270,9 +270,38 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 
 ---
 
-### Historical Results: Original `P0` + `P1` Implementation (`perf/p0-p1-snyder-stride`)
+### Measured Results: Corrected `P0` + `P2` Implementation (`perf/p0-p1-snyder-stride` at `1daa33e`)
 
-These reported measurements used the original endpoint-probing implementation, which was subsequently found to misassign pixels and removed. They are retained as historical data, **not performance results for the corrected implementation or evidence of general exactness**. Matching row counts alone does not prove matching cell statistics; the reported Hawaii parity applies only to those sampled workloads. The corrected implementation retains **P0** (the 4-term authalic series and `rho_sq`) and row-invariant projection hoisting, but indexes every sample exactly. Updated end-to-end benchmarks are needed before claiming its speedup.
+With endpoint stride probing (`P1`) removed so that every valid sample is indexed at every requested resolution, the branch retains **`P0`** (the 4-term Snyder/Chebyshev Horner series, `rho_sq` without `sqrt`, and precomputed reciprocals in `AlbersInverse`) and **`P2`** (row-invariant projection hoisting via `RowCache` whenever `gt.d == 0.0` plus the specialized single-point batch loop).
+
+#### 1. Hawaii Continuous & Categorical Benchmark Suite (3-Run Interleaved Median, CLI)
+
+| Workload | Baseline (`v0.4.0`) | Corrected `P0` + `P2` (`1daa33e`) | Speedup | Runtime Change | Cell & Value Parity (`1daa33e` vs. `v0.4.0`) |
+| :--- | ---: | ---: | :---: | :---: | :--- |
+| **CFL Albers (`EPSG:5070`), Res 8 [IPC]** | 3.010 s | **2.387 s** | **1.26×** | **-20.7%** | — |
+| **CFL Albers (`EPSG:5070`), Res 9 [IPC]** | 3.515 s | **2.922 s** | **1.20×** | **-16.9%** | — |
+| **CFL Albers (`EPSG:5070`), Res 6,8,10 [IPC]** | 10.945 s | **9.772 s** | **1.12×** | **-10.7%** | — |
+| **CFL WGS84 (`EPSG:4326`), Res 8 [IPC]** | 2.104 s | **2.091 s** | **1.01×** | **-0.6%** | — |
+| **CFL WGS84 (`EPSG:4326`), Res 9 [IPC]** | 2.686 s | **2.627 s** | **1.02×** | **-2.2%** | — |
+| **CFL Albers (`EPSG:5070`), Res 8 [Parquet]** | 3.209 s | **2.625 s** | **1.22×** | **-18.2%** | 30,958 cells (1 px of 28,373,991 shifted across a cell edge by sub-nm Chebyshev vs. NR rounding) |
+| **CFL Albers (`EPSG:5070`), Res 9 [Parquet]** | 3.733 s | **3.129 s** | **1.19×** | **-16.2%** | 212,029 cells (sub-nm Chebyshev vs. NR boundary rounding only) |
+| **CFL WGS84 (`EPSG:4326`), Res 8 [Parquet]** | 2.055 s | **2.063 s** | **1.00×** | **+0.4%** | 30,959 cells (**100% bit-for-bit identical**) |
+| **CFL WGS84 (`EPSG:4326`), Res 9 [Parquet]** | 2.739 s | **2.663 s** | **1.03×** | **-2.8%** | 212,042 cells (**100% bit-for-bit identical**) |
+| **FBFM40 Categorical Albers, Res 8 [Parquet]** | 20.787 s | **16.876 s** | **1.23×** | **-18.8%** | 273,840 rows |
+| **FBFM40 Categorical WGS84, Res 8 [Parquet]** | 17.955 s | **17.855 s** | **1.01×** | **-0.6%** | 273,840 rows (**100% bit-for-bit identical**) |
+
+#### 2. Full CONUS Resolution 9 Benchmarks (Polars 2.0 IO Plugin, `/usr/bin/time -l` Hardware Counters)
+
+| Dataset | Metric | Baseline (`v0.4.0`) | Corrected `P0` + `P2` (`1daa33e`) | Measured Improvement |
+| :--- | :--- | ---: | ---: | :--- |
+| **`BP_CONUS.tif`**<br/>*(Albers `EPSG:5070`, 24.4 GB, 15.87B px)* | **User CPU Time**<br/>**Sys CPU Time**<br/>**CPU Cycles Elapsed**<br/>**Instructions Retired**<br/>**Cycles per Pixel**<br/>**Wall-Clock Time**<br/>**Normalized Wall-Clock (at 5.44× cores)**<br/>**Albers / WGS84 Wall-Clock Ratio**<br/>**H3 Row Count** | 4,333.14 s<br/>608.21 s<br/>14.81 T<br/>31.10 T<br/>933.5 cyc/px<br/>908.05 s *(at 5.44× cores)*<br/>908.05 s<br/>1.71×<br/>74,440,878 | **3,454.04 s**<br/>**595.38 s**<br/>**12.09 T**<br/>**28.40 T**<br/>**762.0 cyc/px**<br/>**909.97 s** *(at 4.45× cores)*<br/>**~744.4 s**<br/>**1.44×**<br/>**74,440,878** | **-20.3% (-879.1 s / 1.25× less User CPU)**<br/>**-2.1% (-12.8 s)**<br/>**-18.4% (-2.72 T cycles / 1.23× fewer)**<br/>**-8.7% (-2.69 T instructions)**<br/>**-171.5 cyc/px (-41.1% Albers reprojection overhead)**<br/>+0.2% raw (lower thread scheduling concurrency)<br/>**~1.22× faster (-18.0% / -163.7 s)**<br/>**Albers gap cut from +71% to +44% over WGS84**<br/>Exact match |
+| **`BP_CONUS_wgs84_tiled.tif`**<br/>*(WGS84 `EPSG:4326`, 21.0 GB, 18.22B px)* | **User CPU Time**<br/>**Sys CPU Time**<br/>**CPU Cycles Elapsed**<br/>**Instructions Retired**<br/>**Cycles per Pixel**<br/>**Wall-Clock Time**<br/>**Normalized Wall-Clock (at 6.02× cores)**<br/>**H3 Row Count** | 2,794.64 s<br/>410.49 s<br/>9.56 T<br/>23.67 T<br/>524.8 cyc/px<br/>532.40 s *(at 6.02× cores)*<br/>532.40 s<br/>74,441,152 | **2,780.77 s**<br/>**406.65 s**<br/>**9.50 T**<br/>**23.93 T**<br/>**521.2 cyc/px**<br/>**631.68 s** *(at 5.05× cores)*<br/>**~529.5 s**<br/>**74,441,152** | **-0.5% (-13.9 s User CPU)**<br/>**-0.9% (-3.8 s)**<br/>**-0.7% (-64.8 B cycles)**<br/>+1.1% (+261 B instructions)<br/>**-3.6 cyc/px (-0.7%)**<br/>+18.6% raw (5.05× vs. 6.02× core scheduling)<br/>**1.01× (-0.5% / -2.9 s)**<br/>Exact match |
+
+---
+
+### Historical Results: Original `P0` + `P1` Implementation (`4a48ba6`, With Endpoint Stride Probing)
+
+These reported measurements used the original endpoint-probing implementation (`4a48ba6`), which was subsequently found to misassign pixels on short scanline re-entries and removed in `c8aa1de`. They are retained as historical data showing how much of the initial speedup came from skipping ~65–70% of `LatLng::to_cell` calls versus `P0` + `P2` alone.
 
 #### 1. Full CONUS Resolution 9 Benchmarks (Polars 2.0, `/usr/bin/time -l`)
 
