@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Keep Albers inverse constants in an immutable walker-local prepared projection, preserving public source-field construction and mutation without stale caches. Use portable multiply/add series evaluation, share row terms and exact cell-run advancement, and retain row hoisting for horizontal shear and `stream-profile` builds.
+- Index each sample at every resolution through `h3o::LatLngIndexer`, sharing H3's resolution-independent projection and reusing the last cell per resolution while consecutive samples stay in the same face `IJK` cell; cells are identical. Depends on an h3o fork (`[patch.crates-io]`, pinned by revision) until the API is released upstream. Add opt-in `.cargo/fma.toml` for x86_64 CPUs with FMA3.
 - Label withdrawn stride-probing benchmark results as historical row-count comparisons only; use a monotonic benchmark timer and the direct Parquet exporter when the Polars IO plugin is unavailable.
 
 - Restore safe bbox and mosaic-overlap pruning for built-in EPSG:3413/3031 using analytic radial/angular bounds; skip discarded bounds estimates for uncertified bbox tests. Add end-to-end pruning benchmarks with Lambert/LAEA controls.

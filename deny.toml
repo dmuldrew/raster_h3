@@ -40,3 +40,6 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# h3o fork carrying multi-resolution indexing APIs pending upstream; pinned by
+# rev in the workspace [patch.crates-io]. Remove with that patch.
+allow-git = ["https://github.com/dmuldrew/h3o"]

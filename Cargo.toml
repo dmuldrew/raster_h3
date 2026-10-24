@@ -118,3 +118,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "unwind"
+
+# h3o 0.11.0 plus `LatLngIndexer` (shared and cached H3
+# indexing work), pending upstream: https://github.com/dmuldrew/h3o/tree/multi-resolution-indexing
+# Remove once an h3o release contains them; `cargo package` ignores this patch.
+[patch.crates-io]
+h3o = { git = "https://github.com/dmuldrew/h3o", rev = "24c04cc08c97db4bc8adce23492dcbbb3f516dba" }
