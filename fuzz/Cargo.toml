@@ -36,3 +36,7 @@ path = "fuzz_targets/predictor.rs"
 test = false
 doc = false
 bench = false
+
+# Same h3o fork as the workspace `[patch.crates-io]`; remove both together.
+[patch.crates-io]
+h3o = { git = "https://github.com/dmuldrew/h3o", rev = "24c04cc08c97db4bc8adce23492dcbbb3f516dba" }
