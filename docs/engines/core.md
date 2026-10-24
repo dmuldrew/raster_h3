@@ -67,6 +67,14 @@ accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`
 `31466`–`31469`, `23028`–`23038`) and any PROJ string with `+towgs84`. Grid shifts
 (`+nadgrids`, `+datum=NAD27`) are rejected. See [Datum Shifts](../crs-and-projection.md#datum-shifts).
 
+Albers inverse constants are prepared once per walker under an immutable borrow;
+public `AlbersConicFast` source fields retain their original struct-literal API.
+Standalone inverse calls derive constants from current source fields, not stale caches.
+`AlbersConicFast::row_yp` supplies shared row-invariant inverse terms. WGS84, Mercator,
+and Albers hoist row terms whenever affine `d == 0`, including horizontal shear.
+`stream-profile` retains these optimized paths and counts per-sample projection work
+(including cache use, excluding row setup).
+
 Bounds from `CrsTransformer::transform_rect_bounds` are certified only when
 `bounds_certified()` is true: analytic for the fast paths and built-in EPSG:3413/3031 polar definitions, a Lipschitz enclosure
 for transverse Mercator, a sampled estimate otherwise. Code that rejects data

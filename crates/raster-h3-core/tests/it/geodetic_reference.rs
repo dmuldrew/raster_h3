@@ -182,8 +182,8 @@ fn albers_high_latitude_matches_proj_forward_reference() {
         };
         assert_golden(&tf, definition, points);
         for &((x, y), (ref_lon, ref_lat)) in *points {
-            let y_p = albers.rho0 - (y - albers.y_0);
-            let (lon, lat) = albers.transform_with_yp(x, y_p, y_p * y_p);
+            let (y_p, y_p_sq) = albers.row_yp(y);
+            let (lon, lat) = albers.transform_with_yp(x, y_p, y_p_sq);
             assert!(ground_error_m(lon, lat, ref_lon, ref_lat) <= MAX_ERR_M);
             assert!(
                 lat.abs() < 90.0,

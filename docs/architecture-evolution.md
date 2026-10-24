@@ -223,7 +223,7 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
   2. Two iterations of Newton-Raphson, invoking **6 transcendental functions per pixel** (`2× sin`, `2× cos`, `2× ln`) in addition to `atan2` and `asin`.
 * **The Fix:**
   - Compute `rho_sq = x_p * x_p + y_p * y_p` directly, eliminating the hardware `fsqrt` instruction per pixel.
-  - Replace the 2-iteration Newton-Raphson solver with a **4-term authalic latitude series** using precomputed ellipsoid constants evaluated via Chebyshev/angle-doubling polynomials in $\sin\beta = q / q_p$ and $\cos\beta = \sqrt{1 - \sin^2\beta}$.
+  - Replace the 2-iteration Newton-Raphson solver with a **4-term authalic latitude series** using ellipsoid constants prepared once per walker from an immutable projection borrow, evaluated via ordinary multiply/add Chebyshev/angle-doubling polynomials in $\sin\beta = q / q_p$ and $\cos\beta = \sqrt{1 - \sin^2\beta}$.
   - This removes the iterative `sin`, `cos`, and `ln` calls. Independent PROJ 9.5.1 forward-reference points verify inverse errors below **0.01 m**, including both signs of latitude through **89.9999°**, northern/southern parallels and false offsets. This is a tested range, not a uniform accuracy guarantee arbitrarily close to the poles, where inversion is ill-conditioned in floating point.
 
 #### 2. Endpoint-Only Stride Probing (`P1`, withdrawn)
@@ -235,11 +235,11 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 #### 3. Extend Row-Invariant Latitude Hoisting to `Wgs84Identity` & Specialize the Single-Point `walk` Loop (`P2`)
 * **Where:** [`crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs) (`SampleProjector` and `walk`)
 * **The Bottleneck:**
-  1. `SampleProjector` currently hoists row-constant latitudes (`row_lats`) **only** for `WebMercatorFast`, leaving north-up `Wgs84Identity` (`EPSG:4326`) to recompute `(col, row_idx)` affine math on every pixel.
+  1. Before these changes, `SampleProjector` hoisted row-constant latitudes **only** for `WebMercatorFast`, leaving `Wgs84Identity` (`EPSG:4326`) to recompute them per pixel.
   2. Inside `walk()`, even when `batch == true` (single-band center sampling, covering >95% of queries) and `resolutions.len() == 1`, every valid pixel clears and pushes to a heap-backed `positions: Vec<(LatLng, f64)>`, iterates over `ctx.sampling.points`, and loops over `cells: Vec<u64>`.
 * **The Fix:**
-  - Hoist row latitude (and row $Y$ coordinate) for all north-up grids (`gt.b == 0.0 && gt.d == 0.0`), including `Wgs84Identity`.
-  - Provide a specialized `walk_single_point_single_res` fast path that keeps `curr_cell: Option<u64>` and `curr_acc: Acc` in local scalar registers with zero `Vec` traffic in the inner loop.
+  - Hoist row latitude (and Albers row $Y$ terms) whenever `gt.d == 0.0`, including horizontally sheared grids (`gt.b != 0.0`). A single row-cache enum selects WGS84, Mercator, prepared Albers, or the general fallback.
+  - Use the specialized single-point loop when no bbox or mosaic-owner filter is needed, and share exact cell/run advancement with the general batch loop for one or many resolutions. Optimized projection and scan paths remain enabled under `stream-profile`; transform counters measure the per-sample cache path, excluding row setup.
 
 ---
 
@@ -278,8 +278,8 @@ These reported measurements used the original endpoint-probing implementation, w
 
 | Dataset | Metric | Baseline (`v0.4.0`) | P0 + P1 (`perf/p0-p1-snyder-stride`) | Measured Improvement |
 | :--- | :--- | ---: | ---: | :--- |
-| **`BP_CONUS.tif`**<br/>*(Albers `EPSG:5070`, 24.4 GB, 15.87B px)* | **Wall-Clock Time**<br/>**User CPU Time**<br/>**Sustained Throughput**<br/>**Peak RSS**<br/>**H3 Row Count** | 908.05 s (~15.1 min)<br/>4,333.14 s<br/>17.48 Mpix/s<br/>2,458.6 MB<br/>74,440,878 | **578.76 s (~9.6 min)**<br/>**1,983.15 s**<br/>**27.42 Mpix/s**<br/>**2,307.4 MB**<br/>**74,440,878** | **1.57× faster (-36.3% / -329.3 s)**<br/>**2.18× less User CPU (-54.2%)**<br/>**+56.9% throughput**<br/>**-6.2% (-151 MB)**<br/>**100% Exact Match** |
-| **`BP_CONUS_wgs84_tiled.tif`**<br/>*(WGS84 `EPSG:4326`, 21.0 GB, 18.22B px)* | **Wall-Clock Time**<br/>**User CPU Time**<br/>**Sustained Throughput**<br/>**Peak RSS**<br/>**H3 Row Count** | 532.40 s (~8.9 min)<br/>2,794.64 s<br/>34.23 Mpix/s<br/>4,239.8 MB<br/>74,441,152 | **421.11 s (~7.0 min)**<br/>**1,555.86 s**<br/>**43.27 Mpix/s**<br/>**2,193.9 MB**<br/>**74,441,152** | **1.26× faster (-20.9% / -111.3 s)**<br/>**1.80× less User CPU (-44.3%)**<br/>**+26.4% throughput**<br/>**-48.3% (-2.05 GB)**<br/>**100% Exact Match** |
+| **`BP_CONUS.tif`**<br/>*(Albers `EPSG:5070`, 24.4 GB, 15.87B px)* | **Wall-Clock Time**<br/>**User CPU Time**<br/>**Sustained Throughput**<br/>**Peak RSS**<br/>**H3 Row Count** | 908.05 s (~15.1 min)<br/>4,333.14 s<br/>17.48 Mpix/s<br/>2,458.6 MB<br/>74,440,878 | **578.76 s (~9.6 min)**<br/>**1,983.15 s**<br/>**27.42 Mpix/s**<br/>**2,307.4 MB**<br/>**74,440,878** | **1.57× faster (-36.3% / -329.3 s)**<br/>**2.18× less User CPU (-54.2%)**<br/>**+56.9% throughput**<br/>**-6.2% (-151 MB)**<br/>**Matching row count only** |
+| **`BP_CONUS_wgs84_tiled.tif`**<br/>*(WGS84 `EPSG:4326`, 21.0 GB, 18.22B px)* | **Wall-Clock Time**<br/>**User CPU Time**<br/>**Sustained Throughput**<br/>**Peak RSS**<br/>**H3 Row Count** | 532.40 s (~8.9 min)<br/>2,794.64 s<br/>34.23 Mpix/s<br/>4,239.8 MB<br/>74,441,152 | **421.11 s (~7.0 min)**<br/>**1,555.86 s**<br/>**43.27 Mpix/s**<br/>**2,193.9 MB**<br/>**74,441,152** | **1.26× faster (-20.9% / -111.3 s)**<br/>**1.80× less User CPU (-44.3%)**<br/>**+26.4% throughput**<br/>**-48.3% (-2.05 GB)**<br/>**Matching row count only** |
 
 #### 2. Hawaii Continuous & Categorical Benchmark Suite (Median of 3 Runs)
 
@@ -290,9 +290,9 @@ These reported measurements used the original endpoint-probing implementation, w
 | **CFL Albers (`EPSG:5070`), Res 6,8,10 [IPC]** | 10.941 s | **9.194 s** | **1.19×** | **-16.0%** | — |
 | **CFL WGS84 (`EPSG:4326`), Res 8 [IPC]** | 2.224 s | **1.300 s** | **1.71×** | **-41.5%** | — |
 | **CFL WGS84 (`EPSG:4326`), Res 9 [IPC]** | 2.636 s | **1.944 s** | **1.36×** | **-26.3%** | — |
-| **CFL Albers (`EPSG:5070`), Res 8 [Parquet]** | 3.176 s | **1.474 s** | **2.15×** | **-53.6%** | 30,958 (`exact=True`) |
-| **CFL Albers (`EPSG:5070`), Res 9 [Parquet]** | 3.738 s | **2.237 s** | **1.67×** | **-40.1%** | 212,029 (`exact=True`) |
-| **CFL WGS84 (`EPSG:4326`), Res 8 [Parquet]** | 2.337 s | **1.294 s** | **1.81×** | **-44.6%** | 30,959 (`exact=True`) |
-| **CFL WGS84 (`EPSG:4326`), Res 9 [Parquet]** | 2.642 s | **1.925 s** | **1.37×** | **-27.1%** | 212,042 (`exact=True`) |
-| **FBFM40 Categorical Albers, Res 8 [Parquet]** | 22.484 s | **8.848 s** | **2.54×** | **-60.6%** | 273,840 (`exact=True`) |
-| **FBFM40 Categorical WGS84, Res 8 [Parquet]** | 18.214 s | **10.053 s** | **1.81×** | **-44.8%** | 273,840 (`exact=True`) |
+| **CFL Albers (`EPSG:5070`), Res 8 [Parquet]** | 3.176 s | **1.474 s** | **2.15×** | **-53.6%** | 30,958 (matching row count only) |
+| **CFL Albers (`EPSG:5070`), Res 9 [Parquet]** | 3.738 s | **2.237 s** | **1.67×** | **-40.1%** | 212,029 (matching row count only) |
+| **CFL WGS84 (`EPSG:4326`), Res 8 [Parquet]** | 2.337 s | **1.294 s** | **1.81×** | **-44.6%** | 30,959 (matching row count only) |
+| **CFL WGS84 (`EPSG:4326`), Res 9 [Parquet]** | 2.642 s | **1.925 s** | **1.37×** | **-27.1%** | 212,042 (matching row count only) |
+| **FBFM40 Categorical Albers, Res 8 [Parquet]** | 22.484 s | **8.848 s** | **2.54×** | **-60.6%** | 273,840 (matching row count only) |
+| **FBFM40 Categorical WGS84, Res 8 [Parquet]** | 18.214 s | **10.053 s** | **1.81×** | **-44.8%** | 273,840 (matching row count only) |

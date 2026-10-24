@@ -1,22 +1,30 @@
 import sys
 import time
-from pathlib import Path
 import raster_h3
 
-if len(sys.argv) < 3:
-    print("Usage: run_polars_res9.py <input_tif> <output_parquet>")
-    sys.exit(1)
 
-input_tif = sys.argv[1]
-output_parquet = sys.argv[2]
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: run_polars_res9.py <input_tif> <output_parquet>")
+        sys.exit(1)
 
-print(f"Starting Polars benchmark: {input_tif} -> {output_parquet}")
-t0 = time.time()
-lf = raster_h3.scan_raster_h3(
-    input_tif,
-    resolutions=9,
-    columns=["h3_index", "min", "max", "mean"]
-)
-lf.sink_parquet(output_parquet)
-t1 = time.time()
-print(f"Finished Polars benchmark in {t1 - t0:.2f}s")
+    input_tif, output_parquet = sys.argv[1:]
+    print(f"Starting raster benchmark: {input_tif} -> {output_parquet}")
+    t0 = time.perf_counter()
+    scan = raster_h3.scan_raster_h3(
+        input_tif,
+        resolutions=9,
+        columns=["h3_index", "min", "max", "mean"],
+    )
+    if isinstance(scan, raster_h3.RasterH3ArrowStream):
+        backend = "direct exporter (Polars IO plugin unavailable; full statistics schema)"
+        raster_h3.raster_to_parquet(input_tif, output_parquet, resolutions=9, geoparquet=False)
+    else:
+        backend = "Polars IO plugin"
+        scan.sink_parquet(output_parquet)
+    elapsed = time.perf_counter() - t0
+    print(f"Finished raster benchmark via {backend} in {elapsed:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
