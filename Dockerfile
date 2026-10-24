@@ -15,6 +15,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ ./.cargo/
 COPY crates/ ./crates/
+COPY vendor/ ./vendor/
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY examples/ ./examples/

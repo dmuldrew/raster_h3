@@ -70,6 +70,25 @@ pub fn index(ll: LatLng, res: Resolution) -> CellIndex {
     });
     result
 }
+/// Index one point at every resolution, sharing h3o's projection work.
+#[inline(always)]
+pub fn index_all(ll: LatLng, resolutions: &[Resolution], cells: &mut [u64]) {
+    #[cfg(feature = "stream-profile")]
+    let start = std::time::Instant::now();
+    for (cell, index) in cells
+        .iter_mut()
+        .zip(ll.to_cells(resolutions.iter().copied()))
+    {
+        *cell = u64::from(index);
+    }
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.h3_calls += resolutions.len() as u64;
+        p.h3_ns += start.elapsed().as_nanos() as u64;
+        v.set(p);
+    });
+}
 #[inline(always)]
 pub fn transform(
     crs: &crate::crs::transformer::CrsTransformer,
