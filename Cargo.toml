@@ -123,4 +123,4 @@ panic = "unwind"
 # indexing work), pending upstream: https://github.com/dmuldrew/h3o/tree/multi-resolution-indexing
 # Remove once an h3o release contains them; `cargo package` ignores this patch.
 [patch.crates-io]
-h3o = { git = "https://github.com/dmuldrew/h3o", rev = "3c581179d3d35c13e507b4cfe5e7daf20757afe5" }
+h3o = { git = "https://github.com/dmuldrew/h3o", rev = "24c04cc08c97db4bc8adce23492dcbbb3f516dba" }
