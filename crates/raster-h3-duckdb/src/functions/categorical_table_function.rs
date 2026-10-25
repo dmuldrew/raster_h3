@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
 use std::ffi::{c_void, CString};
 use std::sync::{Arc, Mutex};
 
 use crate::aggregator::multi_horizon::{
-    MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiResolutionConfig,
+    CategoricalLongCursor, CategoricalLongRow, MultiCategoricalHorizonStreamer,
+    MultiCategoricalRecord, MultiResolutionConfig,
 };
 use crate::aggregator::remap::CategoryRemapper;
 use crate::encoding::{WkbBuf, WKB_BUF_LEN};
@@ -30,23 +30,13 @@ pub struct RasterH3CategoricalBindData {
     pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
-pub struct LongCategoricalRow {
-    pub cell_u64: u64,
-    pub resolution: u8,
-    pub category: i64,
-    pub count: f64,
-    pub fraction: f64,
-    pub total_count: f64,
-    pub entropy: f64,
-    pub distinct_classes: i64,
-}
-
 pub struct RasterH3CategoricalGlobalData {
     pub streamer: Mutex<MultiCategoricalHorizonStreamer>,
     pub record_queue: ConcurrentRecordQueue<MultiCategoricalRecord>,
     pub format: CategoricalOutputFormat,
     pub projected_columns: Vec<usize>,
-    pub long_queue: Mutex<VecDeque<LongCategoricalRow>>,
+    /// Long format: the one cell currently being expanded into rows.
+    pub long_cursor: Mutex<CategoricalLongCursor>,
     pub emit_geom: bool,
 }
 
@@ -218,12 +208,14 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
                 }
             };
 
+            // Long-format columns 7/8 are the entropy aliases.
+            let with_entropy = projected_columns.iter().any(|&c| c == 7 || c == 8);
             let global_data = RasterH3CategoricalGlobalData {
                 streamer: Mutex::new(streamer),
                 record_queue: ConcurrentRecordQueue::new(),
                 format: bind_data.format,
                 projected_columns,
-                long_queue: Mutex::new(VecDeque::new()),
+                long_cursor: Mutex::new(CategoricalLongCursor::new(with_entropy)),
                 emit_geom: bind_data.common.emit_geom,
             };
 
@@ -433,69 +425,47 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                 }
                 CategoricalOutputFormat::Long => {
                     let vector_size = get_vector_size();
-                    let rows = {
-                        let mut long_queue = match global_data.long_queue.lock() {
+                    // Expand one cell at a time and only as far as this chunk
+                    // needs, so high-cardinality cells never queue more rows
+                    // than a single output vector.
+                    let rows: Vec<CategoricalLongRow> = {
+                        let mut cursor = match global_data.long_cursor.lock() {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
                         };
+                        let mut streamer_guard = None;
+                        let mut exhausted = false;
+                        let mut rows = Vec::with_capacity(vector_size);
 
-                        while long_queue.len() < vector_size * 4 {
-                            let mut streamer = match global_data.streamer.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-
-                            let mut added_any = false;
-                            let result = streamer.drain_completed_into(512, |_i, rec| {
-                                added_any = true;
-                                let mut entries: Vec<(i64, f64)> =
-                                    Vec::with_capacity(rec.accumulator.unique_classes());
-                                rec.accumulator
-                                    .for_each_class(|cat, cnt| entries.push((cat, cnt)));
-                                entries.sort_unstable_by_key(|&(cat, _)| cat);
-
-                                let entropy = rec.accumulator.shannon_entropy();
-                                let distinct_classes = rec.accumulator.unique_classes() as i64;
-
-                                for (cat, cnt) in entries {
-                                    let fraction = if rec.accumulator.total_count > 0.0 {
-                                        cnt / rec.accumulator.total_count
-                                    } else {
-                                        0.0
-                                    };
-                                    long_queue.push_back(LongCategoricalRow {
-                                        cell_u64: rec.h3_index,
-                                        resolution: rec.resolution,
-                                        category: cat,
-                                        count: cnt,
-                                        fraction,
-                                        total_count: rec.accumulator.total_count,
-                                        entropy,
-                                        distinct_classes,
-                                    });
-                                }
-                            });
-
-                            if let Err(error) = result {
-                                long_queue.clear();
-                                let message = to_c_string(&error.to_string());
-                                duckdb_function_set_error(info, message.as_ptr());
-                                duckdb_data_chunk_set_size(output, 0);
-                                return;
+                        while rows.len() < vector_size {
+                            if cursor.remaining() > 0 {
+                                cursor.emit_into(vector_size - rows.len(), |row| rows.push(row));
+                                continue;
                             }
-                            if !added_any {
+                            if exhausted {
                                 break;
                             }
-                        }
-
-                        let num_taken = vector_size.min(long_queue.len());
-                        let mut chunk_rows = Vec::with_capacity(num_taken);
-                        for _ in 0..num_taken {
-                            if let Some(r) = long_queue.pop_front() {
-                                chunk_rows.push(r);
+                            let streamer = streamer_guard.get_or_insert_with(|| match global_data
+                                .streamer
+                                .lock()
+                            {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            });
+                            let cursor_ref = &mut *cursor;
+                            match streamer.drain_completed_into(1, |_i, rec| cursor_ref.load(&rec))
+                            {
+                                Ok(0) => exhausted = true,
+                                Ok(_) => {}
+                                Err(error) => {
+                                    let message = to_c_string(&error.to_string());
+                                    duckdb_function_set_error(info, message.as_ptr());
+                                    duckdb_data_chunk_set_size(output, 0);
+                                    return;
+                                }
                             }
                         }
-                        chunk_rows
+                        rows
                     };
 
                     let num_taken = rows.len();

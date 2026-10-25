@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Long-format categorical output (core `CategoricalBatchReader` and the DuckDB `format := 'long'` scan) now expands one cell at a time and only as far as each batch needs, instead of eagerly queueing every category of a whole batch of cells (e.g. ~2M rows for 2,048 cells × 1,000 classes). Shannon entropy is skipped when no entropy column is projected.
 - Restore safe bbox and mosaic-overlap pruning for built-in EPSG:3413/3031 using analytic radial/angular bounds; skip discarded bounds estimates for uncertified bbox tests. Add end-to-end pruning benchmarks with Lambert/LAEA controls.
 
 - TM rejection certificates now follow proj4rs scale precedence (`k0`, then `k`) and fail open for duplicate or non-canonical PROJ parameters, preventing incorrect bbox pruning.
