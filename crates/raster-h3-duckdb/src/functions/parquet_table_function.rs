@@ -37,6 +37,7 @@ pub struct ParquetBindData {
     pub band: usize,
     pub source_crs: Option<String>,
     pub custom_nodata: Option<f64>,
+    pub scale_offset: bool,
     pub sampling: SamplingPattern,
     pub overlap_rule: OverlapRule,
     pub is_categorical: bool,
@@ -98,6 +99,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
             let overlap_rule = bind.parse_overlap_rule();
             let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
             let custom_nodata = bind.get_named_double("nodata");
+            let scale_offset = bind.parse_scale_offset();
             let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
             let compact = bind.get_named_bool("compact").unwrap_or(true);
             let geoparquet = bind
@@ -144,6 +146,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
                 band,
                 source_crs,
                 custom_nodata,
+                scale_offset,
                 sampling,
                 overlap_rule,
                 is_categorical,
@@ -214,6 +217,7 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
             config.band = bind_data.band;
             config.custom_crs = bind_data.source_crs.clone();
             config.custom_nodata = bind_data.custom_nodata;
+            config.apply_scale_offset = bind_data.scale_offset;
             config.sampling = bind_data.sampling.clone();
             config.overlap_rule = bind_data.overlap_rule;
             config.bbox = bind_data.bbox;

@@ -95,6 +95,157 @@ pub fn extract_nodata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Option<f64> {
     None
 }
 
+/// Linear calibration from a stored sample to its physical value:
+/// `physical = stored * scale + offset` (GDAL band `SCALE`/`OFFSET`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandScaling {
+    /// Multiplier applied to the stored value.
+    pub scale: f64,
+    /// Constant added after scaling.
+    pub offset: f64,
+}
+
+impl BandScaling {
+    /// The calibration that leaves stored values unchanged.
+    pub const IDENTITY: Self = Self {
+        scale: 1.0,
+        offset: 0.0,
+    };
+
+    /// Whether this calibration leaves stored values unchanged.
+    #[inline(always)]
+    pub fn is_identity(self) -> bool {
+        self == Self::IDENTITY
+    }
+
+    /// Convert a stored value to its physical value.
+    #[inline(always)]
+    pub fn apply(self, stored: f64) -> f64 {
+        stored * self.scale + self.offset
+    }
+}
+
+/// Read the value of `attr="..."` from the attribute text of one XML tag.
+fn xml_attr<'a>(attrs: &'a str, attr: &str) -> Option<&'a str> {
+    let mut rest = attrs;
+    while let Some(i) = rest.find(attr) {
+        let before_ok = i == 0 || rest.as_bytes()[i - 1].is_ascii_whitespace();
+        let after = rest[i + attr.len()..].trim_start();
+        if before_ok {
+            if let Some(after_eq) = after.strip_prefix('=') {
+                let after_eq = after_eq.trim_start();
+                let quote = after_eq.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let body = &after_eq[1..];
+                    return body.find(quote).map(|end| &body[..end]);
+                }
+            }
+        }
+        rest = &rest[i + attr.len()..];
+    }
+    None
+}
+
+/// Parse per-band `SCALE`/`OFFSET` items from a GDAL_METADATA XML document
+/// (TIFF tag 42112). Returns one entry per band, or an empty vector when every
+/// band is uncalibrated. Items without a `sample` attribute describe the whole
+/// dataset and are ignored; items for samples beyond `samples_per_pixel` are
+/// rejected, as are values that are not finite numbers or a zero scale.
+pub fn parse_gdal_band_scaling(xml: &str, samples_per_pixel: u16) -> Result<Vec<BandScaling>> {
+    let mut bands = vec![BandScaling::IDENTITY; samples_per_pixel.max(1) as usize];
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Item") {
+        rest = &rest[start + "<Item".len()..];
+        let Some(tag_end) = rest.find('>') else { break };
+        let attrs = &rest[..tag_end];
+        rest = &rest[tag_end + 1..];
+        if attrs.ends_with('/') {
+            continue;
+        }
+        let Some(close) = rest.find("</Item>") else {
+            break;
+        };
+        let text = rest[..close].trim();
+        rest = &rest[close..];
+
+        let role = xml_attr(attrs, "role").or_else(|| xml_attr(attrs, "name"));
+        let is_scale = role.is_some_and(|r| r.eq_ignore_ascii_case("scale"));
+        let is_offset = role.is_some_and(|r| r.eq_ignore_ascii_case("offset"));
+        if !is_scale && !is_offset {
+            continue;
+        }
+        let Some(sample) = xml_attr(attrs, "sample") else {
+            continue;
+        };
+        let band = sample
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|&b| b < bands.len())
+            .ok_or_else(|| {
+                RasterH3Error::InvalidMetadata(format!(
+                    "GDAL_METADATA {} for sample {sample:?} does not name one of the {} bands",
+                    if is_scale { "SCALE" } else { "OFFSET" },
+                    bands.len()
+                ))
+            })?;
+        let value = text
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| {
+                RasterH3Error::InvalidMetadata(format!(
+                    "GDAL_METADATA band {} {} is not a finite number: {text:?}",
+                    band + 1,
+                    if is_scale { "SCALE" } else { "OFFSET" }
+                ))
+            })?;
+        if is_scale {
+            if value == 0.0 {
+                return Err(RasterH3Error::InvalidMetadata(format!(
+                    "GDAL_METADATA band {} SCALE is zero",
+                    band + 1
+                )));
+            }
+            bands[band].scale = value;
+        } else {
+            bands[band].offset = value;
+        }
+    }
+    if bands.iter().all(|b| b.is_identity()) {
+        bands.clear();
+    }
+    Ok(bands)
+}
+
+/// Extract per-band scale/offset from the GDAL_METADATA tag (42112).
+/// Returns an empty vector when the tag is absent or no band is calibrated.
+pub fn extract_band_scaling<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    samples_per_pixel: u16,
+) -> Result<Vec<BandScaling>> {
+    match decoder.get_tag_ascii_string(Tag::Unknown(42112)) {
+        Ok(xml) => parse_gdal_band_scaling(&xml, samples_per_pixel),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Zero-based index of the alpha sample declared by the TIFF `ExtraSamples`
+/// tag (338): the first extra sample marked associated (1) or unassociated
+/// (2) alpha. Extra samples are the last `ExtraSamples.len()` samples of each
+/// pixel; unspecified extra samples (0), such as a fourth NIR band, are data.
+pub fn extract_alpha_sample<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    samples_per_pixel: u16,
+) -> Option<u16> {
+    let extra = decoder.get_tag_u32_vec(Tag::ExtraSamples).ok()?;
+    let first_extra = (samples_per_pixel as usize).checked_sub(extra.len())?;
+    extra
+        .iter()
+        .position(|&kind| kind == 1 || kind == 2)
+        .map(|i| (first_extra + i) as u16)
+}
+
 // GeoKey IDs (OGC GeoTIFF 1.1, 19-008r4).
 const KEY_GEODETIC_CRS: u16 = 2048;
 const KEY_GEODETIC_DATUM: u16 = 2050;
@@ -473,6 +624,59 @@ fn section_value(upper: &str, tag: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdal_band_scaling_reads_per_sample_scale_and_offset() {
+        // As written by GDAL: dataset items have no sample attribute.
+        let xml = r#"<GDALMetadata>
+  <Item name="AREA_OR_POINT">Area</Item>
+  <Item name="OFFSET" sample="0" role="offset">-0.2</Item>
+  <Item name="SCALE" sample="0" role="scale">2.75e-05</Item>
+  <Item name='SCALE' sample='2' role='scale'>0.5</Item>
+  <Item name="DESCRIPTION" sample="1" role="description">NIR</Item>
+  <Item name="SCALE">7</Item>
+</GDALMetadata>"#;
+        let bands = parse_gdal_band_scaling(xml, 3).unwrap();
+        assert_eq!(
+            bands,
+            vec![
+                BandScaling {
+                    scale: 2.75e-05,
+                    offset: -0.2
+                },
+                BandScaling::IDENTITY,
+                BandScaling {
+                    scale: 0.5,
+                    offset: 0.0
+                },
+            ]
+        );
+        assert_eq!(bands[0].apply(10_000.0), 10_000.0 * 2.75e-05 - 0.2);
+    }
+
+    #[test]
+    fn gdal_band_scaling_is_empty_when_uncalibrated() {
+        let identity = r#"<GDALMetadata><Item name="SCALE" sample="0" role="scale">1</Item>
+<Item name="OFFSET" sample="0" role="offset">0</Item></GDALMetadata>"#;
+        assert!(parse_gdal_band_scaling(identity, 1).unwrap().is_empty());
+        assert!(parse_gdal_band_scaling("", 4).unwrap().is_empty());
+        assert!(parse_gdal_band_scaling("<GDALMetadata/>", 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn gdal_band_scaling_rejects_malformed_values() {
+        for xml in [
+            r#"<Item sample="0" role="scale">abc</Item>"#,
+            r#"<Item sample="0" role="scale">inf</Item>"#,
+            r#"<Item sample="0" role="scale">0</Item>"#,
+            r#"<Item sample="1" role="offset">1</Item>"#,
+            r#"<Item sample="-1" role="offset">1</Item>"#,
+        ] {
+            assert!(parse_gdal_band_scaling(xml, 1).is_err(), "{xml}");
+        }
+    }
 
     #[test]
     fn test_parse_wkt_albers() {

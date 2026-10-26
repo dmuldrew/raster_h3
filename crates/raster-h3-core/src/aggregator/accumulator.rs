@@ -82,6 +82,21 @@ impl H3Accumulator {
         }
     }
 
+    /// Map every observation `v` to `v * scale + offset`, exactly as if the
+    /// transformed values had been accumulated. The quantile sketch is not
+    /// transformed; use this on accumulators built without one.
+    #[inline]
+    pub fn apply_affine(&mut self, scale: f64, offset: f64) {
+        debug_assert!(self.quantiles.is_none());
+        if self.count == 0.0 {
+            return;
+        }
+        self.sum = self.sum * scale + offset * self.count;
+        self.m2 *= scale * scale;
+        let (lo, hi) = (self.min * scale + offset, self.max * scale + offset);
+        (self.min, self.max) = if scale < 0.0 { (hi, lo) } else { (lo, hi) };
+    }
+
     /// Reset statistics and clear quantile sketch while retaining capacity
     #[inline]
     pub fn clear(&mut self) {

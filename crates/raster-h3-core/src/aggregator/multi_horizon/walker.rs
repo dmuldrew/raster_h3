@@ -17,6 +17,7 @@ use std::ops::Range;
 use crate::aggregator::sampling::{SamplePoint, SamplingPattern};
 use crate::crs::transformer::{web_mercator_lat, web_mercator_lon, AlbersInverse, CrsTransformer};
 use crate::raster::geotransform::GeoTransform;
+use crate::raster::metadata::BandScaling;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
 
@@ -76,6 +77,30 @@ pub struct WalkContext<'a> {
     pub samples_per_pixel: u16,
     /// Keep only samples owned by this tile of an overlapping mosaic.
     pub owner: Option<(usize, &'a MosaicReader)>,
+    /// Per-band stored-to-physical calibration, indexed by zero-based band;
+    /// empty means stored values are used unchanged.
+    pub band_scaling: &'a [BandScaling],
+    /// Zero-based interleaved alpha sample; pixels with zero alpha are skipped.
+    pub alpha_sample: Option<u16>,
+}
+
+impl WalkContext<'_> {
+    /// Calibration for the 1-based `band`, or identity when uncalibrated.
+    #[inline]
+    pub fn scaling(&self, band: usize) -> BandScaling {
+        self.band_scaling
+            .get(band.saturating_sub(1))
+            .copied()
+            .unwrap_or(BandScaling::IDENTITY)
+    }
+}
+
+/// Whether an interleaved pixel's alpha sample marks it fully transparent.
+#[inline(always)]
+pub fn is_transparent<T: Copy + Default + PartialEq>(ctx: &WalkContext<'_>, px: &[T]) -> bool {
+    ctx.alpha_sample
+        .and_then(|a| px.get(a as usize))
+        .is_some_and(|&alpha| alpha == T::default())
 }
 
 /// Walk a single-band window. Center sampling batches contiguous pixels
@@ -161,6 +186,8 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
         stride: chunk_stride,
         samples_per_pixel: 1,
         owner: None,
+        band_scaling: &[],
+        alpha_sample: None,
     };
     walk_direct(&ctx, slice, is_row_all_nodata, engine, chunk_maps);
 }
@@ -668,6 +695,8 @@ mod tests {
             stride: 200,
             samples_per_pixel: 1,
             owner: None,
+            band_scaling: &[],
+            alpha_sample: None,
         };
         RowPruner::new(&ctx).unwrap().columns(&ctx, 0, 200)
     }
@@ -711,6 +740,8 @@ mod tests {
                     stride: 1,
                     samples_per_pixel: 1,
                     owner: None,
+                    band_scaling: &[],
+                    alpha_sample: None,
                 };
                 let mut projector = SampleProjector::new(&ctx);
                 assert!(matches!(projector.cache, RowCache::Mercator(_)));
@@ -766,6 +797,8 @@ mod tests {
                     stride: 4,
                     samples_per_pixel: 1,
                     owner: None,
+                    band_scaling: &[],
+                    alpha_sample: None,
                 };
                 let mut projector = SampleProjector::new(&ctx);
                 match (&crs, &projector.cache) {

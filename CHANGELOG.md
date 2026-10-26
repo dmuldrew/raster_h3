@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GDAL band `SCALE`/`OFFSET` calibration: continuous statistics, quantiles and spectral indices now use `stored * scale + offset` per band (and per mosaic file). NoData is still matched on stored values. Opt out with DuckDB `scale_offset := false`, CLI `--raw-values`, DataFusion `with_scale_offset(false)` or `MultiResolutionConfig::apply_scale_offset`. Malformed scale/offset metadata is rejected when the file is opened.
+- TIFF alpha: pixels whose `ExtraSamples` alpha sample is zero are excluded from continuous and categorical aggregation.
+
 - `QuantilePlan` evaluates a list of `QuantileTarget`s with one sketch sweep per cell; `ContinuousBatchReader::tracks_quantiles()` and `columnar::quantiles_projected()` expose the quantile pushdown decision.
 - Release quality gates covering lint, MSRV, engine/community builds, blocking dependency policy, package/version checks, wheels, fuzzing and Miri; weekly advisory and safety checks.
 - GitHub release SHA-256 checksums and build provenance, validated wheel assets, contributor issue forms and PR checklist.

@@ -196,6 +196,12 @@ impl ContinuousRasterTableProvider {
         self
     }
 
+    /// Calibrate stored values with GDAL band scale/offset (default `true`).
+    pub fn with_scale_offset(mut self, apply: bool) -> Self {
+        self.config.apply_scale_offset = apply;
+        self
+    }
+
     pub fn with_bbox(mut self, bbox: [f64; 4]) -> Self {
         self.config.bbox = Some(bbox);
         self
