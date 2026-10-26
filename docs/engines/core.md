@@ -84,6 +84,23 @@ TM certification follows proj4rs scale precedence (`k0`, then `k`) and fails
 open for duplicate parameters or syntax it cannot interpret unambiguously. See
 [Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
 
+### Mosaic decoder cache
+
+`PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF
+decoders per worker, dropping an evicted decoder before opening its replacement.
+It evicts the cached tile whose next chunk is furthest away in the global job
+order, preferring tiles with no remaining chunks. Unlike LRU, this avoids a miss
+on every chunk when a latitude band repeatedly visits more than 16 tiles.
+Each worker advances past predicted uses already assigned to other workers;
+the predictions are exact for a single worker, not worker-specific scheduling.
+Decoding and result delivery remain in their original order, so queue and byte
+budget backpressure are unchanged.
+
+For mosaics with more than 16 tiles, a shared index adds one `usize` per chunk
+reference (8 bytes on 64-bit platforms), with a temporary `usize` per tile while
+building it. Smaller mosaics do not allocate this index. Decoder state and this
+metadata are separate from the decoded-buffer and aggregation budgets.
+
 ## Columnar Model
 
 | Type | Role |

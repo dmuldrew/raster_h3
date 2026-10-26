@@ -13,6 +13,8 @@ prefetching, output buffers, and runtime overhead use additional memory. WGS84,
 Web Mercator, and certified Albers chunks can evict completed cells early.
 Arbitrary Proj4 chunks and Albers chunks that may contain the cone apex retain or
 spill cells until the remaining input permits certified eviction or EOF is reached.
+Mosaic workers retain at most 16 tile decoders each, using future chunk references
+to avoid LRU thrashing on wide mosaics (see the [core engine notes](docs/engines/core.md#mosaic-decoder-cache)).
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
