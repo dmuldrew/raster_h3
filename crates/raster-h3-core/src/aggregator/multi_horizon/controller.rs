@@ -159,6 +159,7 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     resolutions: Vec<Resolution>,
     resolution_u8s: Vec<u8>,
     nodata: Option<f64>,
+    apply_scale_offset: bool,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
     resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
@@ -303,6 +304,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             resolutions,
             resolution_u8s,
             nodata: config.custom_nodata,
+            apply_scale_offset: config.apply_scale_offset,
             bbox: config.bbox,
             sampling: config.sampling.clone(),
             resolution_shards,
@@ -548,6 +550,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         stride: *stride,
                         samples_per_pixel: tile.reader.metadata.samples_per_pixel,
                         owner: overlap.then_some((*tile_idx, &*self.mosaic)),
+                        band_scaling: if self.apply_scale_offset {
+                            &tile.reader.metadata.band_scaling
+                        } else {
+                            &[]
+                        },
+                        alpha_sample: tile.reader.metadata.alpha_sample,
                     };
                     self.kernel.process_window(
                         &window,

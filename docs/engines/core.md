@@ -45,7 +45,8 @@ flowchart LR
 Every adapter follows the same steps:
 
 1. Build a `MultiResolutionConfig` from its own parameters (`resolutions`, `custom_crs`,
-   `custom_nodata`, `bbox`, `overlap_rule`, `sampling`, `quantiles`, filters, …).
+   `custom_nodata`, `apply_scale_offset`, `bbox`, `overlap_rule`, `sampling`, `quantiles`,
+   filters, …). See [band calibration and validity](../api-reference.md#band-calibration-and-validity).
 2. Open a mosaic and a horizon streamer.
 3. Drain completed cells with `drain_completed_into(max, |resolution, record| …)` until
    it returns `Ok(0)` (end of stream) or an error. Errors latch: a failed stream keeps

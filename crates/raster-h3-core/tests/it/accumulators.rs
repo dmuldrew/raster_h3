@@ -494,3 +494,26 @@ fn test_categorical_simd_uniformity_types_and_spans() {
     let zeros_f64 = vec![0.0f64, -0.0f64, 0.0f64, -0.0f64];
     assert!(f64::is_uniform(&zeros_f64));
 }
+
+#[test]
+fn apply_affine_matches_accumulating_transformed_values() {
+    let values = [3.0, -1.5, 8.25, 0.0, 4.0, 4.0, 11.5];
+    for (scale, offset) in [(0.01, 5.0), (-2.5, 100.0), (1.0, -7.0)] {
+        let mut raw = H3Accumulator::default();
+        let mut expected = H3Accumulator::default();
+        for v in values {
+            raw.update(v);
+            expected.update(v * scale + offset);
+        }
+        raw.apply_affine(scale, offset);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+        assert_eq!(raw.count, expected.count);
+        assert!(close(raw.sum, expected.sum), "{} {}", raw.sum, expected.sum);
+        assert!(close(raw.mean(), expected.mean()));
+        assert!(close(raw.variance(), expected.variance()));
+        assert!(close(raw.min, expected.min) && close(raw.max, expected.max));
+    }
+    let mut empty = H3Accumulator::default();
+    empty.apply_affine(-3.0, 1.0);
+    assert_eq!(empty, H3Accumulator::default());
+}

@@ -72,6 +72,7 @@ Schema: `ColumnSchema::continuous(&quantiles)` (see the [overview](README.md#out
 | :--- | :--- |
 | `with_crs(crs)` | `custom_crs` |
 | `with_nodata(v)` | `custom_nodata` |
+| `with_scale_offset(b)` | `apply_scale_offset` (default `true`) |
 | `with_bbox([min_lon, min_lat, max_lon, max_lat])` | `bbox` |
 | `with_sampling(SamplingPattern)` | `sampling` (see [Super-Sampling](../super-sampling.md)) |
 | `with_band(n)` | `band` |

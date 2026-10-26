@@ -25,6 +25,7 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`, `'EPSG:32633'`). Required if raster lacks embedded CRS metadata; otherwise acts as override. Alias: `crs`. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value to exclude from aggregations. |
+| `scale_offset` | `BOOLEAN` | `true` | Convert stored values to physical values with each band's GDAL `SCALE`/`OFFSET` before statistics and spectral indices. `false` aggregates raw stored values. See [Band calibration and validity](#band-calibration-and-validity). |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, `'5point'`, `'8rooks'`, `'9point'`, `'16point'`). |
 | `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Region of Interest (ROI) bounding box coordinates for chunk pruning. |
@@ -75,6 +76,30 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | **`max`** | max(x_i) | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building height. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
 | **`sum`** | sum(w_i * x_i) | **Cumulative Physical Quantities**: Total precipitation volume, solar radiation flux, biomass carbon stock. | Used whenever raster pixel values represent density or rate per unit area that integrates across the hexagon. |
 
+### Band calibration and validity
+
+Every engine reads these from the GeoTIFF and applies them the same way:
+
+- **Scale/offset.** GDAL stores per-band `SCALE` and `OFFSET` in the `GDAL_METADATA` tag
+  (42112). Continuous statistics (`mean`, `min`, `max`, `stddev`, `sum`, quantiles) and
+  spectral indices use the physical value `stored * scale + offset`, computed per band and,
+  in a mosaic, per file. A negative scale swaps `min` and `max`. A scale that is zero or not
+  finite, an offset that is not finite, or an item for a band the file does not have is an
+  error when the file is opened. Non-numeric scale/offset values are also rejected.
+  DuckDB's `scale_offset := false`, the CLI's `--raw-values`, and DataFusion's
+  `with_scale_offset(false)` aggregate stored values instead, but do not bypass metadata
+  validation: invalid calibration metadata is rejected in all modes, including categorical
+  aggregation.
+- **NoData.** The `GDAL_NODATA` tag and the `nodata` override are matched against
+  *stored* values, before scaling, as GDAL does.
+- **Alpha.** A sample declared as associated or unassociated alpha by the TIFF
+  `ExtraSamples` tag makes every pixel whose alpha is `0` transparent: it contributes to no
+  statistic, continuous or categorical. Extra samples declared as unspecified (for
+  example a fourth NIR band) are ordinary data.
+- **Not read.** Internal or external mask bands (`.msk`, `NewSubfileType` mask IFDs) and
+  per-band NoData values other than the single `GDAL_NODATA` sentinel are not read yet.
+- **Categorical classes** are never scaled.
+
 ---
 
 ## Categorical Rasters: `h3_raster_categorical_aggregate(file_path, [resolution], ...)`
@@ -91,6 +116,7 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `source_crs` | `VARCHAR` | `None` (auto) | Raster Coordinate Reference System (e.g. `'EPSG:4326'`, `'EPSG:3857'`). Required if raster lacks embedded CRS metadata; otherwise acts as override. Alias: `crs`. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
+| `scale_offset` | `BOOLEAN` | `true` | Accepted for symmetry and ignored: class codes are never scaled. |
 | `chunk_size` | `BIGINT` | `512` | Strip/tile buffer window size in rows. |
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, etc.). |
 | `min_lon`, `min_lat`, `max_lon`, `max_lat` | `DOUBLE` | `None` | Bounding box coordinates for spatial Region of Interest (ROI) chunk pruning. |
@@ -174,6 +200,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset. |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
+| `scale_offset` | `BOOLEAN` | `true` | Calibrate continuous values with GDAL band `SCALE`/`OFFSET`; ignored for categorical exports. |
 | `categorical` | `BOOLEAN` | `false` | Whether to aggregate categorical raster classes instead of continuous stats. |
 | `compact` | `BOOLEAN` | `false` | Compact output format (fewer columns). |
 | `compression` | `VARCHAR` | `'snappy'` | Parquet compression codec: `'snappy'`, `'zstd'`, `'gzip'`, `'lz4'`, `'brotli'`, `'none'`. |
@@ -215,6 +242,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `sampling` | `VARCHAR` | `'center'` | Sub-pixel super-sampling preset (`'center'`, `'rgss'`, `'hex'`, `'gaussian'`, etc.). |
 | `band` | `BIGINT` | `1` | 1-indexed band to extract and aggregate. |
 | `nodata` | `DOUBLE` | `None` (auto) | Custom NoData sentinel value. |
+| `scale_offset` | `BOOLEAN` | `true` | Calibrate continuous values with GDAL band `SCALE`/`OFFSET`; ignored for categorical exports. |
 | `categorical` | `BOOLEAN` | `false` | Whether to aggregate categorical raster classes instead of continuous stats. |
 | `properties` | `VARCHAR` | `None` (all) | Selective property whitelist (e.g. `'mean,count'` or `'majority,entropy'`). Reduces MVT protobuf encoding overhead and shrinks `.pmtiles` archive size by 15–30%. |
 

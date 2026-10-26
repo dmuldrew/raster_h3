@@ -267,6 +267,13 @@ pub struct MultiResolutionConfig {
     pub band: usize,
     /// Optional user-specified NoData override.
     pub custom_nodata: Option<f64>,
+    /// Convert stored values to physical values with each band's GDAL
+    /// `SCALE`/`OFFSET` before continuous statistics and spectral indices.
+    /// NoData is always matched against stored values. Categorical
+    /// classes are never scaled.
+    /// Invalid scale/offset metadata is rejected when the file is opened,
+    /// even when this is `false`.
+    pub apply_scale_offset: bool,
     /// Optional spatial bounding box for chunk-level pruning.
     pub bbox: Option<[f64; 4]>,
     /// Sub-pixel super-sampling pattern.
@@ -312,6 +319,7 @@ impl MultiResolutionConfig {
             resolutions,
             band: 1,
             custom_nodata: None,
+            apply_scale_offset: true,
             bbox: None,
             sampling: SamplingPattern::center(),
             custom_crs: None,
