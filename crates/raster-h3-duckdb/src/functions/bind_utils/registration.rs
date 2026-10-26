@@ -57,6 +57,7 @@ pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_functio
         add_named_parameter(func, "sampling", DuckDBType::Varchar);
         add_named_parameter(func, "band", DuckDBType::BigInt);
         add_named_parameter(func, "nodata", DuckDBType::Double);
+        add_named_parameter(func, "scale_offset", DuckDBType::Boolean);
         add_named_parameter(func, "source_crs", DuckDBType::Varchar);
         add_named_parameter(func, "crs", DuckDBType::Varchar);
         add_named_parameter(func, "min_lon", DuckDBType::Double);

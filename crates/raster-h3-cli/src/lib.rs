@@ -41,6 +41,8 @@ pub struct CliStreamOptions {
     pub categorical_format: CategoricalFormat,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
+    /// Calibrate stored values with GDAL band scale/offset (`--raw-values` disables).
+    pub apply_scale_offset: bool,
     pub bbox: Option<[f64; 4]>,
     pub columns: Option<Vec<String>>,
     pub batch_size: usize,
@@ -57,6 +59,7 @@ impl Default for CliStreamOptions {
             categorical_format: CategoricalFormat::Wide,
             source_crs: None,
             nodata: None,
+            apply_scale_offset: true,
             bbox: None,
             columns: None,
             batch_size: 2048,
@@ -96,6 +99,7 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
     let mut config = MultiResolutionConfig::new(opts.resolutions.clone());
     config.custom_crs = opts.source_crs.clone();
     config.custom_nodata = opts.nodata;
+    config.apply_scale_offset = opts.apply_scale_offset;
     config.bbox = opts.bbox;
     config.overlap_rule = OverlapRule::Cutline;
 
@@ -142,11 +146,13 @@ pub fn export_raster_to_parquet(
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
     geoparquet: bool,
+    apply_scale_offset: bool,
 ) -> Result<usize> {
     let paths = resolve_raster_sources(input_path)?;
     let mut config = MultiResolutionConfig::new(resolutions);
     config.custom_crs = source_crs.clone();
     config.custom_nodata = nodata;
+    config.apply_scale_offset = apply_scale_offset;
     config.bbox = bbox;
 
     let mosaic = Arc::new(MosaicReader::open(
@@ -174,6 +180,7 @@ pub fn export_raster_to_parquet(
 }
 
 /// Export a raster directly to a PMTiles v3 archive.
+#[allow(clippy::too_many_arguments)]
 pub fn export_raster_to_pmtiles(
     input_path: &str,
     output_path: &Path,
@@ -182,10 +189,12 @@ pub fn export_raster_to_pmtiles(
     source_crs: Option<String>,
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
+    apply_scale_offset: bool,
 ) -> Result<usize> {
     let mut config = MultiResolutionConfig::new(resolutions);
     config.custom_crs = source_crs;
     config.custom_nodata = nodata;
+    config.apply_scale_offset = apply_scale_offset;
     config.bbox = bbox;
 
     if !categorical {
@@ -252,6 +261,7 @@ pub fn parse_stream_args(
                 let v = value()?;
                 opts.nodata = Some(v.parse().map_err(|_| invalid(flag, v, "a number"))?);
             }
+            "--raw-values" => opts.apply_scale_offset = false,
             "--bbox" => {
                 let v = value()?;
                 opts.bbox = Some(
@@ -389,6 +399,8 @@ mod tests {
         assert_eq!(opts.bbox, Some([1.0, 2.0, 3.0, 4.0]));
         assert_eq!(opts.limit, Some(5));
         assert_eq!(out.as_deref(), Some("x"));
+        assert!(opts.apply_scale_offset);
+        assert!(!parse(&["--raw-values"]).unwrap().0.apply_scale_offset);
 
         for bad in [
             &["--bbox", "10,20,30"][..],

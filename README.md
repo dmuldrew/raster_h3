@@ -522,6 +522,23 @@ This prevents silent spatial corruption — meter-based coordinates treated as d
 
 For supported projection families, see [Supported CRS](docs/crs-and-projection.md). Helmert datum shifts (`+towgs84`, and built-in national grids such as `EPSG:27700` and `EPSG:28992`) are applied; grid-based shifts such as NAD27 are rejected (see [Datum Shifts](docs/crs-and-projection.md#datum-shifts)). To convert your dataset into zero-trig native WGS84 for maximum throughput, see [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
 
+### Scaled Values (GDAL Scale/Offset) and Alpha
+
+Bands that carry GDAL `SCALE`/`OFFSET` metadata (packed reflectance, temperatures) are
+aggregated as physical values, `stored * scale + offset`, including quantiles and spectral
+indices. NoData is matched on the stored value, categorical classes are never scaled, and
+pixels whose TIFF alpha sample is `0` are excluded. Invalid scale/offset metadata (including
+a zero or non-finite scale) is rejected when the file is opened, even in raw-value mode.
+To aggregate stored values from files with valid metadata instead:
+
+| Engine | Opt-out |
+| :--- | :--- |
+| DuckDB | `h3_raster_continuous_aggregate('lst.tif', resolution := 8, scale_offset := false)` |
+| CLI | `raster-h3-cli jsonl lst.tif -r 8 --raw-values` |
+| DataFusion | `ContinuousRasterTableProvider::try_new("lst.tif", vec![8])?.with_scale_offset(false)` |
+
+Python and PostgreSQL always calibrate. See [Band calibration and validity](docs/api-reference.md#band-calibration-and-validity).
+
 ### Antimeridian Crossing
 
 For datasets spanning ±180° longitude, `raster_h3` automatically wraps coordinates. For ROI bounding box filters across the antimeridian, split into two queries (e.g., `[170.0, 180.0]` and `[-180.0, -170.0]`).

@@ -399,6 +399,12 @@ impl BindHelper {
             .or_else(|| self.get_named_string("crs"))
     }
 
+    /// `scale_offset` (default true): convert stored values to physical
+    /// values with each band's GDAL `SCALE`/`OFFSET` metadata.
+    pub fn parse_scale_offset(&self) -> bool {
+        self.get_named_bool("scale_offset").unwrap_or(true)
+    }
+
     /// Parse execution limits: `workers`/`threads` (aggregation),
     /// `decode_workers`, `fetch_workers`, `decode_budget_mb` and
     /// `compaction_budget_mb`.
@@ -446,6 +452,7 @@ impl BindHelper {
         let resolutions = self.parse_resolutions(8, Some(1));
         let source_crs = self.parse_source_crs();
         let nodata = self.get_named_double("nodata");
+        let scale_offset = self.parse_scale_offset();
         let chunk_size = self
             .get_named_int("chunk_size")
             .filter(|&cs| cs > 0)
@@ -474,6 +481,7 @@ impl BindHelper {
             resolutions,
             source_crs,
             nodata,
+            scale_offset,
             chunk_size,
             band,
             sampling,
@@ -498,6 +506,8 @@ pub struct CommonRasterParams {
     pub resolutions: Vec<u8>,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
+    /// `scale_offset`: calibrate stored values with GDAL band scale/offset.
+    pub scale_offset: bool,
     pub chunk_size: u32,
     pub band: u32,
     pub sampling: SamplingPattern,

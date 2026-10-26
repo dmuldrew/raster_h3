@@ -183,6 +183,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
             config.overlap_rule = bind_data.common.overlap_rule;
             config.custom_crs = bind_data.common.source_crs.clone();
             config.custom_nodata = bind_data.common.nodata;
+            config.apply_scale_offset = bind_data.common.scale_offset;
             config.bbox = bind_data.common.bbox;
             config.sampling = bind_data.common.sampling.clone();
             config.band = bind_data.common.band as usize;
