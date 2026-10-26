@@ -248,18 +248,21 @@ impl QuantileSketch {
         // Targets that need the bin sweep, as (rank, output index).
         let mut pending: Vec<(f64, usize)> = Vec::with_capacity(targets.len());
         for (i, &q) in targets.iter().enumerate() {
-            results[i] = if q.is_nan() {
-                f64::NAN
+            let fixed = if q.is_nan() {
+                Some(f64::NAN)
             } else if q <= 0.0 {
-                min
+                Some(min)
             } else if q >= 1.0 {
-                max
+                Some(max)
             } else if degenerate {
-                min
+                Some(min)
             } else {
-                pending.push((q * self.total_count, i));
-                continue;
+                None
             };
+            match fixed {
+                Some(v) => results[i] = v,
+                None => pending.push((q * self.total_count, i)),
+            }
         }
         if pending.is_empty() {
             return results;

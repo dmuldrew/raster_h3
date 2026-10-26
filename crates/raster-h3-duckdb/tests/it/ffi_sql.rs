@@ -1902,7 +1902,11 @@ fn test_continuous_quantile_pushdown_and_batched_columns() {
             assert!(close(g, w), "cell {cell} column {k}: {g} vs {w}");
         }
         let (min, max, p50, p90, iqr) = (f[3], f[4], f[6], f[7], f[8]);
-        assert!(min - 1e-9 <= p50 && p50 <= p90 + 1e-9 && p90 <= max + 1e-9);
+        assert!(
+            (min - 1e-9..=p90 + 1e-9).contains(&p50),
+            "p50 {p50} outside [{min}, {p90}]"
+        );
+        assert!(p90 <= max + 1e-9, "p90 {p90} above max {max}");
         assert!(iqr >= 0.0);
     }
 }
