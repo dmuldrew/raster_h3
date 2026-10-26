@@ -175,6 +175,10 @@ impl MockHttpServer {
                 let gate = Arc::clone(&gate_clone);
 
                 thread::spawn(move || {
+                    // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("Failed to make accepted socket blocking");
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     Self::handle_connection(stream, &file_data, served, reqs, fails, hdrs, gate);
