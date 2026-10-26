@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remote COG prefetch no longer reports a chunk as unavailable while its range request is still in flight. The queue previously treated "all ranges claimed" as "all ranges fetched", so decoders near the end of a scan could re-download chunk bytes and leave the late payload orphaned in the ready map.
 - TIFF sample unpacking now rejects truncated buffers, overflowing dimensions, invalid strides and undersized destinations before indexing or copying; the new fuzz target caught the truncated-input regression.
 
 - PostgreSQL scalar functions, `pg_srf_continuous_next`, the `fmgr` text/bytea functions, Python scalar and `h3_polygon_to_cells` exports, and Arrow stream / batch-reader release no longer abort the host process if Rust code panics.
