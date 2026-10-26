@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `profile_hotspots` example and `profile.yml` workflow measuring mosaic tile-scan scaling and nested-Rayon wave dispatch, with a counting allocator. `StreamProfile` gains `waves`, `bridged_waves` and `serial_waves` counters.
 - `QuantilePlan` evaluates a list of `QuantileTarget`s with one sketch sweep per cell; `ContinuousBatchReader::tracks_quantiles()` and `columnar::quantiles_projected()` expose the quantile pushdown decision.
 - Release quality gates covering lint, MSRV, engine/community builds, blocking dependency policy, package/version checks, wheels, fuzzing and Miri; weekly advisory and safety checks.
 - GitHub release SHA-256 checksums and build provenance, validated wheel assets, contributor issue forms and PR checklist.

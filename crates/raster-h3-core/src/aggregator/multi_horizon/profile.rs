@@ -118,6 +118,14 @@ pub struct StreamProfile {
     pub merge_ns: u64,
     pub spill_ns: u64,
     pub jobs: u64,
+    /// Kernel waves dispatched (each runs up to `worker_tasks` window jobs).
+    pub waves: u64,
+    /// Waves handed to the dedicated pool through a helper OS thread because
+    /// the caller was a worker of another Rayon pool (one thread spawn each).
+    pub bridged_waves: u64,
+    /// Waves run serially on the calling thread: the caller was already a
+    /// worker of the dedicated pool, or a Rayon worker with no dedicated pool.
+    pub serial_waves: u64,
     pub worker_map_sets: u64,
     pub peak_worker_bytes: usize,
     pub decoded_bytes: u64,
