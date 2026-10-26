@@ -114,13 +114,39 @@ for batch in reader {
 let cat = CategoricalBatchReader::open(&paths, &config, CategoricalFormat::Long, None, 2048, None)?;
 ```
 
-- `batch_size` is clamped to at least 1; each `next()` drains up to
+- `batch_size` is clamped to at least 1 and counts output rows. Continuous and
+  categorical wide readers emit one row per cell, so each `next()` drains up to
   `min(batch_size, remaining_limit)` completed cells.
-- `limit` stops the reader after that many rows. In long format the limit counts the
-  unnested class rows; the reader buffers per-class rows internally so batches stay at
-  `batch_size`.
+- Categorical long readers emit one row per `(cell, category)`. Each `next()` fills
+  up to `min(batch_size, remaining_limit)` rows by draining one completed cell at a
+  time, resuming any partially emitted cell before draining another. Categories
+  within a cell are sorted, contiguous, and may span batches; batches are full
+  unless EOF or the limit is reached. Cells with `total_count <= 0` are skipped.
+- `limit` counts output rows: cells for continuous/wide output, unnested category
+  rows for long output. A long-format limit may stop mid-cell without expanding
+  that cell's remaining rows or draining the next cell.
 - `from_streamer(...)` accepts a streamer you built yourself (for example with custom
   sampling, spectral formulas or remapping).
+
+#### Public long-format cursor
+
+`raster_h3_core::aggregator::multi_horizon::{CategoricalLongCursor, CategoricalLongRow}`
+provides the incremental expansion shared by the core and DuckDB long readers:
+
+- `CategoricalLongCursor::new(with_entropy)` controls per-cell entropy computation.
+- `load(&MultiCategoricalRecord)` replaces any unconsumed rows with one cell's
+  categories, sorted by category, reusing the entry buffer across cells.
+- `remaining()` reports the current cell's unconsumed category rows.
+- `emit_into(max_rows, callback)` emits at most that many `CategoricalLongRow`s and
+  returns the number emitted; subsequent calls resume the same cell.
+
+For a cell with 300 categories and `batch_size = 32`, the reader drains that one
+cell and returns its first 32 rows, retaining the remaining categories for later
+batches. Pending expansion state is bounded by the largest single cell's category
+count, separate from the output batch and the streamer's aggregation budget.
+The core and DuckDB long readers compute entropy only when `shannon_entropy` or
+`entropy` is projected (full-schema indices 7 and 8); a cursor constructed with
+`with_entropy = false` puts `NaN` in `CategoricalLongRow::entropy`.
 
 ### Arrow C Data / C Stream interface
 

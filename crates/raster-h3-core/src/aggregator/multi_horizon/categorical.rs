@@ -17,6 +17,91 @@ pub struct MultiCategoricalRecord {
     pub accumulator: CategoricalAccumulator,
 }
 
+/// One output row of the long categorical format: a single (cell, category) pair.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CategoricalLongRow {
+    pub cell_u64: u64,
+    pub resolution: u8,
+    pub category: i64,
+    pub count: f64,
+    pub fraction: f64,
+    pub total_count: f64,
+    /// Shannon entropy of the cell, or `NaN` when the cursor was built without entropy.
+    pub entropy: f64,
+    pub distinct_classes: i64,
+}
+
+/// Incrementally expands one categorical record at a time into long-format rows.
+///
+/// Holding a single cell's sorted categories (instead of eagerly expanding a
+/// whole batch of cells) bounds pending output state by the largest cell's
+/// cardinality rather than `cells × categories`. The entry buffer is reused
+/// across cells.
+#[derive(Debug, Default)]
+pub struct CategoricalLongCursor {
+    with_entropy: bool,
+    cell_u64: u64,
+    resolution: u8,
+    total_count: f64,
+    entropy: f64,
+    distinct_classes: i64,
+    entries: Vec<(i64, f64)>,
+    next: usize,
+}
+
+impl CategoricalLongCursor {
+    /// Create a cursor; `with_entropy` controls whether Shannon entropy is computed per cell.
+    pub fn new(with_entropy: bool) -> Self {
+        Self {
+            with_entropy,
+            ..Default::default()
+        }
+    }
+
+    /// Replace any remaining rows with the categories of `rec`, sorted by category.
+    pub fn load(&mut self, rec: &MultiCategoricalRecord) {
+        let acc = &rec.accumulator;
+        self.cell_u64 = rec.h3_index;
+        self.resolution = rec.resolution;
+        self.total_count = acc.total_count;
+        self.distinct_classes = acc.unique_classes() as i64;
+        self.entropy = if self.with_entropy {
+            acc.shannon_entropy()
+        } else {
+            f64::NAN
+        };
+        self.entries.clear();
+        self.next = 0;
+        acc.for_each_class(|cat, cnt| self.entries.push((cat, cnt)));
+        self.entries.sort_unstable_by_key(|&(cat, _)| cat);
+    }
+
+    /// Rows of the current cell not yet emitted.
+    pub fn remaining(&self) -> usize {
+        self.entries.len() - self.next
+    }
+
+    /// Emit up to `max_rows` rows of the current cell, returning how many were emitted.
+    pub fn emit_into<F: FnMut(CategoricalLongRow)>(&mut self, max_rows: usize, mut f: F) -> usize {
+        let take = max_rows.min(self.remaining());
+        let total = self.total_count;
+        for &(category, count) in &self.entries[self.next..self.next + take] {
+            f(CategoricalLongRow {
+                cell_u64: self.cell_u64,
+                resolution: self.resolution,
+                category,
+                count,
+                fraction: if total > 0.0 { count / total } else { 0.0 },
+                total_count: total,
+                entropy: self.entropy,
+                distinct_classes: self.distinct_classes,
+            });
+        }
+        self.next += take;
+        take
+    }
+}
+
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
 fn process_categorical_slice_into_maps<T: CategoricalUniformity>(
     ctx: &WalkContext<'_>,
