@@ -29,8 +29,8 @@ use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, Overl
 use raster_h3_core::scalar_ops::{
     h3_cell_to_parent_str, h3_cell_to_parent_u64, h3_get_resolution, h3_is_valid_str,
     h3_is_valid_u64, h3_polygon_to_cells_wkb, h3_to_lat, h3_to_lng, h3_to_string, h3_to_wkb_u64,
-    parse_bbox_str, parse_containment_mode, parse_resolutions_str, string_to_h3, ContainmentMode,
-    PolygonToCellsError,
+    parse_bbox_str, parse_containment_mode, string_to_h3, try_parse_resolutions_str,
+    ContainmentMode, PolygonToCellsError,
 };
 
 /// Configuration for a Python / Polars H3 raster scan.
@@ -271,6 +271,51 @@ unsafe fn set_c_err(out_err: *mut *mut c_char, msg: &str) {
     }
 }
 
+/// H3 resolutions from a C string; NULL or empty means the default `[8]`.
+///
+/// # Safety
+/// `ptr` must be null or a valid NUL-terminated string.
+unsafe fn parse_c_resolutions(ptr: *const c_char) -> Result<Vec<u8>> {
+    // SAFETY: `ptr` is null or NUL-terminated (caller contract), as `opt_cstr` requires.
+    match unsafe { opt_cstr(ptr) } {
+        None => Ok(vec![8]),
+        Some(s) => try_parse_resolutions_str(&s).ok_or_else(|| {
+            RasterH3Error::InvalidParameter(format!(
+                "Invalid resolutions '{s}': expected H3 resolutions between 0 and 15, e.g. 7,8"
+            ))
+        }),
+    }
+}
+
+/// Categorical output format from a C string; NULL or empty means `wide`.
+///
+/// # Safety
+/// `ptr` must be null or a valid NUL-terminated string.
+unsafe fn parse_c_format(ptr: *const c_char) -> Result<CategoricalFormat> {
+    // SAFETY: `ptr` is null or NUL-terminated (caller contract), as `opt_cstr` requires.
+    match unsafe { opt_cstr(ptr) } {
+        None => Ok(CategoricalFormat::Wide),
+        Some(s) if s.eq_ignore_ascii_case("wide") => Ok(CategoricalFormat::Wide),
+        Some(s) if s.eq_ignore_ascii_case("long") => Ok(CategoricalFormat::Long),
+        Some(s) => Err(RasterH3Error::InvalidParameter(format!(
+            "Invalid format '{s}': expected 'wide' or 'long'"
+        ))),
+    }
+}
+
+/// Like [`parse_bbox_str`], but also rejects non-numeric entries rather than skipping them.
+fn parse_bbox_strict(s: &str) -> Option<[f64; 4]> {
+    let all_numeric = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|item| !item.is_empty())
+        .all(|item| item.parse::<f64>().is_ok());
+    if all_numeric {
+        parse_bbox_str(s)
+    } else {
+        None
+    }
+}
+
 /// # Safety
 /// Every C string argument must be null or a valid NUL-terminated string.
 #[allow(clippy::too_many_arguments)]
@@ -291,21 +336,15 @@ unsafe fn build_py_scan_config(
     unsafe {
         let path_str = opt_cstr(path)
             .ok_or_else(|| RasterH3Error::InvalidParameter("Missing input raster path".into()))?;
-        let res_vec = opt_cstr(resolutions)
-            .map(|s| parse_resolutions_str(&s))
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec![8]);
-        let fmt = match opt_cstr(format) {
-            Some(s) if s.eq_ignore_ascii_case("long") => CategoricalFormat::Long,
-            _ => CategoricalFormat::Wide,
-        };
+        let res_vec = parse_c_resolutions(resolutions)?;
+        let fmt = parse_c_format(format)?;
         let crs_opt = opt_cstr(crs);
         let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
         let bbox_opt = opt_cstr(bbox)
             .map(|s| {
-                parse_bbox_str(&s).ok_or_else(|| {
+                parse_bbox_strict(&s).ok_or_else(|| {
                     RasterH3Error::InvalidParameter(format!(
-                        "bbox must be 'min_lon,min_lat,max_lon,max_lat', got '{s}'"
+                        "Invalid bbox '{s}': expected four numbers min_lon,min_lat,max_lon,max_lat"
                     ))
                 })
             })
@@ -354,10 +393,7 @@ pub unsafe extern "C" fn raster_h3_py_create_arrow_schema(
     // The returned box is freed by `raster_h3_py_free_arrow_schema`.
     unsafe {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let fmt = match opt_cstr(format) {
-                Some(s) if s.eq_ignore_ascii_case("long") => CategoricalFormat::Long,
-                _ => CategoricalFormat::Wide,
-            };
+            let fmt = parse_c_format(format)?;
             let cols_opt = opt_cstr(columns).map(|s| {
                 s.split(',')
                     .map(|c| c.trim().to_string())
@@ -878,10 +914,7 @@ pub unsafe extern "C" fn raster_h3_py_export_parquet(
                 .ok_or_else(|| RasterH3Error::InvalidParameter("Missing input_path".into()))?;
             let out_str = opt_cstr(output_path)
                 .ok_or_else(|| RasterH3Error::InvalidParameter("Missing output_path".into()))?;
-            let res_vec = opt_cstr(resolutions)
-                .map(|s| parse_resolutions_str(&s))
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| vec![8]);
+            let res_vec = parse_c_resolutions(resolutions)?;
             let crs_opt = opt_cstr(crs);
             let paths = resolve_raster_sources(&in_str)?;
             let mut config = MultiResolutionConfig::new(res_vec);
@@ -955,10 +988,7 @@ pub unsafe extern "C" fn raster_h3_py_export_pmtiles(
                 .ok_or_else(|| RasterH3Error::InvalidParameter("Missing input_path".into()))?;
             let out_str = opt_cstr(output_path)
                 .ok_or_else(|| RasterH3Error::InvalidParameter("Missing output_path".into()))?;
-            let res_vec = opt_cstr(resolutions)
-                .map(|s| parse_resolutions_str(&s))
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| vec![8]);
+            let res_vec = parse_c_resolutions(resolutions)?;
             let mut config = MultiResolutionConfig::new(res_vec);
             config.custom_crs = opt_cstr(crs);
 
