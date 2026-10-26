@@ -2,7 +2,8 @@ use std::ffi::{c_void, CString};
 use std::sync::Mutex;
 
 use crate::aggregator::multi_horizon::{
-    MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
+    MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantilePlan,
+    QuantileTarget,
 };
 use crate::encoding::{WkbBuf, WKB_BUF_LEN};
 use crate::ffi::duckdb_c::*;
@@ -191,7 +192,18 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
             config.max_mean = bind_data.max_mean;
             config.compact = bind_data.common.compact;
             config.compact_h3_children = bind_data.common.compact;
-            config.quantiles = bind_data.quantiles.clone();
+            // Quantile columns follow `wkb` (and `geom` when emitted). Build
+            // per-cell sketches only if the query selects one of them; DuckDB
+            // includes filter columns in the projection, so WHERE clauses on
+            // quantiles still get them.
+            let q_start_col = if bind_data.common.emit_geom { 11 } else { 10 };
+            let q_end_col = q_start_col + bind_data.quantiles.len();
+            if projected_columns
+                .iter()
+                .any(|c| (q_start_col..q_end_col).contains(c))
+            {
+                config.quantiles = bind_data.quantiles.clone();
+            }
             bind_data.common.execution.apply(&mut config);
 
             let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
@@ -300,6 +312,32 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             let mut out_idx_wkb: Option<usize> = None;
             let mut out_idx_geom: Option<usize> = None;
 
+            // Evaluate every projected quantile column with one sketch sweep
+            // per cell, rather than one sweep per (cell, column).
+            let mut q_targets: Vec<usize> = proj_cols
+                .iter()
+                .filter_map(|&c| c.checked_sub(q_start_col))
+                .filter(|&q| q < global_data.quantiles.len())
+                .collect();
+            q_targets.sort_unstable();
+            q_targets.dedup();
+            let q_values: Vec<Vec<f64>> = if q_targets.is_empty() {
+                Vec::new()
+            } else {
+                let plan = QuantilePlan::new(q_targets.iter().map(|&i| &global_data.quantiles[i]));
+                let mut columns: Vec<Vec<f64>> = (0..plan.len())
+                    .map(|_| Vec::with_capacity(batch_len))
+                    .collect();
+                let mut row = Vec::with_capacity(plan.len());
+                for r in batch.iter() {
+                    plan.evaluate_into(&r.accumulator, &mut row);
+                    for (column, &v) in columns.iter_mut().zip(&row) {
+                        column.push(v);
+                    }
+                }
+                columns
+            };
+
             // Schema column mapping:
             // 0: h3_index UBIGINT
             // 1: h3_hex VARCHAR
@@ -357,25 +395,8 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                         out_idx_geom = Some(out_idx);
                     }
                     c if c >= q_start_col => {
-                        let q_idx = c - q_start_col;
-                        if q_idx < global_data.quantiles.len() {
-                            match &global_data.quantiles[q_idx] {
-                                QuantileTarget::Percentile(q, _) => {
-                                    let q_val = *q;
-                                    writer.fill_column(
-                                        out_idx,
-                                        batch_len,
-                                        batch.iter().map(|r| r.accumulator.quantile(q_val)),
-                                    );
-                                }
-                                QuantileTarget::Iqr(_) => {
-                                    writer.fill_column(
-                                        out_idx,
-                                        batch_len,
-                                        batch.iter().map(|r| r.accumulator.iqr()),
-                                    );
-                                }
-                            }
+                        if let Ok(slot) = q_targets.binary_search(&(c - q_start_col)) {
+                            writer.fill_column(out_idx, batch_len, q_values[slot].iter().copied());
                         }
                     }
                     _ => {}

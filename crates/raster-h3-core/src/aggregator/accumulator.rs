@@ -283,9 +283,8 @@ impl H3Accumulator {
     #[inline]
     pub fn iqr(&self) -> f64 {
         if let Some(ref sketch) = self.quantiles {
-            let p75 = sketch.quantile(0.75, self.min, self.max);
-            let p25 = sketch.quantile(0.25, self.min, self.max);
-            (p75 - p25).max(0.0)
+            let q = sketch.quantiles_batch(&[0.25, 0.75], self.min, self.max);
+            (q[1] - q[0]).max(0.0)
         } else {
             f64::NAN
         }

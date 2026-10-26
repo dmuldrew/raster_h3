@@ -24,7 +24,7 @@ pub use categorical::{
 };
 pub use categorical_streamer::MultiCategoricalHorizonStreamer;
 pub use compaction::HierarchicalCompactor;
-pub use config::{MultiResolutionConfig, QuantileTarget, SpectralFormula};
+pub use config::{MultiResolutionConfig, QuantilePlan, QuantileTarget, SpectralFormula};
 pub use continuous::{
     process_continuous_chunk_payload_into, ContinuousOptions, MultiContinuousRecord,
 };

@@ -27,7 +27,7 @@ use raster_h3_duckdb::functions::pmtiles_table_function::{
 };
 use raster_h3_duckdb::functions::scalar::*;
 use raster_h3_duckdb::functions::table_function::{
-    raster_h3_bind, raster_h3_init, raster_h3_init_local, raster_h3_scan,
+    raster_h3_bind, raster_h3_init, raster_h3_init_local, raster_h3_scan, RasterH3GlobalData,
 };
 
 // =============================================================================
@@ -1777,6 +1777,134 @@ fn test_continuous_table_function_full_scan_and_projection_pushdown() {
         zero_col_rows += chunk.size;
     }
     assert_eq!(zero_col_rows, total_rows);
+}
+
+#[test]
+fn test_continuous_quantile_pushdown_and_batched_columns() {
+    install_mock_api();
+    // Negative, zero and positive values so sketches use every bin family.
+    let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
+        .origin(-122.45, 37.80)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|c, r| ((c * 7 + r * 3) % 50) as f32 - 10.0);
+
+    let mut named = HashMap::new();
+    named.insert("resolution".to_string(), MockVal::Int(8));
+    named.insert("geom".to_string(), MockVal::Bool(true));
+    named.insert(
+        "quantiles".to_string(),
+        MockVal::Str("p50,p90,iqr".to_string()),
+    );
+    let mut bind_ctx = MockBindContext::new(
+        vec![MockVal::Str(path.to_string_lossy().into_owned())],
+        named,
+    );
+    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+    // treats as the bind info.
+    unsafe {
+        raster_h3_bind(&mut bind_ctx as *mut MockBindContext as duckdb_bind_info);
+    }
+    assert!(
+        bind_ctx.error.is_none(),
+        "Bind failed: {:?}",
+        bind_ctx.error
+    );
+    // 10 base columns + geom (10) + p50 (11), p90 (12), iqr (13).
+    assert_eq!(bind_ctx.result_columns.len(), 14);
+    let bind_data = bind_ctx.bind_data;
+
+    let tracks_quantiles = |projection: Vec<usize>| -> bool {
+        let mut init = MockInitContext::new(bind_data, projection);
+        // SAFETY: the context is a live `MockInitContext` carrying the bind data installed
+        // by the bind callback, which is still owned by its bind context.
+        unsafe {
+            raster_h3_init(&mut init as *mut MockInitContext as duckdb_init_info);
+        }
+        assert!(init.error.is_none(), "Init failed: {:?}", init.error);
+        // SAFETY: init installed a `RasterH3GlobalData` as `init_data`; it stays alive
+        // until `init` is dropped below, after the guard is released.
+        let global = unsafe { &*(init.init_data as *const RasterH3GlobalData) };
+        let tracked = global.streamer.lock().unwrap().track_quantiles();
+        drop(init);
+        tracked
+    };
+    assert!(!tracks_quantiles(vec![0, 2, 4]), "no quantile columns");
+    assert!(
+        !tracks_quantiles(vec![0, 9, 10]),
+        "wkb and geom are not quantiles"
+    );
+    assert!(!tracks_quantiles(Vec::new()), "count(*)");
+    assert!(tracks_quantiles(vec![0, 13]), "iqr alone needs sketches");
+    assert!(tracks_quantiles((0..14).collect()));
+
+    // Scan `projection` (h3_index first, then f64 columns) into h3_index -> values.
+    let scan = |projection: Vec<usize>| -> HashMap<u64, Vec<f64>> {
+        let ncols = projection.len();
+        let mut init = MockInitContext::new(bind_data, projection);
+        let mut local = MockInitContext::new(bind_data, Vec::new());
+        // SAFETY: the contexts are live `MockInitContext`s that carry the bind data
+        // installed by the bind callback, which is still owned by its bind context.
+        unsafe {
+            raster_h3_init(&mut init as *mut MockInitContext as duckdb_init_info);
+            raster_h3_init_local(&mut local as *mut MockInitContext as duckdb_init_info);
+        }
+        assert!(init.error.is_none(), "Init failed: {:?}", init.error);
+        let mut func = MockFuncContext {
+            bind_data,
+            init_data: init.init_data,
+            local_init_data: local.init_data,
+            error: None,
+        };
+        let mut out = HashMap::new();
+        loop {
+            let mut chunk = MockDataChunk::new(ncols, 2048);
+            // SAFETY: the function context carries bind/init/local data installed above
+            // (still owned by their live contexts), and the chunk has one 2048-row mock
+            // vector per projected column.
+            unsafe {
+                raster_h3_scan(
+                    &mut func as *mut MockFuncContext as duckdb_function_info,
+                    &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
+                );
+            }
+            assert!(func.error.is_none(), "Scan failed: {:?}", func.error);
+            if chunk.size == 0 {
+                break;
+            }
+            // SAFETY: column 0 holds UBIGINT h3 indices and the rest DOUBLEs, written for
+            // rows `0..size` into 8-aligned buffers with room for that many rows.
+            unsafe {
+                let cells = chunk.vectors[0].data.as_ptr() as *const u64;
+                for i in 0..chunk.size {
+                    let row = (1..ncols)
+                        .map(|c| *(chunk.vectors[c].data.as_ptr() as *const f64).add(i))
+                        .collect();
+                    assert!(out.insert(*cells.add(i), row).is_none(), "duplicate cell");
+                }
+            }
+        }
+        out
+    };
+
+    // Reference: every DOUBLE column in schema order. Row positions:
+    // mean 0, stddev 1, count 2, min 3, max 4, sum 5, p50 6, p90 7, iqr 8.
+    let full = scan(vec![0, 2, 3, 4, 5, 6, 7, 11, 12, 13]);
+    // Quantiles reordered and repeated, mixed with a base column: iqr, p50, p90, p50, mean.
+    let got = scan(vec![0, 13, 11, 12, 11, 2]);
+    assert!(!got.is_empty());
+    assert_eq!(got.len(), full.len());
+
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+    for (cell, row) in &got {
+        let f = &full[cell];
+        let want = [f[8], f[6], f[7], f[6], f[0]];
+        for (k, (&g, &w)) in row.iter().zip(&want).enumerate() {
+            assert!(close(g, w), "cell {cell} column {k}: {g} vs {w}");
+        }
+        let (min, max, p50, p90, iqr) = (f[3], f[4], f[6], f[7], f[8]);
+        assert!(min - 1e-9 <= p50 && p50 <= p90 + 1e-9 && p90 <= max + 1e-9);
+        assert!(iqr >= 0.0);
+    }
 }
 
 #[test]

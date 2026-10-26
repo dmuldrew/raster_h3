@@ -125,8 +125,15 @@ let cat = CategoricalBatchReader::open(&paths, &config, CategoricalFormat::Long,
 - `limit` counts output rows: cells for continuous/wide output, unnested category
   rows for long output. A long-format limit may stop mid-cell without expanding
   that cell's remaining rows or draining the next cell.
+- `ContinuousBatchReader::open` builds per-cell quantile sketches only when the
+  projection selects a quantile column (full-schema index 10 and up), or when
+  `projection` is `None`. The schema still lists every configured quantile column;
+  `tracks_quantiles()` reports whether sketches are being built, and the public
+  `columnar::quantiles_projected(projection, n)` applies the same rule. DuckDB applies
+  it to its own projection (which includes columns referenced by `WHERE`).
 - `from_streamer(...)` accepts a streamer you built yourself (for example with custom
-  sampling, spectral formulas or remapping).
+  sampling, spectral formulas or remapping). Its sketch tracking is whatever that
+  streamer's config requested.
 
 #### Public long-format cursor
 
@@ -147,6 +154,21 @@ count, separate from the output batch and the streamer's aggregation budget.
 The core and DuckDB long readers compute entropy only when `shannon_entropy` or
 `entropy` is projected (full-schema indices 7 and 8); a cursor constructed with
 `with_entropy = false` puts `NaN` in `CategoricalLongRow::entropy`.
+
+#### Batched quantile evaluation
+
+`QuantileSketch::quantiles_batch(&targets, min, max)` answers several quantiles with
+one sorted sweep of a sketch's bins, returning exactly what `quantile(q, min, max)`
+returns for each target in input order. Targets may be unsorted or repeated; NaN
+targets yield NaN, `q <= 0` yields `min` and `q >= 1` yields `max`.
+
+`raster_h3_core::aggregator::multi_horizon::QuantilePlan` builds on it for
+`QuantileTarget` lists: `QuantilePlan::new(&targets)` deduplicates the probabilities
+(IQR shares p25/p75 with any explicit targets), and
+`evaluate_into(&H3Accumulator, &mut Vec<f64>)` writes one value per target, equal to
+`H3Accumulator::quantile` / `iqr` (NaN when the accumulator has no sketch). The core
+continuous reader and the DuckDB scan evaluate all projected quantile columns of a
+cell this way.
 
 ### Arrow C Data / C Stream interface
 

@@ -234,140 +234,115 @@ impl QuantileSketch {
         max
     }
 
-    /// Query multiple quantiles in a single sorted sweep over all bins
+    /// Query multiple quantiles in a single sorted sweep over all bins.
+    ///
+    /// Returns, in input order, exactly what [`Self::quantile`] returns for each
+    /// target: targets may be unsorted or repeated, and NaN targets yield NaN.
     pub fn quantiles_batch(&self, targets: &[f64], min: f64, max: f64) -> Vec<f64> {
-        if targets.is_empty() {
-            return Vec::new();
-        }
+        let mut results = vec![f64::NAN; targets.len()];
         if self.total_count <= 0.0 {
-            return vec![f64::NAN; targets.len()];
-        }
-        if (min - max).abs() < 1e-12 {
-            return vec![min; targets.len()];
-        }
-
-        let mut sorted_targets: Vec<(usize, f64)> =
-            targets.iter().enumerate().map(|(i, &q)| (i, q)).collect();
-        sorted_targets.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut results = vec![0.0f64; targets.len()];
-        let mut target_idx = 0;
-
-        while target_idx < sorted_targets.len() && sorted_targets[target_idx].1 <= 0.0 {
-            let (orig_idx, _) = sorted_targets[target_idx];
-            results[orig_idx] = min;
-            target_idx += 1;
-        }
-
-        if target_idx >= sorted_targets.len() {
             return results;
         }
+        let degenerate = (min - max).abs() < 1e-12;
 
-        let mut cum = 0.0;
+        // Targets that need the bin sweep, as (rank, output index).
+        let mut pending: Vec<(f64, usize)> = Vec::with_capacity(targets.len());
+        for (i, &q) in targets.iter().enumerate() {
+            results[i] = if q.is_nan() {
+                f64::NAN
+            } else if q <= 0.0 {
+                min
+            } else if q >= 1.0 {
+                max
+            } else if degenerate {
+                min
+            } else {
+                pending.push((q * self.total_count, i));
+                continue;
+            };
+        }
+        if pending.is_empty() {
+            return results;
+        }
+        // Ranks are finite here, so `total_cmp` gives the numeric order.
+        pending.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-        // 1. Negative bins
-        if !self.neg_bins.is_empty() {
-            let mut neg_keys: Vec<i32> = self.neg_bins.keys().copied().collect();
-            neg_keys.sort_unstable_by(|a, b| b.cmp(a)); // Descending
-
-            for key in neg_keys {
-                let count = self.neg_bins[&key];
-                let prior = cum;
-                cum += count;
-
-                while target_idx < sorted_targets.len() {
-                    let (orig_idx, q) = sorted_targets[target_idx];
-                    if q >= 1.0 {
-                        break;
-                    }
-                    let rank = q * self.total_count;
-                    if rank <= cum {
-                        let f = if count > 0.0 {
-                            ((rank - prior) / count).clamp(0.0, 1.0)
-                        } else {
-                            0.5
-                        };
-                        let l = Self::lower_bound(key);
-                        let val = -l * (GAMMA - f * (GAMMA - 1.0));
-                        results[orig_idx] = val.clamp(min, max);
-                        target_idx += 1;
-                    } else {
-                        break;
-                    }
+        /// Resolve every pending target whose rank is reached by `cum`.
+        fn settle(
+            pending: &[(f64, usize)],
+            next: &mut usize,
+            cum: f64,
+            results: &mut [f64],
+            value_at: impl Fn(f64) -> f64,
+        ) {
+            while let Some(&(rank, idx)) = pending.get(*next) {
+                if rank > cum {
+                    break;
                 }
-
-                if target_idx >= sorted_targets.len() {
-                    return results;
-                }
+                results[idx] = value_at(rank);
+                *next += 1;
             }
         }
-
-        // 2. Zero count
-        if self.zero_count > 0.0 {
-            cum += self.zero_count;
-
-            while target_idx < sorted_targets.len() {
-                let (orig_idx, q) = sorted_targets[target_idx];
-                if q >= 1.0 {
-                    break;
-                }
-                let rank = q * self.total_count;
-                if rank <= cum {
-                    results[orig_idx] = 0.0f64.clamp(min, max);
-                    target_idx += 1;
-                } else {
-                    break;
-                }
+        let fraction = |rank: f64, prior: f64, count: f64| {
+            if count > 0.0 {
+                ((rank - prior) / count).clamp(0.0, 1.0)
+            } else {
+                0.5
             }
+        };
 
-            if target_idx >= sorted_targets.len() {
+        let mut next = 0;
+        let mut cum = 0.0;
+
+        // 1. Negative bins, descending key order (most negative value first).
+        let mut neg_keys: Vec<i32> = self.neg_bins.keys().copied().collect();
+        neg_keys.sort_unstable_by(|a, b| b.cmp(a));
+        for key in neg_keys {
+            let count = self.neg_bins[&key];
+            let prior = cum;
+            cum += count;
+            let l = Self::lower_bound(key);
+            settle(&pending, &mut next, cum, &mut results, |rank| {
+                let f = fraction(rank, prior, count);
+                (-l * (GAMMA - f * (GAMMA - 1.0))).clamp(min, max)
+            });
+            if next == pending.len() {
                 return results;
             }
         }
 
-        // 3. Positive bins
-        if !self.pos_bins.is_empty() {
-            let mut pos_keys: Vec<i32> = self.pos_bins.keys().copied().collect();
-            pos_keys.sort_unstable();
-
-            for key in pos_keys {
-                let count = self.pos_bins[&key];
-                let prior = cum;
-                cum += count;
-
-                while target_idx < sorted_targets.len() {
-                    let (orig_idx, q) = sorted_targets[target_idx];
-                    if q >= 1.0 {
-                        break;
-                    }
-                    let rank = q * self.total_count;
-                    if rank <= cum {
-                        let f = if count > 0.0 {
-                            ((rank - prior) / count).clamp(0.0, 1.0)
-                        } else {
-                            0.5
-                        };
-                        let l = Self::lower_bound(key);
-                        let val = l * (1.0 + f * (GAMMA - 1.0));
-                        results[orig_idx] = val.clamp(min, max);
-                        target_idx += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if target_idx >= sorted_targets.len() {
-                    return results;
-                }
+        // 2. Exact zero bucket.
+        if self.zero_count > 0.0 {
+            cum += self.zero_count;
+            settle(&pending, &mut next, cum, &mut results, |_| {
+                0.0f64.clamp(min, max)
+            });
+            if next == pending.len() {
+                return results;
             }
         }
 
-        while target_idx < sorted_targets.len() {
-            let (orig_idx, _) = sorted_targets[target_idx];
-            results[orig_idx] = max;
-            target_idx += 1;
+        // 3. Positive bins, ascending key order.
+        let mut pos_keys: Vec<i32> = self.pos_bins.keys().copied().collect();
+        pos_keys.sort_unstable();
+        for key in pos_keys {
+            let count = self.pos_bins[&key];
+            let prior = cum;
+            cum += count;
+            let l = Self::lower_bound(key);
+            settle(&pending, &mut next, cum, &mut results, |rank| {
+                let f = fraction(rank, prior, count);
+                (l * (1.0 + f * (GAMMA - 1.0))).clamp(min, max)
+            });
+            if next == pending.len() {
+                return results;
+            }
         }
 
+        // Ranks beyond the accumulated count (floating-point slack) clamp to max.
+        for &(_, idx) in &pending[next..] {
+            results[idx] = max;
+        }
         results
     }
 }

@@ -44,7 +44,7 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `min_mean` | `DOUBLE` | `None` | Minimum mean value filter — cells with mean below this are excluded. |
 | `max_mean` | `DOUBLE` | `None` | Maximum mean value filter — cells with mean above this are excluded. |
 | `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with 125-byte OGC WKB 2D Polygon hexagons (enables DuckDB Spatial interop). |
-| `quantiles` | `VARCHAR` | `None` | Streaming quantile targets: `'p50,p90,p99'`, `'iqr'`, `'deciles'`, `'quartiles'`. Adds percentile columns to output. |
+| `quantiles` | `VARCHAR` | `None` | Streaming quantile targets: percentiles such as `'p50,p90,p99.5'` or `'0.05'`, aliases `median`/`q1`/`q2`/`q3`/`iqr`, or presets `'default'`, `'box'` (p25, p50, p75, iqr), `'tails'`, `'deciles'`. Percentiles must be finite and strictly between 0 and 100 (decimals between 0 and 1). Adds one nullable column per target; per-cell sketches are only built when the query selects or filters on one of these columns. |
 | `percentiles` | `VARCHAR` | `None` | Alias for `quantiles`. |
 
 ### Output Schema
