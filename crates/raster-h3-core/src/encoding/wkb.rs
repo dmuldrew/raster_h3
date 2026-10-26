@@ -1,6 +1,20 @@
 //! Well-Known Binary (WKB) geometry serialization for H3 cells.
 
 use h3o::CellIndex;
+use std::sync::OnceLock;
+
+/// The north and south pole cells at each of the 16 resolutions.
+fn pole_cells(res: h3o::Resolution) -> [CellIndex; 2] {
+    static POLES: OnceLock<[[CellIndex; 2]; 16]> = OnceLock::new();
+    POLES.get_or_init(|| {
+        let north = h3o::LatLng::new(90.0, 0.0).expect("valid");
+        let south = h3o::LatLng::new(-90.0, 0.0).expect("valid");
+        std::array::from_fn(|i| {
+            let res = h3o::Resolution::try_from(i as u8).expect("resolution 0..=15");
+            [north.to_cell(res), south.to_cell(res)]
+        })
+    })[u8::from(res) as usize]
+}
 
 /// Maximum capacity in bytes for a stack-allocated H3 WKB polygon.
 /// Standard: 1 (endian) + 4 (type) + 4 (rings) + 4 (num_points) + 16 * (num_vertices + 1)
@@ -63,11 +77,7 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
     // Antimeridian unwrapping: if longitude range exceeds 180° and the cell is not
     // one of the two polar cells that encircle a pole, shift vertices so that each
     // successive vertex differs by < 180° from the previous one.
-    let res = cell.resolution();
-    let is_pole = cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(res)
-        || cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
-
-    if !is_pole && (max_lng - min_lng > 180.0) {
+    if max_lng - min_lng > 180.0 && !pole_cells(cell.resolution()).contains(&cell) {
         for i in 1..n {
             let mut diff = lngs[i] - lngs[i - 1];
             while diff > 180.0 {
@@ -292,6 +302,15 @@ mod tests {
         );
         assert_eq!(first_x, last_x);
         assert_eq!(first_y, last_y);
+    }
+
+    #[test]
+    fn test_pole_cells_cache_matches_direct_indexing() {
+        for res in h3o::Resolution::range(h3o::Resolution::Zero, h3o::Resolution::Fifteen) {
+            let [n, s] = pole_cells(res);
+            assert_eq!(n, h3o::LatLng::new(90.0, 0.0).unwrap().to_cell(res));
+            assert_eq!(s, h3o::LatLng::new(-90.0, 0.0).unwrap().to_cell(res));
+        }
     }
 
     #[test]

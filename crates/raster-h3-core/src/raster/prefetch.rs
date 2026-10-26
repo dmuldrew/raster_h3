@@ -25,6 +25,62 @@ impl<F: FnOnce()> Drop for WorkerPanicGuard<F> {
     }
 }
 
+/// Most tile decoders one mosaic decode worker keeps open at once. Chunks are
+/// delivered north to south across tiles, so the working set is the tiles in
+/// the current latitude band; reopening an evicted tile only re-parses its IFD.
+pub const MAX_OPEN_DECODERS_PER_WORKER: usize = 16;
+
+/// Least-recently-used cache of per-tile values with a fixed capacity.
+struct DecoderLru<T> {
+    capacity: usize,
+    clock: u64,
+    /// (tile index, last use, value); short enough for linear scans.
+    entries: Vec<(usize, u64, T)>,
+}
+
+impl<T> DecoderLru<T> {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            clock: 0,
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Return the value for `key`, opening it with `open` on a miss and
+    /// evicting the least recently used entry when full.
+    fn get_or_try_open<E>(
+        &mut self,
+        key: usize,
+        open: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<&mut T, E> {
+        self.clock += 1;
+        let pos = match self.entries.iter().position(|(k, _, _)| *k == key) {
+            Some(pos) => pos,
+            None => {
+                let value = open()?;
+                if self.entries.len() == self.capacity {
+                    let lru = (0..self.entries.len())
+                        .min_by_key(|&i| self.entries[i].1)
+                        .expect("capacity is at least one");
+                    self.entries.swap_remove(lru);
+                }
+                self.entries.push((key, 0, value));
+                self.entries.len() - 1
+            }
+        };
+        let entry = &mut self.entries[pos];
+        entry.1 = self.clock;
+        Ok(&mut entry.2)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Item yielded by the chunk prefetch worker
 pub type PrefetchItem = Result<(u32, RasterChunk, DecodingResult)>;
 
@@ -780,8 +836,8 @@ impl PrefetchedMosaicReader {
                 };
 
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut decoders: Vec<Option<ChunkDecoder<'_>>> =
-                        (0..worker_mosaic.tiles.len()).map(|_| None).collect();
+                    let mut decoders: DecoderLru<ChunkDecoder<'_>> =
+                        DecoderLru::new(MAX_OPEN_DECODERS_PER_WORKER);
 
                     loop {
                         if worker_queue.is_closed() {
@@ -802,18 +858,16 @@ impl PrefetchedMosaicReader {
                         else {
                             break;
                         };
-                        if decoders[tile_idx].is_none() {
-                            match reader.open_decoder() {
-                                Ok(d) => decoders[tile_idx] = Some(d),
+                        let decoder =
+                            match decoders.get_or_try_open(tile_idx, || reader.open_decoder()) {
+                                Ok(d) => d,
                                 Err(e) => {
                                     worker_budget.settle(charged, 0);
                                     worker_budget.close();
                                     worker_queue.fail(Err(e));
                                     return;
                                 }
-                            }
-                        }
-                        let decoder = decoders[tile_idx].as_mut().unwrap();
+                            };
 
                         let prefetched_bytes = worker_remote_queue
                             .as_ref()
@@ -908,6 +962,39 @@ mod tests {
 
     fn f32_buffer(len: usize) -> DecodingResult {
         DecodingResult::F32(vec![0.0; len])
+    }
+
+    #[test]
+    fn decoder_lru_bounds_open_entries_and_evicts_least_recent() {
+        let mut opens = Vec::new();
+        let mut lru: DecoderLru<usize> = DecoderLru::new(2);
+        let get = |lru: &mut DecoderLru<usize>, key: usize, opens: &mut Vec<usize>| {
+            *lru.get_or_try_open::<()>(key, || {
+                opens.push(key);
+                Ok(key * 10)
+            })
+            .unwrap()
+        };
+        assert_eq!(get(&mut lru, 0, &mut opens), 0);
+        assert_eq!(get(&mut lru, 1, &mut opens), 10);
+        assert_eq!(get(&mut lru, 0, &mut opens), 0); // hit; 1 is now LRU
+        assert_eq!(get(&mut lru, 2, &mut opens), 20); // evicts 1
+        assert_eq!(lru.len(), 2);
+        assert_eq!(get(&mut lru, 0, &mut opens), 0); // still cached
+        assert_eq!(get(&mut lru, 1, &mut opens), 10); // reopened, evicts 2
+        assert_eq!(opens, vec![0, 1, 2, 1]);
+    }
+
+    #[test]
+    fn decoder_lru_open_failure_leaves_cache_unchanged() {
+        let mut lru: DecoderLru<usize> = DecoderLru::new(1);
+        lru.get_or_try_open::<()>(0, || Ok(0)).unwrap();
+        assert!(lru.get_or_try_open(1, || Err("boom")).is_err());
+        assert_eq!(lru.len(), 1);
+        assert_eq!(
+            *lru.get_or_try_open::<()>(0, || panic!("must hit")).unwrap(),
+            0
+        );
     }
 
     #[test]
