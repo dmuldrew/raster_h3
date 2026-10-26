@@ -1874,7 +1874,7 @@ fn test_continuous_quantile_pushdown_and_batched_columns() {
             // SAFETY: column 0 holds UBIGINT h3 indices and the rest DOUBLEs, written for
             // rows `0..size` into 8-aligned buffers with room for that many rows.
             unsafe {
-                let cells = chunk.vectors[0].data.as_ptr() as *const u64;
+                let cells = chunk.vectors[0].data.as_ptr();
                 for i in 0..chunk.size {
                     let row = (1..ncols)
                         .map(|c| *(chunk.vectors[c].data.as_ptr() as *const f64).add(i))

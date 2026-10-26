@@ -291,7 +291,7 @@ fn reader_quantile_columns_match_per_record_quantiles() {
 
     let mosaic = Arc::new(
         MosaicReader::open(
-            &[path.clone()],
+            std::slice::from_ref(&path),
             config.bbox,
             config.custom_crs.as_deref(),
             config.overlap_rule,
