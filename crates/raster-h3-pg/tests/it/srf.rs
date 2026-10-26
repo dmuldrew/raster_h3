@@ -361,6 +361,31 @@ fn continuous_c_abi_srf_matches_core_with_options() {
 }
 
 #[test]
+fn continuous_c_abi_srf_keeps_full_pentagon_wkb() {
+    // Odd-resolution pentagons have 10 boundary vertices: 189 bytes of WKB, more than
+    // the 128-byte row buffer this ABI used to have.
+    let pentagon = h3o::Resolution::Nine
+        .pentagons()
+        .find(|c| h3o::LatLng::from(*c).lat().abs() < 60.0)
+        .unwrap();
+    let center = h3o::LatLng::from(pentagon);
+    let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
+        .origin(center.lng() - 0.0032, center.lat() + 0.0032)
+        .pixel_size(0.0002)
+        .create_f32_tempfile(|c, r| (c + r) as f32);
+    let mut srf = CSrf::new(&path);
+    srf.res = Some(CString::new("9").unwrap());
+    // `rows()` asserts each row's WKB equals `h3_to_wkb_u64` byte for byte.
+    let rows = srf.rows().unwrap();
+    assert!(
+        rows.contains_key(&(u64::from(pentagon) as i64)),
+        "pentagon {pentagon} not scanned"
+    );
+    let wkb = raster_h3_core::scalar_ops::h3_to_wkb_u64(u64::from(pentagon)).unwrap();
+    assert_eq!(wkb.len(), 13 + 16 * 11);
+}
+
+#[test]
 fn continuous_c_abi_srf_errors() {
     let dir = tempfile::tempdir().unwrap();
     let missing = CSrf::new(&dir.path().join("missing.tif"))

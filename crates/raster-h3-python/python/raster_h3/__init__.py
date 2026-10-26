@@ -567,6 +567,21 @@ def scan_raster_h3(
             n_rows: Optional[int],
             batch_size: Optional[int],
         ) -> Iterable[Any]:
+            empty = True
+            for df in _scan_batches(with_columns, predicate, n_rows, batch_size):
+                empty = False
+                yield df
+            if empty:
+                # Polars before 1.28 panics on an IO source that yields no frames.
+                names = with_columns if with_columns is not None else list(pl_schema)
+                yield pl.DataFrame(schema={k: pl_schema[k] for k in names})
+
+        def _scan_batches(
+            with_columns: Optional[List[str]],
+            predicate: Optional[Any],
+            n_rows: Optional[int],
+            batch_size: Optional[int],
+        ) -> Iterable[Any]:
             pushed_cols = with_columns if with_columns is not None else columns
             # `n_rows` can only be pushed into the scan when no predicate runs after it;
             # otherwise it caps the rows that survive the filter.
@@ -602,7 +617,8 @@ def scan_raster_h3(
                 if remaining is not None and remaining <= 0:
                     return
 
-        return register_io_source(io_source=_source_gen, schema=pl_schema)
+        # Positional: the parameter is `callable` before Polars 1.25 and `io_source` after.
+        return register_io_source(_source_gen, schema=pl_schema)
     except ImportError:
         return stream
 

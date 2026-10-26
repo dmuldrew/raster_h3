@@ -22,6 +22,7 @@ on:
           - datafusion
           - cli
           - python
+          - python-polars
           - pg
           - root
       platform:
@@ -42,7 +43,7 @@ on:
           - release
           - debug
       test_args:
-        description: Extra libtest arguments after `--` (e.g. a name filter, --ignored, --nocapture)
+        description: Extra libtest arguments after `--` (e.g. a name filter, --ignored, --nocapture); pytest arguments for python-polars
         type: string
         required: false
         default: ''
@@ -64,6 +65,7 @@ jobs:
       - id: select
         env:
           PLATFORM: ${{ inputs.platform }}
+          ENGINE: ${{ inputs.engine }}
         run: |
           all='[
             {"platform":"linux_amd64","os":"ubuntu-24.04"},
@@ -76,10 +78,21 @@ jobs:
           else
             include=$(jq -c --arg p "$PLATFORM" '[.[] | select(.platform == $p)]' <<<"$all")
           fi
+          # python-polars runs pytest once per dependency set: the declared minimums
+          # (pyproject: polars>=1.0, pyarrow>=14.0; pyarrow 14 needs numpy 1.x), the first
+          # Polars with register_io_source (1.4, so scan_raster_h3 pushdown runs), and latest.
+          if [ "$ENGINE" = python-polars ]; then
+            deps='[
+              {"deps":"min","python":"3.11","pip":"polars==1.0.* pyarrow==14.* numpy<2"},
+              {"deps":"io-source-min","python":"3.11","pip":"polars==1.4.* pyarrow==14.* numpy<2"},
+              {"deps":"latest","python":"3.13","pip":"polars pyarrow"}
+            ]'
+            include=$(jq -c --argjson d "$deps" '[.[] as $p | $d[] | $p + .]' <<<"$include")
+          fi
           echo "include=$include" >> "$GITHUB_OUTPUT"
 
   test:
-    name: ${{ inputs.engine }} (${{ matrix.platform }})
+    name: ${{ inputs.engine }} (${{ matrix.platform }}${{ matrix.deps && format(', {0} deps', matrix.deps) || '' }})
     needs: matrix
     runs-on: ${{ matrix.os }}
     permissions:
@@ -132,6 +145,7 @@ jobs:
           done
 
       - name: Run tests
+        if: inputs.engine != 'python-polars'
         shell: bash
         run: |
           case "$ENGINE" in
@@ -165,3 +179,42 @@ jobs:
           extra=($TEST_ARGS)
           set -x
           cargo test "${profile[@]}" --no-fail-fast -p raster-h3-pg --features pg-extension -- "${extra[@]}"
+
+      - name: Set up Python
+        if: inputs.engine == 'python-polars'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Polars and PyArrow (${{ matrix.deps }})
+        if: inputs.engine == 'python-polars'
+        shell: bash
+        env:
+          PIP_SPECS: ${{ matrix.pip }}
+        run: |
+          # shellcheck disable=SC2206
+          specs=($PIP_SPECS)
+          python -m pip install --upgrade pip
+          python -m pip install pytest h3 "${specs[@]}"
+          python -m pip list | grep -iE '^(polars|pyarrow|numpy|h3|pytest) '
+
+      # pytest loads the in-tree package from crates/raster-h3-python/python with the
+      # freshly built cdylib (RASTER_H3_PYTHON_LIB), not an installed wheel.
+      - name: Run pytest against Polars and PyArrow
+        if: inputs.engine == 'python-polars'
+        shell: bash
+        run: |
+          profile=()
+          dir=debug
+          if [ "$PROFILE" = release ]; then profile=(--release); dir=release; fi
+          cargo build "${profile[@]}" -p raster-h3-python --lib
+          case "$RUNNER_OS" in
+            macOS)   lib=libraster_h3_python.dylib ;;
+            Windows) lib=raster_h3_python.dll ;;
+            *)       lib=libraster_h3_python.so ;;
+          esac
+          export RASTER_H3_PYTHON_LIB="$PWD/target/$dir/$lib"
+          # shellcheck disable=SC2206
+          extra=($TEST_ARGS)
+          set -x
+          python -m pytest crates/raster-h3-python/tests/pytest -ra -p no:cacheprovider "${extra[@]}"
