@@ -261,6 +261,14 @@ their budget, temporary spill files hold partial results for merging; the core s
 report the runs written in total (`spill_run_count()`) and per resolution
 (`spill_run_counts()`). Projected inputs without certified bounds may defer output until EOF.
 
+Categorical wide output has one row per cell; long output has one row per
+`(cell, category)`. In the core batch reader, `batch_size` and `limit` count these
+output rows, not cells in long format. Core and DuckDB long readers expand one
+cell at a time using the public `CategoricalLongCursor`, keeping pending categories
+bounded by the largest single cell rather than a batch of cells. A cell can span
+multiple batches, and a limit can stop mid-cell; entropy is computed only when an
+entropy column is projected. See the [core batch-reader contract](docs/engines/core.md#batch-readers).
+
 ---
 
 ## Engines
