@@ -16,6 +16,8 @@ use raster_h3_core::aggregator::multi_horizon::{
     QuantileTarget, SpectralFormula,
 };
 use raster_h3_core::aggregator::H3Accumulator;
+use raster_h3_core::columnar::{CategoricalBatchReader, CategoricalFormat, ContinuousBatchReader};
+use raster_h3_core::error::RasterH3Error;
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
 
@@ -379,11 +381,19 @@ fn mosaic_tiles_use_their_own_calibration() {
 }
 
 #[test]
-fn malformed_scale_metadata_is_rejected_on_open() {
+fn malformed_calibration_metadata_is_rejected_in_all_modes() {
     let dir = tempfile::tempdir().unwrap();
     for (name, xml) in [
         ("nan", gdal_metadata(&[("scale", 0, f64::NAN)])),
         ("zero", gdal_metadata(&[("scale", 0, 0.0)])),
+        (
+            "infinite_offset",
+            gdal_metadata(&[("offset", 0, f64::INFINITY)]),
+        ),
+        (
+            "non_numeric_scale",
+            "<GDALMetadata><Item sample=\"0\" role=\"scale\">abc</Item></GDALMetadata>".into(),
+        ),
         ("band", gdal_metadata(&[("offset", 4, 1.0)])),
     ] {
         let path = dir.path().join(format!("{name}.tif"));
@@ -400,6 +410,29 @@ fn malformed_scale_metadata_is_rejected_on_open() {
             &[1u16; 16][..],
             &tags
         );
-        assert!(GeoTiffStreamReader::open(&path).is_err(), "{name} accepted");
+        let error = GeoTiffStreamReader::open(&path).err().expect(name);
+        assert!(matches!(error, RasterH3Error::InvalidMetadata(_)));
+        for apply_scale_offset in [true, false] {
+            let cfg = config(apply_scale_offset);
+            let paths = [path.clone()];
+            let continuous = ContinuousBatchReader::open(&paths, &cfg, None, 4096, None);
+            let categorical = CategoricalBatchReader::open(
+                &paths,
+                &cfg,
+                CategoricalFormat::Wide,
+                None,
+                4096,
+                None,
+            );
+            for error in [continuous.err(), categorical.err()] {
+                let error = error.unwrap_or_else(|| {
+                    panic!("{name} accepted with apply_scale_offset={apply_scale_offset}")
+                });
+                assert!(
+                    matches!(&error, RasterH3Error::InvalidMetadata(message) if message.contains("GDAL_METADATA")),
+                    "{name} with apply_scale_offset={apply_scale_offset}: {error}"
+                );
+            }
+        }
     }
 }

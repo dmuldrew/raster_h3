@@ -271,6 +271,8 @@ pub struct MultiResolutionConfig {
     /// `SCALE`/`OFFSET` before continuous statistics and spectral indices.
     /// NoData is always matched against stored values. Categorical
     /// classes are never scaled.
+    /// Invalid scale/offset metadata is rejected when the file is opened,
+    /// even when this is `false`.
     pub apply_scale_offset: bool,
     /// Optional spatial bounding box for chunk-level pruning.
     pub bbox: Option<[f64; 4]>,

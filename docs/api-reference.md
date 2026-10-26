@@ -85,8 +85,11 @@ Every engine reads these from the GeoTIFF and applies them the same way:
   spectral indices use the physical value `stored * scale + offset`, computed per band and,
   in a mosaic, per file. A negative scale swaps `min` and `max`. A scale that is zero or not
   finite, an offset that is not finite, or an item for a band the file does not have is an
-  error when the file is opened. DuckDB's `scale_offset := false` and the CLI's
-  `--raw-values` aggregate stored values instead.
+  error when the file is opened. Non-numeric scale/offset values are also rejected.
+  DuckDB's `scale_offset := false`, the CLI's `--raw-values`, and DataFusion's
+  `with_scale_offset(false)` aggregate stored values instead, but do not bypass metadata
+  validation: invalid calibration metadata is rejected in all modes, including categorical
+  aggregation.
 - **NoData.** The `GDAL_NODATA` tag and the `nodata` override are matched against
   *stored* values, before scaling, as GDAL does.
 - **Alpha.** A sample declared as associated or unassociated alpha by the TIFF

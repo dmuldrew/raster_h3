@@ -527,8 +527,9 @@ For supported projection families, see [Supported CRS](docs/crs-and-projection.m
 Bands that carry GDAL `SCALE`/`OFFSET` metadata (packed reflectance, temperatures) are
 aggregated as physical values, `stored * scale + offset`, including quantiles and spectral
 indices. NoData is matched on the stored value, categorical classes are never scaled, and
-pixels whose TIFF alpha sample is `0` are excluded. A zero or non-finite scale is rejected
-when the file is opened. To aggregate stored values instead:
+pixels whose TIFF alpha sample is `0` are excluded. Invalid scale/offset metadata (including
+a zero or non-finite scale) is rejected when the file is opened, even in raw-value mode.
+To aggregate stored values from files with valid metadata instead:
 
 | Engine | Opt-out |
 | :--- | :--- |
