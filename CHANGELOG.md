@@ -20,11 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `raster_h3_core::error::catch_unwind_or` for panic-safe `extern "C"` entry points.
 - `CrsTransformer::bounds_certified` and certified (Lipschitz-enclosure) WGS84 bounds for transverse Mercator sources (`utm`, `etmerc`, exact `tmerc` on named ellipsoids), so bbox pruning stays sound for them. Explicit `+towgs84` shifts are certified only up to 1.5 km translation, 10″ rotation and 50 ppm scale.
 - `spill_run_counts()` on the continuous and categorical multi-resolution streamers: spill runs per configured resolution.
+- pytest suite for the Python package (`crates/raster-h3-python/tests/pytest`) against real Polars and PyArrow, and a `python-polars` engine in `manual-tests.yml` covering Polars 1.0, 1.4 and latest.
 
 ### Changed
 
 - Long-format categorical output (core `CategoricalBatchReader` and the DuckDB `format := 'long'` scan) now expands one cell at a time and only as far as each batch needs, instead of eagerly queueing every category of a whole batch of cells (e.g. ~2M rows for 2,048 cells × 1,000 classes). Shannon entropy is skipped when no entropy column is projected.
 - Restore safe bbox and mosaic-overlap pruning for built-in EPSG:3413/3031 using analytic radial/angular bounds; skip discarded bounds estimates for uncertified bbox tests. Add end-to-end pruning benchmarks with Lambert/LAEA controls.
+
+- Python C ABI: a malformed `bbox`, invalid `resolutions` or unknown `format` now raises instead of scanning the whole raster, falling back to resolution 8 or treating the format as `wide`; Parquet and PMTiles exports reject invalid resolutions the same way.
+- Python `scan_raster_h3` works on Polars 1.4–1.24 (positional `register_io_source` argument) and returns an empty frame with the schema instead of panicking on Polars before 1.28 when nothing matches.
 
 - TM rejection certificates now follow proj4rs scale precedence (`k0`, then `k`) and fail open for duplicate or non-canonical PROJ parameters, preventing incorrect bbox pruning.
 
