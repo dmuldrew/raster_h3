@@ -76,9 +76,15 @@ pub fn transform(
     x: f64,
     y: f64,
 ) -> crate::error::Result<(f64, f64)> {
+    measure_transform(|| crs.transform_point(x, y))
+}
+
+/// Measure the shipping per-sample path, including row-cache use but not row setup.
+#[inline(always)]
+pub fn measure_transform<T>(transform: impl FnOnce() -> T) -> T {
     #[cfg(feature = "stream-profile")]
     let start = std::time::Instant::now();
-    let result = crs.transform_point(x, y);
+    let result = transform();
     #[cfg(feature = "stream-profile")]
     PROFILE.with(|v| {
         let mut p = v.get();

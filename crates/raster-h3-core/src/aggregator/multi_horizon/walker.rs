@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::aggregator::sampling::{SamplePoint, SamplingPattern};
-use crate::crs::transformer::{web_mercator_lat, web_mercator_lon, CrsTransformer};
+use crate::crs::transformer::{web_mercator_lat, web_mercator_lon, AlbersInverse, CrsTransformer};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
@@ -199,7 +199,6 @@ fn walk<T, Acc, E, N, R>(
     let mut runs = Runs::new(num_res, engine);
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
-    let mut cells = vec![0u64; num_res];
 
     for r in 0..chunk.height as usize {
         let start = r * stride;
@@ -223,6 +222,38 @@ fn walk<T, Acc, E, N, R>(
         // Batch mode: pixels in `span_start..` all map to `runs.cells`.
         // Invalid pixels may sit inside a span; the span kernels skip them.
         let mut span_start: Option<usize> = None;
+
+        if batch && ctx.owner.is_none() && ctx.bbox.is_none() {
+            let sp = ctx.sampling.points[0];
+            let col_offset = chunk.col_offset as usize;
+            for c in cols.clone() {
+                if read(&row[c * spp..(c + 1) * spp]).is_none() {
+                    continue;
+                }
+                let Some(ll) = projector
+                    .project(col_offset + c, row_idx, 0, sp)
+                    .filter(|&(_, lat)| (-90.0..=90.0).contains(&lat))
+                    .and_then(|(lon, lat)| LatLng::new(lat, lon).ok())
+                else {
+                    if let Some(s) = span_start.take() {
+                        runs.add_span(&row[s..c], engine);
+                    }
+                    continue;
+                };
+                runs.advance_cells(
+                    ll,
+                    ctx.resolutions,
+                    &row[..c],
+                    &mut span_start,
+                    engine,
+                    maps,
+                );
+            }
+            if let Some(s) = span_start {
+                runs.add_span(&row[s..cols.end], engine);
+            }
+            continue;
+        }
 
         for c in cols.clone() {
             let Some(sample) = read(&row[c * spp..(c + 1) * spp]) else {
@@ -255,23 +286,14 @@ fn walk<T, Acc, E, N, R>(
             }
 
             if batch {
-                let ll = positions[0].0;
-                let mut changed = false;
-                for (i, &res) in ctx.resolutions.iter().enumerate() {
-                    cells[i] = u64::from(super::profile::index(ll, res));
-                    changed |= Some(cells[i]) != runs.cells[i];
-                }
-                if changed {
-                    if let Some(s) = span_start.take() {
-                        runs.add_span(&row[s..c], engine);
-                    }
-                    for (i, map) in maps.iter_mut().enumerate() {
-                        if Some(cells[i]) != runs.cells[i] {
-                            runs.restart(i, cells[i], engine, map);
-                        }
-                    }
-                }
-                span_start.get_or_insert(c);
+                runs.advance_cells(
+                    positions[0].0,
+                    ctx.resolutions,
+                    &row[..c],
+                    &mut span_start,
+                    engine,
+                    maps,
+                );
                 continue;
             }
 
@@ -307,61 +329,102 @@ fn walk<T, Acc, E, N, R>(
     runs.finish(engine, maps);
 }
 
-/// Projects sample positions to WGS84. On north-up Web Mercator grids a
-/// sample's latitude depends only on its row and vertical offset, so it is
-/// computed once per row and offset rather than per sample. Both paths
-/// evaluate identical expressions, so results are bit-for-bit equal.
+/// Row-dependent projection terms. Horizontal shear is allowed: only d affects y.
+enum RowCache<'a> {
+    None,
+    Wgs84(Vec<f64>),
+    Mercator(Vec<f64>),
+    Albers(AlbersInverse<'a>, Option<Vec<(f64, f64)>>),
+}
+
 struct SampleProjector<'a> {
     transformer: CoordinateTransformer<'a>,
     gt: &'a GeoTransform,
-    /// Latitude of each sampling point on the current row (Web Mercator only).
-    row_lats: Option<Vec<f64>>,
+    cache: RowCache<'a>,
 }
 
 impl<'a> SampleProjector<'a> {
     fn new(ctx: &WalkContext<'a>) -> Self {
-        let mercator = matches!(ctx.crs, CrsTransformer::WebMercatorFast)
-            && ctx.gt.b == 0.0
-            && ctx.gt.d == 0.0;
+        let row_invariant = ctx.gt.d == 0.0;
+        let capacity = ctx.sampling.points.len();
+        let cache = match ctx.crs {
+            CrsTransformer::Wgs84Identity if row_invariant => {
+                RowCache::Wgs84(Vec::with_capacity(capacity))
+            }
+            CrsTransformer::WebMercatorFast if row_invariant => {
+                RowCache::Mercator(Vec::with_capacity(capacity))
+            }
+            CrsTransformer::AlbersConic(albers) => RowCache::Albers(
+                albers.prepare_inverse(),
+                row_invariant.then(|| Vec::with_capacity(capacity)),
+            ),
+            _ => RowCache::None,
+        };
         Self {
             transformer: CoordinateTransformer::new(ctx.gt, ctx.crs),
             gt: ctx.gt,
-            row_lats: mercator.then(|| Vec::with_capacity(ctx.sampling.points.len())),
+            cache,
         }
     }
 
     fn start_row(&mut self, ctx: &WalkContext<'_>, row_idx: usize) {
-        if let Some(lats) = &mut self.row_lats {
-            lats.clear();
-            // With no column rotation (d == 0), y does not depend on the column.
-            lats.extend(ctx.sampling.points.iter().map(|sp| {
-                let (_, y) = self.gt.pixel_to_coord(0.0, row_idx as f64 + sp.dy);
-                web_mercator_lat(y)
-            }));
+        let row_y = |sp: &SamplePoint| self.gt.pixel_to_coord(0.0, row_idx as f64 + sp.dy).1;
+        match &mut self.cache {
+            RowCache::Wgs84(lats) => {
+                lats.clear();
+                lats.extend(ctx.sampling.points.iter().map(row_y));
+            }
+            RowCache::Mercator(lats) => {
+                lats.clear();
+                lats.extend(
+                    ctx.sampling
+                        .points
+                        .iter()
+                        .map(|sp| web_mercator_lat(row_y(sp))),
+                );
+            }
+            RowCache::Albers(inverse, Some(yps)) => {
+                yps.clear();
+                yps.extend(
+                    ctx.sampling
+                        .points
+                        .iter()
+                        .map(|sp| inverse.row_yp(row_y(sp))),
+                );
+            }
+            _ => {}
         }
     }
 
-    /// Project sampling point `k` of pixel (`col`, `row_idx`), or None if the
-    /// CRS cannot transform it. Such samples lie outside the projection's
-    /// domain and are skipped rather than aborting the query; transforms that
-    /// succeed always return a finite latitude in [-90, 90].
+    /// Project sampling point k, skipping samples outside the projection's domain.
     #[inline(always)]
     fn project(&self, col: usize, row_idx: usize, k: usize, sp: SamplePoint) -> Option<(f64, f64)> {
-        match &self.row_lats {
-            Some(lats) => {
-                let (x, _) = self
-                    .gt
-                    .pixel_to_coord(col as f64 + sp.dx, row_idx as f64 + sp.dy);
-                Some((web_mercator_lon(x), lats[k]))
-            }
-            None => self.transformer.subpixel_to_wgs84(col, row_idx, sp).ok(),
+        if matches!(self.cache, RowCache::None) {
+            return self.transformer.subpixel_to_wgs84(col, row_idx, sp).ok();
         }
+        super::profile::measure_transform(|| {
+            let (x, y) = self
+                .gt
+                .pixel_to_coord(col as f64 + sp.dx, row_idx as f64 + sp.dy);
+            let (lon, lat) = match &self.cache {
+                RowCache::Wgs84(lats) => (x, lats[k]),
+                RowCache::Mercator(lats) => (web_mercator_lon(x), lats[k]),
+                RowCache::Albers(inverse, Some(yps)) => {
+                    let (y_p, y_p_sq) = yps[k];
+                    inverse.transform_with_yp(x, y_p, y_p_sq)
+                }
+                RowCache::Albers(inverse, None) => inverse.transform_point(x, y),
+                RowCache::None => unreachable!(),
+            };
+            (lon.is_finite() && lat.is_finite()).then_some((lon, lat))
+        })
     }
 }
 
 /// Current cell (None before the first) and partial accumulator per resolution.
 struct Runs<Acc> {
     cells: Vec<Option<u64>>,
+    next_cells: Vec<u64>,
     accs: Vec<Acc>,
 }
 
@@ -369,8 +432,39 @@ impl<Acc: Clone> Runs<Acc> {
     fn new<T, E: ScanlineEngine<T, Acc>>(num_res: usize, engine: &E) -> Self {
         Self {
             cells: vec![None; num_res],
+            next_cells: vec![0; num_res],
             accs: (0..num_res).map(|_| engine.new_acc()).collect(),
         }
+    }
+
+    /// Index every resolution and flush the preceding span before restarting any run.
+    #[inline]
+    fn advance_cells<T, E: ScanlineEngine<T, Acc>>(
+        &mut self,
+        ll: LatLng,
+        resolutions: &[Resolution],
+        preceding: &[T],
+        span_start: &mut Option<usize>,
+        engine: &E,
+        maps: &mut [CellMap<Acc>],
+    ) {
+        let mut changed = false;
+        for (i, &res) in resolutions.iter().enumerate() {
+            self.next_cells[i] = u64::from(super::profile::index(ll, res));
+            changed |= Some(self.next_cells[i]) != self.cells[i];
+        }
+        if changed {
+            if let Some(s) = span_start.take() {
+                self.add_span(&preceding[s..], engine);
+            }
+            for (i, map) in maps.iter_mut().enumerate() {
+                let cell = self.next_cells[i];
+                if Some(cell) != self.cells[i] {
+                    self.restart(i, cell, engine, map);
+                }
+            }
+        }
+        span_start.get_or_insert(preceding.len());
     }
 
     #[inline]
@@ -619,7 +713,7 @@ mod tests {
                     owner: None,
                 };
                 let mut projector = SampleProjector::new(&ctx);
-                assert!(projector.row_lats.is_some());
+                assert!(matches!(projector.cache, RowCache::Mercator(_)));
                 let reference = CoordinateTransformer::new(&gt, ctx.crs);
                 for row in [0usize, 1, 7, 4_095, 100_000] {
                     projector.start_row(&ctx, row);
@@ -634,6 +728,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn check_row_cache_shear(d: f64) {
+        use crate::crs::transformer::AlbersConicFast;
+
+        let chunk = RasterChunk {
+            col_offset: 3,
+            row_offset: 7,
+            width: 4,
+            height: 2,
+        };
+        for crs in [
+            CrsTransformer::Wgs84Identity,
+            CrsTransformer::WebMercatorFast,
+            CrsTransformer::AlbersConic(AlbersConicFast::epsg_5070()),
+            CrsTransformer::AlbersConic(AlbersConicFast::with_offsets(
+                -18.0, -36.0, -25.0, 132.0, 12345.0, -9876.0,
+            )),
+        ] {
+            let gt = GeoTransform {
+                c0: 1.0,
+                a: 0.1,
+                b: 0.03,
+                f0: 2.0,
+                d,
+                e: -0.1,
+            };
+            for sampling in [SamplingPattern::center(), SamplingPattern::rgss()] {
+                let ctx = WalkContext {
+                    chunk: &chunk,
+                    resolutions: &[],
+                    crs: &crs,
+                    gt: &gt,
+                    sampling: &sampling,
+                    bbox: None,
+                    stride: 4,
+                    samples_per_pixel: 1,
+                    owner: None,
+                };
+                let mut projector = SampleProjector::new(&ctx);
+                match (&crs, &projector.cache) {
+                    (CrsTransformer::Wgs84Identity, RowCache::Wgs84(_))
+                    | (CrsTransformer::WebMercatorFast, RowCache::Mercator(_))
+                    | (CrsTransformer::AlbersConic(_), RowCache::Albers(_, Some(_))) => {
+                        assert_eq!(d, 0.0)
+                    }
+                    (_, RowCache::None | RowCache::Albers(_, None)) => assert_ne!(d, 0.0),
+                    _ => panic!("incorrect row-cache mode"),
+                }
+                #[cfg(feature = "stream-profile")]
+                let scope = super::super::profile::WorkerScope::new();
+                for row in [7, 8] {
+                    projector.start_row(&ctx, row);
+                    for col in [3, 4, 6] {
+                        for (k, &sp) in sampling.points.iter().enumerate() {
+                            let (x, y) = gt.pixel_to_coord(col as f64 + sp.dx, row as f64 + sp.dy);
+                            assert_eq!(
+                                projector.project(col, row, k, sp),
+                                Some(crs.transform_point(x, y).unwrap())
+                            );
+                        }
+                    }
+                }
+                #[cfg(feature = "stream-profile")]
+                assert_eq!(
+                    scope.snapshot().transform_calls,
+                    (6 * sampling.points.len()) as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_shear_keeps_row_hoisting_and_exact_coordinates() {
+        check_row_cache_shear(0.0);
+    }
+
+    #[test]
+    fn vertical_shear_disables_row_hoisting_and_keeps_exact_coordinates() {
+        check_row_cache_shear(0.02);
     }
 
     #[test]

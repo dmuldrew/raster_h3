@@ -16,6 +16,11 @@ spill cells until the remaining input permits certified eviction or EOF is reach
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
+Every valid sample is indexed at each requested H3 resolution. Projection row caches
+support horizontal shear and profiling builds; Albers inverse constants are prepared
+under an immutable borrow to avoid stale state after public source-field updates.
+See the [core engine notes](docs/engines/core.md) for projection behavior.
+
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
 | **H3 table / Arrow stream** | SQL analytics, JOINs, DataFrames | DuckDB, Python/Polars, PostgreSQL, DataFusion, CLI (NDJSON / `RH3IPC01`) |

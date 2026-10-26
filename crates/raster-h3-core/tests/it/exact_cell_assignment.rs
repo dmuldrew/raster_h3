@@ -20,6 +20,124 @@ fn pixel_value(col: u32, row: u32) -> f32 {
 }
 
 #[test]
+fn short_scanline_reentry_and_boundary_match_every_pixel() {
+    for (width, lon, lat, step, tilt, resolution) in [
+        (
+            9,
+            179.99317800481052,
+            -79.99933372467333,
+            0.00016092421954994052,
+            0.0002098967973935639,
+            9,
+        ),
+        (
+            5,
+            179.9933964270366,
+            -79.999048780463,
+            0.0001,
+            0.00013041895539389023,
+            9,
+        ),
+        (5, -180.0, -89.95, 120.0, 0.0, 0),
+    ] {
+        let (_file, path) = TestGeoTiffBuilder::new(width, 1)
+            .origin(lon, lat)
+            .epsg(4326)
+            .pixel_size(step)
+            .create_f32_tempfile(|col, _| (col + 1) as f32);
+        let mut reader = GeoTiffStreamReader::open(&path).unwrap();
+        let gt = &mut reader.metadata.geotransform;
+        gt.c0 = lon - 0.5 * step;
+        gt.d = tilt;
+        gt.e = -0.0001;
+        gt.f0 = lat - 0.5 * tilt - 0.5 * gt.e;
+        let gt = *gt;
+        let res = Resolution::try_from(resolution).unwrap();
+        let cells: Vec<u64> = (0..width)
+            .map(|col| {
+                let (lon, lat) = gt.pixel_to_coord(col as f64 + 0.5, 0.5);
+                LatLng::new(lat, lon).unwrap().to_cell(res).into()
+            })
+            .collect();
+        if width == 5 {
+            assert_eq!(cells[0], cells[1]);
+            assert_ne!(cells[0], cells[2]);
+            assert_eq!(cells[0], cells[3]);
+            assert_eq!(cells[0], cells[4]);
+        } else {
+            // A three-column bisection must not skip column 5's short excursion.
+            assert!(cells[..5].iter().all(|&cell| cell == cells[0]));
+            assert_ne!(cells[0], cells[5]);
+            assert_eq!(cells[0], cells[6]);
+            assert_eq!(cells[7], cells[8]);
+            assert_ne!(cells[0], cells[8]);
+            assert_ne!(cells[5], cells[8]);
+        }
+
+        for resolutions in [vec![resolution], vec![resolution, resolution + 1]] {
+            let mut expected: HashMap<(u8, u64), (f64, f64)> = HashMap::new();
+            let mut expected_classes = HashMap::new();
+            for &res in &resolutions {
+                for col in 0..width {
+                    let (lon, lat) = gt.pixel_to_coord(col as f64 + 0.5, 0.5);
+                    let cell = u64::from(
+                        LatLng::new(lat, lon)
+                            .unwrap()
+                            .to_cell(Resolution::try_from(res).unwrap()),
+                    );
+                    let stats = expected.entry((res, cell)).or_default();
+                    stats.0 += 1.0;
+                    stats.1 += (col + 1) as f64;
+                    expected_classes.insert((res, cell, (col + 1) as i64), 1.0);
+                }
+            }
+            let config = MultiResolutionConfig::new(resolutions);
+            let mut reader = GeoTiffStreamReader::open(&path).unwrap();
+            reader.metadata.geotransform = gt;
+            let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+            let mut actual = HashMap::new();
+            loop {
+                let batch = streamer.fetch_next_batch(7).unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for rec in batch {
+                    assert!(actual
+                        .insert(
+                            (rec.resolution, rec.h3_index),
+                            (rec.accumulator.count, rec.accumulator.sum),
+                        )
+                        .is_none());
+                }
+            }
+            assert_eq!(
+                actual, expected,
+                "continuous reentry at resolution {resolution}"
+            );
+
+            let mut reader = GeoTiffStreamReader::open(&path).unwrap();
+            reader.metadata.geotransform = gt;
+            let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
+            let mut actual_classes = HashMap::new();
+            loop {
+                let batch = streamer.fetch_next_batch(7).unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for rec in batch {
+                    rec.accumulator.for_each_class(|class, count| {
+                        assert!(actual_classes
+                            .insert((rec.resolution, rec.h3_index, class), count)
+                            .is_none());
+                    });
+                }
+            }
+            assert_eq!(actual_classes, expected_classes);
+        }
+    }
+}
+
+#[test]
 fn supersampling_matches_direct_h3_per_cell_and_per_class() {
     // Includes the neighborhood of a known nearest-centroid mismatch, high latitudes,
     // and a raster crossing +180 degrees longitude.
