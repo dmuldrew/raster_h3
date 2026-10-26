@@ -8,14 +8,14 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 309 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 310 |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
 | [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 10 |
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 10 (7 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 203 |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 207 |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -146,8 +146,8 @@ Results must not depend on thread count, scheduling or pool nesting.
 | [`core/threading.rs`](../crates/raster-h3-core/tests/it/threading.rs) (6) | Identical output across Rayon thread counts; pool scaling; a high-contention stress run; multithreaded prefetched chunk reading; aggregation workers run concurrently inside `ThreadPool::install`; a dedicated pool behind a shared mutex does not deadlock. |
 | [`core/sharding.rs`](../crates/raster-h3-core/tests/it/sharding.rs) (5) | Shard balance for H3 indices at resolutions 0–15 and in local neighbourhoods; sharded merge + eviction preserves continuous statistics and categorical histograms; worker results merge before the watermark advances. |
 | [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_prefetched_chunk_reader`, `test_prefetched_chunk_reader_multi_worker_ordering`, `test_prefetched_chunk_reader_early_drop`. |
-| [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) | `test_prefetched_mosaic_reader_multi_worker_concurrency`, `test_prefetched_mosaic_reader_early_drop`. |
-| Unit: `raster/prefetch.rs` (17), `multi_horizon/sharded_map.rs` (1), `aggregator/cell_hash.rs` (2) | `OrderedPrefetchQueue` ordering, backpressure, decode budgets, cancellation (using the `test-hooks` handshakes); shard hashing. |
+| [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) | Multi-worker ordering and early drop; a 17-tile, ten-strip-row mosaic checks eviction/reopening, Deflate and fallback PackBits pixel values, edge strips, recycling and byte budgets with one/four workers. With `test-hooks`, it also bounds decoder opens to prevent round-robin thrashing. |
+| Unit: `raster/prefetch.rs` (20), `multi_horizon/sharded_map.rs` (1), `aggregator/cell_hash.rs` (2) | `OrderedPrefetchQueue` ordering, backpressure, decode budgets, cancellation (using the `test-hooks` handshakes); future-use decoder eviction, skipped jobs, open failures and strict live-decoder bounds; shard hashing. |
 
 ## 10. Memory budgets & spilling
 

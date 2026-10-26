@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - TM rejection certificates now follow proj4rs scale precedence (`k0`, then `k`) and fail open for duplicate or non-canonical PROJ parameters, preventing incorrect bbox pruning.
 
-- Mosaic decode workers keep at most `MAX_OPEN_DECODERS_PER_WORKER` (16) tile decoders open, evicting the least recently used, instead of one cached decoder per tile, bounding decoder state for large mosaics.
+- Mosaic decode workers keep at most `MAX_OPEN_DECODERS_PER_WORKER` (16) tile decoders open, evicting the tile needed furthest in the future instead of using LRU, which thrashes on latitude bands wider than the cache. The next-use index is shared across workers; chunk delivery order and decoded-buffer budgets are unchanged.
 - WKB export looks up the two pole cells per resolution from a precomputed table instead of indexing both poles for every emitted polygon, and only when a ring spans more than 180° of longitude.
 
 - Replaced unmaintained `fxhash` with maintained `rustc-hash`, removed obsolete advisory exceptions, and denied wildcard dependency requirements.
