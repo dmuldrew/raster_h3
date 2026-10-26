@@ -56,14 +56,17 @@ raster_h3.raster_to_pmtiles("dem.tif", "dem.pmtiles", resolutions=[6, 7, 8])
 | Argument | Type | Default | Meaning |
 | :--- | :--- | :--- | :--- |
 | `path` | `str \| Path` | — | Raster path, glob, comma-separated list or VRT |
-| `resolutions` | `int \| str \| Sequence[int]` | `8` | `8`, `"7,8"` or `[7, 8]`; parsed leniently (invalid entries dropped) |
+| `resolutions` | `int \| str \| Sequence[int]` | `8` | `8`, `"7,8"` or `[7, 8]`; each entry must be 0–15 |
 | `categorical` | `bool` | `False` | Categorical instead of continuous aggregation |
-| `format` | `str` | `"wide"` | Categorical layout: `"wide"` or `"long"` |
+| `format` | `str` | `"wide"` | Categorical layout: `"wide"` or `"long"` (case-insensitive) |
 | `crs` | `str` | `None` | Source CRS override, e.g. `"EPSG:32610"` |
 | `nodata` | `float` | `None` | NoData override |
-| `bbox` | `str \| Sequence[float]` | `None` | `min_lon,min_lat,max_lon,max_lat` |
+| `bbox` | `str \| Sequence[float]` | `None` | `min_lon,min_lat,max_lon,max_lat`; exactly four numbers |
 | `columns` | `Sequence[str]` | `None` | Columns to produce (projection pushed into the engine) |
 | `limit` | `int` | `None` | Maximum rows |
+
+An invalid `resolutions`, `format` or `bbox` raises `RuntimeError` (as does an invalid
+`resolutions` passed to the export functions) rather than being ignored or defaulted.
 
 Columns are the canonical core schemas (see the [overview](README.md#output-schemas)).
 Mosaic overlaps always use the `cutline` rule. Sampling, band selection, spectral formulas,
