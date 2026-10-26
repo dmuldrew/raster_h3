@@ -5,6 +5,7 @@ mod helpers;
 mod accumulators;
 mod analytic_south_lat;
 mod antimeridian_bbox;
+mod categorical_long_streaming;
 mod categorical_remap;
 mod certified_bounds;
 mod chunks_and_prefetch;

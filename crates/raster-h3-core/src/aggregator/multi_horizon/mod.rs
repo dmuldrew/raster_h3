@@ -18,7 +18,10 @@ pub mod spectral;
 pub mod spill;
 pub mod walker;
 
-pub use categorical::{process_categorical_chunk_payload_into, MultiCategoricalRecord};
+pub use categorical::{
+    process_categorical_chunk_payload_into, CategoricalLongCursor, CategoricalLongRow,
+    MultiCategoricalRecord,
+};
 pub use categorical_streamer::MultiCategoricalHorizonStreamer;
 pub use compaction::HierarchicalCompactor;
 pub use config::{MultiResolutionConfig, QuantileTarget, SpectralFormula};
