@@ -620,6 +620,7 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
             .unwrap();
         for bbox in [None, Some([lon, lat - 1.0, lon + 1.0, lat + 1.0])] {
             for pattern in [
+                SamplingPattern::center(),
                 SamplingPattern::rgss(),
                 SamplingPattern::sixteen_point(),
                 SamplingPattern {
@@ -701,11 +702,14 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                     let metrics = scope.snapshot();
                     drop(scope);
                     if cfg!(feature = "stream-profile") {
-                        assert_eq!(
-                            metrics.transform_calls,
-                            (values.iter().filter(|v| v.is_finite()).count() * pattern.points.len())
-                                as u64
-                        );
+                        let unpruned = (values.iter().filter(|v| v.is_finite()).count()
+                            * pattern.points.len()) as u64;
+                        if bbox.is_none() {
+                            assert_eq!(metrics.transform_calls, unpruned);
+                        } else {
+                            // Conservative row pruning may skip rejected samples before projection.
+                            assert!((retained..=unpruned).contains(&metrics.transform_calls));
+                        }
                         assert_eq!(
                             metrics.h3_calls,
                             retained * 2,

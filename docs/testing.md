@@ -8,14 +8,14 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 33 modules, 1 binary | 304 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 309 |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
 | [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 12 |
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 11 (7 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 200 |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 203 |
 | [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 2 modules | 24 (35 cases) |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
@@ -61,12 +61,12 @@ Coordinates must land where PROJ puts them, for every transform tier.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/geodetic_reference.rs`](../crates/raster-h3-core/tests/it/geodetic_reference.rs) (24) | Golden forward and inverse points from PROJ 9.5.1 for fast paths and fallbacks, each within **0.01 m**: Web Mercator, Albers CONUS/Alaska, UTM north/south, polar stereographic north/south, EASE-Grid 2.0 and Lambert conformal; EPSG aliases are bit-identical. Affine round trips `coord_to_pixel(pixel_to_coord(p)) == p` on rotated/sheared grids. Coverage/duplicate properties include antimeridian-crossing Albers Alaska, EPSG:32756, pole-containing and supersampled EPSG:3413/3031 rasters, plus prior horizon, longitude-wrapping and mosaic cases. |
+| [`core/geodetic_reference.rs`](../crates/raster-h3-core/tests/it/geodetic_reference.rs) (25) | Golden forward and inverse points from PROJ 9.5.1 for fast paths and fallbacks, each within **0.01 m**: Web Mercator, Albers CONUS/Alaska and southern parallels with false offsets (including non-polar latitudes through ±89.9999°), UTM north/south, polar stereographic north/south, EASE-Grid 2.0 and Lambert conformal; EPSG aliases are bit-identical. Affine round trips `coord_to_pixel(pixel_to_coord(p)) == p` on rotated/sheared grids. Coverage/duplicate properties include antimeridian-crossing Albers Alaska, EPSG:32756, pole-containing and supersampled EPSG:3413/3031 rasters, plus prior horizon, longitude-wrapping and mosaic cases. |
 | [`core/certified_bounds.rs`](../crates/raster-h3-core/tests/it/certified_bounds.rs) (13, plus 1 generated) | Rejection bounds enclose the true image: certified UTM/BNG bounds checked against dense samples and used to prune distant bboxes; generated rotated/sheared chunks for WGS84, Web Mercator, northern and southern Albers (including across the antimeridian, around the cone apex and past the cut opposite the central meridian) and a US-foot transverse Mercator have rect bounds and an eviction bound enclosing every sample; extreme `tmerc` scale factors stay enclosing and certificates use proj4rs's effective scale (`k0`, then `k`; `k_0` ignored); chunks ending at or one ulp below 180° keep non-reversed bounds; pole-containing UTM chunks get full longitude; huge `+towgs84` shifts and other projections fail open; partly unprojectable rectangles get whole-globe bounds; fine (1e-8°) affines invert; singular and non-finite affines are rejected on open; duplicate, quoted, non-lowercase or spaced TM parameters fail open; polar radial/angular bounds enclose dense rotated/sheared grids and preserve per-cell sums/counts across bbox and mosaic ownership modes. |
 | [`core/datum_shifts.rs`](../crates/raster-h3-core/tests/it/datum_shifts.rs) (7) | Helmert transforms match PROJ with identical parameters and stay within published accuracy of PROJ defaults; inverse round trips; explicit `+towgs84`; prime-meridian and axis-order composition; nonzero shifts avoid fast paths; grid-shift datums are rejected clearly. |
 | [`core/geotiff_crs.rs`](../crates/raster-h3-core/tests/it/geotiff_crs.rs) (10) | CRS detection from ESRI PE-string citations and GeoTIFF GeoKeys, EPSG/WKT handling, projected transformations and invalid/unspecified CRS paths. |
 | [`core/geotiff_crs.rs`](../crates/raster-h3-core/tests/it/geotiff_crs.rs), [`core/antimeridian_bbox.rs`](../crates/raster-h3-core/tests/it/antimeridian_bbox.rs) | `test_crs_web_mercator_to_wgs84`, `test_crs_utm_to_wgs84`, `test_crs_southern_hemisphere_utm`, `test_crs_custom_albers_proj_string`, `test_crs_invalid_proj_string_error_handling`, `test_crs_unspecified_fallback_and_invalid_proj_error`, `test_plain_tiff_without_geokeys`, `test_geotransform_accuracy`, `test_geotransform_inverse_precision`, `test_extreme_polar_latitudes_clamping`. |
-| Unit: `crs/transformer.rs` (39) | Tier selection (identity, analytical, Proj4), Newton–Raphson inverse Albers, parameter parsing, error paths, certified and fail-open rectangle bounds. |
+| Unit: `crs/transformer.rs` (40) | Tier selection (identity, analytical, Proj4), authalic-series inverse Albers, public source-field mutation and struct-literal compatibility, parameter parsing, error paths, certified and fail-open rectangle bounds. |
 | Unit: `raster/metadata.rs` (11), `raster/geotransform.rs` (3) | GeoKey directory parsing, tiepoint/pixel-scale/model-transformation tags, EPSG and WKT extraction; scale-independent affine inversion. |
 
 ## 2. Exact cell assignment & coordinates
@@ -76,11 +76,11 @@ grid orientation or bbox edges.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/exact_cell_assignment.rs`](../crates/raster-h3-core/tests/it/exact_cell_assignment.rs) (6) | An independent reference indexes every sample directly with `h3o` (no scanline or cache helpers) and must match supersampled continuous and categorical output per cell and class. Also: NaN NoData keeps finite values; fractional integer NoData does not exclude pixel values; compacting adjacent resolutions is rejected; a bbox keeps subsamples whose pixel centre is outside it; boundary assignment is independent of worker partitioning. |
+| [`core/exact_cell_assignment.rs`](../crates/raster-h3-core/tests/it/exact_cell_assignment.rs) (7) | An independent reference indexes every sample directly with `h3o` (no scanline or cache helpers) and must match supersampled continuous and categorical output per cell and class. Short five-pixel cell re-entry and nine-pixel boundary cases match exhaustive continuous and categorical aggregation at one or multiple resolutions. Also: NaN NoData keeps finite values; fractional integer NoData does not exclude pixel values; compacting adjacent resolutions is rejected; a bbox keeps subsamples whose pixel centre is outside it; boundary assignment is independent of worker partitioning. |
 | [`core/rotated_grid_correctness.rs`](../crates/raster-h3-core/tests/it/rotated_grid_correctness.rs) (1) | Streaming results equal an exhaustive per-sample reference for horizontal shear, latitude-varying shear, general rotation + shear, and south-to-north rasters. |
 | [`core/antimeridian_bbox.rs`](../crates/raster-h3-core/tests/it/antimeridian_bbox.rs) (7) | Bboxes crossing ±180° keep every sample inside them, on grids ending at 180°, crossing 180°, spanning 0–360°, and on multiband rasters. |
 | [`core/antimeridian_bbox.rs`](../crates/raster-h3-core/tests/it/antimeridian_bbox.rs), [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_antimeridian_crossing_and_wrap`, `test_bounding_box_pruning`, `test_chunk_intersects_bbox_tile_filtering`, `test_spatial_filter_pushdown_chunk_skipping`. |
-| Unit: `aggregator/multi_horizon/walker.rs` (3) | Pixel walker spans and row pruning. |
+| Unit: `aggregator/multi_horizon/walker.rs` (5) | Pixel walker spans and row pruning; horizontal/vertical shear mode selection and bit-identical WGS84/Mercator/Albers center and supersampled projection, including transform counts under `stream-profile`. |
 
 ## 3. Horizon eviction soundness
 
@@ -281,6 +281,12 @@ with `-- --baseline before`. Scheduled/manual benchmark runs preserve Criterion 
 as workflow artifacts; shared-runner timings are informational, not release gates.
 Additional workload demonstrations live in [`examples/`](../examples) (`benchmark_*`);
 see [Architecture Comparison](architecture-comparison.md).
+
+`python3 -m unittest discover -s scripts -p 'test_run_polars_res9.py'` runs four
+benchmark-harness regressions: LazyFrame export, Arrow-stream fallback, error propagation,
+and CLI usage. The benchmark uses `perf_counter` and labels its backend. Its fallback
+uses the direct exporter without geometry and writes the full statistics schema,
+not the four-column Polars projection; timings from the two backends are not interchangeable.
 
 ### Fuzzing and unsafe-code validation
 
