@@ -212,10 +212,17 @@ impl QuantilePlan {
     /// Replace `out` with one value per target for `acc` (NaN when it has no sketch).
     pub fn evaluate_into(&self, acc: &H3Accumulator, out: &mut Vec<f64>) {
         out.clear();
+        if self.is_empty() {
+            return;
+        }
         let Some(sketch) = acc.quantiles.as_deref() else {
             out.resize(self.outputs.len(), f64::NAN);
             return;
         };
+        if let [q] = self.probs.as_slice() {
+            out.resize(self.outputs.len(), sketch.quantile(*q, acc.min, acc.max));
+            return;
+        }
         let values = sketch.quantiles_batch(&self.probs, acc.min, acc.max);
         out.extend(self.outputs.iter().map(|output| match *output {
             PlanOutput::Prob(i) => values[i],

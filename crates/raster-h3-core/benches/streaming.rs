@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use raster_h3_core::aggregator::accumulator::H3Accumulator;
 use raster_h3_core::aggregator::categorical::CategoricalAccumulator;
 use raster_h3_core::aggregator::cell_hash::H3BuildHasher;
 use raster_h3_core::aggregator::multi_horizon::{
-    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer, QuantilePlan,
+    QuantileTarget,
 };
 use raster_h3_core::aggregator::quantiles::QuantileSketch;
 use raster_h3_core::aggregator::sampling::SamplingPattern;
@@ -62,6 +64,40 @@ fn streaming(c: &mut Criterion) {
             }
         });
     });
+    group.finish();
+}
+
+fn single_quantile(c: &mut Criterion) {
+    let mut group = c.benchmark_group("single_quantile");
+    group.throughput(Throughput::Elements(1));
+    for (name, values) in [
+        ("positive_16", (1..=16).map(f64::from).collect::<Vec<_>>()),
+        ("mixed_1024", (-512..512).map(f64::from).collect()),
+    ] {
+        let mut acc = H3Accumulator::with_quantiles();
+        for value in values {
+            acc.update(value);
+        }
+        let sketch = acc.quantiles.as_deref().unwrap();
+        for (label, q) in [("p50", 0.5), ("p90", 0.9)] {
+            let targets = [QuantileTarget::Percentile(q, label.into())];
+            let plan = QuantilePlan::new(&targets);
+            let mut out = Vec::with_capacity(1);
+            let input = format!("{name}/{label}");
+            group.bench_function(BenchmarkId::new("scalar", &input), |b| {
+                b.iter(|| black_box(acc.quantile(black_box(q))));
+            });
+            group.bench_function(BenchmarkId::new("batch", &input), |b| {
+                b.iter(|| black_box(sketch.quantiles_batch(black_box(&[q]), acc.min, acc.max)));
+            });
+            group.bench_function(BenchmarkId::new("plan", &input), |b| {
+                b.iter(|| {
+                    plan.evaluate_into(black_box(&acc), &mut out);
+                    black_box(&out);
+                });
+            });
+        }
+    }
     group.finish();
 }
 
@@ -126,7 +162,14 @@ fn h3_map(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, streaming, hash_sensitive, h3_map, pruning);
+criterion_group!(
+    benches,
+    streaming,
+    single_quantile,
+    hash_sensitive,
+    h3_map,
+    pruning
+);
 criterion_main!(benches);
 
 /// Local uncompressed synthetic tiles. Includes open/planning/decode/aggregation;

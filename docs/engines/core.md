@@ -168,7 +168,12 @@ targets yield NaN, `q <= 0` yields `min` and `q >= 1` yields `max`.
 `evaluate_into(&H3Accumulator, &mut Vec<f64>)` writes one value per target, equal to
 `H3Accumulator::quantile` / `iqr` (NaN when the accumulator has no sketch). The core
 continuous reader and the DuckDB scan evaluate all projected quantile columns of a
-cell this way.
+cell this way. Plans with just one distinct probability use the scalar sketch
+query directly (including repeated projections of that probability), avoiding the
+batch query's result and rank-vector allocations. Empty plans skip evaluation.
+The `single_quantile` Criterion group compares scalar, batch and plan queries for
+p50/p90 on small positive and larger mixed-sign sketches; these are query-only
+microbenchmarks, not whole-raster throughput measurements.
 
 ### Arrow C Data / C Stream interface
 

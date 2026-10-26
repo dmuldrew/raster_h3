@@ -169,6 +169,33 @@ fn quantile_plan_matches_quantile_and_iqr() {
 }
 
 #[test]
+fn single_probability_plan_matches_quantile() {
+    let mut cases = datasets();
+    let mut no_sketch = H3Accumulator::default();
+    no_sketch.update(3.0);
+    cases.push(("no_sketch", no_sketch));
+
+    for (name, acc) in &cases {
+        for &q in &TARGETS {
+            for repeats in [1, 3] {
+                let targets = vec![QuantileTarget::Percentile(q, "q".into()); repeats];
+                let plan = QuantilePlan::new(&targets);
+                let mut out = vec![123.0; 4];
+                plan.evaluate_into(acc, &mut out);
+                assert_eq!(out.len(), repeats);
+                assert!(
+                    out.iter().all(|&got| same(got, acc.quantile(q))),
+                    "{name} q={q} repeats={repeats}: {out:?}"
+                );
+            }
+        }
+        let mut out = vec![123.0];
+        QuantilePlan::default().evaluate_into(acc, &mut out);
+        assert!(out.is_empty());
+    }
+}
+
+#[test]
 fn parser_rejects_non_finite_percentiles() {
     for spec in [
         "nan", "pnan", "NaN", "pNaN", "-nan", "p-nan", "inf", "pinf", "-inf",

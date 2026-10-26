@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Single-probability `QuantilePlan` evaluations use the scalar sketch query, avoiding batch result/rank-vector allocations per cell; empty plans skip sketch evaluation. Added p50/p90 scalar/batch/plan Criterion comparisons.
 - `QuantileSketch::quantiles_batch` now returns exactly what `quantile()` returns for every target: NaN targets yield NaN instead of corrupting the sort (which could misorder results or panic), and degenerate `min`/`max` ranges match `q <= 0`/`q >= 1` handling.
 - Quantile specs reject NaN percentiles (`'nan'`, `'pnan'`), which previously parsed because NaN fails both range comparisons. The DuckDB API reference lists the real presets (`'box'`, not the unsupported `'quartiles'`).
 - Remote COG prefetch no longer reports a chunk as unavailable while its range request is still in flight. The queue previously treated "all ranges claimed" as "all ranges fetched", so decoders near the end of a scan could re-download chunk bytes and leave the late payload orphaned in the ready map.
