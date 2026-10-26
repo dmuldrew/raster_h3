@@ -21,8 +21,14 @@ pub unsafe fn from_duckdb_string(ptr: *mut c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-    duckdb_free(ptr as *mut std::ffi::c_void);
+    // SAFETY: non-null and, per the caller contract, a NUL-terminated string
+    // allocated by DuckDB that we now own; it is copied before being freed with
+    // DuckDB's own allocator, and never touched again.
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: see above; `ptr` came from DuckDB's allocator and is freed once.
+    unsafe { duckdb_free(ptr as *mut std::ffi::c_void) };
     Some(s)
 }
 
@@ -71,11 +77,14 @@ pub unsafe fn ffi_bind_guard<F: FnOnce()>(info: duckdb_bind_info, body: F) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let msg = safe_panic_payload_to_string(payload);
             let c_msg = to_c_string(&format!("Panic in bind callback: {msg}"));
-            duckdb_bind_set_error(info, c_msg.as_ptr());
+            // SAFETY: `info` is the live bind handle (caller contract); DuckDB
+            // copies the NUL-terminated message, which outlives the call.
+            unsafe { duckdb_bind_set_error(info, c_msg.as_ptr()) };
         }))
         .map_err(|secondary| {
             std::mem::forget(secondary);
-            duckdb_bind_set_error(info, c"Panic in bind callback".as_ptr());
+            // SAFETY: as above, with a static C string literal.
+            unsafe { duckdb_bind_set_error(info, c"Panic in bind callback".as_ptr()) };
         });
     }
 }
@@ -90,11 +99,14 @@ pub unsafe fn ffi_init_guard<F: FnOnce()>(info: duckdb_init_info, body: F) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let msg = safe_panic_payload_to_string(payload);
             let c_msg = to_c_string(&format!("Panic in init callback: {msg}"));
-            duckdb_init_set_error(info, c_msg.as_ptr());
+            // SAFETY: `info` is the live init handle (caller contract); DuckDB
+            // copies the NUL-terminated message, which outlives the call.
+            unsafe { duckdb_init_set_error(info, c_msg.as_ptr()) };
         }))
         .map_err(|secondary| {
             std::mem::forget(secondary);
-            duckdb_init_set_error(info, c"Panic in init callback".as_ptr());
+            // SAFETY: as above, with a static C string literal.
+            unsafe { duckdb_init_set_error(info, c"Panic in init callback".as_ptr()) };
         });
     }
 }
@@ -113,13 +125,21 @@ pub unsafe fn ffi_scan_guard<F: FnOnce()>(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let msg = safe_panic_payload_to_string(payload);
             let c_msg = to_c_string(&format!("Panic in scan callback: {msg}"));
-            duckdb_function_set_error(info, c_msg.as_ptr());
-            duckdb_data_chunk_set_size(output, 0);
+            // SAFETY: `info`/`output` are the live scan handles (caller
+            // contract); DuckDB copies the NUL-terminated message, and emptying
+            // the chunk discards any rows the panicking body half-wrote.
+            unsafe {
+                duckdb_function_set_error(info, c_msg.as_ptr());
+                duckdb_data_chunk_set_size(output, 0);
+            }
         }))
         .map_err(|secondary| {
             std::mem::forget(secondary);
-            duckdb_function_set_error(info, c"Panic in scan callback".as_ptr());
-            duckdb_data_chunk_set_size(output, 0);
+            // SAFETY: as above, with a static C string literal.
+            unsafe {
+                duckdb_function_set_error(info, c"Panic in scan callback".as_ptr());
+                duckdb_data_chunk_set_size(output, 0);
+            }
         });
     }
 }
@@ -134,11 +154,14 @@ pub unsafe fn ffi_scalar_guard<F: FnOnce()>(info: duckdb_function_info, body: F)
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let msg = safe_panic_payload_to_string(payload);
             let c_msg = to_c_string(&format!("Panic in scalar callback: {msg}"));
-            duckdb_scalar_function_set_error(info, c_msg.as_ptr());
+            // SAFETY: `info` is the live scalar-function handle (caller
+            // contract); DuckDB copies the NUL-terminated message.
+            unsafe { duckdb_scalar_function_set_error(info, c_msg.as_ptr()) };
         }))
         .map_err(|secondary| {
             std::mem::forget(secondary);
-            duckdb_scalar_function_set_error(info, c"Panic in scalar callback".as_ptr());
+            // SAFETY: as above, with a static C string literal.
+            unsafe { duckdb_scalar_function_set_error(info, c"Panic in scalar callback".as_ptr()) };
         });
     }
 }
@@ -168,6 +191,8 @@ mod tests {
     #[test]
     fn test_ffi_guard_catches_panics() {
         let mut captured_error = String::new();
+        // SAFETY: `ffi_guard` hands the error callback a NUL-terminated message
+        // that is valid for the duration of the callback, which reads it once.
         unsafe {
             ffi_guard(
                 &mut captured_error,

@@ -25,6 +25,10 @@ raster-h3-core = { path = "crates/raster-h3-core" }
 
 ## Pipeline
 
+The sample-unpacking boundary checks TIFF chunk dimensions, arithmetic overflow, source
+length and destination capacity. Invalid or truncated decoded chunks return `InvalidMetadata`
+before indexing/copying, including the floating-point predictor path.
+
 ```mermaid
 flowchart LR
     SRC["resolve_raster_sources(path | glob | list | VRT)"] --> MOSAIC["MosaicReader::open(paths, bbox, crs, overlap_rule)"]
@@ -46,6 +50,31 @@ Every adapter follows the same steps:
 3. Drain completed cells with `drain_completed_into(max, |resolution, record| …)` until
    it returns `Ok(0)` (end of stream) or an error. Errors latch: a failed stream keeps
    returning the error instead of reporting a clean EOF.
+
+### Spill diagnostics
+
+Both streamers report spilling after or during a stream: `spill_run_count()` is the
+number of partial sorted runs written to disk, `spill_run_counts()` the same per
+configured resolution (in `resolutions` order), and `peak_active_bytes()` the peak
+active-map allocation estimate. The budget is split evenly between
+resolutions, so a fine resolution can spill while a coarse one stays in memory. Once any
+resolution has spilled, the eviction horizon stops advancing: cells of in-memory
+resolutions south of it are held until EOF and then emitted from memory, never from runs.
+
+`custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
+or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
+accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`,
+`31466`–`31469`, `23028`–`23038`) and any PROJ string with `+towgs84`. Grid shifts
+(`+nadgrids`, `+datum=NAD27`) are rejected. See [Datum Shifts](../crs-and-projection.md#datum-shifts).
+
+Bounds from `CrsTransformer::transform_rect_bounds` are certified only when
+`bounds_certified()` is true: analytic for the fast paths and built-in EPSG:3413/3031 polar definitions, a Lipschitz enclosure
+for transverse Mercator, a sampled estimate otherwise. Code that rejects data
+from bounds (bbox pruning, overlap filtering) must pass them through
+`rejection_bounds()`, which returns the whole globe for uncertified bounds.
+TM certification follows proj4rs scale precedence (`k0`, then `k`) and fails
+open for duplicate parameters or syntax it cannot interpret unambiguously. See
+[Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
 
 ## Columnar Model
 
@@ -77,13 +106,39 @@ for batch in reader {
 let cat = CategoricalBatchReader::open(&paths, &config, CategoricalFormat::Long, None, 2048, None)?;
 ```
 
-- `batch_size` is clamped to at least 1; each `next()` drains up to
+- `batch_size` is clamped to at least 1 and counts output rows. Continuous and
+  categorical wide readers emit one row per cell, so each `next()` drains up to
   `min(batch_size, remaining_limit)` completed cells.
-- `limit` stops the reader after that many rows. In long format the limit counts the
-  unnested class rows; the reader buffers per-class rows internally so batches stay at
-  `batch_size`.
+- Categorical long readers emit one row per `(cell, category)`. Each `next()` fills
+  up to `min(batch_size, remaining_limit)` rows by draining one completed cell at a
+  time, resuming any partially emitted cell before draining another. Categories
+  within a cell are sorted, contiguous, and may span batches; batches are full
+  unless EOF or the limit is reached. Cells with `total_count <= 0` are skipped.
+- `limit` counts output rows: cells for continuous/wide output, unnested category
+  rows for long output. A long-format limit may stop mid-cell without expanding
+  that cell's remaining rows or draining the next cell.
 - `from_streamer(...)` accepts a streamer you built yourself (for example with custom
   sampling, spectral formulas or remapping).
+
+#### Public long-format cursor
+
+`raster_h3_core::aggregator::multi_horizon::{CategoricalLongCursor, CategoricalLongRow}`
+provides the incremental expansion shared by the core and DuckDB long readers:
+
+- `CategoricalLongCursor::new(with_entropy)` controls per-cell entropy computation.
+- `load(&MultiCategoricalRecord)` replaces any unconsumed rows with one cell's
+  categories, sorted by category, reusing the entry buffer across cells.
+- `remaining()` reports the current cell's unconsumed category rows.
+- `emit_into(max_rows, callback)` emits at most that many `CategoricalLongRow`s and
+  returns the number emitted; subsequent calls resume the same cell.
+
+For a cell with 300 categories and `batch_size = 32`, the reader drains that one
+cell and returns its first 32 rows, retaining the remaining categories for later
+batches. Pending expansion state is bounded by the largest single cell's category
+count, separate from the output batch and the streamer's aggregation budget.
+The core and DuckDB long readers compute entropy only when `shannon_entropy` or
+`entropy` is projected (full-schema indices 7 and 8); a cursor constructed with
+`with_entropy = false` puts `NaN` in `CategoricalLongRow::entropy`.
 
 ### Arrow C Data / C Stream interface
 
@@ -140,6 +195,9 @@ floats become `null`; binary columns (`wkb`) are lowercase hex strings.
 | `parse_bbox_str(s)` | `"min_lon,min_lat,max_lon,max_lat"` → `[f64; 4]`; `None` unless exactly four numbers. |
 | `estimate_raster_cardinality(paths, resolutions)` | Planner estimate of emitted cells from the first raster's extent and `H3_AREA_M2`. |
 | `h3_to_string`, `string_to_h3`, `try_string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid_u64`, `h3_is_valid_str`, `h3_to_wkb_u64`, `h3_to_wkb_str`, `h3_cell_to_parent_u64`, `h3_cell_to_parent_str` | The scalar helpers every engine exposes. Invalid-input behaviour is listed in the [overview](README.md#scalar-helpers). |
+| `h3_polygon_to_cells_wkb(wkb, res, mode) -> Result<Vec<u64>, PolygonToCellsError>` | Polyfills a WKB `POLYGON`/`MULTIPOLYGON` with h3o (`h3o` `geo` feature) and returns the cells sorted and deduplicated. `PolygonToCellsError` is `InvalidResolution`, `InvalidGeometry` or `TooManyCells` (over `H3_POLYGON_TO_CELLS_MAX_CELLS`). |
+| `parse_containment_mode(s)`, `H3_CONTAINMENT_MODES`, `ContainmentMode` | Mode names → h3o `ContainmentMode` (see the [mode table](../api-reference.md#containment-modes)). |
+| `encoding::wkb_to_multipolygon(bytes)` | WKB/EWKB `POLYGON`/`MULTIPOLYGON` reader (either byte order; Z/M skipped) → `geo_types::MultiPolygon`. |
 
 ## File Exporters
 
@@ -147,7 +205,7 @@ floats become `null`; binary columns (`wkb`) are lowercase hex strings.
 | :--- | :--- |
 | `H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, path, ParquetExportConfig)` / `write_categorical_streamer_to_parquet` | Parquet or OGC GeoParquet 1.1 (`config.geoparquet`); the file is published only after the stream completes successfully. |
 | `H3PmtilesTiler::process_raster_source_to_pmtiles(source, path, config)` / `process_categorical_source_to_pmtiles` | PMTiles v3 archive with one zoom range per requested resolution. See [PMTiles & Multi-Resolution](../pmtiles.md). |
-| `transcode::process_parquet_to_pmtiles` | Pre-aggregated H3 Parquet → PMTiles. |
+| `transcode::process_parquet_to_pmtiles` | Pre-aggregated H3 Parquet → PMTiles. An explicit `h3_column_name` that isn't in the schema returns `Err` listing available columns; `None` auto-detects. |
 
 ## Errors
 

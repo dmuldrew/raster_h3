@@ -90,7 +90,7 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
         acc: Self::Accumulator,
         output: &mut OutputBuffer<Self::Record>,
     ) {
-        let bytes = std::mem::size_of::<Self::Record>() + acc.heap_bytes();
+        let bytes = size_of::<Self::Record>() + acc.heap_bytes();
         output.push_sized(self.make_record(resolution, key, acc), bytes);
     }
 
@@ -98,7 +98,7 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
     /// resolution. Returns false when the window held no valid data.
     fn process_chunk(
         &self,
-        window: &WalkContext,
+        window: &WalkContext<'_>,
         decoding_result: &mut DecodingResult,
         nodata: Option<f64>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
@@ -107,7 +107,7 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
     /// Borrowed window override. Built-in kernels never allocate a pixel copy.
     fn process_window(
         &self,
-        window: &WalkContext,
+        window: &WalkContext<'_>,
         samples: super::borrowed::BorrowedSamples<'_>,
         nodata: Option<f64>,
         local_maps: &mut [HashMap<u64, Self::Accumulator, H3BuildHasher>],
@@ -272,7 +272,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         // Reserve worker storage by sample cardinality, not TIFF chunk count.
         // 1 KiB/sample covers standard table slack and quantile/category state.
         // Custom heap-owning kernels must obey the same bound or use a larger allowance.
-        let per_sample = 1024usize.max(std::mem::size_of::<K::Accumulator>().saturating_mul(8));
+        let per_sample = 1024usize.max(size_of::<K::Accumulator>().saturating_mul(8));
         let per_pixel = per_sample
             .saturating_mul(num_res)
             .saturating_mul(config.sampling.points.len());
@@ -813,6 +813,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// Number of partial sorted runs written, excluding intermediate merge files.
     pub fn spill_run_count(&self) -> u64 {
         self.spill_runs.iter().map(|r| r.runs_written).sum()
+    }
+
+    /// [`Self::spill_run_count`] for each configured resolution, in order.
+    pub fn spill_run_counts(&self) -> Vec<u64> {
+        self.spill_runs.iter().map(|r| r.runs_written).collect()
     }
 
     /// Peak estimate of active table/heap allocation, including pending

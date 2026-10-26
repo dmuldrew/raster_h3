@@ -110,7 +110,7 @@ impl<R> OutputBuffer<R> {
 
     /// Push an output record onto the back of the buffer.
     pub fn push(&mut self, record: R) {
-        self.push_sized(record, std::mem::size_of::<R>());
+        self.push_sized(record, size_of::<R>());
     }
 
     /// Account for dynamic accumulator state as well as the record itself.

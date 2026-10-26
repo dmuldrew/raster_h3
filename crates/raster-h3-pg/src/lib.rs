@@ -26,7 +26,7 @@ use raster_h3_core::aggregator::multi_horizon::{
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
 use raster_h3_core::encoding::{fast_hex_u64, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
-use raster_h3_core::error::{safe_panic_payload_to_string, RasterH3Error, Result};
+use raster_h3_core::error::{catch_unwind_or, safe_panic_payload_to_string, RasterH3Error, Result};
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 use raster_h3_core::scalar_ops::{
     h3_cell_to_parent_u64, h3_get_resolution, h3_is_valid_u64, h3_to_lat, h3_to_lng,
@@ -90,7 +90,7 @@ impl FunctionCallInfoBaseData {
     }
 
     #[inline]
-    pub unsafe fn arg_i64(&self, idx: usize) -> Option<i64> {
+    pub fn arg_i64(&self, idx: usize) -> Option<i64> {
         if idx >= self.nargs as usize || self.args[idx].isnull {
             None
         } else {
@@ -129,6 +129,61 @@ pub fn datum_to_int64(d: Datum) -> i64 {
 // PostgreSQL V1 Scalar Function Entry Points
 // =============================================================================
 
+/// Raw view of a call's `fcinfo`. The server allocates only `nargs` argument slots
+/// (`SizeForFunctionCallInfo`), fewer than [`FunctionCallInfoBaseData`] declares, so
+/// the struct is accessed field by field and never borrowed as a whole.
+///
+/// Invariant: the pointer is non-null and valid for the duration of the call; only
+/// [`scalar_call`] constructs it.
+struct ScalarCallInfo(pg_func_call_info);
+
+impl ScalarCallInfo {
+    /// Argument `idx` as `int8`, or `None` if it is SQL NULL or absent.
+    fn arg_i64(&self, idx: usize) -> Option<i64> {
+        // SAFETY: `self.0` is a valid `fcinfo` (type invariant). The header fields are
+        // always allocated, and slot `idx` is read through a raw pointer only after
+        // checking `idx < nargs`, so it lies inside the server's allocation.
+        unsafe {
+            let nargs = ptr::addr_of!((*self.0).nargs).read();
+            if idx >= nargs.max(0) as usize {
+                return None;
+            }
+            let slot = ptr::addr_of!((*self.0).args)
+                .cast::<NullableDatum>()
+                .add(idx)
+                .read();
+            (!slot.isnull).then_some(slot.value as i64)
+        }
+    }
+
+    /// Mark the result as SQL NULL.
+    fn set_null(&mut self) {
+        // SAFETY: `self.0` is a valid `fcinfo` (type invariant) and `isnull` is part of
+        // the always-allocated header.
+        unsafe { ptr::addr_of_mut!((*self.0).isnull).write(true) }
+    }
+}
+
+/// Runs a scalar function body on `fcinfo`, returning SQL NULL for a NULL `fcinfo` or a panic.
+///
+/// # Safety
+/// `fcinfo` must be null or point to a valid `FunctionCallInfoBaseData` header followed by
+/// at least `nargs` argument slots.
+unsafe fn scalar_call(
+    fcinfo: pg_func_call_info,
+    body: impl FnOnce(&mut ScalarCallInfo) -> Datum,
+) -> Datum {
+    if fcinfo.is_null() {
+        return 0;
+    }
+    let mut info = ScalarCallInfo(fcinfo);
+    let out = catch_unwind_or(None, || Some(body(&mut info)));
+    out.unwrap_or_else(|| {
+        info.set_null();
+        0
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn pg_finfo_pg_h3_to_lat() -> *const Pg_finfo_record {
     &PG_FINFO_V1
@@ -140,20 +195,22 @@ pub extern "C" fn pg_finfo_pg_h3_to_lat() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_to_lat(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    let lat = h3_to_lat(cell_i64 as u64);
-    if lat.is_nan() {
-        info.isnull = true;
-        0
-    } else {
-        float8_to_datum(lat)
+    // SAFETY: the function manager passes a valid `fcinfo` (contract above), which is
+    // all `scalar_call` requires.
+    unsafe {
+        scalar_call(fcinfo, |info| {
+            let Some(cell_i64) = info.arg_i64(0) else {
+                info.set_null();
+                return 0;
+            };
+            let lat = h3_to_lat(cell_i64 as u64);
+            if lat.is_nan() {
+                info.set_null();
+                0
+            } else {
+                float8_to_datum(lat)
+            }
+        })
     }
 }
 
@@ -168,20 +225,22 @@ pub extern "C" fn pg_finfo_pg_h3_to_lng() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_to_lng(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    let lng = h3_to_lng(cell_i64 as u64);
-    if lng.is_nan() {
-        info.isnull = true;
-        0
-    } else {
-        float8_to_datum(lng)
+    // SAFETY: the function manager passes a valid `fcinfo` (contract above), which is
+    // all `scalar_call` requires.
+    unsafe {
+        scalar_call(fcinfo, |info| {
+            let Some(cell_i64) = info.arg_i64(0) else {
+                info.set_null();
+                return 0;
+            };
+            let lng = h3_to_lng(cell_i64 as u64);
+            if lng.is_nan() {
+                info.set_null();
+                0
+            } else {
+                float8_to_datum(lng)
+            }
+        })
     }
 }
 
@@ -196,20 +255,22 @@ pub extern "C" fn pg_finfo_pg_h3_get_resolution() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_get_resolution(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    let res = h3_get_resolution(cell_i64 as u64);
-    if res < 0 {
-        info.isnull = true;
-        0
-    } else {
-        int64_to_datum(res)
+    // SAFETY: the function manager passes a valid `fcinfo` (contract above), which is
+    // all `scalar_call` requires.
+    unsafe {
+        scalar_call(fcinfo, |info| {
+            let Some(cell_i64) = info.arg_i64(0) else {
+                info.set_null();
+                return 0;
+            };
+            let res = h3_get_resolution(cell_i64 as u64);
+            if res < 0 {
+                info.set_null();
+                0
+            } else {
+                int64_to_datum(res)
+            }
+        })
     }
 }
 
@@ -224,15 +285,17 @@ pub extern "C" fn pg_finfo_pg_h3_is_valid() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_is_valid(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
+    // SAFETY: the function manager passes a valid `fcinfo` (contract above), which is
+    // all `scalar_call` requires.
+    unsafe {
+        scalar_call(fcinfo, |info| {
+            let Some(cell_i64) = info.arg_i64(0) else {
+                info.set_null();
+                return 0;
+            };
+            usize::from(h3_is_valid_u64(cell_i64 as u64))
+        })
     }
-    let info = &mut *fcinfo;
-    let Some(cell_i64) = info.arg_i64(0) else {
-        info.isnull = true;
-        return 0;
-    };
-    usize::from(h3_is_valid_u64(cell_i64 as u64))
 }
 
 #[no_mangle]
@@ -246,20 +309,22 @@ pub extern "C" fn pg_finfo_pg_h3_cell_to_parent() -> *const Pg_finfo_record {
 /// `fcinfo` must point to a valid `FunctionCallInfoBaseData`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_h3_cell_to_parent(fcinfo: pg_func_call_info) -> Datum {
-    if fcinfo.is_null() {
-        return 0;
-    }
-    let info = &mut *fcinfo;
-    let (Some(cell_i64), Some(parent_res)) = (info.arg_i64(0), info.arg_i64(1)) else {
-        info.isnull = true;
-        return 0;
-    };
-    match h3_cell_to_parent_u64(cell_i64 as u64, parent_res) {
-        Some(parent) => int64_to_datum(parent as i64),
-        None => {
-            info.isnull = true;
-            0
-        }
+    // SAFETY: the function manager passes a valid `fcinfo` (contract above), which is
+    // all `scalar_call` requires.
+    unsafe {
+        scalar_call(fcinfo, |info| {
+            let (Some(cell_i64), Some(parent_res)) = (info.arg_i64(0), info.arg_i64(1)) else {
+                info.set_null();
+                return 0;
+            };
+            match h3_cell_to_parent_u64(cell_i64 as u64, parent_res) {
+                Some(parent) => int64_to_datum(parent as i64),
+                None => {
+                    info.set_null();
+                    0
+                }
+            }
+        })
     }
 }
 
@@ -535,15 +600,28 @@ pub struct PgCContinuousRow {
     pub sum: f64,
     pub resolution: i16,
     pub wkb_len: usize,
-    /// Cell boundary WKB; odd-resolution pentagons need up to 189 bytes.
+    /// Sized to hold any H3 cell polygon, including 10-vertex odd-resolution pentagons.
     pub wkb: WkbBuf,
 }
 
+/// Copy a full WKB geometry into the C row. Rows are built from a [`WkbBuf`], so they always fit.
+fn fill_c_wkb(out: &mut PgCContinuousRow, wkb: &[u8]) {
+    out.wkb = [0u8; WKB_BUF_LEN];
+    out.wkb[..wkb.len()].copy_from_slice(wkb);
+    out.wkb_len = wkb.len();
+}
+
+/// # Safety
+/// `ptr` must be null or a valid NUL-terminated C string.
 unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+    // SAFETY: non-null and NUL-terminated (caller contract); the bytes are copied
+    // into an owned `String` before returning.
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
     if s.is_empty() {
         None
     } else {
@@ -567,15 +645,32 @@ pub unsafe extern "C" fn pg_srf_continuous_open(
 ) -> *mut PgContinuousSrf {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<PgContinuousSrf> {
-            let path_str = opt_cstr(raster_path)
+            // SAFETY: every string argument is null or NUL-terminated (caller contract).
+            let (raster_path, resolutions, source_crs, bbox) = unsafe {
+                (
+                    opt_cstr(raster_path),
+                    opt_cstr(resolutions),
+                    opt_cstr(source_crs),
+                    opt_cstr(bbox),
+                )
+            };
+            let path_str = raster_path
                 .ok_or_else(|| RasterH3Error::InvalidParameter("Missing raster_path".into()))?;
-            let res_vec = opt_cstr(resolutions)
+            let res_vec = resolutions
                 .map(|s| parse_resolutions_str(&s))
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| vec![8]);
-            let crs_opt = opt_cstr(source_crs);
+            let crs_opt = source_crs;
             let nodata_opt = if has_nodata != 0 { Some(nodata) } else { None };
-            let bbox_opt = opt_cstr(bbox).and_then(|s| parse_bbox_str(&s));
+            let bbox_opt = bbox
+                .map(|s| {
+                    parse_bbox_str(&s).ok_or_else(|| {
+                        RasterH3Error::InvalidParameter(format!(
+                            "bbox must be 'min_lon,min_lat,max_lon,max_lat', got '{s}'"
+                        ))
+                    })
+                })
+                .transpose()?;
             PgContinuousSrf::open(&path_str, res_vec, crs_opt, nodata_opt, bbox_opt)
         },
     ));
@@ -584,16 +679,22 @@ pub unsafe extern "C" fn pg_srf_continuous_open(
         Ok(Ok(srf)) => Box::into_raw(Box::new(srf)),
         Ok(Err(e)) => {
             if !out_err.is_null() {
-                *out_err = CString::new(e.to_string()).unwrap_or_default().into_raw();
+                // SAFETY: non-null `out_err` is a writable `char **` (caller contract).
+                // Ownership of the string passes to the caller, who must release it
+                // with Rust's allocator (`CString::from_raw`).
+                unsafe { *out_err = CString::new(e.to_string()).unwrap_or_default().into_raw() };
             }
             ptr::null_mut()
         }
         Err(payload) => {
             let msg = safe_panic_payload_to_string(payload);
             if !out_err.is_null() {
-                *out_err = CString::new(format!("Panic in pg_srf_continuous_open: {msg}"))
-                    .unwrap_or_default()
-                    .into_raw();
+                // SAFETY: as above.
+                unsafe {
+                    *out_err = CString::new(format!("Panic in pg_srf_continuous_open: {msg}"))
+                        .unwrap_or_default()
+                        .into_raw();
+                }
             }
             ptr::null_mut()
         }
@@ -613,9 +714,17 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
     if srf.is_null() || out_row.is_null() {
         return -1;
     }
-    match (*srf).next_row() {
+    // SAFETY: non-null and, per the caller contract, a live handle from
+    // `pg_srf_continuous_open` that is not used concurrently.
+    let srf = unsafe { &mut *srf };
+    let panicked = Err(RasterH3Error::StreamFailed(
+        "panic in pg_srf_continuous_next".into(),
+    ));
+    match catch_unwind_or(panicked, || srf.next_row()) {
         Ok(Some(row)) => {
-            let out = &mut *out_row;
+            // SAFETY: non-null `out_row` points to a writable, aligned `PgCContinuousRow`
+            // (caller contract); every field is plain data, so any prior contents are fine.
+            let out = unsafe { &mut *out_row };
             out.h3_index = row.h3_index;
             out.h3_hex = [0u8; 16];
             let hb = row.h3_hex.as_bytes();
@@ -634,11 +743,7 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
             out.max = row.max;
             out.sum = row.sum;
             out.resolution = row.resolution;
-            // `row.wkb` comes from a `WkbBuf`, so it always fits.
-            let wlen = row.wkb.len().min(WKB_BUF_LEN);
-            out.wkb_len = wlen;
-            out.wkb = [0u8; WKB_BUF_LEN];
-            out.wkb[..wlen].copy_from_slice(&row.wkb[..wlen]);
+            fill_c_wkb(out, &row.wkb);
             1
         }
         Ok(None) => 0,
@@ -653,7 +758,10 @@ pub unsafe extern "C" fn pg_srf_continuous_next(
 #[no_mangle]
 pub unsafe extern "C" fn pg_srf_continuous_close(srf: *mut PgContinuousSrf) {
     if !srf.is_null() {
-        drop(Box::from_raw(srf));
+        // SAFETY: non-null `srf` came from `Box::into_raw` in `pg_srf_continuous_open`
+        // and the caller closes it at most once.
+        let srf = unsafe { Box::from_raw(srf) };
+        catch_unwind_or((), || drop(srf));
     }
 }
 
@@ -698,8 +806,35 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_srf_continuous_open_rejects_malformed_bbox() {
+        let tif = write_test_tif(16, 16, 25.5);
+        let path_c = CString::new(tif.path().to_string_lossy().as_bytes()).unwrap();
+        let bad_bbox = CString::new("1,garbage,2,3,4").unwrap();
+        // SAFETY: all string arguments are live NUL-terminated CStrings or null, and the
+        // error string handed back was produced by `CString::into_raw`.
+        unsafe {
+            let mut err: *mut c_char = ptr::null_mut();
+            let srf = pg_srf_continuous_open(
+                path_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                0.0,
+                bad_bbox.as_ptr(),
+                &mut err,
+            );
+            assert!(srf.is_null());
+            assert!(!err.is_null());
+            let msg = CString::from_raw(err).into_string().unwrap();
+            assert!(msg.contains("bbox"), "{msg}");
+        }
+    }
+
+    #[test]
     fn test_pg_v1_scalar_functions_and_null_handling() {
         let valid_cell = 0x8828308281fffffu64 as i64;
+        // SAFETY: each `fc` is a fully initialized local `FunctionCallInfoBaseData` with
+        // all 8 argument slots allocated and `nargs` set by `with_args`.
         unsafe {
             // 1. pg_h3_to_lat / pg_h3_to_lng
             let mut fc = FunctionCallInfoBaseData::with_args(&[NullableDatum {
@@ -786,6 +921,9 @@ mod tests {
         assert_eq!(cat_rows[0].majority_class, 7);
 
         // C-ABI SRF lifecycle
+        // SAFETY: string arguments are live CStrings or null; `c_row` is an all-zero
+        // `PgCContinuousRow` (valid: only integers, floats and byte arrays), and the handle
+        // is used only between open and its single close.
         unsafe {
             let path_c = CString::new(path_str).unwrap();
             let res_c = CString::new("8").unwrap();
@@ -814,5 +952,21 @@ mod tests {
             assert_eq!(count, rows.len());
             pg_srf_continuous_close(handle);
         }
+    }
+
+    #[test]
+    fn test_c_row_holds_full_pentagon_wkb() {
+        // Odd-resolution pentagons have 10 vertices: the largest H3 polygon (189 bytes).
+        let pentagon = h3o::Resolution::One.pentagons().next().unwrap();
+        let mut buf = [0u8; WKB_BUF_LEN];
+        let len = h3_index_to_wkb(u64::from(pentagon), &mut buf).unwrap();
+        assert!(len > 128, "pentagon WKB is {len} bytes");
+
+        // SAFETY: `PgCContinuousRow` holds only integers, floats and byte arrays, for which
+        // all-zero bytes are valid.
+        let mut out: PgCContinuousRow = unsafe { std::mem::zeroed() };
+        fill_c_wkb(&mut out, &buf[..len]);
+        assert_eq!(out.wkb_len, len);
+        assert_eq!(&out.wkb[..out.wkb_len], &buf[..len]);
     }
 }

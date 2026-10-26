@@ -90,6 +90,17 @@ pub fn safe_panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> S
     })
 }
 
+/// Runs `f`, returning `on_panic` instead of unwinding if it panics.
+///
+/// For `extern "C"` entry points: a panic that reaches the C ABI aborts the host process
+/// (DuckDB, PostgreSQL backend, Python interpreter).
+pub fn catch_unwind_or<T>(on_panic: T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        safe_panic_payload_to_string(payload);
+        on_panic
+    })
+}
+
 /// Extracts a human-readable panic message from a panic payload.
 pub fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     safe_panic_payload_to_string(payload)

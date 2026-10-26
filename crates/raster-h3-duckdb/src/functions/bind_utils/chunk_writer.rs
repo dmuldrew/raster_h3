@@ -26,12 +26,16 @@ pub struct ChunkWriter {
 }
 
 impl ChunkWriter {
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    /// Wrap a DuckDB output chunk sized to DuckDB's standard vector size.
+    ///
+    /// # Safety
+    /// `chunk` must be null or a live DuckDB data chunk.
     #[inline(always)]
-    pub fn new(chunk: duckdb_data_chunk) -> Self {
+    pub unsafe fn new(chunk: duckdb_data_chunk) -> Self {
         let column_count = if chunk.is_null() {
             0
         } else {
+            // SAFETY: non-null `chunk` is live (caller contract).
             unsafe { duckdb_data_chunk_get_column_count(chunk) as usize }
         };
         Self {
@@ -41,12 +45,17 @@ impl ChunkWriter {
         }
     }
 
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    /// Wrap a DuckDB output chunk with an explicit row capacity.
+    ///
+    /// # Safety
+    /// `chunk` must be null or a live DuckDB data chunk whose vectors hold at
+    /// least `vector_size` rows; every write method trusts that bound.
     #[inline(always)]
-    pub fn with_vector_size(chunk: duckdb_data_chunk, vector_size: usize) -> Self {
+    pub unsafe fn with_vector_size(chunk: duckdb_data_chunk, vector_size: usize) -> Self {
         let column_count = if chunk.is_null() {
             0
         } else {
+            // SAFETY: non-null `chunk` is live (caller contract).
             unsafe { duckdb_data_chunk_get_column_count(chunk) as usize }
         };
         Self {
@@ -62,10 +71,14 @@ impl ChunkWriter {
     /// `self.chunk` must be null or a live DuckDB data chunk.
     #[inline(always)]
     pub unsafe fn get_vector(&self, col_idx: usize) -> duckdb_vector {
-        if self.chunk.is_null() || col_idx >= self.column_count {
-            return std::ptr::null_mut();
+        // SAFETY: `self.chunk` is non-null here, hence live (caller contract), and
+        // `col_idx` is below its column count.
+        unsafe {
+            if self.chunk.is_null() || col_idx >= self.column_count {
+                return std::ptr::null_mut();
+            }
+            duckdb_data_chunk_get_vector(self.chunk, col_idx as idx_t)
         }
-        duckdb_data_chunk_get_vector(self.chunk, col_idx as idx_t)
     }
 
     /// Obtain a typed mutable slice over a vector's raw data buffer.
@@ -76,19 +89,25 @@ impl ChunkWriter {
     /// for the lifetime of the returned slice.
     #[inline(always)]
     pub unsafe fn get_data_slice_mut<T>(&mut self, col_idx: usize, len: usize) -> &mut [T] {
-        if len == 0 {
-            return &mut [];
+        // SAFETY: the chunk is live and column `col_idx` has physical type `T` with at
+        // least `vector_size` slots (caller contract); clamping to `vector_size` keeps the
+        // slice inside that buffer, which DuckDB allocates suitably aligned, and the caller
+        // guarantees no aliasing reference exists for the slice's lifetime.
+        unsafe {
+            if len == 0 {
+                return &mut [];
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return &mut [];
+            }
+            let ptr = duckdb_vector_get_data(v) as *mut T;
+            if ptr.is_null() {
+                return &mut [];
+            }
+            let safe_len = len.min(self.vector_size);
+            std::slice::from_raw_parts_mut(ptr, safe_len)
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return &mut [];
-        }
-        let ptr = duckdb_vector_get_data(v) as *mut T;
-        if ptr.is_null() {
-            return &mut [];
-        }
-        let safe_len = len.min(self.vector_size);
-        std::slice::from_raw_parts_mut(ptr, safe_len)
     }
 
     /// Set an i64 integer sample at (col_idx, row_idx)
@@ -99,18 +118,24 @@ impl ChunkWriter {
     /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_int64(&self, col_idx: usize, row_idx: usize, val: i64) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `row_idx < vector_size` was checked above, and the chunk is live with at
+        // least `vector_size` rows per vector and column `col_idx` of physical type `i64`
+        // (caller contract), so the slot is in bounds and aligned; no one else accesses the
+        // vector concurrently.
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            let ptr = duckdb_vector_get_data(v) as *mut i64;
+            if ptr.is_null() {
+                return;
+            }
+            *ptr.add(row_idx) = val;
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        let ptr = duckdb_vector_get_data(v) as *mut i64;
-        if ptr.is_null() {
-            return;
-        }
-        *ptr.add(row_idx) = val;
     }
 
     /// Set a u64 unsigned integer sample at (col_idx, row_idx)
@@ -121,18 +146,24 @@ impl ChunkWriter {
     /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_uint64(&self, col_idx: usize, row_idx: usize, val: u64) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `row_idx < vector_size` was checked above, and the chunk is live with at
+        // least `vector_size` rows per vector and column `col_idx` of physical type `u64`
+        // (caller contract), so the slot is in bounds and aligned; no one else accesses the
+        // vector concurrently.
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            let ptr = duckdb_vector_get_data(v) as *mut u64;
+            if ptr.is_null() {
+                return;
+            }
+            *ptr.add(row_idx) = val;
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        let ptr = duckdb_vector_get_data(v) as *mut u64;
-        if ptr.is_null() {
-            return;
-        }
-        *ptr.add(row_idx) = val;
     }
 
     /// Set a u8 unsigned integer sample at (col_idx, row_idx)
@@ -143,18 +174,24 @@ impl ChunkWriter {
     /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_uint8(&self, col_idx: usize, row_idx: usize, val: u8) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `row_idx < vector_size` was checked above, and the chunk is live with at
+        // least `vector_size` rows per vector and column `col_idx` of physical type `u8`
+        // (caller contract), so the slot is in bounds and aligned; no one else accesses the
+        // vector concurrently.
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            let ptr = duckdb_vector_get_data(v) as *mut u8;
+            if ptr.is_null() {
+                return;
+            }
+            *ptr.add(row_idx) = val;
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        let ptr = duckdb_vector_get_data(v) as *mut u8;
-        if ptr.is_null() {
-            return;
-        }
-        *ptr.add(row_idx) = val;
     }
 
     /// Set an f64 double sample at (col_idx, row_idx)
@@ -165,18 +202,24 @@ impl ChunkWriter {
     /// and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_double(&self, col_idx: usize, row_idx: usize, val: f64) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `row_idx < vector_size` was checked above, and the chunk is live with at
+        // least `vector_size` rows per vector and column `col_idx` of physical type `f64`
+        // (caller contract), so the slot is in bounds and aligned; no one else accesses the
+        // vector concurrently.
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            let ptr = duckdb_vector_get_data(v) as *mut f64;
+            if ptr.is_null() {
+                return;
+            }
+            *ptr.add(row_idx) = val;
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        let ptr = duckdb_vector_get_data(v) as *mut f64;
-        if ptr.is_null() {
-            return;
-        }
-        *ptr.add(row_idx) = val;
     }
 
     /// Assign a null-terminated UTF-8 string at (col_idx, row_idx)
@@ -187,19 +230,24 @@ impl ChunkWriter {
     /// other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_string(&self, col_idx: usize, row_idx: usize, s: &str) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `v` is a live VARCHAR/BLOB vector of the caller's chunk and `row_idx <
+        // vector_size` was checked above; DuckDB copies the NUL-terminated `c_s` (alive for
+        // the call) into the vector's own string heap before returning.
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            let c_s = CString::new(s).unwrap_or_default();
+            duckdb_vector_assign_string_element(
+                v,
+                row_idx as idx_t,
+                c_s.as_ptr() as *const std::ffi::c_char,
+            );
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        let c_s = CString::new(s).unwrap_or_default();
-        duckdb_vector_assign_string_element(
-            v,
-            row_idx as idx_t,
-            c_s.as_ptr() as *const std::ffi::c_char,
-        );
     }
 
     /// Assign a string slice or binary blob bytes of known length at (col_idx, row_idx)
@@ -210,19 +258,24 @@ impl ChunkWriter {
     /// other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_string_bytes(&self, col_idx: usize, row_idx: usize, bytes: &[u8]) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `v` is a live VARCHAR/BLOB vector of the caller's chunk and `row_idx <
+        // vector_size` was checked above; DuckDB copies the `bytes.len()` bytes into the
+        // vector's own string heap before returning.
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            duckdb_vector_assign_string_element_len(
+                v,
+                row_idx as idx_t,
+                bytes.as_ptr() as *const std::ffi::c_char,
+                bytes.len() as idx_t,
+            );
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        duckdb_vector_assign_string_element_len(
-            v,
-            row_idx as idx_t,
-            bytes.as_ptr() as *const std::ffi::c_char,
-            bytes.len() as idx_t,
-        );
     }
 
     /// Set a NULL value at (col_idx, row_idx) by updating the DuckDB validity mask
@@ -232,14 +285,18 @@ impl ChunkWriter {
     /// `self.vector_size` rows, and no other code may access that vector concurrently.
     #[inline(always)]
     pub unsafe fn set_null(&self, col_idx: usize, row_idx: usize) {
-        if row_idx >= self.vector_size {
-            return;
+        // SAFETY: `v` is a live vector of the caller's chunk and `row_idx < vector_size`,
+        // which is within its capacity (caller contract).
+        unsafe {
+            if row_idx >= self.vector_size {
+                return;
+            }
+            let v = self.get_vector(col_idx);
+            if v.is_null() {
+                return;
+            }
+            duckdb_vector_set_row_invalid(v, row_idx as idx_t);
         }
-        let v = self.get_vector(col_idx);
-        if v.is_null() {
-            return;
-        }
-        duckdb_vector_set_row_invalid(v, row_idx as idx_t);
     }
 
     /// Fill a primitive copyable column slice from an iterator
@@ -255,10 +312,14 @@ impl ChunkWriter {
         count: usize,
         values: I,
     ) {
-        let safe_count = count.min(self.vector_size);
-        let slice: &mut [T] = self.get_data_slice_mut(col_idx, safe_count);
-        for (dest, val) in slice.iter_mut().zip(values.into_iter().take(safe_count)) {
-            *dest = val;
+        // SAFETY: forwards this function's contract (live chunk, column of type `T`, no
+        // aliasing) to `get_data_slice_mut`.
+        unsafe {
+            let safe_count = count.min(self.vector_size);
+            let slice: &mut [T] = self.get_data_slice_mut(col_idx, safe_count);
+            for (dest, val) in slice.iter_mut().zip(values.into_iter().take(safe_count)) {
+                *dest = val;
+            }
         }
     }
 
@@ -272,9 +333,13 @@ impl ChunkWriter {
     where
         I: IntoIterator<Item = &'a u64>,
     {
-        for (i, &cell_u64) in cells.into_iter().take(self.vector_size).enumerate() {
-            let hex_slice = fast_hex_u64(cell_u64, hex_buf);
-            self.set_string_bytes(out_idx, i, hex_slice);
+        // SAFETY: forwards the caller's contract (live chunk, VARCHAR column `out_idx`) to
+        // `set_string_bytes`; rows are capped at `vector_size`.
+        unsafe {
+            for (i, &cell_u64) in cells.into_iter().take(self.vector_size).enumerate() {
+                let hex_slice = fast_hex_u64(cell_u64, hex_buf);
+                self.set_string_bytes(out_idx, i, hex_slice);
+            }
         }
     }
 
@@ -293,24 +358,28 @@ impl ChunkWriter {
     ) where
         I: IntoIterator<Item = &'a u64>,
     {
-        if out_idx_wkb.is_none() && out_idx_geom.is_none() {
-            return;
-        }
-        for (i, &cell_u64) in cells.into_iter().take(self.vector_size).enumerate() {
-            if let Some(wkb_len) = h3_index_to_wkb(cell_u64, wkb_buf) {
-                let bytes = &wkb_buf[..wkb_len];
-                if let Some(out_wkb) = out_idx_wkb {
-                    self.set_string_bytes(out_wkb, i, bytes);
-                }
-                if let Some(out_geom) = out_idx_geom {
-                    self.set_string_bytes(out_geom, i, bytes);
-                }
-            } else {
-                if let Some(out_wkb) = out_idx_wkb {
-                    self.set_null(out_wkb, i);
-                }
-                if let Some(out_geom) = out_idx_geom {
-                    self.set_null(out_geom, i);
+        // SAFETY: forwards the caller's contract (live chunk, BLOB/GEOMETRY columns) to
+        // `set_string_bytes`/`set_null`; rows are capped at `vector_size`.
+        unsafe {
+            if out_idx_wkb.is_none() && out_idx_geom.is_none() {
+                return;
+            }
+            for (i, &cell_u64) in cells.into_iter().take(self.vector_size).enumerate() {
+                if let Some(wkb_len) = h3_index_to_wkb(cell_u64, wkb_buf) {
+                    let bytes = &wkb_buf[..wkb_len];
+                    if let Some(out_wkb) = out_idx_wkb {
+                        self.set_string_bytes(out_wkb, i, bytes);
+                    }
+                    if let Some(out_geom) = out_idx_geom {
+                        self.set_string_bytes(out_geom, i, bytes);
+                    }
+                } else {
+                    if let Some(out_wkb) = out_idx_wkb {
+                        self.set_null(out_wkb, i);
+                    }
+                    if let Some(out_geom) = out_idx_geom {
+                        self.set_null(out_geom, i);
+                    }
                 }
             }
         }
@@ -323,8 +392,12 @@ impl ChunkWriter {
     /// `self.vector_size` rows.
     #[inline(always)]
     pub unsafe fn set_size(&self, size: usize) {
-        let safe_size = size.min(self.vector_size);
-        duckdb_data_chunk_set_size(self.chunk, safe_size as idx_t);
+        // SAFETY: the chunk is live with capacity for `vector_size` rows (caller contract)
+        // and the size is clamped to that.
+        unsafe {
+            let safe_size = size.min(self.vector_size);
+            duckdb_data_chunk_set_size(self.chunk, safe_size as idx_t);
+        }
     }
 }
 
@@ -334,9 +407,12 @@ mod tests {
 
     #[test]
     fn test_chunk_writer_null_pointer_safety() {
-        let mut writer = ChunkWriter::new(std::ptr::null_mut());
+        // SAFETY: a null chunk is allowed and never dereferenced.
+        let mut writer = unsafe { ChunkWriter::new(std::ptr::null_mut()) };
         assert_eq!(writer.vector_size, get_vector_size());
 
+        // SAFETY: the chunk is null, so every method returns before touching
+        // DuckDB memory; this checks exactly that.
         unsafe {
             // Null chunk/vector returns empty slice without panicking
             let slice: &mut [f64] = writer.get_data_slice_mut(0, 10);
@@ -365,9 +441,12 @@ mod tests {
 
     #[test]
     fn test_chunk_writer_capacity_bounds() {
-        let writer = ChunkWriter::with_vector_size(std::ptr::null_mut(), 100);
+        // SAFETY: a null chunk is allowed and never dereferenced.
+        let writer = unsafe { ChunkWriter::with_vector_size(std::ptr::null_mut(), 100) };
         assert_eq!(writer.vector_size, 100);
 
+        // SAFETY: the chunk is null, so every method returns before touching
+        // DuckDB memory; this checks exactly that.
         unsafe {
             // Out of bounds row index is safely rejected
             writer.set_int64(0, 200, 42);
@@ -377,9 +456,12 @@ mod tests {
 
     #[test]
     fn test_chunk_writer_column_bounds() {
-        let writer = ChunkWriter::new(std::ptr::null_mut());
+        // SAFETY: a null chunk is allowed and never dereferenced.
+        let writer = unsafe { ChunkWriter::new(std::ptr::null_mut()) };
         assert_eq!(writer.column_count, 0);
 
+        // SAFETY: the chunk is null, so every method returns before touching
+        // DuckDB memory; this checks exactly that.
         unsafe {
             // Out of bounds column index returns null vector safely
             let v = writer.get_vector(5);

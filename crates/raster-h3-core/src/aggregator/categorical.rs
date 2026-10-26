@@ -1,4 +1,4 @@
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -96,7 +96,7 @@ impl CategoricalAccumulator {
         } else {
             // Spill to heap
             let mut map: HashMap<i64, f64, FxBuildHasher> =
-                HashMap::with_capacity_and_hasher(32, FxBuildHasher::default());
+                HashMap::with_capacity_and_hasher(32, FxBuildHasher);
             for i in 0..INLINE_CAPACITY {
                 map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
             }
@@ -286,6 +286,9 @@ impl CategoricalUniformity for i8 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
+        // SAFETY: `i8` and `u8` have identical size and alignment and every
+        // bit pattern is valid for both, so the same memory reinterpreted as
+        // `[u8; len]` is a valid shared borrow for the lifetime of `slice`.
         let u8_slice: &[u8] =
             unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
         u8::is_uniform(u8_slice)
@@ -332,6 +335,9 @@ impl CategoricalUniformity for i16 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
+        // SAFETY: `i16` and `u16` have identical size and alignment and every
+        // bit pattern is valid for both, so the same memory reinterpreted as
+        // `[u16; len]` is a valid shared borrow for the lifetime of `slice`.
         let u16_slice: &[u16] =
             unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len()) };
         u16::is_uniform(u16_slice)
@@ -378,6 +384,9 @@ impl CategoricalUniformity for i32 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
+        // SAFETY: `i32` and `u32` have identical size and alignment and every
+        // bit pattern is valid for both, so the same memory reinterpreted as
+        // `[u32; len]` is a valid shared borrow for the lifetime of `slice`.
         let u32_slice: &[u32] =
             unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len()) };
         u32::is_uniform(u32_slice)
@@ -428,6 +437,9 @@ impl CategoricalUniformity for i64 {
 
     #[inline(always)]
     fn is_uniform(slice: &[Self]) -> bool {
+        // SAFETY: `i64` and `u64` have identical size and alignment and every
+        // bit pattern is valid for both, so the same memory reinterpreted as
+        // `[u64; len]` is a valid shared borrow for the lifetime of `slice`.
         let u64_slice: &[u64] =
             unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len()) };
         u64::is_uniform(u64_slice)

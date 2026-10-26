@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +15,8 @@ use raster_h3_core::error::RasterH3Error;
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 use raster_h3_core::raster::http_range::{is_remote_url, normalize_url, RemoteHttpSource};
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader};
+use raster_h3_core::raster::remote_prefetch::{RemoteChunkPrefetchQueue, RemotePrefetchConfig};
+use rustc_hash::FxHashMap;
 use tiff::decoder::DecodingResult;
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -54,8 +56,64 @@ struct MockHttpServer {
     #[allow(dead_code)]
     transient_failures: Arc<AtomicUsize>,
     recorded_headers: Arc<Mutex<Vec<String>>>,
+    gate: Arc<RequestGate>,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct RequestGateState {
+    enabled: bool,
+    fail: Option<bool>,
+    requests: FxHashMap<usize, usize>,
+}
+
+#[derive(Default)]
+struct RequestGate {
+    state: Mutex<RequestGateState>,
+    condvar: Condvar,
+}
+
+impl RequestGate {
+    fn hold(&self) {
+        self.state.lock().unwrap().enabled = true;
+    }
+
+    fn release(&self, fail: bool) {
+        self.state.lock().unwrap().fail = Some(fail);
+        self.condvar.notify_all();
+    }
+
+    fn block_request(&self, start: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.enabled {
+            return false;
+        }
+        *state.requests.entry(start).or_default() += 1;
+        self.condvar.notify_all();
+        while state.fail.is_none() {
+            state = self.condvar.wait(state).unwrap();
+        }
+        state.fail.unwrap()
+    }
+
+    fn wait_for_requests(&self, count: usize) {
+        let (mut state, _) = self
+            .condvar
+            .wait_timeout_while(
+                self.state.lock().unwrap(),
+                Duration::from_secs(10),
+                |state| state.requests.values().sum::<usize>() < count,
+            )
+            .unwrap();
+        let received = state.requests.values().sum::<usize>();
+        if received < count {
+            state.fail = Some(false);
+            self.condvar.notify_all();
+        }
+        drop(state);
+        assert_eq!(received, count, "prefetch ranges were not all requested");
+    }
 }
 
 impl MockHttpServer {
@@ -82,6 +140,8 @@ impl MockHttpServer {
         let request_count = Arc::new(AtomicUsize::new(0));
         let transient_failures = Arc::new(AtomicUsize::new(failure_count));
         let recorded_headers = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(RequestGate::default());
+        let gate_clone = Arc::clone(&gate);
 
         let shutdown_clone = Arc::clone(&shutdown);
         let bytes_served_clone = Arc::clone(&bytes_served);
@@ -112,11 +172,16 @@ impl MockHttpServer {
                 let reqs = Arc::clone(&request_count_clone);
                 let fails = Arc::clone(&failures_clone);
                 let hdrs = Arc::clone(&headers_clone);
+                let gate = Arc::clone(&gate_clone);
 
                 thread::spawn(move || {
+                    // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("Failed to make accepted socket blocking");
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                    Self::handle_connection(stream, &file_data, served, reqs, fails, hdrs);
+                    Self::handle_connection(stream, &file_data, served, reqs, fails, hdrs, gate);
                 });
             }
         });
@@ -128,6 +193,7 @@ impl MockHttpServer {
             request_count,
             transient_failures,
             recorded_headers,
+            gate,
             shutdown,
             handle: Some(handle),
         }
@@ -144,6 +210,7 @@ impl MockHttpServer {
         request_count: Arc<AtomicUsize>,
         transient_failures: Arc<AtomicUsize>,
         recorded_headers: Arc<Mutex<Vec<String>>>,
+        gate: Arc<RequestGate>,
     ) {
         let mut reader = BufReader::new(&stream);
         let mut request_line = String::new();
@@ -190,13 +257,16 @@ impl MockHttpServer {
         request_count.fetch_add(1, Ordering::SeqCst);
 
         // Check for simulated transient failure (HTTP 503 Slow Down)
-        let fail_hit = transient_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            if count > 0 {
-                Some(count - 1)
-            } else {
-                None
-            }
-        });
+        // `try_update` replaces this on Rust 1.95+, but rust-version is 1.94.
+        #[allow(deprecated)]
+        let fail_hit =
+            transient_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count > 0 {
+                    Some(count - 1)
+                } else {
+                    None
+                }
+            });
         if fail_hit.is_ok() {
             let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes());
@@ -234,6 +304,12 @@ impl MockHttpServer {
 
         if let Some(range_str) = range_header {
             if let Some((start, end)) = parse_byte_range(&range_str, total_size) {
+                if gate.block_request(start) {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
+                }
                 let slice = &file_bytes[start..=end];
                 let content_len = slice.len();
                 bytes_served.fetch_add(content_len, Ordering::SeqCst);
@@ -273,10 +349,157 @@ impl MockHttpServer {
 
 impl Drop for MockHttpServer {
     fn drop(&mut self) {
+        self.gate.release(false);
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+type PrefetchResult = Result<Option<Vec<u8>>, String>;
+
+struct GatedPrefetch {
+    server: MockHttpServer,
+    reader: GeoTiffStreamReader,
+    queue: Arc<RemoteChunkPrefetchQueue>,
+    file_bytes: Vec<u8>,
+}
+
+impl GatedPrefetch {
+    fn new(chunk_indices: &[u32]) -> Self {
+        let (file, _) = helpers::TestGeoTiffBuilder::new(512, 512)
+            .create_f32_tempfile(|col, row| (col + row * 512) as f32);
+        let file_bytes = std::fs::read(file.path()).unwrap();
+        let server = MockHttpServer::start(file_bytes.clone());
+        let reader = GeoTiffStreamReader::open(format!("{}/test.tif", server.url_base)).unwrap();
+        server.gate.hold();
+        let queue = Arc::new(
+            RemoteChunkPrefetchQueue::spawn_single(
+                &reader,
+                chunk_indices,
+                Some(RemotePrefetchConfig {
+                    num_workers: 2,
+                    max_range_bytes: 1, // Keep each strip in its own HTTP request.
+                    ..Default::default()
+                }),
+            )
+            .unwrap(),
+        );
+        let fixture = Self {
+            server,
+            reader,
+            queue,
+            file_bytes,
+        };
+        assert_eq!(fixture.queue.total_jobs(), chunk_indices.len());
+        fixture.server.gate.wait_for_requests(chunk_indices.len());
+        fixture
+    }
+
+    fn request_chunk(
+        &self,
+        chunk_idx: u32,
+    ) -> (thread::JoinHandle<()>, mpsc::Receiver<PrefetchResult>) {
+        let queue = Arc::clone(&self.queue);
+        let (tx, rx) = mpsc::channel();
+        let consumer = thread::spawn(move || {
+            let result = queue
+                .get_chunk_payload(0, chunk_idx)
+                .map(|payload| payload.map(|bytes| bytes.to_vec()))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        (consumer, rx)
+    }
+}
+
+impl Drop for GatedPrefetch {
+    fn drop(&mut self) {
+        self.server.gate.release(false);
+        self.queue.cancel();
+    }
+}
+
+#[test]
+fn test_waits_for_in_flight_ranges_after_all_jobs_claimed() {
+    let fixture = GatedPrefetch::new(&[0, 1]);
+    let consumers: Vec<_> = (0..2).map(|chunk| fixture.request_chunk(chunk)).collect();
+    let early: Vec<_> = consumers
+        .iter()
+        .map(|(_, rx)| rx.recv_timeout(Duration::from_millis(200)))
+        .collect();
+    fixture.server.gate.release(false);
+
+    for (chunk_idx, ((consumer, rx), early)) in consumers.into_iter().zip(early).enumerate() {
+        let waited = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        let result = if waited {
+            rx.recv_timeout(Duration::from_secs(10))
+        } else {
+            early
+        };
+        if result.is_err() {
+            fixture.queue.cancel();
+        }
+        consumer.join().unwrap();
+        assert!(waited, "consumer returned before its HTTP response");
+        let info = fixture.reader.chunk_info.as_ref().unwrap();
+        let start = info.chunk_offsets[chunk_idx] as usize;
+        let len = info.chunk_bytes[chunk_idx] as usize;
+        assert_eq!(
+            result.unwrap().unwrap().as_deref(),
+            Some(&fixture.file_bytes[start..start + len])
+        );
+        assert_eq!(
+            fixture.server.gate.state.lock().unwrap().requests[&start],
+            1
+        );
+    }
+}
+
+#[test]
+fn test_final_prefetch_error_wakes_all_consumers() {
+    let fixture = GatedPrefetch::new(&[0]);
+    let consumers: Vec<_> = (0..2).map(|_| fixture.request_chunk(0)).collect();
+    let early: Vec<_> = consumers
+        .iter()
+        .map(|(_, rx)| rx.recv_timeout(Duration::from_millis(200)))
+        .collect();
+    fixture.server.gate.release(true);
+
+    let results: Vec<_> = consumers
+        .iter()
+        .map(|(_, rx)| rx.recv_timeout(Duration::from_secs(10)))
+        .collect();
+    fixture.queue.cancel();
+    for (((consumer, _), early), result) in consumers.into_iter().zip(early).zip(results) {
+        consumer.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        let error = result
+            .expect("consumer missed the final fetch error")
+            .unwrap_err();
+        assert!(error.contains("HTTP 404"), "unexpected error: {error}");
+    }
+}
+
+#[test]
+fn test_prefetch_cancellation_wakes_all_consumers() {
+    let fixture = GatedPrefetch::new(&[0]);
+    let consumers: Vec<_> = (0..2).map(|_| fixture.request_chunk(0)).collect();
+    let early: Vec<_> = consumers
+        .iter()
+        .map(|(_, rx)| rx.recv_timeout(Duration::from_millis(200)))
+        .collect();
+    fixture.queue.cancel();
+
+    for ((consumer, rx), early) in consumers.into_iter().zip(early) {
+        let result = rx.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            fixture.queue.cancel();
+        }
+        consumer.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(result.expect("consumer missed cancellation").unwrap(), None);
     }
 }
 

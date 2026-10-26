@@ -8,15 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- Release quality gates covering lint, MSRV, engine/community builds, blocking dependency policy, package/version checks, wheels, fuzzing and Miri; weekly advisory and safety checks.
+- GitHub release SHA-256 checksums and build provenance, validated wheel assets, contributor issue forms and PR checklist.
+- WKB/EWKB, GeoTIFF metadata and chunk-predictor fuzz targets, generated conservation/merge/CRS tests, scoped Arrow Miri checks and Criterion streaming baselines.
+- Core-only crates.io package policy and automated release metadata consistency checks (without publishing packages).
+
+- CI `lint` job (rustfmt, Clippy with `-D warnings` including the `pg-extension` feature, rustdoc with `-D warnings`) and `msrv` job.
+- Workspace `rust-version = "1.94"` (required by h3o 0.11) and shared `[workspace.lints]`.
+- `SECURITY.md` and Dependabot configuration for Cargo, GitHub Actions and pip.
+- `raster_h3_core::error::catch_unwind_or` for panic-safe `extern "C"` entry points.
+- `CrsTransformer::bounds_certified` and certified (Lipschitz-enclosure) WGS84 bounds for transverse Mercator sources (`utm`, `etmerc`, exact `tmerc` on named ellipsoids), so bbox pruning stays sound for them. Explicit `+towgs84` shifts are certified only up to 1.5 km translation, 10″ rotation and 50 ppm scale.
+- `spill_run_counts()` on the continuous and categorical multi-resolution streamers: spill runs per configured resolution.
+
+### Changed
+
+- Long-format categorical output (core `CategoricalBatchReader` and the DuckDB `format := 'long'` scan) now expands one cell at a time and only as far as each batch needs, instead of eagerly queueing every category of a whole batch of cells (e.g. ~2M rows for 2,048 cells × 1,000 classes). Shannon entropy is skipped when no entropy column is projected.
+- Restore safe bbox and mosaic-overlap pruning for built-in EPSG:3413/3031 using analytic radial/angular bounds; skip discarded bounds estimates for uncertified bbox tests. Add end-to-end pruning benchmarks with Lambert/LAEA controls.
+
+- TM rejection certificates now follow proj4rs scale precedence (`k0`, then `k`) and fail open for duplicate or non-canonical PROJ parameters, preventing incorrect bbox pruning.
+
+- Replaced unmaintained `fxhash` with maintained `rustc-hash`, removed obsolete advisory exceptions, and denied wildcard dependency requirements.
+- Replaced brittle two-second streaming test assertions with correctness-only tests and separate informational benchmarks.
+
+### Fixed
+
+- Remote COG prefetch no longer reports a chunk as unavailable while its range request is still in flight. The queue previously treated "all ranges claimed" as "all ranges fetched", so decoders near the end of a scan could re-download chunk bytes and leave the late payload orphaned in the ready map.
+- TIFF sample unpacking now rejects truncated buffers, overflowing dimensions, invalid strides and undersized destinations before indexing or copying; the new fuzz target caught the truncated-input regression.
+
+- PostgreSQL scalar functions, `pg_srf_continuous_next`, the `fmgr` text/bytea functions, Python scalar and `h3_polygon_to_cells` exports, and Arrow stream / batch-reader release no longer abort the host process if Rust code panics.
+- Replaced `AtomicUsize::try_update` (Rust 1.95) with `fetch_update` so the crate builds on its declared MSRV.
+- Broken rustdoc link in `RemoteHttpSource::read_exact_range`; all Clippy warnings.
+- `GeoTransform::coord_to_pixel` used an absolute determinant cutoff that rejected valid fine-resolution grids (e.g. 1e-8 degree pixels); it is now scale-relative and rejects non-finite affines. Opening a GeoTIFF now rejects a non-finite or singular affine transform.
+- Sampled PROJ bounds could reject valid data: `transform_rect_bounds` now returns the whole globe if any probe fails, and `rejection_bounds` fails open for uncertified bounds instead of padding them by 10%.
+- WGS84 and Web Mercator rect bounds kept unwrapped corner longitudes while per-sample bbox tests wrap every longitude, so a sample on a chunk edge could fall one ulp outside its chunk's rejection bounds; the corners are now wrapped the same way, and a corner just below 180° that rounds to -180° falls back to full longitude instead of reversing the bounds.
+
+## [0.4.0] - 2026-10-21
+
+### Added
+- DuckDB community-extension build scaffolding: root `Makefile` and `extension-ci-tools` submodule (DuckDB's `c_api_extensions` makefiles), so `make configure && make release` produces `build/release/raster_h3.duckdb_extension` (stable C API, minimum DuckDB v1.2.0); `test/sql/raster_h3.test` sqllogictest run by `make test_release` ([DuckDB](docs/engines/duckdb.md#community-extension-build)).
+- `h3_polygon_to_cells(geometry, resolution [, containment])` scalar (h3o polyfill) in DuckDB (`BLOB`/`GEOMETRY` → `UBIGINT[]`) and Python, with the `contains_centroid` (default), `contains_boundary`, `intersects_boundary` and `covers` containment modes ([API Reference](docs/api-reference.md#h3_polygon_to_cells)). Backed by `raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb` and a new WKB polygon reader.
 - **Multi-engine Cargo workspace** ([Engines Overview](docs/engines/README.md)): the engine moved to `crates/raster-h3-core`; the DuckDB extension to `crates/raster-h3-duckdb`. The root `raster_h3` crate re-exports every member and still builds `libraster_h3` for DuckDB.
 - `raster-h3-core` `columnar` module: `RecordBatch`/`ColumnSchema` model, `ContinuousBatchReader` / `CategoricalBatchReader`, Arrow C Data and C Stream interface, `RH3IPC01` binary stream and NDJSON writer; `scalar_ops` module with H3 helpers shared by all engines ([Core](docs/engines/core.md)).
 - `raster-h3-datafusion`: DataFusion-style `TableProvider` / `ExecutionPlan` / `ScalarUDFImpl` with projection, filter and limit pushdown ([DataFusion](docs/engines/datafusion.md)).
 - `raster-h3-python` and the `raster-h3` Python package: Arrow PyCapsule stream, Polars IO source (`scan_raster_h3`, `read_raster_h3`), H3 helpers, Parquet/PMTiles exporters; `py3-none-<platform>` wheels built by `.github/workflows/wheels.yml` ([Python & Polars](docs/engines/python-polars.md)).
-- `raster-h3-pg`: PostgreSQL 13–18 extension with `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` SRFs and H3 scalar functions, plus a Docker-based real-server test (`scripts/pg_e2e.sh`, `tests/test_pg_extension_e2e.rs`) ([PostgreSQL](docs/engines/postgresql.md)).
+- `raster-h3-pg`: PostgreSQL 13–18 extension with `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` SRFs and H3 scalar functions, plus a Docker-based real-server test (`scripts/pg_e2e.sh`, `tests/it/pg_extension_e2e.rs`) ([PostgreSQL](docs/engines/postgresql.md)).
 - `raster-h3-cli`: `ipc`, `jsonl`, `parquet` and `pmtiles` subcommands with strict argument validation ([CLI](docs/engines/cli.md)).
-- `tests/test_multi_engine_e2e.rs`: cross-engine parity on shared synthetic rasters.
+- `tests/it/multi_engine_e2e.rs`: cross-engine parity on shared synthetic rasters.
+- Built-in European national-grid EPSG codes with Helmert datum shifts: `27700` (OSGB36), `28992` (Amersfoort / RD New), `31466`–`31469` (DHDN Gauss-Kruger), `23028`–`23038` (ED50 / UTM); and ETRS89 codes treated as WGS84: `2154`, `3035`, `25828`–`25838` ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 
 ### Changed
+- Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
+- Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
+- Workspace, Python package and PostgreSQL extension versions bumped to `0.4.0` (PostgreSQL install script renamed to `sql/raster_h3--0.4.0.sql`; there is no 0.3.0 release).
+- The DuckDB community-extension manifest moved from `community_extension/` to `packaging/duckdb-community/description.yml`; it now points at `dmuldrew/raster_h3`, declares version `0.4.0` and excludes the opt-in musl and `windows_amd64_rtools` platforms.
+- Repository and homepage URLs point to `github.com/dmuldrew/raster_h3` (previously `raster_h3_hexification`).
+- `h3_parquet_to_pmtiles` (and `process_parquet_to_pmtiles` / `convert_to_pmtiles`) now return an error naming the available columns when an explicit `h3_column` is not found, instead of silently falling back to auto-detection or column 0.
+- PROJ strings with 3- or 7-parameter Helmert shifts (`+towgs84=...`, or a named datum that implies one such as `+datum=OSGB36`) are now transformed via proj4rs instead of rejected. Grid-based datums (`+nadgrids` other than `@null`, `+datum=NAD27`) and unknown `+datum` names are still rejected with `CrsError`; a non-zero shift never takes a fast path ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 - Bound decoded chunk memory in bytes, not only by queue length: the mosaic prefetcher charges buffers being decoded, queued, aggregated and idle against `decode_budget_bytes` (SQL `decode_budget_mb`, default 256 MiB). Reservations are granted in job order before decoding; a chunk larger than the budget is decoded only when no other is held. Peak usage is reported as `StreamProfile::peak_decoded_bytes`.
 - Account pending compaction groups in bytes; they now count toward `peak_active_bytes`, and `StreamProfile` reports `peak_compaction_bytes` and `forced_compaction_flushes`. An opt-in `compaction_budget_bytes` (SQL `compaction_budget_mb`) decomposes the groups nearest completion into child records once exceeded. Samples and totals are unchanged, but which groups compact then depends on batch timing and can vary between runs; unset, compaction stays deterministic.
 - Index pending compaction groups with per-resolution heaps, so streaming completion checks and the published horizon cost O(log n) per finished group instead of a scan of every pending group per batch. Streaming completion flushes stop once the output buffer reaches its byte limit and resume on the next call.
@@ -25,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
 - Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.
 - Document aggregation budgets, spill behavior, and uncertified projected eviction without unconditional process-memory or geometric-skip claims.
+- DuckDB scalar overloads (`h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_to_geometry`, `h3_cell_to_geometry`, `h3_polygon_to_cells`) are registered as scalar function sets. DuckDB before 1.5 rejected the second registration under a name, so only the first overload (e.g. `h3_is_valid(UBIGINT)`) was available there.
+- Reorganise the documentation for the multi-engine workspace: the README is engine-neutral (Engines section after the introduction, topic deep dives at the end), the worked example has DuckDB and Polars versions, DuckDB install/Docker/SQL recipes/client examples moved to the [DuckDB deep dive](docs/engines/duckdb.md), and the Python, PostgreSQL, CLI and DataFusion deep dives gained matching recipes and troubleshooting sections. `docs/api-reference.md` is now titled the DuckDB SQL API Reference.
 
 ### Fixed
 - Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.
@@ -163,6 +213,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docker container** with multi-stage build, bundled DuckDB CLI, and demo script
 - **Query planner integration**: cardinality estimation and parallel `init_local` distribution
 
-[Unreleased]: https://github.com/dmuldrew/raster_h3_hexification/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/dmuldrew/raster_h3_hexification/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dmuldrew/raster_h3_hexification/releases/tag/v0.1.0
+[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dmuldrew/raster_h3/compare/v0.2.0...v0.4.0
+[0.2.0]: https://github.com/dmuldrew/raster_h3/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dmuldrew/raster_h3/releases/tag/v0.1.0

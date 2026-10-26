@@ -1,0 +1,38 @@
+[package]
+name = "raster-h3-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+raster-h3-core = { version = "0.4.0", path = "../crates/raster-h3-core" }
+tempfile = "3.10"
+tiff = "0.11"
+
+[[bin]]
+name = "wkb"
+path = "fuzz_targets/wkb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "geotiff"
+path = "fuzz_targets/geotiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "predictor"
+path = "fuzz_targets/predictor.rs"
+test = false
+doc = false
+bench = false

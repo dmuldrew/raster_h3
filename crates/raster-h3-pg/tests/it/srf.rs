@@ -181,7 +181,7 @@ fn categorical_srf_matches_core_with_options() {
     let bbox = [-122.45, 37.775, -122.425, 37.795];
 
     type Case<'a> = (Vec<u8>, Option<&'a str>, Option<f64>, Option<[f64; 4]>);
-    let cases: [Case; 4] = [
+    let cases: [Case<'_>; 4] = [
         (vec![8], None, None, None),
         (vec![7, 8], Some("EPSG:4326"), None, None),
         (vec![8], None, Some(3.0), None),
@@ -262,6 +262,10 @@ impl CSrf {
 
     /// Drains the C-ABI SRF into the same shape as [`core_continuous`].
     fn rows(&self) -> Result<BTreeMap<i64, Vec<String>>, String> {
+        // SAFETY: string arguments are this struct's live CStrings or null; an error string
+        // comes from `CString::into_raw` and is reclaimed once; `row` is an all-zero
+        // `PgCContinuousRow` (plain numbers and byte arrays), and the handle is used only
+        // between open and close.
         unsafe {
             let mut err: *mut c_char = ptr::null_mut();
             let srf = pg_srf_continuous_open(
@@ -348,12 +352,12 @@ fn continuous_c_abi_srf_matches_core_with_options() {
     assert_eq!(got, core_continuous(&path, &cfg));
     assert!(got.values().any(|r| r[6] == "9"));
 
-    // An unparsable bbox is ignored rather than rejected by the C-ABI entry point.
     let bad_bbox = CSrf {
         bbox: Some(CString::new("1,2,3").unwrap()),
         ..CSrf::new(&path)
     };
-    assert_eq!(bad_bbox.rows().unwrap(), plain);
+    let err = bad_bbox.rows().unwrap_err();
+    assert!(err.contains("bbox"), "{err}");
 }
 
 #[test]
@@ -373,7 +377,10 @@ fn continuous_c_abi_srf_keeps_full_pentagon_wkb() {
     srf.res = Some(CString::new("9").unwrap());
     // `rows()` asserts each row's WKB equals `h3_to_wkb_u64` byte for byte.
     let rows = srf.rows().unwrap();
-    assert!(rows.contains_key(&(u64::from(pentagon) as i64)), "pentagon {pentagon} not scanned");
+    assert!(
+        rows.contains_key(&(u64::from(pentagon) as i64)),
+        "pentagon {pentagon} not scanned"
+    );
     let wkb = raster_h3_core::scalar_ops::h3_to_wkb_u64(u64::from(pentagon)).unwrap();
     assert_eq!(wkb.len(), 13 + 16 * 11);
 }
@@ -397,6 +404,8 @@ fn continuous_c_abi_srf_errors() {
         "next returned -1"
     );
 
+    // SAFETY: null string arguments are allowed; the returned error string comes from
+    // `CString::into_raw` and is reclaimed exactly once.
     unsafe {
         let mut err: *mut c_char = ptr::null_mut();
         let srf = pg_srf_continuous_open(

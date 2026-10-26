@@ -127,6 +127,15 @@ pub fn for_each_cell_tile_mercator<F>(
             min_ux = min_ux.min(x);
             max_ux = max_ux.max(x);
         }
+        let mut cx = center.x;
+        while cx - ux0 > 0.5 {
+            cx -= 1.0;
+        }
+        while cx - ux0 < -0.5 {
+            cx += 1.0;
+        }
+        min_ux = min_ux.min(cx);
+        max_ux = max_ux.max(cx);
         if max_ux - min_ux < 0.5 {
             let n_i = 1i64 << z;
             let n_f = n_i as f64;
@@ -163,6 +172,141 @@ pub fn cell_boundary_mercator(cell: CellIndex) -> ([MercatorPoint; 10], usize) {
         }
     }
     (arr, count)
+}
+
+/// Accumulates exact WGS84 vertex bounds across H3 cells with polar and antimeridian awareness.
+#[derive(Debug, Clone, Copy)]
+pub struct Wgs84BoundsAccumulator {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+    pub min_pos_lon: f64,
+    pub max_neg_lon: f64,
+    pub crosses_antimeridian: bool,
+    pub full_lon: bool,
+    pub count: usize,
+}
+
+impl Default for Wgs84BoundsAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Wgs84BoundsAccumulator {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            min_lon: f64::INFINITY,
+            min_lat: f64::INFINITY,
+            max_lon: f64::NEG_INFINITY,
+            max_lat: f64::NEG_INFINITY,
+            min_pos_lon: f64::INFINITY,
+            max_neg_lon: f64::NEG_INFINITY,
+            crosses_antimeridian: false,
+            full_lon: false,
+            count: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn observe_point(&mut self, lon: f64, lat: f64) {
+        self.min_lat = self.min_lat.min(lat);
+        self.max_lat = self.max_lat.max(lat);
+        self.min_lon = self.min_lon.min(lon);
+        self.max_lon = self.max_lon.max(lon);
+        if lon >= 0.0 {
+            self.min_pos_lon = self.min_pos_lon.min(lon);
+        } else {
+            self.max_neg_lon = self.max_neg_lon.max(lon);
+        }
+    }
+
+    /// Record a validated H3 cell's center and boundary vertices.
+    #[inline]
+    pub fn record_cell(&mut self, cell: CellIndex) {
+        self.count += 1;
+        let res = cell.resolution();
+        let is_north_pole = cell == LatLng::new(90.0, 0.0).expect("valid").to_cell(res);
+        let is_south_pole = cell == LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
+        if is_north_pole {
+            self.max_lat = 90.0;
+            self.full_lon = true;
+        }
+        if is_south_pole {
+            self.min_lat = -90.0;
+            self.full_lon = true;
+        }
+
+        let center: LatLng = cell.into();
+        self.observe_point(center.lng(), center.lat());
+
+        let boundary = cell.boundary();
+        let mut cell_min_lng = f64::INFINITY;
+        let mut cell_max_lng = f64::NEG_INFINITY;
+        for v in boundary.iter() {
+            let lng = v.lng();
+            let lat = v.lat();
+            self.observe_point(lng, lat);
+            cell_min_lng = cell_min_lng.min(lng);
+            cell_max_lng = cell_max_lng.max(lng);
+        }
+        if !is_north_pole && !is_south_pole && (cell_max_lng - cell_min_lng > 180.0) {
+            self.crosses_antimeridian = true;
+        }
+    }
+
+    /// Merge another bounds accumulator into `self`.
+    #[inline]
+    pub fn merge(&mut self, other: &Self) {
+        if other.count == 0 {
+            return;
+        }
+        self.count += other.count;
+        self.min_lon = self.min_lon.min(other.min_lon);
+        self.min_lat = self.min_lat.min(other.min_lat);
+        self.max_lon = self.max_lon.max(other.max_lon);
+        self.max_lat = self.max_lat.max(other.max_lat);
+        self.min_pos_lon = self.min_pos_lon.min(other.min_pos_lon);
+        self.max_neg_lon = self.max_neg_lon.max(other.max_neg_lon);
+        self.crosses_antimeridian |= other.crosses_antimeridian;
+        self.full_lon |= other.full_lon;
+    }
+
+    /// Resolve final `[min_lon, min_lat, max_lon, max_lat]` bounds.
+    /// When the dataset is localized across the antimeridian, returns
+    /// `[min_pos_lon, min_lat, max_neg_lon, max_lat]` with `min_lon > max_lon`.
+    /// These are internal bounds: `PmtilesWriter` expands wrapped longitude
+    /// bounds when serializing the header while retaining their midpoint.
+    #[inline]
+    pub fn finish(&self, empty_default: [f64; 4]) -> [f64; 4] {
+        if self.count == 0 {
+            return empty_default;
+        }
+        if self.full_lon {
+            return [-180.0, self.min_lat, 180.0, self.max_lat];
+        }
+        let direct_span = self.max_lon - self.min_lon;
+        if self.min_pos_lon.is_finite() && self.max_neg_lon.is_finite() {
+            let wrapped_span = (180.0 - self.min_pos_lon) + (self.max_neg_lon + 180.0);
+            if (self.crosses_antimeridian || direct_span > 180.0)
+                && wrapped_span < direct_span
+                && wrapped_span < 180.0
+            {
+                return [
+                    self.min_pos_lon,
+                    self.min_lat,
+                    self.max_neg_lon,
+                    self.max_lat,
+                ];
+            }
+        }
+        if self.crosses_antimeridian && direct_span > 180.0 {
+            return [-180.0, self.min_lat, 180.0, self.max_lat];
+        }
+        [self.min_lon, self.min_lat, self.max_lon, self.max_lat]
+    }
 }
 
 /// Default mapping from H3 resolution to Web Mercator zoom level (scaling ratio ~1.4037)

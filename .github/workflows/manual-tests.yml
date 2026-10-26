@@ -58,6 +58,7 @@ jobs:
   matrix:
     name: Select platforms
     runs-on: ubuntu-latest
+    permissions: {}
     outputs:
       include: ${{ steps.select.outputs.include }}
     steps:
@@ -94,6 +95,8 @@ jobs:
     name: ${{ inputs.engine }} (${{ matrix.platform }}${{ matrix.deps && format(', {0} deps', matrix.deps) || '' }})
     needs: matrix
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -104,16 +107,18 @@ jobs:
       TEST_ARGS: ${{ inputs.test_args }}
       # The pg fmgr suites need a target major; they run against in-process stand-ins.
       RASTER_H3_PG_MAJOR: '16'
+      # SHA-256 of DuckDB v1.2.0's libduckdb-windows-amd64.zip
+      LIBDUCKDB_WINDOWS_SHA256: 6327f8443ff8744a6753819e1ca874a82f1944a603d6dbc3bc564dada39b6337
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: manual-${{ matrix.platform }}-${{ inputs.profile }}
 
@@ -127,7 +132,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/duckdb_lib
-          curl -sLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          curl -fsSLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          scripts/verify_sha256.sh libduckdb-windows-amd64.zip "$LIBDUCKDB_WINDOWS_SHA256"
           unzip -o -q libduckdb-windows-amd64.zip -d target/duckdb_lib
           WIN_LIB_DIR=$(cygpath -w "$(pwd)/target/duckdb_lib")
           echo "LIB=$WIN_LIB_DIR;$LIB" >> "$GITHUB_ENV"

@@ -44,4 +44,4 @@ Each wheel is `py3-none-<platform>` (any Python 3.9+): manylinux_2_28 x86_64 and
 macOS arm64 and x86_64, and Windows x86_64. Building from source requires a Rust toolchain.
 
 Source and the DuckDB, DataFusion and PostgreSQL integrations:
-<https://github.com/dmuldrew/raster_h3_hexification>
+<https://github.com/dmuldrew/raster_h3>

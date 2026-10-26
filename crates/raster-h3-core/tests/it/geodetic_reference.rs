@@ -1,6 +1,6 @@
 //! Geodetic reference tests for the raster → H3 pipeline.
 //!
-//! 1. Golden-point tests for every CRS fast path against PROJ (`cs2cs` 9.8.1), ≤ 0.01 m.
+//! 1. Golden points for CRS fast paths and Proj4 fallbacks against PROJ 9.5.1, ≤ 0.01 m.
 //! 2. Affine round-trip `coord_to_pixel(pixel_to_coord(p)) == p` for rotated/sheared grids.
 //! 3. Coverage / duplicate property tests on synthetic rasters that exercise the streaming
 //!    eviction horizon: the res 2–4 under-reach band, a 0–360° longitude raster, and a
@@ -43,7 +43,7 @@ fn ground_error_m(lon: f64, lat: f64, ref_lon: f64, ref_lat: f64) -> f64 {
     (d_lat * d_lat + d_lon * d_lon).sqrt()
 }
 
-/// Golden values generated with:
+/// Golden values generated with PROJ 9.5.1:
 ///   `printf "x y\n" | cs2cs -f "%.10f" <src> +to +proj=longlat <ellps/datum of src> +no_defs`
 /// The reference target uses the *same* ellipsoid as the source so that only the projection
 /// inverse is compared (no datum shift is applied by the engine either).
@@ -59,6 +59,19 @@ fn assert_golden(tf: &CrsTransformer, name: &str, cases: &[GoldenCase]) {
         assert!(
             err <= MAX_ERR_M,
             "{name}: ({x}, {y}) -> ({lon:.10}, {lat:.10}) vs PROJ ({ref_lon:.10}, {ref_lat:.10}); error {err:.5} m > {MAX_ERR_M} m"
+        );
+    }
+}
+
+fn assert_golden_inverse(tf: &CrsTransformer, name: &str, cases: &[GoldenCase]) {
+    for &((lon, lat), (ref_x, ref_y)) in cases {
+        let (x, y) = tf
+            .wgs84_to_source(lon, lat)
+            .unwrap_or_else(|e| panic!("{name}: wgs84_to_source({lon}, {lat}) failed: {e:?}"));
+        let err = (x - ref_x).hypot(y - ref_y);
+        assert!(
+            err <= 0.01,
+            "{name}: ({lon}, {lat}) -> ({x:.4}, {y:.4}) vs PROJ ({ref_x:.4}, {ref_y:.4}); error {err:.5} m > 0.01 m"
         );
     }
 }
@@ -172,6 +185,196 @@ fn golden_lambert_conformal_proj4_fallback() {
         &[
             ((600_000.0, 300_000.0), (-86.2900057091, 51.3372285094)),
             ((-400_000.0, -200_000.0), (-100.2295396065, 47.0609005688)),
+        ],
+    );
+}
+
+#[test]
+fn golden_polar_stereographic_epsg3031_proj4() {
+    let tf = CrsTransformer::from_crs_or_epsg(Some(3031), None).unwrap();
+    assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+    // +proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +datum=WGS84 -> +proj=longlat +datum=WGS84
+    assert_golden(
+        &tf,
+        "EPSG:3031",
+        &[
+            ((100_000.0, 100_000.0), (45.0000000000, -88.6984598067)),
+            (
+                (-2_000_000.0, 1_000_000.0),
+                (-63.4349488229, -69.6286693858),
+            ),
+            (
+                (1_500_000.0, -2_500_000.0),
+                (149.0362434679, -63.6240217956),
+            ),
+            ((0.0, -1_300_000.0), (180.0000000000, -78.0767201432)),
+        ],
+    );
+}
+
+#[test]
+fn golden_ease_grid2_epsg6933_proj4() {
+    let tf = CrsTransformer::from_crs_or_epsg(Some(6933), None).unwrap();
+    assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+    // +proj=cea +lat_ts=30 +lon_0=0 +datum=WGS84 -> +proj=longlat +datum=WGS84
+    assert_golden(
+        &tf,
+        "EPSG:6933",
+        &[
+            ((1_000_000.0, 2_000_000.0), (10.3641678112, 15.8743405482)),
+            (
+                (-12_000_000.0, -5_000_000.0),
+                (-124.3700137346, -43.0491934997),
+            ),
+            ((17_000_000.0, 6_000_000.0), (176.1908527906, 54.9252751940)),
+        ],
+    );
+}
+
+#[test]
+fn golden_mga56_epsg7856_proj4() {
+    let tf = CrsTransformer::from_crs_or_epsg(Some(7856), None).unwrap();
+    assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+    // +proj=utm +zone=56 +south +ellps=GRS80 -> +proj=longlat +ellps=GRS80
+    assert_golden(
+        &tf,
+        "EPSG:7856",
+        &[
+            ((334_000.0, 6_252_000.0), (151.2055146869, -33.8592617054)),
+            ((500_000.0, 7_000_000.0), (153.0000000000, -27.1224696423)),
+            ((700_000.0, 6_000_000.0), (155.2223913855, -36.1240958331)),
+        ],
+    );
+}
+
+#[test]
+fn golden_utm_south_wgs84_proj4() {
+    for (epsg, cases) in [
+        (
+            32756,
+            &[
+                ((334_000.0, 6_252_000.0), (151.2055146869, -33.8592617045)),
+                ((600_000.0, 8_000_000.0), (153.9450469497, -18.0863946381)),
+            ][..],
+        ),
+        (
+            32719,
+            &[((350_000.0, 6_300_000.0), (-70.6134912095, -33.4288982059))][..],
+        ),
+    ] {
+        let tf = CrsTransformer::from_crs_or_epsg(Some(epsg), None).unwrap();
+        assert!(matches!(tf, CrsTransformer::Proj4 { .. }));
+        // +proj=utm +south +datum=WGS84 -> +proj=longlat +datum=WGS84
+        assert_golden(&tf, &format!("EPSG:{epsg}"), cases);
+    }
+}
+
+#[test]
+fn epsg_aliases_match_their_canonical_codes() {
+    let canonical = CrsTransformer::from_crs_or_epsg(Some(3857), None).unwrap();
+    let aliases = [
+        CrsTransformer::from_crs_or_epsg(Some(900913), None).unwrap(),
+        CrsTransformer::from_crs_or_epsg(Some(3785), None).unwrap(),
+    ];
+    for &(x, y) in &[
+        (-13_627_665.27, 4_547_675.35),
+        (1_113_194.907_9, 6_800_125.454_4),
+        (-19_000_000.0, -15_000_000.0),
+    ] {
+        let expected = canonical.transform_point(x, y).unwrap();
+        let expected_inverse = canonical.wgs84_to_source(expected.0, expected.1).unwrap();
+        for alias in &aliases {
+            let actual = alias.transform_point(x, y).unwrap();
+            assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+            let actual_inverse = alias.wgs84_to_source(expected.0, expected.1).unwrap();
+            assert_eq!(actual_inverse.0.to_bits(), expected_inverse.0.to_bits());
+            assert_eq!(actual_inverse.1.to_bits(), expected_inverse.1.to_bits());
+        }
+    }
+
+    assert!(matches!(
+        CrsTransformer::from_crs_or_epsg(Some(4269), None).unwrap(),
+        CrsTransformer::Wgs84Identity
+    ));
+}
+
+#[test]
+// Golden values keep PROJ's printed form: grouped integer part, ungrouped fraction.
+#[allow(clippy::inconsistent_digit_grouping)]
+fn golden_inverse_wgs84_to_source_all_projections() {
+    let cases: &[(u32, &[GoldenCase])] = &[
+        (
+            3857,
+            &[
+                ((-122.4194, 37.7749), (-13_627_665.2712, 4_547_675.3543)),
+                ((151.2093, -33.8688), (16_832_542.2792, -4_011_198.6473)),
+                ((10.0, 80.0), (1_113_194.9079, 15_538_711.0963)),
+            ],
+        ),
+        (
+            5070,
+            &[
+                ((-77.0369, 38.9072), (1_618_355.2979, 1_926_511.4991)),
+                ((-122.4194, 37.7749), (-2_275_431.9147, 1_955_935.4171)),
+                ((-96.0, 30.0), (0.0, 769_374.7268)),
+                ((-68.0, 47.0), (2_108_589.8319, 2_980_588.5339)),
+            ],
+        ),
+        (
+            3338,
+            &[
+                ((-149.9003, 61.2181), (219_349.5792, 1_255_301.5397)),
+                ((177.5, 52.0), (-1_906_977.4118, 636_568.1543)),
+                ((-141.0, 69.5), (512_343.2267, 2_220_220.3169)),
+            ],
+        ),
+        (
+            32632,
+            &[
+                ((9.19, 45.4642), (514_853.4959, 5_034_536.7962)),
+                ((6.5, 50.0), (320_842.1358, 5_541_625.7498)),
+                ((11.5, 54.0), (663_857.8167, 5_986_414.5332)),
+            ],
+        ),
+        (
+            3413,
+            &[
+                ((-51.7, 64.2), (-331_477.8122, -2_821_736.1290)),
+                ((100.0, 75.0), (937_154.7796, 1_338_395.7305)),
+                ((-170.0, 85.0), (-443_953.1307, 310_859.3288)),
+            ],
+        ),
+        (
+            3031,
+            &[
+                ((166.67, -77.85), (305_467.1627, -1_289_201.5377)),
+                ((-60.0, -65.0), (-2_388_932.7669, 1_379_250.9760)),
+                ((110.0, -89.0), (102_102.3853, -37_162.2291)),
+            ],
+        ),
+        (
+            6933,
+            &[
+                ((-122.4194, 37.7749), (-11_811_792.5365, 4_484_974.0501)),
+                ((151.2093, -33.8688), (14_589_622.8963, -4_079_140.6887)),
+            ],
+        ),
+    ];
+
+    for &(epsg, cases) in cases {
+        let tf = CrsTransformer::from_crs_or_epsg(Some(epsg), None).unwrap();
+        assert_golden_inverse(&tf, &format!("EPSG:{epsg}"), cases);
+    }
+
+    let proj = "+proj=lcc +lat_1=49 +lat_2=77 +lat_0=49 +lon_0=-95 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+    let tf = CrsTransformer::from_proj_string(proj).unwrap();
+    assert_golden_inverse(
+        &tf,
+        "LCC Canada",
+        &[
+            ((-79.3832, 43.6532), (1_277_388.2040, -443_572.4616)),
+            ((-114.0719, 51.0447), (-1_307_786.2864, 424_115.9589)),
         ],
     );
 }
@@ -629,6 +832,79 @@ fn coverage_polar_stereographic_raster_containing_pole() {
 }
 
 #[test]
+fn coverage_polar_stereographic_raster_containing_south_pole() {
+    let temp = TempDir::new().unwrap();
+    let tif = temp.path().join("polar_3031.tif");
+    let (width, height) = (200u32, 300u32);
+    let gt = GeoTransform {
+        c0: -60_000.0,
+        a: 600.0,
+        b: 0.0,
+        f0: 90_000.0,
+        d: 0.0,
+        e: -600.0,
+    };
+    write_geotiff(&tif, width, height, &gt, &projected_geokeys(3031));
+
+    let tf = CrsTransformer::from_crs_or_epsg(Some(3031), None).unwrap();
+    let pole_row = gt.f0 / -gt.e;
+    let b = tf.transform_rect_bounds(&gt, 0.0, pole_row - 1.0, width as f64, 2.0);
+    assert_eq!(b[1], -90.0, "pole chunk must report min_lat = -90");
+
+    assert_coverage_and_no_duplicates(&tif, "EPSG:3031", &gt, width, height, &[3, 4, 5]);
+}
+
+#[test]
+fn coverage_albers_alaska_raster_crossing_antimeridian() {
+    let temp = TempDir::new().unwrap();
+    let tif = temp.path().join("alaska_3338_antimeridian.tif");
+    let (width, height) = (700u32, 400u32);
+    let gt = GeoTransform {
+        c0: -1_700_000.0,
+        a: 1000.0,
+        b: 0.0,
+        f0: 900_000.0,
+        d: 0.0,
+        e: -1000.0,
+    };
+    let tf = CrsTransformer::from_crs_or_epsg(Some(3338), None).unwrap();
+    let (west_lon, west_lat) = tf.transform_point(gt.c0, gt.f0).unwrap();
+    let (east_lon, east_lat) = tf
+        .transform_point(gt.c0 + gt.a * width as f64, gt.f0)
+        .unwrap();
+    let west_lon = west_lon.rem_euclid(360.0);
+    let east_lon = (east_lon + 180.0).rem_euclid(360.0) - 180.0;
+    assert!(
+        west_lon > 170.0 && west_lon < 180.0,
+        "western raster corner should be east of the antimeridian: {west_lon}, {west_lat}"
+    );
+    assert!(
+        east_lon < -170.0 && east_lon > -180.0,
+        "eastern raster corner should be west of the antimeridian: {east_lon}, {east_lat}"
+    );
+
+    write_geotiff(&tif, width, height, &gt, &projected_geokeys(3338));
+    assert_coverage_and_no_duplicates(&tif, "EPSG:3338", &gt, width, height, &[4, 5]);
+}
+
+#[test]
+fn coverage_utm_south_raster() {
+    let temp = TempDir::new().unwrap();
+    let tif = temp.path().join("sydney_32756.tif");
+    let (width, height) = (128u32, 128u32);
+    let gt = GeoTransform {
+        c0: 318_000.0,
+        a: 250.0,
+        b: 0.0,
+        f0: 6_268_000.0,
+        d: 0.0,
+        e: -250.0,
+    };
+    write_geotiff(&tif, width, height, &gt, &projected_geokeys(32756));
+    assert_coverage_and_no_duplicates(&tif, "EPSG:32756", &gt, width, height, &[7, 8]);
+}
+
+#[test]
 fn coverage_supersampling_wgs84() {
     let temp = TempDir::new().unwrap();
     let tif = temp.path().join("supersample_4326.tif");
@@ -696,6 +972,41 @@ fn coverage_supersampling_polar_stereographic_epsg3413() {
     assert_coverage_and_no_duplicates_with_sampling(
         &tif,
         "EPSG:3413",
+        &gt,
+        width,
+        height,
+        &[3, 4],
+        &SamplingPattern::sixteen_point(),
+    );
+}
+
+#[test]
+fn coverage_supersampling_polar_stereographic_epsg3031() {
+    let temp = TempDir::new().unwrap();
+    let tif = temp.path().join("supersample_3031.tif");
+    let (width, height) = (50u32, 50u32);
+    let gt = GeoTransform {
+        c0: -30_000.0,
+        a: 1000.0,
+        b: 0.0,
+        f0: 30_000.0,
+        d: 0.0,
+        e: -1000.0,
+    };
+    write_geotiff(&tif, width, height, &gt, &projected_geokeys(3031));
+
+    assert_coverage_and_no_duplicates_with_sampling(
+        &tif,
+        "EPSG:3031",
+        &gt,
+        width,
+        height,
+        &[3, 4],
+        &SamplingPattern::rgss(),
+    );
+    assert_coverage_and_no_duplicates_with_sampling(
+        &tif,
+        "EPSG:3031",
         &gt,
         width,
         height,

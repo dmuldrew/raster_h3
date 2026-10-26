@@ -24,7 +24,7 @@
 //!   byte count is satisfied. If the requested range extends past `total_size` or if fewer bytes are
 //!   returned, an explicit error is returned.
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
 use ureq::Agent;
@@ -663,7 +663,7 @@ impl RemoteHttpSource {
     /// Read exactly `len` bytes starting at `offset`.
     ///
     /// # Strict Read Contract
-    /// Unlike [`read_range`], this method guarantees returning exactly `len` bytes.
+    /// Unlike [`read_range`](Self::read_range), this method guarantees returning exactly `len` bytes.
     /// If `offset + len > total_size` or if the underlying transport fails to read
     /// the full requested range, it returns an error rather than a partial buffer.
     pub fn read_exact_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {

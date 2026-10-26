@@ -29,7 +29,7 @@ pub struct ContinuousOptions {
 
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
 fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
-    ctx: &WalkContext,
+    ctx: &WalkContext<'_>,
     slice: &[T],
     native_nodata: Option<T>,
     options: ContinuousOptions,
@@ -198,7 +198,7 @@ fn pixel_value<T: SimdSpanAccumulate>(
 /// Process a continuous chunk across all resolutions into thread-local hash maps.
 /// Returns false when a single-band chunk is entirely nodata.
 pub fn process_continuous_chunk_payload_into(
-    window: &WalkContext,
+    window: &WalkContext<'_>,
     decoding_result: &DecodingResult,
     nodata: Option<f64>,
     options: ContinuousOptions,
@@ -215,7 +215,7 @@ pub fn process_continuous_chunk_payload_into(
 
 /// Borrowed-window form of [`process_continuous_chunk_payload_into`].
 pub fn process_continuous_borrowed_into(
-    window: &WalkContext,
+    window: &WalkContext<'_>,
     samples: super::borrowed::BorrowedSamples<'_>,
     nodata: Option<f64>,
     options: ContinuousOptions,

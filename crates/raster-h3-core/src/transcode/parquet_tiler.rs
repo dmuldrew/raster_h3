@@ -16,7 +16,9 @@ use crate::pmtiles::features::{
     build_pmtiles_metadata, PmtilesExportSummary, TilePyramidAccumulator,
 };
 use crate::pmtiles::mvt::{MercatorPoint, MvtValue};
-use crate::pmtiles::pyramid::{cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg};
+use crate::pmtiles::pyramid::{
+    cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg, Wgs84BoundsAccumulator,
+};
 use crate::pmtiles::writer::PmtilesWriter;
 
 /// Extent and statistics for a Parquet row group discovered during pre-scan
@@ -30,6 +32,7 @@ pub struct RowGroupExtent {
     pub min_zoom: u8,
     pub max_zoom: u8,
     pub min_res: u8,
+    pub bounds: Wgs84BoundsAccumulator,
 }
 
 /// Pre-scanned geographical and resolution extent of a Parquet row group
@@ -43,32 +46,14 @@ pub fn scan_row_group_h3_extent(
         Err(_) => return Ok(None),
     };
 
-    let mut min_lat = 90.0f64;
-    let mut max_lat = -90.0f64;
-    let mut min_lon = 180.0f64;
-    let mut max_lon = -180.0f64;
+    let mut bounds = Wgs84BoundsAccumulator::new();
     let mut min_zoom = 255u8;
     let mut max_zoom = 0u8;
     let mut min_res = 255u8;
-    let mut count = 0usize;
 
     let mut process_h3 = |h3: u64| {
         if let Ok(cell) = CellIndex::try_from(h3) {
-            let center: LatLng = cell.into();
-            let lat = center.lat();
-            let lon = center.lng();
-            if lat < min_lat {
-                min_lat = lat;
-            }
-            if lat > max_lat {
-                max_lat = lat;
-            }
-            if lon < min_lon {
-                min_lon = lon;
-            }
-            if lon > max_lon {
-                max_lon = lon;
-            }
+            bounds.record_cell(cell);
             let res: u8 = cell.resolution().into();
             if res < min_res {
                 min_res = res;
@@ -80,7 +65,6 @@ pub fn scan_row_group_h3_extent(
             if zoom > max_zoom {
                 max_zoom = zoom;
             }
-            count += 1;
         }
     };
 
@@ -148,18 +132,20 @@ pub fn scan_row_group_h3_extent(
         _ => return Ok(None),
     }
 
-    if count == 0 {
+    if bounds.count == 0 {
         Ok(None)
     } else {
+        let resolved = bounds.finish([-180.0, -85.0, 180.0, 85.0]);
         Ok(Some(RowGroupExtent {
             rg_idx,
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
+            min_lat: resolved[1],
+            max_lat: resolved[3],
+            min_lon: resolved[0],
+            max_lon: resolved[2],
             min_zoom,
             max_zoom,
             min_res,
+            bounds,
         }))
     }
 }
@@ -176,33 +162,37 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
     let schema = reader.metadata().file_metadata().schema_descr();
 
     // Identify H3 index column
-    let mut h3_col_idx = None;
-    if let Some(target) = h3_column_name {
-        for (idx, field) in schema.columns().iter().enumerate() {
-            if field.name().eq_ignore_ascii_case(target) {
-                h3_col_idx = Some(idx);
-                break;
-            }
-        }
-    }
-
-    if h3_col_idx.is_none() {
-        // Auto-detect common H3 column names: h3_index, h3_hex, h3, cell, hex, or column 0
-        for (idx, field) in schema.columns().iter().enumerate() {
-            let name = field.name().to_ascii_lowercase();
-            if name == "h3_index"
-                || name == "h3_hex"
-                || name == "h3"
-                || name == "cell"
-                || name == "hex"
-            {
-                h3_col_idx = Some(idx);
-                break;
-            }
-        }
-    }
-
-    let h3_idx = h3_col_idx.unwrap_or(0);
+    let h3_idx = if let Some(target) = h3_column_name {
+        schema
+            .columns()
+            .iter()
+            .position(|field| field.name().eq_ignore_ascii_case(target))
+            .ok_or_else(|| {
+                let available = schema
+                    .columns()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "H3 column '{target}' not found in Parquet file; available columns: {available}"
+                    ),
+                )
+            })?
+    } else {
+        schema
+            .columns()
+            .iter()
+            .position(|field| {
+                matches!(
+                    field.name().to_ascii_lowercase().as_str(),
+                    "h3_index" | "h3_hex" | "h3" | "cell" | "hex"
+                )
+            })
+            .unwrap_or(0)
+    };
 
     // Pre-scan row group extents to compute global bounds and row group horizons
     let mut rg_extents = Vec::with_capacity(num_rgs);
@@ -238,19 +228,11 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         });
     }
 
-    let global_min_lon = rg_extents
-        .iter()
-        .map(|e| e.min_lon)
-        .fold(180.0f64, f64::min);
-    let global_min_lat = rg_extents.iter().map(|e| e.min_lat).fold(90.0f64, f64::min);
-    let global_max_lon = rg_extents
-        .iter()
-        .map(|e| e.max_lon)
-        .fold(-180.0f64, f64::max);
-    let global_max_lat = rg_extents
-        .iter()
-        .map(|e| e.max_lat)
-        .fold(-90.0f64, f64::max);
+    let mut global_bounds = Wgs84BoundsAccumulator::new();
+    for ext in &rg_extents {
+        global_bounds.merge(&ext.bounds);
+    }
+    let global_bbox = global_bounds.finish([-180.0, -85.0, 180.0, 85.0]);
     let min_zoom = rg_extents.iter().map(|e| e.min_zoom).min().unwrap_or(0);
     let max_zoom = rg_extents.iter().map(|e| e.max_zoom).max().unwrap_or(0);
     let min_res = rg_extents.iter().map(|e| e.min_res).min().unwrap_or(0);
@@ -303,17 +285,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
         None,
     );
 
-    let mut writer = PmtilesWriter::new(
-        min_zoom,
-        max_zoom,
-        [
-            global_min_lon,
-            global_min_lat,
-            global_max_lon,
-            global_max_lat,
-        ],
-        metadata.to_string(),
-    )?;
+    let mut writer = PmtilesWriter::new(min_zoom, max_zoom, global_bbox, metadata.to_string())?;
 
     let mut accumulator = TilePyramidAccumulator::new(safety_margin);
 

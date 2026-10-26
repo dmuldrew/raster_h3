@@ -179,6 +179,7 @@ mod tests {
         assert_eq!(plan.schema().fields[1].name, "mean");
 
         let mut stream = plan.execute_arrow_c_stream().unwrap();
+        // SAFETY: `execute_arrow_c_stream` returns a freshly built, unreleased stream owned here.
         let (schema, batches) = unsafe { stream.collect_batches().unwrap() };
         assert_eq!(schema.fields.len(), 2);
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
@@ -272,7 +273,7 @@ mod tests {
         };
 
         let hex_col = ctx
-            .invoke_scalar("h3_to_string", &[col_u64.clone()])
+            .invoke_scalar("h3_to_string", std::slice::from_ref(&col_u64))
             .unwrap();
         let ColumnArray::Utf8 { values, validity } = &hex_col else {
             panic!("expected Utf8");
@@ -281,7 +282,7 @@ mod tests {
         assert_eq!(validity.as_ref().unwrap(), &vec![true, false]);
 
         let back_u64 = ctx
-            .invoke_scalar("string_to_h3", &[hex_col.clone()])
+            .invoke_scalar("string_to_h3", std::slice::from_ref(&hex_col))
             .unwrap();
         if let ColumnArray::UInt64 { values, .. } = back_u64 {
             assert_eq!(values[0], cell);
@@ -290,7 +291,7 @@ mod tests {
         }
 
         let res_col = ctx
-            .invoke_scalar("h3_get_resolution", &[col_u64.clone()])
+            .invoke_scalar("h3_get_resolution", std::slice::from_ref(&col_u64))
             .unwrap();
         if let ColumnArray::Int64 { values, .. } = res_col {
             assert_eq!(values[0], 8);
@@ -302,7 +303,7 @@ mod tests {
         }
 
         let geom_col = ctx
-            .invoke_scalar("h3_cell_to_geometry", &[col_u64.clone()])
+            .invoke_scalar("h3_cell_to_geometry", std::slice::from_ref(&col_u64))
             .unwrap();
         if let ColumnArray::Binary { values, .. } = geom_col {
             assert!(values[0].len() >= 109);

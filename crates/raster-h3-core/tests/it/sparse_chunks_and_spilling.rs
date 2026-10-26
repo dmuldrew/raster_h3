@@ -1,8 +1,10 @@
 //! Tests for:
 //! 1. Sparse COG chunks with non-zero NoData values (verifying they are filled with NoData and skipped).
 //! 2. Memory-budgeted aggregation triggering disk spilling (`spill_run_count() > 0`) and external merge sort.
+//! 3. One resolution spilling while another stays in memory, with compaction,
+//!    quantiles, categorical heap maps and a dedicated worker pool.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufWriter;
 use tempfile::NamedTempFile;
@@ -11,11 +13,14 @@ use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::Tag;
 
 use h3o::{LatLng, Resolution};
+use raster_h3_core::aggregator::categorical::INLINE_CAPACITY;
 use raster_h3_core::aggregator::multi_horizon::{
-    continuous_streamer::ContinuousKernel, MultiHorizonStreamer, MultiResolutionConfig,
-    MultiScanHorizonStreamer,
+    continuous_streamer::ContinuousKernel, MultiCategoricalHorizonStreamer, MultiHorizonStreamer,
+    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
 };
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
+
+use crate::helpers::TestGeoTiffBuilder;
 
 #[test]
 fn test_sparse_chunk_filled_with_nonzero_nodata() {
@@ -249,4 +254,176 @@ fn test_low_budget_triggers_spill_runs_and_matches_reference() {
             exp_sum
         );
     }
+}
+
+/// Two resolutions far apart, so a low budget spills the fine one to disk
+/// (final cells come from the external merge at EOF) while the coarse one
+/// stays in memory; both feed one compactor. After the first spill the
+/// eviction horizon is frozen, so in-memory cells south of it also wait for
+/// EOF, and are then emitted from memory rather than from runs.
+const MIXED_RES: [u8; 2] = [6, 8];
+const MIXED_BUDGET: usize = 8 << 20;
+/// Categorical states (heap class maps) are larger, so the same split needs
+/// a larger budget.
+const MIXED_CATEGORICAL_BUDGET: usize = 16 << 20;
+const UNBOUNDED: usize = 1 << 30;
+
+fn mixed_spill_config(budget: usize) -> MultiResolutionConfig {
+    let mut config = MultiResolutionConfig::new(MIXED_RES.to_vec());
+    config.compact_h3_children = true;
+    config.aggregation_workers = Some(4);
+    config.aggregation_budget_bytes = budget;
+    config
+}
+
+/// 300 x 1200 WGS84 strips at 0.002 deg: about 17k res-8 cells and a few
+/// hundred res-6 cells, enough for complete sibling groups at both.
+fn mixed_spill_builder() -> TestGeoTiffBuilder {
+    TestGeoTiffBuilder::new(300, 1200)
+        .origin(-120.0, 45.0)
+        .pixel_size(0.002)
+}
+
+type ContinuousCells = HashMap<(u8, u64), (f64, f64, f64, f64, f64)>;
+
+/// A stream's records and its spill runs per resolution.
+struct Streamed<C> {
+    cells: C,
+    spills: Vec<u64>,
+}
+
+impl<C> Streamed<C> {
+    fn assert_only_fine_spilled(&self) {
+        assert!(
+            self.spills[0] == 0 && self.spills[1] > 1,
+            "resolution {} must stay in memory while {} spills repeatedly: {:?}",
+            MIXED_RES[0],
+            MIXED_RES[1],
+            self.spills
+        );
+    }
+}
+
+fn stream_continuous(
+    path: &std::path::Path,
+    config: &MultiResolutionConfig,
+) -> Streamed<ContinuousCells> {
+    let mut stream =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(path).unwrap(), config).unwrap();
+    let mut cells = HashMap::new();
+    loop {
+        let batch = stream.fetch_next_batch(97).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            let acc = &rec.accumulator;
+            let row = (acc.count, acc.sum, acc.min, acc.max, acc.quantile(0.5));
+            let previous = cells.insert((rec.resolution, rec.h3_index), row);
+            assert!(previous.is_none(), "duplicate record {:x}", rec.h3_index);
+        }
+    }
+    assert!(stream.is_finished());
+    Streamed {
+        cells,
+        spills: stream.spill_run_counts(),
+    }
+}
+
+#[test]
+fn mixed_resolution_spill_with_compaction_and_quantiles_matches_in_memory_reference() {
+    let (_file, path) =
+        mixed_spill_builder().create_f32_tempfile(|c, r| 1.0 + ((c / 4 + r / 6) % 5) as f32);
+
+    let mut reference_config = mixed_spill_config(UNBOUNDED);
+    reference_config.quantiles = QuantileTarget::parse_list("p50").unwrap();
+    let reference = stream_continuous(&path, &reference_config);
+    assert_eq!(
+        reference.spills,
+        [0, 0],
+        "the reference must stay in memory"
+    );
+    let reference = reference.cells;
+    for res in MIXED_RES {
+        assert!(
+            reference.keys().any(|&(r, _)| r == res - 1),
+            "res {res} groups should compact into parents"
+        );
+    }
+
+    let mut config = mixed_spill_config(MIXED_BUDGET);
+    config.quantiles = reference_config.quantiles.clone();
+    let spilled = stream_continuous(&path, &config);
+    spilled.assert_only_fine_spilled();
+    let spilled = spilled.cells;
+
+    assert_eq!(spilled.len(), reference.len());
+    for (key, &(count, sum, min, max, p50)) in &reference {
+        let &(c, s, lo, hi, q) = spilled
+            .get(key)
+            .unwrap_or_else(|| panic!("missing {key:?}"));
+        assert_eq!((c, lo, hi), (count, min, max), "{key:?}");
+        assert!(
+            (s - sum).abs() <= 1e-9 * sum.abs().max(1.0),
+            "{key:?}: {s} vs {sum}"
+        );
+        assert_eq!(q, p50, "{key:?}: sketches merge exactly");
+    }
+}
+
+type CategoricalCells = HashMap<(u8, u64), BTreeMap<i64, f64>>;
+
+fn stream_categorical(
+    path: &std::path::Path,
+    config: &MultiResolutionConfig,
+) -> Streamed<CategoricalCells> {
+    let mut stream =
+        MultiCategoricalHorizonStreamer::new(GeoTiffStreamReader::open(path).unwrap(), config)
+            .unwrap();
+    let mut cells = HashMap::new();
+    loop {
+        let batch = stream.fetch_next_batch(97).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            let mut classes = BTreeMap::new();
+            rec.accumulator.for_each_class(|class, count| {
+                classes.insert(class, count);
+            });
+            let previous = cells.insert((rec.resolution, rec.h3_index), classes);
+            assert!(previous.is_none(), "duplicate record {:x}", rec.h3_index);
+        }
+    }
+    Streamed {
+        cells,
+        spills: stream.spill_run_counts(),
+    }
+}
+
+#[test]
+fn mixed_resolution_categorical_spill_with_compaction_matches_in_memory_reference() {
+    // 40 classes in small blocks: coarse cells overflow the inline class
+    // array into heap maps, which must round-trip through spill runs.
+    let (_file, path) =
+        mixed_spill_builder().create_tempfile(|c, r| (1 + (c / 3 * 7 + r / 3 * 13) % 40) as u8);
+
+    let reference = stream_categorical(&path, &mixed_spill_config(UNBOUNDED));
+    assert_eq!(reference.spills, [0, 0]);
+    let reference = reference.cells;
+    assert!(
+        reference
+            .values()
+            .any(|classes| classes.len() > INLINE_CAPACITY),
+        "some cells must use heap class maps"
+    );
+    assert!(
+        reference.keys().any(|&(r, _)| r == MIXED_RES[1] - 1),
+        "fine sibling groups should compact into parents"
+    );
+
+    let config = mixed_spill_config(MIXED_CATEGORICAL_BUDGET);
+    let spilled = stream_categorical(&path, &config);
+    spilled.assert_only_fine_spilled();
+    assert_eq!(spilled.cells, reference);
 }

@@ -34,7 +34,7 @@ Install the three files where the server looks for them:
 ```bash
 cp target/release/libraster_h3_pg.so  "$(pg_config --pkglibdir)/raster_h3_pg.so"
 cp crates/raster-h3-pg/raster_h3.control       "$(pg_config --sharedir)/extension/"
-cp crates/raster-h3-pg/sql/raster_h3--0.2.0.sql "$(pg_config --sharedir)/extension/"
+cp crates/raster-h3-pg/sql/raster_h3--0.4.0.sql "$(pg_config --sharedir)/extension/"
 ```
 
 On macOS the library is `libraster_h3_pg.dylib`; install it as `raster_h3_pg.dylib` (or
@@ -44,15 +44,23 @@ the suffix your server expects). Then:
 CREATE EXTENSION raster_h3;
 ```
 
-[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.2.0`,
-`module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = false`.
+[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.4.0`,
+`module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = true`.
+
+The raster aggregation functions read files with the server's OS privileges, so `EXECUTE` on
+them is revoked from `PUBLIC` and granted only to `pg_read_server_files` (as with
+`COPY ... FROM` a file). Grant that role to users who need them:
+
+```sql
+GRANT pg_read_server_files TO analyst;
+```
 
 The module requires a little-endian, 64-bit target (pass-by-value `float8`/`int8` Datums);
 other targets fail to compile.
 
 ## SQL API
 
-All definitions are in [`sql/raster_h3--0.2.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.2.0.sql).
+All definitions are in [`sql/raster_h3--0.4.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.4.0.sql).
 
 ### Raster aggregation
 
@@ -112,26 +120,142 @@ valid cells are always positive.
 
 All are `IMMUTABLE STRICT PARALLEL SAFE`.
 
-### Examples
+## Recipes
+
+These mirror the [DuckDB SQL recipes](duckdb.md#sql-usage--recipes) for the arguments the
+PostgreSQL functions accept. Paths are read by the server process (see above).
+
+### Basic continuous aggregation
 
 ```sql
 CREATE EXTENSION raster_h3;
 
-SELECT h3_hex, round(mean::numeric, 2) AS elevation, count
-FROM h3_raster_continuous_aggregate('/data/dem.tif', 8, 'EPSG:4326')
-ORDER BY count DESC
-LIMIT 10;
+SELECT h3_index, h3_hex, mean, count, min, max, sum
+FROM h3_raster_continuous_aggregate('/data/elevation.tif', 8);
+```
 
--- Materialise and join with PostGIS geometry
+### CRS, NoData and bounding box
+
+```sql
+SELECT h3_hex, round(mean::numeric, 2) AS avg_temp_c, count
+FROM h3_raster_continuous_aggregate(
+    '/data/temperature_global.tif',
+    h3_res     => 9,
+    source_crs => 'EPSG:4326',
+    nodata     => -9999,
+    bbox       => '-122.50,37.70,-122.35,37.85'
+)
+ORDER BY count DESC;
+```
+
+### Several resolutions
+
+Each call aggregates one resolution, so a multi-resolution result is one call (one raster
+pass) per resolution:
+
+```sql
+SELECT r.*
+FROM generate_series(6, 8) AS res,
+     LATERAL h3_raster_continuous_aggregate('/data/elevation.tif', res) AS r;
+```
+
+### Helper scalar functions
+
+```sql
+SELECT
+    h3_to_string(h3_index)              AS h3_str,
+    string_to_h3('8828308281fffff')     AS h3_int,
+    h3_to_lat(h3_index)                 AS center_lat,
+    h3_to_lng(h3_index)                 AS center_lng,
+    h3_get_resolution(h3_index)         AS res,
+    h3_cell_to_parent(h3_index, 6)      AS parent,
+    mean
+FROM h3_raster_continuous_aggregate('/data/elevation.tif', 8);
+```
+
+### Joins and PostGIS
+
+```sql
+-- Join with an H3-indexed table (bigint h3_index)
+SELECT r.h3_hex, r.mean AS avg_elevation, p.total_population, p.median_income
+FROM h3_raster_continuous_aggregate('/data/california_elevation.tif', 8) AS r
+JOIN population_h3 AS p USING (h3_index)
+WHERE r.mean > 500.0;
+
+-- Materialise with PostGIS geometry and index it
 CREATE TABLE landcover_h3 AS
 SELECT h3_index, majority_class, majority_fraction,
        ST_GeomFromWKB(wkb, 4326) AS geom
 FROM h3_raster_categorical_aggregate('/data/landcover.tif', h3_res => 8);
 
+CREATE INDEX ON landcover_h3 (h3_index);
+CREATE INDEX ON landcover_h3 USING gist (geom);
+
+-- Roll up to a coarser parent resolution
 SELECT h3_to_string(h3_cell_to_parent(h3_index, 5)) AS parent, avg(majority_fraction)
 FROM landcover_h3
 GROUP BY 1;
 ```
+
+### Export
+
+The PostgreSQL extension has no Parquet or PMTiles writer. Export with `COPY` (or `\copy`
+from `psql` to write on the client):
+
+```sql
+\copy (SELECT h3_index, h3_hex, mean, count FROM h3_raster_continuous_aggregate('/data/elevation.tif', 8)) TO 'elevation_h3.csv' CSV HEADER
+```
+
+For GeoParquet or PMTiles, run the [CLI](cli.md) or [Python](python-polars.md) exporters on
+the same raster.
+
+### Remote COG & S3 streaming
+
+```sql
+SELECT * FROM h3_raster_continuous_aggregate('https://example.com/rasters/cog_elevation.tif', 8);
+SELECT * FROM h3_raster_continuous_aggregate('s3://my-geospatial-bucket/landsat/scene_01.tif', 9);
+```
+
+### Multi-file mosaics
+
+```sql
+SELECT * FROM h3_raster_continuous_aggregate('/data/tiles/tile_*.tif', 8);              -- cutline
+SELECT * FROM h3_raster_categorical_aggregate('/data/tile_west.tif,/data/tile_east.tif', 8);
+```
+
+### Categorical aggregation
+
+```sql
+-- Majority class & dominance
+SELECT h3_hex, majority_class,
+       round((majority_fraction * 100)::numeric, 1) AS dominance_pct,
+       unique_classes, total_count, histogram
+FROM h3_raster_categorical_aggregate('/data/worldcover_2021.tif', 8);
+
+-- Histogram queries (histogram is JSON text)
+SELECT h3_hex, majority_class,
+       (histogram::jsonb ->> '10')::float8 AS forest_fraction,
+       (histogram::jsonb ->> '50')::float8 AS urban_fraction
+FROM h3_raster_categorical_aggregate('/data/worldcover_2021.tif', 8)
+WHERE histogram::jsonb ? '50';
+
+-- Long form: there is no format argument, so unnest the histogram
+SELECT c.h3_hex, h.key::bigint AS category, h.value::float8 AS fraction
+FROM h3_raster_categorical_aggregate('/data/worldcover_2021.tif', 8) AS c,
+     LATERAL jsonb_each_text(c.histogram::jsonb) AS h
+WHERE h.key = '50' AND h.value::float8 >= 0.25
+ORDER BY fraction DESC;
+```
+
+## Troubleshooting
+
+| Error | Cause / fix |
+| :--- | :--- |
+| `permission denied for function h3_raster_continuous_aggregate` | `EXECUTE` is granted only to `pg_read_server_files`; `GRANT pg_read_server_files TO <role>`. |
+| `incompatible library "...raster_h3_pg...": version mismatch` | The module was built for another major. Rebuild with `RASTER_H3_PG_MAJOR=<server major>` or the server's `pg_config` on `PATH`. |
+| File not found for a path that exists on your machine | The server opens the path on the database host as the PostgreSQL OS user. Copy the file there, mount it into the container, or use an HTTP(S)/S3 URL. |
+| `No CRS detected` | Pass `source_crs => 'EPSG:…'`. |
+| Need sampling, bands, spectral formulas, quantiles, `format => 'long'` or exports | Not exposed in PostgreSQL. Use [DuckDB](duckdb.md), [Python](python-polars.md) or the [CLI](cli.md). |
 
 ## Execution Model
 

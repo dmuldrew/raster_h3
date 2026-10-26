@@ -114,3 +114,42 @@ fn test_duckdb_extension_footer_layout() {
     assert_eq!(decompressed.len(), 1024 + 534);
     assert_eq!(decompressed, ext_bytes);
 }
+
+/// Packages `dummy.so` without `--platform` and returns the footer's platform tag.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn default_platform_tag(duckdb_version: &str) -> String {
+    let dir = tempdir().unwrap();
+    let so_path = dir.path().join("dummy.so");
+    let ext_path = dir.path().join("dummy.duckdb_extension");
+    File::create(&so_path)
+        .unwrap()
+        .write_all(&[0xABu8; 64])
+        .unwrap();
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_package_extension"))
+        .arg("-i")
+        .arg(&so_path)
+        .arg("-o")
+        .arg(&ext_path)
+        .arg("-d")
+        .arg(duckdb_version)
+        .status()
+        .expect("Failed to execute package_extension");
+    assert!(status.success());
+
+    let mut ext_bytes = Vec::new();
+    File::open(&ext_path)
+        .unwrap()
+        .read_to_end(&mut ext_bytes)
+        .unwrap();
+    let field = &ext_bytes[64 + 214..64 + 246];
+    let len = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    String::from_utf8(field[..len].to_vec()).unwrap()
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn test_default_platform_follows_duckdb_version_on_linux_x86_64() {
+    assert_eq!(default_platform_tag("v1.2.0"), "linux_amd64_gcc4");
+    assert_eq!(default_platform_tag("v1.3.0"), "linux_amd64");
+}

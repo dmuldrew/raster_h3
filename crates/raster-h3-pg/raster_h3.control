@@ -1,6 +1,6 @@
 # raster_h3 PostgreSQL extension
 comment = 'High-performance GeoTIFF/COG to H3 hexagonal aggregation and PMTiles/GeoParquet export'
-default_version = '0.2.0'
+default_version = '0.4.0'
 module_pathname = '$libdir/raster_h3_pg'
 relocatable = true
-superuser = false
+superuser = true

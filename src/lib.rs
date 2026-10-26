@@ -22,8 +22,8 @@ pub use raster_h3_duckdb::*;
 #[doc(hidden)]
 pub fn _keep_duckdb_c_api_symbols() -> (usize, usize, usize) {
     (
-        raster_h3_duckdb::raster_h3_init as *const () as usize,
-        raster_h3_duckdb::raster_h3_init_c_api as *const () as usize,
-        raster_h3_duckdb::raster_h3_version as *const () as usize,
+        raster_h3_init as *const () as usize,
+        raster_h3_init_c_api as *const () as usize,
+        raster_h3_version as *const () as usize,
     )
 }

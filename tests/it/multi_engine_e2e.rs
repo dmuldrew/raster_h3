@@ -7,7 +7,7 @@
 //! 2. `raster-h3-cli`: Real subprocess execution of `raster-h3` (`ipc`, `jsonl`, `parquet`, `pmtiles`).
 //! 3. `raster-h3-datafusion`: `RasterH3SessionCatalog`, `TableProvider` scan + pushdown, `ExecutionPlan`
 //!    Arrow C Stream, and vectorized `ScalarUDFImpl` execution.
-//! 4. `raster-h3-python`: Real `/usr/bin/python3` subprocess loading `libraster_h3_python`, testing
+//! 4. `raster-h3-python`: Real Python subprocess loading `libraster_h3_python`, testing
 //!    `RasterH3ArrowStream` (`to_dict()`, `__arrow_c_schema__()`, `__arrow_c_stream__()` C-ABI consumption),
 //!    `raster_to_parquet()`, `raster_to_pmtiles()`, and scalar H3 ops.
 //! 5. `raster-h3-pg`: `PgContinuousSrf` and `PgCategoricalSrf` Set-Returning Functions (both Rust & C-ABI) +
@@ -24,6 +24,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use h3o::{CellIndex, LatLng};
 use helpers::TestGeoTiffBuilder;
 use raster_h3::core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3::core::columnar::ipc::read_ipc_stream;
@@ -261,6 +262,13 @@ fn target_profile_dir() -> PathBuf {
     exe.parent().unwrap().parent().unwrap().to_path_buf()
 }
 
+/// Python interpreter for subprocess tests: `$PYTHON` if set, else `python` on Windows
+/// (no `python3` there) and `python3` elsewhere.
+fn python_exe() -> String {
+    std::env::var("PYTHON")
+        .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.to_string())
+}
+
 fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
     let dir = target_profile_dir();
     let lib_path = dir.join(format!(
@@ -269,18 +277,25 @@ fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
         lib_stem,
         std::env::consts::DLL_SUFFIX
     ));
-    if !lib_path.exists() {
-        // Build the same profile as this test binary so the lib lands in `dir`.
-        let mut args = vec!["build", "-p", pkg, "--lib"];
-        if cfg!(not(debug_assertions)) {
-            args.push("--release");
-        }
-        let status = Command::new("cargo")
-            .args(&args)
-            .status()
-            .expect("invoke cargo build");
-        assert!(status.success(), "cargo build -p {pkg} failed");
+    // Always build, even when the file exists: `cargo test` refreshes the cdylib only under
+    // `deps/`, so a copy left in the profile directory by an earlier build can be stale.
+    // Cargo makes this a no-op when the library is already up to date.
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", pkg, "--lib"]);
+    if dir.file_name().is_some_and(|n| n == "release") {
+        cmd.arg("--release");
     }
+    // With `--target <triple>`, artifacts land in `target/<triple>/<profile>`.
+    if let Some(triple) = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| n.matches('-').count() >= 2)
+    {
+        cmd.args(["--target", triple]);
+    }
+    let status = cmd.status().expect("invoke cargo build");
+    assert!(status.success(), "cargo build -p {pkg} failed");
     assert!(
         lib_path.exists(),
         "Expected shared library at {}",
@@ -296,16 +311,31 @@ fn test_cross_engine_continuous_e2e_parity() {
         .with_geokeys(true)
         .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
 
-    let resolutions = vec![7u8, 8u8];
+    run_continuous_parity(&tif_path, "EPSG:4326", &[7, 8], (-122.5, 37.75));
+}
+
+fn run_continuous_parity(
+    tif_path: &Path,
+    crs: &str,
+    resolutions: &[u8],
+    expected_lon_lat: (f64, f64),
+) -> BTreeMap<u64, ContinuousCellSummary> {
+    let resolution_arg = resolutions
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
 
     // =========================================================================
     // Engine 1: raster-h3-core (ContinuousBatchReader + ArrowArrayStream C-ABI)
     // =========================================================================
-    let cfg = MultiResolutionConfig::new(resolutions.clone());
-    let reader =
-        ContinuousBatchReader::open(std::slice::from_ref(&tif_path), &cfg, None, 64, None).unwrap();
+    let mut cfg = MultiResolutionConfig::new(resolutions.to_vec());
+    cfg.custom_crs = Some(crs.to_string());
+    let tif_paths = [tif_path.to_path_buf()];
+    let reader = ContinuousBatchReader::open(&tif_paths, &cfg, None, 64, None).unwrap();
     let schema = reader.schema();
     let mut stream = ArrowArrayStream::from_iterator(schema, reader);
+    // SAFETY: `stream` was just built by `from_iterator`, so it is valid and unreleased.
     let (_imported_schema, core_batches) = unsafe { stream.collect_batches().unwrap() };
     let core_map = collect_continuous_from_batches(&core_batches);
     assert!(
@@ -324,9 +354,9 @@ fn test_cross_engine_continuous_e2e_parity() {
             "ipc",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "--crs",
-            "EPSG:4326",
+            crs,
         ])
         .output()
         .expect("run raster-h3 ipc");
@@ -346,9 +376,9 @@ fn test_cross_engine_continuous_e2e_parity() {
             "jsonl",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "--crs",
-            "EPSG:4326",
+            crs,
             "--columns",
             "h3_index,mean,count,min,max,sum,resolution",
         ])
@@ -385,9 +415,11 @@ fn test_cross_engine_continuous_e2e_parity() {
             "parquet",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "-o",
             cli_pq.to_str().unwrap(),
+            "--crs",
+            crs,
         ])
         .status()
         .unwrap();
@@ -397,9 +429,11 @@ fn test_cross_engine_continuous_e2e_parity() {
             "pmtiles",
             tif_path.to_str().unwrap(),
             "-r",
-            "7,8",
+            &resolution_arg,
             "-o",
             cli_pm.to_str().unwrap(),
+            "--crs",
+            crs,
         ])
         .status()
         .unwrap();
@@ -410,13 +444,14 @@ fn test_cross_engine_continuous_e2e_parity() {
     // =========================================================================
     let catalog = RasterH3SessionCatalog::new();
     let provider = catalog
-        .h3_raster_continuous_aggregate(tif_path.to_str().unwrap(), vec![7, 8])
+        .h3_raster_continuous_aggregate(tif_path.to_str().unwrap(), resolutions.to_vec())
         .unwrap()
-        .with_crs("EPSG:4326");
+        .with_crs(crs);
 
     // Full scan via Arrow C Stream
     let plan = provider.scan(None, &[], None).unwrap();
     let mut df_stream = plan.execute_arrow_c_stream().unwrap();
+    // SAFETY: `execute_arrow_c_stream` returns a freshly built, unreleased stream owned here.
     let (_df_schema, df_batches) = unsafe { df_stream.collect_batches().unwrap() };
     let df_map = collect_continuous_from_batches(&df_batches);
     assert_continuous_maps_equal("raster-h3-datafusion", &core_map, &df_map);
@@ -462,9 +497,12 @@ import raster_h3
 tif_path = sys.argv[1]
 pq_path = sys.argv[2]
 pm_path = sys.argv[3]
+crs = sys.argv[4]
+resolutions = [int(r) for r in sys.argv[5].split(",")]
+resolution_arg = ",".join(str(r) for r in resolutions)
 
 # 1. Stream via RasterH3ArrowStream.to_dict()
-stream = raster_h3.RasterH3ArrowStream(tif_path, resolutions=[7, 8], crs="EPSG:4326")
+stream = raster_h3.RasterH3ArrowStream(tif_path, resolutions=resolutions, crs=crs)
 d = stream.to_dict()
 
 # 2. Verify __arrow_c_schema__() and __arrow_c_stream__() PyCapsules and consume C stream
@@ -535,15 +573,15 @@ for idx, hex_s, res in zip(d["h3_index"], d["h3_hex"], d["resolution"]):
     assert wkb is not None and len(wkb) == 125
 
 # 4. Verify direct Parquet and PMTiles exporters from Python
-pq_count = raster_h3.raster_to_parquet(tif_path, pq_path, resolutions="7,8", crs="EPSG:4326")
-pm_count = raster_h3.raster_to_pmtiles(tif_path, pm_path, resolutions="7,8", crs="EPSG:4326")
+pq_count = raster_h3.raster_to_parquet(tif_path, pq_path, resolutions=resolution_arg, crs=crs)
+pm_count = raster_h3.raster_to_pmtiles(tif_path, pm_path, resolutions=resolution_arg, crs=crs)
 assert pq_count == len(d["h3_index"])
 assert pm_count == len(d["h3_index"])
 
 print(json.dumps(d))
 "#;
 
-    let py_out = Command::new("/usr/bin/python3")
+    let py_out = Command::new(python_exe())
         .env("PYTHONPATH", &py_pkg_dir)
         .env("RASTER_H3_PYTHON_LIB", &py_lib)
         .args([
@@ -552,6 +590,8 @@ print(json.dumps(d))
             tif_path.to_str().unwrap(),
             py_pq.to_str().unwrap(),
             py_pm.to_str().unwrap(),
+            crs,
+            &resolution_arg,
         ])
         .output()
         .expect("run python3 E2E script");
@@ -583,10 +623,13 @@ print(json.dumps(d))
     // Engine 5: raster-h3-pg (C-ABI SRF + Postgres V1 fmgr C-ABI scalars)
     // =========================================================================
     let mut pg_map = BTreeMap::new();
+    // SAFETY: string arguments are live CStrings (or null), the SRF handle is used only between
+    // its open and single close, `c_row` is a fully initialized row, and each `fc*` is a local
+    // call info with all 8 argument slots allocated.
     unsafe {
         let c_path = CString::new(tif_path.to_str().unwrap()).unwrap();
-        let c_res = CString::new("7,8").unwrap();
-        let c_crs = CString::new("EPSG:4326").unwrap();
+        let c_res = CString::new(resolution_arg.as_str()).unwrap();
+        let c_crs = CString::new(crs).unwrap();
         let mut err_ptr: *mut std::ffi::c_char = std::ptr::null_mut();
         let srf_ptr = pg_srf_continuous_open(
             c_path.as_ptr(),
@@ -611,7 +654,7 @@ print(json.dumps(d))
             sum: 0.0,
             resolution: 0,
             wkb_len: 0,
-            wkb: [0u8; 192],
+            wkb: [0u8; raster_h3_core::encoding::WKB_BUF_LEN],
         };
         while pg_srf_continuous_next(srf_ptr, &mut c_row) == 1 {
             let cell_u64 = c_row.h3_index as u64;
@@ -631,7 +674,11 @@ print(json.dumps(d))
             let lng_d = pg_h3_to_lng(&mut fc1);
             let lat = datum_to_float8(lat_d);
             let lng = datum_to_float8(lng_d);
-            assert!(!fc1.isnull && (37.0..38.5).contains(&lat) && (-123.0..-122.0).contains(&lng));
+            assert!(
+                !fc1.isnull
+                    && (lat - expected_lon_lat.1).abs() <= 0.5
+                    && (lng - expected_lon_lat.0).abs() <= 0.5
+            );
 
             let mut fc_parent = FunctionCallInfoBaseData::with_args(&[
                 NullableDatum {
@@ -693,9 +740,11 @@ print(json.dumps(d))
             let sql = format!(
                 "LOAD '{}'; \
                  SELECT h3_index, mean, count, min, max, sum, resolution \
-                 FROM h3_raster_continuous_aggregate('{}', resolutions := '7,8', crs := 'EPSG:4326');",
+                 FROM h3_raster_continuous_aggregate('{}', resolutions := '{}', crs := '{}');",
                 ext_path.display(),
-                tif_path.display()
+                tif_path.display(),
+                resolution_arg,
+                crs
             );
             let duck_out = Command::new("duckdb")
                 .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", &sql])
@@ -727,6 +776,56 @@ print(json.dumps(d))
             assert_continuous_maps_equal("raster-h3-duckdb (DuckDB CLI)", &core_map, &duck_map);
         }
     }
+    core_map
+}
+
+fn assert_core_cells_near(
+    cells: &BTreeMap<u64, ContinuousCellSummary>,
+    expected_lon_lat: (f64, f64),
+    max_distance_m: f64,
+) {
+    let (expected_lon, expected_lat) = expected_lon_lat;
+    assert!(
+        !cells.is_empty(),
+        "core projected aggregation must be non-empty"
+    );
+    for &cell in cells.keys() {
+        let center = LatLng::from(CellIndex::try_from(cell).unwrap());
+        let d_lat = (center.lat() - expected_lat).to_radians() * 6_378_137.0;
+        let d_lon = (center.lng() - expected_lon).to_radians()
+            * 6_378_137.0
+            * expected_lat.to_radians().cos();
+        let distance = d_lat.hypot(d_lon);
+        assert!(
+            distance <= max_distance_m,
+            "core cell {cell:#x} at ({}, {}) is {distance:.0} m from expected location ({expected_lon}, {expected_lat})",
+            center.lng(),
+            center.lat()
+        );
+    }
+}
+
+#[test]
+fn test_cross_engine_projected_continuous_parity() {
+    let (_dc_file, dc_tif) = TestGeoTiffBuilder::new(40, 40)
+        .epsg(5070)
+        .origin(1_614_000.0, 1_930_000.0)
+        .pixel_size_xy(300.0, 300.0)
+        .with_geokeys(true)
+        .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
+    let dc_lon_lat = (-77.0369, 38.9072);
+    let dc_cells = run_continuous_parity(&dc_tif, "EPSG:5070", &[7, 8], dc_lon_lat);
+    assert_core_cells_near(&dc_cells, dc_lon_lat, 20_000.0);
+
+    let (_london_file, london_tif) = TestGeoTiffBuilder::new(40, 40)
+        .epsg(27700)
+        .origin(526_000.0, 184_000.0)
+        .pixel_size_xy(300.0, 300.0)
+        .with_geokeys(true)
+        .create_tempfile(|c, r| (r * 10 + c + 1) as f32);
+    let london_lon_lat = (-0.1276, 51.5072);
+    let london_cells = run_continuous_parity(&london_tif, "EPSG:27700", &[7, 8], london_lon_lat);
+    assert_core_cells_near(&london_cells, london_lon_lat, 20_000.0);
 }
 
 #[test]
@@ -793,7 +892,7 @@ fn test_cross_engine_categorical_e2e_parity() {
     // 4. raster-h3-python subprocess (`RasterH3ArrowStream(..., categorical=True)`)
     let py_lib = ensure_cdylib_built("raster-h3-python", "raster_h3_python");
     let py_pkg_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/raster-h3-python/python");
-    let py_out = Command::new("/usr/bin/python3")
+    let py_out = Command::new(python_exe())
         .env("PYTHONPATH", &py_pkg_dir)
         .env("RASTER_H3_PYTHON_LIB", &py_lib)
         .args([
@@ -908,6 +1007,149 @@ fn test_cross_engine_categorical_e2e_parity() {
                 &core_map,
                 &duck_map,
             );
+        }
+    }
+}
+
+#[test]
+fn test_h3_polygon_to_cells_cross_engine_parity() {
+    use h3o::geom::ContainmentMode;
+    use raster_h3::core::scalar_ops::h3_polygon_to_cells_wkb;
+
+    let outer: [(f64, f64); 5] = [
+        (-122.49, 37.71),
+        (-122.35, 37.71),
+        (-122.35, 37.83),
+        (-122.49, 37.83),
+        (-122.49, 37.71),
+    ];
+    let hole: [(f64, f64); 5] = [
+        (-122.45, 37.75),
+        (-122.40, 37.75),
+        (-122.40, 37.79),
+        (-122.45, 37.79),
+        (-122.45, 37.75),
+    ];
+    let mut wkb = vec![1u8];
+    wkb.extend(3u32.to_le_bytes());
+    wkb.extend(2u32.to_le_bytes());
+    for ring in [&outer[..], &hole[..]] {
+        wkb.extend((ring.len() as u32).to_le_bytes());
+        for &(x, y) in ring {
+            wkb.extend(x.to_le_bytes());
+            wkb.extend(y.to_le_bytes());
+        }
+    }
+    let wkb_hex: String = wkb.iter().map(|byte| format!("{byte:02x}")).collect();
+    let modes = [
+        ("contains_centroid", ContainmentMode::ContainsCentroid),
+        ("contains_boundary", ContainmentMode::ContainsBoundary),
+        ("intersects_boundary", ContainmentMode::IntersectsBoundary),
+        ("covers", ContainmentMode::Covers),
+    ];
+    let mut core_results = BTreeMap::new();
+    for (name, mode) in modes {
+        let cells = h3_polygon_to_cells_wkb(&wkb, 8, mode).unwrap();
+        assert!(!cells.is_empty(), "{name} produced no cells");
+        core_results.insert(name, cells);
+    }
+
+    let py_lib = ensure_cdylib_built("raster-h3-python", "raster_h3_python");
+    let py_pkg_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/raster-h3-python/python");
+    let py_script = r#"
+import json, sys
+import raster_h3
+
+wkb = bytes.fromhex(sys.argv[1])
+modes = ["contains_centroid", "contains_boundary", "intersects_boundary", "covers"]
+cells = {mode: raster_h3.h3_polygon_to_cells(wkb, 8, mode) for mode in modes}
+aliases = {
+    "center": "contains_centroid",
+    "full": "contains_boundary",
+    "overlapping": "covers",
+}
+for alias, canonical in aliases.items():
+    assert raster_h3.h3_polygon_to_cells(wkb, 8, alias) == cells[canonical]
+print(json.dumps(cells, sort_keys=True))
+"#;
+    let py_out = Command::new(python_exe())
+        .env("PYTHONPATH", &py_pkg_dir)
+        .env("RASTER_H3_PYTHON_LIB", &py_lib)
+        .args(["-c", py_script, &wkb_hex])
+        .output()
+        .expect("run Python polygon parity test");
+    assert!(
+        py_out.status.success(),
+        "Python polygon parity failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&py_out.stdout),
+        String::from_utf8_lossy(&py_out.stderr)
+    );
+    let py_json: serde_json::Value = serde_json::from_slice(&py_out.stdout).unwrap();
+    for (name, expected) in &core_results {
+        let actual: Vec<u64> = py_json[*name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.as_u64().unwrap())
+            .collect();
+        assert_eq!(&actual, expected, "Python mismatch for {name}");
+    }
+
+    let duckdb = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".into());
+    if let Ok(version_output) = Command::new(&duckdb).arg("--version").output() {
+        if version_output.status.success() {
+            let temp = tempfile::tempdir().unwrap();
+            let library = ensure_cdylib_built("raster_h3", "raster_h3");
+            let platform_output = Command::new(&duckdb)
+                .args(["-batch", "-csv", "-noheader", "-c", "PRAGMA platform"])
+                .output()
+                .expect("read DuckDB platform");
+            assert!(
+                platform_output.status.success(),
+                "DuckDB PRAGMA platform failed: {}",
+                String::from_utf8_lossy(&platform_output.stderr)
+            );
+            let platform = String::from_utf8(platform_output.stdout).unwrap();
+            let extension = temp.path().join("raster_h3.duckdb_extension");
+            let duckdb_version =
+                std::env::var("DUCKDB_VERSION").unwrap_or_else(|_| "v1.2.0".into());
+            let package_output = Command::new(env!("CARGO_BIN_EXE_package_extension"))
+                .arg("-i")
+                .arg(&library)
+                .arg("-o")
+                .arg(&extension)
+                .args(["-p", platform.trim(), "-d", &duckdb_version])
+                .output()
+                .unwrap();
+            assert!(
+                package_output.status.success(),
+                "extension packaging failed: {}",
+                String::from_utf8_lossy(&package_output.stderr)
+            );
+
+            for (name, expected) in &core_results {
+                let sql = format!(
+                    "LOAD '{}'; SELECT cell FROM unnest(h3_polygon_to_cells(\
+                     from_hex('{wkb_hex}'), 8, '{name}')) AS cells(cell) ORDER BY cell;",
+                    extension.display()
+                );
+                let output = Command::new(&duckdb)
+                    .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", &sql])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "DuckDB polygon query failed for {name}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let actual: Vec<u64> = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| line.parse().unwrap())
+                    .collect();
+                assert_eq!(&actual, expected, "DuckDB mismatch for {name}");
+            }
         }
     }
 }

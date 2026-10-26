@@ -32,6 +32,10 @@ pub struct ArrowSchema {
     pub private_data: *mut c_void,
 }
 
+// SAFETY: every pointer in an `ArrowSchema` we produce points into its own
+// heap-allocated `SchemaPrivateData` (or boxed children), none of which is
+// thread-affine, and the Arrow C Data Interface lets consumers move a schema to
+// another thread and call `release` there.
 unsafe impl Send for ArrowSchema {}
 
 struct SchemaPrivateData {
@@ -40,22 +44,35 @@ struct SchemaPrivateData {
     children_vec: Vec<*mut ArrowSchema>,
 }
 
+/// # Safety
+/// `schema` must be null or point to a live `ArrowSchema` built by
+/// [`ArrowSchema::from_field`] / [`ArrowSchema::from_column_schema`].
 unsafe extern "C" fn release_arrow_schema(schema: *mut ArrowSchema) {
     if schema.is_null() {
         return;
     }
-    let s = &mut *schema;
+    // SAFETY: non-null and, per this callback's contract, a live `ArrowSchema`
+    // that nobody else is accessing while it is being released.
+    let s = unsafe { &mut *schema };
     if s.release.is_none() {
         return;
     }
     if !s.private_data.is_null() {
-        let mut priv_data = Box::from_raw(s.private_data as *mut SchemaPrivateData);
+        // SAFETY: `release` is still set, so `private_data` is the pointer we
+        // produced with `Box::into_raw(Box<SchemaPrivateData>)` and has not been
+        // freed yet; it is nulled below so it can't be freed twice.
+        let mut priv_data = unsafe { Box::from_raw(s.private_data as *mut SchemaPrivateData) };
         for child_ptr in priv_data.children_vec.drain(..) {
             if !child_ptr.is_null() {
-                if let Some(rel) = (*child_ptr).release {
-                    rel(child_ptr);
+                // SAFETY: each child came from `Box::into_raw(Box<ArrowSchema>)` in
+                // `from_column_schema` and is owned solely by this parent, so it is
+                // live here and is freed exactly once by the `Box::from_raw` below.
+                unsafe {
+                    if let Some(rel) = (*child_ptr).release {
+                        rel(child_ptr);
+                    }
+                    drop(Box::from_raw(child_ptr));
                 }
-                drop(Box::from_raw(child_ptr));
             }
         }
         s.private_data = ptr::null_mut();
@@ -153,7 +170,9 @@ impl ArrowSchema {
                 "ArrowSchema is released or null".into(),
             ));
         }
-        let fmt = CStr::from_ptr(self.format).to_string_lossy();
+        // SAFETY: `format` was checked non-null above and, for a valid unreleased
+        // schema (caller contract), is a NUL-terminated string owned by the schema.
+        let fmt = unsafe { CStr::from_ptr(self.format) }.to_string_lossy();
         if fmt != "+s" {
             return Err(RasterH3Error::InvalidParameter(format!(
                 "Expected top-level struct format '+s', got '{}'",
@@ -161,20 +180,39 @@ impl ArrowSchema {
             )));
         }
         let mut fields = Vec::with_capacity(self.n_children.max(0) as usize);
+        if self.n_children > 0 && self.children.is_null() {
+            return Err(RasterH3Error::InvalidParameter(
+                "ArrowSchema has children but a null children array".into(),
+            ));
+        }
         for i in 0..(self.n_children.max(0) as usize) {
-            let child_ptr = *self.children.add(i);
+            // SAFETY: `children` is non-null (checked above) and, for a valid
+            // schema, points to `n_children` child pointers; `i < n_children`.
+            let child_ptr = unsafe { *self.children.add(i) };
             if child_ptr.is_null() {
                 return Err(RasterH3Error::InvalidParameter(
                     "Null child pointer in ArrowSchema".into(),
                 ));
             }
-            let child = &*child_ptr;
+            // SAFETY: non-null child of a valid schema, owned by (and outliving the
+            // borrow of) `self`.
+            let child = unsafe { &*child_ptr };
             let name = if child.name.is_null() {
                 String::new()
             } else {
-                CStr::from_ptr(child.name).to_string_lossy().into_owned()
+                // SAFETY: non-null `name` of a valid schema is NUL-terminated.
+                unsafe { CStr::from_ptr(child.name) }
+                    .to_string_lossy()
+                    .into_owned()
             };
-            let c_fmt = CStr::from_ptr(child.format).to_string_lossy();
+            if child.format.is_null() {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Null format string for ArrowSchema child '{name}'"
+                )));
+            }
+            // SAFETY: checked non-null just above; a valid schema's format is a
+            // NUL-terminated string.
+            let c_fmt = unsafe { CStr::from_ptr(child.format) }.to_string_lossy();
             let dt = match c_fmt.as_ref() {
                 "L" => ArrowDataType::UInt64,
                 "l" => ArrowDataType::Int64,
@@ -200,6 +238,9 @@ impl ArrowSchema {
 impl Drop for ArrowSchema {
     fn drop(&mut self) {
         if let Some(rel) = self.release {
+            // SAFETY: a set `release` means `self` is a live, unreleased schema and
+            // `rel` is the producer's callback for it; we own it, so this is the
+            // single release the C Data Interface requires.
             unsafe { rel(self) };
         }
     }
@@ -220,6 +261,10 @@ pub struct ArrowArray {
     pub private_data: *mut c_void,
 }
 
+// SAFETY: an `ArrowArray` we produce owns its buffers through
+// `ArrayPrivateData` (plain `Vec`s and boxed children, none thread-affine), and
+// the C Data Interface allows moving an array across threads and releasing it
+// from any of them. Imported arrays are only read, never mutated, through it.
 unsafe impl Send for ArrowArray {}
 
 #[allow(dead_code)]
@@ -237,22 +282,35 @@ struct ArrayPrivateData {
     children_vec: Vec<*mut ArrowArray>,
 }
 
+/// # Safety
+/// `array` must be null or point to a live `ArrowArray` built by
+/// [`ArrowArray::from_column_array`] / [`ArrowArray::from_record_batch`].
 unsafe extern "C" fn release_arrow_array(array: *mut ArrowArray) {
     if array.is_null() {
         return;
     }
-    let a = &mut *array;
+    // SAFETY: non-null and, per this callback's contract, a live `ArrowArray`
+    // that nobody else is accessing while it is being released.
+    let a = unsafe { &mut *array };
     if a.release.is_none() {
         return;
     }
     if !a.private_data.is_null() {
-        let mut priv_data = Box::from_raw(a.private_data as *mut ArrayPrivateData);
+        // SAFETY: `release` is still set, so `private_data` is the pointer we
+        // produced with `Box::into_raw(Box<ArrayPrivateData>)` and has not been
+        // freed yet; it is nulled below so it can't be freed twice.
+        let mut priv_data = unsafe { Box::from_raw(a.private_data as *mut ArrayPrivateData) };
         for child_ptr in priv_data.children_vec.drain(..) {
             if !child_ptr.is_null() {
-                if let Some(rel) = (*child_ptr).release {
-                    rel(child_ptr);
+                // SAFETY: each child came from `Box::into_raw(Box<ArrowArray>)` in
+                // `from_record_batch` and is owned solely by this parent, so it is
+                // live here and is freed exactly once by the `Box::from_raw` below.
+                unsafe {
+                    if let Some(rel) = (*child_ptr).release {
+                        rel(child_ptr);
+                    }
+                    drop(Box::from_raw(child_ptr));
                 }
-                drop(Box::from_raw(child_ptr));
             }
         }
         a.private_data = ptr::null_mut();
@@ -290,18 +348,70 @@ fn pack_var_width(
 }
 
 /// Unpack an LSB-first Arrow bitmap of length `len`.
-unsafe fn unpack_bits(ptr: *const u8, len: usize) -> Vec<bool> {
+///
+/// # Safety
+/// `ptr` must be null or valid for reads of `(offset + len).div_ceil(8)` bytes.
+unsafe fn unpack_bits(ptr: *const u8, offset: usize, len: usize) -> Vec<bool> {
     if ptr.is_null() {
         return vec![true; len];
     }
-    let n_bytes = len.div_ceil(8);
-    let bytes = std::slice::from_raw_parts(ptr, n_bytes);
+    let n_bytes = (offset + len).div_ceil(8);
+    // SAFETY: the caller guarantees `ptr` is readable for `n_bytes`; `u8` has no
+    // alignment requirement and the bytes are not mutated while borrowed.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, n_bytes) };
     let mut out = Vec::with_capacity(len);
-    for i in 0..len {
+    for i in offset..offset + len {
         let bit = (bytes[i / 8] >> (i % 8)) & 1 != 0;
         out.push(bit);
     }
     out
+}
+
+/// Copy `len` fixed-width values starting at logical index `start`.
+///
+/// # Safety
+/// `ptr` must be null or aligned for `T` and valid for reads of `start + len`
+/// elements.
+unsafe fn read_values<T: Copy>(ptr: *const T, start: usize, len: usize) -> Vec<T> {
+    if len == 0 || ptr.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the caller guarantees `ptr` is `T`-aligned (the C Data Interface
+    // requires buffers to be aligned for their element type) and readable for
+    // `start + len` elements, so `[start, start + len)` is in bounds.
+    unsafe { std::slice::from_raw_parts(ptr.add(start), len).to_vec() }
+}
+
+/// Borrow `len` variable-length values (Utf8/Binary layout) starting at logical index `start`.
+/// Offsets are absolute positions into the data buffer, so slicing only shifts the offsets window.
+///
+/// # Safety
+/// `off_ptr` must be null or `i32`-aligned and valid for reads of `start + len + 1`
+/// offsets; `data_ptr` must be valid for reads up to the largest offset read. Both
+/// buffers must outlive `'a` and stay unmodified for it.
+unsafe fn read_var_len<'a>(
+    off_ptr: *const i32,
+    data_ptr: *const u8,
+    start: usize,
+    len: usize,
+) -> Vec<&'a [u8]> {
+    if len == 0 || off_ptr.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: per the caller contract the offsets buffer is aligned and holds at
+    // least `start + len + 1` entries (Arrow stores `length + 1` offsets).
+    let offsets = unsafe { std::slice::from_raw_parts(off_ptr.add(start), len + 1) };
+    let total_bytes = offsets[len].max(0) as usize;
+    let bytes = if total_bytes == 0 || data_ptr.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: `offsets[len]` is the end of the last visible value, which the
+        // caller guarantees is within the data buffer; it lives for `'a`.
+        unsafe { std::slice::from_raw_parts(data_ptr, total_bytes) }
+    };
+    (0..len)
+        .map(|r| &bytes[offsets[r].max(0) as usize..offsets[r + 1].max(0) as usize])
+        .collect()
 }
 
 impl ArrowArray {
@@ -462,107 +572,119 @@ impl ArrowArray {
             )));
         }
         let num_rows = self.length.max(0) as usize;
+        let parent_offset = self.offset.max(0) as usize;
         let mut columns = Vec::with_capacity(schema.fields.len());
 
+        if self.n_children > 0 && self.children.is_null() {
+            return Err(RasterH3Error::InvalidParameter(
+                "ArrowArray has children but a null children array".into(),
+            ));
+        }
         for (i, field) in schema.fields.iter().enumerate() {
-            let child_ptr = *self.children.add(i);
-            let child = &*child_ptr;
-            let len = child.length.max(0) as usize;
-            let validity = if child.null_count > 0 && child.n_buffers >= 1 {
-                let bmp_ptr = *child.buffers as *const u8;
+            // SAFETY: `children` is non-null and holds `n_children` entries (valid
+            // array, caller contract); `i < n_children` was checked above.
+            let child_ptr = unsafe { *self.children.add(i) };
+            if child_ptr.is_null() {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Null child pointer {i} in ArrowArray"
+                )));
+            }
+            // SAFETY: non-null child of a valid array, owned by `self` and not
+            // released while `self` is borrowed.
+            let child = unsafe { &*child_ptr };
+            let expected_buffers = match field.data_type {
+                ArrowDataType::Utf8 | ArrowDataType::Binary => 3,
+                _ => 2,
+            };
+            if child.n_buffers < expected_buffers || child.buffers.is_null() {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "ArrowArray child {i} has {} buffers, expected {expected_buffers}",
+                    child.n_buffers
+                )));
+            }
+            // A struct's offset applies to its children on top of their own offsets, and the
+            // struct's length bounds how many child rows are visible.
+            let start = child.offset.max(0) as usize + parent_offset;
+            let len = num_rows;
+            if (child.length.max(0) as usize) < parent_offset + len {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "ArrowArray child {i} length ({}) is shorter than parent offset + length ({})",
+                    child.length,
+                    parent_offset + len
+                )));
+            }
+            // `null_count == -1` means the count was not computed, so the bitmap must be read.
+            let validity = if child.null_count != 0 {
+                // SAFETY: `buffers` is non-null with at least 2 entries (checked
+                // above); entry 0 is the validity bitmap.
+                let bmp_ptr = unsafe { *child.buffers } as *const u8;
                 if bmp_ptr.is_null() {
                     None
                 } else {
-                    Some(unpack_bits(bmp_ptr, len))
+                    // SAFETY: a non-null validity bitmap covers the child's
+                    // `offset + length` slots, and `start + len` is within that
+                    // (length check above).
+                    Some(unsafe { unpack_bits(bmp_ptr, start, len) })
                 }
             } else {
                 None
             };
 
-            let col = match field.data_type {
-                ArrowDataType::UInt64 => {
-                    let data_ptr = *child.buffers.add(1) as *const u64;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::UInt64 { values, validity }
-                }
-                ArrowDataType::Int64 => {
-                    let data_ptr = *child.buffers.add(1) as *const i64;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::Int64 { values, validity }
-                }
-                ArrowDataType::UInt8 => {
-                    let data_ptr = *child.buffers.add(1) as *const u8;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::UInt8 { values, validity }
-                }
-                ArrowDataType::Float64 => {
-                    let data_ptr = *child.buffers.add(1) as *const f64;
-                    let values = if len == 0 || data_ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(data_ptr, len).to_vec()
-                    };
-                    ColumnArray::Float64 { values, validity }
-                }
-                ArrowDataType::Boolean => {
-                    let data_ptr = *child.buffers.add(1) as *const u8;
-                    let values = unpack_bits(data_ptr, len);
-                    ColumnArray::Boolean { values, validity }
-                }
-                ArrowDataType::Utf8 => {
-                    let off_ptr = *child.buffers.add(1) as *const i32;
-                    let data_ptr = *child.buffers.add(2) as *const u8;
-                    let mut values = Vec::with_capacity(len);
-                    if len > 0 && !off_ptr.is_null() {
-                        let offsets = std::slice::from_raw_parts(off_ptr, len + 1);
-                        let total_bytes = offsets[len].max(0) as usize;
-                        let bytes = if total_bytes == 0 || data_ptr.is_null() {
-                            &[][..]
-                        } else {
-                            std::slice::from_raw_parts(data_ptr, total_bytes)
-                        };
-                        for r in 0..len {
-                            let start = offsets[r].max(0) as usize;
-                            let end = offsets[r + 1].max(0) as usize;
-                            let s = std::str::from_utf8(&bytes[start..end])
-                                .unwrap_or_default()
-                                .to_owned();
-                            values.push(s);
-                        }
+            // SAFETY: for every buffer read below, `buffers` holds at least
+            // `expected_buffers` entries (checked above) laid out per the Arrow
+            // C Data Interface for `field.data_type`, i.e. buffer 1 holds values
+            // (or offsets) aligned for their type and buffer 2 the var-width data,
+            // each covering the child's `offset + length` slots, which bounds
+            // `start + len`. The caller guarantees the array matches `schema` and
+            // stays alive and unmodified for the duration of this call; values
+            // are copied out before returning.
+            let col = unsafe {
+                match field.data_type {
+                    ArrowDataType::UInt64 => ColumnArray::UInt64 {
+                        values: read_values(*child.buffers.add(1) as *const u64, start, len),
+                        validity,
+                    },
+                    ArrowDataType::Int64 => ColumnArray::Int64 {
+                        values: read_values(*child.buffers.add(1) as *const i64, start, len),
+                        validity,
+                    },
+                    ArrowDataType::UInt8 => ColumnArray::UInt8 {
+                        values: read_values(*child.buffers.add(1) as *const u8, start, len),
+                        validity,
+                    },
+                    ArrowDataType::Float64 => ColumnArray::Float64 {
+                        values: read_values(*child.buffers.add(1) as *const f64, start, len),
+                        validity,
+                    },
+                    ArrowDataType::Boolean => {
+                        let data_ptr = *child.buffers.add(1) as *const u8;
+                        let values = unpack_bits(data_ptr, start, len);
+                        ColumnArray::Boolean { values, validity }
                     }
-                    ColumnArray::Utf8 { values, validity }
-                }
-                ArrowDataType::Binary => {
-                    let off_ptr = *child.buffers.add(1) as *const i32;
-                    let data_ptr = *child.buffers.add(2) as *const u8;
-                    let mut values = Vec::with_capacity(len);
-                    if len > 0 && !off_ptr.is_null() {
-                        let offsets = std::slice::from_raw_parts(off_ptr, len + 1);
-                        let total_bytes = offsets[len].max(0) as usize;
-                        let bytes = if total_bytes == 0 || data_ptr.is_null() {
-                            &[][..]
-                        } else {
-                            std::slice::from_raw_parts(data_ptr, total_bytes)
-                        };
-                        for r in 0..len {
-                            let start = offsets[r].max(0) as usize;
-                            let end = offsets[r + 1].max(0) as usize;
-                            values.push(bytes[start..end].to_vec());
-                        }
+                    ArrowDataType::Utf8 => {
+                        let values = read_var_len(
+                            *child.buffers.add(1) as *const i32,
+                            *child.buffers.add(2) as *const u8,
+                            start,
+                            len,
+                        )
+                        .into_iter()
+                        .map(|b| std::str::from_utf8(b).unwrap_or_default().to_owned())
+                        .collect();
+                        ColumnArray::Utf8 { values, validity }
                     }
-                    ColumnArray::Binary { values, validity }
+                    ArrowDataType::Binary => {
+                        let values = read_var_len(
+                            *child.buffers.add(1) as *const i32,
+                            *child.buffers.add(2) as *const u8,
+                            start,
+                            len,
+                        )
+                        .into_iter()
+                        .map(<[u8]>::to_vec)
+                        .collect();
+                        ColumnArray::Binary { values, validity }
+                    }
                 }
             };
             columns.push(col);
@@ -579,6 +701,9 @@ impl ArrowArray {
 impl Drop for ArrowArray {
     fn drop(&mut self) {
         if let Some(rel) = self.release {
+            // SAFETY: a set `release` means `self` is a live, unreleased array and
+            // `rel` is the producer's callback for it; we own it, so this is the
+            // single release the C Data Interface requires.
             unsafe { rel(self) };
         }
     }
@@ -597,6 +722,10 @@ pub struct ArrowArrayStream {
     pub private_data: *mut c_void,
 }
 
+// SAFETY: `StreamPrivateData` holds an `Arc<ColumnSchema>`, a `Send` iterator
+// and a `CString`, so the stream may be driven and released from another thread
+// as long as calls are not concurrent, which the C Stream Interface already
+// forbids.
 unsafe impl Send for ArrowArrayStream {}
 
 struct StreamPrivateData {
@@ -612,12 +741,18 @@ unsafe extern "C" fn stream_get_schema(
     if stream.is_null() || out.is_null() {
         return libc::EINVAL;
     }
-    let s = &mut *stream;
+    // SAFETY: non-null, and the C Stream Interface passes the stream this
+    // callback was installed on, with no concurrent calls.
+    let s = unsafe { &mut *stream };
     if s.private_data.is_null() {
         return libc::EINVAL;
     }
-    let priv_data = &*(s.private_data as *const StreamPrivateData);
-    ptr::write(out, ArrowSchema::from_column_schema(&priv_data.schema));
+    // SAFETY: a non-null `private_data` on a stream we built is the live
+    // `Box<StreamPrivateData>` from `from_iterator` (freed only by release).
+    let priv_data = unsafe { &*(s.private_data as *const StreamPrivateData) };
+    // SAFETY: `out` is non-null consumer storage for one `ArrowSchema`; it is
+    // treated as uninitialized, so `write` avoids dropping whatever was there.
+    unsafe { ptr::write(out, ArrowSchema::from_column_schema(&priv_data.schema)) };
     0
 }
 
@@ -625,19 +760,27 @@ unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut Ar
     if stream.is_null() || out.is_null() {
         return libc::EINVAL;
     }
-    let s = &mut *stream;
+    // SAFETY: non-null, and the C Stream Interface passes the stream this
+    // callback was installed on, with no concurrent calls.
+    let s = unsafe { &mut *stream };
     if s.private_data.is_null() {
         return libc::EINVAL;
     }
-    let priv_data = &mut *(s.private_data as *mut StreamPrivateData);
+    // SAFETY: a non-null `private_data` on a stream we built is the live
+    // `Box<StreamPrivateData>` from `from_iterator`; calls are not concurrent,
+    // so this is the only reference to it.
+    let priv_data = unsafe { &mut *(s.private_data as *mut StreamPrivateData) };
     let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| priv_data.iter.next()));
     match step {
         Ok(Some(Ok(batch))) => {
-            ptr::write(out, ArrowArray::from_record_batch(batch));
+            // SAFETY: `out` is non-null consumer storage for one `ArrowArray`,
+            // treated as uninitialized, so `write` avoids dropping it.
+            unsafe { ptr::write(out, ArrowArray::from_record_batch(batch)) };
             0
         }
         Ok(None) => {
-            ptr::write(out, ArrowArray::empty());
+            // SAFETY: as above; a released (empty) array signals end of stream.
+            unsafe { ptr::write(out, ArrowArray::empty()) };
             0
         }
         Ok(Some(Err(err))) => {
@@ -657,11 +800,16 @@ unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *co
     if stream.is_null() {
         return ptr::null();
     }
-    let s = &*stream;
+    // SAFETY: non-null, and the C Stream Interface passes the stream this
+    // callback was installed on.
+    let s = unsafe { &*stream };
     if s.private_data.is_null() {
         return ptr::null();
     }
-    let priv_data = &*(s.private_data as *const StreamPrivateData);
+    // SAFETY: a non-null `private_data` is our live `Box<StreamPrivateData>`. The
+    // returned pointer borrows `last_error`, which the C Stream Interface only
+    // requires to stay valid until the next call on the stream or its release.
+    let priv_data = unsafe { &*(s.private_data as *const StreamPrivateData) };
     match &priv_data.last_error {
         Some(c) => c.as_ptr(),
         None => ptr::null(),
@@ -672,12 +820,18 @@ unsafe extern "C" fn release_arrow_stream(stream: *mut ArrowArrayStream) {
     if stream.is_null() {
         return;
     }
-    let s = &mut *stream;
+    // SAFETY: non-null and the stream this callback was installed on; release is
+    // the last call the consumer makes, so nothing else is accessing it.
+    let s = unsafe { &mut *stream };
     if s.release.is_none() {
         return;
     }
     if !s.private_data.is_null() {
-        drop(Box::from_raw(s.private_data as *mut StreamPrivateData));
+        // Dropping the iterator may join worker threads; never unwind into the consumer.
+        // SAFETY: `release` is still set, so `private_data` is the unfreed
+        // `Box<StreamPrivateData>` from `from_iterator`; it is nulled below.
+        let priv_data = unsafe { Box::from_raw(s.private_data as *mut StreamPrivateData) };
+        crate::error::catch_unwind_or((), || drop(priv_data));
         s.private_data = ptr::null_mut();
     }
     s.get_schema = None;
@@ -719,24 +873,36 @@ impl ArrowArrayStream {
         })?;
 
         let mut raw_schema = ArrowSchema::empty();
-        let rc = get_schema_fn(self, &mut raw_schema);
+        // SAFETY: `self` is a valid unreleased stream (caller contract) and
+        // `get_schema_fn` is its own callback; `raw_schema` is writable storage
+        // whose (empty) contents need no release if overwritten.
+        let rc = unsafe { get_schema_fn(self, &mut raw_schema) };
         if rc != 0 {
             return Err(RasterH3Error::InvalidParameter(format!(
                 "ArrowArrayStream.get_schema failed with code {}",
                 rc
             )));
         }
-        let schema = Arc::new(raw_schema.to_column_schema()?);
+        // SAFETY: `get_schema` returned 0, so `raw_schema` is now a valid,
+        // unreleased schema owned by us.
+        let schema = Arc::new(unsafe { raw_schema.to_column_schema() }?);
 
         let mut batches = Vec::new();
         loop {
             let mut raw_array = ArrowArray::empty();
-            let rc = get_next_fn(self, &mut raw_array);
+            // SAFETY: same stream/callback pairing as `get_schema` above;
+            // `raw_array` is writable storage for one array.
+            let rc = unsafe { get_next_fn(self, &mut raw_array) };
             if rc != 0 {
                 let msg = if let Some(err_fn) = self.get_last_error {
-                    let ptr = err_fn(self);
+                    // SAFETY: the stream's own callback, called on the stream.
+                    let ptr = unsafe { err_fn(self) };
                     if !ptr.is_null() {
-                        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                        // SAFETY: a non-null last-error is a NUL-terminated string
+                        // valid until the next call on the stream; we copy it now.
+                        unsafe { CStr::from_ptr(ptr) }
+                            .to_string_lossy()
+                            .into_owned()
                     } else {
                         format!("ArrowArrayStream error code {}", rc)
                     }
@@ -748,7 +914,9 @@ impl ArrowArrayStream {
             if raw_array.release.is_none() {
                 break;
             }
-            batches.push(raw_array.to_record_batch(Arc::clone(&schema))?);
+            // SAFETY: `get_next` succeeded with a non-released array, which the
+            // producer guarantees matches the schema it reported.
+            batches.push(unsafe { raw_array.to_record_batch(Arc::clone(&schema)) }?);
         }
 
         Ok((schema, batches))
@@ -758,6 +926,9 @@ impl ArrowArrayStream {
 impl Drop for ArrowArrayStream {
     fn drop(&mut self) {
         if let Some(rel) = self.release {
+            // SAFETY: a set `release` means `self` is a live, unreleased stream and
+            // `rel` is the producer's callback for it; we own it, so this is the
+            // single release the C Stream Interface requires.
             unsafe { rel(self) };
         }
     }
@@ -813,9 +984,131 @@ mod tests {
             Arc::clone(&schema),
             vec![Ok(batch.clone())].into_iter(),
         );
+        // SAFETY: freshly built by `from_iterator`, so valid and unreleased.
         let (out_schema, out_batches) = unsafe { stream.collect_batches().unwrap() };
         assert_eq!(*out_schema, *schema);
         assert_eq!(out_batches.len(), 1);
         assert_eq!(out_batches[0], batch);
+    }
+
+    fn sliceable_batch() -> (Arc<ColumnSchema>, RecordBatch) {
+        let schema = Arc::new(ColumnSchema::new(vec![
+            ColumnField::new("v", ArrowDataType::Int64, true),
+            ColumnField::new("s", ArrowDataType::Utf8, false),
+            ColumnField::new("b", ArrowDataType::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                ColumnArray::Int64 {
+                    values: vec![10, 20, 30],
+                    validity: Some(vec![true, false, true]),
+                },
+                ColumnArray::Utf8 {
+                    values: vec!["a".into(), "bb".into(), "ccc".into()],
+                    validity: None,
+                },
+                ColumnArray::Boolean {
+                    values: vec![true, false, true],
+                    validity: None,
+                },
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    #[test]
+    fn release_callbacks_are_null_safe_and_idempotent() {
+        let (schema, batch) = sliceable_batch();
+        let mut raw_schema = ArrowSchema::from_column_schema(&schema);
+        let mut array = ArrowArray::from_record_batch(batch.clone());
+        let mut stream = ArrowArrayStream::from_iterator(schema, vec![Ok(batch)].into_iter());
+        // SAFETY: null is supported; each non-null argument is owned and produced
+        // by the matching constructor, and remains live until after both releases.
+        unsafe {
+            release_arrow_schema(ptr::null_mut());
+            release_arrow_array(ptr::null_mut());
+            release_arrow_stream(ptr::null_mut());
+            for _ in 0..2 {
+                release_arrow_schema(&mut raw_schema);
+                release_arrow_array(&mut array);
+                release_arrow_stream(&mut stream);
+            }
+        }
+        assert!(raw_schema.release.is_none() && raw_schema.private_data.is_null());
+        assert!(array.release.is_none() && array.private_data.is_null());
+        assert!(stream.release.is_none() && stream.private_data.is_null());
+    }
+
+    #[test]
+    fn owned_exports_can_be_released_on_another_thread() {
+        let (schema, batch) = sliceable_batch();
+        let raw_schema = ArrowSchema::from_column_schema(&schema);
+        let array = ArrowArray::from_record_batch(batch.clone());
+        let stream = ArrowArrayStream::from_iterator(schema, vec![Ok(batch)].into_iter());
+        std::thread::spawn(move || {
+            drop(raw_schema);
+            drop(array);
+            drop(stream);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn test_import_respects_parent_and_child_offsets() {
+        let (schema, batch) = sliceable_batch();
+        let expected = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                ColumnArray::Int64 {
+                    values: vec![20, 30],
+                    validity: Some(vec![false, true]),
+                },
+                ColumnArray::Utf8 {
+                    values: vec!["bb".into(), "ccc".into()],
+                    validity: None,
+                },
+                ColumnArray::Boolean {
+                    values: vec![false, true],
+                    validity: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        // Slice via the struct's offset.
+        let mut arr = ArrowArray::from_record_batch(batch.clone());
+        arr.offset = 1;
+        arr.length = 2;
+        // SAFETY: built from `batch` with `schema`; offset 1 + length 2 stays
+        // within the 3-row children.
+        let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
+        assert_eq!(got, expected);
+
+        // Slice via each child's offset.
+        let mut arr = ArrowArray::from_record_batch(batch);
+        arr.length = 2;
+        for i in 0..arr.n_children as usize {
+            // SAFETY: `i < n_children` and each child is a live box owned by `arr`.
+            let child = unsafe { &mut **arr.children.add(i) };
+            child.offset = 1;
+            child.length = 2;
+        }
+        // SAFETY: each child's offset 1 + length 2 stays within its 3 rows.
+        let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_import_reads_validity_when_null_count_unknown() {
+        let (schema, batch) = sliceable_batch();
+        let arr = ArrowArray::from_record_batch(batch.clone());
+        // SAFETY: the batch has 3 columns, so child 0 exists and is owned by `arr`.
+        unsafe { (**arr.children).null_count = -1 };
+        // SAFETY: `arr` was built from `batch` with this `schema`.
+        let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
+        assert_eq!(got, batch);
     }
 }

@@ -54,10 +54,17 @@ fn short_varlena(bytes: &[u8]) -> NullableDatum {
 }
 
 /// Payload of a varlena Datum returned by the extension (always a 4-byte header).
+///
+/// # Safety
+/// `d` must be a varlena Datum built by the extension's `varlena_datum`.
 unsafe fn read_varlena(d: Datum) -> Vec<u8> {
     let p = d as *const u8;
-    let total = ((p as *const u32).read_unaligned() >> 2) as usize;
-    std::slice::from_raw_parts(p.add(4), total - 4).to_vec()
+    // SAFETY: `varlena_datum` writes a 4-byte length header followed by `total - 4`
+    // payload bytes into a (never freed) mock `palloc` buffer.
+    unsafe {
+        let total = ((p as *const u32).read_unaligned() >> 2) as usize;
+        std::slice::from_raw_parts(p.add(4), total - 4).to_vec()
+    }
 }
 
 /// Calls a scalar entry point, returning `None` when it set `isnull`.
@@ -66,6 +73,8 @@ fn call(
     args: &[NullableDatum],
 ) -> Option<Datum> {
     let mut fc = FunctionCallInfoBaseData::with_args(args);
+    // SAFETY: `fc` is a fully initialized local call info with all 8 argument slots, and
+    // `args` matches the SQL signature the test calls `f` with.
     let d = unsafe { f(&mut fc) };
     (!fc.isnull).then_some(d)
 }
@@ -94,12 +103,15 @@ fn finfo_records_and_magic_block() {
         pg_finfo_pg_h3_raster_continuous_aggregate,
         pg_finfo_pg_h3_raster_categorical_aggregate,
     ] {
+        // SAFETY: each `pg_finfo_*` returns a pointer to the static `PG_FINFO_V1`.
         assert_eq!(unsafe { (*finfo()).api_version }, 1);
     }
     assert!(!Pg_magic_func().is_null());
     // The magic block starts with its own size and the major version * 100.
     let words = Pg_magic_func() as *const c_void as *const i32;
     let major: i32 = env!("RASTER_H3_PG_MAJOR").parse().unwrap();
+    // SAFETY: the magic block is a static `repr(C)` struct of at least 24 bytes that starts
+    // with two `c_int`s (`len`, `version`), so both reads are in bounds and aligned.
     unsafe {
         assert!(*words >= 24);
         assert_eq!(*words.add(1), major * 100);
@@ -111,6 +123,7 @@ fn h3_to_string_and_string_to_h3_round_trip() {
     for cell in sample_cells() {
         let as_int = int64_to_datum(u64::from(cell) as i64);
         let text = call(pg_h3_to_string, &[val(as_int)]).expect("valid cell");
+        // SAFETY: `pg_h3_to_string` returns a `varlena_datum`.
         let text = unsafe { read_varlena(text) };
         assert_eq!(String::from_utf8(text.clone()).unwrap(), cell.to_string());
 
@@ -165,6 +178,7 @@ fn h3_is_valid_text_agrees_with_h3o() {
 fn h3_to_wkb_returns_core_wkb_including_pentagons() {
     for cell in sample_cells() {
         let d = call(pg_h3_to_wkb, &[val(int64_to_datum(u64::from(cell) as i64))]).unwrap();
+        // SAFETY: `pg_h3_to_wkb` returns a `varlena_datum`.
         let wkb = unsafe { read_varlena(d) };
         assert_eq!(Some(wkb.clone()), h3_to_wkb_u64(u64::from(cell)), "{cell}");
         // Polygon with one closed ring of boundary vertices.
@@ -193,6 +207,8 @@ fn run_srf(
     let mut calls = 0;
     loop {
         fc.isnull = false;
+        // SAFETY: `fc` is a fully initialized call info whose `flinfo`/`resultinfo` point to
+        // the live locals above, as the value-per-call protocol requires.
         let d = unsafe { srf(&mut fc) };
         calls += 1;
         if rsi.is_done == EXPR_END_RESULT {
@@ -210,6 +226,8 @@ fn run_srf(
         if stop_after == Some(calls) {
             // Early termination (e.g. LIMIT): the executor deletes the multi-call
             // context without a final call, which must release the SRF state.
+            // SAFETY: `fn_extra` is the mock `FuncCallContext` box, whose fifth pointer-sized
+            // field is `multi_call_memory_ctx`.
             let ctx = unsafe { *((flinfo.fn_extra as *const *mut c_void).add(4)) };
             server::reset_context(ctx);
             break;

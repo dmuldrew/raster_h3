@@ -9,7 +9,6 @@ use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 use tempfile::NamedTempFile;
 use tiff::decoder::{Decoder, DecodingResult};
-use tiff::encoder::compression::Deflate;
 use tiff::encoder::{colortype, TiffEncoder};
 use tiff::tags::{CompressionMethod, Predictor, Tag};
 use weezl::encode::Encoder as LZWEncoder;
@@ -198,13 +197,11 @@ fn test_deflate_striped_u8_parity() {
 
     {
         let file = File::create(path).unwrap();
-        let mut encoder = TiffEncoder::new(BufWriter::new(file)).unwrap();
+        let mut encoder = TiffEncoder::new(BufWriter::new(file))
+            .unwrap()
+            .with_compression(tiff::encoder::Compression::Deflate(Default::default()));
         let mut img = encoder
-            .new_image_with_compression::<colortype::Gray8, Deflate>(
-                width,
-                height,
-                Deflate::default(),
-            )
+            .new_image::<colortype::Gray8>(width, height)
             .unwrap();
         img.rows_per_strip(16).unwrap();
         let tiepoint = [0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0];
@@ -258,13 +255,11 @@ fn test_deflate_striped_f32_parity_and_streaming() {
 
     {
         let file = File::create(path).unwrap();
-        let mut encoder = TiffEncoder::new(BufWriter::new(file)).unwrap();
+        let mut encoder = TiffEncoder::new(BufWriter::new(file))
+            .unwrap()
+            .with_compression(tiff::encoder::Compression::Deflate(Default::default()));
         let mut img = encoder
-            .new_image_with_compression::<colortype::Gray32Float, Deflate>(
-                width,
-                height,
-                Deflate::default(),
-            )
+            .new_image::<colortype::Gray32Float>(width, height)
             .unwrap();
         img.rows_per_strip(8).unwrap();
         let tiepoint = [0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0];
@@ -624,8 +619,8 @@ fn test_deflate_exact_bitwise_equivalence_with_tiff_decoder() {
     let mmap = reader.mmap().unwrap();
 
     // 1. Decode with standard tiff Decoder (using flate2/miniz_oxide)
-    let cursor = std::io::Cursor::new(&mmap[..]);
-    let mut standard_decoder = tiff::decoder::Decoder::new(cursor).unwrap();
+    let cursor = Cursor::new(&mmap[..]);
+    let mut standard_decoder = Decoder::new(cursor).unwrap();
 
     // 2. Decode with SIMD libdeflater ChunkDecoder
     let mut simd_decoder = reader.open_decoder().unwrap();

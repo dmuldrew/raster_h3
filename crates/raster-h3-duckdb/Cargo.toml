@@ -1,12 +1,17 @@
 [package]
 name = "raster-h3-duckdb"
+publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "DuckDB C-API loadable extension for raster_h3 GeoTIFF to H3 hexagonal aggregation"
+
+[lints]
+workspace = true
 
 [lib]
 name = "raster_h3_duckdb"
@@ -17,13 +22,13 @@ default = []
 stream-profile = ["raster-h3-core/stream-profile"]
 
 [dependencies]
-raster-h3-core = { path = "../raster-h3-core" }
+raster-h3-core = { version = "0.4.0", path = "../raster-h3-core" }
 h3o.workspace = true
 libc.workspace = true
 parquet.workspace = true
 crossbeam-deque.workspace = true
 
 [dev-dependencies]
-raster-h3-core = { path = "../raster-h3-core", features = ["test-hooks"] }
+raster-h3-core = { version = "0.4.0", path = "../raster-h3-core", features = ["test-hooks"] }
 tempfile.workspace = true
 tiff.workspace = true

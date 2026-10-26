@@ -1,0 +1,42 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/).
+# Run locally with `cargo deny check`; CI runs the same checks in the `deny` job.
+
+[graph]
+# Include feature-gated dependencies (e.g. raster-h3-pg's pg-extension) in every check.
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# raster_h3 is MIT; every license below is permissive and compatible with shipping it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    # webpki-roots: Mozilla's CA bundle data
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+# LLVM's libFuzzer is NCSA-licensed; this permissive license is used only by the fuzz harness.
+allow = ["NCSA"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

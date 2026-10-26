@@ -98,3 +98,10 @@ RETURNS TABLE (
 )
 AS 'MODULE_PATHNAME', 'pg_h3_raster_categorical_aggregate'
 LANGUAGE C VOLATILE PARALLEL SAFE;
+
+-- The raster SRFs open server-side files with the server's OS privileges, so
+-- restrict them like COPY FROM a file: superusers and pg_read_server_files only.
+REVOKE EXECUTE ON FUNCTION h3_raster_continuous_aggregate(text, integer, text, double precision, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION h3_raster_categorical_aggregate(text, integer, text, double precision, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION h3_raster_continuous_aggregate(text, integer, text, double precision, text) TO pg_read_server_files;
+GRANT EXECUTE ON FUNCTION h3_raster_categorical_aggregate(text, integer, text, double precision, text) TO pg_read_server_files;

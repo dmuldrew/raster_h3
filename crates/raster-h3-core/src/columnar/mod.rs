@@ -5,13 +5,13 @@
 pub mod arrow_c;
 pub mod ipc;
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::aggregator::multi_horizon::{
-    MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
-    MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
+    CategoricalLongCursor, CategoricalLongRow, MultiCategoricalHorizonStreamer,
+    MultiCategoricalRecord, MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer,
+    QuantileTarget,
 };
 use crate::encoding::{fast_hex_u64, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 use crate::error::{RasterH3Error, Result};
@@ -732,17 +732,6 @@ impl Iterator for ContinuousBatchReader {
     }
 }
 
-struct LongRow {
-    cell_u64: u64,
-    resolution: u8,
-    category: i64,
-    count: f64,
-    fraction: f64,
-    total_count: f64,
-    entropy: f64,
-    distinct_classes: i64,
-}
-
 /// Streaming iterator yielding [`RecordBatch`]es for categorical H3 raster aggregation.
 pub struct CategoricalBatchReader {
     streamer: MultiCategoricalHorizonStreamer,
@@ -751,7 +740,7 @@ pub struct CategoricalBatchReader {
     schema: Arc<ColumnSchema>,
     batch_size: usize,
     remaining_limit: Option<usize>,
-    long_queue: VecDeque<LongRow>,
+    long_cursor: CategoricalLongCursor,
     finished: bool,
 }
 
@@ -789,6 +778,11 @@ impl CategoricalBatchReader {
             Some(indices) => Arc::new(full_schema.project(indices)?),
             None => Arc::new(full_schema),
         };
+        // Long-format columns 7/8 are the entropy aliases; skip the per-cell
+        // log pass when neither is projected.
+        let with_entropy = projection
+            .as_ref()
+            .is_none_or(|cols| cols.iter().any(|&c| c == 7 || c == 8));
         Ok(Self {
             streamer,
             format,
@@ -796,7 +790,7 @@ impl CategoricalBatchReader {
             schema,
             batch_size: batch_size.max(1),
             remaining_limit: limit,
-            long_queue: VecDeque::new(),
+            long_cursor: CategoricalLongCursor::new(with_entropy),
             finished: false,
         })
     }
@@ -806,42 +800,27 @@ impl CategoricalBatchReader {
     }
 
     fn next_long_batch(&mut self, target: usize) -> Option<Result<RecordBatch>> {
-        while self.long_queue.len() < target && !self.finished {
-            let mut records = Vec::with_capacity(target);
-            match self.streamer.drain_completed_into(target, |_, rec| {
-                records.push(rec);
+        // Expand one cell at a time and only as far as this batch needs, so a
+        // high-cardinality cell never materializes more rows than requested.
+        let mut rows: Vec<CategoricalLongRow> = Vec::with_capacity(target);
+        while rows.len() < target {
+            if self.long_cursor.remaining() > 0 {
+                self.long_cursor
+                    .emit_into(target - rows.len(), |row| rows.push(row));
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            let cursor = &mut self.long_cursor;
+            match self.streamer.drain_completed_into(1, |_, rec| {
+                // Cells without counted pixels produce no long rows.
+                if rec.accumulator.total_count > 0.0 {
+                    cursor.load(&rec);
+                }
             }) {
-                Ok(0) => {
-                    self.finished = true;
-                    break;
-                }
-                Ok(_) => {
-                    for rec in records {
-                        let total = rec.accumulator.total_count;
-                        if total <= 0.0 {
-                            continue;
-                        }
-                        let entropy = rec.accumulator.shannon_entropy();
-                        let distinct = rec.accumulator.unique_classes() as i64;
-                        let mut entries: Vec<(i64, f64)> = Vec::with_capacity(distinct as usize);
-                        rec.accumulator.for_each_class(|k, v| {
-                            entries.push((k, v));
-                        });
-                        entries.sort_unstable_by_key(|&(cat, _)| cat);
-                        for (cat, cnt) in entries {
-                            self.long_queue.push_back(LongRow {
-                                cell_u64: rec.h3_index,
-                                resolution: rec.resolution,
-                                category: cat,
-                                count: cnt,
-                                fraction: cnt / total,
-                                total_count: total,
-                                entropy,
-                                distinct_classes: distinct,
-                            });
-                        }
-                    }
-                }
+                Ok(0) => self.finished = true,
+                Ok(_) => {}
                 Err(e) => {
                     self.finished = true;
                     return Some(Err(e));
@@ -849,13 +828,12 @@ impl CategoricalBatchReader {
             }
         }
 
-        if self.long_queue.is_empty() {
+        if rows.is_empty() {
             self.finished = true;
             return None;
         }
 
-        let n = target.min(self.long_queue.len());
-        let rows: Vec<LongRow> = self.long_queue.drain(..n).collect();
+        let n = rows.len();
         if let Some(rem) = &mut self.remaining_limit {
             *rem = rem.saturating_sub(n);
         }

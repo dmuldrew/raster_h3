@@ -12,20 +12,28 @@ use raster_h3_python::{
 
 fn is_valid(s: &str) -> i32 {
     let c = CString::new(s).unwrap();
+    // SAFETY: `c` is a live NUL-terminated CString.
     unsafe { raster_h3_py_h3_is_valid_str(c.as_ptr()) }
 }
 
 fn parent(s: &str, res: i64) -> Option<String> {
     let c = CString::new(s).unwrap();
+    // SAFETY: `c` is a live NUL-terminated CString, and the result comes from the library,
+    // as `owned` requires.
     unsafe { owned(raster_h3_py_h3_cell_to_parent_str(c.as_ptr(), res)) }
 }
 
+/// # Safety
+/// `p` must be null or a string returned by a `raster_h3_py_*` function, not yet freed.
 unsafe fn owned(p: *mut c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    let s = CStr::from_ptr(p).to_str().unwrap().to_string();
-    raster_h3_py_free_string(p);
+    // SAFETY: non-null `p` is a NUL-terminated string from `CString::into_raw` in this
+    // library (caller contract); it is copied, then freed exactly once.
+    let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
+    // SAFETY: as above.
+    unsafe { raster_h3_py_free_string(p) };
     Some(s)
 }
 
@@ -69,6 +77,7 @@ fn is_valid_str_agrees_with_h3o_and_the_u64_variant() {
         assert_eq!(is_valid(s), expect, "'{s}'");
         assert_eq!(expect, 0, "'{s}' should be invalid");
     }
+    // SAFETY: null is an accepted input and is never dereferenced.
     assert_eq!(unsafe { raster_h3_py_h3_is_valid_str(ptr::null()) }, 0);
 }
 
@@ -101,5 +110,6 @@ fn cell_to_parent_str_agrees_with_h3o_and_the_u64_variant() {
     }
     assert_eq!(parent("not-hex", 3), None);
     assert_eq!(parent("", 3), None);
+    // SAFETY: null is an accepted input and is never dereferenced.
     assert!(unsafe { raster_h3_py_h3_cell_to_parent_str(ptr::null(), 3) }.is_null());
 }

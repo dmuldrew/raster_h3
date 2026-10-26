@@ -218,7 +218,9 @@ pub struct PmtilesWriter {
 }
 
 impl PmtilesWriter {
-    /// Create a new PMTiles v3 streaming archive builder with disk spill storage
+    /// Create a new PMTiles v3 streaming archive builder with disk spill storage.
+    /// Wrapped longitude bounds are accepted internally to preserve the center;
+    /// the archive header uses ordered, full-world longitude bounds in that case.
     pub fn new(
         min_zoom: u8,
         max_zoom: u8,
@@ -337,8 +339,20 @@ impl PmtilesWriter {
         let tile_contents_count = self.entries.len() as u64;
 
         let center_zoom = (self.min_zoom + self.max_zoom) / 2;
-        let center_lon = (self.min_lon + self.max_lon) / 2.0;
+        let center_lon = if self.min_lon <= self.max_lon {
+            (self.min_lon + self.max_lon) / 2.0
+        } else {
+            let span = (180.0 - self.min_lon) + (self.max_lon + 180.0);
+            crate::crs::transformer::wrap_lon(self.min_lon + span * 0.5)
+        };
         let center_lat = (self.min_lat + self.max_lat) / 2.0;
+        // PMTiles/TileJSON consumers expect west <= east. Preserve the wrapped
+        // midpoint above, but conservatively cover both dateline pieces here.
+        let (header_min_lon, header_max_lon) = if self.min_lon <= self.max_lon {
+            (self.min_lon, self.max_lon)
+        } else {
+            (-180.0, 180.0)
+        };
 
         // Build 127-byte PMTiles v3 header
         let mut header = Vec::with_capacity(PMTILES_HEADER_SIZE);
@@ -365,9 +379,9 @@ impl PmtilesWriter {
         header.push(self.min_zoom);
         header.push(self.max_zoom);
 
-        header.extend_from_slice(&((self.min_lon * 1e7) as i32).to_le_bytes());
+        header.extend_from_slice(&((header_min_lon * 1e7) as i32).to_le_bytes());
         header.extend_from_slice(&((self.min_lat * 1e7) as i32).to_le_bytes());
-        header.extend_from_slice(&((self.max_lon * 1e7) as i32).to_le_bytes());
+        header.extend_from_slice(&((header_max_lon * 1e7) as i32).to_le_bytes());
         header.extend_from_slice(&((self.max_lat * 1e7) as i32).to_le_bytes());
 
         header.push(center_zoom);
@@ -393,6 +407,9 @@ impl PmtilesWriter {
         // Stream tile data from spill_file to out_file in sorted Hilbert order via zero-copy memory map
         self.spill_file.flush()?;
         if self.current_spill_offset > 0 {
+            // SAFETY: `spill_file` is an anonymous `tempfile::tempfile()` (unlinked,
+            // so no other process can open it) and we hold `&mut self`, so nothing
+            // writes to or truncates it while the map is alive; it was flushed above.
             let mmap = unsafe { memmap2::Mmap::map(&self.spill_file)? };
             for e in &self.entries {
                 let start = e.spill_offset as usize;

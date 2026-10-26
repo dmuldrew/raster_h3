@@ -81,7 +81,7 @@ pub struct WalkContext<'a> {
 /// Walk a single-band window. Center sampling batches contiguous pixels
 /// through the engine's span kernels.
 pub fn walk_direct<T, Acc, E, N>(
-    ctx: &WalkContext,
+    ctx: &WalkContext<'_>,
     slice: &[T],
     is_row_all_nodata: N,
     engine: &E,
@@ -108,7 +108,7 @@ pub fn walk_direct<T, Acc, E, N>(
 /// Walk a window of `ctx.samples_per_pixel` interleaved values; `read` reduces
 /// one pixel's values (a band selection or spectral index) to a sample.
 pub fn walk_interleaved<T, Acc, E, R>(
-    ctx: &WalkContext,
+    ctx: &WalkContext<'_>,
     slice: &[T],
     read: R,
     engine: &E,
@@ -167,7 +167,7 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
 
 #[allow(clippy::too_many_arguments)]
 fn walk<T, Acc, E, N, R>(
-    ctx: &WalkContext,
+    ctx: &WalkContext<'_>,
     slice: &[T],
     spp: usize,
     is_row_all_nodata: N,
@@ -330,7 +330,7 @@ impl<'a> SampleProjector<'a> {
         }
     }
 
-    fn start_row(&mut self, ctx: &WalkContext, row_idx: usize) {
+    fn start_row(&mut self, ctx: &WalkContext<'_>, row_idx: usize) {
         if let Some(lats) = &mut self.row_lats {
             lats.clear();
             // With no column rotation (d == 0), y does not depend on the column.
@@ -452,7 +452,7 @@ struct RowPruner {
 }
 
 impl RowPruner {
-    fn new(ctx: &WalkContext) -> Option<Self> {
+    fn new(ctx: &WalkContext<'_>) -> Option<Self> {
         let bbox = ctx.bbox?;
         let gt = ctx.gt;
         if !(gt.b == 0.0 && gt.d == 0.0 && gt.a > 0.0 && gt.e < 0.0) {
@@ -480,7 +480,12 @@ impl RowPruner {
 
     /// Columns of this row that may hold a sample inside the bbox, or None
     /// when no sample of the row can be inside it.
-    fn columns(&self, ctx: &WalkContext, row_idx: usize, row_px: usize) -> Option<Range<usize>> {
+    fn columns(
+        &self,
+        ctx: &WalkContext<'_>,
+        row_idx: usize,
+        row_px: usize,
+    ) -> Option<Range<usize>> {
         let [min_lon, min_lat, max_lon, max_lat] = self.bbox;
 
         // Same expressions as sample projection, so the latitude test is exact.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "raster-h3"
-version = "0.2.0"
+version = "0.4.0"
 description = "High-performance GeoTIFF/COG to H3 hexagonal aggregation for Polars, PyArrow, DuckDB, and DataFusion"
 readme = "README.md"
 license = { text = "MIT" }
@@ -44,9 +44,11 @@ test-requires = ["polars>=1.0", "pyarrow>=14.0"]
 test-command = "python {package}/tests/wheel_smoke.py"
 
 [tool.cibuildwheel.linux]
+# 64-bit only: polars/pyarrow publish no i686 wheels, so the smoke test cannot install there.
+archs = ["auto64"]
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
-before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.97.1"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 
 [tool.cibuildwheel.macos]
@@ -55,7 +57,6 @@ archs = ["x86_64", "arm64"]
 [[tool.cibuildwheel.overrides]]
 select = "*-macosx_x86_64"
 environment = { MACOSX_DEPLOYMENT_TARGET = "10.12" }
-before-all = "rustup target add x86_64-apple-darwin"
 
 [[tool.cibuildwheel.overrides]]
 select = "*-macosx_arm64"

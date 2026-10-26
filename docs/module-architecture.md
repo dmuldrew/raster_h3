@@ -26,7 +26,7 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 
 | File | Responsibility |
 | :--- | :--- |
-| [`mod.rs`](../crates/raster-h3-core/src/crs/mod.rs) | CRS detection and parsing from EPSG codes (4326, 3857, 5070, 3338, UTM zones 32601–32760) or PROJ definition strings. Automatic UTM zone string synthesis. |
+| [`mod.rs`](../crates/raster-h3-core/src/crs/mod.rs) | CRS detection and parsing from the built-in EPSG codes (geographic, Web Mercator, Albers, UTM, polar, and European national grids with Helmert datum shifts; see crs-and-projection.md) or PROJ definition strings. Automatic UTM zone string synthesis. |
 | [`transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs) | Three-tier coordinate reprojection pipeline: **Tier 1** `Wgs84Identity` (zero-cost passthrough for EPSG:4326/4269), **Tier 2** `WebMercatorFast` and `AlbersConicFast` (closed-form analytical transforms including 2-iteration Newton-Raphson inverse solver), **Tier 3** `Proj4` (general-purpose fallback via pure-Rust `proj4rs`). |
 
 ---

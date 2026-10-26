@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fxhash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
@@ -126,11 +126,33 @@ pub fn coalesce_chunk_ranges(
 /// Fetched chunk bytes keyed by (tile, chunk index), shared with the workers.
 type ReadyChunks = Arc<Mutex<FxHashMap<(usize, u32), Arc<Vec<u8>>>>>;
 
+fn publish_error(
+    ready: &ReadyChunks,
+    error: &Mutex<Option<String>>,
+    condvar: &Condvar,
+    message: String,
+) {
+    // Serialize terminal predicate updates with the consumer's check and wait.
+    let map = ready
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Ok(mut error) = error.lock() {
+        if error.is_none() {
+            *error = Some(message);
+        }
+    }
+    drop(map);
+    condvar.notify_all();
+}
+
 /// Parallel asynchronous prefetch queue managing concurrent HTTP Range requests
 pub struct RemoteChunkPrefetchQueue {
     ready_chunks: ReadyChunks,
     condvar: Arc<Condvar>,
-    next_job: Arc<AtomicUsize>,
+    /// Ranges whose fetch has finished and whose chunks are in `ready_chunks`.
+    /// Updated while holding the `ready_chunks` lock so waiting consumers
+    /// observe it consistently with the map.
+    completed_jobs: Arc<AtomicUsize>,
     total_jobs: usize,
     scheduled_chunks: FxHashSet<(usize, u32)>,
     error: Arc<Mutex<Option<String>>>,
@@ -249,6 +271,7 @@ impl RemoteChunkPrefetchQueue {
         let ready_chunks = Arc::new(Mutex::new(FxHashMap::default()));
         let condvar = Arc::new(Condvar::new());
         let next_job = Arc::new(AtomicUsize::new(0));
+        let completed_jobs = Arc::new(AtomicUsize::new(0));
         let error = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -266,28 +289,31 @@ impl RemoteChunkPrefetchQueue {
             let ready = Arc::clone(&ready_chunks);
             let cv = Arc::clone(&condvar);
             let job_idx = Arc::clone(&next_job);
+            let done = Arc::clone(&completed_jobs);
             let err_holder = Arc::clone(&error);
             let term = Arc::clone(&shutdown);
 
             let handle = thread::spawn(move || {
                 struct HttpWorkerPanicGuard {
+                    ready: ReadyChunks,
                     err_holder: Arc<Mutex<Option<String>>>,
                     cv: Arc<Condvar>,
                 }
                 impl Drop for HttpWorkerPanicGuard {
                     fn drop(&mut self) {
                         if thread::panicking() {
-                            if let Ok(mut err) = self.err_holder.lock() {
-                                if err.is_none() {
-                                    *err = Some("HTTP prefetch worker panicked".to_string());
-                                }
-                            }
-                            self.cv.notify_all();
+                            publish_error(
+                                &self.ready,
+                                &self.err_holder,
+                                &self.cv,
+                                "HTTP prefetch worker panicked".to_string(),
+                            );
                         }
                     }
                 }
 
                 let _panic_guard = HttpWorkerPanicGuard {
+                    ready: Arc::clone(&ready),
                     err_holder: Arc::clone(&err_holder),
                     cv: Arc::clone(&cv),
                 };
@@ -318,7 +344,14 @@ impl RemoteChunkPrefetchQueue {
                         let range = &ranges[job];
                         let source = match sources.get(range.tile_idx).and_then(|s| s.as_ref()) {
                             Some(s) => s,
-                            None => continue,
+                            None => {
+                                // Nothing to fetch; still count the range as finished.
+                                if let Ok(_map) = ready.lock() {
+                                    done.fetch_add(1, Ordering::Relaxed);
+                                }
+                                cv.notify_all();
+                                continue;
+                            }
                         };
 
                         match source.fetch_range(range.start_offset, range.end_offset) {
@@ -337,15 +370,12 @@ impl RemoteChunkPrefetchQueue {
                                         map.insert((range.tile_idx, chunk_idx), chunk_payload);
                                     }
                                 }
+                                done.fetch_add(1, Ordering::Relaxed);
+                                drop(map);
                                 cv.notify_all();
                             }
                             Err(e) => {
-                                if let Ok(mut err) = err_holder.lock() {
-                                    if err.is_none() {
-                                        *err = Some(e.to_string());
-                                    }
-                                }
-                                cv.notify_all();
+                                publish_error(&ready, &err_holder, &cv, e.to_string());
                                 break;
                             }
                         }
@@ -354,12 +384,12 @@ impl RemoteChunkPrefetchQueue {
 
                 if let Err(payload) = res {
                     let msg = crate::error::panic_payload_to_string(payload);
-                    if let Ok(mut err) = err_holder.lock() {
-                        if err.is_none() {
-                            *err = Some(format!("HTTP prefetch worker panicked: {msg}"));
-                        }
-                    }
-                    cv.notify_all();
+                    publish_error(
+                        &ready,
+                        &err_holder,
+                        &cv,
+                        format!("HTTP prefetch worker panicked: {msg}"),
+                    );
                 }
             });
 
@@ -369,7 +399,7 @@ impl RemoteChunkPrefetchQueue {
         Self {
             ready_chunks,
             condvar,
-            next_job,
+            completed_jobs,
             total_jobs,
             scheduled_chunks,
             error,
@@ -409,8 +439,9 @@ impl RemoteChunkPrefetchQueue {
                 return Ok(None);
             }
 
-            // If all ranges have been fetched and the chunk was not found, return None
-            if self.next_job.load(Ordering::Relaxed) >= self.total_jobs && !map.contains_key(&key) {
+            // Only give up once every range has finished fetching. Ranges that
+            // are merely claimed may still be in flight and deliver this chunk.
+            if self.completed_jobs.load(Ordering::Relaxed) >= self.total_jobs {
                 return Ok(None);
             }
 
@@ -442,7 +473,12 @@ impl RemoteChunkPrefetchQueue {
 
     /// Explicitly signal cancellation, unblocking any waiting consumers or workers.
     pub fn cancel(&self) {
+        let map = self
+            .ready_chunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.shutdown.store(true, Ordering::SeqCst);
+        drop(map);
         self.condvar.notify_all();
     }
 }
@@ -459,6 +495,56 @@ impl Drop for RemoteChunkPrefetchQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_terminal_updates_hold_ready_chunks_lock() {
+        for cancel in [false, true] {
+            let queue = Arc::new(RemoteChunkPrefetchQueue::spawn_internal(
+                vec![],
+                vec![],
+                RemotePrefetchConfig::default(),
+            ));
+            // The check-to-wait gap is only accessible through this private mutex.
+            let map = queue.ready_chunks.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_queue = Arc::clone(&queue);
+            let worker = thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                if cancel {
+                    worker_queue.cancel();
+                } else {
+                    publish_error(
+                        &worker_queue.ready_chunks,
+                        &worker_queue.error,
+                        &worker_queue.condvar,
+                        "fetch failed".to_string(),
+                    );
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let early = done_rx.recv_timeout(Duration::from_millis(200));
+            let error_before_unlock = queue.error.lock().unwrap().clone();
+            let shutdown_before_unlock = queue.shutdown.load(Ordering::SeqCst);
+            drop(map);
+            if early.is_err() {
+                done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            worker.join().unwrap();
+            assert!(matches!(
+                early,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(error_before_unlock, None);
+            assert!(!shutdown_before_unlock);
+            if cancel {
+                assert!(queue.shutdown.load(Ordering::SeqCst));
+            } else {
+                assert_eq!(queue.error.lock().unwrap().as_deref(), Some("fetch failed"));
+            }
+        }
+    }
 
     #[test]
     fn test_coalesce_adjacent_chunks() {

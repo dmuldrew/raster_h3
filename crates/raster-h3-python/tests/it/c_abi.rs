@@ -36,8 +36,13 @@ pub unsafe fn take_err(err: *mut c_char) -> Option<String> {
     if err.is_null() {
         return None;
     }
-    let msg = CStr::from_ptr(err).to_string_lossy().into_owned();
-    raster_h3_py_free_string(err);
+    // SAFETY: non-null `err` is a NUL-terminated string from `CString::into_raw` in this
+    // library (caller contract); it is copied, then freed exactly once.
+    let msg = unsafe { CStr::from_ptr(err) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: as above.
+    unsafe { raster_h3_py_free_string(err) };
     Some(msg)
 }
 
@@ -134,6 +139,8 @@ impl Scan {
     /// Calls `raster_h3_py_scan_json`, returning the parsed object or the error message.
     pub fn json(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
         let a = self.c_args();
+        // SAFETY: string arguments are live `CString`s owned by this frame (or null), and
+        // the returned JSON string is copied and then freed exactly once.
         unsafe {
             let mut err: *mut c_char = ptr::null_mut();
             let out = raster_h3_py_scan_json(
@@ -364,6 +371,8 @@ fn scan_json_errors_set_out_err() {
     assert!(!Scan::of(corrupt.path()).json().unwrap_err().is_empty());
 
     // A NULL out_err pointer is tolerated on failure.
+    // SAFETY: every pointer is null, which the function accepts, including a null
+    // `out_err`.
     let result = unsafe {
         raster_h3_py_scan_json(
             ptr::null(),
@@ -423,6 +432,8 @@ fn scan_json_rejects_malformed_options() {
 fn create_arrow_schema_rejects_unknown_format() {
     let format = CString::new("tall").unwrap();
     let mut err: *mut c_char = ptr::null_mut();
+    // SAFETY: `format` is a live `CString`, `columns` is null, and `err` is a writable
+    // `char **` the function may fill.
     let schema = unsafe {
         raster_h3_python::raster_h3_py_create_arrow_schema(
             1,
@@ -432,6 +443,7 @@ fn create_arrow_schema_rejects_unknown_format() {
         )
     };
     assert!(schema.is_null());
+    // SAFETY: `err` was set by the call above and is taken exactly once.
     let msg = unsafe { take_err(err) }.unwrap();
     assert!(msg.contains("Invalid format 'tall'"), "{msg}");
 }

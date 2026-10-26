@@ -7,7 +7,10 @@ use h3o::{CellIndex, LatLng, Resolution};
 
 use super::{
     mvt::{FeatureProperties, MercatorPoint, MvtLayer, PropertyFilter},
-    pyramid::{cell_boundary_mercator, for_each_cell_tile_mercator, h3_res_for_zoom},
+    pyramid::{
+        cell_boundary_mercator, for_each_cell_tile_mercator, h3_res_for_zoom,
+        Wgs84BoundsAccumulator,
+    },
     writer::{tile_id_to_zxy, zxy_to_tile_id, PmtilesWriter},
 };
 use crate::aggregator::multi_horizon::{
@@ -68,7 +71,7 @@ impl<A: SpillAccumulator> AccumulatorMerge for TileCells<A> {
         self.0.extend(other.0.iter().cloned());
     }
     fn heap_bytes(&self) -> usize {
-        self.0.capacity() * std::mem::size_of::<(u64, A)>()
+        self.0.capacity() * size_of::<(u64, A)>()
             + self.0.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>()
     }
 }
@@ -88,7 +91,7 @@ impl<A: SpillAccumulator> SpillAccumulator for TileCells<A> {
         let count = usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "overview tile length overflow")
         })?;
-        if count > limit / std::mem::size_of::<(u64, A)>() {
+        if count > limit / size_of::<(u64, A)>() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "overview tile exceeds budget",
@@ -133,6 +136,7 @@ impl<A: SpillAccumulator> Overview<A> {
         zooms: &[u8],
         filter: &PropertyFilter,
         writer: &mut PmtilesWriter,
+        bounds: &mut Wgs84BoundsAccumulator,
         properties: impl Fn(u64, u8, &A) -> FeatureProperties,
     ) -> io::Result<()> {
         let mut tiles = BufferedMerge::new(BUFFER_BYTES);
@@ -141,10 +145,12 @@ impl<A: SpillAccumulator> Overview<A> {
             let center: LatLng = cell.into();
             let center = MercatorPoint::from_lat_lng(center.lat(), center.lng());
             let (vertices, len) = cell_boundary_mercator(cell);
+            let mut emitted = false;
             for &z in zooms {
                 if h3_res_for_zoom(z) != u8::from(cell.resolution()) {
                     continue;
                 }
+                emitted = true;
                 let mut result = Ok(());
                 for_each_cell_tile_mercator(center, &vertices[..len], z, |x, y| {
                     if result.is_ok() {
@@ -153,6 +159,9 @@ impl<A: SpillAccumulator> Overview<A> {
                     }
                 });
                 result?;
+            }
+            if emitted {
+                bounds.record_cell(cell);
             }
             Ok(())
         })?;

@@ -300,6 +300,11 @@ macro_rules! dispatch_decoding {
                 let $nd = <f64 as $crate::aggregator::nodata::NodataCast>::from_nodata_f64($nodata);
                 $body
             }
+            tiff::decoder::DecodingResult::F16(half) => {
+                let $slice = &half.iter().copied().map(f32::from).collect::<Vec<f32>>();
+                let $nd = <f32 as $crate::aggregator::nodata::NodataCast>::from_nodata_f64($nodata);
+                $body
+            }
         }
     };
 }

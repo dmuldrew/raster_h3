@@ -51,7 +51,7 @@ fn test_h3_cell_and_hex_bbox_pushdown_high_latitude_and_antimeridian() {
             // Normalized chord interpolation follows the same great-circle arc.
             // Vertices alone do not exercise latitude extrema inside an edge.
             let boundary = cell.boundary();
-            let xyz = |p: h3o::LatLng| {
+            let xyz = |p: LatLng| {
                 let (lat, lon) = (p.lat().to_radians(), p.lng().to_radians());
                 [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
             };

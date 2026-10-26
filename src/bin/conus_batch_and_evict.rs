@@ -76,6 +76,8 @@ struct TileJob {
 /// Query current process resident set size (RSS) in megabytes
 fn get_process_rss_mb() -> Option<f64> {
     #[cfg(unix)]
+    // SAFETY: `rusage` is a plain C struct of integers and `timeval`s, so all-zero bytes are
+    // valid, and `getrusage` only writes into the local it is given.
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {

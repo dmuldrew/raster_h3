@@ -214,7 +214,7 @@ pub const PROP_ALL_CATEGORICAL: u16 = (1 << 8) - 1;
 pub struct PropertyFilter {
     pub continuous_mask: u16,
     pub categorical_mask: u16,
-    pub generic_whitelist: Option<fxhash::FxHashSet<String>>,
+    pub generic_whitelist: Option<rustc_hash::FxHashSet<String>>,
     pub is_custom: bool,
 }
 
@@ -244,7 +244,7 @@ impl PropertyFilter {
 
         let mut cont_mask = 0u16;
         let mut cat_mask = 0u16;
-        let mut generic_set = fxhash::FxHashSet::default();
+        let mut generic_set = rustc_hash::FxHashSet::default();
 
         for part in trimmed.split(',') {
             let token = part.trim().to_ascii_lowercase();
@@ -714,11 +714,56 @@ impl MvtLayer {
         let merc_span = y_merc_bottom - y_merc_top;
 
         let count = vertices.len().min(10);
+        let mut ulng = [0.0f64; 10];
+        let mut min_raw_lng = f64::INFINITY;
+        let mut max_raw_lng = f64::NEG_INFINITY;
+        for (i, v) in vertices.iter().take(count).enumerate() {
+            let lng = v.lng();
+            ulng[i] = lng;
+            min_raw_lng = min_raw_lng.min(lng);
+            max_raw_lng = max_raw_lng.max(lng);
+        }
+
+        if count > 0 && max_raw_lng - min_raw_lng > 180.0 {
+            let mut min_u = ulng[0];
+            let mut max_u = ulng[0];
+            for i in 1..count {
+                let mut l = ulng[i];
+                while l - ulng[i - 1] > 180.0 {
+                    l -= 360.0;
+                }
+                while l - ulng[i - 1] < -180.0 {
+                    l += 360.0;
+                }
+                ulng[i] = l;
+                min_u = min_u.min(l);
+                max_u = max_u.max(l);
+            }
+            if max_u - min_u < 180.0 {
+                let mid_u = 0.5 * (min_u + max_u);
+                let tile_center_lon = 0.5 * (tile_min_lon + tile_max_lon);
+                let shift = if mid_u - tile_center_lon > 180.0 {
+                    -360.0
+                } else if mid_u - tile_center_lon < -180.0 {
+                    360.0
+                } else {
+                    0.0
+                };
+                for l in &mut ulng[..count] {
+                    *l += shift;
+                }
+            } else {
+                for (i, v) in vertices.iter().take(count).enumerate() {
+                    ulng[i] = v.lng();
+                }
+            }
+        }
+
         let mut px = [0i32; 10];
         let mut py = [0i32; 10];
 
         for (i, v) in vertices.iter().take(count).enumerate() {
-            px[i] = ((v.lng() - tile_min_lon) / lon_span * extent_f).round() as i32;
+            px[i] = ((ulng[i] - tile_min_lon) / lon_span * extent_f).round() as i32;
 
             let lat_clamped = v.lat().clamp(-85.05112878, 85.05112878);
             let lat_rad = lat_clamped.to_radians();
@@ -731,6 +776,25 @@ impl MvtLayer {
             };
         }
 
+        // A world tile needs the ring on both sides of the dateline, just as
+        // in MvtFeature::from_mercator. Smaller tiles use only their own branch.
+        let wrapped_x_offset = if (lon_span - 360.0).abs() < 1e-9 {
+            let lo = ulng[..count].iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = ulng[..count]
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            if hi - lo < 180.0 && lo < tile_min_lon {
+                self.extent as i32
+            } else if hi - lo < 180.0 && hi > tile_max_lon {
+                -(self.extent as i32)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         self.seen_ids.insert(id);
         self.features.push(MvtFeature {
             id,
@@ -738,14 +802,15 @@ impl MvtLayer {
             polygon_x: px,
             polygon_y: py,
             num_points: count as u8,
-            wrapped_x_offset: 0,
+            wrapped_x_offset,
         });
     }
 
     /// Encode this layer and its features into MVT Protobuf binary bytes
     pub fn encode(&self) -> Vec<u8> {
-        let mut key_map: fxhash::FxHashMap<Cow<'static, str>, u32> = fxhash::FxHashMap::default();
-        let mut val_map: fxhash::FxHashMap<MvtValue, u32> = fxhash::FxHashMap::default();
+        let mut key_map: rustc_hash::FxHashMap<Cow<'static, str>, u32> =
+            rustc_hash::FxHashMap::default();
+        let mut val_map: rustc_hash::FxHashMap<MvtValue, u32> = rustc_hash::FxHashMap::default();
         let mut keys: Vec<String> = Vec::new();
         let mut values: Vec<MvtValue> = Vec::new();
 

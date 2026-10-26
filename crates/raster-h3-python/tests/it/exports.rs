@@ -28,6 +28,8 @@ fn parquet(
     categorical: bool,
 ) -> Result<i64, String> {
     let (i, o, r) = (c(input), c(output), c(res));
+    // SAFETY: string arguments are live `CString`s owned by this frame (or null), and `err`
+    // is a writable out-pointer whose string `take_err` frees.
     unsafe {
         let mut err: *mut c_char = ptr::null_mut();
         let n = raster_h3_py_export_parquet(
@@ -57,6 +59,8 @@ fn pmtiles(
     categorical: bool,
 ) -> Result<i64, String> {
     let (i, o, r) = (c(input), c(output), c(res));
+    // SAFETY: string arguments are live `CString`s owned by this frame (or null), and `err`
+    // is a writable out-pointer whose string `take_err` frees.
     unsafe {
         let mut err: *mut c_char = ptr::null_mut();
         let n = raster_h3_py_export_pmtiles(
@@ -128,6 +132,8 @@ fn export_error_paths_return_minus_one_with_a_message() {
     }
 
     // NULL out_err is tolerated.
+    // SAFETY: every pointer is null, which the function accepts, including a null
+    // `out_err`.
     let n = unsafe {
         raster_h3_py_export_parquet(
             ptr::null(),
@@ -140,6 +146,8 @@ fn export_error_paths_return_minus_one_with_a_message() {
         )
     };
     assert_eq!(n, -1);
+    // SAFETY: every pointer is null, which the function accepts, including a null
+    // `out_err`.
     let n = unsafe {
         raster_h3_py_export_pmtiles(
             ptr::null(),

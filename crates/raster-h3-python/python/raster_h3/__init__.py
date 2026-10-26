@@ -7,7 +7,7 @@ Provides:
 - `scan_raster_h3()` / `read_raster_h3()`: Polars IO plugin (`register_io_source`) with column projection
   and row-limit pushdown.
 - Scalar and vectorized H3 helpers (`h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`,
-  `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`).
+  `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_polygon_to_cells`).
 - Direct file exporters (`raster_to_parquet`, `raster_to_pmtiles`).
 """
 
@@ -173,6 +173,19 @@ def _get_lib() -> ctypes.CDLL:
     ]
     lib.raster_h3_py_h3_to_wkb.restype = ctypes.c_size_t
 
+    lib.raster_h3_py_h3_polygon_to_cells.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_int64,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.raster_h3_py_h3_polygon_to_cells.restype = ctypes.c_int
+
+    lib.raster_h3_py_free_cells.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+    lib.raster_h3_py_free_cells.restype = None
+
     # Exporters
     lib.raster_h3_py_export_parquet.argtypes = [
         ctypes.c_char_p,
@@ -212,14 +225,26 @@ ctypes.pythonapi.PyCapsule_New.argtypes = [
 ]
 ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
 
-ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+ctypes.pythonapi.PyCapsule_GetName.argtypes = [ctypes.c_void_p]
+ctypes.pythonapi.PyCapsule_GetName.restype = ctypes.c_void_p
+
+ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+
+
+def _capsule_pointer(capsule_ptr: int) -> Optional[int]:
+    # Consumers may rename a capsule once they take ownership (e.g. to
+    # `used_arrow_array_stream`), so look it up by whatever name it has now.
+    # The outer struct is still ours to free; a consumed payload has its
+    # `release` set to NULL, which the native free skips.
+    name = ctypes.pythonapi.PyCapsule_GetName(capsule_ptr)
+    return ctypes.pythonapi.PyCapsule_GetPointer(capsule_ptr, name)
 
 
 @_PYCAPSULE_DESTRUCTOR
 def _schema_capsule_destructor(capsule_ptr: int) -> None:
     if capsule_ptr and _LIB is not None:
-        ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule_ptr, b"arrow_schema")
+        ptr = _capsule_pointer(capsule_ptr)
         if ptr:
             _LIB.raster_h3_py_free_arrow_schema(ptr)
 
@@ -227,7 +252,7 @@ def _schema_capsule_destructor(capsule_ptr: int) -> None:
 @_PYCAPSULE_DESTRUCTOR
 def _stream_capsule_destructor(capsule_ptr: int) -> None:
     if capsule_ptr and _LIB is not None:
-        ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule_ptr, b"arrow_array_stream")
+        ptr = _capsule_pointer(capsule_ptr)
         if ptr:
             _LIB.raster_h3_py_free_arrow_stream(ptr)
 
@@ -561,7 +586,10 @@ def scan_raster_h3(
             # `n_rows` can only be pushed into the scan when no predicate runs after it;
             # otherwise it caps the rows that survive the filter.
             if predicate is None:
-                scan_limit = n_rows if n_rows is not None else limit
+                # Narrow, never widen, the caller's explicit `limit`.
+                scan_limit = (
+                    limit if n_rows is None else n_rows if limit is None else min(limit, n_rows)
+                )
                 remaining = None
             else:
                 scan_limit = limit
@@ -680,6 +708,47 @@ def h3_cell_to_parent(
     return res if res != 0 else None
 
 
+def h3_polygon_to_cells(
+    wkb: bytes, resolution: int, containment: str = "contains_centroid"
+) -> Optional[List[int]]:
+    """Fill a WKB POLYGON / MULTIPOLYGON (WGS84 lon/lat degrees) with H3 cells.
+
+    Returns the cells sorted ascending and deduplicated, or ``None`` if ``wkb`` is not a
+    valid polygonal WKB or ``resolution`` is outside 0..15. ``containment`` is one of
+    ``contains_centroid`` (default, alias ``center``), ``contains_boundary`` (``full``),
+    ``intersects_boundary`` or ``covers`` (``overlapping``); an unknown name, or a polygon
+    that would exceed 10,000,000 cells, raises ``ValueError``.
+    """
+    resolution = int(resolution)
+    if not 0 <= resolution <= 15:
+        return None
+    lib = _get_lib()
+    data = bytes(wkb)
+    out_cells = ctypes.POINTER(ctypes.c_uint64)()
+    out_len = ctypes.c_size_t(0)
+    status = lib.raster_h3_py_h3_polygon_to_cells(
+        data,
+        len(data),
+        resolution,
+        containment.encode("utf-8"),
+        ctypes.byref(out_cells),
+        ctypes.byref(out_len),
+    )
+    if status == 0:
+        try:
+            return [int(out_cells[i]) for i in range(out_len.value)]
+        finally:
+            lib.raster_h3_py_free_cells(out_cells, out_len.value)
+    if status == 2:
+        raise ValueError(f"unknown containment mode {containment!r}")
+    if status == 3:
+        raise ValueError(
+            "polygon would produce more than 10,000,000 cells; "
+            "use a coarser resolution or split the polygon"
+        )
+    return None
+
+
 def raster_to_parquet(
     input_path: Union[str, Path],
     output_path: Union[str, Path],
@@ -738,6 +807,7 @@ __all__ = [
     "h3_is_valid",
     "h3_to_wkb",
     "h3_cell_to_parent",
+    "h3_polygon_to_cells",
     "raster_to_parquet",
     "raster_to_pmtiles",
 ]
