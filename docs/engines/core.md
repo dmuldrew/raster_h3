@@ -85,6 +85,45 @@ TM certification follows proj4rs scale precedence (`k0`, then `k`) and fails
 open for duplicate parameters or syntax it cannot interpret unambiguously. See
 [Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
 
+### Profiling and wave dispatch
+
+The streamers' `metrics()` method returns a `StreamProfile`. Dispatch counters are
+collected even without `stream-profile`:
+
+| Counter | Meaning |
+| :--- | :--- |
+| `waves` | Non-empty kernel dispatches, each containing up to `worker_tasks` window jobs (`jobs` counts the individual jobs). |
+| `bridged_waves` | Waves sent to a dedicated aggregation pool via a newly spawned helper OS thread because the caller is a worker of another Rayon pool. |
+| `serial_waves` | Waves executed serially on the caller: it is already a worker of the dedicated pool, or is a Rayon worker with no dedicated pool. |
+
+Direct non-Rayon callers dispatch in parallel using the dedicated pool when
+configured, otherwise the ambient global pool; neither subtype counter increases.
+The subtype counters are disjoint subsets of `waves`. Serial execution and the
+helper-thread bridge avoid Rayon work-stealing deadlocks when callers hold locks.
+`stream-profile` additionally enables hot-path per-sample worker counters and timers.
+
+Prefer local profiling on stable hardware for performance comparisons. Run the
+hotspot harness with:
+
+```bash
+cargo run --locked --release -p raster-h3-core --example profile_hotspots -- --quick --json profile.json
+```
+
+Omit `--quick` for the full profile. Record the commit SHA, hardware, thread count,
+and configuration alongside results, and keep those conditions consistent when
+comparing changes. For an optional hosted run, use **Actions → Hotspot Profile →
+Run workflow** and select the branch and optional `quick` input. The workflow is
+manual-only; hosted timings are informational. Normal CI runs the harness's
+ownership-sampling test without running the profiling experiments.
+
+It reports mosaic planning, ownership calls sampled equally over each tile's full
+pixel footprint (including non-overlap samples), end-to-end overlap rules, and the
+four direct/nested × dedicated/ambient dispatch combinations. Allocation columns
+for mosaic opening include file opening **and** planning. Allocator peaks are
+approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
+wall-time comparisons include decoding and scheduling; they do not isolate bridge
+cost. The bare spawn/join measurement is only an isolated baseline.
+
 ### Mosaic decoder cache
 
 `PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF
@@ -272,5 +311,5 @@ a secondary panic escape; every adapter uses it at its FFI boundary.
 
 | Feature | Effect |
 | :--- | :--- |
-| `stream-profile` | Collects `StreamProfile` counters (peak active/decoded/compaction bytes, forced flushes). The root crate forwards it to core and DuckDB. |
+| `stream-profile` | Enables per-sample worker instrumentation. Stream-level `StreamProfile` counters (including `waves`, `bridged_waves`, `serial_waves` and memory peaks) are always available. The root crate forwards the feature to core and DuckDB. |
 | `test-hooks` | Exposes test-only synchronisation hooks (for example `OrderedPrefetchQueue::wait_for_blocked_job`) to other workspace crates' tests. Not for release builds. |

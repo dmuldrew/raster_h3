@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `profile_hotspots` example and `profile.yml` workflow measuring mosaic tile-scan scaling and nested-Rayon wave dispatch, with a counting allocator. `StreamProfile` gains `waves`, `bridged_waves` and `serial_waves` counters.
 - GDAL band `SCALE`/`OFFSET` calibration: continuous statistics, quantiles and spectral indices now use `stored * scale + offset` per band (and per mosaic file). NoData is still matched on stored values. Opt out with DuckDB `scale_offset := false`, CLI `--raw-values`, DataFusion `with_scale_offset(false)` or `MultiResolutionConfig::apply_scale_offset`. Malformed scale/offset metadata is rejected when the file is opened.
 - TIFF alpha: pixels whose `ExtraSamples` alpha sample is zero are excluded from continuous and categorical aggregation.
 

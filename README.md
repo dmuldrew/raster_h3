@@ -23,6 +23,13 @@ support horizontal shear and profiling builds; Albers inverse constants are prep
 under an immutable borrow to avoid stale state after public source-field updates.
 See the [core engine notes](docs/engines/core.md) for projection behavior.
 
+Streamer `metrics()` exposes `StreamProfile::waves` (kernel dispatches),
+`bridged_waves` (helper-thread dispatches from an external Rayon worker to a
+dedicated pool), and `serial_waves` (dispatches run on the calling Rayon worker).
+These counters are available without `stream-profile`; that feature adds per-sample
+instrumentation. See [profiling and wave dispatch](docs/engines/core.md#profiling-and-wave-dispatch)
+for the execution policy and hotspot harness.
+
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
 | **H3 table / Arrow stream** | SQL analytics, JOINs, DataFrames | DuckDB, Python/Polars, PostgreSQL, DataFusion, CLI (NDJSON / `RH3IPC01`) |

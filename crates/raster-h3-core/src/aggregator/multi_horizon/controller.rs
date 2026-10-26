@@ -580,11 +580,14 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 // the dedicated pool through a helper OS thread, whose join
                 // blocks without stealing, or, with no dedicated pool, run it
                 // serially.
+                self.metrics.waves += 1;
                 match &self.pool {
                     Some(pool) if pool.current_thread_index().is_some() => {
+                        self.metrics.serial_waves += 1;
                         results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
                     }
                     Some(pool) if rayon::current_thread_index().is_some() => {
+                        self.metrics.bridged_waves += 1;
                         std::thread::scope(|s| {
                             s.spawn(|| pool.install(|| parallel(&mut maps, &mut results)))
                                 .join()
@@ -593,6 +596,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     }
                     Some(pool) => pool.install(|| parallel(&mut maps, &mut results)),
                     None if rayon::current_thread_index().is_some() => {
+                        self.metrics.serial_waves += 1;
                         results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
                     }
                     None => parallel(&mut maps, &mut results),
