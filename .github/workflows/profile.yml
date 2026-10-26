@@ -1,5 +1,6 @@
 name: Hotspot Profile
 
+# Optional manual run; prefer local profiling on stable hardware for comparisons.
 # Measures mosaic tile-scan scaling and nested-Rayon wave dispatch (see
 # crates/raster-h3-core/examples/profile_hotspots.rs). Results go to the job
 # summary, `::notice` annotations and a JSON artifact. Wall times on hosted
@@ -12,11 +13,6 @@ on:
         description: 'Smaller sizes for a fast smoke run'
         type: boolean
         default: false
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'crates/raster-h3-core/examples/profile_hotspots.rs'
-      - '.github/workflows/profile.yml'
 
 permissions:
   contents: read
@@ -38,7 +34,7 @@ jobs:
           QUICK: ${{ inputs.quick && '--quick' || '' }}
         run: |
           nproc
-          cargo run --locked --release -p raster-h3-core --example profile_hotspots -- $QUICK --json profile.json
+          cargo run --locked --release -p raster-h3-core --example profile_hotspots -- ${QUICK:+"$QUICK"} --json profile.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hotspot-profile-${{ github.sha }}

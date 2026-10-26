@@ -102,11 +102,19 @@ The subtype counters are disjoint subsets of `waves`. Serial execution and the
 helper-thread bridge avoid Rayon work-stealing deadlocks when callers hold locks.
 `stream-profile` additionally enables hot-path per-sample worker counters and timers.
 
-Run the hotspot harness with:
+Prefer local profiling on stable hardware for performance comparisons. Run the
+hotspot harness with:
 
 ```bash
 cargo run --locked --release -p raster-h3-core --example profile_hotspots -- --quick --json profile.json
 ```
+
+Omit `--quick` for the full profile. Record the commit SHA, hardware, thread count,
+and configuration alongside results, and keep those conditions consistent when
+comparing changes. For an optional hosted run, use **Actions → Hotspot Profile →
+Run workflow** and select the branch and optional `quick` input. The workflow is
+manual-only; hosted timings are informational. Normal CI runs the harness's
+ownership-sampling test without running the profiling experiments.
 
 It reports mosaic planning, ownership calls sampled equally over each tile's full
 pixel footprint (including non-overlap samples), end-to-end overlap rules, and the
