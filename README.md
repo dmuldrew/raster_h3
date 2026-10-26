@@ -165,6 +165,11 @@ result = (
 )
 ```
 
+Python scans reject malformed `resolutions`, `format` and `bbox` with `RuntimeError`
+instead of silently ignoring them or using defaults. Parquet and PMTiles exports
+also reject invalid resolutions; every resolution must be between 0 and 15. See the
+[Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
+
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars.
 
 ### Why Intermediate H3 Aggregations Change Everything
