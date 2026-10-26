@@ -8,14 +8,14 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 33 modules, 1 binary | 289 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 33 modules, 1 binary | 304 |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
 | [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 10 |
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 10 (7 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 191 |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 200 |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -185,8 +185,8 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (19) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
-| Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (6) | Range validation, caching, coalescing and backoff. |
+| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (22) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
+| Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
 
 ## 14. Mosaics & overlap rules
 

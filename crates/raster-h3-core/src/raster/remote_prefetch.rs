@@ -126,6 +126,25 @@ pub fn coalesce_chunk_ranges(
 /// Fetched chunk bytes keyed by (tile, chunk index), shared with the workers.
 type ReadyChunks = Arc<Mutex<FxHashMap<(usize, u32), Arc<Vec<u8>>>>>;
 
+fn publish_error(
+    ready: &ReadyChunks,
+    error: &Mutex<Option<String>>,
+    condvar: &Condvar,
+    message: String,
+) {
+    // Serialize terminal predicate updates with the consumer's check and wait.
+    let map = ready
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Ok(mut error) = error.lock() {
+        if error.is_none() {
+            *error = Some(message);
+        }
+    }
+    drop(map);
+    condvar.notify_all();
+}
+
 /// Parallel asynchronous prefetch queue managing concurrent HTTP Range requests
 pub struct RemoteChunkPrefetchQueue {
     ready_chunks: ReadyChunks,
@@ -276,23 +295,25 @@ impl RemoteChunkPrefetchQueue {
 
             let handle = thread::spawn(move || {
                 struct HttpWorkerPanicGuard {
+                    ready: ReadyChunks,
                     err_holder: Arc<Mutex<Option<String>>>,
                     cv: Arc<Condvar>,
                 }
                 impl Drop for HttpWorkerPanicGuard {
                     fn drop(&mut self) {
                         if thread::panicking() {
-                            if let Ok(mut err) = self.err_holder.lock() {
-                                if err.is_none() {
-                                    *err = Some("HTTP prefetch worker panicked".to_string());
-                                }
-                            }
-                            self.cv.notify_all();
+                            publish_error(
+                                &self.ready,
+                                &self.err_holder,
+                                &self.cv,
+                                "HTTP prefetch worker panicked".to_string(),
+                            );
                         }
                     }
                 }
 
                 let _panic_guard = HttpWorkerPanicGuard {
+                    ready: Arc::clone(&ready),
                     err_holder: Arc::clone(&err_holder),
                     cv: Arc::clone(&cv),
                 };
@@ -354,12 +375,7 @@ impl RemoteChunkPrefetchQueue {
                                 cv.notify_all();
                             }
                             Err(e) => {
-                                if let Ok(mut err) = err_holder.lock() {
-                                    if err.is_none() {
-                                        *err = Some(e.to_string());
-                                    }
-                                }
-                                cv.notify_all();
+                                publish_error(&ready, &err_holder, &cv, e.to_string());
                                 break;
                             }
                         }
@@ -368,12 +384,12 @@ impl RemoteChunkPrefetchQueue {
 
                 if let Err(payload) = res {
                     let msg = crate::error::panic_payload_to_string(payload);
-                    if let Ok(mut err) = err_holder.lock() {
-                        if err.is_none() {
-                            *err = Some(format!("HTTP prefetch worker panicked: {msg}"));
-                        }
-                    }
-                    cv.notify_all();
+                    publish_error(
+                        &ready,
+                        &err_holder,
+                        &cv,
+                        format!("HTTP prefetch worker panicked: {msg}"),
+                    );
                 }
             });
 
@@ -457,7 +473,12 @@ impl RemoteChunkPrefetchQueue {
 
     /// Explicitly signal cancellation, unblocking any waiting consumers or workers.
     pub fn cancel(&self) {
+        let map = self
+            .ready_chunks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.shutdown.store(true, Ordering::SeqCst);
+        drop(map);
         self.condvar.notify_all();
     }
 }
@@ -474,6 +495,56 @@ impl Drop for RemoteChunkPrefetchQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_terminal_updates_hold_ready_chunks_lock() {
+        for cancel in [false, true] {
+            let queue = Arc::new(RemoteChunkPrefetchQueue::spawn_internal(
+                vec![],
+                vec![],
+                RemotePrefetchConfig::default(),
+            ));
+            // The check-to-wait gap is only accessible through this private mutex.
+            let map = queue.ready_chunks.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_queue = Arc::clone(&queue);
+            let worker = thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                if cancel {
+                    worker_queue.cancel();
+                } else {
+                    publish_error(
+                        &worker_queue.ready_chunks,
+                        &worker_queue.error,
+                        &worker_queue.condvar,
+                        "fetch failed".to_string(),
+                    );
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let early = done_rx.recv_timeout(Duration::from_millis(200));
+            let error_before_unlock = queue.error.lock().unwrap().clone();
+            let shutdown_before_unlock = queue.shutdown.load(Ordering::SeqCst);
+            drop(map);
+            if early.is_err() {
+                done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            worker.join().unwrap();
+            assert!(matches!(
+                early,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(error_before_unlock, None);
+            assert!(!shutdown_before_unlock);
+            if cancel {
+                assert!(queue.shutdown.load(Ordering::SeqCst));
+            } else {
+                assert_eq!(queue.error.lock().unwrap().as_deref(), Some("fetch failed"));
+            }
+        }
+    }
 
     #[test]
     fn test_coalesce_adjacent_chunks() {
@@ -652,217 +723,5 @@ mod tests {
         assert_eq!(queue.get_chunk_payload(1, 0).unwrap(), None);
         assert_eq!(queue.try_get_chunk_payload(0, 0), None);
         assert_eq!(queue.try_get_chunk_payload(1, 0), None);
-    }
-
-    /// Minimal HTTP range server whose responses for offsets at or past
-    /// `gate_offset` are held until the gate opens.
-    struct GatedRangeServer {
-        url: String,
-        gate: Arc<(Mutex<bool>, Condvar)>,
-        gated_waiting: Arc<AtomicUsize>,
-        requests_by_start: Arc<Mutex<FxHashMap<u64, usize>>>,
-        shutdown: Arc<AtomicBool>,
-        handle: Option<JoinHandle<()>>,
-    }
-
-    impl GatedRangeServer {
-        fn start(file: Vec<u8>, gate_offset: u64) -> Self {
-            use std::io::{BufRead, BufReader, Write};
-            use std::net::TcpListener;
-
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-            listener.set_nonblocking(true).unwrap();
-            let url = format!("http://{}/test.tif", listener.local_addr().unwrap());
-            let file = Arc::new(file);
-            let gate = Arc::new((Mutex::new(false), Condvar::new()));
-            let gated_waiting = Arc::new(AtomicUsize::new(0));
-            let requests_by_start = Arc::new(Mutex::new(FxHashMap::default()));
-            let shutdown = Arc::new(AtomicBool::new(false));
-
-            let (g, w, r, s) = (
-                Arc::clone(&gate),
-                Arc::clone(&gated_waiting),
-                Arc::clone(&requests_by_start),
-                Arc::clone(&shutdown),
-            );
-            let handle = thread::spawn(move || {
-                while !s.load(Ordering::SeqCst) {
-                    let stream = match listener.accept() {
-                        Ok((stream, _)) => stream,
-                        Err(_) => {
-                            thread::sleep(Duration::from_millis(2));
-                            continue;
-                        }
-                    };
-                    let (file, g, w, r) = (
-                        Arc::clone(&file),
-                        Arc::clone(&g),
-                        Arc::clone(&w),
-                        Arc::clone(&r),
-                    );
-                    thread::spawn(move || {
-                        let _ = stream.set_nonblocking(false);
-                        let mut reader = BufReader::new(stream.try_clone().unwrap());
-                        let mut range = None;
-                        loop {
-                            let mut line = String::new();
-                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                                return;
-                            }
-                            let line = line.trim_end();
-                            if line.is_empty() {
-                                break;
-                            }
-                            if let Some(v) = line
-                                .to_ascii_lowercase()
-                                .strip_prefix("range: bytes=")
-                                .map(str::to_owned)
-                            {
-                                let (a, b) = v.split_once('-').unwrap();
-                                range =
-                                    Some((a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap()));
-                            }
-                        }
-                        let total = file.len() as u64;
-                        let (start, end) = range.expect("test server expects Range requests");
-                        let end = end.min(total - 1);
-                        *r.lock().unwrap().entry(start).or_insert(0) += 1;
-
-                        if start >= gate_offset {
-                            w.fetch_add(1, Ordering::SeqCst);
-                            let (lock, cv) = &*g;
-                            let mut open = lock.lock().unwrap();
-                            while !*open {
-                                open = cv.wait(open).unwrap();
-                            }
-                        }
-
-                        let body = &file[start as usize..=end as usize];
-                        let mut stream = stream;
-                        let header = format!(
-                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(header.as_bytes());
-                        let _ = stream.write_all(body);
-                    });
-                }
-            });
-
-            Self {
-                url,
-                gate,
-                gated_waiting,
-                requests_by_start,
-                shutdown,
-                handle: Some(handle),
-            }
-        }
-
-        fn open_gate(&self) {
-            let (lock, cv) = &*self.gate;
-            *lock.lock().unwrap() = true;
-            cv.notify_all();
-        }
-
-        fn requests_for(&self, start: u64) -> usize {
-            *self
-                .requests_by_start
-                .lock()
-                .unwrap()
-                .get(&start)
-                .unwrap_or(&0)
-        }
-    }
-
-    impl Drop for GatedRangeServer {
-        fn drop(&mut self) {
-            self.open_gate();
-            self.shutdown.store(true, Ordering::SeqCst);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-        }
-    }
-
-    /// Regression: once every range has been *claimed* by a worker,
-    /// `get_chunk_payload` must keep waiting for ranges still in flight
-    /// rather than reporting the chunk as unavailable (which made the decoder
-    /// re-fetch the same bytes and orphaned the late payload in the map).
-    #[test]
-    fn test_waits_for_in_flight_ranges_after_all_jobs_claimed() {
-        const GATE: u64 = 200_000;
-        let file: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
-        let server = GatedRangeServer::start(file.clone(), GATE);
-        let source = Arc::new(RemoteHttpSource::open(&server.url).expect("open test source"));
-
-        // Two chunks far enough apart to stay in separate ranges.
-        let chunks = [
-            ChunkLocation {
-                tile_idx: 0,
-                chunk_idx: 0,
-                offset: 200_000,
-                length: 1_000,
-            },
-            ChunkLocation {
-                tile_idx: 0,
-                chunk_idx: 1,
-                offset: 600_000,
-                length: 1_000,
-            },
-        ];
-        let cfg = RemotePrefetchConfig {
-            num_workers: 2,
-            ..Default::default()
-        };
-        let ranges = coalesce_chunk_ranges(&chunks, cfg.max_gap_bytes, cfg.max_range_bytes);
-        assert_eq!(ranges.len(), 2);
-        let queue = RemoteChunkPrefetchQueue::spawn_internal(vec![Some(source)], ranges, cfg);
-
-        // Wait until both ranges are claimed and blocked in flight.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while server.gated_waiting.load(Ordering::SeqCst) < 2 {
-            if std::time::Instant::now() >= deadline {
-                server.open_gate();
-                panic!("ranges were never requested");
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        let early = thread::scope(|s| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let q = &queue;
-            s.spawn(move || {
-                let result = q
-                    .get_chunk_payload(0, 1)
-                    .map(|p| p.map(|v| v.to_vec()))
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(result);
-            });
-            // The consumer must still be waiting while the response is held.
-            let early = rx.recv_timeout(Duration::from_millis(200)).ok();
-            server.open_gate();
-            let late = rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("consumer never returned");
-            (early, late)
-        });
-        let (early, late) = early;
-
-        assert!(
-            early.is_none(),
-            "get_chunk_payload returned {early:?} while its range was still in flight"
-        );
-        assert_eq!(late.unwrap().as_deref(), Some(&file[600_000..601_000]));
-        assert_eq!(
-            queue
-                .get_chunk_payload(0, 0)
-                .unwrap()
-                .as_deref()
-                .map(|v| v.as_slice()),
-            Some(&file[200_000..201_000])
-        );
-        assert_eq!(server.requests_for(200_000), 1);
-        assert_eq!(server.requests_for(600_000), 1);
     }
 }
