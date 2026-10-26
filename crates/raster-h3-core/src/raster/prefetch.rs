@@ -6,7 +6,7 @@ use tiff::decoder::DecodingResult;
 
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::{ChunkDecoder, GeoTiffStreamReader};
-use crate::raster::mosaic::MosaicReader;
+use crate::raster::mosaic::{MosaicChunkRef, MosaicReader};
 use crate::raster::remote_prefetch::RemoteChunkPrefetchQueue;
 use crate::raster::RasterChunk;
 
@@ -22,6 +22,76 @@ impl<F: FnOnce()> Drop for WorkerPanicGuard<F> {
                 f();
             }
         }
+    }
+}
+
+/// Most tile decoders one mosaic decode worker keeps open at once.
+pub const MAX_OPEN_DECODERS_PER_WORKER: usize = 16;
+
+/// Next job referencing the same tile, or `usize::MAX` for its last job.
+fn next_tile_uses(chunk_refs: &[MosaicChunkRef], tile_count: usize) -> Arc<[usize]> {
+    let mut next_uses = vec![usize::MAX; chunk_refs.len()];
+    let mut next_by_tile = vec![usize::MAX; tile_count];
+    for (job_id, chunk_ref) in chunk_refs.iter().enumerate().rev() {
+        next_uses[job_id] = next_by_tile[chunk_ref.tile_idx];
+        next_by_tile[chunk_ref.tile_idx] = job_id;
+    }
+    next_uses.into()
+}
+
+/// Evict the tile needed furthest in the future, avoiding LRU thrashing when
+/// a latitude band spans more tiles than the cache can hold.
+struct DecoderCache<T> {
+    capacity: usize,
+    next_uses: Arc<[usize]>,
+    /// (tile index, next use, value); short enough for linear scans.
+    entries: Vec<(usize, usize, T)>,
+}
+
+impl<T> DecoderCache<T> {
+    fn new(capacity: usize, next_uses: Arc<[usize]>) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            next_uses,
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn get_or_try_open<E>(
+        &mut self,
+        key: usize,
+        job_id: usize,
+        open: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<&mut T, E> {
+        let pos = match self.entries.iter().position(|(k, _, _)| *k == key) {
+            Some(pos) => pos,
+            None => {
+                if self.entries.len() == self.capacity {
+                    // Other workers may have processed some of the predicted uses.
+                    for (_, next_use, _) in &mut self.entries {
+                        while *next_use <= job_id {
+                            *next_use = self.next_uses[*next_use];
+                        }
+                    }
+                    let furthest = (0..self.entries.len())
+                        .max_by_key(|&i| self.entries[i].1)
+                        .expect("capacity is at least one");
+                    self.entries.swap_remove(furthest);
+                }
+                let value = open()?;
+                self.entries.push((key, 0, value));
+                self.entries.len() - 1
+            }
+        };
+        let entry = &mut self.entries[pos];
+        entry.1 = self.next_uses.get(job_id).copied().unwrap_or(usize::MAX);
+        Ok(&mut entry.2)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -659,6 +729,8 @@ impl PrefetchedChunkReader {
 pub struct PrefetchedMosaicReader {
     queue: Arc<OrderedPrefetchQueue<MosaicPrefetchItem>>,
     budget: Arc<DecodeBudget>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    decoder_opens: Arc<AtomicUsize>,
     _remote_queue: Option<Arc<RemoteChunkPrefetchQueue>>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
@@ -738,6 +810,8 @@ impl PrefetchedMosaicReader {
         let remote_queue =
             RemoteChunkPrefetchQueue::spawn_mosaic(&mosaic, Some(remote_config)).map(Arc::new);
         let total_jobs = mosaic.chunk_refs.len();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let decoder_opens = Arc::new(AtomicUsize::new(0));
         let queue = Arc::new(OrderedPrefetchQueue::new(
             buffer_capacity.max(16),
             total_jobs,
@@ -753,9 +827,16 @@ impl PrefetchedMosaicReader {
                 budget,
                 _remote_queue: remote_queue,
                 _worker_handles: Vec::new(),
+                #[cfg(any(test, feature = "test-hooks"))]
+                decoder_opens,
             };
         }
 
+        let next_uses = if mosaic.tiles.len() > MAX_OPEN_DECODERS_PER_WORKER {
+            next_tile_uses(&mosaic.chunk_refs, mosaic.tiles.len())
+        } else {
+            Arc::from([])
+        };
         let next_job_idx = Arc::new(AtomicUsize::new(0));
         let actual_workers = num_workers.max(1).min(total_jobs);
         let mut handles = Vec::with_capacity(actual_workers);
@@ -766,6 +847,9 @@ impl PrefetchedMosaicReader {
             let worker_queue = Arc::clone(&queue);
             let worker_budget = Arc::clone(&budget);
             let worker_remote_queue = remote_queue.clone();
+            let worker_next_uses = Arc::clone(&next_uses);
+            #[cfg(any(test, feature = "test-hooks"))]
+            let worker_decoder_opens = Arc::clone(&decoder_opens);
 
             let handle = thread::spawn(move || {
                 let q = Arc::clone(&worker_queue);
@@ -780,8 +864,8 @@ impl PrefetchedMosaicReader {
                 };
 
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut decoders: Vec<Option<ChunkDecoder<'_>>> =
-                        (0..worker_mosaic.tiles.len()).map(|_| None).collect();
+                    let mut decoders: DecoderCache<ChunkDecoder<'_>> =
+                        DecoderCache::new(MAX_OPEN_DECODERS_PER_WORKER, worker_next_uses);
 
                     loop {
                         if worker_queue.is_closed() {
@@ -802,18 +886,20 @@ impl PrefetchedMosaicReader {
                         else {
                             break;
                         };
-                        if decoders[tile_idx].is_none() {
-                            match reader.open_decoder() {
-                                Ok(d) => decoders[tile_idx] = Some(d),
-                                Err(e) => {
-                                    worker_budget.settle(charged, 0);
-                                    worker_budget.close();
-                                    worker_queue.fail(Err(e));
-                                    return;
-                                }
+                        let decoder = match decoders.get_or_try_open(tile_idx, job_id, || {
+                            let decoder = reader.open_decoder()?;
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            worker_decoder_opens.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, RasterH3Error>(decoder)
+                        }) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                worker_budget.settle(charged, 0);
+                                worker_budget.close();
+                                worker_queue.fail(Err(e));
+                                return;
                             }
-                        }
-                        let decoder = decoders[tile_idx].as_mut().unwrap();
+                        };
 
                         let prefetched_bytes = worker_remote_queue
                             .as_ref()
@@ -858,7 +944,16 @@ impl PrefetchedMosaicReader {
             budget,
             _remote_queue: remote_queue,
             _worker_handles: handles,
+            #[cfg(any(test, feature = "test-hooks"))]
+            decoder_opens,
         }
+    }
+
+    /// Successful decoder opens, exposed only for cache regression tests.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn decoder_open_count(&self) -> usize {
+        self.decoder_opens.load(Ordering::Relaxed)
     }
 
     /// Return processed decoding buffers for reuse, releasing their budget
@@ -908,6 +1003,94 @@ mod tests {
 
     fn f32_buffer(len: usize) -> DecodingResult {
         DecodingResult::F32(vec![0.0; len])
+    }
+
+    fn cache_for_tiles<T>(tiles: &[usize], capacity: usize) -> DecoderCache<T> {
+        let refs: Vec<_> = tiles
+            .iter()
+            .map(|&tile_idx| MosaicChunkRef {
+                tile_idx,
+                chunk_idx: 0,
+                north_lat: 0.0,
+                south_lat: 0.0,
+                has_overlap: false,
+            })
+            .collect();
+        let tile_count = tiles.iter().max().map_or(0, |i| i + 1);
+        DecoderCache::new(capacity, next_tile_uses(&refs, tile_count))
+    }
+
+    #[test]
+    fn decoder_cache_evicts_furthest_use_including_jobs_taken_by_other_workers() {
+        for (tiles, jobs, expected_opens) in [
+            (
+                vec![0, 1, 0, 2, 1, 0],
+                vec![0, 1, 2, 3, 4, 5],
+                vec![0, 1, 2, 0],
+            ),
+            (
+                vec![0, 1, 0, 0, 1, 2, 1, 0],
+                vec![0, 1, 5, 6, 7],
+                vec![0, 1, 2, 0],
+            ),
+        ] {
+            let mut cache = cache_for_tiles(&tiles, 2);
+            let mut opens = Vec::new();
+            for job in jobs {
+                let key = tiles[job];
+                let value = cache
+                    .get_or_try_open::<()>(key, job, || {
+                        opens.push(key);
+                        Ok(key * 10)
+                    })
+                    .unwrap();
+                assert_eq!(*value, key * 10);
+                assert!(cache.len() <= 2);
+            }
+            assert_eq!(opens, expected_opens);
+        }
+    }
+
+    #[test]
+    fn decoder_cache_drops_before_open_and_propagates_failure() {
+        struct OpenDecoder(Arc<AtomicUsize>);
+        impl Drop for OpenDecoder {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let open = || {
+            assert_eq!(live.fetch_add(1, Ordering::Relaxed), 0);
+            Ok::<_, &str>(OpenDecoder(Arc::clone(&live)))
+        };
+        let mut cache = cache_for_tiles(&[0, 1, 2, 0], 1);
+        cache.get_or_try_open(0, 0, open).unwrap();
+        cache.get_or_try_open(1, 1, open).unwrap();
+        assert!(cache.get_or_try_open(2, 2, || Err("boom")).is_err());
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.len(), 0);
+        cache.get_or_try_open(0, 3, open).unwrap();
+        drop(cache);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn decoder_cache_avoids_round_robin_thrashing() {
+        let tiles: Vec<_> = (0..10).flat_map(|_| 0..17).collect();
+        let mut cache = cache_for_tiles(&tiles, MAX_OPEN_DECODERS_PER_WORKER);
+        let mut opens = 0;
+        for (job, &tile) in tiles.iter().enumerate() {
+            cache
+                .get_or_try_open::<()>(tile, job, || {
+                    opens += 1;
+                    Ok(tile)
+                })
+                .unwrap();
+            assert!(cache.len() <= MAX_OPEN_DECODERS_PER_WORKER);
+        }
+        assert!(opens > 17, "must exercise decoder reopening");
+        assert!(opens <= 34, "opened {opens} decoders for 170 chunks");
     }
 
     #[test]

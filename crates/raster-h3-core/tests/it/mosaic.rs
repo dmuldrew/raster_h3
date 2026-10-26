@@ -12,7 +12,7 @@ use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 use raster_h3_core::raster::mosaic::{
     glob_match, resolve_raster_sources, MosaicReader, OverlapRule,
 };
-use raster_h3_core::raster::prefetch::PrefetchedMosaicReader;
+use raster_h3_core::raster::prefetch::{PrefetchedMosaicReader, MAX_OPEN_DECODERS_PER_WORKER};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -340,6 +340,105 @@ fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_prefetched_wide_mosaic_decoder_eviction_and_reopening() {
+    const WIDTH: u32 = 8;
+    const HEIGHT: u32 = 39;
+    const STRIP_ROWS: u32 = 4;
+    let tile_count = MAX_OPEN_DECODERS_PER_WORKER + 1;
+    for compression in [
+        tiff::encoder::Compression::Deflate(Default::default()),
+        tiff::encoder::Compression::Packbits,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..tile_count)
+            .map(|tile| {
+                let path = dir.path().join(format!("tile_{tile}.tif"));
+                let mut encoder = TiffEncoder::new(File::create(&path).unwrap())
+                    .unwrap()
+                    .with_compression(compression);
+                let mut image = encoder
+                    .new_image::<colortype::Gray8>(WIDTH, HEIGHT)
+                    .unwrap();
+                image.rows_per_strip(STRIP_ROWS).unwrap();
+                image
+                    .encoder()
+                    .write_tag(Tag::ModelPixelScaleTag, &[0.001, 0.001, 0.0][..])
+                    .unwrap();
+                image
+                    .encoder()
+                    .write_tag(
+                        Tag::ModelTiepointTag,
+                        &[0.0, 0.0, 0.0, -122.5 + tile as f64 * 0.01, 37.85, 0.0][..],
+                    )
+                    .unwrap();
+                image
+                    .encoder()
+                    .write_tag(
+                        Tag::GeoKeyDirectoryTag,
+                        &[1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326][..],
+                    )
+                    .unwrap();
+                let pixels: Vec<_> = (0..HEIGHT)
+                    .flat_map(|row| (0..WIDTH).map(move |col| (tile as u32 * 10 + row + col) as u8))
+                    .collect();
+                image.write_data(&pixels).unwrap();
+                path
+            })
+            .collect();
+        let mosaic = Arc::new(MosaicReader::open(&paths, None, None, OverlapRule::First).unwrap());
+        let chunk_rows = HEIGHT.div_ceil(STRIP_ROWS) as usize;
+        assert_eq!(mosaic.chunk_refs.len(), tile_count * chunk_rows);
+        for (job, chunk_ref) in mosaic.chunk_refs.iter().enumerate() {
+            assert_eq!(chunk_ref.tile_idx, job % tile_count);
+            assert_eq!(chunk_ref.chunk_idx as usize, job / tile_count);
+        }
+
+        for workers in [1, 4] {
+            let budget = (WIDTH * STRIP_ROWS * 2) as usize;
+            let prefetcher = PrefetchedMosaicReader::spawn_with_budget(
+                Arc::clone(&mosaic),
+                16,
+                workers,
+                1,
+                budget,
+            );
+            for expected in &mosaic.chunk_refs {
+                let (tile, chunk, bounds, data, overlap) =
+                    prefetcher.next_chunk().unwrap().unwrap();
+                assert_eq!(
+                    (tile, chunk, overlap),
+                    (expected.tile_idx, expected.chunk_idx, expected.has_overlap)
+                );
+                assert_eq!(bounds.row_offset, chunk * STRIP_ROWS);
+                assert_eq!(bounds.height, STRIP_ROWS.min(HEIGHT - bounds.row_offset));
+                let DecodingResult::U8(ref pixels) = data else {
+                    panic!("expected U8")
+                };
+                assert_eq!(pixels.len(), (bounds.width * bounds.height) as usize);
+                for (i, &pixel) in pixels.iter().enumerate() {
+                    let row = bounds.row_offset + i as u32 / WIDTH;
+                    let col = i as u32 % WIDTH;
+                    assert_eq!(pixel, (tile as u32 * 10 + row + col) as u8);
+                }
+                prefetcher.recycle_batch([data]);
+            }
+            assert!(prefetcher.next_chunk().is_none());
+            assert!(prefetcher.peak_decoded_bytes() <= budget);
+            #[cfg(feature = "test-hooks")]
+            if workers == 1 {
+                let opens = prefetcher.decoder_open_count();
+                assert!(opens > tile_count, "must reopen evicted TIFF decoders");
+                assert!(
+                    opens <= tile_count * 2,
+                    "opened {opens} decoders for {} chunks",
+                    mosaic.chunk_refs.len()
+                );
+            }
+        }
+    }
 }
 
 #[test]

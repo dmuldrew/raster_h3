@@ -13,6 +13,8 @@ prefetching, output buffers, and runtime overhead use additional memory. WGS84,
 Web Mercator, and certified Albers chunks can evict completed cells early.
 Arbitrary Proj4 chunks and Albers chunks that may contain the cone apex retain or
 spill cells until the remaining input permits certified eviction or EOF is reached.
+Mosaic workers retain at most 16 tile decoders each, using future chunk references
+to avoid LRU thrashing on wide mosaics (see the [core engine notes](docs/engines/core.md#mosaic-decoder-cache)).
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
@@ -165,6 +167,11 @@ result = (
 )
 ```
 
+Python scans reject malformed `resolutions`, `format` and `bbox` with `RuntimeError`
+instead of silently ignoring them or using defaults. Parquet and PMTiles exports
+also reject invalid resolutions; every resolution must be between 0 and 15. See the
+[Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
+
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars.
 
 ### Why Intermediate H3 Aggregations Change Everything
@@ -266,6 +273,14 @@ their budget, temporary spill files hold partial results for merging; the core s
 report the runs written in total (`spill_run_count()`) and per resolution
 (`spill_run_counts()`). Projected inputs without certified bounds may defer output until EOF.
 
+Categorical wide output has one row per cell; long output has one row per
+`(cell, category)`. In the core batch reader, `batch_size` and `limit` count these
+output rows, not cells in long format. Core and DuckDB long readers expand one
+cell at a time using the public `CategoricalLongCursor`, keeping pending categories
+bounded by the largest single cell rather than a batch of cells. A cell can span
+multiple batches, and a limit can stop mid-cell; entropy is computed only when an
+entropy column is projected. See the [core batch-reader contract](docs/engines/core.md#batch-readers).
+
 ---
 
 ## Engines
@@ -356,6 +371,14 @@ use raster_h3_core::raster::mosaic::resolve_raster_sources;
 let paths = resolve_raster_sources("dem.tif")?;
 let reader = ContinuousBatchReader::open(&paths, &MultiResolutionConfig::new(vec![8]), None, 2048, None)?;
 ```
+
+Continuous readers build per-cell quantile sketches only when a configured quantile
+column is projected (or the full schema is requested). The schema is unchanged;
+`ContinuousBatchReader::tracks_quantiles()` reports the decision, and
+`columnar::quantiles_projected()` exposes the projection rule.
+`aggregator::multi_horizon::QuantilePlan` evaluates projected percentiles and IQR
+with one sketch sweep per cell, sharing repeated probabilities. See the
+[core engine guide](docs/engines/core.md#batched-quantile-evaluation) for details.
 
 ---
 

@@ -4,18 +4,19 @@
 
 This page lists every test suite in the workspace, grouped by what it protects, and
 explains how to run each group and what CI runs. The counts below are the number of
-`#[test]` functions at the time of writing.
+`#[test]` (or pytest `test_*`) functions at the time of writing.
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 33 modules, 1 binary | 303 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 310 |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
-| [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 10 |
-| [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 10 (7 need `pg-extension`) |
+| [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 12 |
+| [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 11 (7 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 202 |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 207 |
+| [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 2 modules | 24 (35 cases) |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -109,6 +110,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 
 | Suite | What it checks |
 | :--- | :--- |
+| [`core/quantile_pushdown.rs`](../crates/raster-h3-core/tests/it/quantile_pushdown.rs) (8) | `quantiles_batch` and `QuantilePlan` equal per-target `quantile()`/`iqr()` bit for bit on empty, single-value, negative, zero, duplicate and wide-range sketches, for unsorted, repeated, endpoint, out-of-range and NaN targets and (near-)degenerate clamp ranges; single-probability plans (including duplicates and missing sketches) match scalar queries and empty plans clear output; the parser rejects NaN/infinite percentiles; continuous readers skip sketches unless a quantile column is projected, without changing other columns, and projected quantile columns (reordered, repeated) match per-record values. |
 | [`core/quantiles.rs`](../crates/raster-h3-core/tests/it/quantiles.rs) (13) | DDSketch accuracy on empty, single-value, uniform, negative, zero-bucket and mixed inputs; associative/commutative merges; weighted inserts; preset and custom quantile specs; disabled quantiles cost nothing; log-key mapping over wide ranges. |
 | [`core/accumulators.rs`](../crates/raster-h3-core/tests/it/accumulators.rs), [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs), [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | Welford mean/variance (`test_accumulator_operations`, `test_accumulator_single_sample_variance_and_empty_default`, `test_welford_accumulator_extreme_mixed_bathymetry_numerical_stability`); SIMD span kernels equal scalar Welford for f32, f64, variable lengths, integer types and large integers (`test_simd_span_*`); NoData/NaN filtering keeps statistics intact (`test_nodata_filtering_preserves_statistics`, `test_nan_filtering_in_streaming`, `test_custom_nodata_override`, `test_is_chunk_all_nodata`, `test_all_nodata_full_stream_scan_and_categorical`). |
 | Unit: `aggregator/nodata.rs` (5), `aggregator/simd.rs` (1) | NoData casting rules (rejects fractional, non-finite and out-of-range integer markers) and span accumulation. |
@@ -117,6 +119,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 
 | Suite | What it checks |
 | :--- | :--- |
+| [`core/categorical_long_streaming.rs`](../crates/raster-h3-core/tests/it/categorical_long_streaming.rs) (3) | Long-format output on a 300-class raster: batch sizes 1/7/32/4096 equal rows built from the streamer, batches are full except the last, cells split across batches stay contiguous and sorted, limits stop mid-cell, and projecting without entropy keeps values. |
 | [`core/categorical_remap.rs`](../crates/raster-h3-core/tests/it/categorical_remap.rs) (5) | Exact, range, list and wildcard remap syntax; sparse and negative categories; invalid syntax; remapping inside single- and multi-resolution categorical streamers. |
 | [`core/accumulators.rs`](../crates/raster-h3-core/tests/it/accumulators.rs) | Accumulator operations and merges, tied majorities, homogeneous rasters, RLE with interspersed NoData, high-cardinality Shannon entropy, the 16-slot inline array spilling to a heap map, SIMD uniformity across types (`test_categorical_*`). |
 | Unit: `aggregator/categorical.rs` (4), `aggregator/remap.rs` (4) | Histogram and remapper internals. |
@@ -146,8 +149,8 @@ Results must not depend on thread count, scheduling or pool nesting.
 | [`core/threading.rs`](../crates/raster-h3-core/tests/it/threading.rs) (6) | Identical output across Rayon thread counts; pool scaling; a high-contention stress run; multithreaded prefetched chunk reading; aggregation workers run concurrently inside `ThreadPool::install`; a dedicated pool behind a shared mutex does not deadlock. |
 | [`core/sharding.rs`](../crates/raster-h3-core/tests/it/sharding.rs) (5) | Shard balance for H3 indices at resolutions 0–15 and in local neighbourhoods; sharded merge + eviction preserves continuous statistics and categorical histograms; worker results merge before the watermark advances. |
 | [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_prefetched_chunk_reader`, `test_prefetched_chunk_reader_multi_worker_ordering`, `test_prefetched_chunk_reader_early_drop`. |
-| [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) | `test_prefetched_mosaic_reader_multi_worker_concurrency`, `test_prefetched_mosaic_reader_early_drop`. |
-| Unit: `raster/prefetch.rs` (17), `multi_horizon/sharded_map.rs` (1), `aggregator/cell_hash.rs` (2) | `OrderedPrefetchQueue` ordering, backpressure, decode budgets, cancellation (using the `test-hooks` handshakes); shard hashing. |
+| [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) | Multi-worker ordering and early drop; a 17-tile, ten-strip-row mosaic checks eviction/reopening, Deflate and fallback PackBits pixel values, edge strips, recycling and byte budgets with one/four workers. With `test-hooks`, it also bounds decoder opens to prevent round-robin thrashing. |
+| Unit: `raster/prefetch.rs` (20), `multi_horizon/sharded_map.rs` (1), `aggregator/cell_hash.rs` (2) | `OrderedPrefetchQueue` ordering, backpressure, decode budgets, cancellation (using the `test-hooks` handshakes); future-use decoder eviction, skipped jobs, open failures and strict live-decoder bounds; shard hashing. |
 
 ## 10. Memory budgets & spilling
 
@@ -185,8 +188,8 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (19) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
-| Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (6) | Range validation, caching, coalescing and backoff. |
+| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (22) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
+| Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
 
 ## 14. Mosaics & overlap rules
 
@@ -229,7 +232,7 @@ See [PMTiles & Multi-Resolution](pmtiles.md).
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (5) | Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
+| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (6) | Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, quantile sketches built only when a quantile column is projected (`geom` and `wkb` excluded) with reordered/repeated quantile columns matching a full scan, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
 | [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (4, ignored) | Real SQL through DuckDB v1.2.0 and v1.5.6: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 to serialize native geometry as WKB. |
 | [`test/sql/raster_h3.test`](../test/sql/raster_h3.test) (sqllogictest) | Packaged `build/release/raster_h3.duckdb_extension` from `make release` loads through DuckDB's Python sqllogictest runner (the community-extensions test path); `h3_to_string` is absent before `require raster_h3` and returns the expected cell after. |
 | [`root/package_extension.rs`](../tests/it/package_extension.rs) (2) | Extension footer layout: custom section headers, ABI fields, version and platform strings, zeroed signature, gzip output. |
@@ -250,14 +253,16 @@ See [DuckDB](engines/duckdb.md).
 | [`datafusion/scalar_udfs.rs`](../crates/raster-h3-datafusion/tests/it/scalar_udfs.rs) (3) | `string_to_h3`, `h3_to_lat`, `h3_to_lng` against `h3o` and the core scalars on cells near the poles, the antimeridian and a pentagon: validity pass-through, NaN for invalid cells, type errors, round trip back to the same cell. |
 | [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs) (7) | The built `raster-h3-cli` binary against core readers and exporters: `--bbox`, `--nodata` and `--limit` change the output exactly as the core config does; stdout (no `-o`, `-o -`) equals file output; projected JSONL and categorical long format; categorical Parquet rows and a categorical PMTiles archive byte-identical to the core tiler; unknown subcommands, bad options and missing, non-TIFF or corrupt inputs exit non-zero with a stderr message. |
 | [`python/batch_reader.rs`](../crates/raster-h3-python/tests/it/batch_reader.rs) (3) | `raster_h3_py_open_batch_reader` / `_batch_reader_next` / `_free_batch_reader`: one bounded batch per stream, rows equal to core, projection, limit, categorical long, NULL-reader and open errors, early free. |
-| [`python/c_abi.rs`](../crates/raster-h3-python/tests/it/c_abi.rs) (3) | `raster_h3_py_scan_json` columns equal core output with NoData, bbox, CRS, projection, limit, categorical wide/long; errors set `out_err`. |
+| [`python/c_abi.rs`](../crates/raster-h3-python/tests/it/c_abi.rs) (5) | `raster_h3_py_scan_json` columns equal core output with NoData, bbox, CRS, projection, limit, categorical wide/long; errors set `out_err`, including malformed bbox, resolutions and format, which are rejected rather than ignored or defaulted. |
 | [`python/exports.rs`](../crates/raster-h3-python/tests/it/exports.rs) (2) | `raster_h3_py_export_parquet` / `_pmtiles` error paths return `-1` with a message and no output; successful exports return core row counts and PMTiles bytes identical to the core tiler. |
 | [`python/scalars.rs`](../crates/raster-h3-python/tests/it/scalars.rs) (2) | `raster_h3_py_h3_is_valid_str` and `raster_h3_py_h3_cell_to_parent_str` against `h3o` and their `u64` variants. |
-| [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) (3) | `PgCategoricalSrf` with resolution, CRS, NoData and bbox options against `CategoricalBatchReader`; the `pg_srf_continuous_*` C-ABI lifecycle with options, WKB and hex columns, NULL handles and errors. |
+| [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) (4) | `PgCategoricalSrf` with resolution, CRS, NoData and bbox options against `CategoricalBatchReader`; the `pg_srf_continuous_*` C-ABI lifecycle with options, WKB (including the full 189-byte boundary of an odd-resolution pentagon) and hex columns, NULL handles and errors. |
 | [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) (7, `pg-extension` only) | The V1 `fmgr` entry points in process, against server stand-ins in [`pg/fmgr/server.rs`](../crates/raster-h3-pg/tests/it/fmgr/server.rs) (`palloc`, `funcapi` multi-call helpers, reset callbacks): `pg_h3_to_string`, `pg_string_to_h3` (1- and 4-byte varlena headers), `pg_h3_is_valid_text`, `pg_h3_to_wkb`, the finfo records and magic block, and the categorical and continuous value-per-call SRFs against core output, including state release on early termination. Error reporting (`ereport` longjmps) is left to `root/pg_extension_e2e.rs`. |
 | Unit: `raster-h3-datafusion` (3) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
 | Unit: `raster-h3-cli` (2) | Argument validation, IPC and JSONL output. |
 | Unit: `raster-h3-python` (3), `raster-h3-pg` (4 + 3 in `fmgr.rs`) | C-ABI helpers and SRF iterators. The `fmgr.rs` tests only compile with `--features pg-extension`. |
+| [`pytest/test_arrow_stream.py`](../crates/raster-h3-python/tests/pytest/test_arrow_stream.py) (12) | The in-tree `raster_h3` package with the locally built cdylib, read by real PyArrow and Polars: continuous `h3_index`/`count`/`sum`/`min`/`max`/`mean` equal an independent reference that indexes every pixel centre with the `h3` package; `pl.from_arrow`, `to_polars()`, `read_raster_h3` and `iter_batches` equal `pyarrow.table` on `RasterH3ArrowStream` (`__arrow_c_stream__`), and `pyarrow.schema` (`__arrow_c_schema__`) equals the stream schema; `columns` and `limit`; categorical long counts/fractions and wide majority class/count/fraction against the `h3` reference; missing files, non-TIFF input, unknown columns and a non-intersecting bbox raise `RuntimeError`. |
+| [`pytest/test_polars_scan.py`](../crates/raster-h3-python/tests/pytest/test_polars_scan.py) (12) | `scan_raster_h3` as a Polars IO source (`register_io_source`, Polars ≥ 1.4): projection pushdown opens the native scan with only the selected columns; predicate pushdown (numeric, combined, string, `is_in` on `h3_index`) and `head(n)` (pushed as the scan limit), `head` after `filter`, and the `limit`/`columns` arguments give the same rows as the eager full scan filtered in Polars; empty results keep the schema; categorical wide/long pushdown; scan errors and unknown columns raise. |
 | [`wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | After `cibuildwheel` installs a wheel: the bundled library loads, Arrow/Polars paths work, `raster-h3-cli` is on `PATH`, and `h3_polygon_to_cells` handles a cell boundary and invalid resolution. |
 
 See the [engine deep dives](engines/README.md).
@@ -268,7 +273,7 @@ See the [engine deep dives](engines/README.md).
 | :--- | :--- |
 | [`core/performance.rs`](../crates/raster-h3-core/tests/it/performance.rs) (4) | Continuous, multi-resolution, categorical and supersampled streaming conserve pixel mass, with no wall-clock pass/fail thresholds. |
 | [`core/properties.rs`](../crates/raster-h3-core/tests/it/properties.rs) (5 generated tests) | Weighted merge equivalence, WKB validity/truncation, affine and Mercator round trips, and nodata/supersampled conservation plus cell uniqueness across the antimeridian. |
-| [`core/benches/streaming.rs`](../crates/raster-h3-core/benches/streaming.rs) | Criterion baselines for continuous, multi-resolution, categorical and supersampled streaming; hash-sensitive quantile and 8-class inline / 64-class heap categorical accumulators; raw res-10 H3 map insertion/removal. Fixture/input creation is not timed. |
+| [`core/benches/streaming.rs`](../crates/raster-h3-core/benches/streaming.rs) | Criterion baselines for continuous, multi-resolution, categorical and supersampled streaming; `single_quantile` scalar/batch/plan p50/p90 queries on small positive and larger mixed-sign sketches; hash-sensitive quantile and 8-class inline / 64-class heap categorical accumulators; raw res-10 H3 map insertion/removal. Fixture/input creation is not timed. |
 | [`core/super_sampling.rs`](../crates/raster-h3-core/tests/it/super_sampling.rs) | `benchmark_supersampling` (ignored): manual release throughput comparison. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs) | `test_parallel_chunk_aggregation_hawaii_dataset`, `test_parallel_categorical_aggregation_hawaii_dataset` (ignored, need data). |
 
@@ -323,6 +328,14 @@ cargo test --release --workspace -- --ignored       # only the gated tests
 RASTER_H3_PG_MAJOR=16 cargo test --release -p raster-h3-pg --features pg-extension  # adds the fmgr suites
 ```
 
+The Python package tests run with pytest against the locally built library:
+
+```bash
+cargo build -p raster-h3-python --lib
+python -m pip install pytest polars pyarrow h3
+python -m pytest crates/raster-h3-python/tests/pytest   # RASTER_H3_PYTHON_LIB picks a specific library
+```
+
 Use `--release` for anything that streams real data; debug builds are much slower.
 
 ### Gated tests
@@ -335,6 +348,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `super_sampling::benchmark_supersampling` (core) | `#[ignore]` | `cargo test --release -p raster-h3-core --test it benchmark_supersampling -- --ignored --nocapture` |
 | `pg/fmgr.rs` (7) and the `fmgr.rs` unit tests | `--features pg-extension`; needs `RASTER_H3_PG_MAJOR` or `pg_config` on `PATH` | `RASTER_H3_PG_MAJOR=16 cargo test -p raster-h3-pg --features pg-extension` |
 | DuckDB part of `multi_engine_e2e` | Skipped when `duckdb --version` fails | Put the DuckDB CLI on `PATH` |
+| `crates/raster-h3-python/tests/pytest` | Each module skips when `polars` or `pyarrow` is missing; `test_polars_scan.py` also skips without `polars.io.plugins` (Polars < 1.4), the `h3` reference checks skip without `h3`, the `pl.from_arrow(stream)` check skips on Polars without PyCapsule support, and the string-predicate case skips on Polars < 1.22 (it drops such predicates on IO sources) | `pip install pytest polars pyarrow h3` and build the cdylib |
 | Python part of `multi_engine_e2e` | Runs `/usr/bin/python3`; the test fails if that path is absent | Run on a system with `/usr/bin/python3` |
 
 ## What CI Runs
@@ -351,6 +365,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
 | [`manual-tests.yml`](../.github/workflows/manual-tests.yml) (manual) | `cargo test [--release] --no-fail-fast -p <engine>` plus `--features pg-extension` for `pg`/`all` (not on Windows) | Any engine (`all`, `core`, `duckdb`, `datafusion`, `cli`, `python`, `pg`, `root`) on one or all of Linux amd64/arm64, macOS arm64 and Windows, for any branch, tag or SHA, with optional libtest arguments |
+| `manual-tests.yml`, engine `python-polars` | `cargo build [--release] -p raster-h3-python --lib` then `pytest crates/raster-h3-python/tests/pytest` | The pytest suite per platform with three dependency sets: `polars==1.0.*` + `pyarrow==14.*` (Python 3.11, `numpy<2`), `polars==1.4.*` + `pyarrow==14.*` (first Polars with `register_io_source`) and the latest of both (Python 3.13); `test_args` are passed to pytest |
 
 To run it: **Actions → Manual Tests → Run workflow**, or
 
@@ -367,6 +382,4 @@ name any branch, even one without the file.
   their cross-platform coverage is through the root parity tests or the manual workflow.
 - The real PostgreSQL test and the Hawaii-dataset tests never run in CI.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
-- No Python-side test covers `scan_raster_h3` projection, predicate or `n_rows` pushdown
-  into Polars; it needs `polars` installed.
 - EPSG:6933 and EPSG:7856 have no coverage tests.

@@ -84,6 +84,23 @@ TM certification follows proj4rs scale precedence (`k0`, then `k`) and fails
 open for duplicate parameters or syntax it cannot interpret unambiguously. See
 [Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
 
+### Mosaic decoder cache
+
+`PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF
+decoders per worker, dropping an evicted decoder before opening its replacement.
+It evicts the cached tile whose next chunk is furthest away in the global job
+order, preferring tiles with no remaining chunks. Unlike LRU, this avoids a miss
+on every chunk when a latitude band repeatedly visits more than 16 tiles.
+Each worker advances past predicted uses already assigned to other workers;
+the predictions are exact for a single worker, not worker-specific scheduling.
+Decoding and result delivery remain in their original order, so queue and byte
+budget backpressure are unchanged.
+
+For mosaics with more than 16 tiles, a shared index adds one `usize` per chunk
+reference (8 bytes on 64-bit platforms), with a temporary `usize` per tile while
+building it. Smaller mosaics do not allocate this index. Decoder state and this
+metadata are separate from the decoded-buffer and aggregation budgets.
+
 ## Columnar Model
 
 | Type | Role |
@@ -114,13 +131,66 @@ for batch in reader {
 let cat = CategoricalBatchReader::open(&paths, &config, CategoricalFormat::Long, None, 2048, None)?;
 ```
 
-- `batch_size` is clamped to at least 1; each `next()` drains up to
+- `batch_size` is clamped to at least 1 and counts output rows. Continuous and
+  categorical wide readers emit one row per cell, so each `next()` drains up to
   `min(batch_size, remaining_limit)` completed cells.
-- `limit` stops the reader after that many rows. In long format the limit counts the
-  unnested class rows; the reader buffers per-class rows internally so batches stay at
-  `batch_size`.
+- Categorical long readers emit one row per `(cell, category)`. Each `next()` fills
+  up to `min(batch_size, remaining_limit)` rows by draining one completed cell at a
+  time, resuming any partially emitted cell before draining another. Categories
+  within a cell are sorted, contiguous, and may span batches; batches are full
+  unless EOF or the limit is reached. Cells with `total_count <= 0` are skipped.
+- `limit` counts output rows: cells for continuous/wide output, unnested category
+  rows for long output. A long-format limit may stop mid-cell without expanding
+  that cell's remaining rows or draining the next cell.
+- `ContinuousBatchReader::open` builds per-cell quantile sketches only when the
+  projection selects a quantile column (full-schema index 10 and up), or when
+  `projection` is `None`. The schema still lists every configured quantile column;
+  `tracks_quantiles()` reports whether sketches are being built, and the public
+  `columnar::quantiles_projected(projection, n)` applies the same rule. DuckDB applies
+  it to its own projection (which includes columns referenced by `WHERE`).
 - `from_streamer(...)` accepts a streamer you built yourself (for example with custom
-  sampling, spectral formulas or remapping).
+  sampling, spectral formulas or remapping). Its sketch tracking is whatever that
+  streamer's config requested.
+
+#### Public long-format cursor
+
+`raster_h3_core::aggregator::multi_horizon::{CategoricalLongCursor, CategoricalLongRow}`
+provides the incremental expansion shared by the core and DuckDB long readers:
+
+- `CategoricalLongCursor::new(with_entropy)` controls per-cell entropy computation.
+- `load(&MultiCategoricalRecord)` replaces any unconsumed rows with one cell's
+  categories, sorted by category, reusing the entry buffer across cells.
+- `remaining()` reports the current cell's unconsumed category rows.
+- `emit_into(max_rows, callback)` emits at most that many `CategoricalLongRow`s and
+  returns the number emitted; subsequent calls resume the same cell.
+
+For a cell with 300 categories and `batch_size = 32`, the reader drains that one
+cell and returns its first 32 rows, retaining the remaining categories for later
+batches. Pending expansion state is bounded by the largest single cell's category
+count, separate from the output batch and the streamer's aggregation budget.
+The core and DuckDB long readers compute entropy only when `shannon_entropy` or
+`entropy` is projected (full-schema indices 7 and 8); a cursor constructed with
+`with_entropy = false` puts `NaN` in `CategoricalLongRow::entropy`.
+
+#### Batched quantile evaluation
+
+`QuantileSketch::quantiles_batch(&targets, min, max)` answers several quantiles with
+one sorted sweep of a sketch's bins, returning exactly what `quantile(q, min, max)`
+returns for each target in input order. Targets may be unsorted or repeated; NaN
+targets yield NaN, `q <= 0` yields `min` and `q >= 1` yields `max`.
+
+`raster_h3_core::aggregator::multi_horizon::QuantilePlan` builds on it for
+`QuantileTarget` lists: `QuantilePlan::new(&targets)` deduplicates the probabilities
+(IQR shares p25/p75 with any explicit targets), and
+`evaluate_into(&H3Accumulator, &mut Vec<f64>)` writes one value per target, equal to
+`H3Accumulator::quantile` / `iqr` (NaN when the accumulator has no sketch). The core
+continuous reader and the DuckDB scan evaluate all projected quantile columns of a
+cell this way. Plans with just one distinct probability use the scalar sketch
+query directly (including repeated projections of that probability), avoiding the
+batch query's result and rank-vector allocations. Empty plans skip evaluation.
+The `single_quantile` Criterion group compares scalar, batch and plan queries for
+p50/p90 on small positive and larger mixed-sign sketches; these are query-only
+microbenchmarks, not whole-raster throughput measurements.
 
 ### Arrow C Data / C Stream interface
 

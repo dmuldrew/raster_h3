@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `QuantilePlan` evaluates a list of `QuantileTarget`s with one sketch sweep per cell; `ContinuousBatchReader::tracks_quantiles()` and `columnar::quantiles_projected()` expose the quantile pushdown decision.
 - Release quality gates covering lint, MSRV, engine/community builds, blocking dependency policy, package/version checks, wheels, fuzzing and Miri; weekly advisory and safety checks.
 - GitHub release SHA-256 checksums and build provenance, validated wheel assets, contributor issue forms and PR checklist.
 - WKB/EWKB, GeoTIFF metadata and chunk-predictor fuzz targets, generated conservation/merge/CRS tests, scoped Arrow Miri checks and Criterion streaming baselines.
@@ -20,22 +21,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `raster_h3_core::error::catch_unwind_or` for panic-safe `extern "C"` entry points.
 - `CrsTransformer::bounds_certified` and certified (Lipschitz-enclosure) WGS84 bounds for transverse Mercator sources (`utm`, `etmerc`, exact `tmerc` on named ellipsoids), so bbox pruning stays sound for them. Explicit `+towgs84` shifts are certified only up to 1.5 km translation, 10″ rotation and 50 ppm scale.
 - `spill_run_counts()` on the continuous and categorical multi-resolution streamers: spill runs per configured resolution.
+- pytest suite for the Python package (`crates/raster-h3-python/tests/pytest`) against real Polars and PyArrow, and a `python-polars` engine in `manual-tests.yml` covering Polars 1.0, 1.4 and latest.
 
 ### Changed
 
+- Continuous readers (core `ContinuousBatchReader::open`, and so the CLI, Python and DataFusion paths, plus the DuckDB scan) build per-cell quantile sketches only when a quantile column is projected, and compute all projected quantile columns of a cell in one sorted sweep instead of one sweep (and bin-key sort) per column. `H3Accumulator::iqr` uses one sweep for p25/p75.
 - Keep Albers inverse constants in an immutable walker-local prepared projection, preserving public source-field construction and mutation without stale caches. Use portable multiply/add series evaluation, share row terms and exact cell-run advancement, and retain row hoisting for horizontal shear and `stream-profile` builds. The series can differ from the previous Newton iteration at sub-nanometre scale, which moves pixels lying on a cell edge (1 of 28.4M pixels in the Hawaii CFL Albers benchmark); the Hawaii WGS84 outputs were bit-for-bit identical.
 - Index each sample at every resolution through `h3o::LatLngIndexer`, sharing H3's resolution-independent projection and reusing the last cell per resolution while consecutive samples stay in the same face `IJK` cell; cells are identical. Depends on an h3o fork (`[patch.crates-io]`, pinned by revision) until the API is released upstream. Add opt-in `.cargo/fma.toml` for x86_64 CPUs with FMA3.
 - Label withdrawn stride-probing benchmark results as historical row-count comparisons only; use a monotonic benchmark timer and the direct Parquet exporter when the Polars IO plugin is unavailable.
 
+- Long-format categorical output (core `CategoricalBatchReader` and the DuckDB `format := 'long'` scan) now expands one cell at a time and only as far as each batch needs, instead of eagerly queueing every category of a whole batch of cells (e.g. ~2M rows for 2,048 cells × 1,000 classes). Shannon entropy is skipped when no entropy column is projected.
 - Restore safe bbox and mosaic-overlap pruning for built-in EPSG:3413/3031 using analytic radial/angular bounds; skip discarded bounds estimates for uncertified bbox tests. Add end-to-end pruning benchmarks with Lambert/LAEA controls.
 
+- Python C ABI: a malformed `bbox`, invalid `resolutions` or unknown `format` now raises instead of scanning the whole raster, falling back to resolution 8 or treating the format as `wide`; Parquet and PMTiles exports reject invalid resolutions the same way.
+- Python `scan_raster_h3` works on Polars 1.4–1.24 (positional `register_io_source` argument) and returns an empty frame with the schema instead of panicking on Polars before 1.28 when nothing matches.
+
 - TM rejection certificates now follow proj4rs scale precedence (`k0`, then `k`) and fail open for duplicate or non-canonical PROJ parameters, preventing incorrect bbox pruning.
+
+- Mosaic decode workers keep at most `MAX_OPEN_DECODERS_PER_WORKER` (16) tile decoders open, evicting the tile needed furthest in the future instead of using LRU, which thrashes on latitude bands wider than the cache. The next-use index is shared across workers; chunk delivery order and decoded-buffer budgets are unchanged.
+- WKB export looks up the two pole cells per resolution from a precomputed table instead of indexing both poles for every emitted polygon, and only when a ring spans more than 180° of longitude.
 
 - Replaced unmaintained `fxhash` with maintained `rustc-hash`, removed obsolete advisory exceptions, and denied wildcard dependency requirements.
 - Replaced brittle two-second streaming test assertions with correctness-only tests and separate informational benchmarks.
 
 ### Fixed
 
+- Single-probability `QuantilePlan` evaluations use the scalar sketch query, avoiding batch result/rank-vector allocations per cell; empty plans skip sketch evaluation. Added p50/p90 scalar/batch/plan Criterion comparisons.
+- `QuantileSketch::quantiles_batch` now returns exactly what `quantile()` returns for every target: NaN targets yield NaN instead of corrupting the sort (which could misorder results or panic), and degenerate `min`/`max` ranges match `q <= 0`/`q >= 1` handling.
+- Quantile specs reject NaN percentiles (`'nan'`, `'pnan'`), which previously parsed because NaN fails both range comparisons. The DuckDB API reference lists the real presets (`'box'`, not the unsupported `'quartiles'`).
+- Remote COG prefetch no longer reports a chunk as unavailable while its range request is still in flight. The queue previously treated "all ranges claimed" as "all ranges fetched", so decoders near the end of a scan could re-download chunk bytes and leave the late payload orphaned in the ready map.
 - TIFF sample unpacking now rejects truncated buffers, overflowing dimensions, invalid strides and undersized destinations before indexing or copying; the new fuzz target caught the truncated-input regression.
 
 - PostgreSQL scalar functions, `pg_srf_continuous_next`, the `fmgr` text/bytea functions, Python scalar and `h3_polygon_to_cells` exports, and Arrow stream / batch-reader release no longer abort the host process if Rust code panics.
