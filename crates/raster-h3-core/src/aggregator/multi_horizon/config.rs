@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::error::{RasterH3Error, Result};
@@ -105,7 +106,7 @@ impl QuantileTarget {
                                 raw_token
                             ))
                         })?;
-                        if val <= 0.0 || val >= 100.0 {
+                        if !val.is_finite() || val <= 0.0 || val >= 100.0 {
                             return Err(RasterH3Error::InvalidParameter(format!(
                                 "Percentile '{}' must be strictly between 0 and 100",
                                 raw_token
@@ -119,7 +120,7 @@ impl QuantileTarget {
                         };
                         targets.push(Self::Percentile(q, name));
                     } else if let Ok(val) = token.parse::<f64>() {
-                        if val <= 0.0 || val >= 1.0 {
+                        if !val.is_finite() || val <= 0.0 || val >= 1.0 {
                             return Err(RasterH3Error::InvalidParameter(format!(
                                 "Decimal quantile '{}' must be strictly between 0 and 1",
                                 raw_token
@@ -151,6 +152,82 @@ impl QuantileTarget {
             }
         }
         Ok(deduped)
+    }
+}
+
+/// Evaluates a list of [`QuantileTarget`]s against one cell with a single
+/// sorted sweep of its sketch, instead of one sweep (and key sort) per target.
+///
+/// Values match [`H3Accumulator::quantile`] and [`H3Accumulator::iqr`] exactly.
+#[derive(Debug, Clone, Default)]
+pub struct QuantilePlan {
+    /// Distinct probabilities to query, deduplicated by bit pattern.
+    probs: Vec<f64>,
+    outputs: Vec<PlanOutput>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanOutput {
+    Prob(usize),
+    Iqr { p25: usize, p75: usize },
+}
+
+impl QuantilePlan {
+    /// Build a plan producing one output per target, in order.
+    pub fn new<'a>(targets: impl IntoIterator<Item = &'a QuantileTarget>) -> Self {
+        let mut plan = Self::default();
+        for target in targets {
+            let output = match target {
+                QuantileTarget::Percentile(q, _) => PlanOutput::Prob(plan.slot(*q)),
+                QuantileTarget::Iqr(_) => PlanOutput::Iqr {
+                    p25: plan.slot(0.25),
+                    p75: plan.slot(0.75),
+                },
+            };
+            plan.outputs.push(output);
+        }
+        plan
+    }
+
+    fn slot(&mut self, q: f64) -> usize {
+        match self.probs.iter().position(|p| p.to_bits() == q.to_bits()) {
+            Some(i) => i,
+            None => {
+                self.probs.push(q);
+                self.probs.len() - 1
+            }
+        }
+    }
+
+    /// Number of output values per cell.
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Whether the plan produces no outputs.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    /// Replace `out` with one value per target for `acc` (NaN when it has no sketch).
+    pub fn evaluate_into(&self, acc: &H3Accumulator, out: &mut Vec<f64>) {
+        out.clear();
+        if self.is_empty() {
+            return;
+        }
+        let Some(sketch) = acc.quantiles.as_deref() else {
+            out.resize(self.outputs.len(), f64::NAN);
+            return;
+        };
+        if let [q] = self.probs.as_slice() {
+            out.resize(self.outputs.len(), sketch.quantile(*q, acc.min, acc.max));
+            return;
+        }
+        let values = sketch.quantiles_batch(&self.probs, acc.min, acc.max);
+        out.extend(self.outputs.iter().map(|output| match *output {
+            PlanOutput::Prob(i) => values[i],
+            PlanOutput::Iqr { p25, p75 } => (values[p75] - values[p25]).max(0.0),
+        }));
     }
 }
 

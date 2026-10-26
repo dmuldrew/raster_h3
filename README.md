@@ -372,6 +372,14 @@ let paths = resolve_raster_sources("dem.tif")?;
 let reader = ContinuousBatchReader::open(&paths, &MultiResolutionConfig::new(vec![8]), None, 2048, None)?;
 ```
 
+Continuous readers build per-cell quantile sketches only when a configured quantile
+column is projected (or the full schema is requested). The schema is unchanged;
+`ContinuousBatchReader::tracks_quantiles()` reports the decision, and
+`columnar::quantiles_projected()` exposes the projection rule.
+`aggregator::multi_horizon::QuantilePlan` evaluates projected percentiles and IQR
+with one sketch sweep per cell, sharing repeated probabilities. See the
+[core engine guide](docs/engines/core.md#batched-quantile-evaluation) for details.
+
 ---
 
 ## Core Engineering Architecture
