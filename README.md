@@ -256,6 +256,16 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 - **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
 - **Aggregation memory budget**: The default is 64 MiB for aggregation. This is not a total-process RAM limit; decoded chunks, prefetch buffers, output buffers, and other overhead also consume memory.
 
+Remote COG prefetching has its own 32 MiB response-byte budget, configurable in
+Rust with `RemotePrefetchConfig::max_buffered_bytes`. It covers in-flight requests
+and shared responses retained by the queue or callers; a range larger than the
+budget runs alone. `get_chunk_payload` / `try_get_chunk_payload` return
+`PrefetchedChunk` (dereferences to `[u8]`), not `Arc<Vec<u8>>`. Keep these handles
+short-lived: each slice or clone retains the entire coalesced response. Blocking
+requests can arrive out of order; unused prefetched responses may be evicted and
+fetched again to make room. See [Remote COG prefetching](docs/engines/core.md#remote-cog-prefetching)
+for configuration, retention and byte-usage diagnostics.
+
 ### Direct Web-Ready Map Tiles
 
 Generates single-file **PMTiles v3** vector pyramids directly from DuckDB SQL, Python or the CLI:

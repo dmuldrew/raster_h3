@@ -147,6 +147,53 @@ approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
 wall-time comparisons include decoding and scheduling; they do not isolate bridge
 cost. The bare spawn/join measurement is only an isolated baseline.
 
+### Remote COG prefetching
+
+`raster::remote_prefetch::RemoteChunkPrefetchQueue` fetches HTTP/S3 ranges ahead
+of decoding for a single GeoTIFF or a mosaic. Its Rust configuration is separate
+from aggregation and decoded-buffer budgets (it is not a total-process RAM cap):
+
+```rust
+use raster_h3_core::raster::remote_prefetch::{RemoteChunkPrefetchQueue, RemotePrefetchConfig};
+
+let config = RemotePrefetchConfig {
+    max_buffered_bytes: 16 * 1024 * 1024, // default: 32 MiB
+    ..Default::default()
+};
+// reader is an open remote GeoTiffStreamReader; chunk_indices selects its strips/tiles.
+let queue = RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)).unwrap();
+if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
+    let compressed_bytes: &[u8] = &payload;
+    // Decode compressed_bytes here, then drop payload before requesting more chunks.
+}
+```
+
+`max_buffered_bytes` reserves each coalesced response's full byte length **before**
+the HTTP request and counts requests in flight as well as retained responses.
+If a range alone exceeds the budget (including a zero-byte budget), it is admitted
+only when no other response is held. `queue_capacity` additionally throttles
+untaken chunks (default 64, minimum 16); a coalesced response may exceed this count.
+Defaults are 8 HTTP workers, a 32 KiB coalescing gap and a 2 MiB range target.
+
+Blocking `get_chunk_payload` requests are prioritized over speculative prefetches
+and may arrive in any order, including from concurrent decode workers. When a
+requested range cannot fit, responses with no waiting consumers may be evicted.
+An evicted, untaken chunk is fetched again on a later blocking request; chunks
+already taken are not republished. `try_get_chunk_payload` only takes ready chunks
+and does not trigger a fetch. In-order scans normally avoid refetching.
+
+Both methods now return `PrefetchedChunk` instead of `Arc<Vec<u8>>`. It dereferences
+to `[u8]`, implements `AsRef<[u8]>`, and clones cheaply without copying the response.
+Every slice or clone keeps the **entire coalesced response** alive and charged until
+the last reference is dropped. `response_len()` reports that full length, whereas
+`len()` is the chunk's slice length. Eviction cannot release bytes held by callers:
+drop payloads and their clones promptly after decoding, before blocking for another
+range that needs the same budget. Handles remain valid after the queue is dropped.
+`held_bytes()` / `peak_held_bytes()` report current / peak reserved response bytes.
+
+All engine adapters use this core prefetcher; `RemotePrefetchConfig` is a Rust
+queue-level API, not an additional SQL, Python or CLI option.
+
 ### Mosaic decoder cache
 
 `PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF

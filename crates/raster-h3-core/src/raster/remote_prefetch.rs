@@ -3,11 +3,20 @@
 //! Provides high-concurrency background network prefetching with HTTP Range request coalescing.
 //! Merges consecutive/nearby chunk byte ranges to cut HTTP round-trips by 2x–5x and streams
 //! compressed chunk payloads ahead of scanline processing.
+//!
+//! Memory is bounded by bytes: before each request a worker reserves the
+//! range's size against [`RemotePrefetchConfig::max_buffered_bytes`], and the
+//! reservation lasts until the last chunk sliced from that response is
+//! dropped. Chunks share their response buffer instead of being copied.
+//! Consumer requests take priority over speculative prefetches. Unrequested
+//! responses may be evicted under pressure and fetched again on demand.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::collections::VecDeque;
+use std::fmt;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -21,6 +30,9 @@ pub const DEFAULT_PREFETCH_WORKERS: usize = 8;
 pub const DEFAULT_MAX_COALESCE_GAP: u64 = 32768; // 32 KB
 pub const DEFAULT_MAX_COALESCE_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
 pub const DEFAULT_PREFETCH_QUEUE_CAPACITY: usize = 64;
+/// Default cap on response bytes held: requests in flight plus fetched
+/// responses still referenced (enough for 8 workers × 2 MB ranges, twice).
+pub const DEFAULT_PREFETCH_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Location of a chunk in its container file
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +59,15 @@ pub struct RemotePrefetchConfig {
     pub num_workers: usize,
     pub max_gap_bytes: u64,
     pub max_range_bytes: u64,
+    /// Fetched chunks that may wait to be taken (at least 16). Checked before
+    /// each request, so one coalesced response can exceed it. Unrequested
+    /// responses may be evicted to admit a blocking consumer request.
     pub queue_capacity: usize,
+    /// Response bytes the queue may hold: requests in flight plus fetched
+    /// responses still referenced by untaken chunks or by callers. A single
+    /// range larger than this is still fetched, but only when nothing else is
+    /// held.
+    pub max_buffered_bytes: u64,
 }
 
 impl Default for RemotePrefetchConfig {
@@ -57,6 +77,7 @@ impl Default for RemotePrefetchConfig {
             max_gap_bytes: DEFAULT_MAX_COALESCE_GAP,
             max_range_bytes: DEFAULT_MAX_COALESCE_BYTES,
             queue_capacity: DEFAULT_PREFETCH_QUEUE_CAPACITY,
+            max_buffered_bytes: DEFAULT_PREFETCH_BUDGET_BYTES,
         }
     }
 }
@@ -123,40 +144,146 @@ pub fn coalesce_chunk_ranges(
     ranges
 }
 
-/// Fetched chunk bytes keyed by (tile, chunk index), shared with the workers.
-type ReadyChunks = Arc<Mutex<FxHashMap<(usize, u32), Arc<Vec<u8>>>>>;
+/// Queue state shared by workers, consumers and live response buffers.
+#[derive(Default)]
+struct Budget {
+    state: Mutex<BudgetState>,
+    /// Signalled when bytes or chunk slots are released, or on cancellation.
+    condvar: Condvar,
+}
 
-fn publish_error(
-    ready: &ReadyChunks,
-    error: &Mutex<Option<String>>,
-    condvar: &Condvar,
-    message: String,
-) {
+#[derive(Default)]
+struct BudgetState {
+    /// Bytes reserved by requests in flight plus fetched responses still alive.
+    held_bytes: u64,
+    peak_held_bytes: u64,
+    ready: FxHashMap<(usize, u32), PrefetchedChunk>,
+    remaining: FxHashSet<(usize, u32)>,
+    jobs: Vec<JobState>,
+    requested: Vec<usize>,
+    demanded: VecDeque<usize>,
+    /// Next speculative range; explicit consumer requests take priority.
+    next_job: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobState {
+    Pending,
+    InFlight,
+    Finished,
+    Evicted,
+}
+
+impl Budget {
+    fn lock(&self) -> MutexGuard<'_, BudgetState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut state = self.lock();
+        state.held_bytes = state.held_bytes.saturating_sub(bytes);
+        drop(state);
+        self.condvar.notify_all();
+    }
+}
+
+/// Bytes charged to a [`Budget`], released when dropped.
+struct BudgetCharge {
+    // Ready chunks live in BudgetState, so a strong reference would cycle.
+    budget: Weak<Budget>,
+    bytes: u64,
+}
+
+impl Drop for BudgetCharge {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.upgrade() {
+            budget.release(self.bytes);
+        }
+    }
+}
+
+/// One fetched (possibly coalesced) HTTP response, shared by every chunk
+/// sliced from it; its size stays charged until the last slice is dropped.
+struct ResponseBuffer {
+    bytes: Vec<u8>,
+    _charge: BudgetCharge,
+}
+
+/// A prefetched chunk: a slice of a shared response buffer.
+///
+/// Dereferences to the chunk's bytes and is cheap to clone. The whole
+/// response stays allocated, and counted against
+/// [`RemotePrefetchConfig::max_buffered_bytes`], while any chunk sliced from
+/// it is alive, so drop chunks once they are decoded.
+#[derive(Clone)]
+pub struct PrefetchedChunk {
+    buffer: Arc<ResponseBuffer>,
+    start: usize,
+    len: usize,
+}
+
+impl PrefetchedChunk {
+    /// Length of the shared response this chunk was sliced from.
+    pub fn response_len(&self) -> usize {
+        self.buffer.bytes.len()
+    }
+}
+
+impl Deref for PrefetchedChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buffer.bytes[self.start..self.start + self.len]
+    }
+}
+
+impl AsRef<[u8]> for PrefetchedChunk {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl PartialEq for PrefetchedChunk {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for PrefetchedChunk {}
+
+impl fmt::Debug for PrefetchedChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrefetchedChunk")
+            .field("len", &self.len)
+            .field("response_len", &self.response_len())
+            .finish()
+    }
+}
+
+/// Bytes requested for a range (`end_offset` is inclusive).
+fn range_bytes(range: &CoalescedRange) -> u64 {
+    range.end_offset - range.start_offset + 1
+}
+
+fn publish_error(budget: &Budget, error: &Mutex<Option<String>>, message: String) {
     // Serialize terminal predicate updates with the consumer's check and wait.
-    let map = ready
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = budget.lock();
     if let Ok(mut error) = error.lock() {
         if error.is_none() {
             *error = Some(message);
         }
     }
-    drop(map);
-    condvar.notify_all();
+    drop(state);
+    budget.condvar.notify_all();
 }
 
 /// Parallel asynchronous prefetch queue managing concurrent HTTP Range requests
 pub struct RemoteChunkPrefetchQueue {
-    ready_chunks: ReadyChunks,
-    condvar: Arc<Condvar>,
-    /// Ranges whose fetch has finished and whose chunks are in `ready_chunks`.
-    /// Updated while holding the `ready_chunks` lock so waiting consumers
-    /// observe it consistently with the map.
-    completed_jobs: Arc<AtomicUsize>,
     total_jobs: usize,
-    scheduled_chunks: FxHashSet<(usize, u32)>,
+    scheduled_chunks: Arc<FxHashMap<(usize, u32), usize>>,
     error: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
+    budget: Arc<Budget>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
 
@@ -261,17 +388,21 @@ impl RemoteChunkPrefetchQueue {
         config: RemotePrefetchConfig,
     ) -> Self {
         let total_jobs = ranges.len();
-        let mut scheduled_chunks = FxHashSet::default();
-        for range in &ranges {
+        let mut scheduled_chunks = FxHashMap::default();
+        for (job, range) in ranges.iter().enumerate() {
             for &(chunk_idx, _, _) in &range.chunk_slices {
-                scheduled_chunks.insert((range.tile_idx, chunk_idx));
+                scheduled_chunks.insert((range.tile_idx, chunk_idx), job);
             }
         }
 
-        let ready_chunks = Arc::new(Mutex::new(FxHashMap::default()));
-        let condvar = Arc::new(Condvar::new());
-        let next_job = Arc::new(AtomicUsize::new(0));
-        let completed_jobs = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(Budget::default());
+        {
+            let mut state = budget.lock();
+            state.remaining = scheduled_chunks.keys().copied().collect();
+            state.jobs = vec![JobState::Pending; total_jobs];
+            state.requested = vec![0; total_jobs];
+        }
+        let scheduled_chunks = Arc::new(scheduled_chunks);
         let error = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -280,32 +411,29 @@ impl RemoteChunkPrefetchQueue {
 
         let num_workers = config.num_workers.clamp(1, 32).min(total_jobs);
         let queue_capacity = config.queue_capacity.max(16);
+        let max_bytes = config.max_buffered_bytes;
 
         let mut handles = Vec::with_capacity(num_workers);
 
         for _ in 0..num_workers {
             let sources = Arc::clone(&sources_arc);
             let ranges = Arc::clone(&ranges_arc);
-            let ready = Arc::clone(&ready_chunks);
-            let cv = Arc::clone(&condvar);
-            let job_idx = Arc::clone(&next_job);
-            let done = Arc::clone(&completed_jobs);
+            let budget = Arc::clone(&budget);
+            let scheduled = Arc::clone(&scheduled_chunks);
             let err_holder = Arc::clone(&error);
             let term = Arc::clone(&shutdown);
 
             let handle = thread::spawn(move || {
                 struct HttpWorkerPanicGuard {
-                    ready: ReadyChunks,
+                    budget: Arc<Budget>,
                     err_holder: Arc<Mutex<Option<String>>>,
-                    cv: Arc<Condvar>,
                 }
                 impl Drop for HttpWorkerPanicGuard {
                     fn drop(&mut self) {
                         if thread::panicking() {
                             publish_error(
-                                &self.ready,
+                                &self.budget,
                                 &self.err_holder,
-                                &self.cv,
                                 "HTTP prefetch worker panicked".to_string(),
                             );
                         }
@@ -313,69 +441,135 @@ impl RemoteChunkPrefetchQueue {
                 }
 
                 let _panic_guard = HttpWorkerPanicGuard {
-                    ready: Arc::clone(&ready),
+                    budget: Arc::clone(&budget),
                     err_holder: Arc::clone(&err_holder),
-                    cv: Arc::clone(&cv),
+                };
+
+                let claim = || -> Option<(usize, BudgetCharge)> {
+                    let mut state = budget.lock();
+                    loop {
+                        if term.load(Ordering::SeqCst) || state.remaining.is_empty() {
+                            return None;
+                        }
+                        while state.next_job < ranges.len()
+                            && state.jobs[state.next_job] != JobState::Pending
+                        {
+                            state.next_job += 1;
+                        }
+                        let demand = state.demanded.front().copied();
+                        let job = demand
+                            .or_else(|| (state.next_job < ranges.len()).then_some(state.next_job));
+                        let Some(job) = job else {
+                            // Stay alive to service later requests for evicted ranges.
+                            state = budget
+                                .condvar
+                                .wait(state)
+                                .unwrap_or_else(PoisonError::into_inner);
+                            continue;
+                        };
+                        let need = range_bytes(&ranges[job]);
+                        // With nothing held, take the range even if it alone
+                        // exceeds the budget; otherwise it could never run.
+                        let fits = state.held_bytes == 0
+                            || (need <= max_bytes.saturating_sub(state.held_bytes)
+                                && state.ready.len() < queue_capacity);
+                        if fits {
+                            if demand.is_some() {
+                                state.demanded.pop_front();
+                            }
+                            state.jobs[job] = JobState::InFlight;
+                            state.held_bytes += need;
+                            state.peak_held_bytes = state.peak_held_bytes.max(state.held_bytes);
+                            let charge = BudgetCharge {
+                                budget: Arc::downgrade(&budget),
+                                bytes: need,
+                            };
+                            return Some((job, charge));
+                        }
+                        if demand.is_some() {
+                            let mut evicted = Vec::new();
+                            for (key, chunk) in std::mem::take(&mut state.ready) {
+                                let buffered_job = scheduled[&key];
+                                if state.requested[buffered_job] == 0 {
+                                    state.jobs[buffered_job] = JobState::Evicted;
+                                    evicted.push(chunk);
+                                } else {
+                                    state.ready.insert(key, chunk);
+                                }
+                            }
+                            if !evicted.is_empty() {
+                                // Releasing a response takes the budget lock.
+                                drop(state);
+                                drop(evicted);
+                                state = budget.lock();
+                                continue;
+                            }
+                        }
+                        state = budget
+                            .condvar
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
                 };
 
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    loop {
-                        if term.load(Ordering::Relaxed) {
-                            break;
-                        }
-
-                        // Backpressure throttling: pause if buffer is full
-                        loop {
-                            if term.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            let current_buffered = ready.lock().map(|m| m.len()).unwrap_or(0);
-                            if current_buffered < queue_capacity {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(5));
-                        }
-
-                        let job = job_idx.fetch_add(1, Ordering::Relaxed);
-                        if job >= ranges.len() {
-                            break;
-                        }
-
+                    while let Some((job, charge)) = claim() {
                         let range = &ranges[job];
                         let source = match sources.get(range.tile_idx).and_then(|s| s.as_ref()) {
                             Some(s) => s,
                             None => {
                                 // Nothing to fetch; still count the range as finished.
-                                if let Ok(_map) = ready.lock() {
-                                    done.fetch_add(1, Ordering::Relaxed);
-                                }
-                                cv.notify_all();
+                                drop(charge);
+                                budget.lock().jobs[job] = JobState::Finished;
+                                budget.condvar.notify_all();
                                 continue;
                             }
                         };
 
                         match source.fetch_range(range.start_offset, range.end_offset) {
-                            Ok(data) => {
-                                let data_len = data.len();
-                                let mut map = match ready.lock() {
-                                    Ok(m) => m,
-                                    Err(_) => break,
-                                };
-
-                                for &(chunk_idx, slice_start, slice_len) in &range.chunk_slices {
-                                    if slice_start + slice_len <= data_len {
-                                        let chunk_payload = Arc::new(
-                                            data[slice_start..slice_start + slice_len].to_vec(),
-                                        );
-                                        map.insert((range.tile_idx, chunk_idx), chunk_payload);
+                            Ok(bytes) => {
+                                let data_len = bytes.len();
+                                let buffer = Arc::new(ResponseBuffer {
+                                    bytes,
+                                    _charge: charge,
+                                });
+                                let chunks: Vec<((usize, u32), PrefetchedChunk)> = range
+                                    .chunk_slices
+                                    .iter()
+                                    .filter(|&&(_, start, len)| start + len <= data_len)
+                                    .map(|&(chunk_idx, start, len)| {
+                                        let chunk = PrefetchedChunk {
+                                            buffer: Arc::clone(&buffer),
+                                            start,
+                                            len,
+                                        };
+                                        ((range.tile_idx, chunk_idx), chunk)
+                                    })
+                                    .collect();
+                                // From here only the chunks own the response, so
+                                // its bytes are released as soon as the last one
+                                // is dropped (or now, outside any lock, if none).
+                                drop(buffer);
+                                let mut unused = Vec::new();
+                                let mut state = budget.lock();
+                                for (key, chunk) in chunks {
+                                    if scheduled[&key] == job
+                                        && state.remaining.contains(&key)
+                                        && !state.ready.contains_key(&key)
+                                    {
+                                        state.ready.insert(key, chunk);
+                                    } else {
+                                        unused.push(chunk);
                                     }
                                 }
-                                done.fetch_add(1, Ordering::Relaxed);
-                                drop(map);
-                                cv.notify_all();
+                                state.jobs[job] = JobState::Finished;
+                                drop(state);
+                                drop(unused);
+                                budget.condvar.notify_all();
                             }
                             Err(e) => {
-                                publish_error(&ready, &err_holder, &cv, e.to_string());
+                                drop(charge);
+                                publish_error(&budget, &err_holder, e.to_string());
                                 break;
                             }
                         }
@@ -385,9 +579,8 @@ impl RemoteChunkPrefetchQueue {
                 if let Err(payload) = res {
                     let msg = crate::error::panic_payload_to_string(payload);
                     publish_error(
-                        &ready,
+                        &budget,
                         &err_holder,
-                        &cv,
                         format!("HTTP prefetch worker panicked: {msg}"),
                     );
                 }
@@ -397,73 +590,94 @@ impl RemoteChunkPrefetchQueue {
         }
 
         Self {
-            ready_chunks,
-            condvar,
-            completed_jobs,
             total_jobs,
             scheduled_chunks,
             error,
             shutdown,
+            budget,
             _worker_handles: handles,
         }
     }
 
     /// Retrieve a downloaded chunk payload, blocking until available or error occurs.
     /// Removes the chunk from the ready map to maintain bounded memory footprint.
+    /// Requests may arrive in any order. Unrequested responses can be evicted to
+    /// admit a requested range, and fetched again if subsequently requested.
+    /// Drop previously returned chunks before waiting for more budget.
     pub fn get_chunk_payload(
         &self,
         tile_idx: usize,
         chunk_idx: u32,
-    ) -> Result<Option<Arc<Vec<u8>>>> {
+    ) -> Result<Option<PrefetchedChunk>> {
         let key = (tile_idx, chunk_idx);
-        if !self.scheduled_chunks.contains(&key) {
+        let Some(&job) = self.scheduled_chunks.get(&key) else {
             return Ok(None);
+        };
+
+        let mut state = self.budget.lock();
+        state.requested[job] += 1;
+        if state.remaining.contains(&key)
+            && matches!(state.jobs[job], JobState::Pending | JobState::Evicted)
+            && !state.demanded.contains(&job)
+        {
+            state.demanded.push_back(job);
+            self.budget.condvar.notify_all();
         }
-
-        let mut map = self.ready_chunks.lock().map_err(|_| {
-            RasterH3Error::InvalidParameter("Prefetch queue mutex poisoned".to_string())
-        })?;
-
-        loop {
-            if let Some(payload) = map.remove(&key) {
-                return Ok(Some(payload));
+        let result = loop {
+            if let Some(payload) = state.ready.remove(&key) {
+                state.remaining.remove(&key);
+                break Ok(Some(payload));
+            }
+            if !state.remaining.contains(&key) {
+                break Ok(None);
             }
 
             if let Ok(err_guard) = self.error.lock() {
                 if let Some(ref e) = *err_guard {
-                    return Err(RasterH3Error::InvalidParameter(e.clone()));
+                    break Err(RasterH3Error::InvalidParameter(e.clone()));
                 }
             }
 
             if self.shutdown.load(Ordering::Relaxed) {
-                return Ok(None);
+                break Ok(None);
             }
 
-            // Only give up once every range has finished fetching. Ranges that
-            // are merely claimed may still be in flight and deliver this chunk.
-            if self.completed_jobs.load(Ordering::Relaxed) >= self.total_jobs {
-                return Ok(None);
+            if state.jobs[job] == JobState::Finished {
+                break Ok(None);
             }
 
-            map = self.condvar.wait(map).map_err(|_| {
-                RasterH3Error::InvalidParameter("Prefetch queue condvar poisoned".to_string())
-            })?;
-        }
+            state = self
+                .budget
+                .condvar
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        };
+        state.requested[job] -= 1;
+        drop(state);
+        self.budget.condvar.notify_all();
+        result
     }
 
     /// Non-blocking check for a ready chunk payload
-    pub fn try_get_chunk_payload(&self, tile_idx: usize, chunk_idx: u32) -> Option<Arc<Vec<u8>>> {
+    pub fn try_get_chunk_payload(
+        &self,
+        tile_idx: usize,
+        chunk_idx: u32,
+    ) -> Option<PrefetchedChunk> {
         let key = (tile_idx, chunk_idx);
-        if !self.scheduled_chunks.contains(&key) {
-            return None;
+        let mut state = self.budget.lock();
+        let payload = state.ready.remove(&key);
+        if payload.is_some() {
+            state.remaining.remove(&key);
         }
-        let mut map = self.ready_chunks.lock().ok()?;
-        map.remove(&key)
+        drop(state);
+        self.budget.condvar.notify_all();
+        payload
     }
 
     /// Returns true if the specified chunk was scheduled for remote prefetching
     pub fn is_chunk_scheduled(&self, tile_idx: usize, chunk_idx: u32) -> bool {
-        self.scheduled_chunks.contains(&(tile_idx, chunk_idx))
+        self.scheduled_chunks.contains_key(&(tile_idx, chunk_idx))
     }
 
     /// Total jobs planned for this queue
@@ -471,15 +685,23 @@ impl RemoteChunkPrefetchQueue {
         self.total_jobs
     }
 
+    /// Response bytes currently held: requests in flight plus fetched
+    /// responses still referenced by untaken chunks or by callers.
+    pub fn held_bytes(&self) -> u64 {
+        self.budget.lock().held_bytes
+    }
+
+    /// Highest [`Self::held_bytes`] observed so far.
+    pub fn peak_held_bytes(&self) -> u64 {
+        self.budget.lock().peak_held_bytes
+    }
+
     /// Explicitly signal cancellation, unblocking any waiting consumers or workers.
     pub fn cancel(&self) {
-        let map = self
-            .ready_chunks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.budget.lock();
         self.shutdown.store(true, Ordering::SeqCst);
-        drop(map);
-        self.condvar.notify_all();
+        drop(state);
+        self.budget.condvar.notify_all();
     }
 }
 
@@ -495,9 +717,10 @@ impl Drop for RemoteChunkPrefetchQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn test_terminal_updates_hold_ready_chunks_lock() {
+    fn test_terminal_updates_hold_queue_state_lock() {
         for cancel in [false, true] {
             let queue = Arc::new(RemoteChunkPrefetchQueue::spawn_internal(
                 vec![],
@@ -505,7 +728,7 @@ mod tests {
                 RemotePrefetchConfig::default(),
             ));
             // The check-to-wait gap is only accessible through this private mutex.
-            let map = queue.ready_chunks.lock().unwrap();
+            let state = queue.budget.lock();
             let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let worker_queue = Arc::clone(&queue);
@@ -515,9 +738,8 @@ mod tests {
                     worker_queue.cancel();
                 } else {
                     publish_error(
-                        &worker_queue.ready_chunks,
+                        &worker_queue.budget,
                         &worker_queue.error,
-                        &worker_queue.condvar,
                         "fetch failed".to_string(),
                     );
                 }
@@ -527,7 +749,7 @@ mod tests {
             let early = done_rx.recv_timeout(Duration::from_millis(200));
             let error_before_unlock = queue.error.lock().unwrap().clone();
             let shutdown_before_unlock = queue.shutdown.load(Ordering::SeqCst);
-            drop(map);
+            drop(state);
             if early.is_err() {
                 done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             }
