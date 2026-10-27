@@ -48,10 +48,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 flate2 = "1.0"
 libdeflater = "1.23"
-# Held at 59: parquet 60 writes `ColumnOrder::IEEE_754_TOTAL_ORDER` for every FLOAT/DOUBLE
-# column (no opt-out), which Polars' reader rejects ("Invalid thrift: bad data") and PyArrow
-# answers by dropping the column's min/max statistics. (59 really spells the feature "backened".)
-parquet = { version = "59", default-features = false, features = ["flate2-rust_backened", "snap", "zstd", "lz4", "brotli"] }
+parquet = { version = "60", default-features = false, features = ["flate2-rust_backend", "snap", "zstd", "lz4", "brotli"] }
 tempfile = "3.10"
 ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"

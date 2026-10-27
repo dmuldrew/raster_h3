@@ -20,6 +20,7 @@ use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 
 pub use crate::aggregator::multi_horizon::RecordStreamer;
+use crate::parquet::column_order::restore_type_defined_float_orders;
 use crate::parquet::geoparquet_metadata::build_geoparquet_metadata;
 use crate::parquet::writer::ParquetExportConfig;
 
@@ -240,6 +241,7 @@ where
         .unwrap_or_else(|| Path::new("."));
     let output_file = tempfile::NamedTempFile::new_in(parent)?;
     let file = output_file.reopen()?;
+    let mut footer_file = output_file.reopen()?;
     let mut writer = SerializedFileWriter::new(file, schema, props)?;
 
     let (writer_tx, writer_rx) = sync_channel::<B>(2);
@@ -277,7 +279,11 @@ where
                 let geo_json = build_geoparquet_metadata("geometry", bbox.unwrap_or(fallback_bbox));
                 writer.append_key_value_metadata(KeyValue::new("geo".to_string(), geo_json));
             }
-            writer.close()?;
+            let metadata = writer.close()?;
+            restore_type_defined_float_orders(
+                &mut footer_file,
+                metadata.file_metadata().column_orders(),
+            )?;
             Ok(total_rows)
         },
     );
