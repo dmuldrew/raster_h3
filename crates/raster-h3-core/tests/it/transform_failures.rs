@@ -147,3 +147,62 @@ fn exporters_report_through_the_shared_counter() {
         .unwrap();
     assert_eq!(counter.load(Ordering::Relaxed), 50);
 }
+
+#[test]
+fn strict_mode_fails_the_stream_instead_of_dropping_samples() {
+    use raster_h3_core::columnar::{
+        CategoricalBatchReader, CategoricalFormat, ContinuousBatchReader,
+    };
+    use raster_h3_core::error::RasterH3Error;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("past_pole.tif");
+    create_constant_f32_geotiff(&path, 10, 20, 0.0, 95.0, 1.0, 3.0);
+    let mut cfg = config(SamplingPattern::center(), None);
+    cfg.strict_transforms = true;
+
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let mut streamer = MultiScanHorizonStreamer::new(reader, &cfg).unwrap();
+    let err = loop {
+        match streamer.fetch_next_batch(4096) {
+            Ok(batch) => assert!(!batch.is_empty(), "strict stream ended without failing"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(err, RasterH3Error::TransformFailures(n) if n > 0),
+        "{err}"
+    );
+    // The failure is latched: later reads fail too rather than looking like EOF.
+    let again = streamer.fetch_next_batch(4096).unwrap_err().to_string();
+    assert!(again.contains("strict_transforms"), "{again}");
+
+    let paths = [path];
+    let first_err = |mut it: Box<dyn Iterator<Item = raster_h3_core::error::Result<_>>>| {
+        it.find_map(
+            |b: raster_h3_core::error::Result<raster_h3_core::columnar::RecordBatch>| b.err(),
+        )
+        .map(|e| e.to_string())
+    };
+    let msg = first_err(Box::new(
+        ContinuousBatchReader::open(&paths, &cfg, None, 64, None).unwrap(),
+    ))
+    .expect("continuous reader must fail");
+    assert!(msg.contains("strict_transforms"), "{msg}");
+    let msg = first_err(Box::new(
+        CategoricalBatchReader::open(&paths, &cfg, CategoricalFormat::Long, None, 64, None)
+            .unwrap(),
+    ))
+    .expect("categorical reader must fail");
+    assert!(msg.contains("strict_transforms"), "{msg}");
+}
+
+#[test]
+fn strict_mode_accepts_rasters_without_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("valid.tif");
+    create_constant_f32_geotiff(&path, 10, 20, 0.0, 60.0, 1.0, 3.0);
+    let mut cfg = config(SamplingPattern::center(), None);
+    cfg.strict_transforms = true;
+    assert_eq!(continuous(&path, &cfg), (0, 200.0));
+}

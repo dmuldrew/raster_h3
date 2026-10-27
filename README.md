@@ -256,6 +256,16 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 - **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
 - **Aggregation memory budget**: The default is 64 MiB for aggregation. This is not a total-process RAM limit; decoded chunks, prefetch buffers, output buffers, and other overhead also consume memory.
 
+Remote COG prefetching has its own 32 MiB response-byte budget, configurable in
+Rust with `RemotePrefetchConfig::max_buffered_bytes`. It covers in-flight requests
+and shared responses retained by the queue or callers; a range larger than the
+budget runs alone. `get_chunk_payload` / `try_get_chunk_payload` return
+`PrefetchedChunk` (dereferences to `[u8]`), not `Arc<Vec<u8>>`. Keep these handles
+short-lived: each slice or clone retains the entire coalesced response. Blocking
+requests can arrive out of order; unused prefetched responses may be evicted and
+fetched again to make room. See [Remote COG prefetching](docs/engines/core.md#remote-cog-prefetching)
+for configuration, retention and byte-usage diagnostics.
+
 ### Direct Web-Ready Map Tiles
 
 Generates single-file **PMTiles v3** vector pyramids directly from DuckDB SQL, Python or the CLI:
@@ -520,7 +530,7 @@ This prevents silent spatial corruption — meter-based coordinates treated as d
 | CLI | `raster-h3-cli jsonl grid.tif -r 8 --crs EPSG:32610` |
 | DataFusion | `ContinuousRasterTableProvider::try_new("grid.tif", vec![8])?.with_crs("EPSG:32610")` |
 
-Valid pixels whose transform fails or lands outside the valid latitude/longitude range are dropped rather than aborting the stream; they are counted by `transform_failures()` (core streamers and batch readers) and reported by the engines: a `transform_failures` column in DuckDB's export summaries, a PostgreSQL `WARNING`, a Python `RuntimeWarning` from the exporters, and a CLI warning on stderr. See [transform-failure diagnostics](docs/engines/core.md#transform-failure-diagnostics).
+Valid pixels whose transform fails or lands outside the valid latitude/longitude range are dropped rather than aborting the stream; they are counted by `transform_failures()` (core streamers and batch readers) and reported by the engines: a `transform_failures` column in DuckDB's export summaries, a PostgreSQL `WARNING`, a Python `RuntimeWarning` from the exporters and `scan_raster_h3`, and a CLI warning on stderr. DuckDB (`strict_transforms := true`), Python (`strict_transforms=True`) and DataFusion (`with_strict_transforms(true)`) can fail the query instead. See [transform-failure diagnostics](docs/engines/core.md#transform-failure-diagnostics).
 
 For supported projection families, see [Supported CRS](docs/crs-and-projection.md). Helmert datum shifts (`+towgs84`, and built-in national grids such as `EPSG:27700` and `EPSG:28992`) are applied; grid-based shifts such as NAD27 are rejected (see [Datum Shifts](docs/crs-and-projection.md#datum-shifts)). To convert your dataset into zero-trig native WGS84 for maximum throughput, see [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
 

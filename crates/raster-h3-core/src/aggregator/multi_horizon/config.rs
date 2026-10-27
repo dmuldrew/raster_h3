@@ -311,6 +311,10 @@ pub struct MultiResolutionConfig {
     /// streamers). Lets callers of pipelines that own the streamer, such as
     /// the Parquet and PMTiles exporters, read the count afterwards.
     pub transform_failure_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Fail the stream with [`crate::error::RasterH3Error::TransformFailures`]
+    /// as soon as any valid sample point is dropped by a failed coordinate
+    /// transform, instead of skipping it and only counting it.
+    pub strict_transforms: bool,
 }
 
 impl MultiResolutionConfig {
@@ -344,6 +348,7 @@ impl MultiResolutionConfig {
             quantiles: Vec::new(),
             remapper: None,
             transform_failure_counter: None,
+            strict_transforms: false,
         }
     }
 

@@ -39,6 +39,7 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `fetch_workers` | `BIGINT` | `8` | Concurrent HTTP range requests for remote tiles. |
 | `decode_budget_mb` | `BIGINT` | `256` | Memory for decoded chunks held at once (decoding, queued, being aggregated, idle for reuse), in MiB. Decoding waits for room; a single chunk larger than the budget is decoded only when no other is held. |
 | `compaction_budget_mb` | `BIGINT` | `None` | Opt-in limit on pending `compact` sibling groups, in MiB. Past it, the groups nearest completion are emitted as individual children. Samples and totals are unchanged, but which groups compact can vary between runs. Unset keeps compaction deterministic and its memory unbounded. |
+| `strict_transforms` | `BOOLEAN` | `false` | Fail the query when a valid sample point cannot be transformed to WGS84 (wrong or out-of-domain CRS) instead of skipping it. See [transform-failure diagnostics](engines/core.md#transform-failure-diagnostics). |
 | `formula` | `VARCHAR` | `None` | Spectral index formula: `'ndvi'`, `'ndwi'`, `'nbr'`, `'evi'`. Requires multi-band raster. |
 | `nir_band`, `red_band`, `green_band`, `blue_band`, `swir_band` | `BIGINT` | `auto` | 1-indexed band assignments for spectral index formulas. |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold — cells below this are excluded from output. |
@@ -153,6 +154,7 @@ Every engine reads these from the GeoTIFF and applies them the same way:
 | `fetch_workers` | `BIGINT` | `8` | Concurrent HTTP range requests for remote tiles. |
 | `decode_budget_mb` | `BIGINT` | `256` | Memory for decoded chunks held at once (decoding, queued, being aggregated, idle for reuse), in MiB. Decoding waits for room; a single chunk larger than the budget is decoded only when no other is held. |
 | `compaction_budget_mb` | `BIGINT` | `None` | Opt-in limit on pending `compact` sibling groups, in MiB. Past it, the groups nearest completion are emitted as individual children. Samples and totals are unchanged, but which groups compact can vary between runs. Unset keeps compaction deterministic and its memory unbounded. |
+| `strict_transforms` | `BOOLEAN` | `false` | Fail the query when a valid sample point cannot be transformed to WGS84 (wrong or out-of-domain CRS) instead of skipping it. See [transform-failure diagnostics](engines/core.md#transform-failure-diagnostics). |
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold for output. |
 | `min_majority_fraction` | `DOUBLE` | `None` | Minimum majority class fraction — cells below this threshold are excluded. |
 | `remap` | `VARCHAR` | `None` | Category remapping rules: exact (`'10=Forest,20=Urban'`), range (`'20-29=Urban'`), wildcard (`'*=Other'`). |
@@ -235,6 +237,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `geoparquet` | `BOOLEAN` | `false` | Emit OGC GeoParquet 1.1 metadata in Parquet FileMetaData with PROJJSON `OGC:CRS84` datum. |
 | `geom` | `BOOLEAN` | `false` | Emit a `geometry` column of the cell geometries; see [cell geometry](#cell-geometry). |
 | `source_crs` / `crs` | `VARCHAR` | `None` (auto) | CRS override (e.g. `'EPSG:4326'`). Required if raster lacks embedded CRS. |
+| `strict_transforms` | `BOOLEAN` | `false` | Stop the export when a valid sample point cannot be transformed to WGS84; `status` then reads `'ERROR: strict_transforms: ...'` and `transform_failures` holds the count so far. |
 
 ### Output Schema (1 Summary Row)
 | Column Name | Logical Type | Description |
@@ -269,6 +272,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `scale_offset` | `BOOLEAN` | `true` | Calibrate continuous values with GDAL band `SCALE`/`OFFSET`; ignored for categorical exports. |
 | `categorical` | `BOOLEAN` | `false` | Whether to aggregate categorical raster classes instead of continuous stats. |
 | `properties` | `VARCHAR` | `None` (all) | Selective property whitelist (e.g. `'mean,count'` or `'majority,entropy'`). Reduces MVT protobuf encoding overhead and shrinks `.pmtiles` archive size by 15–30%. |
+| `strict_transforms` | `BOOLEAN` | `false` | Stop the export when a valid sample point cannot be transformed to WGS84; `status` then reads `'ERROR: strict_transforms: ...'` and `transform_failures` holds the count so far. |
 
 ### Output Schema (1 Summary Row)
 | Column Name | Logical Type | Description |

@@ -74,16 +74,23 @@ only with `stream-profile`, and is also available as `metrics().worker.transform
 
 For pipelines that own the streamer (`H3ParquetWriter`, `H3PmtilesTiler`), set
 `MultiResolutionConfig::transform_failure_counter` to a shared `Arc<AtomicU64>`; every
-stream built from that configuration adds its failures to it. The engines surface the count
-as follows:
+stream built from that configuration adds its failures to it.
 
-| Engine | Where the count appears |
-| :--- | :--- |
-| DuckDB | `transform_failures` column of the `h3_raster_to_parquet` / `h3_raster_to_pmtiles` summary row. The streaming aggregate functions have no warnings channel and report nothing. |
-| PostgreSQL | One `WARNING` at the end of `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate`. |
-| Python | `RuntimeWarning` from `raster_to_parquet` / `raster_to_pmtiles`. `scan_raster_h3` reports nothing. |
-| CLI | Warning on stderr from every subcommand. |
-| DataFusion | Not surfaced yet. |
+`MultiResolutionConfig::strict_transforms` (default `false`) turns the count into an error:
+the stream fails with `RasterH3Error::TransformFailures(n)` after the first kernel wave that
+drops a sample, and later reads return the latched `StreamFailed` error. `n` covers the work
+done so far, not the whole raster. Records already emitted before that wave stay emitted,
+so a strict consumer must treat the error as fatal to the whole result.
+
+The engines surface the count, and strict mode, as follows:
+
+| Engine | Where the count appears | Strict mode |
+| :--- | :--- | :--- |
+| DuckDB | `transform_failures` column of the `h3_raster_to_parquet` / `h3_raster_to_pmtiles` summary row. The streaming aggregate functions have no warnings channel and report nothing. | `strict_transforms := true` on every table function |
+| PostgreSQL | One `WARNING` at the end of `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate`. | — |
+| Python | `RuntimeWarning` from `raster_to_parquet` / `raster_to_pmtiles`, and from `scan_raster_h3` / `RasterH3ArrowStream.iter_batches()` / `.to_dict()` once the scan completes. `to_polars()` / `read_raster_h3()` / `__arrow_c_stream__` hand the stream to Arrow and report nothing. | `strict_transforms=True` on `scan_raster_h3`, `read_raster_h3` and `RasterH3ArrowStream` |
+| CLI | Warning on stderr from every subcommand. | — |
+| DataFusion | `with_transform_failure_counter(Arc<AtomicU64>)` on either provider. | `with_strict_transforms(true)` |
 
 `custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
 or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
@@ -146,6 +153,53 @@ for mosaic opening include file opening **and** planning. Allocator peaks are
 approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
 wall-time comparisons include decoding and scheduling; they do not isolate bridge
 cost. The bare spawn/join measurement is only an isolated baseline.
+
+### Remote COG prefetching
+
+`raster::remote_prefetch::RemoteChunkPrefetchQueue` fetches HTTP/S3 ranges ahead
+of decoding for a single GeoTIFF or a mosaic. Its Rust configuration is separate
+from aggregation and decoded-buffer budgets (it is not a total-process RAM cap):
+
+```rust
+use raster_h3_core::raster::remote_prefetch::{RemoteChunkPrefetchQueue, RemotePrefetchConfig};
+
+let config = RemotePrefetchConfig {
+    max_buffered_bytes: 16 * 1024 * 1024, // default: 32 MiB
+    ..Default::default()
+};
+// reader is an open remote GeoTiffStreamReader; chunk_indices selects its strips/tiles.
+let queue = RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)).unwrap();
+if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
+    let compressed_bytes: &[u8] = &payload;
+    // Decode compressed_bytes here, then drop payload before requesting more chunks.
+}
+```
+
+`max_buffered_bytes` reserves each coalesced response's full byte length **before**
+the HTTP request and counts requests in flight as well as retained responses.
+If a range alone exceeds the budget (including a zero-byte budget), it is admitted
+only when no other response is held. `queue_capacity` additionally throttles
+untaken chunks (default 64, minimum 16); a coalesced response may exceed this count.
+Defaults are 8 HTTP workers, a 32 KiB coalescing gap and a 2 MiB range target.
+
+Blocking `get_chunk_payload` requests are prioritized over speculative prefetches
+and may arrive in any order, including from concurrent decode workers. When a
+requested range cannot fit, responses with no waiting consumers may be evicted.
+An evicted, untaken chunk is fetched again on a later blocking request; chunks
+already taken are not republished. `try_get_chunk_payload` only takes ready chunks
+and does not trigger a fetch. In-order scans normally avoid refetching.
+
+Both methods now return `PrefetchedChunk` instead of `Arc<Vec<u8>>`. It dereferences
+to `[u8]`, implements `AsRef<[u8]>`, and clones cheaply without copying the response.
+Every slice or clone keeps the **entire coalesced response** alive and charged until
+the last reference is dropped. `response_len()` reports that full length, whereas
+`len()` is the chunk's slice length. Eviction cannot release bytes held by callers:
+drop payloads and their clones promptly after decoding, before blocking for another
+range that needs the same budget. Handles remain valid after the queue is dropped.
+`held_bytes()` / `peak_held_bytes()` report current / peak reserved response bytes.
+
+All engine adapters use this core prefetcher; `RemotePrefetchConfig` is a Rust
+queue-level API, not an additional SQL, Python or CLI option.
 
 ### Mosaic decoder cache
 

@@ -67,6 +67,7 @@ raster_h3.raster_to_pmtiles("dem.tif", "dem.pmtiles", resolutions=[6, 7, 8])
 | `bbox` | `str \| Sequence[float]` | `None` | `min_lon,min_lat,max_lon,max_lat`; exactly four numbers |
 | `columns` | `Sequence[str]` | `None` | Columns to produce (projection pushed into the engine) |
 | `limit` | `int` | `None` | Maximum rows |
+| `strict_transforms` | `bool` | `False` | Raise when a valid sample cannot be transformed to WGS84 instead of skipping it with a `RuntimeWarning` |
 
 An invalid `resolutions`, `format` or `bbox` raises `RuntimeError` (as does an invalid
 `resolutions` passed to the export functions) rather than being ignored or defaulted.
@@ -295,7 +296,7 @@ gdf = gpd.GeoDataFrame(
 | :--- | :--- |
 | `RuntimeError: Could not locate libraster_h3_python shared library` on first call | The native library is not next to the package. Install a wheel, run `cargo build --release -p raster-h3-python` in the workspace, or set `RASTER_H3_PYTHON_LIB` to the library path. |
 | `scan_raster_h3` returns a `RasterH3ArrowStream`, not a `LazyFrame` | Polars is not installed or is too old to have `polars.io.plugins.register_io_source`. Install the `polars` extra. |
-| `RuntimeWarning: raster_h3: N valid sample(s) were dropped ...` from `raster_to_parquet` / `raster_to_pmtiles` | Some valid pixels could not be placed because their coordinate transform failed or fell outside the valid latitude/longitude range. Check `crs`; see [transform-failure diagnostics](core.md#transform-failure-diagnostics). |
+| `RuntimeWarning: raster_h3: N valid sample(s) were dropped ...` from `raster_to_parquet` / `raster_to_pmtiles` / `scan_raster_h3` | Some valid pixels could not be placed because their coordinate transform failed or fell outside the valid latitude/longitude range. Check `crs`; see [transform-failure diagnostics](core.md#transform-failure-diagnostics). |
 | `RuntimeError: ... No CRS detected ...` | Pass `crs="EPSG:…"`. See the README's [Troubleshooting](../../README.md#troubleshooting--common-pitfalls). |
 | Need sampling, bands, spectral formulas, quantiles or remapping | Not exposed in Python. Use [DuckDB](duckdb.md) (for example via `duckdb` from Python) or the Rust [DataFusion](datafusion.md) / [Core](core.md) APIs. |
 

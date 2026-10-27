@@ -162,6 +162,8 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     apply_scale_offset: bool,
     /// Shared total that transform failures are also added to.
     transform_failure_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Fail on the first wave that drops a sample to a transform failure.
+    strict_transforms: bool,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
     resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
@@ -308,6 +310,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             nodata: config.custom_nodata,
             apply_scale_offset: config.apply_scale_offset,
             transform_failure_counter: config.transform_failure_counter.clone(),
+            strict_transforms: config.strict_transforms,
             bbox: config.bbox,
             sampling: config.sampling.clone(),
             resolution_shards,
@@ -619,6 +622,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     self.metrics.worker_ns += ns;
                     self.metrics.jobs += 1;
                 }
+                let failures = self.metrics.worker.transform_failures;
+                if self.strict_transforms && failures > 0 {
+                    return Err(RasterH3Error::TransformFailures(failures));
+                }
                 let bytes: usize = maps
                     .iter()
                     .flatten()
@@ -660,6 +667,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         }
         match result {
             Ok(()) => Ok(()),
+            Err(e @ RasterH3Error::TransformFailures(_)) => {
+                // Keep the typed error for this call; later reads get the latched text.
+                self.fail(e.to_string());
+                Err(e)
+            }
             Err(e) => Err(self.fail(e.to_string())),
         }
     }
