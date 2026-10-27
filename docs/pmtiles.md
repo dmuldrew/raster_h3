@@ -129,7 +129,7 @@ Each feature's exterior ring has positive area in tile coordinates, as MVT 2.1 r
 Cells crossing the antimeridian are drawn on the tile's side of the seam (in the z0 world tile,
 on both sides). The two pole cells are polar caps closed along the map's top or bottom edge;
 at fine resolutions they lie wholly beyond Web Mercator's ±85.05° limit and flatten onto that
-edge. See [cell geometry](api-reference.md#cell-geometry).
+edge. See [cell geometry](sql-api-reference.md#cell-geometry).
 
 ## PMTiles v3 Leaf Directory Architecture
 

@@ -7,6 +7,9 @@
 ([`python/raster_h3/__init__.py`](../../crates/raster-h3-python/python/raster_h3/__init__.py))
 that loads it with `ctypes`, and the bundled `raster-h3-cli` executable.
 
+For every argument, output column, return value and error, see the
+[Polars API Reference](../polars-api-reference.md).
+
 Because the library never links against `libpython`, one wheel per platform
 (`py3-none-<platform>`) serves every Python ≥ 3.9. Polars and PyArrow are optional.
 
@@ -117,9 +120,9 @@ falling back to the stream object if Polars is missing.
 `h3_polygon_to_cells(wkb: bytes, resolution, containment="contains_centroid") -> list[int] | None`
 call the shared core helpers (behaviour on invalid input is listed in the
 [overview](README.md#scalar-helpers); containment modes are described in the
-[API reference](../api-reference.md#containment-modes)). `h3_to_wkb` returns a
+[Polars API reference](../polars-api-reference.md#h3_polygon_to_cells)). `h3_to_wkb` returns a
 `MULTIPOLYGON` for cells crossing the antimeridian and a polar-cap polygon for the pole
-cells (see [cell geometry](../api-reference.md#cell-geometry)). `h3_polygon_to_cells` takes WKB,
+cells (see [cell geometry](../sql-api-reference.md#cell-geometry)). `h3_polygon_to_cells` takes WKB,
 e.g. `shapely.to_wkb(geom)`; it raises `ValueError` for an unknown mode or a polygon over the
 10,000,000-cell limit. They operate on single Python
 values; for whole columns use the Arrow stream or a Polars expression such as
