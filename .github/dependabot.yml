@@ -4,6 +4,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # parquet >= 60 writes IEEE_754_TOTAL_ORDER column orders that Polars cannot read; see
+      # the note on the workspace `parquet` dependency before lifting this.
+      - dependency-name: parquet
+        versions: ['>= 60']
     groups:
       # One PR for semver-compatible bumps; majors still arrive individually.
       cargo-minor:
