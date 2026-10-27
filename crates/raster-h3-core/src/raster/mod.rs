@@ -27,8 +27,8 @@ pub use prefetch::{
     PrefetchedMosaicReader,
 };
 pub use remote_prefetch::{
-    coalesce_chunk_ranges, ChunkLocation, CoalescedRange, RemoteChunkPrefetchQueue,
-    RemotePrefetchConfig,
+    coalesce_chunk_ranges, ChunkLocation, CoalescedRange, PrefetchedChunk,
+    RemoteChunkPrefetchQueue, RemotePrefetchConfig,
 };
 
 /// Represents a 2D chunk / tile window of a raster

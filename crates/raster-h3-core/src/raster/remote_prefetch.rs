@@ -3,11 +3,17 @@
 //! Provides high-concurrency background network prefetching with HTTP Range request coalescing.
 //! Merges consecutive/nearby chunk byte ranges to cut HTTP round-trips by 2x–5x and streams
 //! compressed chunk payloads ahead of scanline processing.
+//!
+//! Memory is bounded by bytes: before each request a worker reserves the
+//! range's size against [`RemotePrefetchConfig::max_buffered_bytes`], and the
+//! reservation lasts until the last chunk sliced from that response is
+//! dropped. Chunks share their response buffer instead of being copied.
 
+use std::fmt;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -21,6 +27,9 @@ pub const DEFAULT_PREFETCH_WORKERS: usize = 8;
 pub const DEFAULT_MAX_COALESCE_GAP: u64 = 32768; // 32 KB
 pub const DEFAULT_MAX_COALESCE_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
 pub const DEFAULT_PREFETCH_QUEUE_CAPACITY: usize = 64;
+/// Default cap on response bytes held: requests in flight plus fetched
+/// responses still referenced (enough for 8 workers × 2 MB ranges, twice).
+pub const DEFAULT_PREFETCH_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Location of a chunk in its container file
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +56,14 @@ pub struct RemotePrefetchConfig {
     pub num_workers: usize,
     pub max_gap_bytes: u64,
     pub max_range_bytes: u64,
+    /// Fetched chunks that may wait to be taken (at least 16). Checked before
+    /// each request, so one coalesced response can exceed it.
     pub queue_capacity: usize,
+    /// Response bytes the queue may hold: requests in flight plus fetched
+    /// responses still referenced by untaken chunks or by callers. A single
+    /// range larger than this is still fetched, but only when nothing else is
+    /// held.
+    pub max_buffered_bytes: u64,
 }
 
 impl Default for RemotePrefetchConfig {
@@ -57,6 +73,7 @@ impl Default for RemotePrefetchConfig {
             max_gap_bytes: DEFAULT_MAX_COALESCE_GAP,
             max_range_bytes: DEFAULT_MAX_COALESCE_BYTES,
             queue_capacity: DEFAULT_PREFETCH_QUEUE_CAPACITY,
+            max_buffered_bytes: DEFAULT_PREFETCH_BUDGET_BYTES,
         }
     }
 }
@@ -123,8 +140,131 @@ pub fn coalesce_chunk_ranges(
     ranges
 }
 
-/// Fetched chunk bytes keyed by (tile, chunk index), shared with the workers.
-type ReadyChunks = Arc<Mutex<FxHashMap<(usize, u32), Arc<Vec<u8>>>>>;
+/// Byte budget shared by workers and every live response buffer. Kept apart
+/// from the ready map so buffers can release it without a reference cycle.
+#[derive(Default)]
+struct Budget {
+    state: Mutex<BudgetState>,
+    /// Signalled when bytes or chunk slots are released, or on cancellation.
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct BudgetState {
+    /// Bytes reserved by requests in flight plus fetched responses still alive.
+    held_bytes: u64,
+    peak_held_bytes: u64,
+    /// Chunks in the ready map not yet taken by a consumer.
+    buffered_chunks: usize,
+    /// Next range to claim. Ranges are claimed strictly in order, so the
+    /// earliest range any consumer can be waiting for is always claimed
+    /// before a later one can take budget.
+    next_job: usize,
+}
+
+impl Budget {
+    fn lock(&self) -> MutexGuard<'_, BudgetState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut state = self.lock();
+        state.held_bytes = state.held_bytes.saturating_sub(bytes);
+        drop(state);
+        self.condvar.notify_all();
+    }
+
+    fn chunks_taken(&self, count: usize) {
+        let mut state = self.lock();
+        state.buffered_chunks = state.buffered_chunks.saturating_sub(count);
+        drop(state);
+        self.condvar.notify_all();
+    }
+
+    /// Wake waiting workers after `shutdown` changes.
+    fn wake(&self) {
+        drop(self.lock());
+        self.condvar.notify_all();
+    }
+}
+
+/// Bytes charged to a [`Budget`], released when dropped.
+struct BudgetCharge {
+    budget: Arc<Budget>,
+    bytes: u64,
+}
+
+impl Drop for BudgetCharge {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// One fetched (possibly coalesced) HTTP response, shared by every chunk
+/// sliced from it; its size stays charged until the last slice is dropped.
+struct ResponseBuffer {
+    bytes: Vec<u8>,
+    _charge: BudgetCharge,
+}
+
+/// A prefetched chunk: a slice of a shared response buffer.
+///
+/// Dereferences to the chunk's bytes and is cheap to clone. The whole
+/// response stays allocated, and counted against
+/// [`RemotePrefetchConfig::max_buffered_bytes`], while any chunk sliced from
+/// it is alive, so drop chunks once they are decoded.
+#[derive(Clone)]
+pub struct PrefetchedChunk {
+    buffer: Arc<ResponseBuffer>,
+    start: usize,
+    len: usize,
+}
+
+impl PrefetchedChunk {
+    /// Length of the shared response this chunk was sliced from.
+    pub fn response_len(&self) -> usize {
+        self.buffer.bytes.len()
+    }
+}
+
+impl Deref for PrefetchedChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buffer.bytes[self.start..self.start + self.len]
+    }
+}
+
+impl AsRef<[u8]> for PrefetchedChunk {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl PartialEq for PrefetchedChunk {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for PrefetchedChunk {}
+
+impl fmt::Debug for PrefetchedChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrefetchedChunk")
+            .field("len", &self.len)
+            .field("response_len", &self.response_len())
+            .finish()
+    }
+}
+
+/// Fetched chunks keyed by (tile, chunk index), shared with the workers.
+type ReadyChunks = Arc<Mutex<FxHashMap<(usize, u32), PrefetchedChunk>>>;
+
+/// Bytes requested for a range (`end_offset` is inclusive).
+fn range_bytes(range: &CoalescedRange) -> u64 {
+    range.end_offset - range.start_offset + 1
+}
 
 fn publish_error(
     ready: &ReadyChunks,
@@ -157,6 +297,7 @@ pub struct RemoteChunkPrefetchQueue {
     scheduled_chunks: FxHashSet<(usize, u32)>,
     error: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
+    budget: Arc<Budget>,
     _worker_handles: Vec<JoinHandle<()>>,
 }
 
@@ -270,7 +411,7 @@ impl RemoteChunkPrefetchQueue {
 
         let ready_chunks = Arc::new(Mutex::new(FxHashMap::default()));
         let condvar = Arc::new(Condvar::new());
-        let next_job = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(Budget::default());
         let completed_jobs = Arc::new(AtomicUsize::new(0));
         let error = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -280,6 +421,7 @@ impl RemoteChunkPrefetchQueue {
 
         let num_workers = config.num_workers.clamp(1, 32).min(total_jobs);
         let queue_capacity = config.queue_capacity.max(16);
+        let max_bytes = config.max_buffered_bytes;
 
         let mut handles = Vec::with_capacity(num_workers);
 
@@ -288,7 +430,7 @@ impl RemoteChunkPrefetchQueue {
             let ranges = Arc::clone(&ranges_arc);
             let ready = Arc::clone(&ready_chunks);
             let cv = Arc::clone(&condvar);
-            let job_idx = Arc::clone(&next_job);
+            let budget = Arc::clone(&budget);
             let done = Arc::clone(&completed_jobs);
             let err_holder = Arc::clone(&error);
             let term = Arc::clone(&shutdown);
@@ -318,34 +460,46 @@ impl RemoteChunkPrefetchQueue {
                     cv: Arc::clone(&cv),
                 };
 
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Claim the next range in order once the budget admits it,
+                // reserving its size until its response buffer is dropped.
+                let claim = || -> Option<(usize, BudgetCharge)> {
+                    let mut state = budget.lock();
                     loop {
-                        if term.load(Ordering::Relaxed) {
-                            break;
+                        if term.load(Ordering::SeqCst) || state.next_job >= ranges.len() {
+                            return None;
                         }
-
-                        // Backpressure throttling: pause if buffer is full
-                        loop {
-                            if term.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            let current_buffered = ready.lock().map(|m| m.len()).unwrap_or(0);
-                            if current_buffered < queue_capacity {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(5));
+                        let need = range_bytes(&ranges[state.next_job]);
+                        // With nothing held, take the range even if it alone
+                        // exceeds the budget; otherwise it could never run.
+                        let fits = state.held_bytes == 0
+                            || (state.held_bytes + need <= max_bytes
+                                && state.buffered_chunks < queue_capacity);
+                        if fits {
+                            let job = state.next_job;
+                            state.next_job += 1;
+                            state.held_bytes += need;
+                            state.peak_held_bytes = state.peak_held_bytes.max(state.held_bytes);
+                            let charge = BudgetCharge {
+                                budget: Arc::clone(&budget),
+                                bytes: need,
+                            };
+                            return Some((job, charge));
                         }
+                        state = budget
+                            .condvar
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                };
 
-                        let job = job_idx.fetch_add(1, Ordering::Relaxed);
-                        if job >= ranges.len() {
-                            break;
-                        }
-
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Some((job, charge)) = claim() {
                         let range = &ranges[job];
                         let source = match sources.get(range.tile_idx).and_then(|s| s.as_ref()) {
                             Some(s) => s,
                             None => {
                                 // Nothing to fetch; still count the range as finished.
+                                drop(charge);
                                 if let Ok(_map) = ready.lock() {
                                     done.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -355,26 +509,49 @@ impl RemoteChunkPrefetchQueue {
                         };
 
                         match source.fetch_range(range.start_offset, range.end_offset) {
-                            Ok(data) => {
-                                let data_len = data.len();
+                            Ok(bytes) => {
+                                let data_len = bytes.len();
+                                let buffer = Arc::new(ResponseBuffer {
+                                    bytes,
+                                    _charge: charge,
+                                });
+                                let chunks: Vec<((usize, u32), PrefetchedChunk)> = range
+                                    .chunk_slices
+                                    .iter()
+                                    .filter(|&&(_, start, len)| start + len <= data_len)
+                                    .map(|&(chunk_idx, start, len)| {
+                                        let chunk = PrefetchedChunk {
+                                            buffer: Arc::clone(&buffer),
+                                            start,
+                                            len,
+                                        };
+                                        ((range.tile_idx, chunk_idx), chunk)
+                                    })
+                                    .collect();
+                                // From here only the chunks own the response, so
+                                // its bytes are released as soon as the last one
+                                // is dropped (or now, outside any lock, if none).
+                                drop(buffer);
+                                // Count before inserting so a fast consumer
+                                // cannot take a chunk that is not yet counted.
+                                budget.lock().buffered_chunks += chunks.len();
+                                let mut replaced = Vec::new();
                                 let mut map = match ready.lock() {
                                     Ok(m) => m,
                                     Err(_) => break,
                                 };
-
-                                for &(chunk_idx, slice_start, slice_len) in &range.chunk_slices {
-                                    if slice_start + slice_len <= data_len {
-                                        let chunk_payload = Arc::new(
-                                            data[slice_start..slice_start + slice_len].to_vec(),
-                                        );
-                                        map.insert((range.tile_idx, chunk_idx), chunk_payload);
-                                    }
+                                for (key, chunk) in chunks {
+                                    replaced.extend(map.insert(key, chunk));
                                 }
                                 done.fetch_add(1, Ordering::Relaxed);
                                 drop(map);
                                 cv.notify_all();
+                                // Drop displaced chunks outside the ready lock:
+                                // releasing budget takes the budget lock.
+                                drop(replaced);
                             }
                             Err(e) => {
+                                drop(charge);
                                 publish_error(&ready, &err_holder, &cv, e.to_string());
                                 break;
                             }
@@ -404,6 +581,7 @@ impl RemoteChunkPrefetchQueue {
             scheduled_chunks,
             error,
             shutdown,
+            budget,
             _worker_handles: handles,
         }
     }
@@ -414,7 +592,7 @@ impl RemoteChunkPrefetchQueue {
         &self,
         tile_idx: usize,
         chunk_idx: u32,
-    ) -> Result<Option<Arc<Vec<u8>>>> {
+    ) -> Result<Option<PrefetchedChunk>> {
         let key = (tile_idx, chunk_idx);
         if !self.scheduled_chunks.contains(&key) {
             return Ok(None);
@@ -426,6 +604,8 @@ impl RemoteChunkPrefetchQueue {
 
         loop {
             if let Some(payload) = map.remove(&key) {
+                drop(map);
+                self.budget.chunks_taken(1);
                 return Ok(Some(payload));
             }
 
@@ -452,13 +632,22 @@ impl RemoteChunkPrefetchQueue {
     }
 
     /// Non-blocking check for a ready chunk payload
-    pub fn try_get_chunk_payload(&self, tile_idx: usize, chunk_idx: u32) -> Option<Arc<Vec<u8>>> {
+    pub fn try_get_chunk_payload(
+        &self,
+        tile_idx: usize,
+        chunk_idx: u32,
+    ) -> Option<PrefetchedChunk> {
         let key = (tile_idx, chunk_idx);
         if !self.scheduled_chunks.contains(&key) {
             return None;
         }
         let mut map = self.ready_chunks.lock().ok()?;
-        map.remove(&key)
+        let payload = map.remove(&key);
+        drop(map);
+        if payload.is_some() {
+            self.budget.chunks_taken(1);
+        }
+        payload
     }
 
     /// Returns true if the specified chunk was scheduled for remote prefetching
@@ -471,6 +660,17 @@ impl RemoteChunkPrefetchQueue {
         self.total_jobs
     }
 
+    /// Response bytes currently held: requests in flight plus fetched
+    /// responses still referenced by untaken chunks or by callers.
+    pub fn held_bytes(&self) -> u64 {
+        self.budget.lock().held_bytes
+    }
+
+    /// Highest [`Self::held_bytes`] observed so far.
+    pub fn peak_held_bytes(&self) -> u64 {
+        self.budget.lock().peak_held_bytes
+    }
+
     /// Explicitly signal cancellation, unblocking any waiting consumers or workers.
     pub fn cancel(&self) {
         let map = self
@@ -480,6 +680,8 @@ impl RemoteChunkPrefetchQueue {
         self.shutdown.store(true, Ordering::SeqCst);
         drop(map);
         self.condvar.notify_all();
+        // Workers waiting for budget re-check `shutdown` under the budget lock.
+        self.budget.wake();
     }
 }
 
@@ -495,6 +697,7 @@ impl Drop for RemoteChunkPrefetchQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_terminal_updates_hold_ready_chunks_lock() {
