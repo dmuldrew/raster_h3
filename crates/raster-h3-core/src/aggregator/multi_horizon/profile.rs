@@ -1,8 +1,9 @@
 //! Per-worker instrumentation. Enable `stream-profile` for counters and stage
-//! timers; normal builds compile hot-path measurement out entirely.
+//! timers; normal builds compile hot-path measurement out entirely. The
+//! transform-failure diagnostic is always counted: it only runs when a sample
+//! is dropped.
 use h3o::{CellIndex, LatLng, Resolution};
 use serde::Serialize;
-#[cfg(feature = "stream-profile")]
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Default, Debug, Serialize)]
@@ -12,6 +13,10 @@ pub struct WorkerProfile {
     pub transform_calls: u64,
     pub transform_ns: u64,
     pub copied_bytes: u64,
+    /// Valid sample points dropped because the coordinate transform failed,
+    /// returned a non-finite coordinate or a latitude outside [-90, 90], or
+    /// H3 rejected the point. Counted in every build.
+    pub transform_failures: u64,
 }
 impl WorkerProfile {
     pub fn merge(&mut self, other: Self) {
@@ -20,33 +25,43 @@ impl WorkerProfile {
         self.transform_calls += other.transform_calls;
         self.transform_ns += other.transform_ns;
         self.copied_bytes += other.copied_bytes;
+        self.transform_failures += other.transform_failures;
     }
 }
 thread_local! {
     #[cfg(feature="stream-profile")]
     static PROFILE: Cell<WorkerProfile> = Cell::new(WorkerProfile::default());
+    static TRANSFORM_FAILURES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Record one valid sample point dropped by a failed coordinate transform.
+#[cold]
+pub fn transform_failed() {
+    TRANSFORM_FAILURES.with(|v| v.set(v.get() + 1));
 }
 /// Restore counters even if a kernel panics or recursively calls another stream.
 #[derive(Default)]
 pub struct WorkerScope {
     #[cfg(feature = "stream-profile")]
     old_profile: WorkerProfile,
+    old_transform_failures: u64,
 }
 impl WorkerScope {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "stream-profile")]
             old_profile: PROFILE.with(|v| v.replace(WorkerProfile::default())),
+            old_transform_failures: TRANSFORM_FAILURES.with(|v| v.replace(0)),
         }
     }
     pub fn snapshot(&self) -> WorkerProfile {
         #[cfg(feature = "stream-profile")]
-        {
-            PROFILE.with(Cell::get)
-        }
+        let profile = PROFILE.with(Cell::get);
         #[cfg(not(feature = "stream-profile"))]
-        {
-            WorkerProfile::default()
+        let profile = WorkerProfile::default();
+        WorkerProfile {
+            transform_failures: TRANSFORM_FAILURES.with(Cell::get),
+            ..profile
         }
     }
 }
@@ -54,6 +69,7 @@ impl Drop for WorkerScope {
     fn drop(&mut self) {
         #[cfg(feature = "stream-profile")]
         PROFILE.with(|v| v.set(self.old_profile));
+        TRANSFORM_FAILURES.with(|v| v.set(self.old_transform_failures));
     }
 }
 #[inline(always)]

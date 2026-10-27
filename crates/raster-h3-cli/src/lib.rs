@@ -92,6 +92,17 @@ fn resolve_projection_indices(
     Ok(Some(indices))
 }
 
+/// Report valid samples the coordinate transform could not place, on stderr
+/// so streamed output stays clean.
+fn warn_transform_failures(failures: u64) {
+    if failures > 0 {
+        eprintln!(
+            "warning: {failures} valid sample(s) were dropped because their coordinate \
+             transform failed or fell outside the valid latitude/longitude range; check the source CRS"
+        );
+    }
+}
+
 /// Stream a GeoTIFF/COG aggregation directly to `writer` in binary IPC or JSONL format.
 /// Returns the total number of rows emitted.
 pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W) -> Result<usize> {
@@ -106,20 +117,22 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
     if !opts.categorical {
         let full_schema = ColumnSchema::continuous(&config.quantiles);
         let projection = resolve_projection_indices(&full_schema, &opts.columns)?;
-        let reader =
+        let mut reader =
             ContinuousBatchReader::open(&paths, &config, projection, opts.batch_size, opts.limit)?;
         let schema = reader.schema();
-        match opts.output_format {
-            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, reader),
-            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, reader),
-        }
+        let rows = match opts.output_format {
+            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, &mut reader),
+            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, &mut reader),
+        }?;
+        warn_transform_failures(reader.transform_failures());
+        Ok(rows)
     } else {
         let full_schema = match opts.categorical_format {
             CategoricalFormat::Wide => ColumnSchema::categorical_wide(),
             CategoricalFormat::Long => ColumnSchema::categorical_long(),
         };
         let projection = resolve_projection_indices(&full_schema, &opts.columns)?;
-        let reader = CategoricalBatchReader::open(
+        let mut reader = CategoricalBatchReader::open(
             &paths,
             &config,
             opts.categorical_format,
@@ -128,10 +141,12 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
             opts.limit,
         )?;
         let schema = reader.schema();
-        match opts.output_format {
-            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, reader),
-            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, reader),
-        }
+        let rows = match opts.output_format {
+            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, &mut reader),
+            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, &mut reader),
+        }?;
+        warn_transform_failures(reader.transform_failures());
+        Ok(rows)
     }
 }
 

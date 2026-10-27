@@ -38,3 +38,4 @@ mod sparse_chunks_and_spilling;
 mod streaming_failures;
 mod super_sampling;
 mod threading;
+mod transform_failures;

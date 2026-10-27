@@ -527,6 +527,8 @@ This prevents silent spatial corruption — meter-based coordinates treated as d
 | CLI | `raster-h3-cli jsonl grid.tif -r 8 --crs EPSG:32610` |
 | DataFusion | `ContinuousRasterTableProvider::try_new("grid.tif", vec![8])?.with_crs("EPSG:32610")` |
 
+Valid pixels whose transform fails or lands outside the valid latitude/longitude range are dropped rather than aborting the stream; they are counted by `transform_failures()` (core streamers and batch readers), and the CLI prints a warning to stderr. See [transform-failure diagnostics](docs/engines/core.md#transform-failure-diagnostics).
+
 For supported projection families, see [Supported CRS](docs/crs-and-projection.md). Helmert datum shifts (`+towgs84`, and built-in national grids such as `EPSG:27700` and `EPSG:28992`) are applied; grid-based shifts such as NAD27 are rejected (see [Datum Shifts](docs/crs-and-projection.md#datum-shifts)). To convert your dataset into zero-trig native WGS84 for maximum throughput, see [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
 
 ### Scaled Values (GDAL Scale/Offset) and Alpha

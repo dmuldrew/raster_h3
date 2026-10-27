@@ -262,6 +262,7 @@ fn walk<T, Acc, E, N, R>(
                     .filter(|&(_, lat)| (-90.0..=90.0).contains(&lat))
                     .and_then(|(lon, lat)| LatLng::new(lat, lon).ok())
                 else {
+                    super::profile::transform_failed();
                     if let Some(s) = span_start.take() {
                         runs.add_span(&row[s..c], engine);
                     }
@@ -289,10 +290,14 @@ fn walk<T, Acc, E, N, R>(
             positions.clear();
             let col = chunk.col_offset as usize + c;
             for (k, sp) in ctx.sampling.points.iter().enumerate() {
-                let Some((lon, lat)) = projector.project(col, row_idx, k, *sp) else {
+                let Some((lon, lat)) = projector
+                    .project(col, row_idx, k, *sp)
+                    .filter(|&(_, lat)| (-90.0..=90.0).contains(&lat))
+                else {
+                    super::profile::transform_failed();
                     continue;
                 };
-                if !(-90.0..=90.0).contains(&lat) || !is_point_in_bbox(lon, lat, ctx.bbox) {
+                if !is_point_in_bbox(lon, lat, ctx.bbox) {
                     continue;
                 }
                 if let Some((tile_idx, mosaic)) = ctx.owner {
@@ -300,8 +305,9 @@ fn walk<T, Acc, E, N, R>(
                         continue;
                     }
                 }
-                if let Ok(ll) = LatLng::new(lat, lon) {
-                    positions.push((ll, sp.weight));
+                match LatLng::new(lat, lon) {
+                    Ok(ll) => positions.push((ll, sp.weight)),
+                    Err(_) => super::profile::transform_failed(),
                 }
             }
             if positions.is_empty() {

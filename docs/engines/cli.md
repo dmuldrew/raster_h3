@@ -44,6 +44,8 @@ raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
 Arguments are validated strictly: unknown flags, missing values, resolutions outside
 `0..=15`, malformed numbers, a bbox without exactly four numbers, an unknown column name
 and a second positional input are all errors. Errors go to stderr with exit status `1`.
+`ipc` and `jsonl` also print a warning to stderr when valid samples were dropped because
+their coordinate transform failed (see [transform-failure diagnostics](core.md#transform-failure-diagnostics)).
 
 Column names come from the core schemas (see the
 [overview](README.md#output-schemas)); `--columns` with a name that does not
