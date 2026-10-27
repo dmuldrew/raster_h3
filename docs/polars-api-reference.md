@@ -46,14 +46,14 @@ Polars and PyArrow are optional dependencies. Without Polars, the scan functions
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :---: | :--- | :--- |
 | `path` | `str \| pathlib.Path` | **Yes** | — | GeoTIFF / Cloud-Optimized GeoTIFF. Also accepts an `http(s)://` or `s3://` URL, a glob (`"tiles/*.tif"`), a comma-separated list of files, or a VRT; multiple files are read as one mosaic. |
-| `resolutions` | `int \| str \| Sequence[int]` | No | `8` | One or more H3 resolutions (0 to 15), aggregated in a single pass: `8`, `"7,8"`, `"7 8"` or `[7, 8]`. |
+| `resolutions` | `int \| str \| Sequence[int]` | No | `8` | One or more H3 resolutions (0 to 15), aggregated in a single pass: `8`, `"7,8"`, `"7 8"` or `[7, 8]`. An empty string or empty sequence means the default, `8`. |
 
 ### Keyword parameters
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `categorical` | `bool` | `False` | Aggregate class codes (majority, histogram, entropy) instead of continuous statistics. |
-| `format` | `str` | `"wide"` | Categorical layout: `"wide"` (one row per cell) or `"long"` (one row per cell and class). Case-insensitive. Ignored when `categorical=False`. |
+| `format` | `str` | `"wide"` | Categorical layout: `"wide"` (one row per cell) or `"long"` (one row per cell and class). Case-insensitive; an empty string means `"wide"`. Validated in both modes, so an invalid value raises even when `categorical=False`, but only used for categorical scans. |
 | `crs` | `str \| None` | `None` (auto) | Source CRS, e.g. `"EPSG:4326"`, `"EPSG:32610"`. Required if the raster has no embedded CRS; otherwise overrides it. |
 | `nodata` | `float \| None` | `None` (auto) | NoData sentinel to exclude, matched against stored values. Overrides the file's `GDAL_NODATA` tag. |
 | `bbox` | `str \| Sequence[float] \| None` | `None` | Region of interest as `(min_lon, min_lat, max_lon, max_lat)` or `"min_lon,min_lat,max_lon,max_lat"`. Exactly four numbers. Chunks outside the box are not read. |
@@ -83,7 +83,8 @@ example through the `duckdb` Python package) or the Rust APIs when you need to c
 ### Validation
 
 Invalid options raise `RuntimeError` with the engine's message; they are never silently
-ignored or defaulted:
+ignored. The only defaulting is for empty values: `resolutions=""` or `[]` means `8`, and
+`format=""` means `"wide"`.
 
 | Input | Message (prefixed `Invalid parameter:`) |
 | :--- | :--- |
