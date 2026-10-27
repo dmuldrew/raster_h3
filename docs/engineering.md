@@ -2,7 +2,7 @@
 
 [← Back to README](../README.md)
 
-This document details the architectural principles that enable `raster_h3` to aggregate multi-gigabyte rasters into H3 hexagonal grids at hardware-saturating throughput with configurable aggregation memory budgets and disk spilling.
+This document details the architectural principles that enable `raster_h3` to aggregate multi-gigabyte rasters into H3 hexagonal grids in parallel across CPU cores, with configurable aggregation memory budgets and disk spilling.
 
 > [!NOTE]
 > Performance benchmarks, timing metrics, and micro-architectural numbers cited in this document reflect native release builds evaluated on an Apple M-series workstation (8 performance cores, 16 GB Unified Memory) and modern x86_64 processors with AVX2/SSE2 support.
@@ -14,7 +14,7 @@ This document details the architectural principles that enable `raster_h3` to ag
 | 1 | **Southernmost Scan-Line Horizon Eviction** | Cells are sealed only when their certified south bound exceeds every remaining chunk’s north bound, bounding aggregation memory. |
 | 2 | **Sequential H3 Spans & In-Register Run Accumulation** | Every pixel is indexed exactly; contiguous equal-cell pixels update running statistics in CPU registers, eliminating ~98% of hash table updates. |
 | 3 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data. |
-| 4 | **Work-Stealing Parallelism (`init_local`)** | Distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
+| 4 | **Work-Stealing Parallelism** | Rayon processes chunk windows in parallel in every engine, each into its own cell maps, then merges them into the horizon. DuckDB additionally emits rows from every scan thread. |
 | 5 | **Bounded Prefetch & Decode Pipeline** | `memmap2` zero-copy reads, parallel decompression into a single-hop in-order ring buffer, and a lock-free buffer pool, all under `decode_budget_bytes`. |
 | 6 | **Coalesced Cloud Range Reads** | Adjacent COG/S3 tile byte ranges are merged into single HTTP requests and prefetched ahead of decompression. |
 | 7 | **Exact CRS Transformation with Analytical Fast Paths** | Pixel centers and subpixel samples are transformed at their actual locations; identity and analytical Web Mercator/Albers paths avoid Proj4 and certify the chunk bounds that pruning and eviction depend on. |
@@ -52,11 +52,13 @@ Queries specifying a spatial Region of Interest (ROI) bounding box (`min_lat`, `
 - **Pre-Decompression Pruning**: `chunk_intersects_bbox` evaluates the projected spatial extent of each strip or tile against the target bounding box before initiating decompression.
 - **Zero I/O Overhead**: Chunks falling entirely outside the target ROI are skipped immediately—zero bytes are transferred from disk/network, zero decompression threads are spawned, and zero buffer memory is allocated.
 
-## 4. Dynamic Work-Stealing Parallelism & DuckDB init_local Pipeline
-DuckDB's vectorized execution engine parallelizes custom table functions across arbitrary CPU threads via the `duckdb_table_function_set_init_local` callback:
-- **Zero Thread Contention**: Each worker thread maintains its own independent scan state and local horizon hash map, eliminating global mutex contention during pixel aggregation.
-- **Work-Stealing Chunk Distribution**: Input GeoTIFF strips or COG tiles are managed as a shared, lock-free task queue. Fast threads that finish their assigned chunks immediately steal remaining chunks from the pool, preventing worker stragglers caused by uneven spatial density or ocean tiles.
-- **Accurate Cardinality Estimation**: `estimate_raster_cardinality()` provides DuckDB's cost-based query optimizer with exact row count bounds based on raster bounding boxes and H3 resolution area formulas, enabling optimal hash join planning and vector pipeline scheduling.
+## 4. Work-Stealing Parallelism
+Every engine (DuckDB, DataFusion, PostgreSQL, Python/Polars, CLI) drives the same multi-resolution controller, so aggregation parallelism is shared:
+- **Parallel Kernel Windows**: Decoded chunks are grouped into waves of worker windows. Rayon processes the windows of a wave in parallel (`par_iter`), each into its own cell maps, so pixel accumulation takes no shared lock. The worker count defaults to Rayon's thread count capped at 8, or `aggregation_workers` (1–64), and is further limited by the aggregation budget.
+- **Horizon Merge**: After each wave, the worker maps are merged into the per-resolution horizon maps, where eviction and spilling happen. Worker map bytes count against the aggregation budget.
+- **Deadlock-Safe Execution**: A wave started from inside a Rayon worker either runs on the dedicated pool through a helper OS thread, or runs serially, so a joining worker never steals a task that needs a lock its caller holds.
+- **DuckDB `init_local`**: DuckDB additionally registers a per-thread local state for its scan callbacks. Its threads pull completed records from a shared record queue and write them to output vectors in parallel; aggregation itself runs in the kernel windows above.
+- **Cardinality Estimate**: `estimate_raster_cardinality()` gives DuckDB's optimizer an approximate output row count from the raster extent and H3 cell area at each requested resolution.
 
 ## 5. Bounded Prefetch & Decode Pipeline
 

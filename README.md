@@ -230,7 +230,7 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 | **Pure Rust, Zero C++ Dependencies** | No GDAL, PROJ or Python runtime; each engine ships as one native library or binary |
 | **One Core, Many Engines** | DuckDB, DataFusion, Python/Polars, PostgreSQL and the CLI all drive the same streamers and return the same cells |
 | **Budgeted aggregation** | Configurable accumulator budget with disk spilling; total RAM also includes decoding and prefetch buffers |
-| **Hardware-Saturating Throughput** | Work-stealing parallelism across all CPU cores |
+| **Multi-Core Throughput** | Raster chunks aggregated in parallel windows across CPU cores |
 | **Native PMTiles v3 Export** | Single-file web maps — zero Tippecanoe, zero tile servers |
 | **Native GeoParquet 1.1 Export** | Stack-allocated WKB polygons with PROJJSON metadata |
 | **Cloud-Native Streaming** | HTTP/S3 COG range prefetching — no local copies needed |
@@ -250,7 +250,7 @@ Traditional tools struggle with large rasters. Here is how `raster_h3` solves ea
 | **Eviction** | Hold all results until file completion | Evict finished hexagons immediately via horizon scan |
 | **Web Tiling** | C++ Tippecanoe + scratch files + tile servers | Generate `.pmtiles` archives in 1 step |
 
-### The Moving Scanner Front (Constant Memory)
+### The Moving Scanner Front (Bounded Memory)
 
 `raster_h3` streams the raster like a document scanner — one thin row at a time from North to South:
 - **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
