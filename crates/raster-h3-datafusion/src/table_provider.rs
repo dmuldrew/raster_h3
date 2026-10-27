@@ -2,6 +2,7 @@
 //! for continuous and categorical GeoTIFF/COG to H3 aggregation.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
@@ -253,6 +254,20 @@ impl ContinuousRasterTableProvider {
         self
     }
 
+    /// Fail the scan when a valid sample point cannot be transformed to WGS84,
+    /// instead of skipping it (default `false`).
+    pub fn with_strict_transforms(mut self, strict: bool) -> Self {
+        self.config.strict_transforms = strict;
+        self
+    }
+
+    /// Add the number of sample points dropped by failed coordinate transforms
+    /// to `counter` as plans built from this provider execute.
+    pub fn with_transform_failure_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.config.transform_failure_counter = Some(counter);
+        self
+    }
+
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
         self
@@ -415,6 +430,20 @@ impl CategoricalRasterTableProvider {
 
     pub fn with_min_majority_fraction(mut self, frac: f64) -> Self {
         self.config.min_majority_fraction = Some(frac);
+        self
+    }
+
+    /// Fail the scan when a valid sample point cannot be transformed to WGS84,
+    /// instead of skipping it (default `false`).
+    pub fn with_strict_transforms(mut self, strict: bool) -> Self {
+        self.config.strict_transforms = strict;
+        self
+    }
+
+    /// Add the number of sample points dropped by failed coordinate transforms
+    /// to `counter` as plans built from this provider execute.
+    pub fn with_transform_failure_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.config.transform_failure_counter = Some(counter);
         self
     }
 

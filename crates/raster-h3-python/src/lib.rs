@@ -47,6 +47,10 @@ pub struct PyScanConfig {
     pub columns: Option<Vec<String>>,
     pub batch_size: usize,
     pub limit: Option<usize>,
+    /// Fail the scan when a valid sample point cannot be transformed to WGS84.
+    pub strict_transforms: bool,
+    /// Receives the number of sample points dropped by failed transforms.
+    pub transform_failure_counter: Option<Arc<AtomicU64>>,
 }
 
 impl Default for PyScanConfig {
@@ -62,6 +66,8 @@ impl Default for PyScanConfig {
             columns: None,
             batch_size: 2048,
             limit: None,
+            strict_transforms: false,
+            transform_failure_counter: None,
         }
     }
 }
@@ -74,6 +80,7 @@ pub type BatchIter = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 pub struct PyBatchReader {
     schema: Arc<ColumnSchema>,
     iter: BatchIter,
+    transform_failures: Arc<AtomicU64>,
 }
 
 /// Scanner backing the Python `RasterH3Scanner` object (`__arrow_c_schema__` and `__arrow_c_stream__`).
@@ -147,6 +154,8 @@ impl PyRasterScanner {
         mr_cfg.custom_nodata = self.config.nodata;
         mr_cfg.bbox = self.config.bbox;
         mr_cfg.overlap_rule = OverlapRule::Cutline;
+        mr_cfg.strict_transforms = self.config.strict_transforms;
+        mr_cfg.transform_failure_counter = self.config.transform_failure_counter.clone();
 
         let projection = self.resolve_projection()?;
         if !self.config.categorical {
@@ -373,6 +382,7 @@ unsafe fn build_py_scan_config(
             columns: cols_opt,
             batch_size: 2048,
             limit: limit_opt,
+            ..Default::default()
         })
     }
 }
@@ -459,13 +469,52 @@ pub unsafe extern "C" fn raster_h3_py_create_arrow_stream(
     limit: i64,
     out_err: *mut *mut c_char,
 ) -> *mut ArrowArrayStream {
+    // SAFETY: forwards the caller's arguments, which meet the `_ex` contract.
+    unsafe {
+        raster_h3_py_create_arrow_stream_ex(
+            path,
+            resolutions,
+            categorical,
+            format,
+            crs,
+            has_nodata,
+            nodata,
+            bbox,
+            columns,
+            limit,
+            0,
+            out_err,
+        )
+    }
+}
+
+/// [`raster_h3_py_create_arrow_stream`] with `strict_transforms`: when non-zero, the
+/// stream fails as soon as a valid sample point cannot be transformed to WGS84.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_create_arrow_stream_ex(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    strict_transforms: c_int,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowArrayStream {
     // SAFETY: every C string argument is null or NUL-terminated (caller contract), as
     // `opt_cstr` requires; `out_err` is null or a writable `char **` (as `set_c_err`
     // requires), and error strings are freed by the caller with `raster_h3_py_free_string`.
     // The returned box is freed by `raster_h3_py_free_arrow_stream`.
     unsafe {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let cfg = build_py_scan_config(
+            let mut cfg = build_py_scan_config(
                 path,
                 resolutions,
                 categorical,
@@ -477,6 +526,7 @@ pub unsafe extern "C" fn raster_h3_py_create_arrow_stream(
                 columns,
                 limit,
             )?;
+            cfg.strict_transforms = strict_transforms != 0;
             PyRasterScanner::new(cfg).to_arrow_c_stream()
         }));
 
@@ -531,6 +581,47 @@ pub unsafe extern "C" fn raster_h3_py_open_batch_reader(
     batch_size: i64,
     out_err: *mut *mut c_char,
 ) -> *mut PyBatchReader {
+    // SAFETY: forwards the caller's arguments, which meet the `_ex` contract.
+    unsafe {
+        raster_h3_py_open_batch_reader_ex(
+            path,
+            resolutions,
+            categorical,
+            format,
+            crs,
+            has_nodata,
+            nodata,
+            bbox,
+            columns,
+            limit,
+            batch_size,
+            0,
+            out_err,
+        )
+    }
+}
+
+/// [`raster_h3_py_open_batch_reader`] with `strict_transforms`: when non-zero, the
+/// reader fails as soon as a valid sample point cannot be transformed to WGS84.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_open_batch_reader_ex(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    batch_size: i64,
+    strict_transforms: c_int,
+    out_err: *mut *mut c_char,
+) -> *mut PyBatchReader {
     // SAFETY: every C string argument is null or NUL-terminated (caller contract), as
     // `opt_cstr` requires; `out_err` is null or a writable `char **` (as `set_c_err`
     // requires), and error strings are freed by the caller with `raster_h3_py_free_string`.
@@ -553,8 +644,15 @@ pub unsafe extern "C" fn raster_h3_py_open_batch_reader(
                 if batch_size > 0 {
                     cfg.batch_size = batch_size as usize;
                 }
+                let transform_failures = Arc::new(AtomicU64::new(0));
+                cfg.strict_transforms = strict_transforms != 0;
+                cfg.transform_failure_counter = Some(Arc::clone(&transform_failures));
                 let (schema, iter) = PyRasterScanner::new(cfg).batch_iter()?;
-                Ok(PyBatchReader { schema, iter })
+                Ok(PyBatchReader {
+                    schema,
+                    iter,
+                    transform_failures,
+                })
             }));
 
         match res {
@@ -612,6 +710,20 @@ pub unsafe extern "C" fn raster_h3_py_batch_reader_next(
     }
 }
 
+/// Valid sample points the reader has dropped so far because their coordinate
+/// transform failed (0 for a null reader).
+///
+/// # Safety
+/// `reader` must be null or a live pointer returned by `raster_h3_py_open_batch_reader`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_batch_reader_transform_failures(
+    reader: *const PyBatchReader,
+) -> u64 {
+    // SAFETY: non-null `reader` is a live box from `raster_h3_py_open_batch_reader`
+    // (caller contract); only its atomic counter is read.
+    unsafe { reader.as_ref() }.map_or(0, |r| r.transform_failures.load(Ordering::Relaxed))
+}
+
 /// Free a reader returned by `raster_h3_py_open_batch_reader`.
 ///
 /// # Safety
@@ -647,13 +759,58 @@ pub unsafe extern "C" fn raster_h3_py_scan_json(
     limit: i64,
     out_err: *mut *mut c_char,
 ) -> *mut c_char {
-    // SAFETY: every C string argument is null or NUL-terminated (caller contract), as
-    // `opt_cstr` requires; `out_err` is null or a writable `char **` (as `set_c_err`
-    // requires), and error strings are freed by the caller with `raster_h3_py_free_string`.
-    // The returned JSON string is freed with `raster_h3_py_free_string`.
+    // SAFETY: forwards the caller's arguments, which meet the `_ex` contract.
     unsafe {
+        raster_h3_py_scan_json_ex(
+            path,
+            resolutions,
+            categorical,
+            format,
+            crs,
+            has_nodata,
+            nodata,
+            bbox,
+            columns,
+            limit,
+            0,
+            ptr::null_mut(),
+            out_err,
+        )
+    }
+}
+
+/// [`raster_h3_py_scan_json`] with `strict_transforms` (non-zero fails the scan as
+/// soon as a valid sample point cannot be transformed to WGS84) and
+/// `out_transform_failures`, which receives the number of such points dropped.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL;
+/// `out_transform_failures` must be NULL or point to a writable `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_scan_json_ex(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    strict_transforms: c_int,
+    out_transform_failures: *mut u64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: every C string argument is null or NUL-terminated (caller contract), as
+    // `opt_cstr` requires; `out_transform_failures` is null or a writable `u64`; `out_err`
+    // is null or a writable `char **` (as `set_c_err` requires), and error strings are
+    // freed by the caller with `raster_h3_py_free_string`. The returned JSON string is
+    // freed with `raster_h3_py_free_string`.
+    unsafe {
+        let failures = Arc::new(AtomicU64::new(0));
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let cfg = build_py_scan_config(
+            let mut cfg = build_py_scan_config(
                 path,
                 resolutions,
                 categorical,
@@ -665,8 +822,13 @@ pub unsafe extern "C" fn raster_h3_py_scan_json(
                 columns,
                 limit,
             )?;
+            cfg.strict_transforms = strict_transforms != 0;
+            cfg.transform_failure_counter = Some(Arc::clone(&failures));
             PyRasterScanner::new(cfg).to_columnar_json()
         }));
+        if !out_transform_failures.is_null() {
+            *out_transform_failures = failures.load(Ordering::Relaxed);
+        }
 
         match res {
             Ok(Ok(json_str)) => CString::new(json_str).unwrap_or_default().into_raw(),

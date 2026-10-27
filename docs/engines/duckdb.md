@@ -503,8 +503,9 @@ are polar-cap polygons; see [cell geometry](../api-reference.md#cell-geometry).
 `h3_raster_to_parquet` and `h3_raster_to_pmtiles` return a `transform_failures` count in their
 summary row: valid pixels dropped because their coordinate transform failed or fell outside
 the valid latitude/longitude range. A non-zero value usually means a wrong `source_crs`. The
-streaming aggregate functions do not report this (DuckDB table functions have no warnings
-channel); run an export, or use another engine, to check a raster. See
+streaming aggregate functions cannot report a count (DuckDB table functions have no warnings
+channel); pass `strict_transforms := true` to make any of them fail instead of silently
+skipping those pixels. See
 [transform-failure diagnostics](core.md#transform-failure-diagnostics).
 
 ### Unsigned extension loading errors

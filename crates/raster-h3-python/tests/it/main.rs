@@ -7,3 +7,4 @@ mod batch_reader;
 mod c_abi;
 mod exports;
 mod scalars;
+mod transform_failures;

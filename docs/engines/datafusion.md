@@ -82,6 +82,8 @@ Schema: `ColumnSchema::continuous(&quantiles)` (see the [overview](README.md#out
 | `with_compact(bool)` | parent compaction |
 | `with_overlap_rule(OverlapRule)` | mosaic overlap rule (`Cutline`, `First`, `Average`) |
 | `with_batch_size(n)` | rows per `RecordBatch` (default 2048) |
+| `with_strict_transforms(b)` | `strict_transforms`: fail the scan instead of skipping samples whose coordinate transform fails |
+| `with_transform_failure_counter(Arc<AtomicU64>)` | `transform_failure_counter`: receives the number of skipped samples |
 
 ### `CategoricalRasterTableProvider`
 
@@ -90,7 +92,7 @@ Schema: `categorical_wide()` (default) or `categorical_long()`.
 | Builder | Effect |
 | :--- | :--- |
 | `with_format(CategoricalFormat::Wide \| Long)` | Output layout |
-| `with_crs`, `with_nodata`, `with_bbox`, `with_batch_size` | As above |
+| `with_crs`, `with_nodata`, `with_bbox`, `with_batch_size`, `with_strict_transforms`, `with_transform_failure_counter` | As above |
 | `with_remapper(Arc<CategoryRemapper>)` | Reclassify categories during ingestion |
 | `with_min_count`, `with_min_majority_fraction` | Value filters |
 

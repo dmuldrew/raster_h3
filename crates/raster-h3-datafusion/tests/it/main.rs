@@ -8,3 +8,4 @@ mod continuous_options;
 mod rows;
 mod scalar_udfs;
 mod statistics;
+mod transform_failures;
