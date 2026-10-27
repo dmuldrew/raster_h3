@@ -37,6 +37,23 @@ def test_lenient_scans_warn_with_the_count(raster_h3, past_pole_tif):
             assert lazy.collect().height > 0
 
 
+def test_warnings_as_errors_still_free_the_result(raster_h3, past_pole_tif, monkeypatch):
+    lib = raster_h3._get_lib()
+    freed = []
+    real_free = lib.raster_h3_py_free_string
+
+    def recording_free(ptr):
+        freed.append(ptr)
+        real_free(ptr)
+
+    monkeypatch.setattr(lib, "raster_h3_py_free_string", recording_free)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(RuntimeWarning, match=r"50 valid sample\(s\)"):
+            raster_h3.RasterH3ArrowStream(past_pole_tif, 3).to_dict()
+    assert len(freed) == 1
+
+
 def test_valid_rasters_do_not_warn(raster_h3, gradient_tif):
     with warnings.catch_warnings():
         warnings.simplefilter("error")

@@ -456,16 +456,14 @@ class RasterH3ArrowStream:
         """Materialize the scan into a Python dictionary of column lists."""
         lib = _get_lib()
         err = ctypes.c_void_p(0)
+        failures = ctypes.c_uint64(0)
         if self._has_ex(lib):
-            failures = ctypes.c_uint64(0)
             json_ptr = lib.raster_h3_py_scan_json_ex(
                 *self._scan_args(),
                 1 if self.strict_transforms else 0,
                 ctypes.byref(failures),
                 ctypes.byref(err),
             )
-            _raise_if_err(err)
-            _warn_transform_failures(failures.value, stacklevel=3)
         else:
             json_ptr = lib.raster_h3_py_scan_json(*self._scan_args(), ctypes.byref(err))
         _raise_if_err(err)
@@ -473,9 +471,12 @@ class RasterH3ArrowStream:
             raise RuntimeError("Failed to execute scan_json")
         try:
             raw = ctypes.string_at(json_ptr).decode("utf-8")
-            return json.loads(raw)
+            result = json.loads(raw)
         finally:
             lib.raster_h3_py_free_string(json_ptr)
+        # Warn only once the native result is freed: the warning may be raised as an error.
+        _warn_transform_failures(failures.value, stacklevel=3)
+        return result
 
     def to_polars(self) -> Any:
         """Convert to a Polars DataFrame via the Arrow PyCapsule stream.
