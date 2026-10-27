@@ -103,6 +103,10 @@ PostgreSQL OS user on the database host (or be an HTTP(S)/S3 URL the server can 
 | | | | `shannon_entropy` | `double precision` |
 | | | | `wkb` | `bytea` |
 
+`wkb` (and `h3_to_wkb`) is a `MULTIPOLYGON` for cells crossing the antimeridian and a
+polar-cap polygon for the two pole cells, so `ST_GeomFromWKB` works without wrapping; see
+[cell geometry](../api-reference.md#cell-geometry).
+
 `h3_index` is the unsigned H3 index reinterpreted as `bigint` (the `h3-pg` convention);
 valid cells are always positive.
 

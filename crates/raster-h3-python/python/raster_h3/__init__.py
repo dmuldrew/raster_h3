@@ -173,6 +173,9 @@ def _get_lib() -> ctypes.CDLL:
     ]
     lib.raster_h3_py_h3_to_wkb.restype = ctypes.c_size_t
 
+    lib.raster_h3_py_wkb_buf_len.argtypes = []
+    lib.raster_h3_py_wkb_buf_len.restype = ctypes.c_size_t
+
     lib.raster_h3_py_h3_polygon_to_cells.argtypes = [
         ctypes.c_char_p,
         ctypes.c_size_t,
@@ -674,17 +677,17 @@ def h3_is_valid(cell_or_hex: Union[int, str]) -> bool:
     return bool(lib.raster_h3_py_h3_is_valid_u64(int(cell_or_hex)))
 
 
-_WKB_BUF_LEN = 192
-
-
 def h3_to_wkb(cell_or_hex: Union[int, str]) -> Optional[bytes]:
+    """OGC WKB for a cell: a Polygon, or a MultiPolygon for cells crossing 180°."""
     cell = string_to_h3(cell_or_hex) if isinstance(cell_or_hex, str) else int(cell_or_hex)
     if cell == 0:
         return None
-    # Matches WKB_BUF_LEN in raster-h3-core: odd-resolution pentagons have up to
-    # 10 boundary vertices (189 bytes of WKB).
-    buf = (ctypes.c_uint8 * _WKB_BUF_LEN)()
-    written = _get_lib().raster_h3_py_h3_to_wkb(cell, buf, _WKB_BUF_LEN)
+    lib = _get_lib()
+    # The native library reports the capacity that fits every cell
+    # (raster-h3-core's WKB_BUF_LEN), so the two cannot drift apart.
+    cap = lib.raster_h3_py_wkb_buf_len()
+    buf = (ctypes.c_uint8 * cap)()
+    written = lib.raster_h3_py_h3_to_wkb(cell, buf, cap)
     if written == 0:
         return None
     return bytes(buf[:written])

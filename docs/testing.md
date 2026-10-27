@@ -210,7 +210,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | [`core/polygon_to_cells.rs`](../crates/raster-h3-core/tests/it/polygon_to_cells.rs) (1) | POLYGON/MULTIPOLYGON WKB polyfill against direct `h3o` output, including holes, overlapping members, four containment modes and two resolutions. |
 | [`duckdb/spatial_geometry.rs`](../crates/raster-h3-duckdb/tests/it/spatial_geometry.rs) | `test_wkb_ogc_compliance`, `test_fast_hex_formatting`. |
 | [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) | `h3_to_wkb_returns_core_wkb_including_pentagons`: the `bytea` from `pg_h3_to_wkb` equals the core WKB, including 10-vertex pentagons. |
-| Unit: `encoding/wkb.rs` (6), `encoding/fast_hex.rs` (2) | Ring construction, dateline unwrapping, hex formatting/parsing. |
+| Unit: `encoding/wkb.rs` (8), `encoding/fast_hex.rs` (2) | Ring construction, antimeridian splitting and polar caps (every cell at resolutions 0–2 checked for range, closure, orientation, simplicity and area), hex formatting/parsing. |
 
 ## 16. GeoParquet export
 

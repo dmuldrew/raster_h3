@@ -790,6 +790,13 @@ pub unsafe extern "C" fn raster_h3_py_h3_cell_to_parent_str(
     }
 }
 
+/// C-ABI helper: the WKB buffer capacity that always suffices for
+/// [`raster_h3_py_h3_to_wkb`] (`raster_h3_core::encoding::WKB_BUF_LEN`).
+#[no_mangle]
+pub extern "C" fn raster_h3_py_wkb_buf_len() -> usize {
+    raster_h3_core::encoding::WKB_BUF_LEN
+}
+
 /// C-ABI helper: write WKB polygon for `cell` into `out_buf` (capacity of
 /// `raster_h3_core::encoding::WKB_BUF_LEN` bytes always suffices).
 /// Returns number of bytes written, or `0` if `cell` is invalid or `buf_cap` is too small.
@@ -1137,6 +1144,17 @@ mod tests {
             assert!(json_s.contains("25.5"));
             raster_h3_py_free_string(json_ptr);
         }
+    }
+
+    #[test]
+    fn test_py_h3_to_wkb_fits_antimeridian_multipolygon() {
+        // Res-5 cell crossing 180°: a two-part MultiPolygon larger than 192 bytes.
+        let cell = 0x0859_b406_3fff_ffffu64;
+        let mut buf = vec![0u8; raster_h3_py_wkb_buf_len()];
+        // SAFETY: `buf` provides `buf.len()` writable bytes.
+        let written = unsafe { raster_h3_py_h3_to_wkb(cell, buf.as_mut_ptr(), buf.len()) };
+        assert!(written > 192, "wrote {written} bytes");
+        assert_eq!(u32::from_le_bytes(buf[1..5].try_into().unwrap()), 6);
     }
 
     #[test]

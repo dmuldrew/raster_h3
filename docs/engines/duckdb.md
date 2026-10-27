@@ -483,7 +483,8 @@ host DuckDB version at runtime (`dlsym` / `GetProcAddress`) and can probe whethe
 `spatial` extension is loaded. `h3_to_geometry` / `h3_cell_to_geometry` return the native
 `GEOMETRY` type on DuckDB ≥ 1.5; on older versions they return a WKB `BLOB` aliased as
 `GEOMETRY`, the convention the `spatial` extension uses. `h3_to_wkb` always returns a
-plain `BLOB`.
+plain `BLOB`. Cells crossing the antimeridian are `MULTIPOLYGON`s and the two pole cells
+are polar-cap polygons; see [cell geometry](../api-reference.md#cell-geometry).
 
 ## FFI Safety
 

@@ -408,7 +408,7 @@ with one sketch sweep per cell, sharing repeated probabilities. See the
 | 11 | **Lock-Free Buffer Pool** | Zero-allocation buffer recycling via `crossbeam_deque::Injector` |
 | 12 | **Single-Hop In-Order Prefetcher** | Direct worker-to-ring-buffer queue, zero context switches |
 | 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
-| 14 | **Native OGC GeoParquet 1.1 Exporter** | 125-byte WKB polygons with embedded PROJJSON metadata |
+| 14 | **Native OGC GeoParquet 1.1 Exporter** | GIS-valid WKB cell polygons (dateline cells split, polar caps) with embedded PROJJSON metadata |
 
 > 📖 **Detailed explanations** of each architectural pillar — See [docs/engineering.md](docs/engineering.md)  
 > 🗺️ **Source Module Architecture** — File-by-file breakdown of crate internals mapped to these principles: [docs/module-architecture.md](docs/module-architecture.md)

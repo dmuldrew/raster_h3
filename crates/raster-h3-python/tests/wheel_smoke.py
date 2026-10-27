@@ -72,6 +72,9 @@ def main() -> None:
     # Odd-resolution pentagon with 10 boundary vertices: 189 bytes of WKB.
     wkb = raster_h3.h3_to_wkb(0x81083FFFFFFFFFF)
     assert wkb is not None and len(wkb) == 13 + 16 * 11, wkb
+    # A res-5 cell crossing 180° is a two-part MultiPolygon (WKB type 6) over 192 bytes.
+    wkb = raster_h3.h3_to_wkb(0x859B4063FFFFFFF)
+    assert wkb is not None and len(wkb) > 192 and wkb[1:5] == b"\x06\x00\x00\x00", wkb
     # A cell's own boundary polyfills back to that cell (centroid containment).
     assert raster_h3.h3_polygon_to_cells(raster_h3.h3_to_wkb(cell), 8) == [cell]
     assert len(raster_h3.h3_polygon_to_cells(raster_h3.h3_to_wkb(cell), 9, "covers")) > 7

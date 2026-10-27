@@ -181,9 +181,18 @@ fn h3_to_wkb_returns_core_wkb_including_pentagons() {
         // SAFETY: `pg_h3_to_wkb` returns a `varlena_datum`.
         let wkb = unsafe { read_varlena(d) };
         assert_eq!(Some(wkb.clone()), h3_to_wkb_u64(u64::from(cell)), "{cell}");
-        // Polygon with one closed ring of boundary vertices.
-        let n = cell.boundary().len();
-        assert_eq!(wkb.len(), 13 + 16 * (n + 1), "{cell}");
+        let lngs: Vec<f64> = cell.boundary().iter().map(|v| v.lng()).collect();
+        let span = lngs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - lngs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let kind = u32::from_le_bytes(wkb[1..5].try_into().unwrap());
+        if span > 180.0 {
+            // Antimeridian cells are MultiPolygons (6); pole cells are polar-cap Polygons (3).
+            assert!(kind == 6 || kind == 3, "{cell}: type {kind}");
+        } else {
+            // Polygon with one closed ring of boundary vertices.
+            assert_eq!(kind, 3, "{cell}");
+            assert_eq!(wkb.len(), 13 + 16 * (lngs.len() + 1), "{cell}");
+        }
     }
     assert_eq!(call(pg_h3_to_wkb, &[NULL]), None);
     assert_eq!(call(pg_h3_to_wkb, &[val(0)]), None);

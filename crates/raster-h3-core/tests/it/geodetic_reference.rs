@@ -1297,6 +1297,20 @@ fn wkb_buffer_capacity_all_resolutions_pentagons_and_icosahedron_edges() {
                     "res {r} cell {cell}: WKB needs {need} bytes > WKB_BUF_LEN {WKB_BUF_LEN}"
                 );
                 let len = cell_to_wkb(cell, &mut buf);
+                assert!(len <= WKB_BUF_LEN);
+                let lngs = cell.boundary().iter().map(|v| v.lng()).collect::<Vec<_>>();
+                let span = lngs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                    - lngs.iter().cloned().fold(f64::INFINITY, f64::min);
+                if span > 180.0 {
+                    // Antimeridian cells are split into a MultiPolygon (6); the
+                    // res-0 pole cells in these disks are polar-cap Polygons (3).
+                    let kind = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+                    assert!(
+                        kind == 6 || (kind == 3 && r == 0),
+                        "res {r} cell {cell}: type {kind}"
+                    );
+                    continue;
+                }
                 assert_eq!(len, need, "res {r} cell {cell}: unexpected WKB length");
 
                 // Structural checks: point count, closed ring.

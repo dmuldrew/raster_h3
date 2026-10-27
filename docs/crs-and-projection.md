@@ -163,10 +163,13 @@ shifts are not supported.
   footprint (exact inverse projection into its pixel grid); bounding boxes are
   only a candidate filter. `first` does not fall back to later tiles where the
   first tile holds nodata.
-- **Geometry export.** WKB output unwraps ordinary antimeridian cells but
-  leaves pole-cell rings unchanged, so polar cells are not faithful polar-cap
-  polygons for planar GIS operations. GeoParquet declares planar edges, so
-  exported boundaries approximate H3's spherical edges.
+- **Geometry export.** WKB geometries stay within [-180, 180] × [-90, 90] and are
+  valid for planar GIS tools: a cell crossing the antimeridian is split into a
+  `MultiPolygon` of its eastern and western parts, and the two cells containing a
+  pole are polar-cap `Polygon`s closed along ±180° and the pole's latitude. All
+  rings are counter-clockwise. Edges are straight in longitude/latitude
+  (GeoParquet `"edges": "planar"`), so exported boundaries approximate H3's
+  spherical (great-circle) edges; edges are not densified.
 
 ## Usage Examples
 
