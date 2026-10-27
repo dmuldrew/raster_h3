@@ -33,6 +33,8 @@ def write_geotiff(
     value: Callable[[int, int], float],
     *,
     dtype: str = "f32",
+    origin: Tuple[float, float] = ORIGIN,
+    pixel: float = PIXEL,
 ) -> None:
     """Uncompressed little-endian single-band GeoTIFF (EPSG:4326 GeoKeys), one strip.
 
@@ -41,8 +43,8 @@ def write_geotiff(
     fmt, bits, sample_format = {"f32": ("f", 32, 3), "u8": ("B", 8, 1)}[dtype]
     values = [value(c, r) for r in range(height) for c in range(width)]
     data = struct.pack(f"<{len(values)}{fmt}", *values)
-    scale = struct.pack("<3d", PIXEL, PIXEL, 0.0)
-    tiepoint = struct.pack("<6d", 0.0, 0.0, 0.0, ORIGIN[0], ORIGIN[1], 0.0)
+    scale = struct.pack("<3d", pixel, pixel, 0.0)
+    tiepoint = struct.pack("<6d", 0.0, 0.0, 0.0, origin[0], origin[1], 0.0)
     geokeys = struct.pack("<12H", 1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326)
     blobs = [scale, tiepoint, geokeys]
     # (tag, type, count, value-or-blob-index); SHORT=3, LONG=4, DOUBLE=12

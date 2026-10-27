@@ -139,6 +139,24 @@ def _get_lib() -> ctypes.CDLL:
     lib.raster_h3_py_free_string.argtypes = [ctypes.c_void_p]
     lib.raster_h3_py_free_string.restype = None
 
+    # `_ex` scan variants (newer libraries) add `strict_transforms`; the JSON scan
+    # also reports dropped samples, and batch readers expose a running count.
+    scan_args = list(lib.raster_h3_py_scan_json.argtypes[:-1])
+    err_ptr = [ctypes.POINTER(ctypes.c_void_p)]
+    if hasattr(lib, "raster_h3_py_create_arrow_stream_ex"):
+        lib.raster_h3_py_create_arrow_stream_ex.argtypes = scan_args + [ctypes.c_int] + err_ptr
+        lib.raster_h3_py_create_arrow_stream_ex.restype = ctypes.c_void_p
+        lib.raster_h3_py_open_batch_reader_ex.argtypes = (
+            scan_args + [ctypes.c_int64, ctypes.c_int] + err_ptr
+        )
+        lib.raster_h3_py_open_batch_reader_ex.restype = ctypes.c_void_p
+        lib.raster_h3_py_scan_json_ex.argtypes = (
+            scan_args + [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)] + err_ptr
+        )
+        lib.raster_h3_py_scan_json_ex.restype = ctypes.c_void_p
+        lib.raster_h3_py_batch_reader_transform_failures.argtypes = [ctypes.c_void_p]
+        lib.raster_h3_py_batch_reader_transform_failures.restype = ctypes.c_uint64
+
     # Scalar C-ABI
     lib.raster_h3_py_h3_to_string.argtypes = [ctypes.c_uint64]
     lib.raster_h3_py_h3_to_string.restype = ctypes.c_void_p
@@ -365,6 +383,7 @@ class RasterH3ArrowStream:
         bbox: Optional[Union[str, Sequence[float]]] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
+        strict_transforms: bool = False,
     ) -> None:
         self.path = str(path)
         self.resolutions = resolutions
@@ -375,6 +394,31 @@ class RasterH3ArrowStream:
         self.bbox = bbox
         self.columns = list(columns) if columns is not None else None
         self.limit = limit
+        self.strict_transforms = strict_transforms
+
+    def _scan_args(self) -> Tuple[Any, ...]:
+        return (
+            self.path.encode("utf-8"),
+            _encode_resolutions(self.resolutions),
+            1 if self.categorical else 0,
+            self.format.encode("utf-8"),
+            self.crs.encode("utf-8") if self.crs else None,
+            1 if self.nodata is not None else 0,
+            float(self.nodata) if self.nodata is not None else 0.0,
+            _encode_bbox(self.bbox),
+            _encode_columns(self.columns),
+            int(self.limit) if self.limit is not None else -1,
+        )
+
+    def _has_ex(self, lib: ctypes.CDLL) -> bool:
+        """Whether to call the `_ex` scan variants; `strict_transforms` requires them."""
+        if hasattr(lib, "raster_h3_py_scan_json_ex"):
+            return True
+        if self.strict_transforms:
+            raise RuntimeError(
+                "strict_transforms requires a newer raster_h3 native library"
+            )
+        return False
 
     def __arrow_c_schema__(self) -> Any:
         lib = _get_lib()
@@ -395,19 +439,12 @@ class RasterH3ArrowStream:
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         lib = _get_lib()
         err = ctypes.c_void_p(0)
-        ptr = lib.raster_h3_py_create_arrow_stream(
-            self.path.encode("utf-8"),
-            _encode_resolutions(self.resolutions),
-            1 if self.categorical else 0,
-            self.format.encode("utf-8"),
-            self.crs.encode("utf-8") if self.crs else None,
-            1 if self.nodata is not None else 0,
-            float(self.nodata) if self.nodata is not None else 0.0,
-            _encode_bbox(self.bbox),
-            _encode_columns(self.columns),
-            int(self.limit) if self.limit is not None else -1,
-            ctypes.byref(err),
-        )
+        if self._has_ex(lib):
+            ptr = lib.raster_h3_py_create_arrow_stream_ex(
+                *self._scan_args(), 1 if self.strict_transforms else 0, ctypes.byref(err)
+            )
+        else:
+            ptr = lib.raster_h3_py_create_arrow_stream(*self._scan_args(), ctypes.byref(err))
         _raise_if_err(err)
         if not ptr:
             raise RuntimeError("Failed to create ArrowArrayStream")
@@ -419,19 +456,18 @@ class RasterH3ArrowStream:
         """Materialize the scan into a Python dictionary of column lists."""
         lib = _get_lib()
         err = ctypes.c_void_p(0)
-        json_ptr = lib.raster_h3_py_scan_json(
-            self.path.encode("utf-8"),
-            _encode_resolutions(self.resolutions),
-            1 if self.categorical else 0,
-            self.format.encode("utf-8"),
-            self.crs.encode("utf-8") if self.crs else None,
-            1 if self.nodata is not None else 0,
-            float(self.nodata) if self.nodata is not None else 0.0,
-            _encode_bbox(self.bbox),
-            _encode_columns(self.columns),
-            int(self.limit) if self.limit is not None else -1,
-            ctypes.byref(err),
-        )
+        if self._has_ex(lib):
+            failures = ctypes.c_uint64(0)
+            json_ptr = lib.raster_h3_py_scan_json_ex(
+                *self._scan_args(),
+                1 if self.strict_transforms else 0,
+                ctypes.byref(failures),
+                ctypes.byref(err),
+            )
+            _raise_if_err(err)
+            _warn_transform_failures(failures.value, stacklevel=3)
+        else:
+            json_ptr = lib.raster_h3_py_scan_json(*self._scan_args(), ctypes.byref(err))
         _raise_if_err(err)
         if not json_ptr:
             raise RuntimeError("Failed to execute scan_json")
@@ -452,20 +488,18 @@ class RasterH3ArrowStream:
         """Yield the scan incrementally as Polars DataFrames of up to `batch_size` rows."""
         lib = _get_lib()
         err = ctypes.c_void_p(0)
-        reader = lib.raster_h3_py_open_batch_reader(
-            self.path.encode("utf-8"),
-            _encode_resolutions(self.resolutions),
-            1 if self.categorical else 0,
-            self.format.encode("utf-8"),
-            self.crs.encode("utf-8") if self.crs else None,
-            1 if self.nodata is not None else 0,
-            float(self.nodata) if self.nodata is not None else 0.0,
-            _encode_bbox(self.bbox),
-            _encode_columns(self.columns),
-            int(self.limit) if self.limit is not None else -1,
-            int(batch_size) if batch_size else 0,
-            ctypes.byref(err),
-        )
+        has_ex = self._has_ex(lib)
+        if has_ex:
+            reader = lib.raster_h3_py_open_batch_reader_ex(
+                *self._scan_args(),
+                int(batch_size) if batch_size else 0,
+                1 if self.strict_transforms else 0,
+                ctypes.byref(err),
+            )
+        else:
+            reader = lib.raster_h3_py_open_batch_reader(
+                *self._scan_args(), int(batch_size) if batch_size else 0, ctypes.byref(err)
+            )
         _raise_if_err(err)
         if not reader:
             raise RuntimeError("Failed to open raster_h3 batch reader")
@@ -475,6 +509,11 @@ class RasterH3ArrowStream:
                 ptr = lib.raster_h3_py_batch_reader_next(reader, ctypes.byref(err))
                 _raise_if_err(err)
                 if not ptr:
+                    if has_ex:
+                        _warn_transform_failures(
+                            lib.raster_h3_py_batch_reader_transform_failures(reader),
+                            stacklevel=3,
+                        )
                     return
                 yield _polars_from_stream(_OwnedArrowStream(ptr))
         finally:
@@ -502,6 +541,7 @@ def scan_raster_h3(
     bbox: Optional[Union[str, Sequence[float]]] = None,
     columns: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
+    strict_transforms: bool = False,
 ) -> Any:
     """
     Scan a GeoTIFF / COG into H3 hexagonal cells.
@@ -509,6 +549,9 @@ def scan_raster_h3(
     If `polars` is installed with `register_io_source`, returns a Polars `LazyFrame`
     with column projection (`with_columns`) and row-slice (`n_rows`) pushdown.
     Otherwise returns a `RasterH3ArrowStream` implementing `__arrow_c_stream__`.
+
+    Valid samples whose coordinate transform fails are skipped with a
+    `RuntimeWarning` once the scan completes; `strict_transforms=True` raises instead.
     """
     stream = RasterH3ArrowStream(
         path=path,
@@ -520,6 +563,7 @@ def scan_raster_h3(
         bbox=bbox,
         columns=columns,
         limit=limit,
+        strict_transforms=strict_transforms,
     )
     try:
         import polars as pl  # type: ignore
@@ -617,6 +661,7 @@ def scan_raster_h3(
                 bbox=bbox,
                 columns=pushed_cols,
                 limit=scan_limit,
+                strict_transforms=strict_transforms,
             )
             if remaining is not None and remaining <= 0:
                 return
@@ -779,14 +824,15 @@ def _run_export(name: str, args: Tuple[Any, ...]) -> int:
     return int(count)
 
 
-def _warn_transform_failures(failures: int) -> None:
+def _warn_transform_failures(failures: int, stacklevel: int = 4) -> None:
     """Warn when valid samples were dropped by failed coordinate transforms."""
     if failures:
         warnings.warn(
             f"raster_h3: {failures} valid sample(s) were dropped because their coordinate "
-            "transform failed or fell outside the valid latitude/longitude range; check crs",
+            "transform failed or fell outside the valid latitude/longitude range; check crs "
+            "(strict_transforms=True raises instead)",
             RuntimeWarning,
-            stacklevel=4,
+            stacklevel=stacklevel,
         )
 
 

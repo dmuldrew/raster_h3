@@ -407,7 +407,7 @@ impl BindHelper {
 
     /// Parse execution limits: `workers`/`threads` (aggregation),
     /// `decode_workers`, `fetch_workers`, `decode_budget_mb` and
-    /// `compaction_budget_mb`.
+    /// `compaction_budget_mb`, plus `strict_transforms`.
     /// Non-positive values are errors.
     pub fn parse_execution(&self) -> Option<ExecutionParams> {
         let positive = |names: &[&str]| -> Result<Option<usize>, ()> {
@@ -428,6 +428,7 @@ impl BindHelper {
             fetch_workers: positive(&["fetch_workers"]).ok()?,
             decode_budget_mb: positive(&["decode_budget_mb"]).ok()?,
             compaction_budget_mb: positive(&["compaction_budget_mb"]).ok()?,
+            strict_transforms: self.get_named_bool("strict_transforms").unwrap_or(false),
         })
     }
 
@@ -518,7 +519,7 @@ pub struct CommonRasterParams {
     pub execution: ExecutionParams,
 }
 
-/// SQL execution limits. Each `None` keeps the streamer default.
+/// SQL execution limits and options. Each `None` keeps the streamer default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecutionParams {
     /// `workers` / `threads`: dedicated aggregation pool size.
@@ -531,6 +532,9 @@ pub struct ExecutionParams {
     pub decode_budget_mb: Option<usize>,
     /// `compaction_budget_mb`: opt-in limit on pending compaction groups in MiB.
     pub compaction_budget_mb: Option<usize>,
+    /// `strict_transforms`: fail the query when a valid sample point cannot
+    /// be transformed to WGS84 instead of silently skipping it.
+    pub strict_transforms: bool,
 }
 
 impl ExecutionParams {
@@ -551,6 +555,7 @@ impl ExecutionParams {
         if let Some(mb) = self.compaction_budget_mb {
             config.compaction_budget_bytes = Some(mb.saturating_mul(1024 * 1024));
         }
+        config.strict_transforms = self.strict_transforms;
     }
 }
 
@@ -602,6 +607,7 @@ mod tests {
             fetch_workers: Some(5),
             decode_budget_mb: Some(32),
             compaction_budget_mb: Some(8),
+            strict_transforms: true,
         }
         .apply(&mut config);
         assert_eq!(config.aggregation_workers, Some(3));
@@ -609,5 +615,6 @@ mod tests {
         assert_eq!(config.fetch_workers, 5);
         assert_eq!(config.decode_budget_bytes, 32 * 1024 * 1024);
         assert_eq!(config.compaction_budget_bytes, Some(8 * 1024 * 1024));
+        assert!(config.strict_transforms);
     }
 }
