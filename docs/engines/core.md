@@ -141,6 +141,33 @@ reference (8 bytes on 64-bit platforms), with a temporary `usize` per tile while
 building it. Smaller mosaics do not allocate this index. Decoder state and this
 metadata are separate from the decoded-buffer and aggregation budgets.
 
+### Overlap ownership cost
+
+With `OverlapRule::Cutline`, each sample in an overlapping chunk is compared
+against every other tile's centre. Centre unit vectors are cached on each
+`TileDescriptor`, so a comparison costs a few multiplies (about 1 ns), and the
+exact containment test, which may inverse-project, runs only for tiles whose
+centre is nearer. `First` checks containment against lower-index tiles. Both
+remain linear in tile count per overlapping sample; only chunks flagged
+`has_overlap` pay it. The `profile_hotspots` example measures this scaling.
+
+### Calling from a Rayon pool
+
+A streamer driven from a worker of another Rayon pool cannot run kernel waves
+on that pool without risking deadlock (see `aggregation_workers`):
+
+- `aggregation_workers: None` runs every wave **serially** on the calling
+  thread, about 2.5× slower than a direct call with 4 workers in the
+  `profile_hotspots` example, at every budget.
+- `aggregation_workers: Some(n)` hands each wave to the dedicated pool through
+  a short-lived helper thread, roughly one thread spawn (≈40 µs) per wave. That
+  is a few percent at budgets of 16 MiB and above, but grows as small
+  `aggregation_budget_bytes` shrink windows (3.4× slower at 256 KiB).
+
+So when calling from inside a Rayon pool, set `aggregation_workers` and keep the
+aggregation budget at its default or larger. Calls from ordinary threads,
+including DuckDB's scan threads, are unaffected.
+
 ## Columnar Model
 
 | Type | Role |

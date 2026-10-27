@@ -258,6 +258,10 @@ pub struct MultiResolutionConfig {
     /// Rayon worker (it may hold locks other tasks on that pool need). `Some(n)`
     /// runs them on a dedicated pool of `n` threads, shared by every stream
     /// configured with the same `n`, from any calling thread.
+    ///
+    /// From a Rayon worker, prefer `Some(n)`: each kernel wave then costs one
+    /// helper-thread spawn instead of running serially. That overhead grows as
+    /// a small `aggregation_budget_bytes` shrinks windows and multiplies waves.
     pub aggregation_workers: Option<usize>,
     /// Concurrent HTTP range-request workers for remote tiles.
     pub fetch_workers: usize,

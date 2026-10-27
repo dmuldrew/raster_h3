@@ -196,6 +196,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | Suite | What it checks |
 | :--- | :--- |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (10) | Glob matching, comma lists, VRT XML resolution; adjacent-tile conservation; `cutline` vs `first` vs `average`; categorical overlaps; mixed VRT paths and export pipelines. |
+| [`core/cutline_ownership.rs`](../crates/raster-h3-core/tests/it/cutline_ownership.rs) (3) | `Cutline` ownership with cached centre vectors matches the original per-call computation for every tile at thousands of points: an overlapping 4×4 grid, three identical footprints (exact distance ties go to the lower index), tiles on different longitude branches across the antimeridian, and near-polar tiles. |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (4) | Mosaic opening keeps antimeridian tiles; overlap rules test real tile footprints, not WGS84 rectangles, including rotated footprints and mixed longitude branches. |
 | [`core/conus_pipeline.rs`](../crates/raster-h3-core/tests/it/conus_pipeline.rs) | `test_conus_batch_and_evict_pipeline_simulation`: multi-tile ingestion, batch eviction, Parquet progress and PMTiles from partitioned input. |
 | [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) | `with_overlap_rule_on_a_multi_file_source_matches_core`: `cutline`, `first` and `average` over a comma-list source, with exact per-rule pixel counts. |

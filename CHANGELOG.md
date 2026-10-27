@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Cutline` overlap ownership caches each tile's centre unit vector and computes the sample's once per call, removing 8 trig calls per tile per overlapping sample (about 29 ns → 1.3 ns per tile); decisions are bit-identical. Documented the cost of driving streamers from a Rayon pool and when to set `aggregation_workers`.
 - Continuous readers (core `ContinuousBatchReader::open`, and so the CLI, Python and DataFusion paths, plus the DuckDB scan) build per-cell quantile sketches only when a quantile column is projected, and compute all projected quantile columns of a cell in one sorted sweep instead of one sweep (and bin-key sort) per column. `H3Accumulator::iqr` uses one sweep for p25/p75.
 - Keep Albers inverse constants in an immutable walker-local prepared projection, preserving public source-field construction and mutation without stale caches. Use portable multiply/add series evaluation, share row terms and exact cell-run advancement, and retain row hoisting for horizontal shear and `stream-profile` builds. The series can differ from the previous Newton iteration at sub-nanometre scale, which moves pixels lying on a cell edge (1 of 28.4M pixels in the Hawaii CFL Albers benchmark); the Hawaii WGS84 outputs were bit-for-bit identical.
 - Label withdrawn stride-probing benchmark results as historical row-count comparisons only; use a monotonic benchmark timer and the direct Parquet exporter when the Polars IO plugin is unavailable.
