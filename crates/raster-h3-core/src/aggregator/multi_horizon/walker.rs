@@ -9,7 +9,7 @@
 //! pattern and resolution count, not by row or raster size.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
-use h3o::{LatLng, Resolution};
+use h3o::{LatLng, LatLngIndexer, Resolution};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -226,6 +226,7 @@ fn walk<T, Acc, E, N, R>(
     let mut runs = Runs::new(num_res, engine);
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
+    let mut position_cells: Vec<u64> = Vec::with_capacity(ctx.sampling.points.len() * num_res);
 
     for r in 0..chunk.height as usize {
         let start = r * stride;
@@ -324,12 +325,21 @@ fn walk<T, Acc, E, N, R>(
                 continue;
             }
 
-            for (i, &res) in ctx.resolutions.iter().enumerate() {
+            // Row-major by position: `position_cells[p * num_res + i]`.
+            position_cells.resize(positions.len() * num_res, 0);
+            for (&(ll, _), cells) in positions
+                .iter()
+                .zip(position_cells.chunks_exact_mut(num_res))
+            {
+                super::profile::index_all(&mut runs.indexer, ll, ctx.resolutions, cells);
+            }
+            for i in 0..num_res {
                 assignments.clear();
                 assignments.extend(
                     positions
                         .iter()
-                        .map(|&(ll, w)| (u64::from(super::profile::index(ll, res)), w)),
+                        .zip(position_cells.chunks_exact(num_res))
+                        .map(|(&(_, w), cells)| (cells[i], w)),
                 );
                 let first = assignments[0].0;
                 // A pixel wholly inside one cell contributes its retained
@@ -448,11 +458,13 @@ impl<'a> SampleProjector<'a> {
     }
 }
 
-/// Current cell (None before the first) and partial accumulator per resolution.
+/// Current cell (None before the first) and partial accumulator per
+/// resolution, and the indexer that remembers recent cells across samples.
 struct Runs<Acc> {
     cells: Vec<Option<u64>>,
     next_cells: Vec<u64>,
     accs: Vec<Acc>,
+    indexer: LatLngIndexer,
 }
 
 impl<Acc: Clone> Runs<Acc> {
@@ -461,6 +473,7 @@ impl<Acc: Clone> Runs<Acc> {
             cells: vec![None; num_res],
             next_cells: vec![0; num_res],
             accs: (0..num_res).map(|_| engine.new_acc()).collect(),
+            indexer: LatLngIndexer::new(),
         }
     }
 
@@ -475,11 +488,12 @@ impl<Acc: Clone> Runs<Acc> {
         engine: &E,
         maps: &mut [CellMap<Acc>],
     ) {
-        let mut changed = false;
-        for (i, &res) in resolutions.iter().enumerate() {
-            self.next_cells[i] = u64::from(super::profile::index(ll, res));
-            changed |= Some(self.next_cells[i]) != self.cells[i];
-        }
+        super::profile::index_all(&mut self.indexer, ll, resolutions, &mut self.next_cells);
+        let changed = self
+            .next_cells
+            .iter()
+            .zip(&self.cells)
+            .any(|(&next, &cell)| Some(next) != cell);
         if changed {
             if let Some(s) = span_start.take() {
                 self.add_span(&preceding[s..], engine);

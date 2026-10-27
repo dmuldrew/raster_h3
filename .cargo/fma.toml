@@ -1,0 +1,13 @@
+# Opt-in build for x86_64 CPUs with FMA3 (Intel Haswell / AMD Piledriver and
+# newer): `cargo build --release --config .cargo/fma.toml`.
+#
+# h3o computes distances with `f64::mul_add`, which without this feature is an
+# out-of-line software/libm call. Hardware FMA rounds identically, so H3 cells
+# are bit-for-bit the same; indexing is ~25-45% faster. The binary fails with
+# an illegal instruction on CPUs without FMA (including Rosetta 2), so release
+# artifacts keep the baseline target. aarch64 always has FMA and needs nothing.
+#
+# Ignored when the RUSTFLAGS environment variable is set; add
+# `-C target-feature=+fma` there instead.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+fma"]
