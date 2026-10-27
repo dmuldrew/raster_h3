@@ -575,6 +575,16 @@ impl<'a> ChunkDecoder<'a> {
         out: &mut [u8],
     ) -> Result<()> {
         match compression {
+            CompressionMethod::None => {
+                // Uncompressed: the payload is the samples themselves. A strip or
+                // tile shorter than its declared layout is malformed.
+                let raw = compressed.get(..out.len()).ok_or_else(|| {
+                    RasterH3Error::InvalidMetadata(
+                        "uncompressed chunk shorter than its declared layout".into(),
+                    )
+                })?;
+                out.copy_from_slice(raw);
+            }
             CompressionMethod::Deflate | CompressionMethod::OldDeflate => {
                 let decompressor = libdeflater
                     .ok_or_else(|| RasterH3Error::InvalidMetadata("no decompressor".into()))?;
@@ -923,7 +933,8 @@ impl GeoTiffStreamReader {
         };
 
         let compression = match decoder.get_tag_u32(Tag::Compression) {
-            Ok(v) => CompressionMethod::from_u16(v as u16).unwrap_or(CompressionMethod::None),
+            // Keep unrecognised codes as `Unknown` so they are never read as raw samples.
+            Ok(v) => CompressionMethod::from_u16_exhaustive(v as u16),
             Err(_) => CompressionMethod::None,
         };
 

@@ -27,6 +27,8 @@ struct Tags<'a> {
     gdal_metadata: Option<&'a str>,
     gdal_nodata: Option<&'a str>,
     extra_samples: Option<&'a [u16]>,
+    /// Overrides the Compression tag without compressing the data.
+    compression: Option<u16>,
 }
 
 macro_rules! write_tiff {
@@ -58,6 +60,9 @@ macro_rules! write_tiff {
         }
         if let Some(nd) = tags.gdal_nodata {
             enc.write_tag(Tag::Unknown(42113), nd).unwrap();
+        }
+        if let Some(code) = tags.compression {
+            enc.write_tag(Tag::Compression, code).unwrap();
         }
         image.write_data($data).unwrap();
     }};
@@ -296,14 +301,90 @@ fn zero_alpha_pixels_have_no_observation() {
     }
 }
 
+fn band_totals(path: &Path, band: usize) -> (f64, f64) {
+    let mut cfg = config(true);
+    cfg.quantiles.clear();
+    cfg.band = band;
+    run(path, &cfg)
+        .iter()
+        .filter(|(k, _)| k.0 == 9)
+        .fold((0.0, 0.0), |(n, s), (_, a)| (n + a.count, s + a.sum))
+}
+
 #[test]
 fn unspecified_extra_samples_are_data_not_alpha() {
+    // Uncompressed RGB plus one unspecified extra sample (e.g. NIR): the
+    // `tiff` decoder drops such samples, so these chunks must be decoded
+    // from the SamplesPerPixel layout instead.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rgbn.tif");
-    write_alpha_tiff(&path, &[0]);
+    let (w, h) = write_alpha_tiff(&path, &[0]);
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     assert_eq!(reader.metadata.samples_per_pixel, 4);
     assert_eq!(reader.metadata.alpha_sample, None);
+
+    let pixels = (w * h) as f64;
+    assert_eq!(band_totals(&path, 3), (pixels, 11.0 * pixels));
+    assert_eq!(band_totals(&path, 4), (pixels, 255.0 * pixels / 2.0));
+}
+
+#[test]
+fn gray_with_unspecified_extra_samples_reads_every_band() {
+    // GDAL's default layout for a 4-band Byte GeoTIFF: MINISBLACK with
+    // three unspecified extra samples.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gray4.tif");
+    let (w, h) = (24u32, 16u32);
+    let data: Vec<u8> = (0..w * h).flat_map(|_| [10u8, 20, 30, 40]).collect();
+    let tags = Tags {
+        extra_samples: Some(&[0, 0, 0]),
+        ..Default::default()
+    };
+    write_tiff!(
+        colortype::Gray8,
+        &path,
+        w,
+        h,
+        (-122.45, 37.80),
+        &data[..],
+        &tags
+    );
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    assert_eq!(reader.metadata.samples_per_pixel, 4);
+    let pixels = (w * h) as f64;
+    for (band, value) in [(1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0)] {
+        assert_eq!(
+            band_totals(&path, band),
+            (pixels, value * pixels),
+            "band {band}"
+        );
+    }
+}
+
+#[test]
+fn unknown_compression_is_never_read_as_raw_samples() {
+    // Uncompressed bytes tagged with an unsupported codec (LZMA, 34925).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lzma.tif");
+    let tags = Tags {
+        compression: Some(34925),
+        ..Default::default()
+    };
+    write_tiff!(
+        colortype::Gray16,
+        &path,
+        8,
+        8,
+        (-122.45, 37.80),
+        &[7u16; 64][..],
+        &tags
+    );
+    let reader = GeoTiffStreamReader::open(&path).unwrap();
+    let mut cfg = config(true);
+    cfg.quantiles.clear();
+    let result =
+        MultiScanHorizonStreamer::new(reader, &cfg).and_then(|mut s| s.fetch_next_batch(4096));
+    assert!(result.is_err(), "unsupported compression was decoded");
 }
 
 #[test]
