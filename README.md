@@ -391,24 +391,17 @@ with one sketch sweep per cell, sharing repeated probabilities. See the
 
 ## Core Engineering Architecture
 
-`raster_h3` achieves near-hardware-limit throughput through these architectural principles, shared by every engine:
+`raster_h3`'s throughput and memory profile come from seven principles, shared by every engine:
 
 | # | Engineering Pillar | Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | Early eviction where certified; disk spilling otherwise |
-| 2 | **Sequential H3 Spans** | Exact indexing with shared accumulation for consecutive equal-cell pixels |
-| 3 | **CRS Transformation** | Identity, analytical, or Proj4 transformation at sample positions |
-| 4 | **Absolute Pixel Coordinates** | One affine coordinate formula for walking, spans, and samples |
-| 5 | **In-Register Run Accumulation** | ~98% fewer hash table lookups |
-| 6 | **Branchless Hardware Min/Max** | Zero branch misprediction penalties (`minsd`/`maxsd`) |
-| 7 | **Zero-Copy `memmap2` & Async Prefetching** | Direct virtual memory mapping with background decompression |
-| 8 | **Zero-Allocation Hex Formatting** | Stack-based 16-byte LUT for H3 index formatting |
-| 9 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before decompression, for CRSs with certified bounds, including EPSG:3413/3031 polar grids ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
-| 10 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
-| 11 | **Lock-Free Buffer Pool** | Zero-allocation buffer recycling via `crossbeam_deque::Injector` |
-| 12 | **Single-Hop In-Order Prefetcher** | Direct worker-to-ring-buffer queue, zero context switches |
-| 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
-| 14 | **Native OGC GeoParquet 1.1 Exporter** | GIS-valid WKB cell polygons (dateline cells split, polar caps) with embedded PROJJSON metadata and an exact geometry `bbox` |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | Bounded aggregation memory: cells are emitted as soon as they are certified complete; disk spilling otherwise |
+| 2 | **Sequential H3 Spans & In-Register Run Accumulation** | One H3 lookup per pixel, but ~98% fewer hash table updates: equal-cell runs accumulate in registers and flush once |
+| 3 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before any read or decompression, for CRSs with certified bounds, including EPSG:3413/3031 polar grids ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
+| 4 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
+| 5 | **Bounded Prefetch & Decode Pipeline** | `memmap2` zero-copy reads, parallel decompression into a single-hop in-order ring, and recycled buffers under `decode_budget_bytes` |
+| 6 | **Coalesced Cloud Range Reads** | Adjacent COG/S3 tile ranges merged into single HTTP requests and prefetched ahead of the decoders |
+| 7 | **Exact CRS Transformation with Analytical Fast Paths** | Every sample transformed at its true position; identity and analytical Web Mercator/Albers paths skip Proj4 and supply the certified bounds that pruning and eviction rely on |
 
 > 📖 **Detailed explanations** of each architectural pillar — See [docs/engineering.md](docs/engineering.md)  
 > 🗺️ **Source Module Architecture** — File-by-file breakdown of crate internals mapped to these principles: [docs/module-architecture.md](docs/module-architecture.md)

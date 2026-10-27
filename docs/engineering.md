@@ -7,24 +7,19 @@ This document details the architectural principles that enable `raster_h3` to ag
 > [!NOTE]
 > Performance benchmarks, timing metrics, and micro-architectural numbers cited in this document reflect native release builds evaluated on an Apple M-series workstation (8 performance cores, 16 GB Unified Memory) and modern x86_64 processors with AVX2/SSE2 support.
 
-`raster_h3` achieves hardware limits through several key architectural principles:
+`raster_h3`'s throughput and memory profile come from seven principles:
 
 | # | Engineering Pillar | Description & Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | Cells are sealed only when their certified south bound exceeds every remaining chunk’s north bound. |
-| 2 | **Sequential H3 Spans** | Exact indexing with shared accumulation for consecutive equal-cell pixels |
-| 3 | **CRS Transformation** | Identity, analytical, or Proj4 transformation at sample positions |
-| 4 | **Absolute Pixel Coordinates** | One affine coordinate formula for walking, spans, and samples |
-| 5 | **In-Register Run Accumulation** | Contiguous pixels within the same H3 cell update running statistics in CPU registers, eliminating ~98% of hash table lookups. |
-| 6 | **Branchless Hardware Min/Max** | Replaces conditional branches with `minsd`/`maxsd` instructions with zero branch mispredictions. |
-| 7 | **Zero-Copy `memmap2` & Async Prefetching** | Maps GeoTIFFs into userspace virtual memory with asynchronous background chunk decompression. |
-| 8 | **Zero-Allocation Fast Hex Formatting** | Formats 64-bit integer H3 indices into lowercase hexadecimal ASCII bytes using a 16-byte stack LUT. |
-| 9 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data from disk. |
-| 10 | **Native DuckDB Parallelism (`init_local`)** | Dynamically distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
-| 11 | **Bounded Lock-Free Buffer Pool** | Bounded buffer pool with retry-on-contention stealing minimizes buffer allocation churn and strictly caps the number of idle buffers. |
-| 12 | **Single-Hop Bounded In-Order Prefetcher** | Direct worker-to-ring-buffer queue eliminates intermediate collector threads with batch draining and backpressure. |
-| 13 | **Cloud-Native COG & Mosaic Ingestion** | Asynchronous HTTP/S3 range prefetching and multi-file Voronoi cutline mosaic blending with zero double-counting. |
-| 14 | **Native OGC GeoParquet 1.1 Exporter** | Direct streaming export of stack-allocated WKB polygon geometries (109–189 bytes) with embedded PROJJSON `OGC:CRS84` metadata. |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | Cells are sealed only when their certified south bound exceeds every remaining chunk’s north bound, bounding aggregation memory. |
+| 2 | **Sequential H3 Spans & In-Register Run Accumulation** | Every pixel is indexed exactly; contiguous equal-cell pixels update running statistics in CPU registers, eliminating ~98% of hash table updates. |
+| 3 | **ROI Bounding Box Chunk Pruning** | Skips non-intersecting raster chunks upfront before reading or decompressing data. |
+| 4 | **Work-Stealing Parallelism (`init_local`)** | Distributes raster chunks across all CPU worker threads with accurate optimizer cardinality. |
+| 5 | **Bounded Prefetch & Decode Pipeline** | `memmap2` zero-copy reads, parallel decompression into a single-hop in-order ring buffer, and a lock-free buffer pool, all under `decode_budget_bytes`. |
+| 6 | **Coalesced Cloud Range Reads** | Adjacent COG/S3 tile byte ranges are merged into single HTTP requests and prefetched ahead of decompression. |
+| 7 | **Exact CRS Transformation with Analytical Fast Paths** | Pixel centers and subpixel samples are transformed at their actual locations; identity and analytical Web Mercator/Albers paths avoid Proj4 and certify the chunk bounds that pruning and eviction depend on. |
+
+Pixel coordinate handling, mosaic overlap rules, and the GeoParquet exporter are covered under [Correctness and Output Design](#correctness-and-output-design).
 
 ## 1. Southernmost Scan-Line Horizon Eviction
 A cell is complete only when its certified south-latitude bound exceeds the
@@ -43,66 +38,41 @@ limit, compaction output is deterministic and its memory is unbounded. Decoded c
 separate budget (`decode_budget_bytes`, default 256 MiB). Output and runtime
 overhead also use RAM.
 
-## 2. Sequential H3 Span Discovery
+## 2. Sequential H3 Spans & In-Register Run Accumulation
 Every candidate pixel center is indexed directly. Consecutive equal-cell pixels
 share accumulation work. The first differing cell is reused by the next run;
 there is no width prediction, geometric jump, or binary search.
 
-## 3. Coordinate Transformation
-The CRS transformer selects identity, analytical Web Mercator/Albers, or Proj4
-transforms. Pixel centers and subpixel samples are transformed at their actual
-locations; projected rows are not assumed to have constant latitude.
-
-## 4. Absolute Pixel Positions
-Walking, span discovery, and supersampling use the full affine transform from
-absolute pixel positions. Coordinates do not accumulate through repeated
-longitude additions, so changing run lengths cannot alter pixel coordinates.
-
-## 5. In-Register Run Accumulation
 Most pixels reside in the interior of an H3 cell. As long as contiguous pixels share the same cell index, running statistics are updated directly in CPU registers without memory access:
 - **Zero Memory Access**: Running statistics (Welford running mean, variance accumulator $M_2$, weighted count, sum, minimum, and maximum) remain in CPU registers during contiguous interior runs.
 - **Batched Horizon Updates**: Only when a cell boundary transition is detected does a single batched flush transfer accumulated weights to the active horizon `FxHashMap<u64, CellAccumulator>`, eliminating ~98% of hash map hashing, bucket lookups, and memory barrier synchronization.
 
-## 6. Branchless Hardware Min/Max
-Computing running minimum and maximum values over millions of pixels traditionally causes frequent CPU pipeline stalls due to unpredictable branch mispredictions:
-- **Hardware-Native Instructions**: `raster_h3` compiles min/max updates into hardware-native branchless instructions (`minsd`/`maxsd` on x86_64 SSE2/AVX, `fminnm`/`fmaxnm` on ARM64 NEON).
-- **Zero Misprediction Penalty**: Guarantees zero branch misprediction penalties even on rugged, noisy, or alternating terrain values.
-
-## 7. Zero-Copy `memmap2` & Async Prefetching
-Local GeoTIFF files are accessed via virtual memory mapping rather than standard read syscalls:
-- **Userspace Virtual Memory**: `MmapFile` maps files into userspace virtual memory with `memmap2`. Chunk byte slices (`&[u8]`) are referenced directly from the memory map without intermediate kernel-to-userspace copying.
-- **Asynchronous Decompression**: Multi-threaded decompression workers read directly from mapped pages in parallel, decoupling disk I/O and page cache faults from pixel aggregation.
-
-## 8. Zero-Allocation Fast Hex Formatting
-Formatting 64-bit integer H3 cell IDs into standard lowercase 15-character or 16-character hexadecimal strings (e.g. `'8828308281fffff'`) avoids all heap allocations, `format!()` macro formatting overhead, and dynamic string copies:
-- **16-Byte Stack-Allocated LUT**: Using a 16-byte lookup table (`[b'0', b'1', ..., b'f']`) and bitwise shifts (`(val >> 60) as usize & 0xF`), indices are formatted directly into DuckDB vector memory in ~2–3 nanoseconds per cell *(measured on Apple M-series workstation)*.
-- **Zero-Copy Parsing**: Companion parser `parse_hex_u64` decodes hexadecimal strings back to 64-bit integers using branchless byte-offset lookups.
-
-## 9. ROI Bounding Box Chunk Pruning
+## 3. ROI Bounding Box Chunk Pruning
 Queries specifying a spatial Region of Interest (ROI) bounding box (`min_lat`, `min_lon`, `max_lat`, `max_lon`) prune non-intersecting chunks upfront:
 - **Pre-Decompression Pruning**: `chunk_intersects_bbox` evaluates the projected spatial extent of each strip or tile against the target bounding box before initiating decompression.
 - **Zero I/O Overhead**: Chunks falling entirely outside the target ROI are skipped immediately—zero bytes are transferred from disk/network, zero decompression threads are spawned, and zero buffer memory is allocated.
 
-## 10. Dynamic Work-Stealing Parallelism & DuckDB init_local Pipeline
+## 4. Dynamic Work-Stealing Parallelism & DuckDB init_local Pipeline
 DuckDB's vectorized execution engine parallelizes custom table functions across arbitrary CPU threads via the `duckdb_table_function_set_init_local` callback:
 - **Zero Thread Contention**: Each worker thread maintains its own independent scan state and local horizon hash map, eliminating global mutex contention during pixel aggregation.
 - **Work-Stealing Chunk Distribution**: Input GeoTIFF strips or COG tiles are managed as a shared, lock-free task queue. Fast threads that finish their assigned chunks immediately steal remaining chunks from the pool, preventing worker stragglers caused by uneven spatial density or ocean tiles.
 - **Accurate Cardinality Estimation**: `estimate_raster_cardinality()` provides DuckDB's cost-based query optimizer with exact row count bounds based on raster bounding boxes and H3 resolution area formulas, enabling optimal hash join planning and vector pipeline scheduling.
 
-## 11. Bounded Lock-Free Buffer Recycling Pool (DecodingBufferPool)
-High-resolution continental datasets (such as CONUS 30m) require decompressing tens of thousands of tiles (e.g. 15,840+ chunks). Continuously allocating, reallocating, and freeing multi-megabyte decompression buffers causes heavy memory fragmentation, allocator lock contention, and kernel `brk`/`mmap` syscall overhead:
-- **Bounded Lock-Free Recycling**: `PrefetchedChunkReader` and `PrefetchedMosaicReader` use `DecodingBufferPool` (wrapping `crossbeam_deque::Injector<DecodingResult>` with an atomic retention counter) as a concurrent, lock-free buffer recycling pool.
-- **Contention-Resilient Acquisition**: When a background decompression thread prepares to decode a chunk, it attempts to acquire an existing buffer from the pool (`buffer_pool.pop()`). If concurrent steals collide (`crossbeam_deque::Steal::Retry`), the worker spins briefly rather than falsely falling back to fresh memory allocation. Only if the pool is genuinely empty (`Steal::Empty`) does it allocate fresh storage.
-- **Strict Retention Bound & Minimized Allocation Churn**: Once the downstream consumer finishes processing a chunk batch, allocated buffers are returned to the pool via `recycle_batch()`. If the pool has reached its configured capacity, excess buffers are immediately dropped. The limit counts buffers, not bytes: differently sized chunks can retain different amounts of storage. Reuse minimizes allocation churn but does not guarantee zero allocations.
+## 5. Bounded Prefetch & Decode Pipeline
 
-## 12. Single-Hop Bounded In-Order Prefetcher (OrderedPrefetchQueue<T>)
+### Zero-Copy `memmap2` Reads
+Local GeoTIFF files are accessed via virtual memory mapping rather than standard read syscalls:
+- **Userspace Virtual Memory**: `MmapFile` maps files into userspace virtual memory with `memmap2`. Chunk byte slices (`&[u8]`) are referenced directly from the memory map without intermediate kernel-to-userspace copying.
+- **Asynchronous Decompression**: Multi-threaded decompression workers read directly from mapped pages in parallel, decoupling disk I/O and page cache faults from pixel aggregation.
+
+### Single-Hop Bounded In-Order Prefetcher (OrderedPrefetchQueue<T>)
 Traditional background prefetchers often suffer from thread thrashing: either unbounded queues that risk out-of-memory (OOM) bloat, or intermediate "collector" threads that copy data through multiple OS synchronization channels:
 - **Direct Worker-to-Consumer Deposit**: `OrderedPrefetchQueue<T>` connects decompression workers directly to the aggregator through a fixed-capacity ring buffer indexed by `job_id % capacity`.
 - **Single-Hop Thread Architecture**: Workers calculate and decompress chunks concurrently, depositing their result directly into their assigned ring buffer slot without intermediate collector threads. The aggregator drains contiguous, sequence-ordered chunks in bulk using `drain_into()`, using one queue guard per batch; condition-variable waits release and reacquire the mutex.
 - **Strict Backpressure & Deadlock-Free Draining**: If background workers outpace the aggregator by more than `capacity` chunks, they block on a condition variable (`not_full`) until the consumer drains slots. When draining batches that exceed ring capacity, `drain_into()` publishes freed slots before sleeping on incomplete batches, avoiding a circular wait between producers and the consumer. Consumers pull ready chunks via `next_chunk_batch(max_batch)` or bulk batch drains.
 
 
-### Downstream backpressure and memory limits
+#### Downstream backpressure and memory limits
 
 `ChunkWriter` bounds writes to DuckDB's output vectors; it does not throttle or schedule decompression. Continuous and wide categorical scan callbacks pull from `ConcurrentRecordQueue::pop_or_refill()` before writing. A refill requests at most four vector-sized batches from the streamer, returns one, and retains at most three. With no further scan calls, no further refills occur. The prefetch ring then fills and each decompression worker eventually blocks in `push()`, after finishing its current decode. An already-running scan may finish its current refill before stalling.
 
@@ -112,14 +82,33 @@ Whole-query memory also includes raster metadata and job lists, compressed remot
 
 Regression coverage includes an explicit producer-wait handshake for oversized batch drains and a 15,840-item test connecting the real record and prefetch queues. The latter pauses record consumption, observes the producer blocked at the expected capacity boundary, and checks ordered completion after resuming. It uses one synthetic record per chunk; it is not a live DuckDB/TIFF memory benchmark.
 
-## 13. Cloud-Native COG & Mosaic Ingestion
-`raster_h3` provides end-to-end cloud-native ingestion for both standalone Cloud-Optimized GeoTIFFs (COGs) and large-scale multi-file mosaics:
+### Bounded Lock-Free Buffer Recycling Pool (DecodingBufferPool)
+High-resolution continental datasets (such as CONUS 30m) require decompressing tens of thousands of tiles (e.g. 15,840+ chunks). Continuously allocating, reallocating, and freeing multi-megabyte decompression buffers causes heavy memory fragmentation, allocator lock contention, and kernel `brk`/`mmap` syscall overhead:
+- **Bounded Lock-Free Recycling**: `PrefetchedChunkReader` and `PrefetchedMosaicReader` use `DecodingBufferPool` (wrapping `crossbeam_deque::Injector<DecodingResult>` with an atomic retention counter) as a concurrent, lock-free buffer recycling pool.
+- **Contention-Resilient Acquisition**: When a background decompression thread prepares to decode a chunk, it attempts to acquire an existing buffer from the pool (`buffer_pool.pop()`). If concurrent steals collide (`crossbeam_deque::Steal::Retry`), the worker spins briefly rather than falsely falling back to fresh memory allocation. Only if the pool is genuinely empty (`Steal::Empty`) does it allocate fresh storage.
+- **Strict Retention Bound & Minimized Allocation Churn**: Once the downstream consumer finishes processing a chunk batch, allocated buffers are returned to the pool via `recycle_batch()`. If the pool has reached its configured capacity, excess buffers are immediately dropped. The limit counts buffers, not bytes: differently sized chunks can retain different amounts of storage. Reuse minimizes allocation churn but does not guarantee zero allocations.
 
-### Remote COG & S3 Streaming (Range Coalescing)
+## 6. Coalesced Cloud Range Reads
 Streams Cloud-Optimized GeoTIFFs directly from HTTP/HTTPS endpoints or AWS S3 buckets without copying the entire multi-gigabyte file to local disk:
 - **Sparse Header Indexing**: Reads the TIFF header, Image File Directories (IFDs), and embedded GeoKey tags in a single initial 16 KB byte-range request.
 - **Spatial Request Coalescing**: Consecutive or proximate chunk byte ranges within the same spatial region are automatically coalesced into single combined HTTP range requests, drastically cutting HTTP round-trip latency and AWS S3 request costs.
 - **Asynchronous Remote Prefetching**: Dedicated background I/O tasks prefetch required remote tile bytes ahead of the decompression workers with automated retry and exponential backoff resilience.
+
+## 7. Exact CRS Transformation with Analytical Fast Paths
+The CRS transformer selects identity, analytical Web Mercator/Albers, or Proj4
+transforms. Pixel centers and subpixel samples are transformed at their actual
+locations; projected rows are not assumed to have constant latitude.
+
+Transformation runs for every sample, so the fast paths set its per-pixel cost: analytical inversions match PROJ (`cs2cs`) to within 0.01 m without the general `proj4rs` pipeline. The same transformer certifies chunk latitude bounds; when it cannot (unknown Proj4 bounds, an Albers chunk that may contain the cone apex), ROI pruning and early horizon eviction fall back to their conservative paths. See [CRS and Projection](crs-and-projection.md).
+
+---
+
+## Correctness and Output Design
+
+### Absolute Pixel Positions
+Walking, span discovery, and supersampling use the full affine transform from
+absolute pixel positions. Coordinates do not accumulate through repeated
+longitude additions, so changing run lengths cannot alter pixel coordinates.
 
 ### Multi-File Raster Mosaics & Voronoi Cutline Partitioning
 Large geospatial datasets are frequently distributed across tiled collections of adjacent or overlapping GeoTIFF files (e.g., Sentinel-2 granules, national DEM tiles, LANDFIRE map zones):
@@ -130,7 +119,7 @@ Large geospatial datasets are frequently distributed across tiled collections of
   - `'first'`: Applies the Painter's Algorithm, giving strict precedence to earlier tiles in the file list.
   - `'average'`: Computes multi-observation running averages across overlapping pixels.
 
-## 14. Native OGC GeoParquet 1.1 Exporter (Stack-Allocated WKB Hexagons & PROJJSON)
+### Native OGC GeoParquet 1.1 Exporter (Stack-Allocated WKB Hexagons & PROJJSON)
 Exporting aggregated hexagonal grids to standard GIS formats traditionally required multi-step ETL pipelines involving intermediate shapefiles, GeoJSON scratch disks, and GDAL conversions:
 - **Direct SQL Parquet Export**: `h3_raster_to_parquet` streams aggregated hexagons directly into highly compressed Apache Parquet files with zero intermediate files.
 - **Stack WKB Polygon Serialization**: Converts 64-bit integer H3 cell indices directly into standard OGC 2D Polygon Well-Known Binary (WKB) bytes in a fixed stack buffer (`WKB_BUF_LEN`) in ~10–15 nanoseconds *(measured on Apple M-series workstation)*. Layout: 1 byte endianness + 4 bytes geometry type + 4 bytes ring count + 4 bytes point count + (n+1) closed-ring vertices $\times$ 16 bytes. Class II (even) resolutions yield 125 bytes (hexagon) / 109 bytes (pentagon); Class III (odd) resolutions add icosahedron-edge crossing vertices, giving 141–157 bytes for edge-straddling hexagons and 189 bytes for 10-vertex pentagons. Antimeridian cells are split into a two-part `MultiPolygon` and pole cells become polar-cap polygons, so every geometry stays within [-180, 180] × [-90, 90].
