@@ -71,7 +71,7 @@ stream, when the consumer expects standard formats.
 
 ### `parquet` and `pmtiles`
 
-`parquet` always writes GeoParquet 1.1 (WKB geometry + `geo` metadata) and reports nothing
+`parquet` always writes GeoParquet 1.1 (WKB geometry, see [cell geometry](../api-reference.md#cell-geometry), + `geo` metadata) and reports nothing
 on stdout. `pmtiles` writes one zoom range per requested resolution (see
 [PMTiles & Multi-Resolution](../pmtiles.md)).
 
