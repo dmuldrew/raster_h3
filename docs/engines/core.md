@@ -72,6 +72,19 @@ purpose and are not counted. A non-zero count means valid data is missing from t
 usually because of a wrong or out-of-domain source CRS. It is counted in every build, not
 only with `stream-profile`, and is also available as `metrics().worker.transform_failures`.
 
+For pipelines that own the streamer (`H3ParquetWriter`, `H3PmtilesTiler`), set
+`MultiResolutionConfig::transform_failure_counter` to a shared `Arc<AtomicU64>`; every
+stream built from that configuration adds its failures to it. The engines surface the count
+as follows:
+
+| Engine | Where the count appears |
+| :--- | :--- |
+| DuckDB | `transform_failures` column of the `h3_raster_to_parquet` / `h3_raster_to_pmtiles` summary row. The streaming aggregate functions have no warnings channel and report nothing. |
+| PostgreSQL | One `WARNING` at the end of `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate`. |
+| Python | `RuntimeWarning` from `raster_to_parquet` / `raster_to_pmtiles`. `scan_raster_h3` reports nothing. |
+| CLI | Warning on stderr from every subcommand. |
+| DataFusion | Not surfaced yet. |
+
 `custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
 or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
 accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`,

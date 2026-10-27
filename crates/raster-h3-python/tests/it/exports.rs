@@ -7,7 +7,10 @@ use std::ptr;
 
 use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::pmtiles::H3PmtilesTiler;
-use raster_h3_python::{raster_h3_py_export_parquet, raster_h3_py_export_pmtiles};
+use raster_h3_python::{
+    raster_h3_py_export_parquet, raster_h3_py_export_parquet_with_stats,
+    raster_h3_py_export_pmtiles, raster_h3_py_export_pmtiles_with_stats,
+};
 
 use crate::c_abi::{classes_tif, core_rows, gradient_tif, take_err, Scan};
 
@@ -159,6 +162,52 @@ fn export_error_paths_return_minus_one_with_a_message() {
         )
     };
     assert_eq!(n, -1);
+}
+
+#[test]
+fn exports_report_transform_failures() {
+    // 10 x 20 one-degree pixels from 95N: the top 5 rows lie beyond the pole.
+    let (_tmp, tif) = crate::helpers::TestGeoTiffBuilder::new(10, 20)
+        .origin(0.0, 95.0)
+        .pixel_size(1.0)
+        .create_constant_tempfile(3.0f32);
+    let dir = tempfile::tempdir().unwrap();
+    let (i, r) = (c(s(&tif)), c(Some("3")));
+    for (name, pm) in [("out.parquet", false), ("out.pmtiles", true)] {
+        let o = c(s(&dir.path().join(name)));
+        let mut failures = u64::MAX;
+        let mut err: *mut c_char = ptr::null_mut();
+        // SAFETY: string arguments are live `CString`s owned by this frame, `failures` and
+        // `err` are writable out-pointers, and `take_err` frees any error string.
+        let n = unsafe {
+            if pm {
+                raster_h3_py_export_pmtiles_with_stats(
+                    p(&i),
+                    p(&o),
+                    p(&r),
+                    0,
+                    ptr::null(),
+                    &mut failures,
+                    &mut err,
+                )
+            } else {
+                raster_h3_py_export_parquet_with_stats(
+                    p(&i),
+                    p(&o),
+                    p(&r),
+                    0,
+                    ptr::null(),
+                    1,
+                    &mut failures,
+                    &mut err,
+                )
+            }
+        };
+        // SAFETY: `err` is null or a string allocated by the export, freed exactly once.
+        assert_eq!(unsafe { take_err(err) }, None);
+        assert!(n > 0, "{name}");
+        assert_eq!(failures, 50, "{name}");
+    }
 }
 
 #[test]

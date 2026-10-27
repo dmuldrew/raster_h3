@@ -420,6 +420,11 @@ impl PgContinuousSrf {
         })
     }
 
+    /// Valid sample points dropped by failed coordinate transforms so far.
+    pub fn transform_failures(&self) -> u64 {
+        self.streamer.transform_failures()
+    }
+
     pub fn next_row(&mut self) -> Result<Option<PgContinuousRow>> {
         if self.buffer.is_empty() && !self.finished {
             let mut batch = Vec::with_capacity(self.batch_size);
@@ -522,6 +527,11 @@ impl PgCategoricalSrf {
             wkb_buf: [0u8; WKB_BUF_LEN],
             finished: false,
         })
+    }
+
+    /// Valid sample points dropped by failed coordinate transforms so far.
+    pub fn transform_failures(&self) -> u64 {
+        self.streamer.transform_failures()
     }
 
     pub fn next_row(&mut self) -> Result<Option<PgCategoricalRow>> {

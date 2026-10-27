@@ -204,6 +204,8 @@ struct MemoryContextCallback {
     next: *mut MemoryContextCallback,
 }
 
+/// `WARNING` elevel (elog.h); unchanged across the supported majors (13–18).
+const WARNING_LEVEL: c_int = 19;
 const EXPR_MULTIPLE_RESULT: c_int = 1;
 const EXPR_END_RESULT: c_int = 2;
 const TYPEFUNC_COMPOSITE: c_int = 1;
@@ -277,6 +279,32 @@ unsafe fn raise_error(msg: *const c_char) -> ! {
         // errstart never declines ERROR and errfinish never returns from it.
         std::process::abort()
     }
+}
+
+/// `ereport(WARNING, errmsg("%s", msg))`. Returns normally, but `errfinish` may
+/// longjmp on a pending query cancel.
+///
+/// # Safety
+/// No live values with destructors may exist in calling Rust frames.
+unsafe fn raise_warning(msg: *const c_char) {
+    // SAFETY: the backend's `ereport` sequence on the backend thread, as in
+    // `raise_error`; `msg` is a NUL-terminated string that outlives the call, formatted
+    // through a constant `%s`. A cancel longjmp from `errfinish` skips only frames
+    // without pending destructors (caller contract).
+    unsafe {
+        if errstart(WARNING_LEVEL, ptr::null()) {
+            errmsg(c"%s".as_ptr(), msg);
+            errfinish(c"raster_h3_pg".as_ptr(), line!() as c_int, ptr::null());
+        }
+    }
+}
+
+/// The `WARNING` text for valid samples dropped by failed coordinate transforms.
+pub fn transform_failure_warning(failures: u64) -> String {
+    format!(
+        "raster_h3: {failures} valid sample(s) were dropped because their coordinate \
+         transform failed or fell outside the valid latitude/longitude range; check source_crs"
+    )
 }
 
 /// Run `f`, turning errors and panics into a `palloc`'d message for [`raise_error`].
@@ -698,6 +726,7 @@ unsafe fn run_srf<S: 'static>(
     fcinfo: pg_func_call_info,
     open: fn(&SrfArgs<'_>) -> Result<S, String>,
     next: fn(&mut S) -> Result<Option<RowText>, String>,
+    transform_failures: fn(&S) -> u64,
 ) -> Datum {
     // SAFETY: `fcinfo` is the valid call info of a value-per-call SRF declared to return a
     // composite (caller contract), so `flinfo` is set and the `funcapi` multi-call protocol
@@ -763,6 +792,13 @@ unsafe fn run_srf<S: 'static>(
                 HeapTupleHeaderGetDatum((*tuple).t_data)
             }
             Ok(None) => {
+                // Report dropped samples while the state is still alive. The message
+                // is palloc'd and the temporary `String` is dropped before `ereport`.
+                let failures = transform_failures(&*state);
+                if failures > 0 {
+                    let msg = pstrdup(&transform_failure_warning(failures));
+                    raise_warning(msg);
+                }
                 // Deleting the multi-call context runs `drop_srf_state`.
                 end_MultiFuncCall(fcinfo, funcctx);
                 set_is_done(fcinfo, EXPR_END_RESULT);
@@ -808,7 +844,11 @@ pub extern "C" fn pg_finfo_pg_h3_raster_continuous_aggregate() -> *const Pg_finf
 pub unsafe extern "C" fn pg_h3_raster_continuous_aggregate(fcinfo: pg_func_call_info) -> Datum {
     // SAFETY: forwards the function manager's valid `fcinfo` for this SRF, declared as
     // returning a composite, to `run_srf`.
-    unsafe { run_srf(fcinfo, open_continuous, next_continuous) }
+    unsafe {
+        run_srf(fcinfo, open_continuous, next_continuous, |s| {
+            s.transform_failures()
+        })
+    }
 }
 
 #[no_mangle]
@@ -824,7 +864,11 @@ pub extern "C" fn pg_finfo_pg_h3_raster_categorical_aggregate() -> *const Pg_fin
 pub unsafe extern "C" fn pg_h3_raster_categorical_aggregate(fcinfo: pg_func_call_info) -> Datum {
     // SAFETY: forwards the function manager's valid `fcinfo` for this SRF, declared as
     // returning a composite, to `run_srf`.
-    unsafe { run_srf(fcinfo, open_categorical, next_categorical) }
+    unsafe {
+        run_srf(fcinfo, open_categorical, next_categorical, |s| {
+            s.transform_failures()
+        })
+    }
 }
 
 #[cfg(test)]
