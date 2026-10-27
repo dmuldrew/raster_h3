@@ -46,7 +46,7 @@ Polars and PyArrow are optional dependencies. Without Polars, the scan functions
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :---: | :--- | :--- |
 | `path` | `str \| pathlib.Path` | **Yes** | — | GeoTIFF / Cloud-Optimized GeoTIFF. Also accepts an `http(s)://` or `s3://` URL, a glob (`"tiles/*.tif"`), a comma-separated list of files, or a VRT; multiple files are read as one mosaic. |
-| `resolutions` | `int \| str \| Sequence[int]` | No | `8` | One or more H3 resolutions (0 to 15), aggregated in a single pass: `8`, `"7,8"`, `"7 8"` or `[7, 8]`. An empty string or empty sequence means the default, `8`. |
+| `resolutions` | `int \| str \| Sequence[int]` | No | `8` | One or more H3 resolutions (0 to 15), aggregated in a single pass: `8`, `"7,8"`, `"7 8"` or `[7, 8]`. An empty string or empty sequence raises an error. |
 
 ### Keyword parameters
 
@@ -83,12 +83,11 @@ example through the `duckdb` Python package) or the Rust APIs when you need to c
 ### Validation
 
 Invalid options raise `RuntimeError` with the engine's message; they are never silently
-ignored. The only defaulting is for empty values: `resolutions=""` or `[]` means `8`, and
-`format=""` means `"wide"`.
+ignored. The one empty value that falls back to a default is `format=""`, which means `"wide"`.
 
 | Input | Message (prefixed `Invalid parameter:`) |
 | :--- | :--- |
-| A resolution outside 0–15, or an unparsable `resolutions` string | `Invalid resolutions '16': expected H3 resolutions between 0 and 15, e.g. 7,8` |
+| A resolution outside 0–15, an unparsable `resolutions` string, or an empty one (`""` or `[]`) | `Invalid resolutions '16': expected H3 resolutions between 0 and 15, e.g. 7,8` |
 | `format` other than `wide` / `long` | `Invalid format 'tall': expected 'wide' or 'long'` |
 | `bbox` without exactly four numbers | `Invalid bbox '1,2,3': expected four numbers min_lon,min_lat,max_lon,max_lat` |
 | Unknown name in `columns` | `Column 'nope' not found in raster_h3 schema` |
