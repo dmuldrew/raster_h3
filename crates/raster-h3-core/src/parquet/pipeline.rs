@@ -165,6 +165,12 @@ pub trait ParquetRowGroupBuffer: Sized + Send + 'static {
     /// Current number of rows in the buffer
     fn len(&self) -> usize;
 
+    /// `[min_lon, min_lat, max_lon, max_lat]` of the geometries buffered since
+    /// the last `clear`, or `None` without geometries.
+    fn geometry_bounds(&self) -> Option<[f64; 4]> {
+        None
+    }
+
     /// Check if the buffer is empty
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -206,19 +212,16 @@ where
     let message_type = B::schema_message(compact, geoparquet);
     let schema = Arc::new(parse_message_type(message_type)?);
 
-    let mut props_builder = WriterProperties::builder()
+    let props_builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_column_encoding(ColumnPath::from("h3_index"), Encoding::DELTA_BINARY_PACKED)
         .set_compression(parquet_config.compression);
 
-    if geoparquet {
-        let bbox = streamer
-            .bounds_wgs84()
-            .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
-        let geo_json = build_geoparquet_metadata("geometry", bbox);
-        props_builder = props_builder
-            .set_key_value_metadata(Some(vec![KeyValue::new("geo".to_string(), geo_json)]));
-    }
+    // The GeoParquet `geo` metadata is appended once every row is written, so its
+    // bbox covers the cell geometries themselves (which extend past the raster).
+    let fallback_bbox = streamer
+        .bounds_wgs84()
+        .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
 
     let props = Arc::new(props_builder.build());
 
@@ -249,15 +252,30 @@ where
     let writer_handle = thread::spawn(
         move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
             let mut total_rows = 0usize;
+            let mut bbox: Option<[f64; 4]> = None;
             while let Ok(mut buf) = writer_rx.recv() {
                 if !buf.is_empty() {
                     buf.sort_by_h3_index();
                     let count = buf.len();
                     buf.flush_to_row_group(&mut writer)?;
                     total_rows += count;
+                    if let Some(b) = buf.geometry_bounds() {
+                        bbox = Some(bbox.map_or(b, |a| {
+                            [
+                                a[0].min(b[0]),
+                                a[1].min(b[1]),
+                                a[2].max(b[2]),
+                                a[3].max(b[3]),
+                            ]
+                        }));
+                    }
                     buf.clear();
                     let _ = recycle_tx.send(buf);
                 }
+            }
+            if geoparquet {
+                let geo_json = build_geoparquet_metadata("geometry", bbox.unwrap_or(fallback_bbox));
+                writer.append_key_value_metadata(KeyValue::new("geo".to_string(), geo_json));
             }
             writer.close()?;
             Ok(total_rows)

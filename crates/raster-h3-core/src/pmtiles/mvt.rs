@@ -465,15 +465,102 @@ impl From<Vec<(Cow<'static, str>, MvtValue)>> for FeatureProperties {
     }
 }
 
+/// Most points in a feature ring: an H3 boundary (at most 10 vertices) plus a
+/// polar cap's two seam crossings and two corners on the map edge.
+pub const MAX_FEATURE_POINTS: usize = 14;
+
+/// Planar ring for a cell that encircles a pole, in a space where `x` wraps with
+/// `period` over `[x0, x0 + period]` and the pole lies on the line `y = edge_y`:
+/// the ring unrolled eastward from `x0` to `x0 + period`, closed along both seam
+/// edges and `edge_y`. Returns the points and their count.
+fn polar_cap(
+    xs: &[f64],
+    ys: &[f64],
+    x0: f64,
+    period: f64,
+    edge_y: f64,
+) -> ([(f64, f64); MAX_FEATURE_POINTS], usize) {
+    let n = xs.len();
+    let half = period / 2.0;
+    let wrap = |d: f64| {
+        if d > half {
+            d - period
+        } else if d <= -half {
+            d + period
+        } else {
+            d
+        }
+    };
+    // Visit vertices eastward (increasing x).
+    let turn: f64 = (0..n).map(|i| wrap(xs[(i + 1) % n] - xs[i])).sum();
+    let order = |i: usize| if turn >= 0.0 { i } else { n - 1 - i };
+    let x1 = x0 + period;
+    // The eastward edge that crosses the seam starts at `k`.
+    let k = (0..n)
+        .find(|&i| {
+            let a = xs[order(i)];
+            a + wrap(xs[order((i + 1) % n)] - a) > x1
+        })
+        .unwrap_or(n - 1);
+    let (a, b) = (order(k), order((k + 1) % n));
+    let b_x = xs[a] + wrap(xs[b] - xs[a]);
+    let t = (x1 - xs[a]) / (b_x - xs[a]);
+    let cross_y = ys[a] + t * (ys[b] - ys[a]);
+
+    let mut pts = [(0.0, 0.0); MAX_FEATURE_POINTS];
+    let mut len = 0;
+    let mut push = |p: (f64, f64)| {
+        if len == 0 || pts[len - 1] != p {
+            pts[len] = p;
+            len += 1;
+        }
+    };
+    push((x0, cross_y));
+    for step in 1..=n {
+        let i = order((k + step) % n);
+        // Vertices exactly on the seam sit on the cap's seam edges.
+        let x = match xs[i] {
+            v if step == 1 && v == x1 => x0,
+            v if step == n && v == x0 => x1,
+            v => v,
+        };
+        push((x, ys[i]));
+    }
+    push((x1, cross_y));
+    push((x1, edge_y));
+    push((x0, edge_y));
+    (pts, len)
+}
+
+/// Reverse `n` tile points in place when their surveyor's-formula area is negative:
+/// MVT 2.1 requires exterior rings to have positive area in tile coordinates.
+fn orient_exterior(
+    px: &mut [i32; MAX_FEATURE_POINTS],
+    py: &mut [i32; MAX_FEATURE_POINTS],
+    n: usize,
+) {
+    let area: i64 = (0..n)
+        .map(|i| {
+            let j = (i + 1) % n;
+            px[i] as i64 * py[j] as i64 - px[j] as i64 * py[i] as i64
+        })
+        .sum();
+    if area < 0 {
+        px[..n].reverse();
+        py[..n].reverse();
+    }
+}
+
 /// A single feature inside an MVT layer with stack-allocated polygon geometry
 #[derive(Debug, Clone)]
 pub struct MvtFeature {
     pub id: u64,
     /// Properties
     pub properties: FeatureProperties,
-    /// Boundary vertices in tile-local [0, 4096] integer coordinate space (stack allocated; up to 10 for Class III pentagons)
-    pub polygon_x: [i32; 10],
-    pub polygon_y: [i32; 10],
+    /// Exterior ring in tile-local [0, 4096] integer coordinates, positive area (MVT 2.1):
+    /// up to 10 H3 vertices, or [`MAX_FEATURE_POINTS`] for a polar cap.
+    pub polygon_x: [i32; MAX_FEATURE_POINTS],
+    pub polygon_y: [i32; MAX_FEATURE_POINTS],
     pub num_points: u8,
     /// Translation of a second exterior ring for a seam-crossing world tile.
     pub wrapped_x_offset: i32,
@@ -499,6 +586,7 @@ impl MvtFeature {
 
         let count = vertices.len().min(10);
         let mut ux = [0.0f64; 10];
+        let mut encircles_pole = false;
         let mut min_raw_x = f64::INFINITY;
         let mut max_raw_x = f64::NEG_INFINITY;
         for (i, v) in vertices.iter().take(count).enumerate() {
@@ -539,10 +627,39 @@ impl MvtFeature {
                     *x += shift;
                 }
             } else {
-                for (i, v) in vertices.iter().take(count).enumerate() {
-                    ux[i] = v.x;
-                }
+                encircles_pole = true;
             }
+        }
+
+        let mut px = [0i32; MAX_FEATURE_POINTS];
+        let mut py = [0i32; MAX_FEATURE_POINTS];
+        let to_tile = |x: f64, y: f64| {
+            (
+                ((x - tile_x_min) / tile_span * extent_f).round() as i32,
+                ((y - tile_y_min) / tile_span * extent_f).round() as i32,
+            )
+        };
+        if encircles_pole {
+            // The ring circles a pole: close it along the map's top or bottom edge.
+            let (mut xs, mut ys) = ([0.0f64; 10], [0.0f64; 10]);
+            for (i, v) in vertices.iter().take(count).enumerate() {
+                (xs[i], ys[i]) = (v.x, v.y);
+            }
+            let north = ys[..count].iter().sum::<f64>() < 0.5 * (count as f64);
+            let edge_y = if north { 0.0 } else { 1.0 };
+            let (pts, n) = polar_cap(&xs[..count], &ys[..count], 0.0, 1.0, edge_y);
+            for (i, &(x, y)) in pts[..n].iter().enumerate() {
+                (px[i], py[i]) = to_tile(x, y);
+            }
+            orient_exterior(&mut px, &mut py, n);
+            return Self {
+                id,
+                properties: properties.into(),
+                polygon_x: px,
+                polygon_y: py,
+                num_points: n as u8,
+                wrapped_x_offset: 0,
+            };
         }
 
         let wrapped_x_offset = if z == 0 && max_raw_x - min_raw_x > 0.5 {
@@ -562,12 +679,10 @@ impl MvtFeature {
             0
         };
 
-        let mut px = [0i32; 10];
-        let mut py = [0i32; 10];
         for (i, v) in vertices.iter().take(count).enumerate() {
-            px[i] = ((ux[i] - tile_x_min) / tile_span * extent_f).round() as i32;
-            py[i] = ((v.y - tile_y_min) / tile_span * extent_f).round() as i32;
+            (px[i], py[i]) = to_tile(ux[i], v.y);
         }
+        orient_exterior(&mut px, &mut py, count);
 
         Self {
             id,
@@ -753,28 +868,64 @@ impl MvtLayer {
                     *l += shift;
                 }
             } else {
+                // The ring circles a pole; it becomes a polar cap below.
                 for (i, v) in vertices.iter().take(count).enumerate() {
                     ulng[i] = v.lng();
                 }
             }
         }
 
-        let mut px = [0i32; 10];
-        let mut py = [0i32; 10];
-
-        for (i, v) in vertices.iter().take(count).enumerate() {
-            px[i] = ((ulng[i] - tile_min_lon) / lon_span * extent_f).round() as i32;
-
-            let lat_clamped = v.lat().clamp(-85.05112878, 85.05112878);
+        let to_px = |lng: f64| ((lng - tile_min_lon) / lon_span * extent_f).round() as i32;
+        let to_py = |lat: f64| {
+            let lat_clamped = lat.clamp(-85.05112878, 85.05112878);
             let lat_rad = lat_clamped.to_radians();
             let y_merc =
                 (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
-            py[i] = if merc_span > 0.0 {
+            if merc_span > 0.0 {
                 ((y_merc - y_merc_top) / merc_span * extent_f).round() as i32
             } else {
-                ((tile_max_lat - v.lat()) / lat_span * extent_f).round() as i32
-            };
+                ((tile_max_lat - lat) / lat_span * extent_f).round() as i32
+            }
+        };
+        let mut px = [0i32; MAX_FEATURE_POINTS];
+        let mut py = [0i32; MAX_FEATURE_POINTS];
+
+        let encircles_pole = count > 0 && {
+            let lo = ulng[..count].iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = ulng[..count]
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            hi - lo > 180.0
+        };
+        if encircles_pole {
+            let mut lats = [0.0f64; 10];
+            for (i, v) in vertices.iter().take(count).enumerate() {
+                lats[i] = v.lat();
+            }
+            let north = lats[..count].iter().sum::<f64>() > 0.0;
+            let edge = if north { 90.0 } else { -90.0 };
+            let (pts, n) = polar_cap(&ulng[..count], &lats[..count], -180.0, 360.0, edge);
+            for (i, &(lng, lat)) in pts[..n].iter().enumerate() {
+                (px[i], py[i]) = (to_px(lng), to_py(lat));
+            }
+            orient_exterior(&mut px, &mut py, n);
+            self.seen_ids.insert(id);
+            self.features.push(MvtFeature {
+                id,
+                properties: properties.into(),
+                polygon_x: px,
+                polygon_y: py,
+                num_points: n as u8,
+                wrapped_x_offset: 0,
+            });
+            return;
         }
+
+        for (i, v) in vertices.iter().take(count).enumerate() {
+            (px[i], py[i]) = (to_px(ulng[i]), to_py(v.lat()));
+        }
+        orient_exterior(&mut px, &mut py, count);
 
         // A world tile needs the ring on both sides of the dateline, just as
         // in MvtFeature::from_mercator. Smaller tiles use only their own branch.
