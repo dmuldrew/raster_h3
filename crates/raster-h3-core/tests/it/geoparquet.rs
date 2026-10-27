@@ -685,3 +685,54 @@ fn geoparquet_bbox_spans_split_antimeridian_cells() {
         && y >= bbox[1] - 1e-9
         && y <= bbox[3] + 1e-9));
 }
+
+/// Every leaf must carry the type-defined column order. parquet-rs 60 writes
+/// `IEEE_754_TOTAL_ORDER` for FLOAT/DOUBLE leaves instead, which Polars' native reader rejects
+/// ("Invalid thrift: bad data") and PyArrow answers by ignoring those columns' min/max.
+#[test]
+fn test_parquet_column_orders_readable_by_polars() {
+    use parquet::basic::{ColumnOrder, Type};
+
+    let tiff_file = create_test_geotiff(40, 40);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+    let config = MultiResolutionConfig::new(vec![9]);
+
+    for geoparquet in [false, true] {
+        let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+        let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+        let streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        let parquet_config = ParquetExportConfig {
+            geoparquet,
+            ..Default::default()
+        };
+        H3ParquetWriter::write_continuous_streamer_to_parquet(
+            streamer,
+            &parquet_file,
+            parquet_config,
+        )
+        .unwrap();
+
+        let reader = SerializedFileReader::new(File::open(&parquet_file).unwrap()).unwrap();
+        let meta = reader.metadata();
+        let schema = meta.file_metadata().schema_descr();
+        let orders = meta
+            .file_metadata()
+            .column_orders()
+            .expect("column orders are written");
+        assert_eq!(orders.len(), schema.num_columns());
+        for (col, order) in schema.columns().iter().zip(orders) {
+            assert!(
+                matches!(order, ColumnOrder::TYPE_DEFINED_ORDER(_)),
+                "{} (geoparquet={geoparquet}) has column order {order:?}",
+                col.name()
+            );
+        }
+        let double = schema
+            .columns()
+            .iter()
+            .position(|c| c.physical_type() == Type::DOUBLE)
+            .expect("schema has a DOUBLE column");
+        let stats = meta.row_group(0).column(double).statistics().unwrap();
+        assert!(stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some());
+    }
+}

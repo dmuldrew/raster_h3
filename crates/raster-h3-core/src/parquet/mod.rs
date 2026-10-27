@@ -1,5 +1,6 @@
 //! Native Parquet and OGC GeoParquet 1.1 streaming export module.
 
+pub mod column_order;
 pub mod geoparquet_metadata;
 pub mod pipeline;
 pub mod writer;
