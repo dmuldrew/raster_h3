@@ -23,6 +23,13 @@ support horizontal shear and profiling builds; Albers inverse constants are prep
 under an immutable borrow to avoid stale state after public source-field updates.
 See the [core engine notes](docs/engines/core.md) for projection behavior.
 
+Streamer `metrics()` exposes `StreamProfile::waves` (kernel dispatches),
+`bridged_waves` (helper-thread dispatches from an external Rayon worker to a
+dedicated pool), and `serial_waves` (dispatches run on the calling Rayon worker).
+These counters are available without `stream-profile`; that feature adds per-sample
+instrumentation. See [profiling and wave dispatch](docs/engines/core.md#profiling-and-wave-dispatch)
+for the execution policy and hotspot harness.
+
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
 | **H3 table / Arrow stream** | SQL analytics, JOINs, DataFrames | DuckDB, Python/Polars, PostgreSQL, DataFusion, CLI (NDJSON / `RH3IPC01`) |
@@ -521,6 +528,23 @@ This prevents silent spatial corruption — meter-based coordinates treated as d
 | DataFusion | `ContinuousRasterTableProvider::try_new("grid.tif", vec![8])?.with_crs("EPSG:32610")` |
 
 For supported projection families, see [Supported CRS](docs/crs-and-projection.md). Helmert datum shifts (`+towgs84`, and built-in national grids such as `EPSG:27700` and `EPSG:28992`) are applied; grid-based shifts such as NAD27 are rejected (see [Datum Shifts](docs/crs-and-projection.md#datum-shifts)). To convert your dataset into zero-trig native WGS84 for maximum throughput, see [Optimal Raster Format & Ingestion Speed](docs/optimal-raster-format.md).
+
+### Scaled Values (GDAL Scale/Offset) and Alpha
+
+Bands that carry GDAL `SCALE`/`OFFSET` metadata (packed reflectance, temperatures) are
+aggregated as physical values, `stored * scale + offset`, including quantiles and spectral
+indices. NoData is matched on the stored value, categorical classes are never scaled, and
+pixels whose TIFF alpha sample is `0` are excluded. Invalid scale/offset metadata (including
+a zero or non-finite scale) is rejected when the file is opened, even in raw-value mode.
+To aggregate stored values from files with valid metadata instead:
+
+| Engine | Opt-out |
+| :--- | :--- |
+| DuckDB | `h3_raster_continuous_aggregate('lst.tif', resolution := 8, scale_offset := false)` |
+| CLI | `raster-h3-cli jsonl lst.tif -r 8 --raw-values` |
+| DataFusion | `ContinuousRasterTableProvider::try_new("lst.tif", vec![8])?.with_scale_offset(false)` |
+
+Python and PostgreSQL always calibrate. See [Band calibration and validity](docs/api-reference.md#band-calibration-and-validity).
 
 ### Antimeridian Crossing
 

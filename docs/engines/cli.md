@@ -34,6 +34,7 @@ raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
 | `--format <wide\|long>` | `ipc`, `jsonl` | Categorical layout (default `wide`) |
 | `--crs <CRS>` (alias `--source-crs`) | all | Source CRS override, e.g. `EPSG:4326` |
 | `--nodata <FLOAT>` | all | NoData override |
+| `--raw-values` | all | Aggregate stored values without GDAL band scale/offset calibration |
 | `--bbox <min_lon,min_lat,max_lon,max_lat>` | all | WGS84 bounding box |
 | `--columns <c1,c2,…>` | `ipc`, `jsonl` | Column projection, in the given order |
 | `--limit <N>` | `ipc`, `jsonl` | Maximum rows |
@@ -200,7 +201,7 @@ The binary is a thin wrapper over [`src/lib.rs`](../../crates/raster-h3-cli/src/
 | Item | Purpose |
 | :--- | :--- |
 | `parse_stream_args(args, default_format)` | Parse arguments into `CliStreamOptions` and an optional output path |
-| `CliStreamOptions` | `input_path`, `resolutions`, `categorical`, `categorical_format`, `source_crs`, `nodata`, `bbox`, `columns`, `batch_size` (2048), `limit`, `output_format` |
+| `CliStreamOptions` | `input_path`, `resolutions`, `categorical`, `categorical_format`, `source_crs`, `nodata`, `apply_scale_offset` (true), `bbox`, `columns`, `batch_size` (2048), `limit`, `output_format` |
 | `stream_raster_to_writer(&opts, &mut impl Write)` | Stream IPC or JSONL to any writer; returns rows written |
 | `export_raster_to_parquet(...)`, `export_raster_to_pmtiles(...)` | File exports |
 

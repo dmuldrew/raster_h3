@@ -9,9 +9,10 @@
 //!    handed over through a freshly spawned OS thread. This measures how many
 //!    waves take that path and what it costs relative to a direct call.
 //!
-//! Allocation counts and peak live bytes come from a counting global
-//! allocator, so they are deterministic for a given input; wall times are
-//! medians of several runs and depend on the machine.
+//! Allocation counts and approximate peak extra live bytes come from a counting
+//! global allocator (not RSS). Concurrent scheduling can change these numbers;
+//! wall times are medians of several runs and depend on the machine. Full-stream
+//! comparisons do not isolate the cost of a helper-thread hand-off.
 //!
 //! ```text
 //! cargo run --release -p raster-h3-core --example profile_hotspots -- [--quick] [--json out.json]
@@ -79,9 +80,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        on_dealloc(layout.size());
         // SAFETY: `ptr` was allocated by this allocator (hence `System`) with `layout`.
         unsafe { System.dealloc(ptr, layout) };
-        on_dealloc(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -99,7 +100,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// Wall time, allocations and peak extra live bytes for one closure call.
+/// Wall time, allocations and approximate peak extra live bytes for one closure call.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
     ms: f64,
@@ -128,7 +129,7 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, Sample) {
     (out, sample)
 }
 
-/// Run `f` `reps` times; return the last output and the run with the median wall time.
+/// Run `f` `reps` times; return the output and measurements of the median wall-time run.
 fn median_of<T>(reps: usize, mut f: impl FnMut() -> T) -> (T, Sample) {
     let mut runs: Vec<(T, Sample)> = (0..reps.max(1)).map(|_| measure(&mut f)).collect();
     runs.sort_by(|a, b| a.1.ms.total_cmp(&b.1.ms));
@@ -149,6 +150,7 @@ struct Grid {
     _dir: tempfile::TempDir,
     paths: Vec<PathBuf>,
     n_side: usize,
+    tile_px: u32,
     stride_deg: f64,
 }
 
@@ -177,14 +179,28 @@ impl Grid {
             _dir: dir,
             paths,
             n_side,
+            tile_px,
             stride_deg,
         }
     }
 
-    /// Index of a tile whose footprint contains `(lon, lat)`.
-    fn tile_at(&self, lon: f64, lat: f64) -> usize {
-        let cell = |d: f64| ((d / self.stride_deg).floor().max(0.0) as usize).min(self.n_side - 1);
-        cell(ORIGIN.1 - lat) * self.n_side + cell(lon - ORIGIN.0)
+    /// Sample each tile equally at pixel centres across its entire footprint.
+    fn ownership_points(&self, count: usize) -> Vec<(usize, f64, f64)> {
+        let mut rng = Rng(0x5EED);
+        (0..count)
+            .map(|i| {
+                let tile = i % self.paths.len();
+                let col = (rng.next_f64() * f64::from(self.tile_px)).floor();
+                let row = (rng.next_f64() * f64::from(self.tile_px)).floor();
+                let lon = ORIGIN.0
+                    + (tile % self.n_side) as f64 * self.stride_deg
+                    + (col + 0.5) * PIXEL_DEG;
+                let lat = ORIGIN.1
+                    - (tile / self.n_side) as f64 * self.stride_deg
+                    - (row + 0.5) * PIXEL_DEG;
+                (tile, lon, lat)
+            })
+            .collect()
     }
 }
 
@@ -222,7 +238,7 @@ fn mosaic_scaling(sides: &[usize], reps: usize, report: &mut Report) {
     const POINTS: usize = 200_000;
 
     let mut table = String::from(
-        "| tiles | chunks | overlap chunks | open files ms | open + plan ms | plan ms (est.) | plan allocs | Cutline ns/owner call | First ns/owner call |\n\
+        "| tiles | chunks | overlap chunks | open files ms | open + plan ms | plan ms (est.) | open + plan allocs | Cutline ns/owner call | First ns/owner call |\n\
          |---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     let mut rows = Vec::new();
@@ -245,16 +261,8 @@ fn mosaic_scaling(sides: &[usize], reps: usize, report: &mut Report) {
         let chunks = plan.chunk_refs.len();
         let overlaps = plan.chunk_refs.iter().filter(|c| c.has_overlap).count();
 
+        let points = grid.ownership_points(POINTS);
         let owner_ns = |mosaic: &MosaicReader| -> f64 {
-            let [min_lon, min_lat, max_lon, max_lat] = mosaic.mosaic_bounds_wgs84;
-            let mut rng = Rng(0x5EED);
-            let points: Vec<(usize, f64, f64)> = (0..POINTS)
-                .map(|_| {
-                    let lon = min_lon + rng.next_f64() * (max_lon - min_lon);
-                    let lat = min_lat + rng.next_f64() * (max_lat - min_lat);
-                    (grid.tile_at(lon, lat), lon, lat)
-                })
-                .collect();
             let start = Instant::now();
             let owned = std::hint::black_box(
                 points
@@ -282,14 +290,14 @@ fn mosaic_scaling(sides: &[usize], reps: usize, report: &mut Report) {
         rows.push(json!({
             "tiles": tiles, "chunks": chunks, "overlap_chunks": overlaps,
             "open_files_ms": files.ms, "open_and_plan_ms": opened.ms, "plan_ms_est": plan_ms,
-            "open_allocs": opened.allocs, "open_peak_mib": opened.peak_mib,
+            "open_and_plan_allocs": opened.allocs, "open_and_plan_peak_mib": opened.peak_mib,
             "cutline_owner_ns": cutline_ns, "first_owner_ns": first_ns,
         }));
     }
     report.section(
         "Mosaic planning and ownership scaling",
         &format!(
-            "{TILE_PX}×{TILE_PX} px tiles overlapping by {OVERLAP_PX} px. `plan ms (est.)` = mosaic open minus opening the files alone. Owner calls are `is_point_owned_by` at {POINTS} uniform points, each against a tile containing it."
+            "{TILE_PX}×{TILE_PX} px tiles overlapping by {OVERLAP_PX} px. `plan ms (est.)` = mosaic open minus opening the files alone; allocations include both opening and planning. Owner calls are `is_point_owned_by` at {POINTS} pixel centres sampled equally from every tile's full footprint, including non-overlap samples. Overlapping pixels can be sampled from either tile. Peak bytes are approximate, scheduling-dependent allocator accounting, not RSS."
         ),
         table,
         json!(rows),
@@ -368,7 +376,7 @@ fn rayon_nesting(side_px: u32, budgets_kib: &[usize], reps: usize, report: &mut 
         .build()
         .expect("outer pool");
 
-    // Baseline: cost of the helper-thread hand-off itself.
+    // Isolated spawn + join baseline, not the cost of dispatching a real wave.
     let spawns = 2000;
     let (_, spawn) = measure(|| {
         for _ in 0..spawns {
@@ -378,12 +386,11 @@ fn rayon_nesting(side_px: u32, budgets_kib: &[usize], reps: usize, report: &mut 
     let spawn_us = spawn.ms * 1e3 / f64::from(spawns);
 
     let mut table = String::from(
-        "| budget KiB | caller | pool | wall ms | waves | bridged | serial | jobs | kernel ms | allocs | Δ vs direct µs/bridged wave |\n\
-         |---:|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "| budget KiB | caller | pool | wall ms | waves | bridged | serial | jobs | kernel ms | allocs |\n\
+         |---:|:---|:---|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     let mut rows = Vec::new();
     for &budget_kib in budgets_kib {
-        let mut direct_ms = None;
         for (caller, nested, dedicated) in [
             ("main thread", false, true),
             ("Rayon worker", true, true),
@@ -422,23 +429,14 @@ fn rayon_nesting(side_px: u32, budgets_kib: &[usize], reps: usize, report: &mut 
                 Err(e) => {
                     let _ = writeln!(
                         table,
-                        "| {budget_kib} | {caller} | {pool} | error: {e} |||||||||"
+                        "| {budget_kib} | {caller} | {pool} | error: {e} |||||||"
                     );
                     continue;
                 }
             };
-            if dedicated && !nested {
-                direct_ms = Some(s.ms);
-            }
-            let delta = match (dedicated && nested, direct_ms) {
-                (true, Some(d)) if bridged > 0 => {
-                    format!("{:.1}", (s.ms - d) * 1e3 / bridged as f64)
-                }
-                _ => "–".into(),
-            };
             let _ = writeln!(
                 table,
-                "| {budget_kib} | {caller} | {pool} | {:.1} | {waves} | {bridged} | {serial} | {jobs} | {:.1} | {} | {delta} |",
+                "| {budget_kib} | {caller} | {pool} | {:.1} | {waves} | {bridged} | {serial} | {jobs} | {:.1} | {} |",
                 s.ms,
                 kernel_ns as f64 / 1e6,
                 s.allocs
@@ -453,7 +451,7 @@ fn rayon_nesting(side_px: u32, budgets_kib: &[usize], reps: usize, report: &mut 
     report.section(
         "Nested Rayon wave dispatch",
         &format!(
-            "{side_px}×{side_px} px raster, resolution 9, {WORKERS} aggregation workers when dedicated, called directly or from a {WORKERS}-thread outer Rayon pool. Smaller budgets mean smaller windows and more waves. Bare `thread::scope` spawn + join on this machine: {spawn_us:.1} µs. `ambient` from a Rayon worker runs every wave serially."
+            "{side_px}×{side_px} px raster, resolution 9, {WORKERS} aggregation workers when dedicated, called directly or from a {WORKERS}-thread outer Rayon pool. Smaller budgets mean smaller windows and more waves. Bare `thread::scope` spawn + join on this machine: {spawn_us:.1} µs (isolated baseline only). Full-stream wall-time differences include opening, decoding and scheduling, not just hand-off overhead. `ambient` from a Rayon worker runs every wave serially."
         ),
         table,
         json!({ "spawn_join_us": spawn_us, "runs": rows }),
@@ -529,4 +527,44 @@ fn main() {
     mosaic_streaming(stream_sides, reps, &mut report);
     rayon_nesting(rayon_px, budgets, reps.max(3), &mut report);
     report.finish(json_path.as_deref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn ownership_samples_cover_both_tiles_in_overlaps() {
+        let grid = Grid::write(2, 4, 2);
+        let points = grid.ownership_points(4096);
+        let mut per_tile = [0; 4];
+        let mut pixels = BTreeMap::<(i32, i32), BTreeSet<usize>>::new();
+        for &(tile, lon, lat) in &points {
+            per_tile[tile] += 1;
+            let col = ((lon - ORIGIN.0) / PIXEL_DEG).floor() as i32;
+            let row = ((ORIGIN.1 - lat) / PIXEL_DEG).floor() as i32;
+            let tile_col = (tile % 2) as i32 * 2;
+            let tile_row = (tile / 2) as i32 * 2;
+            assert!((tile_col..tile_col + 4).contains(&col));
+            assert!((tile_row..tile_row + 4).contains(&row));
+            pixels.entry((col, row)).or_default().insert(tile);
+        }
+        assert_eq!(per_tile, [1024; 4]);
+        assert_eq!(pixels.len(), 36);
+        assert_eq!(pixels[&(2, 0)], BTreeSet::from([0, 1]));
+        assert_eq!(pixels[&(0, 2)], BTreeSet::from([0, 2]));
+        assert_eq!(pixels[&(2, 2)], BTreeSet::from([0, 1, 2, 3]));
+
+        let first = MosaicReader::open(&grid.paths, None, None, OverlapRule::First).unwrap();
+        let lon = ORIGIN.0 + 2.5 * PIXEL_DEG;
+        let lat = ORIGIN.1 - 0.5 * PIXEL_DEG;
+        for tile in [0, 1] {
+            assert!(points.iter().any(|&(t, x, y)| {
+                t == tile && (x - lon).abs() < 1e-10 && (y - lat).abs() < 1e-10
+            }));
+        }
+        assert!(first.is_point_owned_by(0, lon, lat));
+        assert!(!first.is_point_owned_by(1, lon, lat));
+    }
 }

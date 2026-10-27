@@ -7,7 +7,8 @@ use crate::aggregator::nodata::PixelValidity;
 use crate::aggregator::remap::CategoryRemapper;
 
 use super::walker::{
-    is_slice_all_native_nodata, walk_direct, walk_interleaved, ScanlineEngine, WalkContext,
+    is_slice_all_native_nodata, is_transparent, walk_direct, walk_interleaved, ScanlineEngine,
+    WalkContext,
 };
 /// Categorical record yielded by the multi-resolution categorical streamer
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +104,7 @@ impl CategoricalLongCursor {
 }
 
 /// Process a single typed chunk slice for categorical landcover aggregation across resolutions
-fn process_categorical_slice_into_maps<T: CategoricalUniformity>(
+fn process_categorical_slice_into_maps<T: CategoricalUniformity + Default>(
     ctx: &WalkContext<'_>,
     slice: &[T],
     native_nodata: Option<T>,
@@ -126,7 +127,13 @@ fn process_categorical_slice_into_maps<T: CategoricalUniformity>(
         walk_interleaved(
             ctx,
             slice,
-            |px| engine.get_sample(px[b]),
+            |px| {
+                if is_transparent(ctx, px) {
+                    None
+                } else {
+                    engine.get_sample(px[b])
+                }
+            },
             &engine,
             chunk_maps,
         );

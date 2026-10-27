@@ -15,7 +15,10 @@ use tiff::tags::{CompressionMethod, PhotometricInterpretation, Predictor, Sample
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::http_range::{is_remote_url, HttpRangeReader, RemoteHttpSource};
-use crate::raster::metadata::{extract_crs, extract_geotransform, extract_nodata};
+use crate::raster::metadata::{
+    extract_alpha_sample, extract_band_scaling, extract_crs, extract_geotransform, extract_nodata,
+    BandScaling,
+};
 use crate::raster::predictor::{unpack_f32, unpack_f64, unpack_integer_samples, ChunkEncoding};
 use crate::raster::RasterChunk;
 
@@ -45,6 +48,23 @@ pub struct GeoTiffMetadata {
     pub proj_string: Option<String>,
     /// Number of bands or samples per pixel.
     pub samples_per_pixel: u16,
+    /// Per-band GDAL `SCALE`/`OFFSET` calibration, indexed by zero-based
+    /// band; empty when no band is calibrated.
+    pub band_scaling: Vec<BandScaling>,
+    /// Zero-based alpha sample (TIFF `ExtraSamples`); a pixel whose alpha
+    /// is zero is transparent and has no observation.
+    pub alpha_sample: Option<u16>,
+}
+
+impl GeoTiffMetadata {
+    /// Calibration for the 1-based `band`, or identity when uncalibrated.
+    #[inline]
+    pub fn band_scaling(&self, band: usize) -> BandScaling {
+        self.band_scaling
+            .get(band.saturating_sub(1))
+            .copied()
+            .unwrap_or(BandScaling::IDENTITY)
+    }
 }
 
 /// Chunk layout information (tiled vs striped)
@@ -874,6 +894,8 @@ impl GeoTiffStreamReader {
             .or_else(|_| decoder.get_tag_u32(Tag::Unknown(277)))
             .map(|v| v as u16)
             .unwrap_or(1);
+        let band_scaling = extract_band_scaling(decoder, samples_per_pixel)?;
+        let alpha_sample = extract_alpha_sample(decoder, samples_per_pixel);
 
         let (chunk_w, chunk_h) = decoder.chunk_dimensions();
         let chunks_across = width.div_ceil(chunk_w);
@@ -896,6 +918,8 @@ impl GeoTiffStreamReader {
             epsg,
             proj_string,
             samples_per_pixel,
+            band_scaling,
+            alpha_sample,
         };
 
         let compression = match decoder.get_tag_u32(Tag::Compression) {
