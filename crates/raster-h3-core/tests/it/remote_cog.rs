@@ -590,6 +590,27 @@ impl RemoteStrips {
         RemoteChunkPrefetchQueue::spawn_single(&self.reader, &indices, Some(config)).unwrap()
     }
 
+    fn take_with_timeout(&self, queue: &Arc<RemoteChunkPrefetchQueue>, chunk_idx: u32) {
+        let worker_queue = Arc::clone(queue);
+        let (tx, rx) = mpsc::channel();
+        let consumer = thread::spawn(move || {
+            let result = worker_queue
+                .get_chunk_payload(0, chunk_idx)
+                .map(|payload| payload.map(|bytes| bytes.to_vec()));
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            queue.cancel();
+        }
+        consumer.join().unwrap();
+        assert_eq!(
+            result.expect("requested chunk stalled").unwrap().as_deref(),
+            Some(self.expected(chunk_idx as usize)),
+            "chunk {chunk_idx}"
+        );
+    }
+
     /// Take every chunk in order, checking bytes and holding each for `hold`.
     fn consume(&self, queue: &RemoteChunkPrefetchQueue, hold: Duration) {
         for i in 0..self.chunks().0.len() {
@@ -598,6 +619,199 @@ impl RemoteStrips {
             thread::sleep(hold);
         }
     }
+}
+
+#[test]
+fn prefetch_out_of_order_requests_refetch_evicted_ranges() {
+    for workers in [1, 4] {
+        for oversized in [false, true] {
+            let fixture = RemoteStrips::new();
+            let (offsets, lens) = fixture.chunks();
+            let strip = lens[0];
+            let queue = Arc::new(
+                RemoteChunkPrefetchQueue::spawn_single(
+                    &fixture.reader,
+                    &[0, 63],
+                    Some(RemotePrefetchConfig {
+                        num_workers: workers,
+                        max_range_bytes: 1,
+                        max_buffered_bytes: if oversized { 0 } else { strip },
+                        ..Default::default()
+                    }),
+                )
+                .unwrap(),
+            );
+            fixture.server.gate.wait_for_requests(1);
+            fixture.take_with_timeout(&queue, 63);
+            fixture.take_with_timeout(&queue, 0);
+            assert_eq!(queue.peak_held_bytes(), strip);
+            assert_eq!(queue.held_bytes(), 0);
+            let requests = fixture.requests();
+            assert_eq!(requests[&(offsets[0] as usize)], 2);
+            assert_eq!(requests[&(offsets[63] as usize)], 1);
+        }
+    }
+}
+
+#[test]
+fn prefetch_out_of_order_coalesced_siblings_remain_available() {
+    let fixture = RemoteStrips::new();
+    let (_, lens) = fixture.chunks();
+    let budget = lens[0] * 2;
+    let queue = Arc::new(
+        RemoteChunkPrefetchQueue::spawn_single(
+            &fixture.reader,
+            &[0, 1, 2, 3],
+            Some(RemotePrefetchConfig {
+                num_workers: 4,
+                max_range_bytes: budget,
+                max_buffered_bytes: budget,
+                ..Default::default()
+            }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(queue.total_jobs(), 2);
+    for chunk in [0, 3, 1, 2] {
+        fixture.take_with_timeout(&queue, chunk);
+    }
+    assert_eq!(
+        queue.held_bytes(),
+        0,
+        "consumed siblings must not be republished"
+    );
+    assert!(queue.peak_held_bytes() <= budget);
+    assert!(queue.get_chunk_payload(0, 0).unwrap().is_none());
+    assert!(queue.try_get_chunk_payload(0, 3).is_none());
+}
+
+#[test]
+fn prefetch_concurrent_reverse_requests_stay_within_budget() {
+    let fixture = RemoteStrips::new();
+    let strip = fixture.chunks().1[0];
+    let queue = Arc::new(fixture.spawn(RemotePrefetchConfig {
+        num_workers: 4,
+        max_range_bytes: 1,
+        max_buffered_bytes: strip,
+        ..Default::default()
+    }));
+    fixture.server.gate.wait_for_requests(1);
+    let (tx, rx) = mpsc::channel();
+    let consumers: Vec<_> = (0..64)
+        .rev()
+        .map(|chunk| {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result = queue
+                    .get_chunk_payload(0, chunk)
+                    .map(|payload| payload.map(|bytes| bytes.to_vec()));
+                let _ = tx.send((chunk, result));
+            })
+        })
+        .collect();
+    drop(tx);
+    let mut received = Vec::new();
+    for _ in 0..64 {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(item) => received.push(item),
+            Err(_) => break,
+        }
+    }
+    queue.cancel();
+    for consumer in consumers {
+        consumer.join().unwrap();
+    }
+    assert_eq!(received.len(), 64, "concurrent requests stalled");
+    for (chunk, result) in received {
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some(fixture.expected(chunk as usize))
+        );
+    }
+    assert_eq!(queue.held_bytes(), 0);
+    assert_eq!(queue.peak_held_bytes(), strip);
+}
+
+#[test]
+fn prefetch_out_of_order_requests_bypass_full_chunk_capacity() {
+    let fixture = RemoteStrips::new();
+    let budget = fixture.chunks().1.iter().sum();
+    let queue = Arc::new(fixture.spawn(RemotePrefetchConfig {
+        num_workers: 1,
+        max_range_bytes: 1,
+        max_buffered_bytes: budget,
+        queue_capacity: 16,
+        ..Default::default()
+    }));
+    fixture.server.gate.wait_for_requests(16);
+    fixture.take_with_timeout(&queue, 63);
+    fixture.take_with_timeout(&queue, 0);
+    assert!(queue.peak_held_bytes() <= budget);
+}
+
+#[test]
+fn prefetch_caller_clones_retain_budget_until_dropped() {
+    let fixture = RemoteStrips::new();
+    let strip = fixture.chunks().1[0];
+    let queue = Arc::new(
+        RemoteChunkPrefetchQueue::spawn_single(
+            &fixture.reader,
+            &[0, 1],
+            Some(RemotePrefetchConfig {
+                num_workers: 2,
+                max_range_bytes: 1,
+                max_buffered_bytes: strip,
+                ..Default::default()
+            }),
+        )
+        .unwrap(),
+    );
+    let payload = queue.get_chunk_payload(0, 0).unwrap().unwrap();
+    let clone = payload.clone();
+    drop(payload);
+    let worker_queue = Arc::clone(&queue);
+    let (tx, rx) = mpsc::channel();
+    let consumer = thread::spawn(move || {
+        let result = worker_queue
+            .get_chunk_payload(0, 1)
+            .map(|payload| payload.map(|bytes| bytes.to_vec()));
+        let _ = tx.send(result);
+    });
+    let early = rx.recv_timeout(Duration::from_millis(100));
+    let held = queue.held_bytes();
+    drop(clone);
+    let waited = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+    let result = if waited {
+        rx.recv_timeout(Duration::from_secs(10))
+    } else {
+        early
+    };
+    if result.is_err() {
+        queue.cancel();
+    }
+    consumer.join().unwrap();
+    assert!(
+        waited,
+        "caller-held bytes must not be evicted or bypass the budget"
+    );
+    assert_eq!(held, strip);
+    assert_eq!(
+        result.unwrap().unwrap().as_deref(),
+        Some(fixture.expected(1))
+    );
+    assert_eq!(queue.peak_held_bytes(), strip);
+    assert_eq!(queue.held_bytes(), 0);
+}
+
+#[test]
+fn prefetch_payload_remains_valid_after_queue_drop() {
+    let fixture = RemoteStrips::new();
+    let queue = RemoteChunkPrefetchQueue::spawn_single(&fixture.reader, &[0], None).unwrap();
+    let payload = queue.get_chunk_payload(0, 0).unwrap().unwrap();
+    drop(queue);
+    assert_eq!(&payload[..], fixture.expected(0));
+    assert_eq!(payload.response_len(), payload.len());
 }
 
 #[test]
