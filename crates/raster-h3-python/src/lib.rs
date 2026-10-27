@@ -894,10 +894,45 @@ pub unsafe extern "C" fn raster_h3_py_free_cells(cells: *mut u64, len: usize) {
 
 /// C-ABI direct Parquet exporter (`h3_raster_to_parquet`). Returns number of hexagons written, or `-1` on error.
 ///
+/// Kept with its original signature for callers built against earlier releases; see
+/// [`raster_h3_py_export_parquet_with_stats`] for the transform-failure count.
+///
 /// # Safety
 /// Pointer arguments must be valid NUL-terminated C strings or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_py_export_parquet(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    crs: *const c_char,
+    geoparquet: c_int,
+    out_err: *mut *mut c_char,
+) -> i64 {
+    // SAFETY: forwards the caller's arguments unchanged (same contract), with a null
+    // `out_transform_failures`, which the callee accepts.
+    unsafe {
+        raster_h3_py_export_parquet_with_stats(
+            input_path,
+            output_path,
+            resolutions,
+            categorical,
+            crs,
+            geoparquet,
+            ptr::null_mut(),
+            out_err,
+        )
+    }
+}
+
+/// [`raster_h3_py_export_parquet`] that also writes the number of valid sample points
+/// dropped by failed coordinate transforms to `out_transform_failures` (when non-null).
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL;
+/// `out_transform_failures` must be NULL or point to a writable `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_export_parquet_with_stats(
     input_path: *const c_char,
     output_path: *const c_char,
     resolutions: *const c_char,
@@ -976,10 +1011,43 @@ pub unsafe extern "C" fn raster_h3_py_export_parquet(
 
 /// C-ABI direct PMTiles v3 exporter (`h3_raster_to_pmtiles`). Returns number of hexagons written, or `-1` on error.
 ///
+/// Kept with its original signature for callers built against earlier releases; see
+/// [`raster_h3_py_export_pmtiles_with_stats`] for the transform-failure count.
+///
 /// # Safety
 /// Pointer arguments must be valid NUL-terminated C strings or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn raster_h3_py_export_pmtiles(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    crs: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i64 {
+    // SAFETY: forwards the caller's arguments unchanged (same contract), with a null
+    // `out_transform_failures`, which the callee accepts.
+    unsafe {
+        raster_h3_py_export_pmtiles_with_stats(
+            input_path,
+            output_path,
+            resolutions,
+            categorical,
+            crs,
+            ptr::null_mut(),
+            out_err,
+        )
+    }
+}
+
+/// [`raster_h3_py_export_pmtiles`] that also writes the number of valid sample points
+/// dropped by failed coordinate transforms to `out_transform_failures` (when non-null).
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL;
+/// `out_transform_failures` must be NULL or point to a writable `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_export_pmtiles_with_stats(
     input_path: *const c_char,
     output_path: *const c_char,
     resolutions: *const c_char,

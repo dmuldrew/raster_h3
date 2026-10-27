@@ -187,29 +187,36 @@ def _get_lib() -> ctypes.CDLL:
     lib.raster_h3_py_free_cells.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
     lib.raster_h3_py_free_cells.restype = None
 
-    # Exporters
-    lib.raster_h3_py_export_parquet.argtypes = [
+    # Exporters. The `_with_stats` variants (newer libraries) also report the
+    # transform-failure count; the original symbols keep their signatures.
+    parquet_args = [
         ctypes.c_char_p,
         ctypes.c_char_p,
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_int,
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.POINTER(ctypes.c_void_p),
     ]
-    lib.raster_h3_py_export_parquet.restype = ctypes.c_int64
-
-    lib.raster_h3_py_export_pmtiles.argtypes = [
+    pmtiles_args = [
         ctypes.c_char_p,
         ctypes.c_char_p,
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.POINTER(ctypes.c_void_p),
     ]
-    lib.raster_h3_py_export_pmtiles.restype = ctypes.c_int64
+    err_arg = [ctypes.POINTER(ctypes.c_void_p)]
+    stats_args = [ctypes.POINTER(ctypes.c_uint64)] + err_arg
+    for name, args in (
+        ("raster_h3_py_export_parquet", parquet_args),
+        ("raster_h3_py_export_pmtiles", pmtiles_args),
+    ):
+        fn = getattr(lib, name)
+        fn.argtypes = args + err_arg
+        fn.restype = ctypes.c_int64
+        if hasattr(lib, name + "_with_stats"):
+            fn = getattr(lib, name + "_with_stats")
+            fn.argtypes = args + stats_args
+            fn.restype = ctypes.c_int64
 
     _LIB = lib
     return lib
@@ -752,6 +759,23 @@ def h3_polygon_to_cells(
     return None
 
 
+def _run_export(name: str, args: Tuple[Any, ...]) -> int:
+    """Call a native exporter, preferring its `_with_stats` variant when available."""
+    lib = _get_lib()
+    err = ctypes.c_void_p(0)
+    if hasattr(lib, name + "_with_stats"):
+        failures = ctypes.c_uint64(0)
+        count = getattr(lib, name + "_with_stats")(
+            *args, ctypes.byref(failures), ctypes.byref(err)
+        )
+        _raise_if_err(err)
+        _warn_transform_failures(failures.value)
+    else:
+        count = getattr(lib, name)(*args, ctypes.byref(err))
+        _raise_if_err(err)
+    return int(count)
+
+
 def _warn_transform_failures(failures: int) -> None:
     """Warn when valid samples were dropped by failed coordinate transforms."""
     if failures:
@@ -759,7 +783,7 @@ def _warn_transform_failures(failures: int) -> None:
             f"raster_h3: {failures} valid sample(s) were dropped because their coordinate "
             "transform failed or fell outside the valid latitude/longitude range; check crs",
             RuntimeWarning,
-            stacklevel=3,
+            stacklevel=4,
         )
 
 
@@ -772,22 +796,15 @@ def raster_to_parquet(
     crs: Optional[str] = None,
     geoparquet: bool = True,
 ) -> int:
-    lib = _get_lib()
-    err = ctypes.c_void_p(0)
-    failures = ctypes.c_uint64(0)
-    count = lib.raster_h3_py_export_parquet(
+    args = (
         str(input_path).encode("utf-8"),
         str(output_path).encode("utf-8"),
         _encode_resolutions(resolutions),
         1 if categorical else 0,
         crs.encode("utf-8") if crs else None,
         1 if geoparquet else 0,
-        ctypes.byref(failures),
-        ctypes.byref(err),
     )
-    _raise_if_err(err)
-    _warn_transform_failures(failures.value)
-    return int(count)
+    return _run_export("raster_h3_py_export_parquet", args)
 
 
 def raster_to_pmtiles(
@@ -798,21 +815,14 @@ def raster_to_pmtiles(
     categorical: bool = False,
     crs: Optional[str] = None,
 ) -> int:
-    lib = _get_lib()
-    err = ctypes.c_void_p(0)
-    failures = ctypes.c_uint64(0)
-    count = lib.raster_h3_py_export_pmtiles(
+    args = (
         str(input_path).encode("utf-8"),
         str(output_path).encode("utf-8"),
         _encode_resolutions(resolutions),
         1 if categorical else 0,
         crs.encode("utf-8") if crs else None,
-        ctypes.byref(failures),
-        ctypes.byref(err),
     )
-    _raise_if_err(err)
-    _warn_transform_failures(failures.value)
-    return int(count)
+    return _run_export("raster_h3_py_export_pmtiles", args)
 
 
 __all__ = [

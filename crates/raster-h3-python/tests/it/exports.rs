@@ -7,7 +7,10 @@ use std::ptr;
 
 use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::pmtiles::H3PmtilesTiler;
-use raster_h3_python::{raster_h3_py_export_parquet, raster_h3_py_export_pmtiles};
+use raster_h3_python::{
+    raster_h3_py_export_parquet, raster_h3_py_export_parquet_with_stats,
+    raster_h3_py_export_pmtiles, raster_h3_py_export_pmtiles_with_stats,
+};
 
 use crate::c_abi::{classes_tif, core_rows, gradient_tif, take_err, Scan};
 
@@ -39,7 +42,6 @@ fn parquet(
             i32::from(categorical),
             ptr::null(),
             1,
-            ptr::null_mut(),
             &mut err,
         );
         let msg = take_err(err);
@@ -70,7 +72,6 @@ fn pmtiles(
             p(&r),
             i32::from(categorical),
             ptr::null(),
-            ptr::null_mut(),
             &mut err,
         );
         let msg = take_err(err);
@@ -145,7 +146,6 @@ fn export_error_paths_return_minus_one_with_a_message() {
             ptr::null(),
             0,
             ptr::null_mut(),
-            ptr::null_mut(),
         )
     };
     assert_eq!(n, -1);
@@ -158,7 +158,6 @@ fn export_error_paths_return_minus_one_with_a_message() {
             ptr::null(),
             0,
             ptr::null(),
-            ptr::null_mut(),
             ptr::null_mut(),
         )
     };
@@ -182,7 +181,7 @@ fn exports_report_transform_failures() {
         // `err` are writable out-pointers, and `take_err` frees any error string.
         let n = unsafe {
             if pm {
-                raster_h3_py_export_pmtiles(
+                raster_h3_py_export_pmtiles_with_stats(
                     p(&i),
                     p(&o),
                     p(&r),
@@ -192,7 +191,7 @@ fn exports_report_transform_failures() {
                     &mut err,
                 )
             } else {
-                raster_h3_py_export_parquet(
+                raster_h3_py_export_parquet_with_stats(
                     p(&i),
                     p(&o),
                     p(&r),
