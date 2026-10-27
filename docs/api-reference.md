@@ -44,7 +44,7 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold — cells below this are excluded from output. |
 | `min_mean` | `DOUBLE` | `None` | Minimum mean value filter — cells with mean below this are excluded. |
 | `max_mean` | `DOUBLE` | `None` | Maximum mean value filter — cells with mean above this are excluded. |
-| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with 125-byte OGC WKB 2D Polygon hexagons (enables DuckDB Spatial interop). |
+| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column of the cell geometries (enables DuckDB Spatial interop); see [cell geometry](#cell-geometry). |
 | `quantiles` | `VARCHAR` | `None` | Streaming quantile targets: percentiles such as `'p50,p90,p99.5'` or `'0.05'`, aliases `median`/`q1`/`q2`/`q3`/`iqr`, or presets `'default'`, `'box'` (p25, p50, p75, iqr), `'tails'`, `'deciles'`. Percentiles must be finite and strictly between 0 and 100 (decimals between 0 and 1). Adds one nullable column per target; per-cell sketches are only built when the query selects or filters on one of these columns. |
 | `percentiles` | `VARCHAR` | `None` | Alias for `quantiles`. |
 
@@ -60,7 +60,7 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `max` | `DOUBLE` | Maximum pixel value observed within the cell. |
 | `sum` | `DOUBLE` | Sum of all weighted pixel values in the cell. |
 | `resolution` | `UTINYINT` | H3 resolution level (0 to 15) of the cell. |
-| `wkb` | `BLOB` | 125-byte OGC standard 2D Polygon Well-Known Binary (WKB) representation. |
+| `wkb` | `BLOB` | OGC 2D Well-Known Binary (WKB) cell geometry; see [cell geometry](#cell-geometry). |
 | `geom` | `GEOMETRY` | Native DuckDB Spatial Polygon geometry (emitted when `geom := true`). |
 
 ---
@@ -75,6 +75,21 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | **`min`** | min(x_i) | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Evaluated via branchless hardware `minsd`/`fminnm` instructions with zero branch penalties. |
 | **`max`** | max(x_i) | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building height. | Evaluated via branchless hardware `maxsd`/`fmaxnm` instructions. |
 | **`sum`** | sum(w_i * x_i) | **Cumulative Physical Quantities**: Total precipitation volume, solar radiation flux, biomass carbon stock. | Used whenever raster pixel values represent density or rate per unit area that integrates across the hexagon. |
+
+### Cell geometry
+
+Every engine writes H3 cells (`wkb`, `geom`, `h3_to_wkb`, GeoParquet `geometry`) as OGC
+2D WKB in WGS84 longitude/latitude, valid for planar GIS tools:
+
+- Ordinary cells are a `Polygon` of H3's 5–10 vertices plus the closing point (125 bytes
+  for a hexagon, 109 for a pentagon, up to 189 at odd resolutions), counter-clockwise.
+- A cell crossing the antimeridian is a `MultiPolygon` of its eastern and western parts,
+  cut at ±180°. Longitudes always stay within [-180, 180].
+- The two cells containing a pole are polar-cap `Polygon`s: the cell ring unrolled from
+  -180° to 180° and closed along both meridians and ±90°.
+- Edges are straight lines in longitude/latitude, approximating H3's great-circle edges;
+  GeoParquet metadata declares `"edges": "planar"` and `geometry_types`
+  `["Polygon", "MultiPolygon"]`.
 
 ### Band calibration and validity
 
@@ -150,7 +165,7 @@ Every engine reads these from the GeoTIFF and applies them the same way:
 | `shannon_entropy` | `DOUBLE` | Shannon-Wiener entropy index ($-\sum p_i \ln p_i$), measuring landscape diversity. |
 | `entropy` | `DOUBLE` | Alias for `shannon_entropy`. |
 | `distinct_classes`| `BIGINT` | Number of distinct categories present in the hexagon (alias for `unique_classes`). |
-| `wkb` | `BLOB` | 125-byte OGC standard 2D Polygon Well-Known Binary (WKB) representation. |
+| `wkb` | `BLOB` | OGC 2D Well-Known Binary (WKB) cell geometry; see [cell geometry](#cell-geometry). |
 | `geom` | `GEOMETRY` | Native DuckDB Spatial Polygon geometry (emitted when `geom := true`). |
 
 ### Long Format Output Schema (`format := 'long'`)
@@ -167,7 +182,7 @@ Every engine reads these from the GeoTIFF and applies them the same way:
 | `entropy` | `DOUBLE` | Alias for `shannon_entropy`. |
 | `distinct_classes`| `BIGINT` | Number of distinct categories in the parent hexagon. |
 | `unique_classes`  | `BIGINT` | Alias for `distinct_classes`. |
-| `wkb` | `BLOB` | 125-byte OGC standard 2D Polygon Well-Known Binary (WKB) representation. |
+| `wkb` | `BLOB` | OGC 2D Well-Known Binary (WKB) cell geometry; see [cell geometry](#cell-geometry). |
 | `geom` | `GEOMETRY` | Native DuckDB Spatial Polygon geometry (emitted when `geom := true`). |
 
 ---
@@ -210,7 +225,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `h3_cell` | `BIGINT` | `None` | Single H3 cell predicate pushdown filter. |
 | `h3_hex` | `VARCHAR` | `None` | Single H3 hex string predicate pushdown filter. |
 | `geoparquet` | `BOOLEAN` | `false` | Emit OGC GeoParquet 1.1 metadata in Parquet FileMetaData with PROJJSON `OGC:CRS84` datum. |
-| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with 125-byte OGC WKB 2D Polygon hexagons. |
+| `geom` | `BOOLEAN` | `false` | Emit a `geometry` column of the cell geometries; see [cell geometry](#cell-geometry). |
 | `source_crs` / `crs` | `VARCHAR` | `None` (auto) | CRS override (e.g. `'EPSG:4326'`). Required if raster lacks embedded CRS. |
 
 ### Output Schema (1 Summary Row)
@@ -297,7 +312,7 @@ Returns the same 7-column summary schema as `h3_raster_to_pmtiles` (`total_hexag
 | `h3_to_lng` | `(UBIGINT)` | `DOUBLE` | Centroid longitude in WGS84 decimal degrees. |
 | `h3_get_resolution` | `(UBIGINT)` | `BIGINT` | Single-cycle bitshift extraction of H3 resolution level (0 to 15). |
 | `h3_is_valid` | `(UBIGINT)` / `(VARCHAR)` | `BOOLEAN` | Validates mode, base cell range (0 to 121), resolution (0 to 15), directional digits, and padding. |
-| `h3_to_wkb` | `(UBIGINT)` / `(VARCHAR)` | `BLOB` | Emits 125-byte OGC standard 2D Polygon Well-Known Binary (WKB) representation for hexagons (109 bytes for pentagons). |
+| `h3_to_wkb` | `(UBIGINT)` / `(VARCHAR)` | `BLOB` | Emits the cell's OGC 2D Well-Known Binary (WKB) geometry; see [cell geometry](#cell-geometry). |
 | `h3_to_geometry` | `(UBIGINT)` / `(VARCHAR)` | `GEOMETRY` | Converts H3 index directly to native DuckDB Spatial polygon geometry (compatible with `ST_Area`, `ST_Intersects`, etc.). |
 | `h3_cell_to_geometry` | `(UBIGINT)` / `(VARCHAR)` | `GEOMETRY` | Standard DuckDB spatial compatibility alias for `h3_to_geometry`. |
 | `h3_cell_to_parent` | `(UBIGINT, BIGINT)` / `(VARCHAR, BIGINT)` | `UBIGINT` / `VARCHAR` | Truncates H3 cell to coarser parent resolution level. Returns null if requested resolution is finer. |

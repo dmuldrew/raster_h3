@@ -429,8 +429,7 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
     let geom_types = col["geometry_types"]
         .as_array()
         .expect("geometry_types array");
-    assert_eq!(geom_types.len(), 1);
-    assert_eq!(geom_types[0], "Polygon");
+    assert_eq!(geom_types, &["Polygon", "MultiPolygon"]);
 
     // Spec check 3: Bounding box
     let bbox = col["bbox"].as_array().expect("bbox array");

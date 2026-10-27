@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- WKB cell geometries are valid for planar GIS tools: cells crossing the antimeridian are written as a `MultiPolygon` cut at ±180° (instead of a ring with longitudes beyond ±180°), and the two pole cells are written as counter-clockwise polar-cap polygons (instead of an unchanged ring that self-intersects in longitude/latitude). Ordinary cells are unchanged. `WKB_BUF_LEN` grows from 192 to 771 bytes, and GeoParquet `geometry_types` now lists `Polygon` and `MultiPolygon`.
 - Uncompressed GeoTIFFs with unspecified extra samples (for example RGB plus NIR) failed with "decoded chunk shorter than its declared dimensions" because the `tiff` decoder drops those samples; uncompressed chunks are now decoded from the `SamplesPerPixel` layout. Unrecognised compression codes are no longer mapped to uncompressed.
 - Single-probability `QuantilePlan` evaluations use the scalar sketch query, avoiding batch result/rank-vector allocations per cell; empty plans skip sketch evaluation. Added p50/p90 scalar/batch/plan Criterion comparisons.
 - `QuantileSketch::quantiles_batch` now returns exactly what `quantile()` returns for every target: NaN targets yield NaN instead of corrupting the sort (which could misorder results or panic), and degenerate `min`/`max` ranges match `q <= 0`/`q >= 1` handling.
