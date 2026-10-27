@@ -89,7 +89,15 @@ Every engine writes H3 cells (`wkb`, `geom`, `h3_to_wkb`, GeoParquet `geometry`)
   -180° to 180° and closed along both meridians and ±90°.
 - Edges are straight lines in longitude/latitude, approximating H3's great-circle edges;
   GeoParquet metadata declares `"edges": "planar"` and `geometry_types`
-  `["Polygon", "MultiPolygon"]`.
+  `["Polygon", "MultiPolygon"]`. Its `bbox` is the extent of the cell geometries actually
+  written (wider than the raster, since cells extend past its edges); it spans -180 to 180
+  when a written cell crosses the antimeridian.
+
+PMTiles vector tiles use the same rules in Web Mercator tile coordinates: every exterior ring
+has positive area as MVT 2.1 requires, a cell crossing the antimeridian is drawn on the
+tile's side of the seam (and on both sides in the z0 world tile), and the two pole cells are
+polar caps closed along the map's top or bottom edge. Cells lying wholly beyond Web
+Mercator's ±85.05° limit flatten onto that edge.
 
 ### Band calibration and validity
 

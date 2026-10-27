@@ -123,6 +123,14 @@ To ensure optimal visual density on screen (150 to 2,500 hexagons per 512px tile
 | **Res 9** | 0.105 km² (10.5 ha) | 174 m | Parcel / Intersection | **Z14 – Z15** | ~700 – 2,200 |
 | **Res 10** | 0.015 km² (1.5 ha) | 65.9 m | Building Footprint / Lot | **Z16 – Z17** | ~800 – 2,500 |
 
+## Cell Geometry in Vector Tiles
+
+Each feature's exterior ring has positive area in tile coordinates, as MVT 2.1 requires.
+Cells crossing the antimeridian are drawn on the tile's side of the seam (in the z0 world tile,
+on both sides). The two pole cells are polar caps closed along the map's top or bottom edge;
+at fine resolutions they lie wholly beyond Web Mercator's ±85.05° limit and flatten onto that
+edge. See [cell geometry](api-reference.md#cell-geometry).
+
 ## PMTiles v3 Leaf Directory Architecture
 
 For massive multi-resolution archives containing tens of thousands or millions of vector tiles, `raster_h3` automatically constructs **PMTiles v3 Leaf Directories**:

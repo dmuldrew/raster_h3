@@ -16,7 +16,7 @@ use tempfile::NamedTempFile;
 
 use crate::helpers;
 #[path = "support/mvt.rs"]
-mod mvt_decode;
+pub(crate) mod mvt_decode;
 use helpers::create_temp_geotiff;
 
 #[test]

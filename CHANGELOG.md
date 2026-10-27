@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PMTiles vector-tile rings now have positive area in tile coordinates, as MVT 2.1 requires for exterior rings (they were all reversed), and the two pole cells are polar caps reaching the map edge instead of rings jumping back across the tile. `MvtFeature` holds up to `MAX_FEATURE_POINTS` (14) points.
+- The GeoParquet `bbox` covers the cell geometries actually written instead of the raster's bounds, which cells extend past; the `geo` metadata is appended when the file is closed. Adds `encoding::extend_wkb_bounds`.
 - WKB cell geometries are valid for planar GIS tools: cells crossing the antimeridian are written as a `MultiPolygon` cut at ±180° (instead of a ring with longitudes beyond ±180°), and the two pole cells are written as counter-clockwise polar-cap polygons (instead of an unchanged ring that self-intersects in longitude/latitude). Ordinary cells are unchanged. `WKB_BUF_LEN` grows from 192 to 771 bytes, and GeoParquet `geometry_types` now lists `Polygon` and `MultiPolygon`. Python's `h3_to_wkb` sizes its buffer from the new `raster_h3_py_wkb_buf_len()` instead of a hard-coded 192 bytes.
 - Uncompressed GeoTIFFs with unspecified extra samples (for example RGB plus NIR) failed with "decoded chunk shorter than its declared dimensions" because the `tiff` decoder drops those samples; uncompressed chunks are now decoded from the `SamplesPerPixel` layout. Unrecognised compression codes are no longer mapped to uncompressed.
 - Single-probability `QuantilePlan` evaluations use the scalar sketch query, avoiding batch result/rank-vector allocations per cell; empty plans skip sketch evaluation. Added p50/p90 scalar/batch/plan Criterion comparisons.

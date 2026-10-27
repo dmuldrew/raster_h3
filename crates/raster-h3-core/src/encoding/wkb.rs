@@ -286,6 +286,57 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
     out.pos
 }
 
+/// Grow `bounds` (`[min_x, min_y, max_x, max_y]`) to cover every point of a
+/// little-endian `Polygon` or `MultiPolygon` as written by [`cell_to_wkb`].
+/// Other or truncated input leaves `bounds` unchanged past the readable part.
+pub fn extend_wkb_bounds(wkb: &[u8], bounds: &mut [f64; 4]) {
+    let u32_at = |pos: usize| {
+        wkb.get(pos..pos + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    let f64_at = |pos: usize| {
+        wkb.get(pos..pos + 8)
+            .map(|b| f64::from_le_bytes(b.try_into().expect("8 bytes")))
+    };
+    // Visit the polygon starting at `pos`; returns the offset just past it.
+    let polygon = |mut pos: usize, bounds: &mut [f64; 4]| -> Option<usize> {
+        if wkb.get(pos) != Some(&1) || u32_at(pos + 1)? != WKB_POLYGON {
+            return None;
+        }
+        let rings = u32_at(pos + 5)?;
+        pos += 9;
+        for _ in 0..rings {
+            let points = u32_at(pos)? as usize;
+            pos += 4;
+            for _ in 0..points {
+                let (x, y) = (f64_at(pos)?, f64_at(pos + 8)?);
+                bounds[0] = bounds[0].min(x);
+                bounds[1] = bounds[1].min(y);
+                bounds[2] = bounds[2].max(x);
+                bounds[3] = bounds[3].max(y);
+                pos += 16;
+            }
+        }
+        Some(pos)
+    };
+    match (wkb.first(), u32_at(1)) {
+        (Some(1), Some(WKB_POLYGON)) => {
+            polygon(0, bounds);
+        }
+        (Some(1), Some(WKB_MULTIPOLYGON)) => {
+            let Some(parts) = u32_at(5) else { return };
+            let mut pos = 9;
+            for _ in 0..parts {
+                match polygon(pos, bounds) {
+                    Some(next) => pos = next,
+                    None => return,
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert a raw 64-bit H3 index to standard 2D WKB polygon bytes.
 /// Returns `None` if the index is not a valid H3 cell.
 #[inline]
@@ -598,6 +649,53 @@ mod tests {
             let [n, s] = pole_cells(res);
             assert_eq!(n, h3o::LatLng::new(90.0, 0.0).unwrap().to_cell(res));
             assert_eq!(s, h3o::LatLng::new(-90.0, 0.0).unwrap().to_cell(res));
+        }
+    }
+
+    #[test]
+    fn wkb_bounds_cover_polygons_and_multipolygons() {
+        for cell in [
+            h3o::LatLng::new(37.7749, -122.4194)
+                .unwrap()
+                .to_cell(h3o::Resolution::Eight),
+            h3o::LatLng::new(-18.0, 180.0)
+                .unwrap()
+                .to_cell(h3o::Resolution::Five),
+            h3o::LatLng::new(90.0, 0.0)
+                .unwrap()
+                .to_cell(h3o::Resolution::Zero),
+        ] {
+            let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
+            let len = cell_to_wkb(cell, &mut buf);
+            let mut bounds = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            extend_wkb_bounds(&buf[..len], &mut bounds);
+            let mut want = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for polygon in &encode(cell).0 {
+                for c in &polygon.exterior().0 {
+                    want = [
+                        want[0].min(c.x),
+                        want[1].min(c.y),
+                        want[2].max(c.x),
+                        want[3].max(c.y),
+                    ];
+                }
+            }
+            assert_eq!(bounds, want, "{cell}");
+            // Truncated or foreign input never panics.
+            for cut in 0..len {
+                extend_wkb_bounds(&buf[..cut], &mut bounds);
+            }
+            extend_wkb_bounds(&[0, 3, 0, 0, 0], &mut bounds);
         }
     }
 

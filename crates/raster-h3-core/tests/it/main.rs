@@ -25,6 +25,7 @@ mod memory_budgets;
 mod mosaic;
 mod multi_resolution;
 mod multiband_and_query_pushdown;
+mod mvt_geometry;
 mod performance;
 mod pmtiles;
 mod polygon_to_cells;
