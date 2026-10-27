@@ -832,6 +832,14 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         self.spill_runs.iter().map(|r| r.runs_written).collect()
     }
 
+    /// Valid sample points dropped because their coordinate transform failed
+    /// or left the valid latitude/longitude domain; see
+    /// [`super::profile::WorkerProfile::transform_failures`]. Samples outside
+    /// the bbox or owned by another mosaic tile are not counted.
+    pub fn transform_failures(&self) -> u64 {
+        self.metrics.worker.transform_failures
+    }
+
     /// Peak estimate of active table/heap allocation, including pending
     /// compaction groups; excludes decoded chunks and output memory.
     pub fn peak_active_bytes(&self) -> usize {

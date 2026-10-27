@@ -62,6 +62,16 @@ resolutions, so a fine resolution can spill while a coarse one stays in memory. 
 resolution has spilled, the eviction horizon stops advancing: cells of in-memory
 resolutions south of it are held until EOF and then emitted from memory, never from runs.
 
+### Transform-failure diagnostics
+
+`transform_failures()` on both streamers and both batch readers counts valid sample points
+(pixels, or sub-pixel points when super-sampling) that were dropped because the coordinate
+transform failed, returned a non-finite coordinate or a latitude outside [-90, 90], or H3
+rejected the point. Pixels outside `bbox` or owned by another mosaic tile are excluded on
+purpose and are not counted. A non-zero count means valid data is missing from the output,
+usually because of a wrong or out-of-domain source CRS. It is counted in every build, not
+only with `stream-profile`, and is also available as `metrics().worker.transform_failures`.
+
 `custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
 or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
 accepts European national grids with Helmert datum shifts (`EPSG:27700`, `28992`,
