@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Transform-failure counts reach the engines: a `transform_failures` column in DuckDB's `h3_raster_to_parquet` / `h3_raster_to_pmtiles` (and `h3_parquet_to_pmtiles`, always 0) summary rows, one PostgreSQL `WARNING` at the end of the aggregate SRFs, a Python `RuntimeWarning` from `raster_to_parquet` / `raster_to_pmtiles`, and a CLI stderr warning from `parquet` / `pmtiles`. Core adds `MultiResolutionConfig::transform_failure_counter` for pipelines that own the streamer. The Python export C ABI gains an `out_transform_failures` parameter.
 - `transform_failures()` on the continuous and categorical streamers and batch readers: valid sample points dropped because their coordinate transform failed or left the valid latitude/longitude range (previously silent). Counted in every build. The CLI warns on stderr when it is non-zero.
 - `profile_hotspots` example and `profile.yml` workflow measuring mosaic tile-scan scaling and nested-Rayon wave dispatch, with a counting allocator. `StreamProfile` gains `waves`, `bridged_waves` and `serial_waves` counters.
 - GDAL band `SCALE`/`OFFSET` calibration: continuous statistics, quantiles and spectral indices now use `stored * scale + offset` per band (and per mosaic file). NoData is still matched on stored values. Opt out with DuckDB `scale_offset := false`, CLI `--raw-values`, DataFusion `with_scale_offset(false)` or `MultiResolutionConfig::apply_scale_offset`. Malformed scale/offset metadata is rejected when the file is opened.

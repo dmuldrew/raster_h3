@@ -51,6 +51,8 @@ fn add_pmtiles_summary_columns(bind: &BindHelper) {
     bind.add_result_column("elapsed_ms", DuckDBType::Double);
     bind.add_result_column("output_path", DuckDBType::Varchar);
     bind.add_result_column("status", DuckDBType::Varchar);
+    // Valid samples dropped by failed coordinate transforms (0 for Parquet input).
+    bind.add_result_column("transform_failures", DuckDBType::BigInt);
     // SAFETY: a `BindHelper` always wraps the live bind handle of the current
     // bind callback (its construction contract).
     unsafe { duckdb_bind_set_cardinality(bind.info(), 1, true) };
@@ -192,6 +194,8 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
             config.bbox = bind_data.bbox;
             config.properties = bind_data.properties.clone();
             bind_data.execution.apply(&mut config);
+            let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            config.transform_failure_counter = Some(std::sync::Arc::clone(&failures));
 
             let start = Instant::now();
             let result = if bind_data.is_categorical {
@@ -241,6 +245,7 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
             writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
             writer.set_string(5, 0, &bind_data.output_pmtiles);
             writer.set_string(6, 0, &status);
+            writer.set_int64(7, 0, failures.load(Ordering::Relaxed) as i64);
             writer.set_size(1);
         });
     }
@@ -403,6 +408,7 @@ pub unsafe extern "C" fn parquet_pmtiles_scan(
             writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
             writer.set_string(5, 0, &bind_data.output_pmtiles);
             writer.set_string(6, 0, &status);
+            writer.set_int64(7, 0, 0);
             writer.set_size(1);
         });
     }

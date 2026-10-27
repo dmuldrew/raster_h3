@@ -119,3 +119,31 @@ fn batch_readers_report_transform_failures() {
     }
     assert_eq!(reader.transform_failures(), 50);
 }
+
+#[test]
+fn exporters_report_through_the_shared_counter() {
+    use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
+    use raster_h3_core::pmtiles::H3PmtilesTiler;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("past_pole.tif");
+    create_constant_f32_geotiff(&path, 10, 20, 0.0, 95.0, 1.0, 3.0);
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let mut cfg = config(SamplingPattern::center(), None);
+    cfg.transform_failure_counter = Some(Arc::clone(&counter));
+    H3ParquetWriter::process_raster_source_to_parquet(
+        &path,
+        dir.path().join("out.parquet"),
+        cfg.clone(),
+        ParquetExportConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(counter.swap(0, Ordering::Relaxed), 50);
+
+    H3PmtilesTiler::process_raster_source_to_pmtiles(&path, dir.path().join("out.pmtiles"), cfg)
+        .unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 50);
+}

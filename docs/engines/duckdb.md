@@ -497,6 +497,15 @@ plain `BLOB`.
 
 ## Troubleshooting
 
+### Missing pixels near a projection's edge
+
+`h3_raster_to_parquet` and `h3_raster_to_pmtiles` return a `transform_failures` count in their
+summary row: valid pixels dropped because their coordinate transform failed or fell outside
+the valid latitude/longitude range. A non-zero value usually means a wrong `source_crs`. The
+streaming aggregate functions do not report this (DuckDB table functions have no warnings
+channel); run an export, or use another engine, to check a raster. See
+[transform-failure diagnostics](core.md#transform-failure-diagnostics).
+
 ### Unsigned extension loading errors
 
 `Error: Extension ".../libraster_h3.dylib" is not signed by DuckDB`

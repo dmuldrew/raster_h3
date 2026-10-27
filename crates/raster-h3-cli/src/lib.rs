@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
@@ -169,6 +170,8 @@ pub fn export_raster_to_parquet(
     config.custom_nodata = nodata;
     config.apply_scale_offset = apply_scale_offset;
     config.bbox = bbox;
+    let failures = Arc::new(AtomicU64::new(0));
+    config.transform_failure_counter = Some(Arc::clone(&failures));
 
     let mosaic = Arc::new(MosaicReader::open(
         &paths,
@@ -183,15 +186,16 @@ pub fn export_raster_to_parquet(
         ..Default::default()
     };
 
-    if !categorical {
+    let rows = if !categorical {
         let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;
         H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, output_path, pq_cfg)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     } else {
         let streamer = MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config)?;
         H3ParquetWriter::write_categorical_streamer_to_parquet(streamer, output_path, pq_cfg)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     }
+    .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+    warn_transform_failures(failures.load(Ordering::Relaxed));
+    Ok(rows)
 }
 
 /// Export a raster directly to a PMTiles v3 archive.
@@ -211,14 +215,17 @@ pub fn export_raster_to_pmtiles(
     config.custom_nodata = nodata;
     config.apply_scale_offset = apply_scale_offset;
     config.bbox = bbox;
+    let failures = Arc::new(AtomicU64::new(0));
+    config.transform_failure_counter = Some(Arc::clone(&failures));
 
-    if !categorical {
+    let tiles = if !categorical {
         H3PmtilesTiler::process_raster_source_to_pmtiles(input_path, output_path, config)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     } else {
         H3PmtilesTiler::process_categorical_source_to_pmtiles(input_path, output_path, config)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     }
+    .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+    warn_transform_failures(failures.load(Ordering::Relaxed));
+    Ok(tiles)
 }
 
 /// Parse CLI arguments into [`CliStreamOptions`] and an optional output file path (`None` = stdout).

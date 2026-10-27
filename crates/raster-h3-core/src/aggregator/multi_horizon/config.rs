@@ -306,6 +306,11 @@ pub struct MultiResolutionConfig {
     pub quantiles: Vec<QuantileTarget>,
     /// Optional category remapping configuration.
     pub remapper: Option<Arc<CategoryRemapper>>,
+    /// Optional shared counter that streams built from this configuration add
+    /// their transform failures to (see `transform_failures()` on the
+    /// streamers). Lets callers of pipelines that own the streamer, such as
+    /// the Parquet and PMTiles exporters, read the count afterwards.
+    pub transform_failure_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl MultiResolutionConfig {
@@ -338,6 +343,7 @@ impl MultiResolutionConfig {
             overlap_rule: OverlapRule::default(),
             quantiles: Vec::new(),
             remapper: None,
+            transform_failure_counter: None,
         }
     }
 

@@ -391,3 +391,38 @@ fn continuous_aggregate_srf_matches_rust_srf() {
     round(&mut want);
     assert_eq!(got, want);
 }
+
+#[test]
+fn srfs_warn_when_samples_are_dropped_by_failed_transforms() {
+    use raster_h3_pg::fmgr::transform_failure_warning;
+    assert!(transform_failure_warning(50).starts_with("raster_h3: 50 valid sample(s)"));
+
+    // 10 x 20 one-degree pixels from 95N: the top 5 rows lie beyond the pole.
+    let (_tmp, path) = crate::helpers::TestGeoTiffBuilder::new(10, 20)
+        .origin(0.0, 95.0)
+        .pixel_size(1.0)
+        .create_f32_tempfile(|_, _| 3.0);
+    let args = srf_args(&path, Some(3), None, None, None);
+    for (srf, natts) in [
+        (pg_h3_raster_continuous_aggregate as _, 10),
+        (pg_h3_raster_categorical_aggregate as _, 11),
+    ] {
+        let rows = run_srf(srf, natts, &args, None);
+        assert!(!rows.is_empty());
+        assert_eq!(
+            SERVER.with_borrow(|s| s.warnings),
+            1,
+            "one WARNING at end of stream"
+        );
+    }
+
+    // A valid raster raises no warning.
+    let (_tmp, path) = gradient_tif();
+    run_srf(
+        pg_h3_raster_continuous_aggregate,
+        10,
+        &srf_args(&path, Some(8), None, None, None),
+        None,
+    );
+    assert_eq!(SERVER.with_borrow(|s| s.warnings), 0);
+}

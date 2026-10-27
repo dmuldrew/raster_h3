@@ -253,6 +253,7 @@ ORDER BY fraction DESC;
 | :--- | :--- |
 | `permission denied for function h3_raster_continuous_aggregate` | `EXECUTE` is granted only to `pg_read_server_files`; `GRANT pg_read_server_files TO <role>`. |
 | `incompatible library "...raster_h3_pg...": version mismatch` | The module was built for another major. Rebuild with `RASTER_H3_PG_MAJOR=<server major>` or the server's `pg_config` on `PATH`. |
+| `WARNING: raster_h3: N valid sample(s) were dropped ...` | Some valid pixels could not be placed because their coordinate transform failed or fell outside the valid latitude/longitude range. Check `source_crs`; see [transform-failure diagnostics](core.md#transform-failure-diagnostics). |
 | File not found for a path that exists on your machine | The server opens the path on the database host as the PostgreSQL OS user. Copy the file there, mount it into the container, or use an HTTP(S)/S3 URL. |
 | `No CRS detected` | Pass `source_crs => 'EPSG:…'`. |
 | Need sampling, bands, spectral formulas, quantiles, `format => 'long'` or exports | Not exposed in PostgreSQL. Use [DuckDB](duckdb.md), [Python](python-polars.md) or the [CLI](cli.md). |

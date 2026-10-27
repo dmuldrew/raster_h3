@@ -17,6 +17,7 @@ import ctypes
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -194,6 +195,7 @@ def _get_lib() -> ctypes.CDLL:
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_void_p),
     ]
     lib.raster_h3_py_export_parquet.restype = ctypes.c_int64
@@ -204,6 +206,7 @@ def _get_lib() -> ctypes.CDLL:
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_void_p),
     ]
     lib.raster_h3_py_export_pmtiles.restype = ctypes.c_int64
@@ -749,6 +752,17 @@ def h3_polygon_to_cells(
     return None
 
 
+def _warn_transform_failures(failures: int) -> None:
+    """Warn when valid samples were dropped by failed coordinate transforms."""
+    if failures:
+        warnings.warn(
+            f"raster_h3: {failures} valid sample(s) were dropped because their coordinate "
+            "transform failed or fell outside the valid latitude/longitude range; check crs",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def raster_to_parquet(
     input_path: Union[str, Path],
     output_path: Union[str, Path],
@@ -760,6 +774,7 @@ def raster_to_parquet(
 ) -> int:
     lib = _get_lib()
     err = ctypes.c_void_p(0)
+    failures = ctypes.c_uint64(0)
     count = lib.raster_h3_py_export_parquet(
         str(input_path).encode("utf-8"),
         str(output_path).encode("utf-8"),
@@ -767,9 +782,11 @@ def raster_to_parquet(
         1 if categorical else 0,
         crs.encode("utf-8") if crs else None,
         1 if geoparquet else 0,
+        ctypes.byref(failures),
         ctypes.byref(err),
     )
     _raise_if_err(err)
+    _warn_transform_failures(failures.value)
     return int(count)
 
 
@@ -783,15 +800,18 @@ def raster_to_pmtiles(
 ) -> int:
     lib = _get_lib()
     err = ctypes.c_void_p(0)
+    failures = ctypes.c_uint64(0)
     count = lib.raster_h3_py_export_pmtiles(
         str(input_path).encode("utf-8"),
         str(output_path).encode("utf-8"),
         _encode_resolutions(resolutions),
         1 if categorical else 0,
         crs.encode("utf-8") if crs else None,
+        ctypes.byref(failures),
         ctypes.byref(err),
     )
     _raise_if_err(err)
+    _warn_transform_failures(failures.value)
     return int(count)
 
 

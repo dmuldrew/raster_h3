@@ -160,6 +160,8 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     resolution_u8s: Vec<u8>,
     nodata: Option<f64>,
     apply_scale_offset: bool,
+    /// Shared total that transform failures are also added to.
+    transform_failure_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
     resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
@@ -305,6 +307,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             resolution_u8s,
             nodata: config.custom_nodata,
             apply_scale_offset: config.apply_scale_offset,
+            transform_failure_counter: config.transform_failure_counter.clone(),
             bbox: config.bbox,
             sampling: config.sampling.clone(),
             resolution_shards,
@@ -607,6 +610,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     .max(peak.load(Ordering::Relaxed));
                 self.metrics.kernel_wall_ns += t.elapsed().as_nanos() as u64;
                 for (profile, ns) in results.drain(..) {
+                    if let (Some(counter), n @ 1..) =
+                        (&self.transform_failure_counter, profile.transform_failures)
+                    {
+                        counter.fetch_add(n, Ordering::Relaxed);
+                    }
                     self.metrics.worker.merge(profile);
                     self.metrics.worker_ns += ns;
                     self.metrics.jobs += 1;

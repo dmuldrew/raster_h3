@@ -222,6 +222,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `hexagons_per_sec` | `DOUBLE` | Throughput rate in hexagons processed per second. |
 | `output_path` | `VARCHAR` | Path to the created `.parquet` file. |
 | `status` | `VARCHAR` | Execution status (`'SUCCESS'` or error message). |
+| `transform_failures` | `BIGINT` | Valid sample points dropped because their coordinate transform failed or fell outside the valid latitude/longitude range (0 when the CRS is right); see [transform-failure diagnostics](engines/core.md#transform-failure-diagnostics). |
 
 ---
 
@@ -256,6 +257,7 @@ SELECT * FROM h3_raster_to_parquet(
 | `elapsed_ms` | `DOUBLE` | Total end-to-end execution time in milliseconds. |
 | `output_path` | `VARCHAR` | Path to the created `.pmtiles` file. |
 | `status` | `VARCHAR` | Execution status (`'SUCCESS'` or error message). |
+| `transform_failures` | `BIGINT` | Valid sample points dropped by failed coordinate transforms; see [transform-failure diagnostics](engines/core.md#transform-failure-diagnostics). |
 
 ---
 
@@ -283,7 +285,7 @@ SELECT * FROM h3_parquet_to_pmtiles(
 | `h3_column` | `VARCHAR` | `None` (auto-detect) | Name of the H3 index column (supports BIGINT/UBIGINT integer or hex VARCHAR; matching is case-insensitive). An explicitly named column that is not found is an error listing available columns. Alias: `h3_col`. |
 
 ### Output Schema (1 Summary Row)
-Returns the same 7-column summary schema as `h3_raster_to_pmtiles` (`total_hexagons`, `pmtiles_size_bytes`, `min_zoom`, `max_zoom`, `elapsed_ms`, `output_path`, `status`).
+Returns the same 8-column summary schema as `h3_raster_to_pmtiles` (`total_hexagons`, `pmtiles_size_bytes`, `min_zoom`, `max_zoom`, `elapsed_ms`, `output_path`, `status`, `transform_failures`); `transform_failures` is always 0 because Parquet input is already indexed.
 
 ---
 
