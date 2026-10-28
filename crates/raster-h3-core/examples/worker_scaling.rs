@@ -126,13 +126,28 @@ impl Workload {
 // ---------------------------------------------------------------------------
 
 /// What one stream produced; must not depend on the worker count.
+///
+/// Fixture values are small integers, so pixel counts, sums, minima, maxima
+/// and class counts are exact in any merge order and can be compared bit for
+/// bit. Quantile sketch results are not digested.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Checksum {
     cells: usize,
-    /// Total pixel weight (integer-valued, so exact in any merge order).
+    /// Total pixel weight.
     weight: f64,
-    /// XOR of every (resolution, cell) key.
-    keys: u64,
+    /// Order-independent sum of one hash per output cell over its key and
+    /// exact statistics (count/sum/min/max, or every class count).
+    digest: u64,
+}
+
+/// Hash a cell's fields into one well-mixed word (SplitMix64 finaliser per step).
+fn cell_hash(fields: impl IntoIterator<Item = u64>) -> u64 {
+    fields.into_iter().fold(0x9E37_79B9_7F4A_7C15, |h, v| {
+        let mut z = (h ^ v).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    })
 }
 
 /// One timed stream: wall time plus the stage timers it reported.
@@ -172,12 +187,12 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
     let mut sum = Checksum {
         cells: 0,
         weight: 0.0,
-        keys: 0,
+        digest: 0,
     };
-    let mut add = |resolution: u8, h3: u64, weight: f64| {
+    let mut add = |weight: f64, hash: u64| {
         sum.cells += 1;
         sum.weight += weight;
-        sum.keys ^= h3.rotate_left(u32::from(resolution));
+        sum.digest = sum.digest.wrapping_add(hash);
     };
     match workload.kind {
         Kind::Continuous => {
@@ -188,7 +203,16 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                     break;
                 }
                 for r in &batch {
-                    add(r.resolution, r.h3_index, r.accumulator.count);
+                    let a = &r.accumulator;
+                    let hash = cell_hash([
+                        u64::from(r.resolution),
+                        r.h3_index,
+                        a.count.to_bits(),
+                        a.sum.to_bits(),
+                        a.min.to_bits(),
+                        a.max.to_bits(),
+                    ]);
+                    add(a.count, hash);
                 }
             }
             Run::new(elapsed_ns(start), s.metrics(), sum)
@@ -201,7 +225,14 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                     break;
                 }
                 for r in &batch {
-                    add(r.resolution, r.h3_index, r.accumulator.total_count);
+                    let mut classes = Vec::new();
+                    r.accumulator
+                        .for_each_class(|class, count| classes.push((class, count.to_bits())));
+                    classes.sort_unstable();
+                    let fields = [u64::from(r.resolution), r.h3_index]
+                        .into_iter()
+                        .chain(classes.iter().flat_map(|&(c, n)| [c as u64, n]));
+                    add(r.accumulator.total_count, cell_hash(fields));
                 }
             }
             Run::new(elapsed_ns(start), s.metrics(), sum)
@@ -307,11 +338,19 @@ fn main() {
     let reps: usize = arg(&args, "--reps")
         .map(|s| s.parse().expect("--reps"))
         .unwrap_or(if quick { 1 } else { 3 });
-    let workers: Vec<usize> = arg(&args, "--workers")
+    // Ascending, so the first count is the speedup baseline and the last the
+    // highest count the summary reports.
+    let mut workers: Vec<usize> = arg(&args, "--workers")
         .unwrap_or("1,2,4,8")
         .split(',')
         .map(|w| w.trim().parse().expect("--workers"))
         .collect();
+    workers.sort_unstable();
+    workers.dedup();
+    assert!(
+        workers.first().is_some_and(|&n| n >= 1),
+        "--workers needs at least one positive count"
+    );
     let json_path = arg(&args, "--json").map(PathBuf::from);
     let budget_mb: Option<usize> =
         arg(&args, "--budget-mb").map(|s| s.parse().expect("--budget-mb"));
@@ -473,5 +512,31 @@ mod tests {
                 workload.name
             );
         }
+    }
+
+    #[test]
+    fn checksum_catches_changed_cell_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder = helpers::TestGeoTiffBuilder::new(32, 32)
+            .origin(ORIGIN.0, ORIGIN.1)
+            .pixel_size(PIXEL_DEG);
+        let (a, b) = (dir.path().join("a.tif"), dir.path().join("b.tif"));
+        builder.write_fn(&a, |c, r| ((c + r) % 7) as f32).unwrap();
+        builder
+            .write_fn(&b, |c, r| {
+                if (c, r) == (5, 5) {
+                    50.0
+                } else {
+                    ((c + r) % 7) as f32
+                }
+            })
+            .unwrap();
+        let workload = &WORKLOADS[0];
+        let (x, y) = (
+            stream_once(&a, workload, 1, None).checksum,
+            stream_once(&b, workload, 1, None).checksum,
+        );
+        assert_eq!((x.cells, x.weight), (y.cells, y.weight));
+        assert_ne!(x.digest, y.digest);
     }
 }

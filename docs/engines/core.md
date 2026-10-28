@@ -168,8 +168,8 @@ It streams synthetic rasters through six workloads: resolution 9, coarse (7), fi
 wall time, throughput, `kernel_wall_ns`, `merge_ns` and the merge's share of wall
 time, plus parallel-stage efficiency, decode wait and spill time. `--quick` uses
 1024² rasters and one run; `--side` and `--reps` override the size and repetitions.
-Every worker count must produce the same cells and pixel weights, or the run
-aborts. These stage timers are always on, so a normal release build suffices.
+Every worker count must produce the same cells and exact per-cell statistics
+(count, sum, min, max, class counts; not quantiles), or the run aborts. These stage timers are always on, so a normal release build suffices.
 Worker counts above the machine's cores oversubscribe it; the report prints the
 available parallelism. Results and the resulting decision are recorded in
 [Worker Scaling](../worker-scaling.md).
