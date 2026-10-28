@@ -18,8 +18,9 @@ time caps the speedup from adding workers.
   they show contention rather than 8-core scaling.
 - 4096 × 4096 px synthetic rasters (16.8 Mpx, 0.0005° pixels), centre sampling,
   `decode_workers` 4.
-- Each figure is the median of 3 runs after one warm-up. Output was identical at every
-  worker count.
+- Each figure is the median of 3 runs after one warm-up. Cells and pixel weights were
+  identical at every worker count. These runs predate the per-cell statistics check,
+  which now runs on every invocation and in CI.
 
 ```bash
 cargo run --release -p raster-h3-core --example worker_scaling -- --json scaling.json
