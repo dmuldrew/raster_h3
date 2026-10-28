@@ -189,6 +189,8 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
         weight: 0.0,
         digest: 0,
     };
+    // Checksum work is timed and subtracted, so wall time covers the stream only.
+    let mut digest_ns = 0u64;
     let mut add = |weight: f64, hash: u64| {
         sum.cells += 1;
         sum.weight += weight;
@@ -202,6 +204,7 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                 if batch.is_empty() {
                     break;
                 }
+                let t = Instant::now();
                 for r in &batch {
                     let a = &r.accumulator;
                     let hash = cell_hash([
@@ -214,8 +217,9 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                     ]);
                     add(a.count, hash);
                 }
+                digest_ns += elapsed_ns(t);
             }
-            Run::new(elapsed_ns(start), s.metrics(), sum)
+            Run::new(elapsed_ns(start) - digest_ns, s.metrics(), sum)
         }
         Kind::Categorical => {
             let mut s = MultiCategoricalHorizonStreamer::new(reader, &config).expect("streamer");
@@ -224,6 +228,7 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                 if batch.is_empty() {
                     break;
                 }
+                let t = Instant::now();
                 for r in &batch {
                     let mut classes = Vec::new();
                     r.accumulator
@@ -234,8 +239,9 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                         .chain(classes.iter().flat_map(|&(c, n)| [c as u64, n]));
                     add(r.accumulator.total_count, cell_hash(fields));
                 }
+                digest_ns += elapsed_ns(t);
             }
-            Run::new(elapsed_ns(start), s.metrics(), sum)
+            Run::new(elapsed_ns(start) - digest_ns, s.metrics(), sum)
         }
     }
 }
