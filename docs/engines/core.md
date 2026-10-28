@@ -154,6 +154,26 @@ approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
 wall-time comparisons include decoding and scheduling; they do not isolate bridge
 cost. The bare spawn/join measurement is only an isolated baseline.
 
+### Worker scaling
+
+The `worker_scaling` example measures how wall time splits between the parallel
+kernel waves and the serial horizon merge as `aggregation_workers` grows:
+
+```bash
+cargo run --locked --release -p raster-h3-core --example worker_scaling -- --workers 1,2,4,8 --json scaling.json
+```
+
+It streams synthetic rasters through six workloads: resolution 9, coarse (7), fine
+(11), three resolutions, quantiles and categorical. For each worker count it reports
+wall time, throughput, `kernel_wall_ns`, `merge_ns` and the merge's share of wall
+time, plus parallel-stage efficiency, decode wait and spill time. `--quick` uses
+1024² rasters and one run; `--side` and `--reps` override the size and repetitions.
+Every worker count must produce the same cells and exact per-cell statistics
+(count, sum, min, max, class counts; not quantiles), or the run aborts. These stage timers are always on, so a normal release build suffices.
+Worker counts above the machine's cores oversubscribe it; the report prints the
+available parallelism. Results and the resulting decision are recorded in
+[Worker Scaling](../worker-scaling.md).
+
 ### Remote COG prefetching
 
 `raster::remote_prefetch::RemoteChunkPrefetchQueue` fetches HTTP/S3 ranges ahead

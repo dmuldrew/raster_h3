@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `worker_scaling` example and `profile.yml` job: wall, kernel, merge and spill time for six workloads at 1/2/4/8 aggregation workers, with output-equality checks (`--budget-mb`, `--only`, `--quick`). Results and the decision not to parallelise the merge yet are in `docs/worker-scaling.md`: the serial merge's main cost is computing each new cell's eviction latitude (~584 ns per cell). `metrics()` on `MultiCategoricalHorizonStreamer`.
+
 ## [0.5.0] - 2026-10-28
 
 ### Added
