@@ -314,20 +314,17 @@ from the scan schema:
 \* Only when `geoparquet=True`.
 
 `h3_index` is stored as signed `Int64` (the same 64 bits); cast it to `UInt64` before
-joining to scan output.
+joining to scan output:
 
-> **Reading the file back with Polars.** Polars' native Parquet reader (checked with
-> Polars 1.36) rejects files written by the bundled `parquet` 60 crate (this exporter and the CLI) with
-> `File out of specification: Invalid thrift`, while PyArrow reads them. Until that is
-> fixed, read through PyArrow:
->
-> ```python
-> cells = (pl.read_parquet("elevation_h3.parquet", use_pyarrow=True)
->            .with_columns(pl.col("h3_index").cast(pl.UInt64)))
-> ```
+```python
+cells = (pl.read_parquet("elevation_h3.parquet")
+           .with_columns(pl.col("h3_index").cast(pl.UInt64)))
+```
 
-To write the scan schema itself, or a projection of it, use Polars, which writes files its
-own reader accepts:
+Files written by releases before the Parquet footer fix fail in Polars with
+`Invalid thrift: bad data`; regenerate them or read them with `use_pyarrow=True`.
+
+To write the scan schema itself, or a projection of it, use Polars:
 
 ```python
 (raster_h3.scan_raster_h3("elevation.tif", 8, columns=["h3_index", "mean", "count"])
