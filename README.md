@@ -220,16 +220,6 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 
 ## How It Works
 
-Traditional tools struggle with large rasters. Here is how `raster_h3` solves each bottleneck:
-
-| Step | Traditional Approach | raster_h3 Approach |
-| :--- | :--- | :--- |
-| **Memory** | Load entire raster into RAM | Budget active accumulators and spill to disk |
-| **Projection** | Recalculate spherical math per pixel | Row-constant hoisting: 1 transform per row |
-| **H3 Lookup** | Recompute cell ID per pixel | Exact per-sample indexing with run accumulation |
-| **Eviction** | Hold all results until file completion | Evict finished hexagons immediately via horizon scan |
-| **Web Tiling** | C++ Tippecanoe + scratch files + tile servers | Generate `.pmtiles` archives in 1 step |
-
 ### The Moving Scanner Front (Bounded Memory)
 
 `raster_h3` streams the raster like a document scanner — one thin row at a time from North to South:
