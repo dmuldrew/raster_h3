@@ -8,8 +8,9 @@
 //! time splits between the parallel kernel stage and the serial merge.
 //!
 //! The stage timers are always on, so this needs no `stream-profile` build.
-//! Wall times are medians of several runs after one warm-up run. Every worker
-//! count must produce the same cells and pixel counts, or the run aborts.
+//! Wall times are medians of several runs after one warm-up run. The warm-up
+//! also digests every output cell's exact statistics; every worker count must
+//! produce the same digest, or the run aborts. Timed runs do no checksum work.
 //!
 //! ```text
 //! cargo run --release -p raster-h3-core --example worker_scaling -- \
@@ -180,7 +181,15 @@ impl Run {
     }
 }
 
-fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Option<usize>) -> Run {
+/// Stream one workload. With `verify`, also digest every output cell; timed
+/// runs pass `false`, so their wall time contains no checksum work.
+fn stream_once(
+    path: &Path,
+    workload: &Workload,
+    workers: usize,
+    budget_mb: Option<usize>,
+    verify: bool,
+) -> Run {
     let config = workload.config(workers, budget_mb);
     let reader = GeoTiffStreamReader::open(path).expect("open raster");
     let start = Instant::now();
@@ -188,13 +197,6 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
         cells: 0,
         weight: 0.0,
         digest: 0,
-    };
-    // Checksum work is timed and subtracted, so wall time covers the stream only.
-    let mut digest_ns = 0u64;
-    let mut add = |weight: f64, hash: u64| {
-        sum.cells += 1;
-        sum.weight += weight;
-        sum.digest = sum.digest.wrapping_add(hash);
     };
     match workload.kind {
         Kind::Continuous => {
@@ -204,22 +206,23 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                 if batch.is_empty() {
                     break;
                 }
-                let t = Instant::now();
-                for r in &batch {
-                    let a = &r.accumulator;
-                    let hash = cell_hash([
-                        u64::from(r.resolution),
-                        r.h3_index,
-                        a.count.to_bits(),
-                        a.sum.to_bits(),
-                        a.min.to_bits(),
-                        a.max.to_bits(),
-                    ]);
-                    add(a.count, hash);
+                sum.cells += batch.len();
+                if verify {
+                    for r in &batch {
+                        let a = &r.accumulator;
+                        sum.weight += a.count;
+                        sum.digest = sum.digest.wrapping_add(cell_hash([
+                            u64::from(r.resolution),
+                            r.h3_index,
+                            a.count.to_bits(),
+                            a.sum.to_bits(),
+                            a.min.to_bits(),
+                            a.max.to_bits(),
+                        ]));
+                    }
                 }
-                digest_ns += elapsed_ns(t);
             }
-            Run::new(elapsed_ns(start) - digest_ns, s.metrics(), sum)
+            Run::new(elapsed_ns(start), s.metrics(), sum)
         }
         Kind::Categorical => {
             let mut s = MultiCategoricalHorizonStreamer::new(reader, &config).expect("streamer");
@@ -228,20 +231,22 @@ fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Opti
                 if batch.is_empty() {
                     break;
                 }
-                let t = Instant::now();
-                for r in &batch {
-                    let mut classes = Vec::new();
-                    r.accumulator
-                        .for_each_class(|class, count| classes.push((class, count.to_bits())));
-                    classes.sort_unstable();
-                    let fields = [u64::from(r.resolution), r.h3_index]
-                        .into_iter()
-                        .chain(classes.iter().flat_map(|&(c, n)| [c as u64, n]));
-                    add(r.accumulator.total_count, cell_hash(fields));
+                sum.cells += batch.len();
+                if verify {
+                    for r in &batch {
+                        let mut classes = Vec::new();
+                        r.accumulator
+                            .for_each_class(|class, count| classes.push((class, count.to_bits())));
+                        classes.sort_unstable();
+                        let fields = [u64::from(r.resolution), r.h3_index]
+                            .into_iter()
+                            .chain(classes.iter().flat_map(|&(c, n)| [c as u64, n]));
+                        sum.weight += r.accumulator.total_count;
+                        sum.digest = sum.digest.wrapping_add(cell_hash(fields));
+                    }
                 }
-                digest_ns += elapsed_ns(t);
             }
-            Run::new(elapsed_ns(start) - digest_ns, s.metrics(), sum)
+            Run::new(elapsed_ns(start), s.metrics(), sum)
         }
     }
 }
@@ -250,7 +255,8 @@ fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
-/// One warm-up run, then the median-wall-time run of `reps`.
+/// One verified warm-up run, then the median-wall-time run of `reps` unverified
+/// runs. The result carries the warm-up's checksum.
 fn median_run(
     path: &Path,
     workload: &Workload,
@@ -258,18 +264,20 @@ fn median_run(
     reps: usize,
     budget_mb: Option<usize>,
 ) -> Run {
-    stream_once(path, workload, workers, budget_mb);
+    let verified = stream_once(path, workload, workers, budget_mb, true).checksum;
     let mut runs: Vec<Run> = (0..reps.max(1))
-        .map(|_| stream_once(path, workload, workers, budget_mb))
+        .map(|_| stream_once(path, workload, workers, budget_mb, false))
         .collect();
-    runs.sort_by_key(|r| r.wall_ns);
-    let median = runs[runs.len() / 2];
     assert!(
-        runs.iter().all(|r| r.checksum == median.checksum),
-        "{}: output differs between runs at {workers} workers",
+        runs.iter().all(|r| r.checksum.cells == verified.cells),
+        "{}: cell count differs between runs at {workers} workers",
         workload.name
     );
-    median
+    runs.sort_by_key(|r| r.wall_ns);
+    Run {
+        checksum: verified,
+        ..runs[runs.len() / 2]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,10 +517,10 @@ mod tests {
                 Kind::Continuous => &continuous,
                 Kind::Categorical => &categorical,
             };
-            let one = stream_once(path, workload, 1, None).checksum;
+            let one = stream_once(path, workload, 1, None, true).checksum;
             assert_eq!(one.weight, 96.0 * 96.0 * workload.resolutions.len() as f64);
             assert_eq!(
-                stream_once(path, workload, 3, None).checksum,
+                stream_once(path, workload, 3, None, true).checksum,
                 one,
                 "{}",
                 workload.name
@@ -539,8 +547,8 @@ mod tests {
             .unwrap();
         let workload = &WORKLOADS[0];
         let (x, y) = (
-            stream_once(&a, workload, 1, None).checksum,
-            stream_once(&b, workload, 1, None).checksum,
+            stream_once(&a, workload, 1, None, true).checksum,
+            stream_once(&b, workload, 1, None, true).checksum,
         );
         assert_eq!((x.cells, x.weight), (y.cells, y.weight));
         assert_ne!(x.digest, y.digest);
@@ -559,10 +567,10 @@ mod tests {
             .iter()
             .find(|w| w.name == "res 11 (fine)")
             .unwrap();
-        let in_memory = stream_once(&path, fine, 1, None);
+        let in_memory = stream_once(&path, fine, 1, None, true);
         assert_eq!(in_memory.spill_ns, 0);
         for workers in [1, 3] {
-            let spilled = stream_once(&path, fine, workers, Some(1));
+            let spilled = stream_once(&path, fine, workers, Some(1), true);
             assert!(spilled.spill_ns > 0, "a 1 MiB budget must spill");
             assert_eq!(spilled.checksum, in_memory.checksum, "{workers} workers");
         }
