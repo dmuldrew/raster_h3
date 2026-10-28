@@ -50,7 +50,7 @@ libdir="$(docker exec "$container" pg_config --pkglibdir)"
 sharedir="$(docker exec "$container" pg_config --sharedir)"
 docker cp "$out_dir/raster_h3_pg.so" "$container:$libdir/raster_h3_pg.so"
 docker cp "$repo/crates/raster-h3-pg/raster_h3.control" "$container:$sharedir/extension/"
-docker cp "$repo/crates/raster-h3-pg/sql/raster_h3--0.4.0.sql" "$container:$sharedir/extension/"
+docker cp "$repo/crates/raster-h3-pg/sql/raster_h3--0.5.0.sql" "$container:$sharedir/extension/"
 
 # The entrypoint restarts the server once after initdb; wait for the final instance.
 for _ in $(seq 1 60); do

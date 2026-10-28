@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Workspace, Python package, PostgreSQL extension and DuckDB community-extension manifest versions bumped to `0.5.0` (PostgreSQL install script renamed to `sql/raster_h3--0.5.0.sql`; its definitions are unchanged from 0.4.0).
+- Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
+- Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
 - The DuckDB reference moved to [`docs/sql-api-reference.md`](docs/sql-api-reference.md) (SQL API Reference) and a new [Polars API Reference](docs/polars-api-reference.md) documents the Python package's scan options, output schemas, `RasterH3ArrowStream`, exporters and H3 helpers. `docs/api-reference.md` now links to both.
 - Python scans and exporters reject an empty `resolutions` (`""` or `[]`) with `Invalid resolutions` instead of silently using resolution 8. A NULL `resolutions` pointer in the C ABI still means `[8]`.
 - Remote COG prefetching is bounded by bytes instead of chunk count: each range's size is reserved against `RemotePrefetchConfig::max_buffered_bytes` (new, default 32 MiB) before its request, covering requests in flight, and stays charged until the last chunk sliced from the response is dropped. Chunks share the response buffer instead of being copied out under the lock, and workers wait on a condition variable instead of a 5 ms polling loop. `get_chunk_payload`/`try_get_chunk_payload` now return `PrefetchedChunk` (derefs to `[u8]`) instead of `Arc<Vec<u8>>`; `held_bytes()`/`peak_held_bytes()` report budget use. Blocking requests are prioritized in any order, evicting unrequested prefetched responses when necessary and refetching their untaken chunks on demand without exceeding the byte budget (or one oversized range).
@@ -92,8 +95,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in European national-grid EPSG codes with Helmert datum shifts: `27700` (OSGB36), `28992` (Amersfoort / RD New), `31466`–`31469` (DHDN Gauss-Kruger), `23028`–`23038` (ED50 / UTM); and ETRS89 codes treated as WGS84: `2154`, `3035`, `25828`–`25838` ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 
 ### Changed
-- Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
-- Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
 - Workspace, Python package and PostgreSQL extension versions bumped to `0.4.0` (PostgreSQL install script renamed to `sql/raster_h3--0.4.0.sql`).
 - The DuckDB community-extension manifest moved from `community_extension/` to `packaging/duckdb-community/description.yml`; it now points at `dmuldrew/raster_h3`, declares version `0.4.0` and excludes the opt-in musl and `windows_amd64_rtools` platforms.
 - Repository and homepage URLs point to `github.com/dmuldrew/raster_h3` (previously `raster_h3_hexification`).
@@ -252,6 +253,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dmuldrew/raster_h3/compare/c63dd46...v0.4.0
-[0.3.0]: https://github.com/dmuldrew/raster_h3/compare/v0.2.0...c63dd46
-[0.2.0]: https://github.com/dmuldrew/raster_h3/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dmuldrew/raster_h3/releases/tag/v0.1.0
+[0.3.0]: https://github.com/dmuldrew/raster_h3/tree/c63dd46
