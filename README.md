@@ -220,53 +220,23 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 
 ## How It Works
 
-### The Moving Scanner Front (Bounded Memory)
+`raster_h3` reads a raster like a document scanner: one strip at a time, from north to south.
 
-`raster_h3` streams the raster like a document scanner — one thin row at a time from North to South:
-- **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
-- **Aggregation memory budget**: The default is 64 MiB for aggregation. This is not a total-process RAM limit; decoded chunks, prefetch buffers, output buffers, and other overhead also consume memory.
+- **Finished hexagons leave immediately.** Once the scan has passed a hexagon's southern
+  edge, no later row can touch it, so its statistics are final and it is sent on and
+  freed. Memory holds only the band of hexagons under the scanner, not the whole raster.
+- **Results stream into your tool.** Cells arrive in DuckDB, Polars, PostgreSQL,
+  DataFusion or the CLI as they finish, so joins and exports start before the raster
+  is fully read, and a `LIMIT` stops the scan early.
+- **Memory stays within a budget.** If the active hexagons outgrow the aggregation
+  budget (64 MiB by default), partial results spill to temporary files on disk and are
+  merged at the end.
+- **One pass, every resolution.** Each pixel is located once and counted at every
+  requested H3 resolution, which is how a multi-zoom PMTiles pyramid comes from a
+  single read.
 
-Remote COG prefetching has its own 32 MiB response-byte budget, configurable in
-Rust with `RemotePrefetchConfig::max_buffered_bytes`. It covers in-flight requests
-and shared responses retained by the queue or callers; a range larger than the
-budget runs alone. `get_chunk_payload` / `try_get_chunk_payload` return
-`PrefetchedChunk` (dereferences to `[u8]`), not `Arc<Vec<u8>>`. Keep these handles
-short-lived: each slice or clone retains the entire coalesced response. Blocking
-requests can arrive out of order; unused prefetched responses may be evicted and
-fetched again to make room. See [Remote COG prefetching](docs/engines/core.md#remote-cog-prefetching)
-for configuration, retention and byte-usage diagnostics.
-
-### Direct Web-Ready Map Tiles
-
-Generates single-file **PMTiles v3** vector pyramids directly from DuckDB SQL, Python or the CLI:
-- **Zero Intermediate Tooling**: Eliminates C++ Tippecanoe, GeoJSON scratch files, and dedicated tile server infrastructure.
-- **Serverless Map Delivery**: Upload the `.pmtiles` archive directly to Amazon S3, Cloudflare R2, or GitHub Pages and render with zero backend infrastructure.
-
-### Exact Coordinates and Sequential Spans
-
-Pixel centers and subpixel samples use absolute raster coordinates followed by
-CRS transformation. Span discovery uses the same calculation as ordinary pixel
-assignment, avoiding accumulated coordinate drift. Each candidate is indexed
-with H3; contiguous equal-cell runs share accumulation work. Supersampling evaluates each sample once and combines same-cell weights per pixel,
-replaying stored assignments when samples split across cells.
-
-### In-Engine Streaming
-
-Aggregated cells stream into the host engine as they complete — DuckDB `DataChunk`s,
-Arrow `RecordBatch`es for DataFusion and Polars, PostgreSQL rows, or NDJSON / `RH3IPC01` on
-stdout — so queries, joins and exports start before the raster is fully read. Every engine
-pulls on demand, so a `LIMIT` stops aggregation early. When active accumulators exceed
-their budget, temporary spill files hold partial results for merging; the core streamers
-report the runs written in total (`spill_run_count()`) and per resolution
-(`spill_run_counts()`). Projected inputs without certified bounds may defer output until EOF.
-
-Categorical wide output has one row per cell; long output has one row per
-`(cell, category)`. In the core batch reader, `batch_size` and `limit` count these
-output rows, not cells in long format. Core and DuckDB long readers expand one
-cell at a time using the public `CategoricalLongCursor`, keeping pending categories
-bounded by the largest single cell rather than a batch of cells. A cell can span
-multiple batches, and a limit can stop mid-cell; entropy is computed only when an
-entropy column is projected. See the [core batch-reader contract](docs/engines/core.md#batch-readers).
+See [Core Engineering Architecture](#core-engineering-architecture) for how each step is
+implemented.
 
 ---
 
