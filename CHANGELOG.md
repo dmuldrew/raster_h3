@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Workspace, Python package, PostgreSQL extension and DuckDB community-extension manifest versions bumped to `0.5.0` (PostgreSQL install script renamed to `sql/raster_h3--0.5.0.sql`; its definitions are unchanged from 0.4.0).
+- Workspace, Python package, PostgreSQL extension and DuckDB community-extension manifest versions bumped to `0.5.0` (PostgreSQL install script renamed to `sql/raster_h3--0.5.0.sql`; its definitions are unchanged from 0.4.0, and `sql/raster_h3--0.4.0--0.5.0.sql` lets existing databases run `ALTER EXTENSION raster_h3 UPDATE`). The community-extension manifest's `repo.ref` points at the 0.5.0 version-bump commit.
 - Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
 - Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
 - The DuckDB reference moved to [`docs/sql-api-reference.md`](docs/sql-api-reference.md) (SQL API Reference) and a new [Polars API Reference](docs/polars-api-reference.md) documents the Python package's scan options, output schemas, `RasterH3ArrowStream`, exporters and H3 helpers. `docs/api-reference.md` now links to both.
