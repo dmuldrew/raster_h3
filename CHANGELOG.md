@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-28
+
 ### Added
 
 - Strict transform mode: `MultiResolutionConfig::strict_transforms` fails the stream with the new `RasterH3Error::TransformFailures` as soon as a valid sample point is dropped by a failed coordinate transform. Exposed as DuckDB `strict_transforms := true` (every table function; exports report it in `status`), Python `strict_transforms=True` (`scan_raster_h3`, `read_raster_h3`, `RasterH3ArrowStream`) and DataFusion `with_strict_transforms(true)`. Off by default.
@@ -247,7 +249,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docker container** with multi-stage build, bundled DuckDB CLI, and demo script
 - **Query planner integration**: cardinality estimation and parallel `init_local` distribution
 
-[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dmuldrew/raster_h3/compare/c63dd46...v0.4.0
 [0.3.0]: https://github.com/dmuldrew/raster_h3/compare/v0.2.0...c63dd46
 [0.2.0]: https://github.com/dmuldrew/raster_h3/compare/v0.1.0...v0.2.0
