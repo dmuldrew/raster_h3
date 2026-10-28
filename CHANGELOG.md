@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-10-28
-
 ### Added
 
 - `worker_scaling` example and `profile.yml` job: wall, kernel, merge and spill time for six workloads at 1/2/4/8 aggregation workers, with output-equality checks (`--budget-mb`, `--only`, `--quick`). Results and the decision not to parallelise the merge yet are in `docs/worker-scaling.md`: the serial merge's main cost is computing each new cell's eviction latitude (~584 ns per cell). `metrics()` on `MultiCategoricalHorizonStreamer`.
+
+## [0.5.0] - 2026-10-28
+
+### Added
 
 - Strict transform mode: `MultiResolutionConfig::strict_transforms` fails the stream with the new `RasterH3Error::TransformFailures` as soon as a valid sample point is dropped by a failed coordinate transform. Exposed as DuckDB `strict_transforms := true` (every table function; exports report it in `status`), Python `strict_transforms=True` (`scan_raster_h3`, `read_raster_h3`, `RasterH3ArrowStream`) and DataFusion `with_strict_transforms(true)`. Off by default.
 - Lenient scans report dropped samples too: Python `scan_raster_h3`, `RasterH3ArrowStream.iter_batches()` and `.to_dict()` emit a `RuntimeWarning` once the scan completes, and DataFusion providers take `with_transform_failure_counter`. The Python native library adds `raster_h3_py_create_arrow_stream_ex`, `raster_h3_py_open_batch_reader_ex`, `raster_h3_py_scan_json_ex` and `raster_h3_py_batch_reader_transform_failures`; the existing scan symbols keep their signatures.
