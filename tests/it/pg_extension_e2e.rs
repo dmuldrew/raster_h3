@@ -222,7 +222,7 @@ fn check_server(major: &str, cont_tif: &Path, cat_tif: &Path) {
             "CREATE EXTENSION raster_h3;
              SELECT extversion FROM pg_extension WHERE extname = 'raster_h3';"
         ),
-        ["0.4.0"]
+        ["0.5.0"]
     );
 
     // Scalar functions on a known cell.
