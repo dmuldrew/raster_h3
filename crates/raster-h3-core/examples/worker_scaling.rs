@@ -13,8 +13,13 @@
 //!
 //! ```text
 //! cargo run --release -p raster-h3-core --example worker_scaling -- \
-//!     [--quick] [--workers 1,2,4,8] [--reps N] [--side PX] [--json out.json]
+//!     [--quick] [--workers 1,2,4,8] [--reps N] [--side PX] [--budget-mb MB] \
+//!     [--only 'NAME;...'] [--json out.json]
 //! ```
+//!
+//! `merge_ns` includes spilling a resolution map that outgrows its share of
+//! the aggregation budget (`spill_ns` counts that too), so compare a run with
+//! a large `--budget-mb` to see the hash merge alone.
 //!
 //! Worker counts above the machine's cores oversubscribe it; the report
 //! prints the available parallelism so results can be read accordingly.
@@ -103,9 +108,12 @@ const WORKLOADS: &[Workload] = &[
 ];
 
 impl Workload {
-    fn config(&self, workers: usize) -> MultiResolutionConfig {
+    fn config(&self, workers: usize, budget_mb: Option<usize>) -> MultiResolutionConfig {
         let mut config = MultiResolutionConfig::new(self.resolutions.to_vec());
         config.aggregation_workers = Some(workers);
+        if let Some(mb) = budget_mb {
+            config.aggregation_budget_bytes = mb * 1024 * 1024;
+        }
         if !self.quantiles.is_empty() {
             config.quantiles = QuantileTarget::parse_list(self.quantiles).expect("quantiles");
         }
@@ -157,8 +165,8 @@ impl Run {
     }
 }
 
-fn stream_once(path: &Path, workload: &Workload, workers: usize) -> Run {
-    let config = workload.config(workers);
+fn stream_once(path: &Path, workload: &Workload, workers: usize, budget_mb: Option<usize>) -> Run {
+    let config = workload.config(workers, budget_mb);
     let reader = GeoTiffStreamReader::open(path).expect("open raster");
     let start = Instant::now();
     let mut sum = Checksum {
@@ -206,10 +214,16 @@ fn elapsed_ns(start: Instant) -> u64 {
 }
 
 /// One warm-up run, then the median-wall-time run of `reps`.
-fn median_run(path: &Path, workload: &Workload, workers: usize, reps: usize) -> Run {
-    stream_once(path, workload, workers);
+fn median_run(
+    path: &Path,
+    workload: &Workload,
+    workers: usize,
+    reps: usize,
+    budget_mb: Option<usize>,
+) -> Run {
+    stream_once(path, workload, workers, budget_mb);
     let mut runs: Vec<Run> = (0..reps.max(1))
-        .map(|_| stream_once(path, workload, workers))
+        .map(|_| stream_once(path, workload, workers, budget_mb))
         .collect();
     runs.sort_by_key(|r| r.wall_ns);
     let median = runs[runs.len() / 2];
@@ -299,6 +313,10 @@ fn main() {
         .map(|w| w.trim().parse().expect("--workers"))
         .collect();
     let json_path = arg(&args, "--json").map(PathBuf::from);
+    let budget_mb: Option<usize> =
+        arg(&args, "--budget-mb").map(|s| s.parse().expect("--budget-mb"));
+    let only: Option<Vec<&str>> =
+        arg(&args, "--only").map(|s| s.split(';').map(str::trim).collect());
 
     let dir = tempfile::tempdir().expect("temp dir");
     let builder = helpers::TestGeoTiffBuilder::new(side, side)
@@ -319,17 +337,22 @@ fn main() {
         markdown: String::new(),
         json: serde_json::Map::new(),
     };
+    let budget = budget_mb.map_or("default (64 MiB)".to_string(), |mb| format!("{mb} MiB"));
     report.push(&format!(
         "{side}×{side} px rasters ({mpx:.1} Mpx, {PIXEL_DEG}° pixels), centre sampling, \
-         default budgets, `decode_workers` 4. Available parallelism: {cores}. \
+         aggregation budget {budget}, `decode_workers` 4. Available parallelism: {cores}. \
          Median of {reps} run(s) after one warm-up.\n\n\
-         `merge %` is the serial merge's share of wall time. `kernel eff %` is summed \
+         `merge %` is the serial merge's share of wall time; it includes spilling, which \
+         `spill ms` also counts. `kernel eff %` is summed \
          worker time over (kernel wall time × workers): how busy the parallel stage keeps \
          its workers. `decode wait` is time spent waiting on decoded chunks.\n\n"
     ));
     report.json.insert(
         "setup".into(),
-        json!({ "side_px": side, "mpx": mpx, "reps": reps, "cores": cores, "workers": workers }),
+        json!({
+            "side_px": side, "mpx": mpx, "reps": reps, "cores": cores, "workers": workers,
+            "aggregation_budget_mb": budget_mb,
+        }),
     );
 
     let mut summary = String::from(
@@ -338,13 +361,19 @@ fn main() {
     );
     let mut all = Vec::new();
     for workload in WORKLOADS {
+        if only
+            .as_ref()
+            .is_some_and(|names| !names.contains(&workload.name))
+        {
+            continue;
+        }
         let path = match workload.kind {
             Kind::Continuous => &continuous,
             Kind::Categorical => &categorical,
         };
         let runs: Vec<(usize, Run)> = workers
             .iter()
-            .map(|&n| (n, median_run(path, workload, n, reps)))
+            .map(|&n| (n, median_run(path, workload, n, reps, budget_mb)))
             .collect();
         let base = runs[0].1;
         for (n, run) in &runs {
@@ -435,10 +464,10 @@ mod tests {
                 Kind::Continuous => &continuous,
                 Kind::Categorical => &categorical,
             };
-            let one = stream_once(path, workload, 1).checksum;
+            let one = stream_once(path, workload, 1, None).checksum;
             assert_eq!(one.weight, 96.0 * 96.0 * workload.resolutions.len() as f64);
             assert_eq!(
-                stream_once(path, workload, 3).checksum,
+                stream_once(path, workload, 3, None).checksum,
                 one,
                 "{}",
                 workload.name
