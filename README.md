@@ -6,29 +6,9 @@
 [![Python / Polars](https://img.shields.io/badge/Python-Polars_%7C_Arrow-3776AB.svg)](docs/engines/python-polars.md)
 [![PostgreSQL 13–18](https://img.shields.io/badge/PostgreSQL-13–18-336791.svg)](docs/engines/postgresql.md)
 
-A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation uses a configurable memory budget with disk spilling. The same engine ships as a native DuckDB extension, DataFusion-style table providers, a Python/Polars package, a PostgreSQL extension and a command-line tool (see [Engines](#engines)).
-
-The default aggregation budget is 64 MiB, not a whole-process RAM limit. Decoding,
-prefetching, output buffers, and runtime overhead use additional memory. WGS84,
-Web Mercator, and certified Albers chunks can evict completed cells early.
-Arbitrary Proj4 chunks and Albers chunks that may contain the cone apex retain or
-spill cells until the remaining input permits certified eviction or EOF is reached.
-Mosaic workers retain at most 16 tile decoders each, using future chunk references
-to avoid LRU thrashing on wide mosaics (see the [core engine notes](docs/engines/core.md#mosaic-decoder-cache)).
+A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation runs in a [bounded memory budget](docs/engineering.md#1-southernmost-scan-line-horizon-eviction) and spills to disk when needed. The same engine ships as a native DuckDB extension, DataFusion-style table providers, a Python/Polars package, a PostgreSQL extension and a command-line tool (see [Engines](#engines)).
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
-
-Every valid sample is indexed at each requested H3 resolution. Projection row caches
-support horizontal shear and profiling builds; Albers inverse constants are prepared
-under an immutable borrow to avoid stale state after public source-field updates.
-See the [core engine notes](docs/engines/core.md) for projection behavior.
-
-Streamer `metrics()` exposes `StreamProfile::waves` (kernel dispatches),
-`bridged_waves` (helper-thread dispatches from an external Rayon worker to a
-dedicated pool), and `serial_waves` (dispatches run on the calling Rayon worker).
-These counters are available without `stream-profile`; that feature adds per-sample
-instrumentation. See [profiling and wave dispatch](docs/engines/core.md#profiling-and-wave-dispatch)
-for the execution policy and hotspot harness.
 
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
@@ -230,7 +210,7 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 | **Pure Rust, Zero C++ Dependencies** | No GDAL, PROJ or Python runtime; each engine ships as one native library or binary |
 | **One Core, Many Engines** | DuckDB, DataFusion, Python/Polars, PostgreSQL and the CLI all drive the same streamers and return the same cells |
 | **Budgeted aggregation** | Configurable accumulator budget with disk spilling; total RAM also includes decoding and prefetch buffers |
-| **Hardware-Saturating Throughput** | Work-stealing parallelism across all CPU cores |
+| **Multi-Core Throughput** | Raster chunks aggregated in parallel windows across CPU cores |
 | **Native PMTiles v3 Export** | Single-file web maps — zero Tippecanoe, zero tile servers |
 | **Native GeoParquet 1.1 Export** | Stack-allocated WKB polygons with PROJJSON metadata |
 | **Cloud-Native Streaming** | HTTP/S3 COG range prefetching — no local copies needed |
@@ -240,63 +220,28 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 
 ## How It Works
 
-Traditional tools struggle with large rasters. Here is how `raster_h3` solves each bottleneck:
+`raster_h3` reads a raster like a document scanner: one strip at a time, from north to south.
 
-| Step | Traditional Approach | raster_h3 Approach |
-| :--- | :--- | :--- |
-| **Memory** | Load entire raster into RAM | Budget active accumulators and spill to disk |
-| **Projection** | Recalculate spherical math per pixel | Row-constant hoisting: 1 transform per row |
-| **H3 Lookup** | Recompute cell ID per pixel | Exact per-sample indexing with run accumulation |
-| **Eviction** | Hold all results until file completion | Evict finished hexagons immediately via horizon scan |
-| **Web Tiling** | C++ Tippecanoe + scratch files + tile servers | Generate `.pmtiles` archives in 1 step |
+- **Finished hexagons leave early.** Once the scan has passed a hexagon's southern
+  edge, no later row can touch it, so its statistics are final and it is sent on and
+  freed. Memory holds only the band of hexagons under the scanner, not the whole raster.
+- **Results stream into your tool.** Cells arrive in DuckDB, Polars, PostgreSQL,
+  DataFusion or the CLI as they finish, so joins and exports can start before the raster
+  is fully read, and a `LIMIT` can stop the scan early.
+- **Memory stays within a budget.** If the active hexagons outgrow the aggregation
+  budget (64 MiB by default), partial results spill to temporary files on disk and are
+  merged at the end.
+- **Some inputs wait for the end.** After a spill, and for projections whose chunk bounds
+  can't be certified (many PROJ-string projections, Albers chunks near the cone apex), the scanner
+  can't prove a hexagon is finished, so cells are held until the whole file is read.
+  See [Bounding boxes and pruning](docs/crs-and-projection.md#bounding-boxes-and-pruning)
+  for which projections are certified.
+- **One pass, every resolution.** Each pixel is located once and counted at every
+  requested H3 resolution, which is how a multi-zoom PMTiles pyramid comes from a
+  single read.
 
-### The Moving Scanner Front (Constant Memory)
-
-`raster_h3` streams the raster like a document scanner — one thin row at a time from North to South:
-- **Immediate Eviction**: When a scanline passes a hexagon's southernmost boundary, that cell is finalized and streamed directly into query results.
-- **Aggregation memory budget**: The default is 64 MiB for aggregation. This is not a total-process RAM limit; decoded chunks, prefetch buffers, output buffers, and other overhead also consume memory.
-
-Remote COG prefetching has its own 32 MiB response-byte budget, configurable in
-Rust with `RemotePrefetchConfig::max_buffered_bytes`. It covers in-flight requests
-and shared responses retained by the queue or callers; a range larger than the
-budget runs alone. `get_chunk_payload` / `try_get_chunk_payload` return
-`PrefetchedChunk` (dereferences to `[u8]`), not `Arc<Vec<u8>>`. Keep these handles
-short-lived: each slice or clone retains the entire coalesced response. Blocking
-requests can arrive out of order; unused prefetched responses may be evicted and
-fetched again to make room. See [Remote COG prefetching](docs/engines/core.md#remote-cog-prefetching)
-for configuration, retention and byte-usage diagnostics.
-
-### Direct Web-Ready Map Tiles
-
-Generates single-file **PMTiles v3** vector pyramids directly from DuckDB SQL, Python or the CLI:
-- **Zero Intermediate Tooling**: Eliminates C++ Tippecanoe, GeoJSON scratch files, and dedicated tile server infrastructure.
-- **Serverless Map Delivery**: Upload the `.pmtiles` archive directly to Amazon S3, Cloudflare R2, or GitHub Pages and render with zero backend infrastructure.
-
-### Exact Coordinates and Sequential Spans
-
-Pixel centers and subpixel samples use absolute raster coordinates followed by
-CRS transformation. Span discovery uses the same calculation as ordinary pixel
-assignment, avoiding accumulated coordinate drift. Each candidate is indexed
-with H3; contiguous equal-cell runs share accumulation work. Supersampling evaluates each sample once and combines same-cell weights per pixel,
-replaying stored assignments when samples split across cells.
-
-### In-Engine Streaming
-
-Aggregated cells stream into the host engine as they complete — DuckDB `DataChunk`s,
-Arrow `RecordBatch`es for DataFusion and Polars, PostgreSQL rows, or NDJSON / `RH3IPC01` on
-stdout — so queries, joins and exports start before the raster is fully read. Every engine
-pulls on demand, so a `LIMIT` stops aggregation early. When active accumulators exceed
-their budget, temporary spill files hold partial results for merging; the core streamers
-report the runs written in total (`spill_run_count()`) and per resolution
-(`spill_run_counts()`). Projected inputs without certified bounds may defer output until EOF.
-
-Categorical wide output has one row per cell; long output has one row per
-`(cell, category)`. In the core batch reader, `batch_size` and `limit` count these
-output rows, not cells in long format. Core and DuckDB long readers expand one
-cell at a time using the public `CategoricalLongCursor`, keeping pending categories
-bounded by the largest single cell rather than a batch of cells. A cell can span
-multiple batches, and a limit can stop mid-cell; entropy is computed only when an
-entropy column is projected. See the [core batch-reader contract](docs/engines/core.md#batch-readers).
+See [Core Engineering Architecture](#core-engineering-architecture) for how each step is
+implemented.
 
 ---
 
@@ -308,8 +253,8 @@ returns the same cells and statistics for the same input.
 
 | Engine | Crate | Get it | Docs |
 | :--- | :--- | :--- | :--- |
-| **DuckDB** | `raster-h3-duckdb` | Pre-built `.duckdb_extension` from [Releases](https://github.com/dmuldrew/raster_h3/releases), Docker, or `cargo build --release` → `libraster_h3.{so,dylib,dll}` | [DuckDB deep dive](docs/engines/duckdb.md) · [SQL API Reference](docs/api-reference.md) |
-| **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) |
+| **DuckDB** | `raster-h3-duckdb` | Pre-built `.duckdb_extension` from [Releases](https://github.com/dmuldrew/raster_h3/releases), Docker, or `cargo build --release` → `libraster_h3.{so,dylib,dll}` | [DuckDB deep dive](docs/engines/duckdb.md) · [SQL API Reference](docs/sql-api-reference.md) |
+| **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) · [Polars API Reference](docs/polars-api-reference.md) |
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
@@ -338,7 +283,7 @@ LIMIT 5;
 SELECT h3_polygon_to_cells(ST_AsWKB(geom), 8, 'covers') AS cells FROM areas;
 ```
 
-See [`h3_polygon_to_cells`](docs/api-reference.md#h3_polygon_to_cells) for the containment modes
+See [`h3_polygon_to_cells`](docs/sql-api-reference.md#h3_polygon_to_cells) for the containment modes
 (also available in Python as `raster_h3.h3_polygon_to_cells`).
 
 **Python / Polars**
@@ -401,24 +346,17 @@ with one sketch sweep per cell, sharing repeated probabilities. See the
 
 ## Core Engineering Architecture
 
-`raster_h3` achieves near-hardware-limit throughput through these architectural principles, shared by every engine:
+`raster_h3`'s throughput and memory profile come from seven principles, shared by every engine:
 
 | # | Engineering Pillar | Impact |
 | :---: | :--- | :--- |
-| 1 | **Southernmost Scan-Line Horizon Eviction** | Early eviction where certified; disk spilling otherwise |
-| 2 | **Sequential H3 Spans** | Exact indexing with shared accumulation for consecutive equal-cell pixels |
-| 3 | **CRS Transformation** | Identity, analytical, or Proj4 transformation at sample positions |
-| 4 | **Absolute Pixel Coordinates** | One affine coordinate formula for walking, spans, and samples |
-| 5 | **In-Register Run Accumulation** | ~98% fewer hash table lookups |
-| 6 | **Branchless Hardware Min/Max** | Zero branch misprediction penalties (`minsd`/`maxsd`) |
-| 7 | **Zero-Copy `memmap2` & Async Prefetching** | Direct virtual memory mapping with background decompression |
-| 8 | **Zero-Allocation Hex Formatting** | Stack-based 16-byte LUT for H3 index formatting |
-| 9 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before decompression, for CRSs with certified bounds, including EPSG:3413/3031 polar grids ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
-| 10 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
-| 11 | **Lock-Free Buffer Pool** | Zero-allocation buffer recycling via `crossbeam_deque::Injector` |
-| 12 | **Single-Hop In-Order Prefetcher** | Direct worker-to-ring-buffer queue, zero context switches |
-| 13 | **Cloud-Native COG & Mosaic Ingestion** | Async HTTP/S3 range prefetching with Voronoi cutline blending |
-| 14 | **Native OGC GeoParquet 1.1 Exporter** | GIS-valid WKB cell polygons (dateline cells split, polar caps) with embedded PROJJSON metadata and an exact geometry `bbox` |
+| 1 | **Southernmost Scan-Line Horizon Eviction** | Bounded aggregation memory: cells are emitted as soon as they are certified complete; disk spilling otherwise |
+| 2 | **Sequential H3 Spans & In-Register Run Accumulation** | One H3 lookup per pixel, but ~98% fewer hash table updates: equal-cell runs accumulate in registers and flush once |
+| 3 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before any read or decompression, for CRSs with certified bounds, including EPSG:3413/3031 polar grids ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
+| 4 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
+| 5 | **Bounded Prefetch & Decode Pipeline** | `memmap2` zero-copy reads, parallel decompression into a single-hop in-order ring, and recycled buffers under `decode_budget_bytes` |
+| 6 | **Coalesced Cloud Range Reads** | Adjacent COG/S3 tile ranges merged into single HTTP requests and prefetched ahead of the decoders |
+| 7 | **Exact CRS Transformation with Analytical Fast Paths** | Every sample transformed at its true position; identity and analytical Web Mercator/Albers paths skip Proj4 and supply the certified bounds that pruning and eviction rely on |
 
 > 📖 **Detailed explanations** of each architectural pillar — See [docs/engineering.md](docs/engineering.md)  
 > 🗺️ **Source Module Architecture** — File-by-file breakdown of crate internals mapped to these principles: [docs/module-architecture.md](docs/module-architecture.md)
@@ -556,7 +494,7 @@ To aggregate stored values from files with valid metadata instead:
 | CLI | `raster-h3-cli jsonl lst.tif -r 8 --raw-values` |
 | DataFusion | `ContinuousRasterTableProvider::try_new("lst.tif", vec![8])?.with_scale_offset(false)` |
 
-Python and PostgreSQL always calibrate. See [Band calibration and validity](docs/api-reference.md#band-calibration-and-validity).
+Python and PostgreSQL always calibrate. See [Band calibration and validity](docs/sql-api-reference.md#band-calibration-and-validity).
 
 ### Antimeridian Crossing
 

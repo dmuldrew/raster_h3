@@ -140,7 +140,7 @@ classification above so a planner knows which predicates it still has to evaluat
 | `H3ToLatUdf`, `H3ToLngUdf` | `(UInt64) -> Float64` | |
 | `H3GetResolutionUdf` | `h3_get_resolution(UInt64) -> Int64` | |
 | `H3IsValidUdf` | `h3_is_valid(UInt64 \| Utf8) -> Boolean` | |
-| `H3ToWkbUdf` | `h3_to_wkb(UInt64 \| Utf8) -> Binary` ([cell geometry](../api-reference.md#cell-geometry)) | `h3_to_geometry`, `h3_cell_to_geometry` |
+| `H3ToWkbUdf` | `h3_to_wkb(UInt64 \| Utf8) -> Binary` ([cell geometry](../sql-api-reference.md#cell-geometry)) | `h3_to_geometry`, `h3_cell_to_geometry` |
 | `H3CellToParentUdf` | `h3_cell_to_parent(UInt64, Int64) -> UInt64`, `(Utf8, Int64) -> Utf8` | |
 
 ```rust

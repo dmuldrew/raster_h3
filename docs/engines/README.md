@@ -94,7 +94,7 @@ All engines derive their columns from `raster_h3_core::columnar::ColumnSchema`:
 | `ColumnSchema::categorical_long()` | `h3_index`, `h3_hex`, `category` i64, `count`, `fraction`, `total_count`, `resolution`, `shannon_entropy`, `entropy`, `distinct_classes`, `unique_classes`, `wkb` |
 
 The DuckDB table functions keep their own historical column sets (documented in the
-[DuckDB SQL API Reference](../api-reference.md)); PostgreSQL returns a subset (see
+[DuckDB SQL API Reference](../sql-api-reference.md)); PostgreSQL returns a subset (see
 [PostgreSQL](postgresql.md#output-columns)).
 
 ### H3 index representation
@@ -120,12 +120,12 @@ differences that remain:
 | `h3_is_valid(cell \| hex)` | `false` | — |
 | `h3_to_wkb(cell \| hex)` (aliases `h3_to_geometry`, `h3_cell_to_geometry`) | `None` | PostgreSQL has the `bigint` overload only |
 | `h3_cell_to_parent(cell, res)` | `None` when `res` is outside `0..=15` or finer than the cell | DuckDB returns `0` |
-| `h3_polygon_to_cells(wkb, res[, containment])` ([modes](../api-reference.md#h3_polygon_to_cells)) | `Err` for invalid WKB, a resolution outside `0..=15`, or more than `H3_POLYGON_TO_CELLS_MAX_CELLS` (10,000,000) cells | DuckDB and Python only. Both return `NULL` / `None` for invalid geometry or resolution, and raise a query error / `ValueError` for an unknown mode or too many cells. Not yet in DataFusion (no list column type) or PostgreSQL |
+| `h3_polygon_to_cells(wkb, res[, containment])` ([modes](../sql-api-reference.md#h3_polygon_to_cells)) | `Err` for invalid WKB, a resolution outside `0..=15`, or more than `H3_POLYGON_TO_CELLS_MAX_CELLS` (10,000,000) cells | DuckDB and Python only. Both return `NULL` / `None` for invalid geometry or resolution, and raise a query error / `ValueError` for an unknown mode or too many cells. Not yet in DataFusion (no list column type) or PostgreSQL |
 
 Every engine emits the same cell geometry, from one shared encoder: a `Polygon` for
 ordinary cells, a two-part `MultiPolygon` cut at ±180° for cells crossing the
 antimeridian, and polar-cap `Polygon`s for the two pole cells, with longitudes always
-in [-180, 180]. See [cell geometry](../api-reference.md#cell-geometry).
+in [-180, 180]. See [cell geometry](../sql-api-reference.md#cell-geometry).
 
 ## Cross-Engine Parity Testing
 

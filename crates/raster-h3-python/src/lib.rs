@@ -281,20 +281,22 @@ unsafe fn set_c_err(out_err: *mut *mut c_char, msg: &str) {
     }
 }
 
-/// H3 resolutions from a C string; NULL or empty means the default `[8]`.
+/// H3 resolutions from a C string; NULL means the default `[8]`. An empty string is
+/// rejected like any other list without a resolution.
 ///
 /// # Safety
 /// `ptr` must be null or a valid NUL-terminated string.
 unsafe fn parse_c_resolutions(ptr: *const c_char) -> Result<Vec<u8>> {
-    // SAFETY: `ptr` is null or NUL-terminated (caller contract), as `opt_cstr` requires.
-    match unsafe { opt_cstr(ptr) } {
-        None => Ok(vec![8]),
-        Some(s) => try_parse_resolutions_str(&s).ok_or_else(|| {
-            RasterH3Error::InvalidParameter(format!(
-                "Invalid resolutions '{s}': expected H3 resolutions between 0 and 15, e.g. 7,8"
-            ))
-        }),
+    if ptr.is_null() {
+        return Ok(vec![8]);
     }
+    // SAFETY: `ptr` is non-null and NUL-terminated (caller contract).
+    let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+    try_parse_resolutions_str(&s).ok_or_else(|| {
+        RasterH3Error::InvalidParameter(format!(
+            "Invalid resolutions '{s}': expected H3 resolutions between 0 and 15, e.g. 7,8"
+        ))
+    })
 }
 
 /// Categorical output format from a C string; NULL or empty means `wide`.

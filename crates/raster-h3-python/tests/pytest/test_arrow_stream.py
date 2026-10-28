@@ -137,7 +137,7 @@ def test_bad_input_raises(raster_h3, gradient_tif, tmp_path):
     for bbox in ["1,2,3", "x,y,z,w", [1, 2, 3]]:
         with pytest.raises(RuntimeError, match="Invalid bbox"):
             pa.table(raster_h3.RasterH3ArrowStream(gradient_tif, RES, bbox=bbox))
-    for res in [99, "abc", [8, 16]]:
+    for res in [99, "abc", [8, 16], "", []]:
         with pytest.raises(RuntimeError, match="Invalid resolutions"):
             pa.table(raster_h3.RasterH3ArrowStream(gradient_tif, res))
     with pytest.raises(RuntimeError, match="Invalid format"):

@@ -11,7 +11,7 @@ DuckDB is the engine with the widest parameter coverage: every option of the cor
 (sampling, bands, spectral formulas, quantiles, remapping, compaction, worker and memory
 budgets) is a named SQL parameter, and it is the only engine that transcodes
 pre-aggregated Parquet into PMTiles. For every parameter and output column, see the
-[DuckDB SQL API Reference](../api-reference.md).
+[DuckDB SQL API Reference](../sql-api-reference.md).
 
 - [Install](#install)
 - [Docker Quickstart](#docker-quickstart)
@@ -484,7 +484,7 @@ host DuckDB version at runtime (`dlsym` / `GetProcAddress`) and can probe whethe
 `GEOMETRY` type on DuckDB ≥ 1.5; on older versions they return a WKB `BLOB` aliased as
 `GEOMETRY`, the convention the `spatial` extension uses. `h3_to_wkb` always returns a
 plain `BLOB`. Cells crossing the antimeridian are `MULTIPOLYGON`s and the two pole cells
-are polar-cap polygons; see [cell geometry](../api-reference.md#cell-geometry).
+are polar-cap polygons; see [cell geometry](../sql-api-reference.md#cell-geometry).
 
 ## FFI Safety
 
