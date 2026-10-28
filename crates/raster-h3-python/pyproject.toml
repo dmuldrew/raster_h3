@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "raster-h3"
-version = "0.4.0"
+version = "0.5.0"
 description = "High-performance GeoTIFF/COG to H3 hexagonal aggregation for Polars, PyArrow, DuckDB, and DataFusion"
 readme = "README.md"
 license = { text = "MIT" }

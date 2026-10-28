@@ -886,9 +886,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmap2"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
 ]
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "h3o",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "criterion",
  "crossbeam-deque",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-datafusion"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "h3o",
  "raster-h3-core",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-duckdb"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crossbeam-deque",
  "h3o",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-pg"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "h3o",
  "libc",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-python"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "h3o",
  "libc",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "raster_h3"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crossbeam-deque",
  "flate2",
