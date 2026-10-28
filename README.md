@@ -6,29 +6,9 @@
 [![Python / Polars](https://img.shields.io/badge/Python-Polars_%7C_Arrow-3776AB.svg)](docs/engines/python-polars.md)
 [![PostgreSQL 13–18](https://img.shields.io/badge/PostgreSQL-13–18-336791.svg)](docs/engines/postgresql.md)
 
-A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation uses a configurable memory budget with disk spilling. The same engine ships as a native DuckDB extension, DataFusion-style table providers, a Python/Polars package, a PostgreSQL extension and a command-line tool (see [Engines](#engines)).
-
-The default aggregation budget is 64 MiB, not a whole-process RAM limit. Decoding,
-prefetching, output buffers, and runtime overhead use additional memory. WGS84,
-Web Mercator, and certified Albers chunks can evict completed cells early.
-Arbitrary Proj4 chunks and Albers chunks that may contain the cone apex retain or
-spill cells until the remaining input permits certified eviction or EOF is reached.
-Mosaic workers retain at most 16 tile decoders each, using future chunk references
-to avoid LRU thrashing on wide mosaics (see the [core engine notes](docs/engines/core.md#mosaic-decoder-cache)).
+A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, Cloud-Optimized GeoTIFFs) into [Uber H3](https://h3geo.org/) hexagonal grid cells — and generates cloud-native **PMTiles v3** vector pyramids for instant web visualization. Aggregation runs in a [bounded memory budget](docs/engineering.md#1-southernmost-scan-line-horizon-eviction) and spills to disk when needed. The same engine ships as a native DuckDB extension, DataFusion-style table providers, a Python/Polars package, a PostgreSQL extension and a command-line tool (see [Engines](#engines)).
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
-
-Every valid sample is indexed at each requested H3 resolution. Projection row caches
-support horizontal shear and profiling builds; Albers inverse constants are prepared
-under an immutable borrow to avoid stale state after public source-field updates.
-See the [core engine notes](docs/engines/core.md) for projection behavior.
-
-Streamer `metrics()` exposes `StreamProfile::waves` (kernel dispatches),
-`bridged_waves` (helper-thread dispatches from an external Rayon worker to a
-dedicated pool), and `serial_waves` (dispatches run on the calling Rayon worker).
-These counters are available without `stream-profile`; that feature adds per-sample
-instrumentation. See [profiling and wave dispatch](docs/engines/core.md#profiling-and-wave-dispatch)
-for the execution policy and hotspot harness.
 
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
