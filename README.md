@@ -222,15 +222,20 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 
 `raster_h3` reads a raster like a document scanner: one strip at a time, from north to south.
 
-- **Finished hexagons leave immediately.** Once the scan has passed a hexagon's southern
+- **Finished hexagons leave early.** Once the scan has passed a hexagon's southern
   edge, no later row can touch it, so its statistics are final and it is sent on and
   freed. Memory holds only the band of hexagons under the scanner, not the whole raster.
 - **Results stream into your tool.** Cells arrive in DuckDB, Polars, PostgreSQL,
-  DataFusion or the CLI as they finish, so joins and exports start before the raster
-  is fully read, and a `LIMIT` stops the scan early.
+  DataFusion or the CLI as they finish, so joins and exports can start before the raster
+  is fully read, and a `LIMIT` can stop the scan early.
 - **Memory stays within a budget.** If the active hexagons outgrow the aggregation
   budget (64 MiB by default), partial results spill to temporary files on disk and are
   merged at the end.
+- **Some inputs wait for the end.** After a spill, and for projections whose chunk bounds
+  can't be certified (many PROJ-string projections, Albers chunks near the cone apex), the scanner
+  can't prove a hexagon is finished, so cells are held until the whole file is read.
+  See [Bounding boxes and pruning](docs/crs-and-projection.md#bounding-boxes-and-pruning)
+  for which projections are certified.
 - **One pass, every resolution.** Each pixel is located once and counted at every
   requested H3 resolution, which is how a multi-zoom PMTiles pyramid comes from a
   single read.
