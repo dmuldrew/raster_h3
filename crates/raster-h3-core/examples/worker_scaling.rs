@@ -539,4 +539,26 @@ mod tests {
         assert_eq!((x.cells, x.weight), (y.cells, y.weight));
         assert_ne!(x.digest, y.digest);
     }
+
+    #[test]
+    fn spilling_runs_match_in_memory_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fine.tif");
+        helpers::TestGeoTiffBuilder::new(96, 96)
+            .origin(ORIGIN.0, ORIGIN.1)
+            .pixel_size(PIXEL_DEG)
+            .write_fn(&path, |c, r| ((c * 31 + r * 17) % 97) as f32)
+            .unwrap();
+        let fine = WORKLOADS
+            .iter()
+            .find(|w| w.name == "res 11 (fine)")
+            .unwrap();
+        let in_memory = stream_once(&path, fine, 1, None);
+        assert_eq!(in_memory.spill_ns, 0);
+        for workers in [1, 3] {
+            let spilled = stream_once(&path, fine, workers, Some(1));
+            assert!(spilled.spill_ns > 0, "a 1 MiB budget must spill");
+            assert_eq!(spilled.checksum, in_memory.checksum, "{workers} workers");
+        }
+    }
 }
