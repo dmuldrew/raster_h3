@@ -199,6 +199,9 @@ jobs:
       - name: Test hotspot harness ownership sampling
         run: cargo test --locked --release -p raster-h3-core --example profile_hotspots
 
+      - name: Test worker-scaling benchmark output equality
+        run: cargo test --locked --release -p raster-h3-core --example worker_scaling
+
       - name: Build Dynamic Library & Binaries
         run: cargo build --locked --release --target ${{ matrix.target }}
 

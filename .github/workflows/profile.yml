@@ -2,8 +2,9 @@ name: Hotspot Profile
 
 # Optional manual run; prefer local profiling on stable hardware for comparisons.
 # Measures mosaic tile-scan scaling and nested-Rayon wave dispatch (see
-# crates/raster-h3-core/examples/profile_hotspots.rs). Results go to the job
-# summary, `::notice` annotations and a JSON artifact. Wall times on hosted
+# crates/raster-h3-core/examples/profile_hotspots.rs), and aggregation-worker
+# scaling (examples/worker_scaling.rs). Results go to the job summary and
+# JSON artifacts (plus `::notice` annotations for the hotspot profile). Wall times on hosted
 # runners are noisy; allocator peaks and counts can also vary with scheduling.
 
 on:
@@ -39,3 +40,27 @@ jobs:
         with:
           name: hotspot-profile-${{ github.sha }}
           path: profile.json
+
+  # Aggregation-worker scaling (crates/raster-h3-core/examples/worker_scaling.rs):
+  # how wall time splits between parallel kernel waves and the serial merge at
+  # 1/2/4/8 workers. Hosted runners have few cores, so the higher counts
+  # oversubscribe them; use a larger runner or a local machine for decisions.
+  worker-scaling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Run worker-scaling benchmark
+        env:
+          QUICK: ${{ inputs.quick && '--quick' || '' }}
+        run: |
+          nproc
+          cargo run --locked --release -p raster-h3-core --example worker_scaling -- ${QUICK:+"$QUICK"} --json worker-scaling.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: worker-scaling-${{ github.sha }}
+          path: worker-scaling.json

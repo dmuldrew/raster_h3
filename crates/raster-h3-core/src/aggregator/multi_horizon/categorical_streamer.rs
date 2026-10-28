@@ -196,6 +196,11 @@ impl MultiCategoricalHorizonStreamer {
         self.inner.transform_failures()
     }
 
+    /// Stage timings and counters, including observed kernel concurrency.
+    pub fn metrics(&self) -> &super::profile::StreamProfile {
+        self.inner.metrics()
+    }
+
     /// Peak active-map allocation estimate (not whole-process memory).
     pub fn peak_active_bytes(&self) -> usize {
         self.inner.peak_active_bytes()
