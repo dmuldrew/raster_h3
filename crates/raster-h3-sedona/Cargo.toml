@@ -1,0 +1,38 @@
+[package]
+name = "raster-h3-sedona"
+publish = false
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.94"
+authors = ["raster_h3 contributors"]
+license = "MIT"
+repository = "https://github.com/dmuldrew/raster_h3"
+description = "Apache DataFusion / SedonaDB adapter for raster_h3 table functions and H3 scalar UDFs"
+
+# Standalone workspace: DataFusion is pinned to SedonaDB's version, and keeping it out of
+# the main workspace leaves the root Cargo.lock, `cargo deny` and `--workspace` CI untouched.
+[workspace]
+
+[lib]
+name = "raster_h3_sedona"
+
+[dependencies]
+raster-h3-core = { path = "../raster-h3-core" }
+raster-h3-datafusion = { path = "../raster-h3-datafusion" }
+# Must match the DataFusion / arrow versions pinned by apache/sedona-db.
+datafusion = { version = "=54.1.0", default-features = false, features = ["sql"] }
+arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }
+futures = "0.3"
+tokio = { version = "1", features = ["rt"] }
+async-trait = "0.1"
+# Only for the `sedona-e2e` tests; pinned to the SedonaDB revision this adapter was checked against.
+sedona = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc06fae0ff5662e99608d7e8b1", default-features = false, features = ["geo"], optional = true }
+
+[features]
+# Run the test suite inside a real SedonaContext (slow first build: compiles SedonaDB).
+sedona-e2e = ["dep:sedona"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3.10"
+tiff = "0.11"
