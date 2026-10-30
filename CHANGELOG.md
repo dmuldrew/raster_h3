@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- DataFusion `FilterPredicate::Bbox` pushdown no longer changes the aggregates of cells straddling the box edge. The pushed box is widened by more than the largest cell diameter at the coarsest resolution, so every cell intersecting the box keeps the values of an unfiltered scan and the pushdown is a true `Inexact` superset. It is not pushed when compaction is on. `with_bbox` keeps its pixel-clipping semantics.
+
 ## [0.5.0] - 2026-10-28
 
 ### Added
