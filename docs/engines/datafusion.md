@@ -12,7 +12,8 @@ using the same shapes as Apache DataFusion's `TableProvider`, `ExecutionPlan` an
 > DataFusion's, operating on `raster_h3_core::columnar` types (`ColumnSchema`,
 > `RecordBatch`, `ColumnArray`). To use them inside a real DataFusion `SessionContext`, wrap
 > them in DataFusion's traits and import batches through the Arrow C Stream
-> (`execute_arrow_c_stream`). Its only dependencies are `raster-h3-core` and `h3o`.
+> (`execute_arrow_c_stream`), or use [`raster-h3-sedona`](#using-with-apache-datafusion-and-sedonadb),
+> which does exactly that. Its only dependencies are `raster-h3-core` and `h3o`.
 
 ```toml
 [dependencies]
@@ -275,51 +276,46 @@ The DataFusion crate has no file writers. For Parquet/GeoParquet or PMTiles, use
 exporters (`H3ParquetWriter`, `H3PmtilesTiler`, see [Core](core.md#file-exporters)) with the
 same `MultiResolutionConfig`, or write the Arrow stream with any Arrow-based writer.
 
-## Using with Apache DataFusion
+## Using with Apache DataFusion and SedonaDB
 
-The traits above mirror DataFusion's, but the crate does not depend on `datafusion`. The
-bridge is the Arrow C Stream: `execute_arrow_c_stream()` returns a `#[repr(C)]`
-`ArrowArrayStream` with the standard layout, which `arrow-rs` can import. A minimal sketch
-that materialises a scan into a DataFusion `MemTable`:
+[`crates/raster-h3-sedona`](../../crates/raster-h3-sedona) is the real DataFusion adapter.
+It depends on `datafusion`/`arrow` at the versions [SedonaDB](https://github.com/apache/sedona-db)
+pins (currently DataFusion `=54.1.0`, arrow `58`), so the same objects register into a plain
+`SessionContext` or into `SedonaContext::ctx`:
 
 ```rust
-use std::sync::Arc;
+let ctx = sedona::context::SedonaContext::new_local_interactive().await?;
+raster_h3_sedona::register_all(&ctx.ctx); // or a plain datafusion SessionContext
 
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionContext;
-use raster_h3_datafusion::{ContinuousRasterTableProvider, TableProvider};
-
-let provider = ContinuousRasterTableProvider::try_new("dem.tif", vec![8])?;
-let mut stream = provider.scan(None, &[], None)?.execute_arrow_c_stream()?;
-
-// `from_raw` moves the stream out and leaves `stream` released, so its Drop is a no-op.
-let reader = unsafe {
-    ArrowArrayStreamReader::from_raw(&mut stream as *mut _ as *mut FFI_ArrowArrayStream)?
-};
-let schema = reader.schema();
-let batches = reader.collect::<Result<Vec<_>, _>>()?;
-
-let ctx = SessionContext::new();
-ctx.register_table("dem", Arc::new(MemTable::try_new(schema, vec![batches])?))?;
-let df = ctx.sql("SELECT h3_index, mean FROM dem WHERE count > 10").await?;
+ctx.sql(
+    "SELECT h3_index, mean FROM h3_raster_continuous_aggregate('dem.tif', 8)
+     WHERE count >= 4
+       AND ST_Intersects(wkb, ST_SetSRID(ST_GeomFromWKT('POINT (-122.42 37.77)'), 4326))",
+).await?.show().await?;
 ```
 
-For streaming instead of materialising, implement DataFusion's `TableProvider` and return
-a `StreamingTableExec` (or your own `ExecutionPlan`) that calls this crate's `scan` with the
-projection, translated filters and limit DataFusion passes in. Map each DataFusion
-`Expr` you recognise to a `FilterPredicate`, and report this crate's
-`supports_filters_pushdown` result (`Exact` / `Inexact` / `Unsupported`) as DataFusion's
-`TableProviderFilterPushDown` so DataFusion re-applies whatever was not handled exactly.
-Wrap the `ScalarUDFImpl`s the same way, converting Arrow arrays to and from `ColumnArray`.
+| Piece | What it does |
+| :--- | :--- |
+| `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) and `LIMIT` are pushed down. |
+| Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
+| Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals` between `wkb` and a constant `geoarrow.wkb` geometry in `OGC:CRS84` / `EPSG:4326` push an `Inexact` `bbox`. Core's `bbox` drops *samples* outside the box, so the query geometry's envelope is widened by 4× the average edge length at the coarsest resolution, which is more than any cell's diameter. Every cell touching the envelope then keeps all its samples, and the partial cells near the widened edge fail the re-applied predicate. Compacted tables (`with_compact(true)`) skip spatial pushdown because their cells have no size bound. |
+| Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
+| Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types. |
+| Geometry | The `wkb` column and `h3_to_wkb` results are `geoarrow.wkb` fields with CRS `OGC:CRS84` (planar edges, as in the GeoParquet export), so Sedona's `ST_*` functions accept them directly. |
 
-The `arrow` / `datafusion` versions are your choice; this sketch is not compiled in this
-repository's CI.
+The crate is a standalone Cargo workspace (listed in the root `exclude`), so DataFusion
+never enters the root `Cargo.lock` or the `--workspace` CI jobs. Not yet covered:
+registering from SedonaDB's Python API
+(which takes a `sedonadb_table_provider` capsule; `sedona_extension::ExportedTableProvider`
+can wrap `RasterH3Table` for that).
 
 ## Testing
 
 ```bash
 cargo test -p raster-h3-datafusion
+# DataFusion / SedonaDB adapter (standalone workspace)
+cargo test --manifest-path crates/raster-h3-sedona/Cargo.toml
+cargo test --manifest-path crates/raster-h3-sedona/Cargo.toml --features sedona-e2e  # inside a real SedonaContext
 ```
 
 Unit tests cover projection, limit, filter narrowing (resolution and bbox), the Arrow C

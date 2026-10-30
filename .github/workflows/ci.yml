@@ -363,6 +363,41 @@ jobs:
       - name: Run pg-extension tests
         run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
 
+  # raster-h3-sedona is a standalone workspace (DataFusion pinned to SedonaDB's version), so
+  # the --workspace jobs above never see it. The `sedona-e2e` suite is left to manual runs:
+  # it compiles SedonaDB from git.
+  sedona-adapter:
+    name: DataFusion / SedonaDB adapter
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: crates/raster-h3-sedona
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: crates/raster-h3-sedona
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --no-fail-fast
+
   # All supply-chain checks are blocking; exceptions belong in deny.toml with a reason.
   deny:
     name: cargo-deny (${{ matrix.checks }})
@@ -426,7 +461,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, lint, msrv, community-build, test-crates, deny, metadata, package-check, wheel-validation, safety]
+    needs: [build, lint, msrv, community-build, test-crates, sedona-adapter, deny, metadata, package-check, wheel-validation, safety]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

@@ -257,6 +257,7 @@ returns the same cells and statistics for the same input.
 | **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) · [Polars API Reference](docs/polars-api-reference.md) |
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
+| **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version) | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
 | **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 
@@ -321,6 +322,17 @@ let ctx = RasterH3SessionCatalog::new();
 let provider = ctx.h3_raster_continuous_aggregate("dem.tif", vec![8])?;
 let plan = provider.scan(Some(&[0, 2]), &[FilterPredicate::MinCount(10.0)], Some(1000))?;
 for batch in plan.execute()? { /* RecordBatch with h3_index, mean */ }
+```
+
+**Apache DataFusion / SedonaDB**
+
+```rust
+let ctx = sedona::context::SedonaContext::new_local_interactive().await?;
+raster_h3_sedona::register_all(&ctx.ctx); // or a plain datafusion SessionContext
+ctx.sql("SELECT h3_index, mean FROM h3_raster_continuous_aggregate('dem.tif', 8) WHERE count >= 10")
+    .await?
+    .show()
+    .await?;
 ```
 
 **Rust library**
@@ -543,6 +555,7 @@ cargo build --release -p raster-h3-pg --features pg-extension  # PostgreSQL modu
 | `raster-h3-core` | [`crates/raster-h3-core`](crates/raster-h3-core) |
 | `raster-h3-duckdb` | [`crates/raster-h3-duckdb`](crates/raster-h3-duckdb) |
 | `raster-h3-datafusion` | [`crates/raster-h3-datafusion`](crates/raster-h3-datafusion) |
+| `raster-h3-sedona` | [`crates/raster-h3-sedona`](crates/raster-h3-sedona) (standalone workspace) |
 | `raster-h3-python` | [`crates/raster-h3-python`](crates/raster-h3-python) |
 | `raster-h3-pg` | [`crates/raster-h3-pg`](crates/raster-h3-pg) |
 | `raster-h3-cli` | [`crates/raster-h3-cli`](crates/raster-h3-cli) |
