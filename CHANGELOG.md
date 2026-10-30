@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `raster-h3-sedona`: a real Apache DataFusion adapter (DataFusion `=54.1.0`, arrow `58`, matching SedonaDB) that registers into a plain `SessionContext` or SedonaDB's `SedonaContext::ctx`. It provides `RasterH3Table` (a `TableProvider` with projection, `LIMIT` and `Expr` filter pushdown, streamed zero-copy over the Arrow C Stream), the `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` table functions (with an optional CRS argument), and the H3 scalar UDFs. `wkb` and `h3_to_wkb` output are `geoarrow.wkb` fields in `OGC:CRS84`, so Sedona's `ST_*` functions accept them directly. It is a standalone workspace, so it adds nothing to the root `Cargo.lock`. A `sedona-e2e` feature runs the tests inside a real `SedonaContext`.
+- `raster-h3-sedona` spatial pushdown: `ST_Intersects`-style predicates between `wkb` and a constant lon/lat geometry push a `bbox` into the scan. The box is widened past the largest cell, so cells on the query edge keep all their samples and results match an unpruned scan.
 
 ## [0.5.0] - 2026-10-28
 

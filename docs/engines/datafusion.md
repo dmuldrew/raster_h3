@@ -298,13 +298,14 @@ ctx.sql(
 | :--- | :--- |
 | `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) and `LIMIT` are pushed down. |
 | Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
+| Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals` between `wkb` and a constant `geoarrow.wkb` geometry in `OGC:CRS84` / `EPSG:4326` push an `Inexact` `bbox`. Core's `bbox` drops *samples* outside the box, so the query geometry's envelope is widened by 4× the average edge length at the coarsest resolution, which is more than any cell's diameter. Every cell touching the envelope then keeps all its samples, and the partial cells near the widened edge fail the re-applied predicate. Compacted tables (`with_compact(true)`) skip spatial pushdown because their cells have no size bound. |
 | Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
 | Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types. |
 | Geometry | The `wkb` column and `h3_to_wkb` results are `geoarrow.wkb` fields with CRS `OGC:CRS84` (planar edges, as in the GeoParquet export), so Sedona's `ST_*` functions accept them directly. |
 
 The crate is a standalone Cargo workspace (listed in the root `exclude`), so DataFusion
-never enters the root `Cargo.lock` or the `--workspace` CI jobs. Not yet covered: `bbox`
-pushdown from `ST_Intersects(wkb, <constant>)`, and registering from SedonaDB's Python API
+never enters the root `Cargo.lock` or the `--workspace` CI jobs. Not yet covered:
+registering from SedonaDB's Python API
 (which takes a `sedonadb_table_provider` capsule; `sedona_extension::ExportedTableProvider`
 can wrap `RasterH3Table` for that).
 

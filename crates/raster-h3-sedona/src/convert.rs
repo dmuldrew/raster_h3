@@ -20,7 +20,7 @@ pub const GEOARROW_WKB_EXTENSION: &str = "geoarrow.wkb";
 pub const GEOARROW_WKB_METADATA: &str = r#"{"crs":"OGC:CRS84"}"#;
 
 /// Name of the WKB polygon column in every `raster_h3` table schema.
-const WKB_COLUMN: &str = "wkb";
+pub(crate) const WKB_COLUMN: &str = "wkb";
 
 pub(crate) fn to_df_error(err: RasterH3Error) -> DataFusionError {
     DataFusionError::External(Box::new(err))

@@ -26,6 +26,7 @@
 
 mod convert;
 mod filters;
+mod spatial;
 pub mod table;
 pub mod udf;
 pub mod udtf;

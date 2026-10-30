@@ -16,6 +16,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::ExecutionPlan;
+use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::columnar::ArrowArrayStream;
 use raster_h3_datafusion::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
@@ -23,6 +24,7 @@ use raster_h3_datafusion::{
 
 use crate::convert::{to_arrow_schema, to_df_error};
 use crate::filters::translate;
+use crate::spatial::cell_margin_km;
 
 /// Which aggregation a table runs; selects the columns filters may be pushed into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,34 +36,53 @@ pub enum TableKind {
 /// A raster aggregated to H3 cells, exposed as a DataFusion table.
 ///
 /// Projection and `LIMIT` are pushed into the scanline aggregator, and so are filters on
-/// `count` / `total_count`, `mean`, `majority_fraction` and `resolution` (see the
-/// `filters` module). Aggregation runs on DataFusion's blocking thread pool and streams
+/// `count` / `total_count`, `mean`, `majority_fraction` and `resolution`, and spatial
+/// predicates on `wkb` against a constant lon/lat geometry (see the `filters` and
+/// `spatial` modules). Aggregation runs on DataFusion's blocking thread pool and streams
 /// batches back through the Arrow C Stream Interface without copying.
 pub struct RasterH3Table {
     inner: Arc<dyn raster_h3_datafusion::TableProvider>,
     kind: TableKind,
     schema: arrow::datatypes::SchemaRef,
+    /// Bound on cell size for spatial pushdown; `None` disables it.
+    bbox_margin_km: Option<f64>,
 }
 
 impl RasterH3Table {
     /// Wrap a configured continuous provider (CRS, nodata, quantiles, ...).
     pub fn continuous(provider: ContinuousRasterTableProvider) -> Self {
-        Self::new(Arc::new(provider), TableKind::Continuous)
+        let margin = bbox_margin_km(&provider.config);
+        Self::new(Arc::new(provider), TableKind::Continuous, margin)
     }
 
     /// Wrap a configured categorical provider (format, remapper, ...).
     pub fn categorical(provider: CategoricalRasterTableProvider) -> Self {
-        Self::new(Arc::new(provider), TableKind::Categorical)
+        let margin = bbox_margin_km(&provider.config);
+        Self::new(Arc::new(provider), TableKind::Categorical, margin)
     }
 
-    fn new(inner: Arc<dyn raster_h3_datafusion::TableProvider>, kind: TableKind) -> Self {
+    fn new(
+        inner: Arc<dyn raster_h3_datafusion::TableProvider>,
+        kind: TableKind,
+        bbox_margin_km: Option<f64>,
+    ) -> Self {
         let schema = to_arrow_schema(&inner.schema());
         Self {
             inner,
             kind,
             schema,
+            bbox_margin_km,
         }
     }
+}
+
+/// Margin covering the largest cell the scan can emit: the coarsest configured resolution.
+/// Compaction merges children into coarser parents, so it gets no margin.
+fn bbox_margin_km(config: &MultiResolutionConfig) -> Option<f64> {
+    if config.compact || config.compact_h3_children {
+        return None;
+    }
+    cell_margin_km(*config.resolutions.iter().min()?)
 }
 
 impl fmt::Debug for RasterH3Table {
@@ -89,7 +110,7 @@ impl TableProvider for RasterH3Table {
         Ok(filters
             .iter()
             .map(|f| {
-                translate(f, self.kind)
+                translate(f, self.kind, self.bbox_margin_km)
                     .map_or(TableProviderFilterPushDown::Unsupported, |t| t.pushdown)
             })
             .collect())
@@ -114,7 +135,7 @@ impl TableProvider for RasterH3Table {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let predicates: Vec<FilterPredicate> = filters
             .iter()
-            .filter_map(|f| translate(f, self.kind))
+            .filter_map(|f| translate(f, self.kind, self.bbox_margin_km))
             .flat_map(|t| t.predicates)
             .collect();
 
