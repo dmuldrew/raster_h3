@@ -85,6 +85,14 @@ pub trait TableProvider: Send + Sync {
 /// `config`. Returns `false` when the filter excludes every row. Filters only ever narrow the
 /// table: a `Resolution` outside the configured set or a `Bbox` disjoint from the configured
 /// one yields an empty scan rather than widening it.
+///
+/// Core's bbox clips individual samples, so a cell straddling its edge would be aggregated
+/// from only part of its pixels. A pushed `Bbox` is therefore widened by [`cell_margin_km`]
+/// at the coarsest resolution first: every cell that touches the requested box then lies
+/// wholly inside the widened one and keeps its full aggregate. The partial cells near the
+/// widened edge do not touch the requested box, so the caller's re-applied predicate drops
+/// them (the pushdown is `Inexact`). With compaction on, a cell's output depends on all its
+/// children, so the box is not pushed at all.
 fn apply_shared_filter(config: &mut MultiResolutionConfig, filter: &FilterPredicate) -> bool {
     match *filter {
         FilterPredicate::MinCount(v) => {
@@ -99,21 +107,91 @@ fn apply_shared_filter(config: &mut MultiResolutionConfig, filter: &FilterPredic
                 false
             }
         }
-        FilterPredicate::Bbox(bbox) => match config.bbox {
-            None => {
-                config.bbox = Some(bbox);
-                true
+        FilterPredicate::Bbox(bbox) => {
+            if config.compact || config.compact_h3_children {
+                return true;
             }
-            Some(current) => match intersect_bbox(current, bbox) {
-                Some(narrowed) => {
-                    config.bbox = Some(narrowed);
+            let Some(widened) = config
+                .resolutions
+                .iter()
+                .min()
+                .and_then(|&r| cell_margin_km(r))
+                .and_then(|margin| expand_bbox(bbox, margin))
+            else {
+                return true;
+            };
+            match config.bbox {
+                None => {
+                    config.bbox = Some(widened);
                     true
                 }
-                None => false,
-            },
-        },
+                Some(current) => match intersect_bbox(current, widened) {
+                    Some(narrowed) => {
+                        config.bbox = Some(narrowed);
+                        true
+                    }
+                    None => false,
+                },
+            }
+        }
         _ => true,
     }
+}
+
+/// Kilometres per degree of latitude, rounded down so degree margins come out larger.
+const KM_PER_DEG_LAT: f64 = 110.0;
+/// Kilometres per degree of longitude at the equator, rounded down likewise.
+const KM_PER_DEG_LON_EQUATOR: f64 = 111.0;
+/// Beyond this latitude the widened box spans every longitude.
+const POLAR_LAT: f64 = 89.0;
+
+/// A distance larger than the diameter of any H3 cell at `resolution`, including the
+/// samples a cell owns along its geodesic edges.
+///
+/// The largest cells have edges about 1.4x the average and a diameter about 2x their edge,
+/// so roughly 2.8x the average edge; 4x leaves headroom.
+fn cell_margin_km(resolution: u8) -> Option<f64> {
+    h3o::Resolution::try_from(resolution)
+        .ok()
+        .map(|r| 4.0 * r.edge_length_km())
+}
+
+/// Widen a `[min_lon, min_lat, max_lon, max_lat]` box by `margin_km` on every side. The
+/// result crosses the antimeridian (`min_lon > max_lon`) when the margin wraps, and spans
+/// every longitude near a pole or once wider than the globe. `None` for coordinates out of
+/// range, in which case the box is not pushed.
+fn expand_bbox(bbox: [f64; 4], margin_km: f64) -> Option<[f64; 4]> {
+    let [min_lon, min_lat, max_lon, max_lat] = bbox;
+    let in_range =
+        |lon: f64, lat: f64| (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat);
+    if !(in_range(min_lon, min_lat) && in_range(max_lon, max_lat)) || min_lat > max_lat {
+        return None;
+    }
+    let lat_margin = margin_km / KM_PER_DEG_LAT;
+    let lo_lat = (min_lat - lat_margin).max(-90.0);
+    let hi_lat = (max_lat + lat_margin).min(90.0);
+    let widest = lo_lat.abs().max(hi_lat.abs());
+    if widest >= POLAR_LAT {
+        return Some([-180.0, lo_lat, 180.0, hi_lat]);
+    }
+    let lon_margin = margin_km / (KM_PER_DEG_LON_EQUATOR * widest.to_radians().cos());
+    let span = if min_lon > max_lon {
+        max_lon + 360.0 - min_lon
+    } else {
+        max_lon - min_lon
+    };
+    if span + 2.0 * lon_margin >= 360.0 {
+        return Some([-180.0, lo_lat, 180.0, hi_lat]);
+    }
+    let mut lo_lon = min_lon - lon_margin;
+    let mut hi_lon = max_lon + lon_margin;
+    if lo_lon < -180.0 {
+        lo_lon += 360.0;
+    }
+    if hi_lon > 180.0 {
+        hi_lon -= 360.0;
+    }
+    Some([lo_lon, lo_lat, hi_lon, hi_lat])
 }
 
 /// Intersect two `[min_lon, min_lat, max_lon, max_lat]` boxes; `None` when disjoint.
@@ -130,6 +208,66 @@ fn intersect_bbox(current: [f64; 4], other: [f64; 4]) -> Option<[f64; 4]> {
         current[3].min(other[3]),
     ];
     (out[0] <= out[2] && out[1] <= out[3]).then_some(out)
+}
+
+#[cfg(test)]
+mod bbox_tests {
+    use super::*;
+    use h3o::CellIndex;
+
+    #[test]
+    fn expand_wraps_and_saturates() {
+        let m = 110.0; // one degree of latitude
+        assert_eq!(
+            expand_bbox([0.0, 0.0, 1.0, 1.0], 0.0),
+            Some([0.0, 0.0, 1.0, 1.0])
+        );
+        let [lo, s, hi, n] = expand_bbox([10.0, 10.0, 11.0, 11.0], m).unwrap();
+        assert_eq!((s, n), (9.0, 12.0));
+        assert!(lo < 9.0 && hi > 12.0);
+        // Widening across the antimeridian yields min_lon > max_lon.
+        let [lo, _, hi, _] = expand_bbox([179.5, 0.0, 179.9, 1.0], m).unwrap();
+        assert!(lo > hi && lo < 179.5 && hi > -180.0);
+        // A box already crossing it stays crossing, and grows on both sides.
+        let [lo, _, hi, _] = expand_bbox([178.0, 0.0, -178.0, 1.0], m).unwrap();
+        assert!(lo < 178.0 && hi > -178.0 && lo > hi);
+        // Near a pole, or wider than the globe, every longitude is kept.
+        assert_eq!(expand_bbox([0.0, 88.5, 1.0, 88.6], m).unwrap()[0], -180.0);
+        assert_eq!(expand_bbox([-179.5, 0.0, 179.5, 1.0], m).unwrap()[2], 180.0);
+        assert_eq!(expand_bbox([190.0, 0.0, 191.0, 1.0], m), None);
+    }
+
+    #[test]
+    fn margin_exceeds_every_cell_diameter() {
+        for res in 0..=3u8 {
+            let margin = cell_margin_km(res).unwrap();
+            let r = h3o::Resolution::try_from(res).unwrap();
+            let widest = CellIndex::base_cells()
+                .flat_map(|b| b.children(r))
+                .map(|cell| {
+                    let b: Vec<_> = cell.boundary().iter().copied().collect();
+                    b.iter()
+                        .flat_map(|p| b.iter().map(move |q| p.distance_km(*q)))
+                        .fold(0.0, f64::max)
+                })
+                .fold(0.0, f64::max);
+            assert!(
+                widest * 1.25 < margin,
+                "res {res}: widest {widest} km, margin {margin} km"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_skips_bbox_pushdown() {
+        let mut config = MultiResolutionConfig::new(vec![8]);
+        config.compact = true;
+        assert!(apply_shared_filter(
+            &mut config,
+            &FilterPredicate::Bbox([0.0, 0.0, 1.0, 1.0])
+        ));
+        assert_eq!(config.bbox, None);
+    }
 }
 
 /// Physical execution plan for continuous H3 raster aggregation.
