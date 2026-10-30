@@ -210,6 +210,20 @@ fn intersect_bbox(current: [f64; 4], other: [f64; 4]) -> Option<[f64; 4]> {
     (out[0] <= out[2] && out[1] <= out[3]).then_some(out)
 }
 
+/// The row limit a scan may hand its batch reader. A pushed `Bbox` is `Inexact`: the scan
+/// also emits cells near the widened edge that the caller's re-applied predicate drops, so
+/// a reader-level limit could be spent on them before every matching cell is produced.
+fn reader_limit(filters: &[FilterPredicate], limit: Option<usize>) -> Option<usize> {
+    if filters
+        .iter()
+        .any(|f| matches!(f, FilterPredicate::Bbox(_)))
+    {
+        None
+    } else {
+        limit
+    }
+}
+
 #[cfg(test)]
 mod bbox_tests {
     use super::*;
@@ -471,7 +485,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             projection: projection.map(|p| p.to_vec()),
             schema,
             batch_size: self.batch_size,
-            limit,
+            limit: reader_limit(filters, limit),
             empty,
         }))
     }
@@ -651,7 +665,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             projection: projection.map(|p| p.to_vec()),
             schema,
             batch_size: self.batch_size,
-            limit,
+            limit: reader_limit(filters, limit),
             empty,
         }))
     }

@@ -117,6 +117,7 @@ classification above so a planner knows which predicates it still has to evaluat
 
 - **Projection**: `Some(&[indices])` projects the schema; only those columns are built.
 - **Limit**: passed to the batch reader, which stops draining once the limit is reached.
+  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out.
 - **Statistics**: `statistics()` returns `TableStatistics { num_rows, is_exact: false }`
   from `estimate_raster_cardinality`.
 

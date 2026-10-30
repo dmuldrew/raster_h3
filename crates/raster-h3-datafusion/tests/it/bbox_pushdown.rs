@@ -151,3 +151,24 @@ fn compacted_scan_ignores_pushed_bbox() {
     );
     assert_eq!(pushed, full);
 }
+
+#[test]
+fn limit_is_not_spent_on_cells_outside_a_pushed_bbox() {
+    let (_tmp, path) = TestGeoTiffBuilder::new(200, 200)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|c, r| (c * 7 + r * 3) as f32);
+    let src = path.to_str().unwrap();
+    let bbox = [FilterPredicate::Bbox(QUERY)];
+    let cont = ContinuousRasterTableProvider::try_new(src, vec![8]).unwrap();
+    let cat = CategoricalRasterTableProvider::try_new(src, vec![8]).unwrap();
+    for (name, provider) in [
+        ("continuous", &cont as &dyn TableProvider),
+        ("categorical", &cat as &dyn TableProvider),
+    ] {
+        // The widened box emits padding cells the caller drops, so a reader-level limit
+        // could be used up before every matching cell is produced.
+        let expected = reapply(&plan_table(provider.scan(None, &bbox, None).unwrap()));
+        let limited = plan_table(provider.scan(None, &bbox, Some(expected.len())).unwrap());
+        assert_eq!(reapply(&limited), expected, "{name}");
+    }
+}
