@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Memory benchmark suite (`cargo test --release -p raster-h3-core --test memory`): seven scenarios (spill-run construction, forced spills with quantile sketches and high-cardinality categories, slow HTTP and Parquet consumers, many tiny chunks, concurrent streams), each variant in its own process, with allocator, request-count and spill checks that run in CI on every platform; RSS and wall time are reported only. `docs/testing.md` records a before/after measurement of the #60 prefetch byte budget. The counting allocator is shared with `profile_hotspots`.
+
 ## [0.5.0] - 2026-10-28
 
 ### Added
