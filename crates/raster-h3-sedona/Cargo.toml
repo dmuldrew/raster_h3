@@ -17,8 +17,8 @@ description = "Apache DataFusion / SedonaDB adapter for raster_h3 table function
 name = "raster_h3_sedona"
 
 [dependencies]
-raster-h3-core = { path = "../raster-h3-core" }
-raster-h3-datafusion = { path = "../raster-h3-datafusion" }
+raster-h3-core = { version = "0.5.0", path = "../raster-h3-core" }
+raster-h3-datafusion = { version = "0.5.0", path = "../raster-h3-datafusion" }
 # Must match the DataFusion / arrow versions pinned by apache/sedona-db.
 datafusion = { version = "=54.1.0", default-features = false, features = ["sql"] }
 arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }

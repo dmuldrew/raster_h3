@@ -31,14 +31,19 @@ def check(root, metadata, ref=""):
             if dep.get("path") and dep["req"] != f"^{version}":
                 errors.append(f"{package['name']}: {dep['name']} must require {version}")
 
-    fields = {
-        "fuzz/Cargo.toml": r'^raster-h3-core\s*=\s*\{[^\n]*version\s*=\s*"([^"]+)"',
-        "crates/raster-h3-python/pyproject.toml": r'^version\s*=\s*"([^"]+)"',
-        "crates/raster-h3-pg/raster_h3.control": r"^default_version\s*=\s*'([^']+)'",
-        "packaging/duckdb-community/description.yml": r"^  version:\s*(\S+)",
-        "crates/raster-h3-pg/src/fmgr.rs": r'version: c"([^"]+)"\.as_ptr\(\)',
-    }
-    for path, pattern in fields.items():
+    path_dep = r'^{}\s*=\s*\{{[^\n]*version\s*=\s*"([^"]+)"'.format
+    # The standalone workspaces (fuzz, raster-h3-sedona) are outside `cargo metadata`.
+    fields = [
+        ("fuzz/Cargo.toml", path_dep("raster-h3-core")),
+        ("crates/raster-h3-sedona/Cargo.toml", r'^version\s*=\s*"([^"]+)"'),
+        ("crates/raster-h3-sedona/Cargo.toml", path_dep("raster-h3-core")),
+        ("crates/raster-h3-sedona/Cargo.toml", path_dep("raster-h3-datafusion")),
+        ("crates/raster-h3-python/pyproject.toml", r'^version\s*=\s*"([^"]+)"'),
+        ("crates/raster-h3-pg/raster_h3.control", r"^default_version\s*=\s*'([^']+)'"),
+        ("packaging/duckdb-community/description.yml", r"^  version:\s*(\S+)"),
+        ("crates/raster-h3-pg/src/fmgr.rs", r'version: c"([^"]+)"\.as_ptr\(\)'),
+    ]
+    for path, pattern in fields:
         try:
             actual = field((root / path).read_text(), pattern)
             if actual != version:
