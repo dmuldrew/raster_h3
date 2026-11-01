@@ -118,3 +118,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "unwind"
+
+[patch.crates-io]
+# Experimental exact row indexing (`LatLngIndexer::index_row`).
+h3o = { git = "https://github.com/dmuldrew/h3o", branch = "raster-row-indexing" }

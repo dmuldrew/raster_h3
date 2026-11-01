@@ -9,7 +9,7 @@
 //! pattern and resolution count, not by row or raster size.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
-use h3o::{LatLng, Resolution};
+use h3o::{GeographicRow, LatLng, LatLngIndexer, Resolution, RowPath};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -224,6 +224,7 @@ fn walk<T, Acc, E, N, R>(
     let pruner = RowPruner::new(ctx);
     let mut projector = SampleProjector::new(ctx);
     let mut runs = Runs::new(num_res, engine);
+    let mut row_indexer = ParallelRowIndexer::new(num_res);
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
 
@@ -253,6 +254,20 @@ fn walk<T, Acc, E, N, R>(
         if batch && ctx.owner.is_none() && ctx.bbox.is_none() {
             let sp = ctx.sampling.points[0];
             let col_offset = chunk.col_offset as usize;
+            if let Some(mut path) = projector.parallel_row(row_idx, col_offset, sp) {
+                row_indexer.walk(
+                    &mut path,
+                    cols.clone(),
+                    row,
+                    spp,
+                    &read,
+                    ctx.resolutions,
+                    &mut runs,
+                    engine,
+                    maps,
+                );
+                continue;
+            }
             for c in cols.clone() {
                 if read(&row[c * spp..(c + 1) * spp]).is_none() {
                     continue;
@@ -429,6 +444,50 @@ impl<'a> SampleProjector<'a> {
         }
     }
 
+    /// A row of constant latitude whose longitude is affine in the column
+    /// (north-up WGS84 or Web Mercator), as an exact `RowPath`: `point(c)`
+    /// reproduces `project(col_offset + c, row_idx, 0, sp)` bit for bit.
+    fn parallel_row(
+        &self,
+        row_idx: usize,
+        col_offset: usize,
+        sp: SamplePoint,
+    ) -> Option<ParallelRow<'a>> {
+        if !exact_rows_enabled() {
+            return None;
+        }
+        let (lat, mercator) = match &self.cache {
+            RowCache::Wgs84(lats) => (*lats.first()?, false),
+            RowCache::Mercator(lats) => (*lats.first()?, true),
+            _ => return None,
+        };
+        let gt = self.gt;
+        if !(-90.0..=90.0).contains(&lat)
+            || ![gt.c0, gt.a, gt.b, sp.dx, sp.dy]
+                .iter()
+                .all(|v| v.is_finite())
+        {
+            return None;
+        }
+        // Longitude step per column, in degrees.
+        let step = if mercator {
+            web_mercator_lon(gt.a)
+        } else {
+            gt.a
+        };
+        let bounds = GeographicRow::new(lat, 0.0, step);
+        Some(ParallelRow {
+            gt,
+            row: row_idx as f64 + sp.dy,
+            col_offset,
+            dx: sp.dx,
+            lat,
+            mercator,
+            speed: bounds.speed_bound(),
+            accel: bounds.accel_bound(),
+        })
+    }
+
     /// Project sampling point k, skipping samples outside the projection's domain.
     #[inline(always)]
     fn project(&self, col: usize, row_idx: usize, k: usize, sp: SamplePoint) -> Option<(f64, f64)> {
@@ -451,6 +510,131 @@ impl<'a> SampleProjector<'a> {
             };
             (lon.is_finite() && lat.is_finite()).then_some((lon, lat))
         })
+    }
+}
+
+/// Whether rows of constant latitude use `LatLngIndexer::index_row` (on unless
+/// `RASTER_H3_EXACT_ROWS=0`, for A/B comparisons).
+fn exact_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RASTER_H3_EXACT_ROWS").map_or(true, |v| v != "0"))
+}
+
+/// See [`SampleProjector::parallel_row`].
+struct ParallelRow<'a> {
+    gt: &'a GeoTransform,
+    row: f64,
+    col_offset: usize,
+    dx: f64,
+    lat: f64,
+    mercator: bool,
+    speed: f64,
+    accel: f64,
+}
+
+impl RowPath for ParallelRow<'_> {
+    #[inline]
+    fn point(&mut self, c: usize) -> LatLng {
+        let x = self
+            .gt
+            .pixel_to_coord((self.col_offset + c) as f64 + self.dx, self.row)
+            .0;
+        let lon = if self.mercator {
+            web_mercator_lon(x)
+        } else {
+            x
+        };
+        LatLng::new(self.lat, lon).expect("finite coordinate")
+    }
+
+    fn speed_bound(&self) -> f64 {
+        self.speed
+    }
+
+    fn accel_bound(&self) -> f64 {
+        self.accel
+    }
+}
+
+/// Indexes whole rows with `LatLngIndexer::index_row` and replays the cell
+/// changes through `Runs` exactly as the per-pixel batch loop would.
+struct ParallelRowIndexer {
+    indexer: LatLngIndexer,
+    /// Per resolution: (first column, cell) of each run of the current row.
+    row_runs: Vec<Vec<(usize, u64)>>,
+    cursor: Vec<usize>,
+}
+
+impl ParallelRowIndexer {
+    fn new(num_res: usize) -> Self {
+        Self {
+            indexer: LatLngIndexer::new(),
+            row_runs: vec![Vec::new(); num_res],
+            cursor: vec![0; num_res],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk<T, Acc, E, R>(
+        &mut self,
+        path: &mut ParallelRow<'_>,
+        cols: Range<usize>,
+        row: &[T],
+        spp: usize,
+        read: &R,
+        resolutions: &[Resolution],
+        runs: &mut Runs<Acc>,
+        engine: &E,
+        maps: &mut [CellMap<Acc>],
+    ) where
+        T: Copy,
+        Acc: Clone,
+        E: ScanlineEngine<T, Acc>,
+        R: Fn(&[T]) -> Option<E::Sample>,
+    {
+        if cols.is_empty() {
+            return;
+        }
+        for runs in &mut self.row_runs {
+            runs.clear();
+        }
+        let row_runs = &mut self.row_runs;
+        self.indexer
+            .index_row(path, cols.clone(), resolutions, |i, span, cell| {
+                row_runs[i].push((span.start, u64::from(cell)));
+            });
+        self.cursor.fill(0);
+
+        // Segments where no resolution changes cell. In each, the first valid
+        // pixel is where the per-pixel loop would notice a change; the other
+        // valid pixels would leave `Runs` untouched.
+        let mut span_start: Option<usize> = None;
+        let mut start = cols.start;
+        loop {
+            let mut end = cols.end;
+            for (i, runs_i) in self.row_runs.iter().enumerate() {
+                let k = self.cursor[i];
+                runs.next_cells[i] = runs_i[k].1;
+                if let Some(&(next, _)) = runs_i.get(k + 1) {
+                    end = end.min(next);
+                }
+            }
+            if let Some(c) = (start..end).find(|&c| read(&row[c * spp..(c + 1) * spp]).is_some()) {
+                runs.apply_next_cells(&row[..c], &mut span_start, engine, maps);
+            }
+            if end >= cols.end {
+                break;
+            }
+            for (i, runs_i) in self.row_runs.iter().enumerate() {
+                if runs_i.get(self.cursor[i] + 1).map(|r| r.0) == Some(end) {
+                    self.cursor[i] += 1;
+                }
+            }
+            start = end;
+        }
+        if let Some(s) = span_start {
+            runs.add_span(&row[s..cols.end], engine);
+        }
     }
 }
 
@@ -481,11 +665,26 @@ impl<Acc: Clone> Runs<Acc> {
         engine: &E,
         maps: &mut [CellMap<Acc>],
     ) {
-        let mut changed = false;
         for (i, &res) in resolutions.iter().enumerate() {
             self.next_cells[i] = u64::from(super::profile::index(ll, res));
-            changed |= Some(self.next_cells[i]) != self.cells[i];
         }
+        self.apply_next_cells(preceding, span_start, engine, maps);
+    }
+
+    /// Flush and restart the runs whose cell differs from `next_cells`.
+    #[inline]
+    fn apply_next_cells<T, E: ScanlineEngine<T, Acc>>(
+        &mut self,
+        preceding: &[T],
+        span_start: &mut Option<usize>,
+        engine: &E,
+        maps: &mut [CellMap<Acc>],
+    ) {
+        let changed = self
+            .next_cells
+            .iter()
+            .zip(&self.cells)
+            .any(|(&next, &cell)| Some(next) != cell);
         if changed {
             if let Some(s) = span_start.take() {
                 self.add_span(&preceding[s..], engine);
