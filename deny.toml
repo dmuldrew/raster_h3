@@ -40,3 +40,6 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Experimental exact row indexing (PR #74): unreleased h3o branch pulled in
+# through `[patch.crates-io]`. Remove once the h3o changes are on crates.io.
+allow-git = ["https://github.com/dmuldrew/h3o"]
