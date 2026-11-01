@@ -103,6 +103,16 @@ fn main() {
         .epsg(3857)
         .pixel_size(30.0)
         .create_f32_tempfile(value);
+    let albers = TestGeoTiffBuilder::new(size, size)
+        .origin(-300_000.0, 2_000_000.0) // central CONUS, EPSG:5070 metres
+        .epsg(5070)
+        .pixel_size(30.0)
+        .create_f32_tempfile(value);
+    let albers_classes = TestGeoTiffBuilder::new(size, size)
+        .origin(-300_000.0, 2_000_000.0)
+        .epsg(5070)
+        .pixel_size(30.0)
+        .create_tempfile(|col, row| ((col / 11 + row / 13) % 6) as u8);
     let classes = TestGeoTiffBuilder::new(size, size)
         .origin(-122.5, 37.85)
         .epsg(4326)
@@ -111,7 +121,7 @@ fn main() {
 
     let mut fingerprint = String::new();
     println!("mode RASTER_H3_EXACT_ROWS={mode}, {size}x{size} px, median of {reps}");
-    let cases: [(&str, &Path, &[u8], bool); 9] = [
+    let cases: [(&str, &Path, &[u8], bool); 14] = [
         ("wgs84 27m", &wgs84.1, &[6], false),
         ("wgs84 27m", &wgs84.1, &[8], false),
         ("wgs84 27m", &wgs84.1, &[9], false),
@@ -121,6 +131,16 @@ fn main() {
         ("mercator 30m", &mercator.1, &[6, 8, 10], false),
         ("wgs84 27m categorical", &classes.1, &[8], true),
         ("wgs84 27m categorical", &classes.1, &[6, 8, 10], true),
+        ("albers5070 30m", &albers.1, &[8], false),
+        ("albers5070 30m", &albers.1, &[9], false),
+        ("albers5070 30m", &albers.1, &[10], false),
+        ("albers5070 30m", &albers.1, &[6, 8, 10], false),
+        (
+            "albers5070 30m categorical",
+            &albers_classes.1,
+            &[6, 8, 10],
+            true,
+        ),
     ];
     for (name, path, res, is_cat) in cases {
         let mut times = Vec::new();

@@ -254,7 +254,7 @@ fn walk<T, Acc, E, N, R>(
         if batch && ctx.owner.is_none() && ctx.bbox.is_none() {
             let sp = ctx.sampling.points[0];
             let col_offset = chunk.col_offset as usize;
-            if let Some(mut path) = projector.parallel_row(row_idx, col_offset, sp) {
+            if let Some(mut path) = projector.parallel_row(row_idx, col_offset, sp, &cols) {
                 row_indexer.walk(
                     &mut path,
                     cols.clone(),
@@ -444,47 +444,80 @@ impl<'a> SampleProjector<'a> {
         }
     }
 
-    /// A row of constant latitude whose longitude is affine in the column
-    /// (north-up WGS84 or Web Mercator), as an exact `RowPath`: `point(c)`
-    /// reproduces `project(col_offset + c, row_idx, 0, sp)` bit for bit.
+    /// A row whose coordinates come from a north-up raster row, as an exact
+    /// `RowPath`: `point(c)` reproduces `project(col_offset + c, row_idx, 0,
+    /// sp)` bit for bit. WGS84 and Web Mercator rows are parallels (constant
+    /// latitude, longitude affine in the column); Albers rows have constant
+    /// projected y, with bounds derived from the analytic inverse. `None`
+    /// keeps the per-pixel path (other CRSs, rotated grids, rows that may
+    /// reach a pole).
     fn parallel_row(
         &self,
         row_idx: usize,
         col_offset: usize,
         sp: SamplePoint,
-    ) -> Option<ParallelRow<'a>> {
+        cols: &Range<usize>,
+    ) -> Option<ParallelRow<'_>> {
         if !exact_rows_enabled() {
             return None;
         }
-        let (lat, mercator) = match &self.cache {
-            RowCache::Wgs84(lats) => (*lats.first()?, false),
-            RowCache::Mercator(lats) => (*lats.first()?, true),
-            _ => return None,
-        };
         let gt = self.gt;
-        if !(-90.0..=90.0).contains(&lat)
-            || ![gt.c0, gt.a, gt.b, sp.dx, sp.dy]
-                .iter()
-                .all(|v| v.is_finite())
+        if ![gt.c0, gt.a, gt.b, sp.dx, sp.dy]
+            .iter()
+            .all(|v| v.is_finite())
         {
             return None;
         }
-        // Longitude step per column, in degrees.
-        let step = if mercator {
-            web_mercator_lon(gt.a)
-        } else {
-            gt.a
+        let row = row_idx as f64 + sp.dy;
+        let (kind, speed, accel, noise) = match &self.cache {
+            RowCache::Wgs84(lats) | RowCache::Mercator(lats) => {
+                let lat = *lats.first()?;
+                if !(-90.0..=90.0).contains(&lat) {
+                    return None;
+                }
+                let mercator = matches!(self.cache, RowCache::Mercator(_));
+                // Longitude step per column, in degrees.
+                let step = if mercator {
+                    web_mercator_lon(gt.a)
+                } else {
+                    gt.a
+                };
+                let bounds = GeographicRow::new(lat, 0.0, step);
+                (
+                    RowKind::Geographic { lat, mercator },
+                    bounds.speed_bound(),
+                    bounds.accel_bound(),
+                    0.0,
+                )
+            }
+            RowCache::Albers(inverse, Some(yps)) => {
+                let (y_p, y_p_sq) = *yps.first()?;
+                // `index_row` samples `cols.start..=cols.end`.
+                let x_of = |c: usize| gt.pixel_to_coord((col_offset + c) as f64 + sp.dx, row).0;
+                let (x0, x1) = (x_of(cols.start), x_of(cols.end));
+                let bounds = inverse.row_path_bounds(x0.min(x1), x0.max(x1), y_p, gt.a)?;
+                (
+                    RowKind::Albers {
+                        inverse,
+                        y_p,
+                        y_p_sq,
+                    },
+                    bounds.speed,
+                    bounds.accel,
+                    bounds.noise,
+                )
+            }
+            _ => return None,
         };
-        let bounds = GeographicRow::new(lat, 0.0, step);
         Some(ParallelRow {
             gt,
-            row: row_idx as f64 + sp.dy,
+            row,
             col_offset,
             dx: sp.dx,
-            lat,
-            mercator,
-            speed: bounds.speed_bound(),
-            accel: bounds.accel_bound(),
+            kind,
+            speed,
+            accel,
+            noise,
         })
     }
 
@@ -520,16 +553,28 @@ fn exact_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("RASTER_H3_EXACT_ROWS").map_or(true, |v| v != "0"))
 }
 
+/// How a [`ParallelRow`] turns projected x into a location.
+enum RowKind<'a> {
+    /// Constant latitude; longitude is x (WGS84) or `web_mercator_lon(x)`.
+    Geographic { lat: f64, mercator: bool },
+    /// Albers with the row's hoisted `y_p` terms.
+    Albers {
+        inverse: &'a AlbersInverse<'a>,
+        y_p: f64,
+        y_p_sq: f64,
+    },
+}
+
 /// See [`SampleProjector::parallel_row`].
 struct ParallelRow<'a> {
     gt: &'a GeoTransform,
     row: f64,
     col_offset: usize,
     dx: f64,
-    lat: f64,
-    mercator: bool,
+    kind: RowKind<'a>,
     speed: f64,
     accel: f64,
+    noise: f64,
 }
 
 impl RowPath for ParallelRow<'_> {
@@ -539,12 +584,17 @@ impl RowPath for ParallelRow<'_> {
             .gt
             .pixel_to_coord((self.col_offset + c) as f64 + self.dx, self.row)
             .0;
-        let lon = if self.mercator {
-            web_mercator_lon(x)
-        } else {
-            x
+        let (lon, lat) = match self.kind {
+            RowKind::Geographic { lat, mercator } => {
+                (if mercator { web_mercator_lon(x) } else { x }, lat)
+            }
+            RowKind::Albers {
+                inverse,
+                y_p,
+                y_p_sq,
+            } => inverse.transform_with_yp(x, y_p, y_p_sq),
         };
-        LatLng::new(self.lat, lon).expect("finite coordinate")
+        LatLng::new(lat, lon).expect("finite coordinate")
     }
 
     fn speed_bound(&self) -> f64 {
@@ -553,6 +603,10 @@ impl RowPath for ParallelRow<'_> {
 
     fn accel_bound(&self) -> f64 {
         self.accel
+    }
+
+    fn noise_bound(&self) -> f64 {
+        self.noise
     }
 }
 
