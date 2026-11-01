@@ -224,7 +224,8 @@ fn walk<T, Acc, E, N, R>(
     let pruner = RowPruner::new(ctx);
     let mut projector = SampleProjector::new(ctx);
     let mut runs = Runs::new(num_res, engine);
-    let mut row_indexer = ParallelRowIndexer::new(num_res);
+    let mut row_indexer = ParallelRowIndexer::new(num_res, ctx.sampling.points.len());
+    let total_weight = ctx.sampling.points.iter().map(|sp| sp.weight).sum::<f64>();
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
 
@@ -251,10 +252,28 @@ fn walk<T, Acc, E, N, R>(
         // Invalid pixels may sit inside a span; the span kernels skip them.
         let mut span_start: Option<usize> = None;
 
+        if !batch && ctx.owner.is_none() && ctx.bbox.is_none() {
+            let col_offset = chunk.col_offset as usize;
+            if row_indexer.index_samples(&projector, ctx, row_idx, col_offset, &cols) {
+                row_indexer.replay_samples(
+                    cols.clone(),
+                    row,
+                    spp,
+                    &read,
+                    ctx,
+                    (combine, total_weight),
+                    &mut runs,
+                    engine,
+                    maps,
+                );
+                continue;
+            }
+        }
+
         if batch && ctx.owner.is_none() && ctx.bbox.is_none() {
             let sp = ctx.sampling.points[0];
             let col_offset = chunk.col_offset as usize;
-            if let Some(mut path) = projector.parallel_row(row_idx, col_offset, sp, &cols) {
+            if let Some(mut path) = projector.parallel_row(row_idx, col_offset, 0, sp, &cols) {
                 row_indexer.walk(
                     &mut path,
                     cols.clone(),
@@ -444,9 +463,9 @@ impl<'a> SampleProjector<'a> {
         }
     }
 
-    /// A row whose coordinates come from a north-up raster row, as an exact
-    /// `RowPath`: `point(c)` reproduces `project(col_offset + c, row_idx, 0,
-    /// sp)` bit for bit. WGS84 and Web Mercator rows are parallels (constant
+    /// Sample point `k` of a north-up raster row, as an exact `RowPath`:
+    /// `point(c)` reproduces `project(col_offset + c, row_idx, k, sp)` bit for
+    /// bit. WGS84 and Web Mercator rows are parallels (constant
     /// latitude, longitude affine in the column); Albers rows have constant
     /// projected y, with bounds derived from the analytic inverse. `None`
     /// keeps the per-pixel path (other CRSs, rotated grids, rows that may
@@ -455,6 +474,7 @@ impl<'a> SampleProjector<'a> {
         &self,
         row_idx: usize,
         col_offset: usize,
+        k: usize,
         sp: SamplePoint,
         cols: &Range<usize>,
     ) -> Option<ParallelRow<'_>> {
@@ -471,7 +491,7 @@ impl<'a> SampleProjector<'a> {
         let row = row_idx as f64 + sp.dy;
         let (kind, speed, accel, noise) = match &self.cache {
             RowCache::Wgs84(lats) | RowCache::Mercator(lats) => {
-                let lat = *lats.first()?;
+                let lat = *lats.get(k)?;
                 if !(-90.0..=90.0).contains(&lat) {
                     return None;
                 }
@@ -491,7 +511,7 @@ impl<'a> SampleProjector<'a> {
                 )
             }
             RowCache::Albers(inverse, Some(yps)) => {
-                let (y_p, y_p_sq) = *yps.first()?;
+                let (y_p, y_p_sq) = *yps.get(k)?;
                 // `index_row` samples `cols.start..=cols.end`.
                 let x_of = |c: usize| gt.pixel_to_coord((col_offset + c) as f64 + sp.dx, row).0;
                 let (x0, x1) = (x_of(cols.start), x_of(cols.end));
@@ -611,20 +631,122 @@ impl RowPath for ParallelRow<'_> {
 }
 
 /// Indexes whole rows with `LatLngIndexer::index_row` and replays the cell
-/// changes through `Runs` exactly as the per-pixel batch loop would.
+/// changes through `Runs` exactly as the per-pixel loops would.
 struct ParallelRowIndexer {
     indexer: LatLngIndexer,
-    /// Per resolution: (first column, cell) of each run of the current row.
+    /// (first column, cell) of each run of the current row, per resolution
+    /// and sample point: `row_runs[i * num_samples + k]`.
     row_runs: Vec<Vec<(usize, u64)>>,
     cursor: Vec<usize>,
+    num_samples: usize,
+    /// Each sample point's cell in the current segment, laid out like `row_runs`.
+    segment_cells: Vec<u64>,
 }
 
 impl ParallelRowIndexer {
-    fn new(num_res: usize) -> Self {
+    fn new(num_res: usize, num_samples: usize) -> Self {
+        let len = num_res * num_samples;
         Self {
             indexer: LatLngIndexer::new(),
-            row_runs: vec![Vec::new(); num_res],
-            cursor: vec![0; num_res],
+            row_runs: vec![Vec::new(); len],
+            cursor: vec![0; len],
+            num_samples,
+            segment_cells: vec![0; len],
+        }
+    }
+
+    /// Index every sample point of a row. False keeps the per-pixel path, for
+    /// rows where some sample point has no `ParallelRow`.
+    fn index_samples(
+        &mut self,
+        projector: &SampleProjector<'_>,
+        ctx: &WalkContext<'_>,
+        row_idx: usize,
+        col_offset: usize,
+        cols: &Range<usize>,
+    ) -> bool {
+        if cols.is_empty() {
+            return true;
+        }
+        for runs in &mut self.row_runs {
+            runs.clear();
+        }
+        let num_samples = self.num_samples;
+        for (k, &sp) in ctx.sampling.points.iter().enumerate() {
+            let Some(mut path) = projector.parallel_row(row_idx, col_offset, k, sp, cols) else {
+                return false;
+            };
+            let row_runs = &mut self.row_runs;
+            self.indexer
+                .index_row(&mut path, cols.clone(), ctx.resolutions, |i, span, cell| {
+                    row_runs[i * num_samples + k].push((span.start, u64::from(cell)));
+                });
+        }
+        true
+    }
+
+    /// Feed the row indexed by `index_samples` through `Runs`, with the same
+    /// updates in the same order as the per-pixel weighted loop. Between two
+    /// cell changes every valid pixel has the same assignments, so only `read`
+    /// and `Runs::update` remain per pixel.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_samples<T, Acc, E, R>(
+        &mut self,
+        cols: Range<usize>,
+        row: &[T],
+        spp: usize,
+        read: &R,
+        ctx: &WalkContext<'_>,
+        (combine, total_weight): (bool, f64),
+        runs: &mut Runs<Acc>,
+        engine: &E,
+        maps: &mut [CellMap<Acc>],
+    ) where
+        T: Copy,
+        Acc: Clone,
+        E: ScanlineEngine<T, Acc>,
+        R: Fn(&[T]) -> Option<E::Sample>,
+    {
+        if cols.is_empty() {
+            return;
+        }
+        let num_samples = self.num_samples;
+        let single_weight = total_weight.is_finite() && (combine || num_samples == 1);
+        self.cursor.fill(0);
+        let mut start = cols.start;
+        loop {
+            let mut end = cols.end;
+            for (j, runs_j) in self.row_runs.iter().enumerate() {
+                let cursor = self.cursor[j];
+                self.segment_cells[j] = runs_j[cursor].1;
+                if let Some(&(next, _)) = runs_j.get(cursor + 1) {
+                    end = end.min(next);
+                }
+            }
+            for c in start..end {
+                let Some(sample) = read(&row[c * spp..(c + 1) * spp]) else {
+                    continue;
+                };
+                for (i, cells) in self.segment_cells.chunks_exact(num_samples).enumerate() {
+                    let first = cells[0];
+                    if single_weight && cells.iter().all(|&cell| cell == first) {
+                        runs.update(i, first, sample, total_weight, engine, &mut maps[i]);
+                        continue;
+                    }
+                    for (&cell, sp) in cells.iter().zip(&ctx.sampling.points) {
+                        runs.update(i, cell, sample, sp.weight, engine, &mut maps[i]);
+                    }
+                }
+            }
+            if end >= cols.end {
+                break;
+            }
+            for (j, runs_j) in self.row_runs.iter().enumerate() {
+                if runs_j.get(self.cursor[j] + 1).map(|r| r.0) == Some(end) {
+                    self.cursor[j] += 1;
+                }
+            }
+            start = end;
         }
     }
 
