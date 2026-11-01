@@ -96,6 +96,88 @@ fn web_mercator_samples_match_exact_projection() {
     }
 }
 
+/// North-up rows take the exact row indexer one sample point at a time; every
+/// sample must still land in the cell `to_cell` gives its own coordinate.
+#[test]
+fn north_up_row_samples_match_exact_projection() {
+    use h3o::{LatLng, Resolution};
+    use raster_h3_core::crs::transformer::CrsTransformer;
+    use std::collections::HashMap;
+
+    let value = |col: u32, row: u32| {
+        if (col + row * 31).is_multiple_of(13) {
+            f32::NAN
+        } else {
+            (1 + (col + row) % 5) as f32
+        }
+    };
+    let cases = [
+        (4326, -122.5, 37.85, 0.0005),
+        (3857, -11_700_000.0, 4_830_000.0, 60.0),
+        (5070, -300_000.0, 2_000_000.0, 60.0),
+    ];
+    let patterns = [
+        SamplingPattern::rgss(),
+        SamplingPattern::gaussian_five_point(),
+        SamplingPattern::sixteen_point(),
+    ];
+    let resolutions = [8u8, 10, 12];
+    for (epsg, x, y, size) in cases {
+        let (_file, path) = TestGeoTiffBuilder::new(300, 40)
+            .origin(x, y)
+            .pixel_size(size)
+            .epsg(epsg)
+            .create_f32_tempfile(value);
+        let crs = CrsTransformer::from_crs_or_epsg(Some(epsg as u32), None).unwrap();
+        for pattern in &patterns {
+            let reader = GeoTiffStreamReader::open(&path).unwrap();
+            let gt = reader.metadata.geotransform;
+            let mut expected = HashMap::<(u8, u64), (f64, f64)>::new();
+            for row in 0..40 {
+                for col in 0..300 {
+                    let v = value(col, row) as f64;
+                    if v.is_nan() {
+                        continue;
+                    }
+                    for sample in &pattern.points {
+                        let (px, py) =
+                            gt.pixel_to_coord(col as f64 + sample.dx, row as f64 + sample.dy);
+                        let (lon, lat) = crs.transform_point(px, py).unwrap();
+                        let ll = LatLng::new(lat, lon).unwrap();
+                        for res in resolutions {
+                            let r = Resolution::try_from(res).unwrap();
+                            let e = expected.entry((res, ll.to_cell(r).into())).or_default();
+                            e.0 += sample.weight;
+                            e.1 += sample.weight * v;
+                        }
+                    }
+                }
+            }
+
+            let mut config = MultiResolutionConfig::new(resolutions.to_vec());
+            config.sampling = pattern.clone();
+            let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+            let mut actual = HashMap::new();
+            loop {
+                let batch = streamer.fetch_next_batch(1024).unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for r in batch {
+                    let a = r.accumulator;
+                    actual.insert((r.resolution, r.h3_index), (a.count, a.sum));
+                }
+            }
+            assert_eq!(actual.len(), expected.len(), "EPSG:{epsg}");
+            for (key, (count, sum)) in expected {
+                let (c, s) = actual[&key];
+                assert!((c - count).abs() < 1e-9, "EPSG:{epsg} {key:?}");
+                assert!((s - sum).abs() < 1e-9, "EPSG:{epsg} {key:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn test_continuous_supersampling_all_patterns_conservation() {
     let width = 128u32;
@@ -603,7 +685,7 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
         (32610, 500000.0, 4180000.0, 100.0, 30.0),
         (5070, -100000.0, 1500000.0, 100.0, 0.0),
     ] {
-        let crs = CrsTransformer::from_crs_or_epsg(Some(epsg), None).unwrap();
+        let crs = CrsTransformer::from_crs_or_epsg(Some(epsg as u32), None).unwrap();
         let gt = GeoTransform {
             c0: x,
             f0: y,
