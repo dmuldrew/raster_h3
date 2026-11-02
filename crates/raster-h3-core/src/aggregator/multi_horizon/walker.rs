@@ -10,6 +10,7 @@
 
 use crate::aggregator::cell_hash::H3BuildHasher;
 use h3o::{GeographicRow, LatLng, LatLngIndexer, Resolution, RowPath};
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -224,7 +225,7 @@ fn walk<T, Acc, E, N, R>(
     let pruner = RowPruner::new(ctx);
     let mut projector = SampleProjector::new(ctx);
     let mut runs = Runs::new(num_res, engine);
-    let mut row_indexer = ParallelRowIndexer::new(num_res, ctx.sampling.points.len());
+    let mut row_indexer = ParallelRowIndexer::take(num_res, ctx.sampling.points.len());
     let total_weight = ctx.sampling.points.iter().map(|sp| sp.weight).sum::<f64>();
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
@@ -404,6 +405,7 @@ fn walk<T, Acc, E, N, R>(
         }
     }
     runs.finish(engine, maps);
+    row_indexer.release();
 }
 
 /// Row-dependent projection terms. Horizontal shear is allowed: only d affects y.
@@ -642,6 +644,7 @@ impl RowPath for ParallelRow<'_> {
 
 /// Indexes whole rows with `LatLngIndexer::index_row` and replays the cell
 /// changes through `Runs` exactly as the per-pixel loops would.
+#[derive(Default)]
 struct ParallelRowIndexer {
     indexer: LatLngIndexer,
     /// (first column, cell) of each run of the current row, per resolution
@@ -653,16 +656,29 @@ struct ParallelRowIndexer {
     segment_cells: Vec<u64>,
 }
 
+thread_local! {
+    /// Per-thread `ParallelRowIndexer` reused across chunks, so a stream of
+    /// small chunks doesn't reallocate (and regrow) its row buffers each time.
+    static ROW_INDEXER: RefCell<ParallelRowIndexer> = RefCell::default();
+}
+
 impl ParallelRowIndexer {
-    fn new(num_res: usize, num_samples: usize) -> Self {
+    /// This thread's indexer, sized for `num_res * num_samples` row paths.
+    /// Hand it back with [`Self::release`]; if the walk panics it is dropped
+    /// and the next walk starts from empty buffers.
+    fn take(num_res: usize, num_samples: usize) -> Self {
+        let mut this = ROW_INDEXER.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         let len = num_res * num_samples;
-        Self {
-            indexer: LatLngIndexer::new(),
-            row_runs: vec![Vec::new(); len],
-            cursor: vec![0; len],
-            num_samples,
-            segment_cells: vec![0; len],
-        }
+        this.row_runs.resize_with(len, Vec::new);
+        this.cursor.resize(len, 0);
+        this.segment_cells.resize(len, 0);
+        this.num_samples = num_samples;
+        this
+    }
+
+    /// Return the buffers to this thread for the next walk.
+    fn release(self) {
+        ROW_INDEXER.with(|cell| *cell.borrow_mut() = self);
     }
 
     /// Index every sample point of a row. False keeps the per-pixel path, for
