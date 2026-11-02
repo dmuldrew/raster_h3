@@ -446,7 +446,7 @@ impl<Acc: Clone> Runs<Acc> {
             cells: vec![None; num_res],
             next_cells: vec![0; num_res],
             accs: (0..num_res).map(|_| engine.new_acc()).collect(),
-            indexer: LatLngIndexer::new(),
+            indexer: LatLngIndexer::default(),
         }
     }
 

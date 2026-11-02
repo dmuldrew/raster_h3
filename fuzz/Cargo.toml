@@ -37,6 +37,6 @@ test = false
 doc = false
 bench = false
 
-# Same h3o fork as the workspace `[patch.crates-io]`; remove both together.
+# Same unreleased h3o revision as the workspace `[patch.crates-io]`; remove both together.
 [patch.crates-io]
-h3o = { git = "https://github.com/dmuldrew/h3o", rev = "24c04cc08c97db4bc8adce23492dcbbb3f516dba" }
+h3o = { git = "https://github.com/HydroniumLabs/h3o", rev = "49e653e2102a0f53af0930a4f12b88cd7600b832" }

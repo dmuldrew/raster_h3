@@ -408,7 +408,7 @@ dependencies = [
 [[package]]
 name = "h3o"
 version = "0.11.0"
-source = "git+https://github.com/dmuldrew/h3o?rev=24c04cc08c97db4bc8adce23492dcbbb3f516dba#24c04cc08c97db4bc8adce23492dcbbb3f516dba"
+source = "git+https://github.com/HydroniumLabs/h3o?rev=49e653e2102a0f53af0930a4f12b88cd7600b832#49e653e2102a0f53af0930a4f12b88cd7600b832"
 dependencies = [
  "ahash",
  "either",
