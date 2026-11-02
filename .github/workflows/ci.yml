@@ -252,6 +252,13 @@ jobs:
             cp dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension.gz target/${{ matrix.target }}/release/raster_h3-linux_amd64.duckdb_extension.gz
           fi
 
+          # Signed builds must verify before they are uploaded for release
+          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
+            for ext in dist/v1.2.0/*/raster_h3.duckdb_extension*; do
+              cargo run --release --bin package_extension -- --verify "$ext"
+            done
+          fi
+
       - name: Verify Extension Loading with DuckDB CLI
         if: matrix.cli_arch != ''
         shell: bash
@@ -482,6 +489,9 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    env:
+      DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
+      DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -499,18 +509,16 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
 
+      # The trusted-repository manifest is only emitted for signed builds, so the
+      # packager is only needed when a signing key is configured.
       - name: Set up Rust toolchain for release packaging
-        if: env.DUCKDB_EXTENSION_SIGNING_KEY != '' || env.DUCKDB_EXTENSION_PUBLIC_KEY != ''
-        env:
-          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
-          DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
+        if: env.DUCKDB_EXTENSION_SIGNING_KEY != ''
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: '1.97.1'
 
       - name: Prepare Release Assets and Repository Bundle
         shell: bash
-        env:
-          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
-          DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
         run: |
           mkdir -p release-assets
           mkdir -p duckdb-repository/v1.2.0
@@ -525,10 +533,24 @@ jobs:
             cp "$file" "duckdb-repository/v1.2.0/$plat/"
           done
 
-          # If a signing or public key is configured, emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json`
-          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" || -n "${DUCKDB_EXTENSION_PUBLIC_KEY:-}" ]]; then
-            cargo run --release --bin package_extension -- \
-              --repo-manifest duckdb-repository/.well-known/duckdb-extension-repo.json
+          # Emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json` only for signed builds: the
+          # build job signs only when DUCKDB_EXTENSION_SIGNING_KEY is set, and a manifest that pins
+          # a key over unsigned extensions makes `INSTALL ... FROM <repo>` fail verification.
+          if [[ -z "${DUCKDB_EXTENSION_SIGNING_KEY:-}" && -n "${DUCKDB_EXTENSION_PUBLIC_KEY:-}" ]]; then
+            echo "::warning::DUCKDB_EXTENSION_PUBLIC_KEY is set without DUCKDB_EXTENSION_SIGNING_KEY; extensions are unsigned, so no trusted repository manifest is published."
+          fi
+          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
+            cargo build --locked --release --bin package_extension
+            PACKAGER=target/release/package_extension
+            "$PACKAGER" --repo-manifest duckdb-repository/.well-known/duckdb-extension-repo.json
+
+            # Every bundled and flat extension must verify against the manifest key (the public key
+            # when configured, else the one derived from the signing key). This also fails the
+            # release when the two configured secrets are not a matching key pair.
+            find duckdb-repository/v1.2.0 release-assets -type f -name "*.duckdb_extension*" -print0 |
+              while IFS= read -r -d '' ext; do
+                "$PACKAGER" --verify "$ext"
+              done
             cp duckdb-repository/.well-known/duckdb-extension-repo.json release-assets/duckdb-extension-repo.json
             (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0 .well-known)
           else

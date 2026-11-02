@@ -443,6 +443,7 @@ fn print_help() {
         -K, --public-key <PATH>      RSA-2048 public key PEM file for verification / repo manifest\n  \
         -m, --repo-manifest <PATH>   Write DuckDB 2.0 `.well-known/duckdb-extension-repo.json`\n  \
             --verify <PATH>          Verify signature of a packaged .duckdb_extension[.gz] file\n  \
+            --print-platform         Print the platform tag for --duckdb-version on this host and exit\n  \
         -h, --help                   Print help information\n\n\
         Example:\n  \
         package_extension -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension \\\n    \
@@ -472,6 +473,7 @@ fn main() {
     let mut public_key: Option<String> = non_empty_env("DUCKDB_EXTENSION_PUBLIC_KEY");
     let mut repo_manifest: Option<String> = None;
     let mut verify_path: Option<String> = None;
+    let mut print_platform = false;
 
     let mut i = 1;
     let mut positional = Vec::new();
@@ -539,6 +541,9 @@ fn main() {
                     repo_manifest = Some(args[i].clone());
                 }
             }
+            "--print-platform" => {
+                print_platform = true;
+            }
             "--verify" => {
                 i += 1;
                 if i < args.len() {
@@ -568,6 +573,14 @@ fn main() {
     }
     if !positional.is_empty() {
         duckdb_version = positional.remove(0);
+    }
+
+    if print_platform {
+        println!(
+            "{}",
+            platform.unwrap_or_else(|| detect_platform(&duckdb_version))
+        );
+        return;
     }
 
     // Standalone or combined `--repo-manifest` mode
