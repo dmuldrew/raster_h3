@@ -252,9 +252,18 @@ jobs:
             cp dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension.gz target/${{ matrix.target }}/release/raster_h3-linux_amd64.duckdb_extension.gz
           fi
 
+          # DuckDB requests `<prefix>/<its own version>/<platform>/...` from a repository, so DuckDB 2.0
+          # (`INSTALL raster_h3 FROM <repo>`) needs a v2.0.0 tree. Its Linux x86_64 tag is linux_amd64.
+          V2_PLATFORM="${{ matrix.platform }}"
+          if [[ "$V2_PLATFORM" == "linux_amd64_gcc4" ]]; then
+            V2_PLATFORM=linux_amd64
+          fi
+          mkdir -p "dist/v2.0.0/$V2_PLATFORM"
+          cp "dist/v1.2.0/$V2_PLATFORM/raster_h3.duckdb_extension" "dist/v1.2.0/$V2_PLATFORM/raster_h3.duckdb_extension.gz" "dist/v2.0.0/$V2_PLATFORM/"
+
           # Signed builds must verify before they are uploaded for release
           if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
-            for ext in dist/v1.2.0/*/raster_h3.duckdb_extension*; do
+            for ext in dist/v*/*/raster_h3.duckdb_extension*; do
               cargo run --release --bin package_extension -- --verify "$ext"
             done
           fi
@@ -346,6 +355,9 @@ jobs:
           export DUCKDB_VERSION=v1.2.0
           chmod +x "$DUCKDB_BIN" || true
           cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
+          # Signed install/load through CREATE EXTENSION REPOSITORY (no -unsigned), plus
+          # rejection of unsigned and wrong-key extensions
+          cargo test --release -p raster_h3 --test it duckdb_trusted_repository -- --ignored
 
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -356,7 +368,7 @@ jobs:
             target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz
             target/${{ matrix.target }}/release/raster_h3-*.duckdb_extension
             target/${{ matrix.target }}/release/raster_h3-*.duckdb_extension.gz
-            dist/v1.2.0/**/*
+            dist/**/*
           if-no-files-found: error
 
   # Builds through the extension-ci-tools Makefile the way duckdb/community-extensions
@@ -521,16 +533,18 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-assets
-          mkdir -p duckdb-repository/v1.2.0
+          mkdir -p duckdb-repository
 
           # Copy flat release binaries (both uncompressed and gzipped)
           find all-artifacts -name "raster_h3-*.duckdb_extension*" -exec cp {} release-assets/ \;
 
-          # Assemble repository layout: v1.2.0/<platform>/raster_h3.duckdb_extension[.gz]
-          find all-artifacts -path "*/dist/v1.2.0/*" -type f | while read -r file; do
-            plat=$(basename $(dirname "$file"))
-            mkdir -p "duckdb-repository/v1.2.0/$plat"
-            cp "$file" "duckdb-repository/v1.2.0/$plat/"
+          # Assemble repository layout: <duckdb_version>/<platform>/raster_h3.duckdb_extension[.gz]
+          # (v1.2.0 for custom_extension_repository on DuckDB 1.2, v2.0.0 for CREATE EXTENSION REPOSITORY)
+          find all-artifacts -path "*/dist/v*/*" -type f | while read -r file; do
+            plat=$(basename "$(dirname "$file")")
+            ver=$(basename "$(dirname "$(dirname "$file")")")
+            mkdir -p "duckdb-repository/$ver/$plat"
+            cp "$file" "duckdb-repository/$ver/$plat/"
           done
 
           # Emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json` only for signed builds: the
@@ -547,15 +561,15 @@ jobs:
             # Every bundled and flat extension must verify against the manifest key (the public key
             # when configured, else the one derived from the signing key). This also fails the
             # release when the two configured secrets are not a matching key pair.
-            find duckdb-repository/v1.2.0 release-assets -type f -name "*.duckdb_extension*" -print0 |
+            find duckdb-repository/v* release-assets -type f -name "*.duckdb_extension*" -print0 |
               while IFS= read -r -d '' ext; do
                 "$PACKAGER" --verify "$ext"
               done
             cp duckdb-repository/.well-known/duckdb-extension-repo.json release-assets/duckdb-extension-repo.json
-            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0 .well-known)
+            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v* .well-known)
           else
             # Archive repository bundle for custom_extension_repository distribution
-            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0)
+            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v*)
           fi
 
           cp all-wheels/*.whl release-assets/

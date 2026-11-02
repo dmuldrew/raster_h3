@@ -54,7 +54,7 @@ SELECT raster_h3_version();
 
 **DuckDB 2.0+ (Trusted Custom Extension Repository with Key Pinning):**
 
-When hosting the signed `duckdb-extension-repository-v1.2.0.zip` bundle (which includes `.well-known/duckdb-extension-repo.json` and `v1.2.0/<platform>/raster_h3.duckdb_extension.gz`), DuckDB 2.0 pins the repository's RSA-2048 public key and verifies extension signatures without needing `allow_unsigned_extensions`:
+When hosting the signed `duckdb-extension-repository-v1.2.0.zip` bundle (which includes `.well-known/duckdb-extension-repo.json` and `v2.0.0/<platform>/raster_h3.duckdb_extension.gz`; DuckDB requests the directory named after its own version), DuckDB 2.0 pins the repository's RSA-2048 public key at `CREATE` time, prints its SHA-256 fingerprint, and verifies the extension signature on every `INSTALL` and `LOAD` without needing `allow_unsigned_extensions`. The prefix can be an `https://` URL or a local directory. The bundle only contains the manifest when the release was signed:
 
 ```sql
 SET allow_extension_repositories = 'allowed';
@@ -64,6 +64,8 @@ CREATE EXTENSION REPOSITORY IF NOT EXISTS raster_h3_repo
 INSTALL raster_h3 FROM raster_h3_repo;
 LOAD raster_h3 FROM raster_h3_repo;
 ```
+
+Later sessions only need `LOAD raster_h3 FROM raster_h3_repo;` (no opt-in). A plain `LOAD raster_h3;` does not find extensions installed from a custom repository.
 
 **DuckDB 1.2–1.5 (Legacy `custom_extension_repository`):**
 
