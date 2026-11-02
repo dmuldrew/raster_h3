@@ -12,7 +12,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["raster_h3 contributors"]
 license = "MIT"
@@ -87,12 +87,12 @@ default = []
 stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
 
 [dependencies]
-raster-h3-core = { version = "0.4.0", path = "crates/raster-h3-core" }
-raster-h3-cli = { version = "0.4.0", path = "crates/raster-h3-cli" }
-raster-h3-duckdb = { version = "0.4.0", path = "crates/raster-h3-duckdb" }
-raster-h3-datafusion = { version = "0.4.0", path = "crates/raster-h3-datafusion" }
-raster-h3-python = { version = "0.4.0", path = "crates/raster-h3-python" }
-raster-h3-pg = { version = "0.4.0", path = "crates/raster-h3-pg" }
+raster-h3-core = { version = "0.5.0", path = "crates/raster-h3-core" }
+raster-h3-cli = { version = "0.5.0", path = "crates/raster-h3-cli" }
+raster-h3-duckdb = { version = "0.5.0", path = "crates/raster-h3-duckdb" }
+raster-h3-datafusion = { version = "0.5.0", path = "crates/raster-h3-datafusion" }
+raster-h3-python = { version = "0.5.0", path = "crates/raster-h3-python" }
+raster-h3-pg = { version = "0.5.0", path = "crates/raster-h3-pg" }
 
 h3o.workspace = true
 rayon.workspace = true

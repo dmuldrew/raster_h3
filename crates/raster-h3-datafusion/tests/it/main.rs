@@ -3,8 +3,10 @@
 #[path = "../../../raster-h3-core/tests/it/helpers.rs"]
 mod helpers;
 
+mod bbox_pushdown;
 mod categorical_options;
 mod continuous_options;
 mod rows;
 mod scalar_udfs;
 mod statistics;
+mod transform_failures;

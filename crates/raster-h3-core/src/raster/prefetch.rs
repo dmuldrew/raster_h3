@@ -660,7 +660,7 @@ impl PrefetchedChunkReader {
                             .and_then(|payload| {
                                 decoder.read_chunk_with_payload(
                                     chunk_idx,
-                                    payload.as_ref().map(|v| v.as_slice()),
+                                    payload.as_deref(),
                                     recycled_buf,
                                 )
                             })
@@ -911,7 +911,7 @@ impl PrefetchedMosaicReader {
                             .and_then(|payload| {
                                 decoder.read_chunk_with_payload(
                                     chunk_idx,
-                                    payload.as_ref().map(|v| v.as_slice()),
+                                    payload.as_deref(),
                                     recycled_buf,
                                 )
                             })

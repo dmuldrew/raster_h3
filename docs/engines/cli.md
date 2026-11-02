@@ -34,6 +34,7 @@ raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
 | `--format <wide\|long>` | `ipc`, `jsonl` | Categorical layout (default `wide`) |
 | `--crs <CRS>` (alias `--source-crs`) | all | Source CRS override, e.g. `EPSG:4326` |
 | `--nodata <FLOAT>` | all | NoData override |
+| `--raw-values` | all | Aggregate stored values without GDAL band scale/offset calibration |
 | `--bbox <min_lon,min_lat,max_lon,max_lat>` | all | WGS84 bounding box |
 | `--columns <c1,c2,…>` | `ipc`, `jsonl` | Column projection, in the given order |
 | `--limit <N>` | `ipc`, `jsonl` | Maximum rows |
@@ -43,6 +44,8 @@ raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
 Arguments are validated strictly: unknown flags, missing values, resolutions outside
 `0..=15`, malformed numbers, a bbox without exactly four numbers, an unknown column name
 and a second positional input are all errors. Errors go to stderr with exit status `1`.
+Every subcommand also prints a warning to stderr when valid samples were dropped because
+their coordinate transform failed (see [transform-failure diagnostics](core.md#transform-failure-diagnostics)).
 
 Column names come from the core schemas (see the
 [overview](README.md#output-schemas)); `--columns` with a name that does not
@@ -70,7 +73,7 @@ stream, when the consumer expects standard formats.
 
 ### `parquet` and `pmtiles`
 
-`parquet` always writes GeoParquet 1.1 (WKB geometry + `geo` metadata) and reports nothing
+`parquet` always writes GeoParquet 1.1 (WKB geometry, see [cell geometry](../sql-api-reference.md#cell-geometry), + `geo` metadata) and reports nothing
 on stdout. `pmtiles` writes one zoom range per requested resolution (see
 [PMTiles & Multi-Resolution](../pmtiles.md)).
 
@@ -200,7 +203,7 @@ The binary is a thin wrapper over [`src/lib.rs`](../../crates/raster-h3-cli/src/
 | Item | Purpose |
 | :--- | :--- |
 | `parse_stream_args(args, default_format)` | Parse arguments into `CliStreamOptions` and an optional output path |
-| `CliStreamOptions` | `input_path`, `resolutions`, `categorical`, `categorical_format`, `source_crs`, `nodata`, `bbox`, `columns`, `batch_size` (2048), `limit`, `output_format` |
+| `CliStreamOptions` | `input_path`, `resolutions`, `categorical`, `categorical_format`, `source_crs`, `nodata`, `apply_scale_offset` (true), `bbox`, `columns`, `batch_size` (2048), `limit`, `output_format` |
 | `stream_raster_to_writer(&opts, &mut impl Write)` | Stream IPC or JSONL to any writer; returns rows written |
 | `export_raster_to_parquet(...)`, `export_raster_to_pmtiles(...)` | File exports |
 

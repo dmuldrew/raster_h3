@@ -22,7 +22,7 @@ name = "raster-h3-cli"
 path = "src/bin/raster_h3.rs"
 
 [dependencies]
-raster-h3-core = { version = "0.4.0", path = "../raster-h3-core" }
+raster-h3-core = { version = "0.5.0", path = "../raster-h3-core" }
 h3o.workspace = true
 flate2.workspace = true
 serde.workspace = true

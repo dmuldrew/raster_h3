@@ -299,6 +299,58 @@ fn test_aggregation_workers_run_concurrently_inside_pool_install() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn test_wave_dispatch_counters_for_each_caller_and_pool() -> Result<()> {
+    let (_file, path) = helpers::TestGeoTiffBuilder::new(64, 64)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|_, _| 1.0);
+    let caller = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+
+    for dedicated in [false, true] {
+        for nested in [false, true] {
+            let mut config = MultiResolutionConfig::single(8);
+            config.aggregation_budget_bytes = 256 * 1024;
+            config.aggregation_workers = dedicated.then_some(2);
+            let run = || -> Result<()> {
+                let mut streamer =
+                    MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path)?, &config)?;
+                let counters = |s: &MultiScanHorizonStreamer| {
+                    let m = s.metrics();
+                    (m.waves, m.bridged_waves, m.serial_waves, m.jobs)
+                };
+                assert_eq!(counters(&streamer), (0, 0, 0, 0));
+                let mut count = 0.0;
+                while !streamer.is_finished() {
+                    count += streamer
+                        .fetch_next_batch(128)?
+                        .iter()
+                        .map(|r| r.accumulator.count)
+                        .sum::<f64>();
+                }
+                assert_eq!(count, 64.0 * 64.0);
+                let (waves, bridged, serial, jobs) = counters(&streamer);
+                assert!(waves > 1, "fixture must exercise multiple dispatches");
+                assert!(jobs >= waves);
+                assert_eq!(bridged, if dedicated && nested { waves } else { 0 });
+                assert_eq!(serial, if !dedicated && nested { waves } else { 0 });
+
+                assert!(streamer.fetch_next_batch(128)?.is_empty());
+                assert_eq!(counters(&streamer), (waves, bridged, serial, jobs));
+                Ok(())
+            };
+            if nested {
+                caller.install(run)?;
+            } else {
+                run()?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rayon workers that hold a shared streamer mutex while sibling tasks wait
 /// for it must not deadlock when the streamer uses a dedicated pool.
 #[test]

@@ -190,6 +190,12 @@ impl MultiCategoricalHorizonStreamer {
         self.inner.spill_run_counts()
     }
 
+    /// Valid sample points dropped by failed or out-of-domain coordinate
+    /// transforms. Non-zero means some valid pixels are missing from the output.
+    pub fn transform_failures(&self) -> u64 {
+        self.inner.transform_failures()
+    }
+
     /// Peak active-map allocation estimate (not whole-process memory).
     pub fn peak_active_bytes(&self) -> usize {
         self.inner.peak_active_bytes()

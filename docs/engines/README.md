@@ -71,6 +71,8 @@ Each deep dive has a recipes section covering the same tasks. The core calls, si
 | Categorical scan | `h3_raster_categorical_aggregate(..., format := 'long')` | `scan_raster_h3(..., categorical=True, format="long")` | `h3_raster_categorical_aggregate(...)` (wide only) | `jsonl ... -c --format long` | `CategoricalRasterTableProvider::try_new(..)?.with_format(Long)` |
 | Several resolutions | `resolutions := '7,8'` | `[7, 8]` | one call per resolution | `-r 7,8` | `vec![7, 8]` |
 | CRS / NoData / bbox | `source_crs :=`, `nodata :=`, `bbox :=` | `crs=`, `nodata=`, `bbox=` | `source_crs =>`, `nodata =>`, `bbox =>` | `--crs`, `--nodata`, `--bbox` | `with_crs`, `with_nodata`, `with_bbox` |
+| Band scale/offset | `scale_offset := false` opts out | always applied | always applied | `--raw-values` opts out | `with_scale_offset(false)` opts out |
+| Fail on dropped samples | `strict_transforms := true` | `strict_transforms=True` | — (`WARNING` only) | — (stderr warning only) | `with_strict_transforms(true)` |
 | GeoParquet export | `h3_raster_to_parquet(...)` | `raster_to_parquet(...)` | — (`COPY` to CSV) | `raster-h3-cli parquet ... -o` | — (core `H3ParquetWriter`) |
 | PMTiles export | `h3_raster_to_pmtiles(...)` | `raster_to_pmtiles(...)` | — | `raster-h3-cli pmtiles ... -o` | — (core `H3PmtilesTiler`) |
 | Recipes | [DuckDB](duckdb.md#sql-usage--recipes) | [Python](python-polars.md#recipes) | [PostgreSQL](postgresql.md#recipes) | [CLI](cli.md#recipes) | [DataFusion](datafusion.md#recipes) |
@@ -92,7 +94,7 @@ All engines derive their columns from `raster_h3_core::columnar::ColumnSchema`:
 | `ColumnSchema::categorical_long()` | `h3_index`, `h3_hex`, `category` i64, `count`, `fraction`, `total_count`, `resolution`, `shannon_entropy`, `entropy`, `distinct_classes`, `unique_classes`, `wkb` |
 
 The DuckDB table functions keep their own historical column sets (documented in the
-[DuckDB SQL API Reference](../api-reference.md)); PostgreSQL returns a subset (see
+[DuckDB SQL API Reference](../sql-api-reference.md)); PostgreSQL returns a subset (see
 [PostgreSQL](postgresql.md#output-columns)).
 
 ### H3 index representation
@@ -118,7 +120,12 @@ differences that remain:
 | `h3_is_valid(cell \| hex)` | `false` | — |
 | `h3_to_wkb(cell \| hex)` (aliases `h3_to_geometry`, `h3_cell_to_geometry`) | `None` | PostgreSQL has the `bigint` overload only |
 | `h3_cell_to_parent(cell, res)` | `None` when `res` is outside `0..=15` or finer than the cell | DuckDB returns `0` |
-| `h3_polygon_to_cells(wkb, res[, containment])` ([modes](../api-reference.md#h3_polygon_to_cells)) | `Err` for invalid WKB, a resolution outside `0..=15`, or more than `H3_POLYGON_TO_CELLS_MAX_CELLS` (10,000,000) cells | DuckDB and Python only. Both return `NULL` / `None` for invalid geometry or resolution, and raise a query error / `ValueError` for an unknown mode or too many cells. Not yet in DataFusion (no list column type) or PostgreSQL |
+| `h3_polygon_to_cells(wkb, res[, containment])` ([modes](../sql-api-reference.md#h3_polygon_to_cells)) | `Err` for invalid WKB, a resolution outside `0..=15`, or more than `H3_POLYGON_TO_CELLS_MAX_CELLS` (10,000,000) cells | DuckDB and Python only. Both return `NULL` / `None` for invalid geometry or resolution, and raise a query error / `ValueError` for an unknown mode or too many cells. Not yet in DataFusion (no list column type) or PostgreSQL |
+
+Every engine emits the same cell geometry, from one shared encoder: a `Polygon` for
+ordinary cells, a two-part `MultiPolygon` cut at ±180° for cells crossing the
+antimeridian, and polar-cap `Polygon`s for the two pole cells, with longitudes always
+in [-180, 180]. See [cell geometry](../sql-api-reference.md#cell-geometry).
 
 ## Cross-Engine Parity Testing
 

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Memory benchmark suite (`cargo test --release -p raster-h3-core --test memory`): seven scenarios (spill-run construction, forced spills with quantile sketches and high-cardinality categories, slow HTTP and Parquet consumers, many tiny chunks, concurrent streams), each variant in its own process, with allocator, request-count and spill checks that run in CI on every platform; RSS and wall time are reported only. `docs/testing.md` records a before/after measurement of the #60 prefetch byte budget. The counting allocator is shared with `profile_hotspots`.
+
+### Changed
+
+- Index each sample at every resolution through `h3o::LatLngIndexer`, sharing H3's resolution-independent projection and reusing the last cell per resolution while consecutive samples stay in the same face `IJK` cell; cells are identical. Depends on unreleased upstream h3o master (`[patch.crates-io]`, pinned by revision) until the API ships in an h3o release. Add opt-in `.cargo/fma.toml` for x86_64 CPUs with FMA3.
+
+### Fixed
+
+- DataFusion `FilterPredicate::Bbox` pushdown no longer changes the aggregates of cells straddling the box edge. The pushed box is widened by more than the largest cell diameter at the coarsest resolution, so every cell intersecting the box keeps the values of an unfiltered scan and the pushdown is a true `Inexact` superset. It is not pushed when compaction is on. `with_bbox` keeps its pixel-clipping semantics.
+
+## [0.5.0] - 2026-10-28
+
+### Added
+
+- Strict transform mode: `MultiResolutionConfig::strict_transforms` fails the stream with the new `RasterH3Error::TransformFailures` as soon as a valid sample point is dropped by a failed coordinate transform. Exposed as DuckDB `strict_transforms := true` (every table function; exports report it in `status`), Python `strict_transforms=True` (`scan_raster_h3`, `read_raster_h3`, `RasterH3ArrowStream`) and DataFusion `with_strict_transforms(true)`. Off by default.
+- Lenient scans report dropped samples too: Python `scan_raster_h3`, `RasterH3ArrowStream.iter_batches()` and `.to_dict()` emit a `RuntimeWarning` once the scan completes, and DataFusion providers take `with_transform_failure_counter`. The Python native library adds `raster_h3_py_create_arrow_stream_ex`, `raster_h3_py_open_batch_reader_ex`, `raster_h3_py_scan_json_ex` and `raster_h3_py_batch_reader_transform_failures`; the existing scan symbols keep their signatures.
+- Transform-failure counts reach the engines: a `transform_failures` column in DuckDB's `h3_raster_to_parquet` / `h3_raster_to_pmtiles` (and `h3_parquet_to_pmtiles`, always 0) summary rows, one PostgreSQL `WARNING` at the end of the aggregate SRFs, a Python `RuntimeWarning` from `raster_to_parquet` / `raster_to_pmtiles`, and a CLI stderr warning from `parquet` / `pmtiles`. Core adds `MultiResolutionConfig::transform_failure_counter` for pipelines that own the streamer. The Python native library adds `raster_h3_py_export_parquet_with_stats` / `raster_h3_py_export_pmtiles_with_stats`; the existing export symbols keep their signatures.
+- `transform_failures()` on the continuous and categorical streamers and batch readers: valid sample points dropped because their coordinate transform failed or left the valid latitude/longitude range (previously silent). Counted in every build. The CLI warns on stderr when it is non-zero.
+- `profile_hotspots` example and `profile.yml` workflow measuring mosaic tile-scan scaling and nested-Rayon wave dispatch, with a counting allocator. `StreamProfile` gains `waves`, `bridged_waves` and `serial_waves` counters.
+- GDAL band `SCALE`/`OFFSET` calibration: continuous statistics, quantiles and spectral indices now use `stored * scale + offset` per band (and per mosaic file). NoData is still matched on stored values. Opt out with DuckDB `scale_offset := false`, CLI `--raw-values`, DataFusion `with_scale_offset(false)` or `MultiResolutionConfig::apply_scale_offset`. Malformed scale/offset metadata is rejected when the file is opened.
+- TIFF alpha: pixels whose `ExtraSamples` alpha sample is zero are excluded from continuous and categorical aggregation.
+
 - `QuantilePlan` evaluates a list of `QuantileTarget`s with one sketch sweep per cell; `ContinuousBatchReader::tracks_quantiles()` and `columnar::quantiles_projected()` expose the quantile pushdown decision.
 - Release quality gates covering lint, MSRV, engine/community builds, blocking dependency policy, package/version checks, wheels, fuzzing and Miri; weekly advisory and safety checks.
 - GitHub release SHA-256 checksums and build provenance, validated wheel assets, contributor issue forms and PR checklist.
@@ -25,9 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Workspace, Python package, PostgreSQL extension and DuckDB community-extension manifest versions bumped to `0.5.0` (PostgreSQL install script renamed to `sql/raster_h3--0.5.0.sql`; its definitions are unchanged from 0.4.0, and `sql/raster_h3--0.4.0--0.5.0.sql` lets existing databases run `ALTER EXTENSION raster_h3 UPDATE`). The community-extension manifest's `repo.ref` points at the 0.5.0 version-bump commit.
+- Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
+- Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
+- The DuckDB reference moved to [`docs/sql-api-reference.md`](docs/sql-api-reference.md) (SQL API Reference) and a new [Polars API Reference](docs/polars-api-reference.md) documents the Python package's scan options, output schemas, `RasterH3ArrowStream`, exporters and H3 helpers. `docs/api-reference.md` now links to both.
+- Python scans and exporters reject an empty `resolutions` (`""` or `[]`) with `Invalid resolutions` instead of silently using resolution 8. A NULL `resolutions` pointer in the C ABI still means `[8]`.
+- Remote COG prefetching is bounded by bytes instead of chunk count: each range's size is reserved against `RemotePrefetchConfig::max_buffered_bytes` (new, default 32 MiB) before its request, covering requests in flight, and stays charged until the last chunk sliced from the response is dropped. Chunks share the response buffer instead of being copied out under the lock, and workers wait on a condition variable instead of a 5 ms polling loop. `get_chunk_payload`/`try_get_chunk_payload` now return `PrefetchedChunk` (derefs to `[u8]`) instead of `Arc<Vec<u8>>`; `held_bytes()`/`peak_held_bytes()` report budget use. Blocking requests are prioritized in any order, evicting unrequested prefetched responses when necessary and refetching their untaken chunks on demand without exceeding the byte budget (or one oversized range).
+- `Cutline` overlap ownership caches each tile's centre unit vector and computes the sample's once per call, removing 8 trig calls per tile per overlapping sample (about 29 ns → 1.3 ns per tile); decisions are bit-identical. Documented the cost of driving streamers from a Rayon pool and when to set `aggregation_workers`.
 - Continuous readers (core `ContinuousBatchReader::open`, and so the CLI, Python and DataFusion paths, plus the DuckDB scan) build per-cell quantile sketches only when a quantile column is projected, and compute all projected quantile columns of a cell in one sorted sweep instead of one sweep (and bin-key sort) per column. `H3Accumulator::iqr` uses one sweep for p25/p75.
 - Keep Albers inverse constants in an immutable walker-local prepared projection, preserving public source-field construction and mutation without stale caches. Use portable multiply/add series evaluation, share row terms and exact cell-run advancement, and retain row hoisting for horizontal shear and `stream-profile` builds. The series can differ from the previous Newton iteration at sub-nanometre scale, which moves pixels lying on a cell edge (1 of 28.4M pixels in the Hawaii CFL Albers benchmark); the Hawaii WGS84 outputs were bit-for-bit identical.
-- Index each sample at every resolution through `h3o::LatLngIndexer`, sharing H3's resolution-independent projection and reusing the last cell per resolution while consecutive samples stay in the same face `IJK` cell; cells are identical. Depends on unreleased upstream h3o master (`[patch.crates-io]`, pinned by revision) until the API ships in an h3o release. Add opt-in `.cargo/fma.toml` for x86_64 CPUs with FMA3.
 - Label withdrawn stride-probing benchmark results as historical row-count comparisons only; use a monotonic benchmark timer and the direct Parquet exporter when the Polars IO plugin is unavailable.
 
 - Long-format categorical output (core `CategoricalBatchReader` and the DuckDB `format := 'long'` scan) now expands one cell at a time and only as far as each batch needs, instead of eagerly queueing every category of a whole batch of cells (e.g. ~2M rows for 2,048 cells × 1,000 classes). Shannon entropy is skipped when no entropy column is projected.
@@ -46,6 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Polars' native Parquet reader (`pl.read_parquet` / `pl.scan_parquet`) failed with "Invalid thrift: bad data" on every Parquet / GeoParquet file from `raster_to_parquet`, the CLI `parquet` subcommand and DuckDB `h3_raster_to_parquet`. parquet 60 writes the `IEEE_754_TOTAL_ORDER` column order for FLOAT/DOUBLE columns with no way to opt out; Polars cannot decode it and PyArrow ignores those columns' min/max statistics. The export pipeline now rewrites those footer entries as the type-defined order after closing the file (`parquet::column_order::restore_type_defined_float_orders`). Files written before this fix still need `use_pyarrow=True`, or have to be regenerated.
+- PMTiles vector-tile rings now have positive area in tile coordinates, as MVT 2.1 requires for exterior rings (they were all reversed), and the two pole cells are polar caps reaching the map edge instead of rings jumping back across the tile. `MvtFeature` holds up to `MAX_FEATURE_POINTS` (14) points.
+- The GeoParquet `bbox` covers the cell geometries actually written instead of the raster's bounds, which cells extend past; the `geo` metadata is appended when the file is closed. Adds `encoding::extend_wkb_bounds`.
+- WKB cell geometries are valid for planar GIS tools: cells crossing the antimeridian are written as a `MultiPolygon` cut at ±180° (instead of a ring with longitudes beyond ±180°), and the two pole cells are written as counter-clockwise polar-cap polygons (instead of an unchanged ring that self-intersects in longitude/latitude). Ordinary cells are unchanged. `WKB_BUF_LEN` grows from 192 to 771 bytes, and GeoParquet `geometry_types` now lists `Polygon` and `MultiPolygon`. Python's `h3_to_wkb` sizes its buffer from the new `raster_h3_py_wkb_buf_len()` instead of a hard-coded 192 bytes.
+- Uncompressed GeoTIFFs with unspecified extra samples (for example RGB plus NIR) failed with "decoded chunk shorter than its declared dimensions" because the `tiff` decoder drops those samples; uncompressed chunks are now decoded from the `SamplesPerPixel` layout. Unrecognised compression codes are no longer mapped to uncompressed.
 - Single-probability `QuantilePlan` evaluations use the scalar sketch query, avoiding batch result/rank-vector allocations per cell; empty plans skip sketch evaluation. Added p50/p90 scalar/batch/plan Criterion comparisons.
 - `QuantileSketch::quantiles_batch` now returns exactly what `quantile()` returns for every target: NaN targets yield NaN instead of corrupting the sort (which could misorder results or panic), and degenerate `min`/`max` ranges match `q <= 0`/`q >= 1` handling.
 - Quantile specs reject NaN percentiles (`'nan'`, `'pnan'`), which previously parsed because NaN fails both range comparisons. The DuckDB API reference lists the real presets (`'box'`, not the unsupported `'quartiles'`).
@@ -63,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - DuckDB community-extension build scaffolding: root `Makefile` and `extension-ci-tools` submodule (DuckDB's `c_api_extensions` makefiles), so `make configure && make release` produces `build/release/raster_h3.duckdb_extension` (stable C API, minimum DuckDB v1.2.0); `test/sql/raster_h3.test` sqllogictest run by `make test_release` ([DuckDB](docs/engines/duckdb.md#community-extension-build)).
-- `h3_polygon_to_cells(geometry, resolution [, containment])` scalar (h3o polyfill) in DuckDB (`BLOB`/`GEOMETRY` → `UBIGINT[]`) and Python, with the `contains_centroid` (default), `contains_boundary`, `intersects_boundary` and `covers` containment modes ([API Reference](docs/api-reference.md#h3_polygon_to_cells)). Backed by `raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb` and a new WKB polygon reader.
+- `h3_polygon_to_cells(geometry, resolution [, containment])` scalar (h3o polyfill) in DuckDB (`BLOB`/`GEOMETRY` → `UBIGINT[]`) and Python, with the `contains_centroid` (default), `contains_boundary`, `intersects_boundary` and `covers` containment modes ([API Reference](docs/sql-api-reference.md#h3_polygon_to_cells)). Backed by `raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb` and a new WKB polygon reader.
 - **Multi-engine Cargo workspace** ([Engines Overview](docs/engines/README.md)): the engine moved to `crates/raster-h3-core`; the DuckDB extension to `crates/raster-h3-duckdb`. The root `raster_h3` crate re-exports every member and still builds `libraster_h3` for DuckDB.
 - `raster-h3-core` `columnar` module: `RecordBatch`/`ColumnSchema` model, `ContinuousBatchReader` / `CategoricalBatchReader`, Arrow C Data and C Stream interface, `RH3IPC01` binary stream and NDJSON writer; `scalar_ops` module with H3 helpers shared by all engines ([Core](docs/engines/core.md)).
 - `raster-h3-datafusion`: DataFusion-style `TableProvider` / `ExecutionPlan` / `ScalarUDFImpl` with projection, filter and limit pushdown ([DataFusion](docs/engines/datafusion.md)).
@@ -74,37 +107,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in European national-grid EPSG codes with Helmert datum shifts: `27700` (OSGB36), `28992` (Amersfoort / RD New), `31466`–`31469` (DHDN Gauss-Kruger), `23028`–`23038` (ED50 / UTM); and ETRS89 codes treated as WGS84: `2154`, `3035`, `25828`–`25838` ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
 
 ### Changed
-- Upgraded tiff to 0.11. 16-bit floating-point GeoTIFFs, which tiff 0.9 could not decode, are now read and widened to `f32`; the TIFF floating-point predictor (Predictor 3) is now implemented in `raster_h3_core::raster::predictor` because tiff no longer exports it.
-- Upgraded h3o to 0.11 (polyfill now uses `h3o::geom::TilerBuilder`) and parquet to 60 (`flate2-rust_backend` codec feature). With h3o 0.11, `h3_polygon_to_cells(..., 'intersects_boundary')` returns the enclosing cell for a polygon that fits inside one cell, matching `covers`, instead of an empty list.
-- Workspace, Python package and PostgreSQL extension versions bumped to `0.4.0` (PostgreSQL install script renamed to `sql/raster_h3--0.4.0.sql`; there is no 0.3.0 release).
+- Workspace, Python package and PostgreSQL extension versions bumped to `0.4.0` (PostgreSQL install script renamed to `sql/raster_h3--0.4.0.sql`).
 - The DuckDB community-extension manifest moved from `community_extension/` to `packaging/duckdb-community/description.yml`; it now points at `dmuldrew/raster_h3`, declares version `0.4.0` and excludes the opt-in musl and `windows_amd64_rtools` platforms.
 - Repository and homepage URLs point to `github.com/dmuldrew/raster_h3` (previously `raster_h3_hexification`).
 - `h3_parquet_to_pmtiles` (and `process_parquet_to_pmtiles` / `convert_to_pmtiles`) now return an error naming the available columns when an explicit `h3_column` is not found, instead of silently falling back to auto-detection or column 0.
 - PROJ strings with 3- or 7-parameter Helmert shifts (`+towgs84=...`, or a named datum that implies one such as `+datum=OSGB36`) are now transformed via proj4rs instead of rejected. Grid-based datums (`+nadgrids` other than `@null`, `+datum=NAD27`) and unknown `+datum` names are still rejected with `CrsError`; a non-zero shift never takes a fast path ([Datum Shifts](docs/crs-and-projection.md#datum-shifts)).
-- Bound decoded chunk memory in bytes, not only by queue length: the mosaic prefetcher charges buffers being decoded, queued, aggregated and idle against `decode_budget_bytes` (SQL `decode_budget_mb`, default 256 MiB). Reservations are granted in job order before decoding; a chunk larger than the budget is decoded only when no other is held. Peak usage is reported as `StreamProfile::peak_decoded_bytes`.
-- Account pending compaction groups in bytes; they now count toward `peak_active_bytes`, and `StreamProfile` reports `peak_compaction_bytes` and `forced_compaction_flushes`. An opt-in `compaction_budget_bytes` (SQL `compaction_budget_mb`) decomposes the groups nearest completion into child records once exceeded. Samples and totals are unchanged, but which groups compact then depends on batch timing and can vary between runs; unset, compaction stays deterministic.
-- Index pending compaction groups with per-resolution heaps, so streaming completion checks and the published horizon cost O(log n) per finished group instead of a scan of every pending group per batch. Streaming completion flushes stop once the output buffer reaches its byte limit and resume on the next call.
-- Fuse supersample projection, H3 assignment, and accumulation with reusable per-pixel scratch buffers; avoid repeated certification work and preserve individual quantile sample updates.
-- Use absolute pixel coordinates consistently for indexing, sequential span discovery, and supersampling; remove incremental coordinate stepping and obsolete width-prediction state.
-- Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
-- Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.
-- Document aggregation budgets, spill behavior, and uncertified projected eviction without unconditional process-memory or geometric-skip claims.
 - DuckDB scalar overloads (`h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_to_geometry`, `h3_cell_to_geometry`, `h3_polygon_to_cells`) are registered as scalar function sets. DuckDB before 1.5 rejected the second registration under a name, so only the first overload (e.g. `h3_is_valid(UBIGINT)`) was available there.
 - Reorganise the documentation for the multi-engine workspace: the README is engine-neutral (Engines section after the introduction, topic deep dives at the end), the worked example has DuckDB and Polars versions, DuckDB install/Docker/SQL recipes/client examples moved to the [DuckDB deep dive](docs/engines/duckdb.md), and the Python, PostgreSQL, CLI and DataFusion deep dives gained matching recipes and troubleshooting sections. `docs/api-reference.md` is now titled the DuckDB SQL API Reference.
 
-### Fixed
-- Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.
-- Return complete remote byte reads across cache blocks and use a cached full-file HTTP response for large reads.
-- Preserve supersamples that fall inside a bounding box when their pixel center falls outside it.
-- Reject compact multi-resolution requests that would emit both a requested parent cell and a compacted child-cell parent.
-- Validate HTTP partial-content status, range offsets, total size, and body length before accepting remote COG bytes.
-- Preserve finite Float32 values when the NoData marker is NaN, including span statistics and variance.
-- Apply full affine coordinates to rotated/sheared raster centers and subpixel samples, including WGS84 and Web Mercator. Disable north-up scanline shortcuts for these rasters.
-- Mix all 64 bits of H3 indices when choosing aggregation shards, preventing resolutions 0–13 from collapsing into a single shard. Added distribution tests across resolutions 0–15 and local neighborhoods, plus continuous/categorical merge and eviction checks with one and four Rayon threads.
-- Propagate chunk decoding and remote prefetch errors through continuous/categorical streamers, DuckDB table functions, and Parquet/PMTiles exporters. Failed streams continue returning an error on subsequent reads instead of reporting successful EOF.
-- Deliver prefetch initialization failures even when earlier chunk slots are still empty.
-- Replace approximate nearest-centroid subpixel assignment and core-span checks with direct H3 indexing.
-- Publish Parquet exports only after successful completion, preserving an existing destination on stream failure.
+## [0.3.0] - 2026-10-15
 
 ### Added
 - **Single-Pass Multi-Resolution Fusion**:
@@ -160,6 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Supports OGC GeoParquet 1.1 metadata, compact format, and configurable compression (`snappy`, `zstd`, `gzip`, `lz4`, `brotli`).
 
 ### Changed
+- Bound decoded chunk memory in bytes, not only by queue length: the mosaic prefetcher charges buffers being decoded, queued, aggregated and idle against `decode_budget_bytes` (SQL `decode_budget_mb`, default 256 MiB). Reservations are granted in job order before decoding; a chunk larger than the budget is decoded only when no other is held. Peak usage is reported as `StreamProfile::peak_decoded_bytes`.
+- Account pending compaction groups in bytes; they now count toward `peak_active_bytes`, and `StreamProfile` reports `peak_compaction_bytes` and `forced_compaction_flushes`. An opt-in `compaction_budget_bytes` (SQL `compaction_budget_mb`) decomposes the groups nearest completion into child records once exceeded. Samples and totals are unchanged, but which groups compact then depends on batch timing and can vary between runs; unset, compaction stays deterministic.
+- Index pending compaction groups with per-resolution heaps, so streaming completion checks and the published horizon cost O(log n) per finished group instead of a scan of every pending group per batch. Streaming completion flushes stop once the output buffer reaches its byte limit and resume on the next call.
+- Fuse supersample projection, H3 assignment, and accumulation with reusable per-pixel scratch buffers; avoid repeated certification work and preserve individual quantile sample updates.
+- Use absolute pixel coordinates consistently for indexing, sequential span discovery, and supersampling; remove incremental coordinate stepping and obsolete width-prediction state.
+- Remove unused profiling counters, sampling-bound helpers, and the `raster_h3::h3` compatibility alias. Rust callers should use `h3o` directly; callers of removed scanline helpers must migrate to the stateless indexing/span functions.
+- Replace Hawaii aggregation goldens with per-pixel reference comparisons. External-data tests remain ignored by default and fail explicitly if invoked without their datasets.
+- Document aggregation budgets, spill behavior, and uncertified projected eviction without unconditional process-memory or geometric-skip claims.
 - **Rust API change:** `fetch_next_batch`, `drain_completed_into`, and `advance_until_completed` now return `Result`; callers must propagate or handle failures (for example, `streamer.fetch_next_batch(2048)?`). The `ParquetStreamer` and record-queue interfaces also propagate `Result`.
 - Removed the approximate `H3NeighborDiskCache` and `can_use_neighbor_cache` helpers and their unused per-row geometry fields. Boundary-heavy supersampling may be slower with exact indexing; center-sampled scanline aggregation retains its existing fast path.
 - **Strict CRS Validation on GeoTIFF Ingestion**:
@@ -175,6 +194,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added structured `RasterH3Error::UnsupportedEpsg { code, detail }` error variant.
   - Unified continuous and categorical scanline loops into generic `ScanlineEngine` trait with `scanline_walk` in `src/aggregator/multi_horizon/walker.rs`.
   - Consolidated test GeoTIFF generation across all integration test suites into generic `TestGeoTiffBuilder`.
+
+### Fixed
+- Reject fractional, nonfinite, and out-of-range integer NoData markers instead of truncating or saturating them to valid pixel values.
+- Return complete remote byte reads across cache blocks and use a cached full-file HTTP response for large reads.
+- Preserve supersamples that fall inside a bounding box when their pixel center falls outside it.
+- Reject compact multi-resolution requests that would emit both a requested parent cell and a compacted child-cell parent.
+- Validate HTTP partial-content status, range offsets, total size, and body length before accepting remote COG bytes.
+- Preserve finite Float32 values when the NoData marker is NaN, including span statistics and variance.
+- Apply full affine coordinates to rotated/sheared raster centers and subpixel samples, including WGS84 and Web Mercator. Disable north-up scanline shortcuts for these rasters.
+- Mix all 64 bits of H3 indices when choosing aggregation shards, preventing resolutions 0–13 from collapsing into a single shard. Added distribution tests across resolutions 0–15 and local neighborhoods, plus continuous/categorical merge and eviction checks with one and four Rayon threads.
+- Propagate chunk decoding and remote prefetch errors through continuous/categorical streamers, DuckDB table functions, and Parquet/PMTiles exporters. Failed streams continue returning an error on subsequent reads instead of reporting successful EOF.
+- Deliver prefetch initialization failures even when earlier chunk slots are still empty.
+- Replace approximate nearest-centroid subpixel assignment and core-span checks with direct H3 indexing.
+- Publish Parquet exports only after successful completion, preserving an existing destination on stream failure.
 
 ## [0.2.0] - 2026-08-30
 
@@ -229,7 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docker container** with multi-stage build, bundled DuckDB CLI, and demo script
 - **Query planner integration**: cardinality estimation and parallel `init_local` distribution
 
-[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/dmuldrew/raster_h3/compare/v0.2.0...v0.4.0
-[0.2.0]: https://github.com/dmuldrew/raster_h3/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dmuldrew/raster_h3/releases/tag/v0.1.0
+[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/dmuldrew/raster_h3/compare/c63dd46...v0.4.0
+[0.3.0]: https://github.com/dmuldrew/raster_h3/tree/c63dd46

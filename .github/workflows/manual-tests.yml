@@ -182,7 +182,7 @@ jobs:
 
       - name: Set up Python
         if: inputs.engine == 'python-polars'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 

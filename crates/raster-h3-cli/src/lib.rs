@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
@@ -41,6 +42,8 @@ pub struct CliStreamOptions {
     pub categorical_format: CategoricalFormat,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
+    /// Calibrate stored values with GDAL band scale/offset (`--raw-values` disables).
+    pub apply_scale_offset: bool,
     pub bbox: Option<[f64; 4]>,
     pub columns: Option<Vec<String>>,
     pub batch_size: usize,
@@ -57,6 +60,7 @@ impl Default for CliStreamOptions {
             categorical_format: CategoricalFormat::Wide,
             source_crs: None,
             nodata: None,
+            apply_scale_offset: true,
             bbox: None,
             columns: None,
             batch_size: 2048,
@@ -89,6 +93,17 @@ fn resolve_projection_indices(
     Ok(Some(indices))
 }
 
+/// Report valid samples the coordinate transform could not place, on stderr
+/// so streamed output stays clean.
+fn warn_transform_failures(failures: u64) {
+    if failures > 0 {
+        eprintln!(
+            "warning: {failures} valid sample(s) were dropped because their coordinate \
+             transform failed or fell outside the valid latitude/longitude range; check the source CRS"
+        );
+    }
+}
+
 /// Stream a GeoTIFF/COG aggregation directly to `writer` in binary IPC or JSONL format.
 /// Returns the total number of rows emitted.
 pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W) -> Result<usize> {
@@ -96,26 +111,29 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
     let mut config = MultiResolutionConfig::new(opts.resolutions.clone());
     config.custom_crs = opts.source_crs.clone();
     config.custom_nodata = opts.nodata;
+    config.apply_scale_offset = opts.apply_scale_offset;
     config.bbox = opts.bbox;
     config.overlap_rule = OverlapRule::Cutline;
 
     if !opts.categorical {
         let full_schema = ColumnSchema::continuous(&config.quantiles);
         let projection = resolve_projection_indices(&full_schema, &opts.columns)?;
-        let reader =
+        let mut reader =
             ContinuousBatchReader::open(&paths, &config, projection, opts.batch_size, opts.limit)?;
         let schema = reader.schema();
-        match opts.output_format {
-            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, reader),
-            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, reader),
-        }
+        let rows = match opts.output_format {
+            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, &mut reader),
+            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, &mut reader),
+        }?;
+        warn_transform_failures(reader.transform_failures());
+        Ok(rows)
     } else {
         let full_schema = match opts.categorical_format {
             CategoricalFormat::Wide => ColumnSchema::categorical_wide(),
             CategoricalFormat::Long => ColumnSchema::categorical_long(),
         };
         let projection = resolve_projection_indices(&full_schema, &opts.columns)?;
-        let reader = CategoricalBatchReader::open(
+        let mut reader = CategoricalBatchReader::open(
             &paths,
             &config,
             opts.categorical_format,
@@ -124,10 +142,12 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
             opts.limit,
         )?;
         let schema = reader.schema();
-        match opts.output_format {
-            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, reader),
-            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, reader),
-        }
+        let rows = match opts.output_format {
+            StreamOutputFormat::Ipc => write_ipc_stream(writer, &schema, &mut reader),
+            StreamOutputFormat::Jsonl => write_jsonl_stream(writer, &mut reader),
+        }?;
+        warn_transform_failures(reader.transform_failures());
+        Ok(rows)
     }
 }
 
@@ -142,12 +162,16 @@ pub fn export_raster_to_parquet(
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
     geoparquet: bool,
+    apply_scale_offset: bool,
 ) -> Result<usize> {
     let paths = resolve_raster_sources(input_path)?;
     let mut config = MultiResolutionConfig::new(resolutions);
     config.custom_crs = source_crs.clone();
     config.custom_nodata = nodata;
+    config.apply_scale_offset = apply_scale_offset;
     config.bbox = bbox;
+    let failures = Arc::new(AtomicU64::new(0));
+    config.transform_failure_counter = Some(Arc::clone(&failures));
 
     let mosaic = Arc::new(MosaicReader::open(
         &paths,
@@ -162,18 +186,20 @@ pub fn export_raster_to_parquet(
         ..Default::default()
     };
 
-    if !categorical {
+    let rows = if !categorical {
         let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;
         H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, output_path, pq_cfg)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     } else {
         let streamer = MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config)?;
         H3ParquetWriter::write_categorical_streamer_to_parquet(streamer, output_path, pq_cfg)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     }
+    .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+    warn_transform_failures(failures.load(Ordering::Relaxed));
+    Ok(rows)
 }
 
 /// Export a raster directly to a PMTiles v3 archive.
+#[allow(clippy::too_many_arguments)]
 pub fn export_raster_to_pmtiles(
     input_path: &str,
     output_path: &Path,
@@ -182,19 +208,24 @@ pub fn export_raster_to_pmtiles(
     source_crs: Option<String>,
     nodata: Option<f64>,
     bbox: Option<[f64; 4]>,
+    apply_scale_offset: bool,
 ) -> Result<usize> {
     let mut config = MultiResolutionConfig::new(resolutions);
     config.custom_crs = source_crs;
     config.custom_nodata = nodata;
+    config.apply_scale_offset = apply_scale_offset;
     config.bbox = bbox;
+    let failures = Arc::new(AtomicU64::new(0));
+    config.transform_failure_counter = Some(Arc::clone(&failures));
 
-    if !categorical {
+    let tiles = if !categorical {
         H3PmtilesTiler::process_raster_source_to_pmtiles(input_path, output_path, config)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     } else {
         H3PmtilesTiler::process_categorical_source_to_pmtiles(input_path, output_path, config)
-            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
     }
+    .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+    warn_transform_failures(failures.load(Ordering::Relaxed));
+    Ok(tiles)
 }
 
 /// Parse CLI arguments into [`CliStreamOptions`] and an optional output file path (`None` = stdout).
@@ -252,6 +283,7 @@ pub fn parse_stream_args(
                 let v = value()?;
                 opts.nodata = Some(v.parse().map_err(|_| invalid(flag, v, "a number"))?);
             }
+            "--raw-values" => opts.apply_scale_offset = false,
             "--bbox" => {
                 let v = value()?;
                 opts.bbox = Some(
@@ -389,6 +421,8 @@ mod tests {
         assert_eq!(opts.bbox, Some([1.0, 2.0, 3.0, 4.0]));
         assert_eq!(opts.limit, Some(5));
         assert_eq!(out.as_deref(), Some("x"));
+        assert!(opts.apply_scale_offset);
+        assert!(!parse(&["--raw-values"]).unwrap().0.apply_scale_offset);
 
         for bad in [
             &["--bbox", "10,20,30"][..],

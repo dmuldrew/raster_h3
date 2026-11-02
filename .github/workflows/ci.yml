@@ -196,6 +196,9 @@ jobs:
       - name: Run Tests
         run: cargo test --locked --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb
 
+      - name: Test hotspot harness ownership sampling
+        run: cargo test --locked --release -p raster-h3-core --example profile_hotspots
+
       - name: Build Dynamic Library & Binaries
         run: cargo build --locked --release --target ${{ matrix.target }}
 
@@ -473,7 +476,7 @@ jobs:
           ls -la release-assets/
 
       - name: Attest release assets
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-assets/*
 

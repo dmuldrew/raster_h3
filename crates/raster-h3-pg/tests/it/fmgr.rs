@@ -181,9 +181,18 @@ fn h3_to_wkb_returns_core_wkb_including_pentagons() {
         // SAFETY: `pg_h3_to_wkb` returns a `varlena_datum`.
         let wkb = unsafe { read_varlena(d) };
         assert_eq!(Some(wkb.clone()), h3_to_wkb_u64(u64::from(cell)), "{cell}");
-        // Polygon with one closed ring of boundary vertices.
-        let n = cell.boundary().len();
-        assert_eq!(wkb.len(), 13 + 16 * (n + 1), "{cell}");
+        let lngs: Vec<f64> = cell.boundary().iter().map(|v| v.lng()).collect();
+        let span = lngs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - lngs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let kind = u32::from_le_bytes(wkb[1..5].try_into().unwrap());
+        if span > 180.0 {
+            // Antimeridian cells are MultiPolygons (6); pole cells are polar-cap Polygons (3).
+            assert!(kind == 6 || kind == 3, "{cell}: type {kind}");
+        } else {
+            // Polygon with one closed ring of boundary vertices.
+            assert_eq!(kind, 3, "{cell}");
+            assert_eq!(wkb.len(), 13 + 16 * (lngs.len() + 1), "{cell}");
+        }
     }
     assert_eq!(call(pg_h3_to_wkb, &[NULL]), None);
     assert_eq!(call(pg_h3_to_wkb, &[val(0)]), None);
@@ -390,4 +399,39 @@ fn continuous_aggregate_srf_matches_rust_srf() {
     round(&mut got);
     round(&mut want);
     assert_eq!(got, want);
+}
+
+#[test]
+fn srfs_warn_when_samples_are_dropped_by_failed_transforms() {
+    use raster_h3_pg::fmgr::transform_failure_warning;
+    assert!(transform_failure_warning(50).starts_with("raster_h3: 50 valid sample(s)"));
+
+    // 10 x 20 one-degree pixels from 95N: the top 5 rows lie beyond the pole.
+    let (_tmp, path) = crate::helpers::TestGeoTiffBuilder::new(10, 20)
+        .origin(0.0, 95.0)
+        .pixel_size(1.0)
+        .create_f32_tempfile(|_, _| 3.0);
+    let args = srf_args(&path, Some(3), None, None, None);
+    for (srf, natts) in [
+        (pg_h3_raster_continuous_aggregate as _, 10),
+        (pg_h3_raster_categorical_aggregate as _, 11),
+    ] {
+        let rows = run_srf(srf, natts, &args, None);
+        assert!(!rows.is_empty());
+        assert_eq!(
+            SERVER.with_borrow(|s| s.warnings),
+            1,
+            "one WARNING at end of stream"
+        );
+    }
+
+    // A valid raster raises no warning.
+    let (_tmp, path) = gradient_tif();
+    run_srf(
+        pg_h3_raster_continuous_aggregate,
+        10,
+        &srf_args(&path, Some(8), None, None, None),
+        None,
+    );
+    assert_eq!(SERVER.with_borrow(|s| s.warnings), 0);
 }

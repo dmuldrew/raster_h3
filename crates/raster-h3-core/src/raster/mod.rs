@@ -15,7 +15,10 @@ pub use http_range::{
     is_remote_url, normalize_url, ByteCache, HttpRangeReader, HttpTransport, ProbeResult,
     RemoteHttpSource,
 };
-pub use metadata::{extract_crs, extract_geotransform, extract_nodata, parse_wkt_or_ascii_to_proj};
+pub use metadata::{
+    extract_alpha_sample, extract_band_scaling, extract_crs, extract_geotransform, extract_nodata,
+    parse_gdal_band_scaling, parse_wkt_or_ascii_to_proj, BandScaling,
+};
 pub use mosaic::{
     glob_match, resolve_raster_sources, MosaicChunkRef, MosaicReader, OverlapRule, TileDescriptor,
 };
@@ -24,8 +27,8 @@ pub use prefetch::{
     PrefetchedMosaicReader,
 };
 pub use remote_prefetch::{
-    coalesce_chunk_ranges, ChunkLocation, CoalescedRange, RemoteChunkPrefetchQueue,
-    RemotePrefetchConfig,
+    coalesce_chunk_ranges, ChunkLocation, CoalescedRange, PrefetchedChunk,
+    RemoteChunkPrefetchQueue, RemotePrefetchConfig,
 };
 
 /// Represents a 2D chunk / tile window of a raster

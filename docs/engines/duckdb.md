@@ -11,7 +11,7 @@ DuckDB is the engine with the widest parameter coverage: every option of the cor
 (sampling, bands, spectral formulas, quantiles, remapping, compaction, worker and memory
 budgets) is a named SQL parameter, and it is the only engine that transcodes
 pre-aggregated Parquet into PMTiles. For every parameter and output column, see the
-[DuckDB SQL API Reference](../api-reference.md).
+[DuckDB SQL API Reference](../sql-api-reference.md).
 
 - [Install](#install)
 - [Docker Quickstart](#docker-quickstart)
@@ -483,7 +483,8 @@ host DuckDB version at runtime (`dlsym` / `GetProcAddress`) and can probe whethe
 `spatial` extension is loaded. `h3_to_geometry` / `h3_cell_to_geometry` return the native
 `GEOMETRY` type on DuckDB ≥ 1.5; on older versions they return a WKB `BLOB` aliased as
 `GEOMETRY`, the convention the `spatial` extension uses. `h3_to_wkb` always returns a
-plain `BLOB`.
+plain `BLOB`. Cells crossing the antimeridian are `MULTIPOLYGON`s and the two pole cells
+are polar-cap polygons; see [cell geometry](../sql-api-reference.md#cell-geometry).
 
 ## FFI Safety
 
@@ -496,6 +497,16 @@ plain `BLOB`.
   the prefetch queues and join decode/HTTP worker threads before freeing buffers.
 
 ## Troubleshooting
+
+### Missing pixels near a projection's edge
+
+`h3_raster_to_parquet` and `h3_raster_to_pmtiles` return a `transform_failures` count in their
+summary row: valid pixels dropped because their coordinate transform failed or fell outside
+the valid latitude/longitude range. A non-zero value usually means a wrong `source_crs`. The
+streaming aggregate functions cannot report a count (DuckDB table functions have no warnings
+channel); pass `strict_transforms := true` to make any of them fail instead of silently
+skipping those pixels. See
+[transform-failure diagnostics](core.md#transform-failure-diagnostics).
 
 ### Unsigned extension loading errors
 

@@ -399,9 +399,15 @@ impl BindHelper {
             .or_else(|| self.get_named_string("crs"))
     }
 
+    /// `scale_offset` (default true): convert stored values to physical
+    /// values with each band's GDAL `SCALE`/`OFFSET` metadata.
+    pub fn parse_scale_offset(&self) -> bool {
+        self.get_named_bool("scale_offset").unwrap_or(true)
+    }
+
     /// Parse execution limits: `workers`/`threads` (aggregation),
     /// `decode_workers`, `fetch_workers`, `decode_budget_mb` and
-    /// `compaction_budget_mb`.
+    /// `compaction_budget_mb`, plus `strict_transforms`.
     /// Non-positive values are errors.
     pub fn parse_execution(&self) -> Option<ExecutionParams> {
         let positive = |names: &[&str]| -> Result<Option<usize>, ()> {
@@ -422,6 +428,7 @@ impl BindHelper {
             fetch_workers: positive(&["fetch_workers"]).ok()?,
             decode_budget_mb: positive(&["decode_budget_mb"]).ok()?,
             compaction_budget_mb: positive(&["compaction_budget_mb"]).ok()?,
+            strict_transforms: self.get_named_bool("strict_transforms").unwrap_or(false),
         })
     }
 
@@ -446,6 +453,7 @@ impl BindHelper {
         let resolutions = self.parse_resolutions(8, Some(1));
         let source_crs = self.parse_source_crs();
         let nodata = self.get_named_double("nodata");
+        let scale_offset = self.parse_scale_offset();
         let chunk_size = self
             .get_named_int("chunk_size")
             .filter(|&cs| cs > 0)
@@ -474,6 +482,7 @@ impl BindHelper {
             resolutions,
             source_crs,
             nodata,
+            scale_offset,
             chunk_size,
             band,
             sampling,
@@ -498,6 +507,8 @@ pub struct CommonRasterParams {
     pub resolutions: Vec<u8>,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,
+    /// `scale_offset`: calibrate stored values with GDAL band scale/offset.
+    pub scale_offset: bool,
     pub chunk_size: u32,
     pub band: u32,
     pub sampling: SamplingPattern,
@@ -508,7 +519,7 @@ pub struct CommonRasterParams {
     pub execution: ExecutionParams,
 }
 
-/// SQL execution limits. Each `None` keeps the streamer default.
+/// SQL execution limits and options. Each `None` keeps the streamer default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecutionParams {
     /// `workers` / `threads`: dedicated aggregation pool size.
@@ -521,6 +532,9 @@ pub struct ExecutionParams {
     pub decode_budget_mb: Option<usize>,
     /// `compaction_budget_mb`: opt-in limit on pending compaction groups in MiB.
     pub compaction_budget_mb: Option<usize>,
+    /// `strict_transforms`: fail the query when a valid sample point cannot
+    /// be transformed to WGS84 instead of silently skipping it.
+    pub strict_transforms: bool,
 }
 
 impl ExecutionParams {
@@ -541,6 +555,7 @@ impl ExecutionParams {
         if let Some(mb) = self.compaction_budget_mb {
             config.compaction_budget_bytes = Some(mb.saturating_mul(1024 * 1024));
         }
+        config.strict_transforms = self.strict_transforms;
     }
 }
 
@@ -592,6 +607,7 @@ mod tests {
             fetch_workers: Some(5),
             decode_budget_mb: Some(32),
             compaction_budget_mb: Some(8),
+            strict_transforms: true,
         }
         .apply(&mut config);
         assert_eq!(config.aggregation_workers, Some(3));
@@ -599,5 +615,6 @@ mod tests {
         assert_eq!(config.fetch_workers, 5);
         assert_eq!(config.decode_budget_bytes, 32 * 1024 * 1024);
         assert_eq!(config.compaction_budget_bytes, Some(8 * 1024 * 1024));
+        assert!(config.strict_transforms);
     }
 }

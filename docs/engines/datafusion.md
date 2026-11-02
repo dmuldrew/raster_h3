@@ -72,6 +72,7 @@ Schema: `ColumnSchema::continuous(&quantiles)` (see the [overview](README.md#out
 | :--- | :--- |
 | `with_crs(crs)` | `custom_crs` |
 | `with_nodata(v)` | `custom_nodata` |
+| `with_scale_offset(b)` | `apply_scale_offset` (default `true`) |
 | `with_bbox([min_lon, min_lat, max_lon, max_lat])` | `bbox` |
 | `with_sampling(SamplingPattern)` | `sampling` (see [Super-Sampling](../super-sampling.md)) |
 | `with_band(n)` | `band` |
@@ -81,6 +82,8 @@ Schema: `ColumnSchema::continuous(&quantiles)` (see the [overview](README.md#out
 | `with_compact(bool)` | parent compaction |
 | `with_overlap_rule(OverlapRule)` | mosaic overlap rule (`Cutline`, `First`, `Average`) |
 | `with_batch_size(n)` | rows per `RecordBatch` (default 2048) |
+| `with_strict_transforms(b)` | `strict_transforms`: fail the scan instead of skipping samples whose coordinate transform fails |
+| `with_transform_failure_counter(Arc<AtomicU64>)` | `transform_failure_counter`: receives the number of skipped samples |
 
 ### `CategoricalRasterTableProvider`
 
@@ -89,7 +92,7 @@ Schema: `categorical_wide()` (default) or `categorical_long()`.
 | Builder | Effect |
 | :--- | :--- |
 | `with_format(CategoricalFormat::Wide \| Long)` | Output layout |
-| `with_crs`, `with_nodata`, `with_bbox`, `with_batch_size` | As above |
+| `with_crs`, `with_nodata`, `with_bbox`, `with_batch_size`, `with_strict_transforms`, `with_transform_failure_counter` | As above |
 | `with_remapper(Arc<CategoryRemapper>)` | Reclassify categories during ingestion |
 | `with_min_count`, `with_min_majority_fraction` | Value filters |
 
@@ -104,14 +107,17 @@ narrows it with the filters and returns an `ExecutionPlan`.
 | `MinMean(v)`, `MaxMean(v)` | Exact | Unsupported | Keeps the stricter bound |
 | `MinMajorityFraction(v)` | Unsupported | Exact | Keeps the stricter bound |
 | `Resolution(r)` | Exact | Exact | Restricts the scan to `r`; an `r` outside the configured set yields an empty scan |
-| `Bbox(b)` | Inexact | Inexact | Intersects with the configured bbox; a disjoint box yields an empty scan. Antimeridian-crossing boxes keep the configured bbox, so the caller must re-apply the predicate |
+| `Bbox(b)` | Inexact | Inexact | Widens `b` by more than the largest cell diameter at the coarsest resolution, then intersects it with the configured bbox (a disjoint box yields an empty scan). Every cell that intersects `b` keeps the aggregates of an unfiltered scan; the extra cells near the widened edge are partial, so the caller must re-apply the predicate. Not pushed when `with_compact(true)` is set |
 | `Other(_)` | Unsupported | Unsupported | Ignored by the scan |
 
-Filters only ever narrow the table. `supports_filters_pushdown(&filters)` returns the
+Filters only ever narrow the table. A pushed `Bbox` differs from `with_bbox`: `with_bbox` is
+part of the table definition and clips individual pixels, so cells straddling its edge are
+aggregated from only their pixels inside the box. `supports_filters_pushdown(&filters)` returns the
 classification above so a planner knows which predicates it still has to evaluate.
 
 - **Projection**: `Some(&[indices])` projects the schema; only those columns are built.
 - **Limit**: passed to the batch reader, which stops draining once the limit is reached.
+  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out.
 - **Statistics**: `statistics()` returns `TableStatistics { num_rows, is_exact: false }`
   from `estimate_raster_cardinality`.
 
@@ -137,7 +143,7 @@ classification above so a planner knows which predicates it still has to evaluat
 | `H3ToLatUdf`, `H3ToLngUdf` | `(UInt64) -> Float64` | |
 | `H3GetResolutionUdf` | `h3_get_resolution(UInt64) -> Int64` | |
 | `H3IsValidUdf` | `h3_is_valid(UInt64 \| Utf8) -> Boolean` | |
-| `H3ToWkbUdf` | `h3_to_wkb(UInt64 \| Utf8) -> Binary` | `h3_to_geometry`, `h3_cell_to_geometry` |
+| `H3ToWkbUdf` | `h3_to_wkb(UInt64 \| Utf8) -> Binary` ([cell geometry](../sql-api-reference.md#cell-geometry)) | `h3_to_geometry`, `h3_cell_to_geometry` |
 | `H3CellToParentUdf` | `h3_cell_to_parent(UInt64, Int64) -> UInt64`, `(Utf8, Int64) -> Utf8` | |
 
 ```rust

@@ -45,7 +45,8 @@ flowchart LR
 Every adapter follows the same steps:
 
 1. Build a `MultiResolutionConfig` from its own parameters (`resolutions`, `custom_crs`,
-   `custom_nodata`, `bbox`, `overlap_rule`, `sampling`, `quantiles`, filters, …).
+   `custom_nodata`, `apply_scale_offset`, `bbox`, `overlap_rule`, `sampling`, `quantiles`,
+   filters, …). See [band calibration and validity](../sql-api-reference.md#band-calibration-and-validity).
 2. Open a mosaic and a horizon streamer.
 3. Drain completed cells with `drain_completed_into(max, |resolution, record| …)` until
    it returns `Ok(0)` (end of stream) or an error. Errors latch: a failed stream keeps
@@ -60,6 +61,36 @@ active-map allocation estimate. The budget is split evenly between
 resolutions, so a fine resolution can spill while a coarse one stays in memory. Once any
 resolution has spilled, the eviction horizon stops advancing: cells of in-memory
 resolutions south of it are held until EOF and then emitted from memory, never from runs.
+
+### Transform-failure diagnostics
+
+`transform_failures()` on both streamers and both batch readers counts valid sample points
+(pixels, or sub-pixel points when super-sampling) that were dropped because the coordinate
+transform failed, returned a non-finite coordinate or a latitude outside [-90, 90], or H3
+rejected the point. Pixels outside `bbox` or owned by another mosaic tile are excluded on
+purpose and are not counted. A non-zero count means valid data is missing from the output,
+usually because of a wrong or out-of-domain source CRS. It is counted in every build, not
+only with `stream-profile`, and is also available as `metrics().worker.transform_failures`.
+
+For pipelines that own the streamer (`H3ParquetWriter`, `H3PmtilesTiler`), set
+`MultiResolutionConfig::transform_failure_counter` to a shared `Arc<AtomicU64>`; every
+stream built from that configuration adds its failures to it.
+
+`MultiResolutionConfig::strict_transforms` (default `false`) turns the count into an error:
+the stream fails with `RasterH3Error::TransformFailures(n)` after the first kernel wave that
+drops a sample, and later reads return the latched `StreamFailed` error. `n` covers the work
+done so far, not the whole raster. Records already emitted before that wave stay emitted,
+so a strict consumer must treat the error as fatal to the whole result.
+
+The engines surface the count, and strict mode, as follows:
+
+| Engine | Where the count appears | Strict mode |
+| :--- | :--- | :--- |
+| DuckDB | `transform_failures` column of the `h3_raster_to_parquet` / `h3_raster_to_pmtiles` summary row. The streaming aggregate functions have no warnings channel and report nothing. | `strict_transforms := true` on every table function |
+| PostgreSQL | One `WARNING` at the end of `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate`. | — |
+| Python | `RuntimeWarning` from `raster_to_parquet` / `raster_to_pmtiles`, and from `scan_raster_h3` / `RasterH3ArrowStream.iter_batches()` / `.to_dict()` once the scan completes. `to_polars()` / `read_raster_h3()` / `__arrow_c_stream__` hand the stream to Arrow and report nothing. | `strict_transforms=True` on `scan_raster_h3`, `read_raster_h3` and `RasterH3ArrowStream` |
+| CLI | Warning on stderr from every subcommand. | — |
+| DataFusion | `with_transform_failure_counter(Arc<AtomicU64>)` on either provider. | `with_strict_transforms(true)` |
 
 `custom_crs` (every adapter's CRS override) is resolved by `CrsTransformer::from_epsg_code`
 or `from_proj_string`. Besides geographic, Web Mercator, Albers, UTM and polar codes, it
@@ -84,6 +115,92 @@ TM certification follows proj4rs scale precedence (`k0`, then `k`) and fails
 open for duplicate parameters or syntax it cannot interpret unambiguously. See
 [Bounding boxes and pruning](../crs-and-projection.md#bounding-boxes-and-pruning).
 
+### Profiling and wave dispatch
+
+The streamers' `metrics()` method returns a `StreamProfile`. Dispatch counters are
+collected even without `stream-profile`:
+
+| Counter | Meaning |
+| :--- | :--- |
+| `waves` | Non-empty kernel dispatches, each containing up to `worker_tasks` window jobs (`jobs` counts the individual jobs). |
+| `bridged_waves` | Waves sent to a dedicated aggregation pool via a newly spawned helper OS thread because the caller is a worker of another Rayon pool. |
+| `serial_waves` | Waves executed serially on the caller: it is already a worker of the dedicated pool, or is a Rayon worker with no dedicated pool. |
+
+Direct non-Rayon callers dispatch in parallel using the dedicated pool when
+configured, otherwise the ambient global pool; neither subtype counter increases.
+The subtype counters are disjoint subsets of `waves`. Serial execution and the
+helper-thread bridge avoid Rayon work-stealing deadlocks when callers hold locks.
+`stream-profile` additionally enables hot-path per-sample worker counters and timers.
+
+Prefer local profiling on stable hardware for performance comparisons. Run the
+hotspot harness with:
+
+```bash
+cargo run --locked --release -p raster-h3-core --example profile_hotspots -- --quick --json profile.json
+```
+
+Omit `--quick` for the full profile. Record the commit SHA, hardware, thread count,
+and configuration alongside results, and keep those conditions consistent when
+comparing changes. For an optional hosted run, use **Actions → Hotspot Profile →
+Run workflow** and select the branch and optional `quick` input. The workflow is
+manual-only; hosted timings are informational. Normal CI runs the harness's
+ownership-sampling test without running the profiling experiments.
+
+It reports mosaic planning, ownership calls sampled equally over each tile's full
+pixel footprint (including non-overlap samples), end-to-end overlap rules, and the
+four direct/nested × dedicated/ambient dispatch combinations. Allocation columns
+for mosaic opening include file opening **and** planning. Allocator peaks are
+approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
+wall-time comparisons include decoding and scheduling; they do not isolate bridge
+cost. The bare spawn/join measurement is only an isolated baseline.
+
+### Remote COG prefetching
+
+`raster::remote_prefetch::RemoteChunkPrefetchQueue` fetches HTTP/S3 ranges ahead
+of decoding for a single GeoTIFF or a mosaic. Its Rust configuration is separate
+from aggregation and decoded-buffer budgets (it is not a total-process RAM cap):
+
+```rust
+use raster_h3_core::raster::remote_prefetch::{RemoteChunkPrefetchQueue, RemotePrefetchConfig};
+
+let config = RemotePrefetchConfig {
+    max_buffered_bytes: 16 * 1024 * 1024, // default: 32 MiB
+    ..Default::default()
+};
+// reader is an open remote GeoTiffStreamReader; chunk_indices selects its strips/tiles.
+let queue = RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)).unwrap();
+if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
+    let compressed_bytes: &[u8] = &payload;
+    // Decode compressed_bytes here, then drop payload before requesting more chunks.
+}
+```
+
+`max_buffered_bytes` reserves each coalesced response's full byte length **before**
+the HTTP request and counts requests in flight as well as retained responses.
+If a range alone exceeds the budget (including a zero-byte budget), it is admitted
+only when no other response is held. `queue_capacity` additionally throttles
+untaken chunks (default 64, minimum 16); a coalesced response may exceed this count.
+Defaults are 8 HTTP workers, a 32 KiB coalescing gap and a 2 MiB range target.
+
+Blocking `get_chunk_payload` requests are prioritized over speculative prefetches
+and may arrive in any order, including from concurrent decode workers. When a
+requested range cannot fit, responses with no waiting consumers may be evicted.
+An evicted, untaken chunk is fetched again on a later blocking request; chunks
+already taken are not republished. `try_get_chunk_payload` only takes ready chunks
+and does not trigger a fetch. In-order scans normally avoid refetching.
+
+Both methods now return `PrefetchedChunk` instead of `Arc<Vec<u8>>`. It dereferences
+to `[u8]`, implements `AsRef<[u8]>`, and clones cheaply without copying the response.
+Every slice or clone keeps the **entire coalesced response** alive and charged until
+the last reference is dropped. `response_len()` reports that full length, whereas
+`len()` is the chunk's slice length. Eviction cannot release bytes held by callers:
+drop payloads and their clones promptly after decoding, before blocking for another
+range that needs the same budget. Handles remain valid after the queue is dropped.
+`held_bytes()` / `peak_held_bytes()` report current / peak reserved response bytes.
+
+All engine adapters use this core prefetcher; `RemotePrefetchConfig` is a Rust
+queue-level API, not an additional SQL, Python or CLI option.
+
 ### Mosaic decoder cache
 
 `PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF
@@ -100,6 +217,33 @@ For mosaics with more than 16 tiles, a shared index adds one `usize` per chunk
 reference (8 bytes on 64-bit platforms), with a temporary `usize` per tile while
 building it. Smaller mosaics do not allocate this index. Decoder state and this
 metadata are separate from the decoded-buffer and aggregation budgets.
+
+### Overlap ownership cost
+
+With `OverlapRule::Cutline`, each sample in an overlapping chunk is compared
+against every other tile's centre. Centre unit vectors are cached on each
+`TileDescriptor`, so a comparison costs a few multiplies (about 1 ns), and the
+exact containment test, which may inverse-project, runs only for tiles whose
+centre is nearer. `First` checks containment against lower-index tiles. Both
+remain linear in tile count per overlapping sample; only chunks flagged
+`has_overlap` pay it. The `profile_hotspots` example measures this scaling.
+
+### Calling from a Rayon pool
+
+A streamer driven from a worker of another Rayon pool cannot run kernel waves
+on that pool without risking deadlock (see `aggregation_workers`):
+
+- `aggregation_workers: None` runs every wave **serially** on the calling
+  thread, about 2.5× slower than a direct call with 4 workers in the
+  `profile_hotspots` example, at every budget.
+- `aggregation_workers: Some(n)` hands each wave to the dedicated pool through
+  a short-lived helper thread, roughly one thread spawn (≈40 µs) per wave. That
+  is a few percent at budgets of 16 MiB and above, but grows as small
+  `aggregation_budget_bytes` shrink windows (3.4× slower at 256 KiB).
+
+So when calling from inside a Rayon pool, set `aggregation_workers` and keep the
+aggregation budget at its default or larger. Calls from ordinary threads,
+including DuckDB's scan threads, are unaffected.
 
 ## Columnar Model
 
@@ -248,7 +392,8 @@ floats become `null`; binary columns (`wkb`) are lowercase hex strings.
 | `estimate_raster_cardinality(paths, resolutions)` | Planner estimate of emitted cells from the first raster's extent and `H3_AREA_M2`. |
 | `h3_to_string`, `string_to_h3`, `try_string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid_u64`, `h3_is_valid_str`, `h3_to_wkb_u64`, `h3_to_wkb_str`, `h3_cell_to_parent_u64`, `h3_cell_to_parent_str` | The scalar helpers every engine exposes. Invalid-input behaviour is listed in the [overview](README.md#scalar-helpers). |
 | `h3_polygon_to_cells_wkb(wkb, res, mode) -> Result<Vec<u64>, PolygonToCellsError>` | Polyfills a WKB `POLYGON`/`MULTIPOLYGON` with h3o (`h3o` `geo` feature) and returns the cells sorted and deduplicated. `PolygonToCellsError` is `InvalidResolution`, `InvalidGeometry` or `TooManyCells` (over `H3_POLYGON_TO_CELLS_MAX_CELLS`). |
-| `parse_containment_mode(s)`, `H3_CONTAINMENT_MODES`, `ContainmentMode` | Mode names → h3o `ContainmentMode` (see the [mode table](../api-reference.md#containment-modes)). |
+| `parse_containment_mode(s)`, `H3_CONTAINMENT_MODES`, `ContainmentMode` | Mode names → h3o `ContainmentMode` (see the [mode table](../sql-api-reference.md#containment-modes)). |
+| `encoding::cell_to_wkb(cell, &mut WkbBuf)`, `h3_index_to_wkb` | Cell geometry into a `WKB_BUF_LEN`-byte stack buffer: `Polygon`, or `MultiPolygon` cut at ±180°, or a polar cap ([cell geometry](../sql-api-reference.md#cell-geometry)). |
 | `encoding::wkb_to_multipolygon(bytes)` | WKB/EWKB `POLYGON`/`MULTIPOLYGON` reader (either byte order; Z/M skipped) → `geo_types::MultiPolygon`. |
 
 ## File Exporters
@@ -271,5 +416,5 @@ a secondary panic escape; every adapter uses it at its FFI boundary.
 
 | Feature | Effect |
 | :--- | :--- |
-| `stream-profile` | Collects `StreamProfile` counters (peak active/decoded/compaction bytes, forced flushes). The root crate forwards it to core and DuckDB. |
+| `stream-profile` | Enables per-sample worker instrumentation. Stream-level `StreamProfile` counters (including `waves`, `bridged_waves`, `serial_waves` and memory peaks) are always available. The root crate forwards the feature to core and DuckDB. |
 | `test-hooks` | Exposes test-only synchronisation hooks (for example `OrderedPrefetchQueue::wait_for_blocked_job`) to other workspace crates' tests. Not for release builds. |

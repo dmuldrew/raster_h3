@@ -14,7 +14,8 @@ pub fn build_geoparquet_metadata(primary_column: &str, bbox: [f64; 4]) -> String
         "columns": {
             primary_column: {
                 "encoding": "WKB",
-                "geometry_types": ["Polygon"],
+                // Antimeridian-crossing cells are written as MultiPolygons.
+                "geometry_types": ["Polygon", "MultiPolygon"],
                 "crs": {
                     "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
                     "type": "GeographicCRS",
@@ -78,6 +79,10 @@ mod tests {
         assert_eq!(parsed["version"], "1.1.0");
         assert_eq!(parsed["primary_column"], "geometry");
         assert_eq!(parsed["columns"]["geometry"]["encoding"], "WKB");
+        assert_eq!(
+            parsed["columns"]["geometry"]["geometry_types"],
+            serde_json::json!(["Polygon", "MultiPolygon"])
+        );
         assert_eq!(
             parsed["columns"]["geometry"]["bbox"],
             serde_json::json!([-122.5, 37.5, -122.0, 38.0])

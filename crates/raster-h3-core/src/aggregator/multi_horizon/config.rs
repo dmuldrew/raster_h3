@@ -258,6 +258,10 @@ pub struct MultiResolutionConfig {
     /// Rayon worker (it may hold locks other tasks on that pool need). `Some(n)`
     /// runs them on a dedicated pool of `n` threads, shared by every stream
     /// configured with the same `n`, from any calling thread.
+    ///
+    /// From a Rayon worker, prefer `Some(n)`: each kernel wave then costs one
+    /// helper-thread spawn instead of running serially. That overhead grows as
+    /// a small `aggregation_budget_bytes` shrinks windows and multiplies waves.
     pub aggregation_workers: Option<usize>,
     /// Concurrent HTTP range-request workers for remote tiles.
     pub fetch_workers: usize,
@@ -267,6 +271,13 @@ pub struct MultiResolutionConfig {
     pub band: usize,
     /// Optional user-specified NoData override.
     pub custom_nodata: Option<f64>,
+    /// Convert stored values to physical values with each band's GDAL
+    /// `SCALE`/`OFFSET` before continuous statistics and spectral indices.
+    /// NoData is always matched against stored values. Categorical
+    /// classes are never scaled.
+    /// Invalid scale/offset metadata is rejected when the file is opened,
+    /// even when this is `false`.
+    pub apply_scale_offset: bool,
     /// Optional spatial bounding box for chunk-level pruning.
     pub bbox: Option<[f64; 4]>,
     /// Sub-pixel super-sampling pattern.
@@ -295,6 +306,15 @@ pub struct MultiResolutionConfig {
     pub quantiles: Vec<QuantileTarget>,
     /// Optional category remapping configuration.
     pub remapper: Option<Arc<CategoryRemapper>>,
+    /// Optional shared counter that streams built from this configuration add
+    /// their transform failures to (see `transform_failures()` on the
+    /// streamers). Lets callers of pipelines that own the streamer, such as
+    /// the Parquet and PMTiles exporters, read the count afterwards.
+    pub transform_failure_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Fail the stream with [`crate::error::RasterH3Error::TransformFailures`]
+    /// as soon as any valid sample point is dropped by a failed coordinate
+    /// transform, instead of skipping it and only counting it.
+    pub strict_transforms: bool,
 }
 
 impl MultiResolutionConfig {
@@ -312,6 +332,7 @@ impl MultiResolutionConfig {
             resolutions,
             band: 1,
             custom_nodata: None,
+            apply_scale_offset: true,
             bbox: None,
             sampling: SamplingPattern::center(),
             custom_crs: None,
@@ -326,6 +347,8 @@ impl MultiResolutionConfig {
             overlap_rule: OverlapRule::default(),
             quantiles: Vec::new(),
             remapper: None,
+            transform_failure_counter: None,
+            strict_transforms: false,
         }
     }
 

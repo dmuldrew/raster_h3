@@ -732,6 +732,12 @@ impl ContinuousBatchReader {
     pub fn tracks_quantiles(&self) -> bool {
         self.streamer.track_quantiles()
     }
+
+    /// Valid sample points dropped by failed or out-of-domain coordinate
+    /// transforms so far (see `transform_failures` on the streamers).
+    pub fn transform_failures(&self) -> u64 {
+        self.streamer.transform_failures()
+    }
 }
 
 impl Iterator for ContinuousBatchReader {
@@ -842,6 +848,12 @@ impl CategoricalBatchReader {
 
     pub fn schema(&self) -> Arc<ColumnSchema> {
         Arc::clone(&self.schema)
+    }
+
+    /// Valid sample points dropped by failed or out-of-domain coordinate
+    /// transforms so far (see `transform_failures` on the streamers).
+    pub fn transform_failures(&self) -> u64 {
+        self.streamer.transform_failures()
     }
 
     fn next_long_batch(&mut self, target: usize) -> Option<Result<RecordBatch>> {

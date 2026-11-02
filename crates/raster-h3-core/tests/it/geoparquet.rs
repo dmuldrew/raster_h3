@@ -429,8 +429,7 @@ fn test_geoparquet_ogc_1_1_specification_deep_validation() {
     let geom_types = col["geometry_types"]
         .as_array()
         .expect("geometry_types array");
-    assert_eq!(geom_types.len(), 1);
-    assert_eq!(geom_types[0], "Polygon");
+    assert_eq!(geom_types, &["Polygon", "MultiPolygon"]);
 
     // Spec check 3: Bounding box
     let bbox = col["bbox"].as_array().expect("bbox array");
@@ -593,4 +592,147 @@ fn test_geoparquet_column_projection_and_filtering() {
         rows_checked += 1;
     }
     assert_eq!(rows_checked, total_written);
+}
+
+/// (bbox from the `geo` metadata, every geometry coordinate) of a GeoParquet file.
+fn bbox_and_coords(path: &std::path::Path) -> ([f64; 4], Vec<(f64, f64)>) {
+    let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+    let meta = reader.metadata();
+    let geo = meta
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .iter()
+        .find(|kv| kv.key == "geo")
+        .and_then(|kv| kv.value.clone())
+        .unwrap();
+    let geo: serde_json::Value = serde_json::from_str(&geo).unwrap();
+    let b: Vec<f64> = geo["columns"]["geometry"]["bbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    let idx = meta
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|c| c.name() == "geometry")
+        .unwrap();
+    let mut coords = Vec::new();
+    for row in reader.get_row_iter(None).unwrap() {
+        let row = row.unwrap();
+        let geometry =
+            raster_h3_core::encoding::wkb_to_multipolygon(row.get_bytes(idx).unwrap().data())
+                .unwrap();
+        for polygon in geometry.0 {
+            coords.extend(polygon.exterior().0.iter().map(|c| (c.x, c.y)));
+        }
+    }
+    ([b[0], b[1], b[2], b[3]], coords)
+}
+
+fn export(tiff: &std::path::Path, out: &std::path::Path, res: u8) {
+    let config = MultiResolutionConfig::new(vec![res]);
+    let streamer =
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(tiff).unwrap(), &config).unwrap();
+    let pq = ParquetExportConfig {
+        geoparquet: true,
+        row_group_size: 7,
+        ..Default::default()
+    };
+    H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, out, pq).unwrap();
+}
+
+#[test]
+fn geoparquet_bbox_covers_every_cell_geometry() {
+    // A small raster at a coarse resolution: cells reach well past the raster.
+    let tiff = create_test_geotiff(20, 20); // 0.02° square at (-122.45, 37.80)
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("coarse.parquet");
+    export(tiff.path(), &out, 5);
+    let (bbox, coords) = bbox_and_coords(&out);
+    assert!(!coords.is_empty());
+    let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for (x, y) in coords {
+        (lo_x, lo_y, hi_x, hi_y) = (lo_x.min(x), lo_y.min(y), hi_x.max(x), hi_y.max(y));
+    }
+    // Exactly the cells' extent, which is wider than the raster's 0.02°. (The
+    // test's JSON parse may be 1 ulp off, so compare to 1e-9°.)
+    for (got, want) in bbox.iter().zip([lo_x, lo_y, hi_x, hi_y]) {
+        assert!((got - want).abs() < 1e-9, "{bbox:?}");
+    }
+    assert!(bbox[2] - bbox[0] > 0.1, "{bbox:?}");
+}
+
+#[test]
+fn geoparquet_bbox_spans_split_antimeridian_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let tiff = dir.path().join("dateline.tif");
+    // 0.5° x 0.5° just west of 180°, at a resolution whose cells cross it.
+    helpers::create_constant_f32_geotiff(&tiff, 50, 50, 179.5, -16.0, 0.01, 1.0);
+    let out = dir.path().join("dateline.parquet");
+    export(&tiff, &out, 3);
+    let (bbox, coords) = bbox_and_coords(&out);
+    assert!(
+        coords.iter().any(|&(x, _)| x == -180.0),
+        "expected a split cell"
+    );
+    assert_eq!((bbox[0], bbox[2]), (-180.0, 180.0), "{bbox:?}");
+    assert!(coords.iter().all(|&(x, y)| x >= bbox[0] - 1e-9
+        && x <= bbox[2] + 1e-9
+        && y >= bbox[1] - 1e-9
+        && y <= bbox[3] + 1e-9));
+}
+
+/// Every leaf must carry the type-defined column order. parquet-rs 60 writes
+/// `IEEE_754_TOTAL_ORDER` for FLOAT/DOUBLE leaves instead, which Polars' native reader rejects
+/// ("Invalid thrift: bad data") and PyArrow answers by ignoring those columns' min/max.
+#[test]
+fn test_parquet_column_orders_readable_by_polars() {
+    use parquet::basic::{ColumnOrder, Type};
+
+    let tiff_file = create_test_geotiff(40, 40);
+    let tiff_path = tiff_file.path().to_str().unwrap();
+    let config = MultiResolutionConfig::new(vec![9]);
+
+    for geoparquet in [false, true] {
+        let parquet_file = NamedTempFile::new().unwrap().into_temp_path();
+        let reader = GeoTiffStreamReader::open(tiff_path).unwrap();
+        let streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        let parquet_config = ParquetExportConfig {
+            geoparquet,
+            ..Default::default()
+        };
+        H3ParquetWriter::write_continuous_streamer_to_parquet(
+            streamer,
+            &parquet_file,
+            parquet_config,
+        )
+        .unwrap();
+
+        let reader = SerializedFileReader::new(File::open(&parquet_file).unwrap()).unwrap();
+        let meta = reader.metadata();
+        let schema = meta.file_metadata().schema_descr();
+        let orders = meta
+            .file_metadata()
+            .column_orders()
+            .expect("column orders are written");
+        assert_eq!(orders.len(), schema.num_columns());
+        for (col, order) in schema.columns().iter().zip(orders) {
+            assert!(
+                matches!(order, ColumnOrder::TYPE_DEFINED_ORDER(_)),
+                "{} (geoparquet={geoparquet}) has column order {order:?}",
+                col.name()
+            );
+        }
+        let double = schema
+            .columns()
+            .iter()
+            .position(|c| c.physical_type() == Type::DOUBLE)
+            .expect("schema has a DOUBLE column");
+        let stats = meta.row_group(0).column(double).statistics().unwrap();
+        assert!(stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some());
+    }
 }

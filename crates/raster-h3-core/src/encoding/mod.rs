@@ -9,5 +9,5 @@ pub mod wkb;
 pub mod wkb_reader;
 
 pub use fast_hex::{fast_hex_u64, parse_hex_u64};
-pub use wkb::{cell_to_wkb, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
+pub use wkb::{cell_to_wkb, extend_wkb_bounds, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
 pub use wkb_reader::wkb_to_multipolygon;

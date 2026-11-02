@@ -37,6 +37,7 @@ pub struct ParquetBindData {
     pub band: usize,
     pub source_crs: Option<String>,
     pub custom_nodata: Option<f64>,
+    pub scale_offset: bool,
     pub sampling: SamplingPattern,
     pub overlap_rule: OverlapRule,
     pub is_categorical: bool,
@@ -98,6 +99,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
             let overlap_rule = bind.parse_overlap_rule();
             let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
             let custom_nodata = bind.get_named_double("nodata");
+            let scale_offset = bind.parse_scale_offset();
             let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);
             let compact = bind.get_named_bool("compact").unwrap_or(true);
             let geoparquet = bind
@@ -133,6 +135,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
             bind.add_result_column("hexagons_per_sec", DuckDBType::Double);
             bind.add_result_column("output_path", DuckDBType::Varchar);
             bind.add_result_column("status", DuckDBType::Varchar);
+            bind.add_result_column("transform_failures", DuckDBType::BigInt);
 
             // Cardinality is always 1 summary row
             duckdb_bind_set_cardinality(info, 1, true);
@@ -144,6 +147,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
                 band,
                 source_crs,
                 custom_nodata,
+                scale_offset,
                 sampling,
                 overlap_rule,
                 is_categorical,
@@ -214,10 +218,13 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
             config.band = bind_data.band;
             config.custom_crs = bind_data.source_crs.clone();
             config.custom_nodata = bind_data.custom_nodata;
+            config.apply_scale_offset = bind_data.scale_offset;
             config.sampling = bind_data.sampling.clone();
             config.overlap_rule = bind_data.overlap_rule;
             config.bbox = bind_data.bbox;
             bind_data.execution.apply(&mut config);
+            let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            config.transform_failure_counter = Some(std::sync::Arc::clone(&failures));
 
             let parquet_config = ParquetExportConfig {
                 omit_redundant_columns: bind_data.compact,
@@ -262,6 +269,7 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
             writer.set_double(3, 0, rate);
             writer.set_string(4, 0, &bind_data.output_parquet);
             writer.set_string(5, 0, &status);
+            writer.set_int64(6, 0, failures.load(Ordering::Relaxed) as i64);
             writer.set_size(1);
         });
     }

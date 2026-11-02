@@ -58,6 +58,15 @@ pub enum RasterH3Error {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// Strict transform mode: valid sample points could not be transformed to
+    /// WGS84 (the count covers the work done before the stream stopped).
+    #[error(
+        "strict_transforms: {0} valid sample point(s) could not be transformed to WGS84 \
+         (unsupported CRS, or points outside its valid domain); check the raster's CRS \
+         or pass an explicit crs"
+    )]
+    TransformFailures(u64),
+
     /// DuckDB C-FFI or extension lifecycle error.
     #[error("DuckDB extension error: {0}")]
     DuckDbError(String),

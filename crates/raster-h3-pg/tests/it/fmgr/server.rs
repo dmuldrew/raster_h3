@@ -5,7 +5,8 @@
 //! protocol: `init_MultiFuncCall` stores the context in `flinfo->fn_extra`,
 //! `end_MultiFuncCall` resets the multi-call context (running its callbacks), and
 //! `BuildTupleFromCStrings` records each row's text values for the test to read back.
-//! Errors cannot be raised in process (the server longjmps), so `errfinish` aborts.
+//! Errors cannot be raised in process (the server longjmps), so `errfinish` aborts for
+//! them; warnings are counted and return, as in the server.
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
@@ -102,6 +103,10 @@ pub struct Server {
     /// How many reset callbacks have run.
     pub callbacks_run: usize,
     pub contexts_live: usize,
+    /// Elevel of the `ereport` in progress.
+    elevel: c_int,
+    /// How many `ereport(WARNING)`s completed.
+    pub warnings: usize,
 }
 
 thread_local! {
@@ -154,7 +159,8 @@ pub unsafe extern "C" fn pg_detoast_datum_packed(datum: *mut c_void) -> *mut c_v
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn errstart(_elevel: c_int, _domain: *const c_char) -> bool {
+pub unsafe extern "C" fn errstart(elevel: c_int, _domain: *const c_char) -> bool {
+    SERVER.with_borrow_mut(|s| s.elevel = elevel);
     true
 }
 
@@ -177,6 +183,14 @@ pub unsafe extern "C" fn errfinish(
     _lineno: c_int,
     _funcname: *const c_char,
 ) {
+    // WARNING (19 on every supported major) returns to the caller.
+    if SERVER.with_borrow_mut(|s| {
+        let warning = s.elevel == 19;
+        s.warnings += usize::from(warning);
+        warning
+    }) {
+        return;
+    }
     eprintln!("ereport(ERROR) cannot longjmp in process; aborting");
     std::process::abort();
 }

@@ -28,6 +28,7 @@ pub struct PmtilesBindData {
     pub band: usize,
     pub source_crs: Option<String>,
     pub custom_nodata: Option<f64>,
+    pub scale_offset: bool,
     pub sampling: SamplingPattern,
     pub overlap_rule: OverlapRule,
     pub bbox: Option<[f64; 4]>,
@@ -50,6 +51,8 @@ fn add_pmtiles_summary_columns(bind: &BindHelper) {
     bind.add_result_column("elapsed_ms", DuckDBType::Double);
     bind.add_result_column("output_path", DuckDBType::Varchar);
     bind.add_result_column("status", DuckDBType::Varchar);
+    // Valid samples dropped by failed coordinate transforms (0 for Parquet input).
+    bind.add_result_column("transform_failures", DuckDBType::BigInt);
     // SAFETY: a `BindHelper` always wraps the live bind handle of the current
     // bind callback (its construction contract).
     unsafe { duckdb_bind_set_cardinality(bind.info(), 1, true) };
@@ -98,6 +101,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
             let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
             let source_crs = bind.parse_source_crs();
             let custom_nodata = bind.get_named_double("nodata");
+            let scale_offset = bind.parse_scale_offset();
             let sampling = bind.parse_sampling();
             let overlap_rule = bind.parse_overlap_rule();
             let bbox = bind.parse_bbox();
@@ -116,6 +120,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
                 band,
                 source_crs,
                 custom_nodata,
+                scale_offset,
                 sampling,
                 overlap_rule,
                 bbox,
@@ -183,11 +188,14 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
             config.band = bind_data.band;
             config.custom_crs = bind_data.source_crs.clone();
             config.custom_nodata = bind_data.custom_nodata;
+            config.apply_scale_offset = bind_data.scale_offset;
             config.sampling = bind_data.sampling.clone();
             config.overlap_rule = bind_data.overlap_rule;
             config.bbox = bind_data.bbox;
             config.properties = bind_data.properties.clone();
             bind_data.execution.apply(&mut config);
+            let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            config.transform_failure_counter = Some(std::sync::Arc::clone(&failures));
 
             let start = Instant::now();
             let result = if bind_data.is_categorical {
@@ -237,6 +245,7 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
             writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
             writer.set_string(5, 0, &bind_data.output_pmtiles);
             writer.set_string(6, 0, &status);
+            writer.set_int64(7, 0, failures.load(Ordering::Relaxed) as i64);
             writer.set_size(1);
         });
     }
@@ -399,6 +408,7 @@ pub unsafe extern "C" fn parquet_pmtiles_scan(
             writer.set_double(4, 0, elapsed.as_secs_f64() * 1000.0);
             writer.set_string(5, 0, &bind_data.output_pmtiles);
             writer.set_string(6, 0, &status);
+            writer.set_int64(7, 0, 0);
             writer.set_size(1);
         });
     }

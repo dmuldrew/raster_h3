@@ -18,7 +18,15 @@ use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
-use crate::encoding::{cell_to_wkb, fast_hex_u64, WkbBuf, WKB_BUF_LEN};
+use crate::encoding::{cell_to_wkb, extend_wkb_bounds, fast_hex_u64, WkbBuf, WKB_BUF_LEN};
+
+/// Bounds that any point extends (`min > max` until the first point).
+const EMPTY_BOUNDS: [f64; 4] = [
+    f64::INFINITY,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NEG_INFINITY,
+];
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 use super::pipeline::{
@@ -76,6 +84,8 @@ pub struct ContinuousRowGroupBuffer {
     geoparquet: bool,
     h3_indices: Vec<i64>,
     geometries: Vec<ByteArray>,
+    /// `[min_x, min_y, max_x, max_y]` of the geometries pushed since `clear`.
+    geometry_bounds: [f64; 4],
     min_values: Vec<f64>,
     max_values: Vec<f64>,
     sum_values: Vec<f64>,
@@ -99,6 +109,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             } else {
                 Vec::new()
             },
+            geometry_bounds: EMPTY_BOUNDS,
             min_values: Vec::with_capacity(capacity),
             max_values: Vec::with_capacity(capacity),
             sum_values: Vec::with_capacity(capacity),
@@ -132,6 +143,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             if let Ok(cell) = CellIndex::try_from(cell_u64) {
                 let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
                 let len = cell_to_wkb(cell, &mut wkb_buf);
+                extend_wkb_bounds(&wkb_buf[..len], &mut self.geometry_bounds);
                 self.geometries.push(ByteArray::from(&wkb_buf[..len]));
             } else {
                 self.geometries.push(ByteArray::from(Vec::new()));
@@ -165,10 +177,15 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
         self.h3_indices.len()
     }
 
+    fn geometry_bounds(&self) -> Option<[f64; 4]> {
+        (self.geometry_bounds[0] <= self.geometry_bounds[2]).then_some(self.geometry_bounds)
+    }
+
     fn clear(&mut self) {
         self.h3_indices.clear();
         if self.geoparquet {
             self.geometries.clear();
+            self.geometry_bounds = EMPTY_BOUNDS;
         }
         self.min_values.clear();
         self.max_values.clear();
@@ -301,6 +318,8 @@ pub struct CategoricalRowGroupBuffer {
     geoparquet: bool,
     h3_indices: Vec<i64>,
     geometries: Vec<ByteArray>,
+    /// `[min_x, min_y, max_x, max_y]` of the geometries pushed since `clear`.
+    geometry_bounds: [f64; 4],
     majorities: Vec<i64>,
     fractions: Vec<f64>,
     pixel_counts: Vec<f64>,
@@ -324,6 +343,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             } else {
                 Vec::new()
             },
+            geometry_bounds: EMPTY_BOUNDS,
             majorities: Vec::with_capacity(capacity),
             fractions: Vec::with_capacity(capacity),
             pixel_counts: Vec::with_capacity(capacity),
@@ -358,6 +378,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             if let Ok(cell) = CellIndex::try_from(cell_u64) {
                 let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
                 let len = cell_to_wkb(cell, &mut wkb_buf);
+                extend_wkb_bounds(&wkb_buf[..len], &mut self.geometry_bounds);
                 self.geometries.push(ByteArray::from(&wkb_buf[..len]));
             } else {
                 self.geometries.push(ByteArray::from(Vec::new()));
@@ -391,10 +412,15 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
         self.h3_indices.len()
     }
 
+    fn geometry_bounds(&self) -> Option<[f64; 4]> {
+        (self.geometry_bounds[0] <= self.geometry_bounds[2]).then_some(self.geometry_bounds)
+    }
+
     fn clear(&mut self) {
         self.h3_indices.clear();
         if self.geoparquet {
             self.geometries.clear();
+            self.geometry_bounds = EMPTY_BOUNDS;
         }
         self.majorities.clear();
         self.fractions.clear();

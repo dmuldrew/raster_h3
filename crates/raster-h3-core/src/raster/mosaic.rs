@@ -237,6 +237,9 @@ pub struct TileDescriptor {
     /// Spatial bounding box in WGS 84 coordinates: `[min_lon, min_lat, max_lon, max_lat]`.
     pub bounds_wgs84: [f64; 4],
     /// WGS 84 position of the raster's centre pixel: `(lon, lat)`.
+    ///
+    /// `Cutline` ownership uses a unit vector derived from this value when the
+    /// descriptor is created; changing it afterwards does not affect ownership.
     pub centroid_wgs84: (f64, f64),
     /// CRS transformer for projecting raster coordinates to WGS 84.
     pub crs_transformer: CrsTransformer,
@@ -244,6 +247,9 @@ pub struct TileDescriptor {
     /// cylindrical CRSs (geographic, Mercator, ...) whose rasters may use
     /// unwrapped coordinates; None for other projections.
     lon_period: Option<(f64, f64)>,
+    /// Unit vector of `centroid_wgs84`, cached so `Cutline` ownership does no
+    /// trigonometry per tile.
+    centroid_unit: UnitVector,
 }
 
 impl TileDescriptor {
@@ -296,6 +302,7 @@ impl TileDescriptor {
             centroid_wgs84,
             crs_transformer,
             lon_period,
+            centroid_unit: unit_vector(centroid_wgs84),
         })
     }
 
@@ -355,12 +362,16 @@ fn source_longitude_period(crs: &CrsTransformer, (lon, lat): (f64, f64)) -> Opti
 
 /// Squared chord length between two WGS84 points on the unit sphere; a
 /// monotone, wrap-safe proxy for great-circle distance.
-fn sphere_chord_sq(a: (f64, f64), b: (f64, f64)) -> f64 {
-    let unit = |(lon, lat): (f64, f64)| {
-        let (lon, lat) = (lon.to_radians(), lat.to_radians());
-        (lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin())
-    };
-    let (p, q) = (unit(a), unit(b));
+type UnitVector = (f64, f64, f64);
+
+/// Point on the unit sphere for WGS84 `(lon, lat)` in degrees.
+fn unit_vector((lon, lat): (f64, f64)) -> UnitVector {
+    let (lon, lat) = (lon.to_radians(), lat.to_radians());
+    (lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin())
+}
+
+/// Squared chord length between two unit vectors (monotone in great-circle distance).
+fn chord_sq(p: UnitVector, q: UnitVector) -> f64 {
     (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2)
 }
 
@@ -592,13 +603,18 @@ impl MosaicReader {
             OverlapRule::Average => true,
             OverlapRule::First => !self.tiles[..tile_idx].iter().any(|t| t.contains(lon, lat)),
             OverlapRule::Cutline => {
-                let own = sphere_chord_sq((lon, lat), self.tiles[tile_idx].centroid_wgs84);
+                // The point's vector is computed once and centroid vectors are
+                // cached, so each other tile costs a few multiplies; the exact
+                // (inverse-projecting) containment test still runs only for
+                // tiles whose centre is nearer.
+                let p = unit_vector((lon, lat));
+                let own = chord_sq(p, self.tiles[tile_idx].centroid_unit);
                 // Ties go to the lower tile index.
                 !self.tiles.iter().enumerate().any(|(idx, t)| {
                     if idx == tile_idx {
                         return false;
                     }
-                    let d = sphere_chord_sq((lon, lat), t.centroid_wgs84);
+                    let d = chord_sq(p, t.centroid_unit);
                     (d < own || (d == own && idx < tile_idx)) && t.contains(lon, lat)
                 })
             }

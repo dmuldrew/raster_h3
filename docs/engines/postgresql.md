@@ -29,12 +29,12 @@ cargo build --release -p raster-h3-pg --features pg-extension
 RASTER_H3_PG_MAJOR=16 cargo build --release -p raster-h3-pg --features pg-extension
 ```
 
-Install the three files where the server looks for them:
+Install the library, control file and SQL scripts where the server looks for them:
 
 ```bash
 cp target/release/libraster_h3_pg.so  "$(pg_config --pkglibdir)/raster_h3_pg.so"
 cp crates/raster-h3-pg/raster_h3.control       "$(pg_config --sharedir)/extension/"
-cp crates/raster-h3-pg/sql/raster_h3--0.4.0.sql "$(pg_config --sharedir)/extension/"
+cp crates/raster-h3-pg/sql/raster_h3--*.sql   "$(pg_config --sharedir)/extension/"
 ```
 
 On macOS the library is `libraster_h3_pg.dylib`; install it as `raster_h3_pg.dylib` (or
@@ -44,7 +44,10 @@ the suffix your server expects). Then:
 CREATE EXTENSION raster_h3;
 ```
 
-[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.4.0`,
+A database with 0.4.0 installed upgrades in place with `ALTER EXTENSION raster_h3 UPDATE;`
+(`raster_h3--0.4.0--0.5.0.sql`; the SQL definitions are unchanged).
+
+[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.5.0`,
 `module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = true`.
 
 The raster aggregation functions read files with the server's OS privileges, so `EXECUTE` on
@@ -60,7 +63,7 @@ other targets fail to compile.
 
 ## SQL API
 
-All definitions are in [`sql/raster_h3--0.4.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.4.0.sql).
+All definitions are in [`sql/raster_h3--0.5.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.5.0.sql).
 
 ### Raster aggregation
 
@@ -102,6 +105,10 @@ PostgreSQL OS user on the database host (or be an HTTP(S)/S3 URL the server can 
 | | | | `resolution` | `smallint` |
 | | | | `shannon_entropy` | `double precision` |
 | | | | `wkb` | `bytea` |
+
+`wkb` (and `h3_to_wkb`) is a `MULTIPOLYGON` for cells crossing the antimeridian and a
+polar-cap polygon for the two pole cells, so `ST_GeomFromWKB` works without wrapping; see
+[cell geometry](../sql-api-reference.md#cell-geometry).
 
 `h3_index` is the unsigned H3 index reinterpreted as `bigint` (the `h3-pg` convention);
 valid cells are always positive.
@@ -253,6 +260,7 @@ ORDER BY fraction DESC;
 | :--- | :--- |
 | `permission denied for function h3_raster_continuous_aggregate` | `EXECUTE` is granted only to `pg_read_server_files`; `GRANT pg_read_server_files TO <role>`. |
 | `incompatible library "...raster_h3_pg...": version mismatch` | The module was built for another major. Rebuild with `RASTER_H3_PG_MAJOR=<server major>` or the server's `pg_config` on `PATH`. |
+| `WARNING: raster_h3: N valid sample(s) were dropped ...` | Some valid pixels could not be placed because their coordinate transform failed or fell outside the valid latitude/longitude range. Check `source_crs`; see [transform-failure diagnostics](core.md#transform-failure-diagnostics). |
 | File not found for a path that exists on your machine | The server opens the path on the database host as the PostgreSQL OS user. Copy the file there, mount it into the container, or use an HTTP(S)/S3 URL. |
 | `No CRS detected` | Pass `source_crs => 'EPSG:…'`. |
 | Need sampling, bands, spectral formulas, quantiles, `format => 'long'` or exports | Not exposed in PostgreSQL. Use [DuckDB](duckdb.md), [Python](python-polars.md) or the [CLI](cli.md). |

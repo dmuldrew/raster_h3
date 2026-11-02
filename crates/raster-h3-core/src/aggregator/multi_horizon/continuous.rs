@@ -7,8 +7,10 @@ use crate::aggregator::simd::SimdSpanAccumulate;
 
 use super::config::SpectralFormula;
 use super::walker::{
-    is_slice_all_native_nodata, walk_direct, walk_interleaved, ScanlineEngine, WalkContext,
+    is_slice_all_native_nodata, is_transparent, walk_direct, walk_interleaved, ScanlineEngine,
+    WalkContext,
 };
+use crate::raster::metadata::BandScaling;
 
 /// Continuous record yielded by the multi-resolution streamer
 #[derive(Debug, Clone, PartialEq)]
@@ -28,7 +30,7 @@ pub struct ContinuousOptions {
 }
 
 /// Process a single typed chunk slice for continuous numeric aggregation across resolutions
-fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
+fn process_continuous_slice_into_maps<T: SimdSpanAccumulate + Default>(
     ctx: &WalkContext<'_>,
     slice: &[T],
     native_nodata: Option<T>,
@@ -38,6 +40,7 @@ fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
     let engine = ContinuousEngine {
         native_nodata,
         track_quantiles: options.track_quantiles,
+        scaling: ctx.scaling(1),
     };
     if ctx.samples_per_pixel <= 1 && options.spectral_formula.is_none() {
         walk_direct(
@@ -51,7 +54,15 @@ fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
         walk_interleaved(
             ctx,
             slice,
-            |px| pixel_value(px, native_nodata, options.band, options.spectral_formula),
+            |px| {
+                pixel_value(
+                    ctx,
+                    px,
+                    native_nodata,
+                    options.band,
+                    options.spectral_formula,
+                )
+            },
             &engine,
             chunk_maps,
         );
@@ -61,6 +72,23 @@ fn process_continuous_slice_into_maps<T: SimdSpanAccumulate>(
 struct ContinuousEngine<T> {
     native_nodata: Option<T>,
     track_quantiles: bool,
+    /// Calibration of single-band samples; interleaved pixels are
+    /// calibrated per band by [`pixel_value`].
+    scaling: BandScaling,
+}
+
+impl<T: SimdSpanAccumulate> ContinuousEngine<T> {
+    /// Accumulate a span of stored values as calibrated values. The SIMD
+    /// kernel sums stored values; an affine map of those statistics equals
+    /// accumulating the calibrated values.
+    #[inline(always)]
+    fn span_accumulator(&self, slice: &[T]) -> H3Accumulator {
+        let mut span_acc = T::accumulate_span(slice, self.native_nodata);
+        if !self.scaling.is_identity() {
+            span_acc.apply_affine(self.scaling.scale, self.scaling.offset);
+        }
+        span_acc
+    }
 }
 
 impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngine<T> {
@@ -96,14 +124,14 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
 
     #[inline(always)]
     fn accumulate_span(&self, acc: &mut H3Accumulator, slice: &[T]) {
-        let span_acc = T::accumulate_span(slice, self.native_nodata);
+        let span_acc = self.span_accumulator(slice);
         if span_acc.count > 0.0 {
             acc.merge(&span_acc);
             if self.track_quantiles {
                 if let Some(ref mut q) = acc.quantiles {
                     for &v in slice {
                         if v.is_valid(self.native_nodata) {
-                            q.update(v.to_f64_val(), 1.0);
+                            q.update(self.scaling.apply(v.to_f64_val()), 1.0);
                         }
                     }
                 }
@@ -113,7 +141,7 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
 
     #[inline(always)]
     fn accumulate_span_multi(&self, run_accs: &mut [H3Accumulator], slice: &[T]) {
-        let span_acc = T::accumulate_span(slice, self.native_nodata);
+        let span_acc = self.span_accumulator(slice);
         if span_acc.count > 0.0 {
             for acc in run_accs.iter_mut() {
                 acc.merge(&span_acc);
@@ -121,7 +149,7 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
             if self.track_quantiles {
                 for &v in slice {
                     if v.is_valid(self.native_nodata) {
-                        let fv = v.to_f64_val();
+                        let fv = self.scaling.apply(v.to_f64_val());
                         for q in run_accs.iter_mut().filter_map(|a| a.quantiles.as_mut()) {
                             q.update(fv, 1.0);
                         }
@@ -134,7 +162,7 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
     #[inline(always)]
     fn get_sample(&self, pixel: T) -> Option<f64> {
         if pixel.is_valid(self.native_nodata) {
-            Some(pixel.to_f64_val())
+            Some(self.scaling.apply(pixel.to_f64_val()))
         } else {
             None
         }
@@ -151,17 +179,25 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
     }
 }
 
-/// Reduce one pixel's interleaved band values to the selected band or spectral index.
+/// Reduce one pixel's interleaved band values to the selected band or
+/// spectral index. Nodata is tested on stored values; formulas see
+/// calibrated values. Pixels with zero alpha have no value.
 #[inline(always)]
-fn pixel_value<T: SimdSpanAccumulate>(
+fn pixel_value<T: SimdSpanAccumulate + Default>(
+    ctx: &WalkContext<'_>,
     px: &[T],
     nodata: Option<T>,
     band: usize,
     formula: Option<SpectralFormula>,
 ) -> Option<f64> {
+    if is_transparent(ctx, px) {
+        return None;
+    }
     let get = |b: usize| {
-        let v = px[b.saturating_sub(1).min(px.len() - 1)];
-        v.is_valid(nodata).then(|| v.to_f64_val())
+        let b = b.saturating_sub(1).min(px.len() - 1);
+        let v = px[b];
+        v.is_valid(nodata)
+            .then(|| ctx.scaling(b + 1).apply(v.to_f64_val()))
     };
     let ratio = |num: f64, den: f64| (den.abs() > 1e-12).then(|| num / den);
     match formula {

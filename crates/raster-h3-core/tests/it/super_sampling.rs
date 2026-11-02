@@ -682,6 +682,8 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                     stride: 24,
                     samples_per_pixel: 1,
                     owner: None,
+                    band_scaling: &[],
+                    alpha_sample: None,
                 };
                 for quantiles in [false, true] {
                     let mut actual =

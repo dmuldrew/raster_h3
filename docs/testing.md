@@ -9,6 +9,7 @@ explains how to run each group and what CI runs. The counts below are the number
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
 | [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 310 |
+| [`crates/raster-h3-core/tests/memory/`](../crates/raster-h3-core/tests/memory) (`memory`, one child process per scenario variant) | 7 scenarios, 1 binary | 38 checks |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
@@ -159,8 +160,41 @@ Results must not depend on thread count, scheduling or pool nesting.
 | [`core/memory_budgets.rs`](../crates/raster-h3-core/tests/it/memory_budgets.rs) (2) | The decoded-chunk budget bounds held chunks without changing results; the compaction limit decomposes groups without losing or duplicating samples. |
 | [`core/sparse_chunks_and_spilling.rs`](../crates/raster-h3-core/tests/it/sparse_chunks_and_spilling.rs) (4) | Sparse COG chunks are filled with a non-zero NoData and skipped; a low aggregation budget creates spill runs (`spill_run_count() > 0`) and the external merge matches an in-memory reference; with resolutions 6 and 8, compaction and four aggregation workers, a budget that spills only resolution 8 (resolution 6 stays in memory, checked per resolution) reproduces the in-memory continuous (count, sum, min, max, p50) and categorical (heap class maps) output exactly. |
 | Unit: `multi_horizon/spill.rs` (5) | Spill file writing and merging. |
+| [`memory`](../crates/raster-h3-core/tests/memory/scenarios.rs) (7 scenarios, 38 checks) | Measured, not estimated, memory. A counting allocator records peak live heap and allocations; each scenario variant runs in its own process. `spill_sorted_run`: the sorted vector built for a spill run is the only new heap while the map's shards drain (accumulators move, nothing is cloned), it fits within the map's accounted bytes, and the map is freed afterwards (plain, quantile and categorical maps). `spill_stream_quantiles`, `categorical_high_cardinality`: p50/p90 sketches and ~46-class heap histograms forced to spill reproduce the in-memory output bit for bit per cell, stay within the budget and lower peak heap. `slow_http_consumer`: with a slow consumer, held response bytes stay within `max_buffered_bytes`, peak heap within twice it and under half of the chunk-count bound alone, with one request per coalesced range. `slow_parquet_writer`: a writer that sleeps per row group adds at most three row-group buffers. `many_tiny_chunks`: 512 one-row strips cost at most 16 allocations each and coalesce into one HTTP range. `concurrent_streams`: four streams use at most 5× the heap of one. |
 
 See [Engineering Architecture](engineering.md) for what the budgets cover.
+
+### Memory benchmarks
+
+`cargo test --release -p raster-h3-core --test memory` runs every scenario (a name
+filter after `--` selects some). The binary re-runs itself once per scenario variant, so
+allocator peaks and RSS high-water marks never mix, and builds fixtures before measuring.
+Checks compare allocator bytes (requested sizes, the same on every platform) with
+configured budgets or with another variant, plus HTTP request counts, spill runs and
+exact output digests, so they hold on any machine. Streams pin two decode and two
+aggregation workers so the numbers do not scale with core count. RSS (high-water mark
+reset after fixtures on Linux, whole-process maximum on macOS, absent on Windows) and wall
+time are reported only; compare them on one machine with
+`-- --repeat 5 --json mem.json` (medians of five processes per variant). In CI the
+tables go to the job summary and one `::notice` annotation lists each scenario's checks
+and peaks.
+
+**Prefetch byte budget (#60), before and after.** The same program streamed a 64 MiB
+remote GeoTIFF (4096×4096 f32) through `RemoteChunkPrefetchQueue` with the default
+configuration (8 workers, 2 MiB ranges, 32 MiB budget, 2 ms server latency), built
+against the commit before #60 and against #60, five processes each on a 4-core Linux VM
+(medians; requests were identical, 32):
+
+| Strips, consumer hold per chunk | Peak heap MiB | RSS growth MiB | Allocated MiB | Wall ms |
+| :--- | ---: | ---: | ---: | ---: |
+| 512 KiB, 5 ms | 49.0 → 32.0 | 65.8 → 32.3 | 128.6 → 64.6 | 686 → 675 |
+| 128 KiB, 1 ms | 25.5 → 24.1 | 39.7 → 26.4 | 128.7 → 64.8 | 599 → 588 |
+| 32 KiB, none | 18.2 → 16.3 | 32.2 → 16.7 | 129.0 → 65.3 | 74 → 56 |
+
+Before #60 the queue counted ready chunks (64) and copied each out of its response, so a
+slow consumer of large chunks held 64 chunks plus eight ranges in flight; with the budget
+the peak is the 32 MiB budget, and shared response buffers halve the bytes allocated.
+`slow_http_consumer` keeps checking the same effect at a small scale.
 
 ## 11. Failure propagation & resilience
 
@@ -188,7 +222,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (22) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
+| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (32) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
 | Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
 
 ## 14. Mosaics & overlap rules
@@ -196,6 +230,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | Suite | What it checks |
 | :--- | :--- |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (10) | Glob matching, comma lists, VRT XML resolution; adjacent-tile conservation; `cutline` vs `first` vs `average`; categorical overlaps; mixed VRT paths and export pipelines. |
+| [`core/cutline_ownership.rs`](../crates/raster-h3-core/tests/it/cutline_ownership.rs) (3) | `Cutline` ownership with cached centre vectors matches the original per-call computation for every tile at thousands of points: an overlapping 4×4 grid, three identical footprints (exact distance ties go to the lower index), tiles on different longitude branches across the antimeridian, and near-polar tiles. |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (4) | Mosaic opening keeps antimeridian tiles; overlap rules test real tile footprints, not WGS84 rectangles, including rotated footprints and mixed longitude branches. |
 | [`core/conus_pipeline.rs`](../crates/raster-h3-core/tests/it/conus_pipeline.rs) | `test_conus_batch_and_evict_pipeline_simulation`: multi-tile ingestion, batch eviction, Parquet progress and PMTiles from partitioned input. |
 | [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) | `with_overlap_rule_on_a_multi_file_source_matches_core`: `cutline`, `first` and `average` over a comma-list source, with exact per-rule pixel counts. |
@@ -209,7 +244,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | [`core/polygon_to_cells.rs`](../crates/raster-h3-core/tests/it/polygon_to_cells.rs) (1) | POLYGON/MULTIPOLYGON WKB polyfill against direct `h3o` output, including holes, overlapping members, four containment modes and two resolutions. |
 | [`duckdb/spatial_geometry.rs`](../crates/raster-h3-duckdb/tests/it/spatial_geometry.rs) | `test_wkb_ogc_compliance`, `test_fast_hex_formatting`. |
 | [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) | `h3_to_wkb_returns_core_wkb_including_pentagons`: the `bytea` from `pg_h3_to_wkb` equals the core WKB, including 10-vertex pentagons. |
-| Unit: `encoding/wkb.rs` (6), `encoding/fast_hex.rs` (2) | Ring construction, dateline unwrapping, hex formatting/parsing. |
+| Unit: `encoding/wkb.rs` (8), `encoding/fast_hex.rs` (2) | Ring construction, antimeridian splitting and polar caps (every cell at resolutions 0–2 checked for range, closure, orientation, simplicity and area), hex formatting/parsing. |
 
 ## 16. GeoParquet export
 
@@ -324,6 +359,7 @@ cargo test --release --workspace                    # every crate: unit tests + 
 cargo test --release -p raster-h3-core              # core only; does not compile other engines
 cargo test --release -p raster-h3-core --test it threading::  # one suite (module filter)
 cargo test --release -p raster-h3-core prefetch     # tests matching a filter
+cargo test --release -p raster-h3-core --test memory -- spill  # memory benchmarks (name filter)
 cargo test --release --workspace -- --ignored       # only the gated tests
 RASTER_H3_PG_MAJOR=16 cargo test --release -p raster-h3-pg --features pg-extension  # adds the fmgr suites
 ```
@@ -355,13 +391,15 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 
 | Workflow | Command | Covers |
 | :--- | :--- | :--- |
-| [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded) |
+| [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded), and the core `memory` benchmark checks |
 | `ci.yml` | `cargo build --release --lib` then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs | Real-SQL coverage on both DuckDB versions, packaging with each CLI's `PRAGMA platform` tag |
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
 | `ci.yml` (`test-crates`, Linux) | `cargo test --release -p raster-h3-core -p raster-h3-duckdb -p raster-h3-datafusion -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
 | [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets and scoped Arrow Miri tests | Malformed input, sanitizer smoke checks, and FFI ownership; longer fuzz runs weekly |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
+| `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example profile_hotspots` | Hotspot harness ownership-sampling correctness; profiling experiments are excluded |
+| [`profile.yml`](../.github/workflows/profile.yml) (optional, manual-only) | `cargo run --release -p raster-h3-core --example profile_hotspots -- --json profile.json` | Informational: mosaic planning/ownership scaling with tile count, end-to-end cost per overlap rule, and nested-Rayon wave dispatch (waves, helper-thread hand-offs, allocations). Prefer [local profiling](engines/core.md#profiling-and-wave-dispatch) for comparisons. Optional hosted results appear in the job summary, `::notice` annotations and a JSON artifact |
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
 | [`manual-tests.yml`](../.github/workflows/manual-tests.yml) (manual) | `cargo test [--release] --no-fail-fast -p <engine>` plus `--features pg-extension` for `pg`/`all` (not on Windows) | Any engine (`all`, `core`, `duckdb`, `datafusion`, `cli`, `python`, `pg`, `root`) on one or all of Linux amd64/arm64, macOS arm64 and Windows, for any branch, tag or SHA, with optional libtest arguments |

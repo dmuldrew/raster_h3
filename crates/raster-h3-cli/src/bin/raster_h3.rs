@@ -25,6 +25,7 @@ fn print_help() {
           --format <wide|long>       Categorical output format (default: wide)\n  \
           --crs <CRS>                Override source CRS (e.g. EPSG:4326)\n  \
           --nodata <FLOAT>           Override nodata value\n  \
+          --raw-values               Skip GDAL band scale/offset calibration\n  \
           --bbox <minx,miny,maxx,maxy> WGS84 bounding box filter\n  \
           --columns <col1,col2,...>  Column projection pushdown\n  \
           --limit <N>                Maximum number of rows to emit\n  \
@@ -81,6 +82,7 @@ fn main() {
                 opts.nodata,
                 opts.bbox,
                 true,
+                opts.apply_scale_offset,
             )
         }),
         "pmtiles" => parse_stream_args(rest, StreamOutputFormat::Ipc).and_then(|(opts, out)| {
@@ -97,6 +99,7 @@ fn main() {
                 opts.source_crs,
                 opts.nodata,
                 opts.bbox,
+                opts.apply_scale_offset,
             )
         }),
         other => {

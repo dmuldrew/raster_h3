@@ -159,6 +159,11 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     resolutions: Vec<Resolution>,
     resolution_u8s: Vec<u8>,
     nodata: Option<f64>,
+    apply_scale_offset: bool,
+    /// Shared total that transform failures are also added to.
+    transform_failure_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Fail on the first wave that drops a sample to a transform failure.
+    strict_transforms: bool,
     bbox: Option<[f64; 4]>,
     sampling: SamplingPattern,
     resolution_shards: Vec<ShardedResolutionMap<K::Accumulator>>,
@@ -303,6 +308,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             resolutions,
             resolution_u8s,
             nodata: config.custom_nodata,
+            apply_scale_offset: config.apply_scale_offset,
+            transform_failure_counter: config.transform_failure_counter.clone(),
+            strict_transforms: config.strict_transforms,
             bbox: config.bbox,
             sampling: config.sampling.clone(),
             resolution_shards,
@@ -548,6 +556,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         stride: *stride,
                         samples_per_pixel: tile.reader.metadata.samples_per_pixel,
                         owner: overlap.then_some((*tile_idx, &*self.mosaic)),
+                        band_scaling: if self.apply_scale_offset {
+                            &tile.reader.metadata.band_scaling
+                        } else {
+                            &[]
+                        },
+                        alpha_sample: tile.reader.metadata.alpha_sample,
                     };
                     self.kernel.process_window(
                         &window,
@@ -572,11 +586,14 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 // the dedicated pool through a helper OS thread, whose join
                 // blocks without stealing, or, with no dedicated pool, run it
                 // serially.
+                self.metrics.waves += 1;
                 match &self.pool {
                     Some(pool) if pool.current_thread_index().is_some() => {
+                        self.metrics.serial_waves += 1;
                         results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
                     }
                     Some(pool) if rayon::current_thread_index().is_some() => {
+                        self.metrics.bridged_waves += 1;
                         std::thread::scope(|s| {
                             s.spawn(|| pool.install(|| parallel(&mut maps, &mut results)))
                                 .join()
@@ -585,6 +602,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     }
                     Some(pool) => pool.install(|| parallel(&mut maps, &mut results)),
                     None if rayon::current_thread_index().is_some() => {
+                        self.metrics.serial_waves += 1;
                         results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
                     }
                     None => parallel(&mut maps, &mut results),
@@ -595,9 +613,18 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     .max(peak.load(Ordering::Relaxed));
                 self.metrics.kernel_wall_ns += t.elapsed().as_nanos() as u64;
                 for (profile, ns) in results.drain(..) {
+                    if let (Some(counter), n @ 1..) =
+                        (&self.transform_failure_counter, profile.transform_failures)
+                    {
+                        counter.fetch_add(n, Ordering::Relaxed);
+                    }
                     self.metrics.worker.merge(profile);
                     self.metrics.worker_ns += ns;
                     self.metrics.jobs += 1;
+                }
+                let failures = self.metrics.worker.transform_failures;
+                if self.strict_transforms && failures > 0 {
+                    return Err(RasterH3Error::TransformFailures(failures));
                 }
                 let bytes: usize = maps
                     .iter()
@@ -640,6 +667,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         }
         match result {
             Ok(()) => Ok(()),
+            Err(e @ RasterH3Error::TransformFailures(_)) => {
+                // Keep the typed error for this call; later reads get the latched text.
+                self.fail(e.to_string());
+                Err(e)
+            }
             Err(e) => Err(self.fail(e.to_string())),
         }
     }
@@ -818,6 +850,14 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// [`Self::spill_run_count`] for each configured resolution, in order.
     pub fn spill_run_counts(&self) -> Vec<u64> {
         self.spill_runs.iter().map(|r| r.runs_written).collect()
+    }
+
+    /// Valid sample points dropped because their coordinate transform failed
+    /// or left the valid latitude/longitude domain; see
+    /// [`super::profile::WorkerProfile::transform_failures`]. Samples outside
+    /// the bbox or owned by another mosaic tile are not counted.
+    pub fn transform_failures(&self) -> u64 {
+        self.metrics.worker.transform_failures
     }
 
     /// Peak estimate of active table/heap allocation, including pending

@@ -403,7 +403,7 @@ fn scan_json_rejects_malformed_options() {
         });
         assert!(msg.contains("Invalid bbox"), "{bbox}: {msg}");
     }
-    for res in ["99", "abc", "7,16", "8,x", ","] {
+    for res in ["99", "abc", "7,16", "8,x", ",", "", "  "] {
         let msg = err(Scan {
             resolutions: Some(res.into()),
             ..Scan::of(&path)
