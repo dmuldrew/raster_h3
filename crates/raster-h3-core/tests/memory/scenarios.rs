@@ -652,9 +652,12 @@ fn row_group_buffer_bytes(path: &Path) -> usize {
     let reader = GeoTiffStreamReader::open(path).expect("open");
     let mut streamer = MultiScanHorizonStreamer::new(reader, &pinned_config(10)).expect("streamer");
     let records = streamer.fetch_next_batch(ROW_GROUP).expect("records");
+    // Match the export's column layout (compact by default) so extra columns don't
+    // inflate the allowance.
+    let compact = ParquetExportConfig::default().compact;
     let (buffer, region) = crate::alloc::region(|| {
         let mut buffer =
-            ContinuousRowGroupBuffer::with_capacity_and_options(ROW_GROUP, false, true);
+            ContinuousRowGroupBuffer::with_capacity_and_options(ROW_GROUP, compact, true);
         let n = records.len();
         // Pad short batches by repeating records; only the size matters here.
         for i in 0..ROW_GROUP {

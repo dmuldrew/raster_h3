@@ -225,7 +225,8 @@ fn spawn_child(name: &str, variant: &str) -> Result<Metrics, String> {
     }
 }
 
-/// Per-key median over repeated runs (checks and the report use the median run).
+/// Per-key median over repeated runs. Each metric is its own median, so one reported
+/// variant can mix values from different runs; checks and the report use these medians.
 fn median(runs: Vec<Metrics>) -> Metrics {
     let mut out = Metrics::new();
     for key in runs[0].keys() {
