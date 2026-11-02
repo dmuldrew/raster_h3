@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Index each sample at every resolution through `h3o::LatLngIndexer`, sharing H3's resolution-independent projection and reusing the last cell per resolution while consecutive samples stay in the same face `IJK` cell; cells are identical. Depends on unreleased upstream h3o master (`[patch.crates-io]`, pinned by revision) until the API ships in an h3o release. Add opt-in `.cargo/fma.toml` for x86_64 CPUs with FMA3.
+- Index each sample at every resolution through `h3o::LatLngIndexer`, sharing H3's resolution-independent projection and reusing the last cell per resolution while consecutive samples stay in the same face `IJK` cell; cells are identical. Requires h3o 0.11.1, the first release with `LatLngIndexer`. Add opt-in `.cargo/fma.toml` for x86_64 CPUs with FMA3.
 
 ### Fixed
 

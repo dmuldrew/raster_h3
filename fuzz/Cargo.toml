@@ -36,7 +36,3 @@ path = "fuzz_targets/predictor.rs"
 test = false
 doc = false
 bench = false
-
-# Same unreleased h3o revision as the workspace `[patch.crates-io]`; remove both together.
-[patch.crates-io]
-h3o = { git = "https://github.com/HydroniumLabs/h3o", rev = "49e653e2102a0f53af0930a4f12b88cd7600b832" }
