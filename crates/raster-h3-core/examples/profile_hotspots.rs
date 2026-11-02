@@ -21,13 +21,13 @@
 //! Results print as Markdown tables. Under GitHub Actions they are also
 //! appended to the job summary and emitted as `::notice` annotations.
 
+#[path = "../tests/memory/alloc.rs"]
+mod alloc;
 #[path = "../tests/it/helpers.rs"]
 mod helpers;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,69 +36,8 @@ use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
 use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
 use serde_json::{json, Value};
 
-// ---------------------------------------------------------------------------
-// Counting allocator
-// ---------------------------------------------------------------------------
-
-struct Counting;
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn on_alloc(size: usize) {
-    ALLOCS.fetch_add(1, Ordering::Relaxed);
-    ALLOC_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-fn on_dealloc(size: usize) {
-    LIVE.fetch_sub(size, Ordering::Relaxed);
-}
-
-// SAFETY: every method forwards to `System` with the caller's arguments
-// unchanged and only updates counters, so `System`'s guarantees carry over.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded with the caller's (non-zero-size) layout.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            on_alloc(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded with the caller's (non-zero-size) layout.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            on_alloc(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        on_dealloc(layout.size());
-        // SAFETY: `ptr` was allocated by this allocator (hence `System`) with `layout`.
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: `ptr`/`layout` describe a live `System` allocation and
-        // `new_size` is valid per the caller's contract.
-        let new = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new.is_null() {
-            on_dealloc(layout.size());
-            on_alloc(new_size);
-        }
-        new
-    }
-}
-
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: alloc::Counting = alloc::Counting;
 
 /// Wall time, allocations and approximate peak extra live bytes for one closure call.
 #[derive(Clone, Copy, Debug)]
@@ -110,21 +49,15 @@ struct Sample {
 }
 
 fn measure<T>(f: impl FnOnce() -> T) -> (T, Sample) {
-    let live0 = LIVE.load(Ordering::Relaxed);
-    PEAK.store(live0, Ordering::Relaxed);
-    let (a0, b0) = (
-        ALLOCS.load(Ordering::Relaxed),
-        ALLOC_BYTES.load(Ordering::Relaxed),
-    );
     let start = Instant::now();
-    let out = f();
+    let (out, region) = alloc::region(f);
     let ms = start.elapsed().as_secs_f64() * 1e3;
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     let sample = Sample {
         ms,
-        allocs: ALLOCS.load(Ordering::Relaxed) - a0,
-        alloc_mib: mib(ALLOC_BYTES.load(Ordering::Relaxed) - b0),
-        peak_mib: mib(PEAK.load(Ordering::Relaxed).saturating_sub(live0) as u64),
+        allocs: region.allocs,
+        alloc_mib: mib(region.alloc_bytes),
+        peak_mib: mib(region.peak_extra as u64),
     };
     (out, sample)
 }

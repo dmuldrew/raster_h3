@@ -50,6 +50,13 @@ crossbeam-deque.workspace = true
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1.6", default-features = false, features = ["std"] }
 
+# Memory benchmarks: each scenario runs in its own child process, so the
+# binary has its own `main` (see tests/memory/main.rs).
+[[test]]
+name = "memory"
+path = "tests/memory/main.rs"
+harness = false
+
 [[bench]]
 name = "streaming"
 harness = false
