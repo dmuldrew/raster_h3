@@ -408,7 +408,7 @@ dependencies = [
 [[package]]
 name = "h3o"
 version = "0.11.0"
-source = "git+https://github.com/dmuldrew/h3o?branch=raster-row-indexing#c54c449eb22194edb97eecd9fd7c1aa34a108968"
+source = "git+https://github.com/dmuldrew/h3o?branch=raster-row-indexing#c880d8242754400f05d149542674f3a409c9ac6d"
 dependencies = [
  "ahash",
  "either",
