@@ -113,12 +113,13 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            # DuckDB v1.2 tags its glibc x86_64 builds linux_amd64_gcc4
+            # DuckDB v1.2 tags its glibc x86_64 builds linux_amd64_gcc4; v1.3+ and v2.0+ use linux_amd64 (both are packaged below)
             platform: linux_amd64_gcc4
             lib_file: libraster_h3.so
             cli_arch: linux-amd64
             cli_sha256: 5221744caf224994bf563bff8e8bd039a9b63437ef05ccfdcc14d2c1cece8d3e
             cli_v156_sha256: 6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f
+            cli_v200_sha256: c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux_arm64
@@ -126,6 +127,7 @@ jobs:
             cli_arch: linux-aarch64
             cli_sha256: 324bd819153c685b7e8153e73d34cbd590b48e096680fd68c8b16a7035206323
             cli_v156_sha256: c544e92c9b7c31fc53c2139802cabd8e2d1b2b3e3f933117f31611239c1402db
+            cli_v200_sha256: 859e1875d2a9515fbb4bf8871061437a14af82320da68c753f094c4b776348fe
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: osx_arm64
@@ -133,6 +135,7 @@ jobs:
             cli_arch: osx-universal
             cli_sha256: 09c57c5065decc254f64e51e7b1de94d262ec13fcd8d1a96a16f08f67ee2ed9f
             cli_v156_sha256: 80a80c68736bd7dea53e8b02447e9759db0c8596ea156476ba396c44f54c5810
+            cli_v200_sha256: 8a8f67e7c7f7d1392fa63ba3971948391392fe2a25fca63e7008e33c50beb4c2
           - os: macos-latest
             target: x86_64-apple-darwin
             platform: osx_amd64
@@ -140,6 +143,7 @@ jobs:
             cli_arch: osx-universal
             cli_sha256: 09c57c5065decc254f64e51e7b1de94d262ec13fcd8d1a96a16f08f67ee2ed9f
             cli_v156_sha256: 80a80c68736bd7dea53e8b02447e9759db0c8596ea156476ba396c44f54c5810
+            cli_v200_sha256: 8a8f67e7c7f7d1392fa63ba3971948391392fe2a25fca63e7008e33c50beb4c2
             # Cross-compiled on an arm64 runner: run the universal CLI's x86_64 slice
             cli_prefix: arch -x86_64
           - os: windows-latest
@@ -149,6 +153,7 @@ jobs:
             cli_arch: windows-amd64
             cli_sha256: 3f3194799c1f289ff570cef9191168ea5d6743202d4445dd6d5ee669a8586435
             cli_v156_sha256: 798eae475d07c645ff3b914f7b0e676d06502b5412dd7552638fafed81f9e916
+            cli_v200_sha256: 91663c2f36c2a334b0e5e639006d8c29c29e013af0c477d80bb931df68870312
     permissions:
       contents: read
     env:
@@ -204,6 +209,8 @@ jobs:
 
       - name: Package DuckDB Extension (Uncompressed & Gzipped)
         shell: bash
+        env:
+          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
         run: |
           cargo run --release --bin package_extension -- \
             --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
@@ -226,6 +233,24 @@ jobs:
           mkdir -p dist/v1.2.0/${{ matrix.platform }}
           cp target/${{ matrix.target }}/release/raster_h3.duckdb_extension dist/v1.2.0/${{ matrix.platform }}/
           cp target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz dist/v1.2.0/${{ matrix.platform }}/
+
+          # On Linux x86_64, also package under the `linux_amd64` platform tag used by DuckDB v1.3+ and v2.0+
+          if [[ "${{ matrix.platform }}" == "linux_amd64_gcc4" ]]; then
+            mkdir -p dist/v1.2.0/linux_amd64
+            cargo run --release --bin package_extension -- \
+              --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+              --output dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension \
+              --platform linux_amd64 \
+              --duckdb-version v1.2.0
+            cargo run --release --bin package_extension -- \
+              --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+              --output dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension.gz \
+              --platform linux_amd64 \
+              --duckdb-version v1.2.0 \
+              --gzip
+            cp dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension target/${{ matrix.target }}/release/raster_h3-linux_amd64.duckdb_extension
+            cp dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension.gz target/${{ matrix.target }}/release/raster_h3-linux_amd64.duckdb_extension.gz
+          fi
 
       - name: Verify Extension Loading with DuckDB CLI
         if: matrix.cli_arch != ''
@@ -291,6 +316,30 @@ jobs:
           chmod +x "$DUCKDB_BIN" || true
           cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
 
+      - name: Run DuckDB 2.0.0 SQL Smoke Test
+        if: matrix.cli_arch != ''
+        shell: bash
+        run: |
+          mkdir -p duckdb-2.0
+          CLI_ARCH="${{ matrix.cli_arch }}"
+          if [[ "$CLI_ARCH" == "linux-aarch64" ]]; then
+            CLI_ARCH="linux-arm64"
+          fi
+          CLI_URL="https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-${CLI_ARCH}.tar.gz"
+          echo "Downloading DuckDB CLI from $CLI_URL..."
+          curl -fsSL "$CLI_URL" -o "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz"
+          scripts/verify_sha256.sh "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz" "${{ matrix.cli_v200_sha256 }}"
+          tar -xzf "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz" -C duckdb-2.0
+
+          DUCKDB_BIN="$(pwd)/duckdb-2.0/duckdb"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            DUCKDB_BIN="$(cygpath -w "$(pwd)/duckdb-2.0/duckdb.exe")"
+          fi
+          export DUCKDB_BIN
+          export DUCKDB_VERSION=v1.2.0
+          chmod +x "$DUCKDB_BIN" || true
+          cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
+
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -298,9 +347,9 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/raster_h3.duckdb_extension
             target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz
-            target/${{ matrix.target }}/release/raster_h3-${{ matrix.platform }}.duckdb_extension
-            target/${{ matrix.target }}/release/raster_h3-${{ matrix.platform }}.duckdb_extension.gz
-            dist/v1.2.0/${{ matrix.platform }}/*
+            target/${{ matrix.target }}/release/raster_h3-*.duckdb_extension
+            target/${{ matrix.target }}/release/raster_h3-*.duckdb_extension.gz
+            dist/v1.2.0/**/*
           if-no-files-found: error
 
   # Builds through the extension-ci-tools Makefile the way duckdb/community-extensions
@@ -450,8 +499,18 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
 
+      - name: Set up Rust toolchain for release packaging
+        if: env.DUCKDB_EXTENSION_SIGNING_KEY != '' || env.DUCKDB_EXTENSION_PUBLIC_KEY != ''
+        env:
+          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
+          DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+
       - name: Prepare Release Assets and Repository Bundle
         shell: bash
+        env:
+          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
+          DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
         run: |
           mkdir -p release-assets
           mkdir -p duckdb-repository/v1.2.0
@@ -466,8 +525,16 @@ jobs:
             cp "$file" "duckdb-repository/v1.2.0/$plat/"
           done
 
-          # Archive repository bundle for custom_extension_repository distribution
-          (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0)
+          # If a signing or public key is configured, emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json`
+          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" || -n "${DUCKDB_EXTENSION_PUBLIC_KEY:-}" ]]; then
+            cargo run --release --bin package_extension -- \
+              --repo-manifest duckdb-repository/.well-known/duckdb-extension-repo.json
+            cp duckdb-repository/.well-known/duckdb-extension-repo.json release-assets/duckdb-extension-repo.json
+            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0 .well-known)
+          else
+            # Archive repository bundle for custom_extension_repository distribution
+            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0)
+          fi
 
           cp all-wheels/*.whl release-assets/
           (cd release-assets && sha256sum * > SHA256SUMS)

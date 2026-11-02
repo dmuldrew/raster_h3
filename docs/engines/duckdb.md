@@ -33,7 +33,8 @@ Pre-compiled extensions are published for all major platforms:
 | :--- | :--- | :--- |
 | **`osx_arm64`** | macOS Apple Silicon (M1/M2/M3/M4) | `raster_h3-osx_arm64.duckdb_extension.gz` |
 | **`osx_amd64`** | macOS Intel x86_64 | `raster_h3-osx_amd64.duckdb_extension.gz` |
-| **`linux_amd64_gcc4`** | Ubuntu, Debian, CentOS, Fedora (glibc) | `raster_h3-linux_amd64_gcc4.duckdb_extension.gz` |
+| **`linux_amd64`** | Ubuntu, Debian, CentOS, Fedora (glibc, DuckDB ≥ 1.3 & 2.0+) | `raster_h3-linux_amd64.duckdb_extension.gz` |
+| **`linux_amd64_gcc4`** | Ubuntu, Debian, CentOS, Fedora (glibc, DuckDB 1.2) | `raster_h3-linux_amd64_gcc4.duckdb_extension.gz` |
 | **`linux_arm64`** | AWS Graviton, Raspberry Pi 4/5, AArch64 | `raster_h3-linux_arm64.duckdb_extension.gz` |
 | **`windows_amd64`** | Windows 10/11, Windows Server (x64) | `raster_h3-windows_amd64.duckdb_extension.gz` |
 
@@ -42,7 +43,7 @@ Pre-compiled extensions are published for all major platforms:
 ```sql
 SET allow_unsigned_extensions = true;
 
--- Replace <platform> with your platform identifier (e.g. osx_arm64)
+-- Replace <platform> with your platform identifier (e.g. osx_arm64, linux_amd64)
 INSTALL 'https://github.com/dmuldrew/raster_h3/releases/latest/download/raster_h3-<platform>.duckdb_extension.gz';
 LOAD 'raster_h3';
 
@@ -50,6 +51,21 @@ SELECT raster_h3_version();
 ```
 
 #### Option B: Install via custom repository
+
+**DuckDB 2.0+ (Trusted Custom Extension Repository with Key Pinning):**
+
+When hosting the signed `duckdb-extension-repository-v1.2.0.zip` bundle (which includes `.well-known/duckdb-extension-repo.json` and `v1.2.0/<platform>/raster_h3.duckdb_extension.gz`), DuckDB 2.0 pins the repository's RSA-2048 public key and verifies extension signatures without needing `allow_unsigned_extensions`:
+
+```sql
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS raster_h3_repo
+    WITH PREFIX 'https://your-extension-host.example.org/duckdb-repository';
+
+INSTALL raster_h3 FROM raster_h3_repo;
+LOAD raster_h3 FROM raster_h3_repo;
+```
+
+**DuckDB 1.2–1.5 (Legacy `custom_extension_repository`):**
 
 ```sql
 SET allow_unsigned_extensions = true;
@@ -382,11 +398,28 @@ print(res)
 cargo build --release
 # -> target/release/libraster_h3.dylib (macOS) / .so (Linux) / .dll (Windows)
 
-# Optional: append the DuckDB extension metadata footer
+# Optional: append the 534-byte DuckDB extension metadata footer (unsigned)
 cargo run --release --bin package_extension -- \
     --input target/release/libraster_h3.so \
     --output target/release/raster_h3.duckdb_extension
+
+# Optional: sign with a 2048-bit RSA private key (or DUCKDB_EXTENSION_SIGNING_KEY env),
+# emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json`, and verify the signature
+cargo run --release --bin package_extension -- \
+    --input target/release/libraster_h3.so \
+    --output target/release/raster_h3.duckdb_extension \
+    --signing-key signing_key.pem \
+    --repo-manifest dist/.well-known/duckdb-extension-repo.json \
+    --verify target/release/raster_h3.duckdb_extension
 ```
+
+When `--signing-key` (`-k`) or `DUCKDB_EXTENSION_SIGNING_KEY` is provided, `package_extension`
+computes DuckDB's two-level 1 MiB chunked SHA-256 hash over the library and 278-byte metadata
+prefix, signs the composite digest with RSA-2048 PKCS#1 v1.5 (`openssl pkeyutl -sign -pkeyopt digest:sha256`),
+and writes the 256-byte signature into the trailing slot (`footer[278..534]`) before optional
+gzip compression (`--gzip`). `--repo-manifest` (`-m`) writes the public key into
+`.well-known/duckdb-extension-repo.json` (`signature_keys`) and prints its DER SHA-256
+fingerprint to match DuckDB 2.0's `CREATE EXTENSION REPOSITORY` output.
 
 ```sql
 -- Unsigned local builds need allow_unsigned_extensions (or `duckdb -unsigned`)

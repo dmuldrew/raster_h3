@@ -25,10 +25,15 @@ RUN cargo build --release --workspace && \
     cargo test --release --workspace && \
     cargo build --release --examples && \
     cargo run --release --example generate_sample -- sample_sf.tif && \
+    PLAT=$(cargo run --release --bin package_extension -- \
+        --input target/release/libraster_h3.so \
+        --output target/release/raster_h3.duckdb_extension \
+        --duckdb-version "${DUCKDB_VERSION}" | awk '/Platform:/ {print $2}') && \
     cargo run --release --bin package_extension -- \
         --input target/release/libraster_h3.so \
         --output target/release/raster_h3.duckdb_extension \
-        --duckdb-version "${DUCKDB_VERSION}"
+        --platform "${PLAT}" \
+        --duckdb-version v1.2.0
 
 # ==============================================================================
 # Stage 2: Runtime Environment with DuckDB CLI
@@ -52,16 +57,28 @@ RUN set -eux; \
         aarch64|arm64) DUCK_ARCH="linux-arm64" ;; \
         *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac; \
-    CLI_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${DUCK_ARCH}.zip"; \
-    LIB_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-${DUCK_ARCH}.zip"; \
-    curl -fsSL "$CLI_URL" -o duckdb.zip; \
-    unzip duckdb.zip -d /usr/local/bin; \
+    case "$DUCKDB_VERSION" in \
+        v0.*|v1.*) \
+            CLI_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${DUCK_ARCH}.zip"; \
+            LIB_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-${DUCK_ARCH}.zip"; \
+            curl -fsSL "$CLI_URL" -o duckdb.zip; \
+            unzip duckdb.zip -d /usr/local/bin; \
+            rm duckdb.zip; \
+            curl -fsSL "$LIB_URL" -o libduckdb.zip; \
+            mkdir -p /tmp/libduckdb; \
+            unzip libduckdb.zip -d /tmp/libduckdb; \
+            mv /tmp/libduckdb/libduckdb.so /usr/local/lib/; \
+            rm -rf /tmp/libduckdb libduckdb.zip ;; \
+        *) \
+            CLI_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb-cli-${DUCK_ARCH}.tar.gz"; \
+            LIB_URL="https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb-shared-libs-${DUCK_ARCH}.tar.gz"; \
+            curl -fsSL "$CLI_URL" | tar -xz -C /usr/local/bin; \
+            mkdir -p /tmp/libduckdb; \
+            curl -fsSL "$LIB_URL" | tar -xz -C /tmp/libduckdb; \
+            mv /tmp/libduckdb/libduckdb.so /usr/local/lib/; \
+            rm -rf /tmp/libduckdb ;; \
+    esac; \
     chmod +x /usr/local/bin/duckdb; \
-    rm duckdb.zip; \
-    curl -fsSL "$LIB_URL" -o libduckdb.zip; \
-    unzip libduckdb.zip -d /tmp/libduckdb; \
-    mv /tmp/libduckdb/libduckdb.so /usr/local/lib/; \
-    rm -rf /tmp/libduckdb libduckdb.zip; \
     ldconfig
 
 # Create directories

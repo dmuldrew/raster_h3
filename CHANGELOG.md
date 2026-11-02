@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DuckDB 2.0 extension signing and custom repository support: `package_extension` gains `--signing-key` (`-k`, or `DUCKDB_EXTENSION_SIGNING_KEY`), `--public-key` (`-K`, or `DUCKDB_EXTENSION_PUBLIC_KEY`), `--repo-manifest` (`-m`) and `--verify` to compute DuckDB's 1 MiB chunked SHA-256 tree hash, sign the 256-byte footer slot (`footer[278..534]`) with RSA-2048 PKCS#1 v1.5, verify signed `.duckdb_extension[.gz]` binaries, and generate `.well-known/duckdb-extension-repo.json` (`signature_keys`) for `CREATE EXTENSION REPOSITORY`. CI packages both `linux_amd64` (DuckDB ≥ 1.3 & 2.0+) and `linux_amd64_gcc4` (DuckDB 1.2) on Linux x86_64 and runs `duckdb_sql_smoke` against DuckDB v2.0.0.
 - Memory benchmark suite (`cargo test --release -p raster-h3-core --test memory`): seven scenarios (spill-run construction, forced spills with quantile sketches and high-cardinality categories, slow HTTP and Parquet consumers, many tiny chunks, concurrent streams), each variant in its own process, with allocator, request-count and spill checks that run in CI on every platform; RSS and wall time are reported only. `docs/testing.md` records a before/after measurement of the #60 prefetch byte budget. The counting allocator is shared with `profile_hotspots`.
 
 ### Fixed
