@@ -107,14 +107,17 @@ narrows it with the filters and returns an `ExecutionPlan`.
 | `MinMean(v)`, `MaxMean(v)` | Exact | Unsupported | Keeps the stricter bound |
 | `MinMajorityFraction(v)` | Unsupported | Exact | Keeps the stricter bound |
 | `Resolution(r)` | Exact | Exact | Restricts the scan to `r`; an `r` outside the configured set yields an empty scan |
-| `Bbox(b)` | Inexact | Inexact | Intersects with the configured bbox; a disjoint box yields an empty scan. Antimeridian-crossing boxes keep the configured bbox, so the caller must re-apply the predicate |
+| `Bbox(b)` | Inexact | Inexact | Widens `b` by more than the largest cell diameter at the coarsest resolution, then intersects it with the configured bbox (a disjoint box yields an empty scan). Every cell that intersects `b` keeps the aggregates of an unfiltered scan; the extra cells near the widened edge are partial, so the caller must re-apply the predicate. Not pushed when `with_compact(true)` is set |
 | `Other(_)` | Unsupported | Unsupported | Ignored by the scan |
 
-Filters only ever narrow the table. `supports_filters_pushdown(&filters)` returns the
+Filters only ever narrow the table. A pushed `Bbox` differs from `with_bbox`: `with_bbox` is
+part of the table definition and clips individual pixels, so cells straddling its edge are
+aggregated from only their pixels inside the box. `supports_filters_pushdown(&filters)` returns the
 classification above so a planner knows which predicates it still has to evaluate.
 
 - **Projection**: `Some(&[indices])` projects the schema; only those columns are built.
 - **Limit**: passed to the batch reader, which stops draining once the limit is reached.
+  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out.
 - **Statistics**: `statistics()` returns `TableStatistics { num_rows, is_exact: false }`
   from `estimate_raster_cardinality`.
 
