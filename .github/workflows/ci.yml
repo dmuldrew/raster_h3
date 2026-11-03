@@ -371,9 +371,8 @@ jobs:
           # On the arm64 macOS runner, osx_amd64's v1.5.6 library is x86_64;
           # run the universal CLI under Rosetta so it can load it.
           if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" && "$(uname -m)" == "arm64" ]]; then
-            printf '#!/bin/bash
-exec arch -x86_64 "%s" "$@"
-' "$DUCKDB_BIN" > duckdb-2.0/duckdb-x86
+            echo '#!/bin/bash' > duckdb-2.0/duckdb-x86
+            echo "exec arch -x86_64 '$DUCKDB_BIN' "\$@"" >> duckdb-2.0/duckdb-x86
             chmod +x duckdb-2.0/duckdb-x86
             DUCKDB_BIN="$(pwd)/duckdb-2.0/duckdb-x86"
           fi
