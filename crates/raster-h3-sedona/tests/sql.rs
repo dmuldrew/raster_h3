@@ -414,11 +414,7 @@ async fn polygon_to_cells_parallel_batch_matches_sequential() {
     ctx.register_batch("polys", batch(vec!["covers"; n]))
         .unwrap();
 
-    let out = collect(
-        &ctx,
-        "SELECT h3_polygon_to_cells(geom, 9, mode) FROM polys",
-    )
-    .await;
+    let out = collect(&ctx, "SELECT h3_polygon_to_cells(geom, 9, mode) FROM polys").await;
     let got: Vec<Option<Vec<u64>>> = out
         .iter()
         .flat_map(|b| {
