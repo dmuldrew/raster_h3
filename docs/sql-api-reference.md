@@ -416,7 +416,8 @@ The same function is available in Apache DataFusion and SedonaDB through
 (`register_all` in Rust, `sd.register(raster_h3_sedona.scalar_functions())` in Python). There it
 returns `List<UInt64>`, takes `Binary` WKB or a geometry column, and refuses at planning a
 geometry whose CRS is set to something other than lon/lat. The containment modes, NULL
-handling and limits below are the same.
+handling and limits below are the same, except that an out-of-range `resolution` is always
+`NULL` there, even as a constant.
 
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
