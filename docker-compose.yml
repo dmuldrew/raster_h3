@@ -17,3 +17,27 @@ services:
       - .:/app
     ports:
       - "8080:8080"
+
+  # Apache Sedona (Spark) with the raster-h3 Python package installed. Behind a
+  # profile so `docker compose up` doesn't build it; naming the service enables it:
+  #   docker compose up --build sedona     # JupyterLab on http://localhost:8888
+  #   docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py
+  sedona:
+    profiles: ["sedona"]
+    build:
+      context: .
+      dockerfile: Dockerfile.sedona
+      args:
+        SEDONA_VERSION: ${SEDONA_VERSION:-1.9.1}
+    image: raster_h3-sedona:latest
+    environment:
+      # Read by the image's entrypoint; it refuses to start if the two exceed host RAM.
+      DRIVER_MEM: ${SEDONA_DRIVER_MEM:-4g}
+      EXECUTOR_MEM: ${SEDONA_EXECUTOR_MEM:-4g}
+    volumes:
+      - ./data:/data
+      - ./examples/sedona_spark:/opt/raster_h3/examples
+    ports:
+      - "8888:8888"   # JupyterLab
+      - "8090:8080"   # Spark master UI (8080 is the viewer's)
+      - "4040:4040"   # Spark application UI
