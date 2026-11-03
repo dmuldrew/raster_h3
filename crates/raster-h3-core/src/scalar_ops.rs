@@ -285,7 +285,29 @@ pub fn h3_polygon_to_cells_wkb_into(
     mode: ContainmentMode,
     out: &mut Vec<u64>,
 ) -> Result<(), PolygonToCellsError> {
-    *out = h3_polygon_to_cells_wkb(wkb, res, mode)?;
+    let resolution = u8::try_from(res)
+        .ok()
+        .and_then(|r| Resolution::try_from(r).ok())
+        .ok_or(PolygonToCellsError::InvalidResolution(res))?;
+    let multi = wkb_to_multipolygon(wkb).map_err(PolygonToCellsError::InvalidGeometry)?;
+    out.clear();
+    if multi.0.is_empty() {
+        return Ok(());
+    }
+    let mut tiler = TilerBuilder::new(resolution).containment_mode(mode).build();
+    tiler
+        .add_batch(multi)
+        .map_err(|_| PolygonToCellsError::InvalidGeometry("non-finite coordinates"))?;
+    let estimate = tiler.coverage_size_hint();
+    if estimate > H3_POLYGON_TO_CELLS_MAX_CELLS {
+        return Err(PolygonToCellsError::TooManyCells {
+            estimate,
+            limit: H3_POLYGON_TO_CELLS_MAX_CELLS,
+        });
+    }
+    out.extend(tiler.into_coverage().map(u64::from));
+    out.sort_unstable();
+    out.dedup();
     Ok(())
 }
 

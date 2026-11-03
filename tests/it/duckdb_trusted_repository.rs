@@ -182,7 +182,15 @@ impl Harness {
             .arg(&self.library)
             .arg("-o")
             .arg(ext_dir.join("raster_h3.duckdb_extension.gz"))
-            .args(["-p", &self.platform, "-d", "v1.2.0", "--gzip"]);
+            // Package with the C-API version tag matching the built library
+            // (the v1.5.6 build is selected via RASTER_H3_LIBRARY).
+            .args([
+                "-p",
+                &self.platform,
+                "-d",
+                &std::env::var("DUCKDB_VERSION").unwrap_or_else(|_| "v1.2.0".to_string()),
+                "--gzip",
+            ]);
         if let Some(key) = signing_key {
             package.arg("-k").arg(key);
         }
