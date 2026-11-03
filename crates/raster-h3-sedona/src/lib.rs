@@ -27,6 +27,7 @@
 
 mod convert;
 mod filters;
+pub mod merge;
 mod polyfill;
 mod spatial;
 pub mod table;
@@ -38,10 +39,11 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 
 pub use convert::{geometry_field, GEOARROW_WKB_EXTENSION, GEOARROW_WKB_METADATA};
+pub use merge::{merge_udafs, MergePartials};
 pub use polyfill::H3PolygonToCells;
 pub use table::{RasterH3Table, TableKind};
 pub use udf::{scalar_udfs, RasterH3ScalarUdf};
-pub use udtf::{CategoricalAggregateFunction, ContinuousAggregateFunction};
+pub use udtf::{CategoricalAggregateFunction, ContinuousAggregateFunction, PlanPartitionsFunction};
 
 /// Register the `raster_h3` table functions and scalar UDFs into `ctx`.
 ///
@@ -55,7 +57,14 @@ pub fn register_all(ctx: &SessionContext) {
         "h3_raster_categorical_aggregate",
         Arc::new(CategoricalAggregateFunction),
     );
+    ctx.register_udtf(
+        "h3_raster_plan_partitions",
+        Arc::new(PlanPartitionsFunction),
+    );
     for udf in scalar_udfs() {
         ctx.register_udf(udf);
+    }
+    for udaf in merge_udafs() {
+        ctx.register_udaf(udaf);
     }
 }
