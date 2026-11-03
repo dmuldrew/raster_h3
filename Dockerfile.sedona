@@ -35,8 +35,11 @@ COPY tests/ ./tests/
 COPY examples/ ./examples/
 
 ENV RASTER_H3_WORKSPACE=/build
+# Drop Cargo's build directory in the same step: only the wheel is needed, and keeping
+# target/ would leave several GB in the build cache.
 RUN pip install --no-cache-dir "hatchling>=1.26" \
-    && pip wheel --no-deps --no-build-isolation -w /wheels crates/raster-h3-python
+    && pip wheel --no-deps --no-build-isolation -w /wheels crates/raster-h3-python \
+    && rm -rf /build/target
 
 # ==============================================================================
 # Stage 2: Sedona + raster-h3
