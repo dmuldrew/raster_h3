@@ -117,9 +117,11 @@ impl DuckDbFileSystem {
         let state = unsafe {
             if for_write {
                 duckdb_file_open_options_set_flag(options, DuckDBFileFlag::Write, true);
-                // CREATE_NEW maps to DuckDB's FILE_CREATE_NEW (create or
-                // truncate). Plain CREATE keeps existing bytes, which leaves
-                // stale data past the end when overwriting a larger file.
+                // CREATE alone keeps existing bytes, which leaves stale data
+                // past the end when overwriting a larger file; CREATE_NEW alone
+                // does not create a missing file. Both together = create or
+                // truncate.
+                duckdb_file_open_options_set_flag(options, DuckDBFileFlag::Create, true);
                 duckdb_file_open_options_set_flag(options, DuckDBFileFlag::CreateNew, true);
             } else {
                 duckdb_file_open_options_set_flag(options, DuckDBFileFlag::Read, true);
