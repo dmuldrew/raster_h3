@@ -25,6 +25,8 @@ raster-h3-datafusion = { version = "0.5.0", path = "../raster-h3-datafusion" }
 datafusion = { version = "=54.1.0", default-features = false, features = ["sql"] }
 arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }
 futures = "0.3"
+# Parallel polyfill in `h3_polygon_to_cells` (already used by raster-h3-core).
+rayon = "1.10"
 tokio = { version = "1", features = ["rt"] }
 async-trait = "0.1"
 serde_json = "1.0"

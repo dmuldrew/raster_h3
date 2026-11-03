@@ -3153,6 +3153,7 @@ dependencies = [
  "h3o",
  "raster-h3-core",
  "raster-h3-datafusion",
+ "rayon",
  "sedona",
  "sedona-extension",
  "serde_json",

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, ListBuilder, UInt64Builder};
 use arrow::datatypes::{DataType, Field, FieldRef, Int64Type};
-use datafusion::common::{exec_err, plan_err, ScalarValue};
+use datafusion::common::{exec_err, plan_err, DataFusionError, ScalarValue};
 use datafusion::error::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
@@ -13,6 +13,7 @@ use raster_h3_core::scalar_ops::{
     h3_polygon_to_cells_wkb, parse_containment_mode, ContainmentMode, PolygonToCellsError,
     H3_CONTAINMENT_MODES,
 };
+use rayon::prelude::*;
 
 use crate::convert::GEOARROW_WKB_EXTENSION;
 use crate::spatial::is_planar_lnglat;
@@ -114,38 +115,54 @@ impl ScalarUDFImpl for H3PolygonToCells {
         let resolution = arrays[1].as_primitive::<Int64Type>();
         let mode = arrays.get(2).map(|a| a.as_string::<i32>());
 
-        let mut out = ListBuilder::new(UInt64Builder::new());
-        for i in 0..geometry.len() {
+        // Polyfilling one row is far more work than scheduling it, so rows run in parallel on
+        // the rayon pool (a batch of tracts typically arrives as one partition). Results are
+        // assembled in row order, so the output and the first error reported are the same as
+        // a sequential pass.
+        let fill_row = |i: usize| -> Result<Option<Vec<u64>>> {
             if geometry.is_null(i) || resolution.is_null(i) || mode.is_some_and(|m| m.is_null(i)) {
-                out.append_null();
-                continue;
+                return Ok(None);
             }
             let containment = match mode {
                 None => ContainmentMode::ContainsCentroid,
-                Some(m) => match parse_containment_mode(m.value(i)) {
-                    Some(c) => c,
-                    None => {
-                        let names: Vec<_> = H3_CONTAINMENT_MODES.iter().map(|(n, _)| *n).collect();
-                        return exec_err!(
-                            "{NAME}: unknown containment mode '{}' (expected one of {})",
-                            m.value(i),
-                            names.join(", ")
-                        );
-                    }
-                },
+                Some(m) => parse_containment_mode(m.value(i)).ok_or_else(|| {
+                    let names: Vec<_> = H3_CONTAINMENT_MODES.iter().map(|(n, _)| *n).collect();
+                    DataFusionError::Execution(format!(
+                        "{NAME}: unknown containment mode '{}' (expected one of {})",
+                        m.value(i),
+                        names.join(", ")
+                    ))
+                })?,
             };
             match h3_polygon_to_cells_wkb(geometry.value(i), resolution.value(i), containment) {
-                Ok(cells) => {
-                    out.values().append_slice(&cells);
-                    out.append(true);
-                }
+                Ok(cells) => Ok(Some(cells)),
                 // As in DuckDB: a row that is not a polygon, or an out-of-range resolution,
                 // gives NULL; only the cell limit fails the query.
                 Err(
                     PolygonToCellsError::InvalidGeometry(_)
                     | PolygonToCellsError::InvalidResolution(_),
-                ) => out.append_null(),
-                Err(e) => return exec_err!("{NAME}: {e}"),
+                ) => Ok(None),
+                Err(e) => exec_err!("{NAME}: {e}"),
+            }
+        };
+        let rows: Vec<Result<Option<Vec<u64>>>> = if geometry.len() > 1 {
+            (0..geometry.len()).into_par_iter().map(fill_row).collect()
+        } else {
+            (0..geometry.len()).map(fill_row).collect()
+        };
+
+        let total = rows
+            .iter()
+            .map(|r| r.as_ref().map_or(0, |c| c.as_ref().map_or(0, Vec::len)))
+            .sum();
+        let mut out = ListBuilder::with_capacity(UInt64Builder::with_capacity(total), rows.len());
+        for row in rows {
+            match row? {
+                Some(cells) => {
+                    out.values().append_slice(&cells);
+                    out.append(true);
+                }
+                None => out.append_null(),
             }
         }
         let out: Arc<dyn Array> = Arc::new(out.finish());

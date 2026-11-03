@@ -375,3 +375,88 @@ async fn polygon_to_cells_handles_bad_input_like_duckdb() {
         .unwrap_err();
     assert!(err.to_string().contains("lon/lat"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn polygon_to_cells_parallel_batch_matches_sequential() {
+    use datafusion::arrow::array::{BinaryArray, ListArray, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use raster_h3_core::scalar_ops::{h3_polygon_to_cells_wkb, h3_to_wkb_u64, ContainmentMode};
+
+    // 200 res-7 cell polygons around San Francisco, polyfilled at res 9, with a NULL and an
+    // invalid geometry mixed in.
+    let parent = h3o::CellIndex::try_from(0x8828308281fffffu64)
+        .unwrap()
+        .parent(h3o::Resolution::Four)
+        .unwrap();
+    let mut geoms: Vec<Option<Vec<u8>>> = parent
+        .children(h3o::Resolution::Seven)
+        .take(200)
+        .map(|c| Some(h3_to_wkb_u64(u64::from(c)).unwrap()))
+        .collect();
+    geoms[17] = None;
+    geoms[42] = Some(vec![1, 2, 3]);
+    let n = geoms.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("geom", DataType::Binary, true),
+        Field::new("mode", DataType::Utf8, false),
+    ]));
+    let batch = |modes: Vec<&str>| {
+        datafusion::arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BinaryArray::from_iter(geoms.iter().map(|g| g.as_deref()))),
+                Arc::new(StringArray::from(modes)),
+            ],
+        )
+        .unwrap()
+    };
+    let ctx = context();
+    ctx.register_batch("polys", batch(vec!["covers"; n]))
+        .unwrap();
+
+    let out = collect(
+        &ctx,
+        "SELECT h3_polygon_to_cells(geom, 9, mode) FROM polys",
+    )
+    .await;
+    let got: Vec<Option<Vec<u64>>> = out
+        .iter()
+        .flat_map(|b| {
+            let list = b.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+            (0..list.len())
+                .map(|i| {
+                    (!list.is_null(i))
+                        .then(|| list.value(i).as_primitive::<UInt64Type>().values().to_vec())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let want: Vec<Option<Vec<u64>>> = geoms
+        .iter()
+        .map(|g| {
+            g.as_deref()
+                .and_then(|g| h3_polygon_to_cells_wkb(g, 9, ContainmentMode::Covers).ok())
+        })
+        .collect();
+    assert_eq!(got.len(), n);
+    assert!(got[17].is_none() && got[42].is_none());
+    assert!(got
+        .iter()
+        .filter(|c| c.is_some())
+        .all(|c| c.as_ref().unwrap().len() > 40));
+    assert_eq!(got, want);
+
+    // The first bad row in row order is the error reported, as in a sequential pass.
+    let mut modes = vec!["covers"; n];
+    modes[150] = "nearby";
+    modes[60] = "sideways";
+    ctx.register_batch("bad_modes", batch(modes)).unwrap();
+    let err = ctx
+        .sql("SELECT h3_polygon_to_cells(geom, 9, mode) FROM bad_modes")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("'sideways'"), "{err}");
+}
