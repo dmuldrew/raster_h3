@@ -291,9 +291,25 @@ the certified bounds of every outside chunk (`rejection_bounds`). Uncertified CR
 and cells near a pole or across the antimeridian count as boundary, which is always
 correct and only adds merge work. The test runs once per finalized cell, and an
 ancestor-level cache settles most interior cells without computing their boundary.
-Boundary cells are a perimeter effect: about 11% of res-9 cells for 5 partitions of a
-512 x 384 px test raster, and less as partitions grow. `partition_cell_counts()` reports
-the split.
+Boundary cells are a perimeter effect and shrink as partitions grow. `partition_cell_counts()`
+reports the split.
+
+Partitioning adds no measurable CPU. The `partition_overhead` example scans a 6144 x 6144 px
+f32 raster (576 tiles of 256 px) once, then as all partitions plus the merge, and compares
+total process CPU time (median of 5 interleaved runs, 4 vCPUs):
+
+| resolutions | 4 partitions (144 tiles each) | 16 partitions (36 tiles each) |
+| :--- | :--- | :--- |
+| 8 | 0.99x CPU, 4.6% boundary cells | 0.98x, 13.2% |
+| 10 | 0.99x, 0.6% | 1.01x, 1.9% |
+| 7, 8, 9 | 0.97x, 2.3% | 1.02x, 6.8% |
+
+Ratios within a few percent of 1.0 are run-to-run noise on that machine. The merge takes
+milliseconds (under 3 ms for about 35,000 boundary cells at resolution 10).
+
+```bash
+cargo run --release -p raster-h3-core --example partition_overhead -- [--quick] [--json out.json]
+```
 
 Child compaction cannot be combined with a partition (sibling groups may span
 partitions), and record-only reads (`drain_completed_into`, `fetch_next_batch`) are
