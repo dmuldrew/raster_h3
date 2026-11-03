@@ -99,10 +99,31 @@ pub fn validate_range_response_headers(
     Ok(total)
 }
 
-/// Check if a path or string is a remote URL (http, https, or s3)
+/// Check if a path or string is a remote URI: `http(s)://`, `s3://`, or any
+/// other `scheme://` cloud URI (gs, gcs, azure, abfs, r2, oss, hf, ftp, ...).
+/// Non-http(s) schemes need a remote source factory that understands them
+/// (e.g. the DuckDB file system); the built-in HTTP transport only supports
+/// http/https and s3 (which it normalizes to https).
 pub fn is_remote_url(path: &str) -> bool {
     let p = path.trim().to_lowercase();
-    p.starts_with("http://") || p.starts_with("https://") || p.starts_with("s3://")
+    let Some(pos) = p.find("://") else {
+        return false;
+    };
+    let scheme = &p[..pos];
+    // `file://` URIs name local paths and take the local (mmap) path.
+    if scheme == "file" {
+        return false;
+    }
+    // A URI scheme is [A-Za-z][A-Za-z0-9+._-]*; require length >= 2 so
+    // single-letter Windows drive paths like "c://x" are not remote.
+    scheme.len() >= 2
+        && scheme
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'_' | b'-'))
 }
 
 /// Normalize input URL, resolving `s3://bucket/key` into an HTTPS URL with region and endpoint support

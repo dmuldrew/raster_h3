@@ -136,7 +136,7 @@ unsafe fn register_options_impl(con: duckdb_connection) {
             // `set_default_value` likewise copies the value.
             duckdb_config_option_set_default_value(option, default);
             duckdb_destroy_value(&mut { default });
-            duckdb_config_option_set_default_scope(option, DuckDBConfigOptionScope::Global);
+            duckdb_config_option_set_default_scope(option, DuckDBConfigOptionScope::Session);
             duckdb_config_option_set_description(option, description.as_ptr());
             // `register` copies; failure means the option already exists.
             let _ = duckdb_register_config_option(con, option);
