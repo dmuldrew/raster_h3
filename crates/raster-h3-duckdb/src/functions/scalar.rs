@@ -644,6 +644,139 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
     }
 }
 
+/// Owns a scalar-bind expression and destroys it on drop.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+struct ExpressionGuard(duckdb_expression);
+
+#[cfg(feature = "duckdb-api-v1_5_6")]
+impl Drop for ExpressionGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: owned expression handle, destroyed once.
+            unsafe { duckdb_destroy_expression(&mut self.0) };
+        }
+    }
+}
+
+/// Owns a client context and destroys it on drop.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+struct ClientContextGuard(duckdb_client_context);
+
+#[cfg(feature = "duckdb-api-v1_5_6")]
+impl Drop for ClientContextGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: owned client-context handle, destroyed once.
+            unsafe { duckdb_destroy_client_context(&mut self.0) };
+        }
+    }
+}
+
+/// Owns a `duckdb_value` and destroys it on drop.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+struct ValueGuard(duckdb_value);
+
+#[cfg(feature = "duckdb-api-v1_5_6")]
+impl Drop for ValueGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: owned value handle, destroyed once.
+            unsafe { duckdb_destroy_value(&mut self.0) };
+        }
+    }
+}
+
+/// Fold scalar-bind argument `index` to a constant if DuckDB can.
+///
+/// Returns `Ok(None)` when the argument is absent, not foldable, or folds to
+/// NULL (the kernel turns NULL arguments into NULL rows), and `Err` with
+/// DuckDB's message when folding itself fails.
+///
+/// # Safety
+/// `info` must be the live scalar-bind handle and `ctx` its client context.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+unsafe fn fold_constant_argument(
+    info: duckdb_bind_info,
+    ctx: duckdb_client_context,
+    index: idx_t,
+) -> Result<Option<ValueGuard>, String> {
+    // SAFETY: `info`/`ctx` are live (caller contract); the expression, error
+    // data and value are owned here and released by their guards.
+    unsafe {
+        if index >= duckdb_scalar_function_bind_get_argument_count(info) {
+            return Ok(None);
+        }
+        let expr = ExpressionGuard(duckdb_scalar_function_bind_get_argument(info, index));
+        if expr.0.is_null() || !duckdb_expression_is_foldable(expr.0) {
+            return Ok(None);
+        }
+        let mut val: duckdb_value = std::ptr::null_mut();
+        let err = ErrorData::from_raw(duckdb_expression_fold(ctx, expr.0, &mut val));
+        let val = ValueGuard(val);
+        if err.has_error() {
+            return Err(err.message());
+        }
+        if val.0.is_null() || duckdb_is_null_value(val.0) {
+            return Ok(None);
+        }
+        Ok(Some(val))
+    }
+}
+
+/// Bind callback for `h3_polygon_to_cells`: folds constant `resolution` and
+/// `containment` arguments and rejects invalid values at plan time instead of
+/// failing per row.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+unsafe extern "C" fn polygon_cells_bind(info: duckdb_bind_info) {
+    let set_error = |msg: String| {
+        let c = to_c_string(&format!("h3_polygon_to_cells: {msg}"));
+        // SAFETY: `info` is the live scalar-bind handle; DuckDB copies the message.
+        unsafe { duckdb_scalar_function_bind_set_error(info, c.as_ptr()) };
+    };
+    let run = || -> Result<(), String> {
+        let mut raw_ctx: duckdb_client_context = std::ptr::null_mut();
+        // SAFETY: `info` is the live scalar-bind handle; `raw_ctx` is written
+        // with an owned context (or left null).
+        unsafe { duckdb_scalar_function_get_client_context(info, &mut raw_ctx) };
+        let ctx = ClientContextGuard(raw_ctx);
+        if ctx.0.is_null() {
+            return Ok(());
+        }
+
+        // Argument 1: resolution.
+        // SAFETY: live bind handle and its client context.
+        if let Some(val) = unsafe { fold_constant_argument(info, ctx.0, 1) }? {
+            // SAFETY: `val` is a live non-NULL value.
+            let res = unsafe { duckdb_get_int64(val.0) };
+            if !(0..=15).contains(&res) {
+                return Err(format!("resolution {res} is outside 0..=15"));
+            }
+        }
+
+        // Argument 2: containment mode.
+        // SAFETY: live bind handle and its client context.
+        if let Some(val) = unsafe { fold_constant_argument(info, ctx.0, 2) }? {
+            // SAFETY: `val` is a live non-NULL value; the returned string is
+            // DuckDB-allocated and freed by `from_duckdb_string`.
+            let name = unsafe { from_duckdb_string(duckdb_get_varchar(val.0)) };
+            if let Some(name) = name {
+                if scalar_ops::parse_containment_mode(&name).is_none() {
+                    return Err(format!("unknown containment mode `{name}`"));
+                }
+            }
+        }
+        Ok(())
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => set_error(msg),
+        Err(payload) => set_error(format!(
+            "panic in bind: {}",
+            safe_panic_payload_to_string(payload)
+        )),
+    }
+}
+
 /// Shared body of `h3_polygon_to_cells(geom, res[, containment])` -> `UBIGINT[]`.
 ///
 /// Rows with a NULL argument, invalid WKB or a resolution outside `0..=15` yield NULL. An
@@ -709,6 +842,9 @@ unsafe fn polygon_to_cells_kernel(
             std::ptr::null_mut()
         };
 
+        // One buffer reused for every row of the chunk; its contents are
+        // copied into the list child vector below.
+        let mut cells: Vec<u64> = Vec::new();
         let mut total: u64 = 0;
         for i in 0..count {
             *entries.add(i as usize) = duckdb_list_entry {
@@ -740,9 +876,13 @@ unsafe fn polygon_to_cells_kernel(
                 scalar_ops::ContainmentMode::ContainsCentroid
             };
             let wkb = (*p_geom.add(i as usize)).as_bytes();
-            let cells = match scalar_ops::h3_polygon_to_cells_wkb(wkb, *p_res.add(i as usize), mode)
-            {
-                Ok(cells) => cells,
+            match scalar_ops::h3_polygon_to_cells_wkb_into(
+                wkb,
+                *p_res.add(i as usize),
+                mode,
+                &mut cells,
+            ) {
+                Ok(()) => {}
                 Err(err @ scalar_ops::PolygonToCellsError::TooManyCells { .. }) => {
                     let msg = to_c_string(&format!("h3_polygon_to_cells: {err}"));
                     duckdb_scalar_function_set_error(info, msg.as_ptr());
@@ -752,7 +892,7 @@ unsafe fn polygon_to_cells_kernel(
                     duckdb_vector_set_row_invalid(output, i);
                     continue;
                 }
-            };
+            }
             let new_total = total + cells.len() as u64;
             if duckdb_list_vector_reserve(output, new_total) != DuckDBState::Success {
                 duckdb_scalar_function_set_error(
@@ -841,6 +981,21 @@ unsafe fn register_scalar_fn_set(
     name: &str,
     overloads: &[ScalarOverload<'_>],
 ) -> Result<(), String> {
+    // SAFETY: forwarded; `with_bind` off means identical behaviour.
+    unsafe { register_scalar_fn_set_ex(con, name, overloads, false) }
+}
+
+/// Register a scalar overload set, optionally attaching the v1.5.6 bind
+/// callback used by `h3_polygon_to_cells` (ignored on the v1.2.0 build).
+///
+/// # Safety
+/// Same contract as [`register_scalar_fn_set`].
+unsafe fn register_scalar_fn_set_ex(
+    con: duckdb_connection,
+    name: &str,
+    overloads: &[ScalarOverload<'_>],
+    #[allow(unused_variables)] with_bind: bool,
+) -> Result<(), String> {
     // SAFETY: `con` is a live connection and every logical type in `overloads` is live
     // (caller contract). Names are NUL-terminated CStrings outliving each call, each
     // created function/set is destroyed exactly once after DuckDB has copied it into the
@@ -857,6 +1012,10 @@ unsafe fn register_scalar_fn_set(
             }
             duckdb_scalar_function_set_return_type(scalar_fn, return_type);
             duckdb_scalar_function_set_function(scalar_fn, func);
+            #[cfg(feature = "duckdb-api-v1_5_6")]
+            if with_bind {
+                duckdb_scalar_function_set_bind(scalar_fn, polygon_cells_bind);
+            }
             ok &= duckdb_add_scalar_function_to_set(set, scalar_fn) == DuckDBState::Success;
             duckdb_destroy_scalar_function(&mut scalar_fn);
         }
@@ -1039,10 +1198,11 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
                 ]
             })
             .collect();
-        results.push(register_scalar_fn_set(
+        results.push(register_scalar_fn_set_ex(
             con,
             "h3_polygon_to_cells",
             &polygon_overloads,
+            cfg!(feature = "duckdb-api-v1_5_6"),
         ));
         let mut type_cell_list_mut = type_cell_list;
         duckdb_destroy_logical_type(&mut type_cell_list_mut);

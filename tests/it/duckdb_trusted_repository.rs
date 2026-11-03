@@ -119,11 +119,22 @@ impl Harness {
         let probe = harness.run("SELECT version(); PRAGMA platform;");
         assert!(probe.status.success(), "{}", output_text(&probe));
         let stdout = String::from_utf8(probe.stdout).unwrap();
-        let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+        // The CLI may print warnings (e.g. a Rosetta notice) before the result
+        // rows; keep only lines of identifier characters.
+        let mut lines = stdout.lines().map(str::trim).filter(|l| {
+            !l.is_empty()
+                && l.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
         // `version()` is the release tag (e.g. `v2.0.0`), which is also the
         // `${REVISION}` directory DuckDB requests from a repository.
         harness.version_dir = lines.next().unwrap().to_string();
-        harness.platform = lines.next().unwrap().to_string();
+        // DUCKDB_PLATFORM overrides probing where the CLI output is unreliable
+        // (e.g. a Rosetta wrapper on osx_amd64 CI runners).
+        harness.platform = std::env::var("DUCKDB_PLATFORM")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| lines.next().unwrap().to_string());
 
         let major: u32 = harness
             .version_dir
@@ -182,7 +193,15 @@ impl Harness {
             .arg(&self.library)
             .arg("-o")
             .arg(ext_dir.join("raster_h3.duckdb_extension.gz"))
-            .args(["-p", &self.platform, "-d", "v1.2.0", "--gzip"]);
+            // Package with the C-API version tag matching the built library
+            // (the v1.5.6 build is selected via RASTER_H3_LIBRARY).
+            .args([
+                "-p",
+                &self.platform,
+                "-d",
+                &std::env::var("DUCKDB_VERSION").unwrap_or_else(|_| "v1.2.0".to_string()),
+                "--gzip",
+            ]);
         if let Some(key) = signing_key {
             package.arg("-k").arg(key);
         }

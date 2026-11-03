@@ -5,7 +5,11 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Minimum C extension API version requested from DuckDB's `get_api`.
+#[cfg(not(feature = "duckdb-api-v1_5_6"))]
 pub const DUCKDB_C_API_VERSION: &std::ffi::CStr = c"v1.2.0";
+/// Minimum C extension API version requested from DuckDB's `get_api`.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub const DUCKDB_C_API_VERSION: &std::ffi::CStr = c"v1.5.6";
 
 /// Process-wide copy of the `duckdb_ext_api_v1` function table handed over
 /// by DuckDB at load time. Reinstalling overwrites it in place, so repeated
@@ -45,7 +49,7 @@ pub unsafe fn install_api_table(table: *const c_void) {
 /// `name` must be NUL-terminated and `index` must be its position in
 /// `duckdb_ext_api_v1`.
 #[inline(always)]
-unsafe fn resolve_api_fn(
+pub(crate) unsafe fn resolve_api_fn(
     index: usize,
     name: &'static str,
     fallback: &AtomicPtr<c_void>,
@@ -131,7 +135,11 @@ macro_rules! duckdb_api {
 }
 
 /// Number of function pointers in DuckDB v1.2.0's stable `duckdb_ext_api_v1`.
+#[cfg(not(feature = "duckdb-api-v1_5_6"))]
 pub const API_TABLE_LEN: usize = 357;
+/// Number of function pointers in the v1.5.6 stable table in DuckDB's v2.0.0 header.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub const API_TABLE_LEN: usize = 548;
 
 pub type idx_t = u64;
 
@@ -329,6 +337,64 @@ pub type duckdb_scalar_function_t = unsafe extern "C" fn(
 );
 pub type duckdb_delete_callback_t = unsafe extern "C" fn(data: *mut c_void);
 
+// === Stable C API v1.5.6 handle types ===
+//
+// These handles are opaque pointers; the versions they exist in are enforced
+// by requesting the v1.5.6 API table at load time (feature
+// `duckdb-api-v1_5_6`). They are declared unconditionally so shared code can
+// name them without cfg annotations.
+pub type duckdb_client_context = *mut c_void;
+pub type duckdb_file_system = *mut c_void;
+pub type duckdb_file_handle = *mut c_void;
+pub type duckdb_file_open_options = *mut c_void;
+pub type duckdb_config_option = *mut c_void;
+pub type duckdb_copy_function = *mut c_void;
+pub type duckdb_copy_function_bind_info = *mut c_void;
+pub type duckdb_copy_function_global_init_info = *mut c_void;
+pub type duckdb_copy_function_sink_info = *mut c_void;
+pub type duckdb_copy_function_finalize_info = *mut c_void;
+pub type duckdb_expression = *mut c_void;
+pub type duckdb_error_data = *mut c_void;
+
+/// Copies scalar-function bind data when DuckDB duplicates it for parallel
+/// execution. Must return an owned copy.
+pub type duckdb_copy_callback_t = unsafe extern "C" fn(data: *mut c_void) -> *mut c_void;
+/// `COPY ... TO` bind callback.
+pub type duckdb_copy_function_bind_t = unsafe extern "C" fn(info: duckdb_copy_function_bind_info);
+/// `COPY ... TO` global init callback.
+pub type duckdb_copy_function_global_init_t =
+    unsafe extern "C" fn(info: duckdb_copy_function_global_init_info);
+/// `COPY ... TO` sink callback receiving each input chunk.
+pub type duckdb_copy_function_sink_t =
+    unsafe extern "C" fn(info: duckdb_copy_function_sink_info, input: duckdb_data_chunk);
+/// `COPY ... TO` finalize callback.
+pub type duckdb_copy_function_finalize_t =
+    unsafe extern "C" fn(info: duckdb_copy_function_finalize_info);
+/// Scalar function bind callback (validates arguments at plan time).
+pub type duckdb_scalar_function_bind_t = unsafe extern "C" fn(info: duckdb_bind_info);
+/// Scalar function per-executor init callback.
+pub type duckdb_scalar_function_init_t = unsafe extern "C" fn(info: duckdb_init_info);
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DuckDBFileFlag {
+    Invalid = 0,
+    Read = 1,
+    Write = 2,
+    Create = 3,
+    CreateNew = 4,
+    Append = 5,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DuckDBConfigOptionScope {
+    Invalid = 0,
+    Local = 1,
+    Session = 2,
+    Global = 3,
+}
+
 duckdb_api! {
     [3] pub fn duckdb_connect(
         database: duckdb_database,
@@ -515,6 +581,19 @@ duckdb_api! {
     [306] pub fn duckdb_fetch_chunk(result: duckdb_result) -> duckdb_data_chunk;
     [19] pub fn duckdb_column_count(result: *mut duckdb_result) -> idx_t;
     [21] pub fn duckdb_result_error(result: *mut duckdb_result) -> *const c_char;
+
+    // Value introspection (used by COPY option parsing and scalar binds)
+    [95] pub fn duckdb_create_bool(input: bool) -> duckdb_value;
+    [103] pub fn duckdb_create_int64(input: i64) -> duckdb_value;
+    [136] pub fn duckdb_get_value_type(val: duckdb_value) -> duckdb_logical_type;
+    [149] pub fn duckdb_is_null_value(val: duckdb_value) -> bool;
+    [155] pub fn duckdb_get_struct_child(val: duckdb_value, index: idx_t) -> duckdb_value;
+    [166] pub fn duckdb_get_type_id(type_: duckdb_logical_type) -> DuckDBType;
+    [178] pub fn duckdb_struct_type_child_count(type_: duckdb_logical_type) -> idx_t;
+    [179] pub fn duckdb_struct_type_child_name(
+        type_: duckdb_logical_type,
+        index: idx_t,
+    ) -> *mut c_char;
 }
 
 /// Check if a specific row in a validity mask is valid.

@@ -254,12 +254,29 @@ jobs:
 
           # DuckDB requests `<prefix>/<its own version>/<platform>/...` from a repository, so DuckDB 2.0
           # (`INSTALL raster_h3 FROM <repo>`) needs a v2.0.0 tree. Its Linux x86_64 tag is linux_amd64.
+          # The v2.0.0 tree ships a separate build against the v1.5.6 C extension API, enabling
+          # DuckDB file-system access, COPY output, session options and scalar bind/init.
           V2_PLATFORM="${{ matrix.platform }}"
           if [[ "$V2_PLATFORM" == "linux_amd64_gcc4" ]]; then
             V2_PLATFORM=linux_amd64
           fi
           mkdir -p "dist/v2.0.0/$V2_PLATFORM"
-          cp "dist/v1.2.0/$V2_PLATFORM/raster_h3.duckdb_extension" "dist/v1.2.0/$V2_PLATFORM/raster_h3.duckdb_extension.gz" "dist/v2.0.0/$V2_PLATFORM/"
+
+          CARGO_TARGET_DIR=target-v156 cargo build --locked --release --target ${{ matrix.target }} \
+            -p raster_h3 --lib --features duckdb-api-v1_5_6
+
+          cargo run --release --bin package_extension -- \
+            --input target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+            --output "dist/v2.0.0/$V2_PLATFORM/raster_h3.duckdb_extension" \
+            --platform "$V2_PLATFORM" \
+            --duckdb-version v1.5.6
+
+          cargo run --release --bin package_extension -- \
+            --input target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+            --output "dist/v2.0.0/$V2_PLATFORM/raster_h3.duckdb_extension.gz" \
+            --platform "$V2_PLATFORM" \
+            --duckdb-version v1.5.6 \
+            --gzip
 
           # Signed builds must verify before they are uploaded for release
           if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
@@ -351,8 +368,23 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             DUCKDB_BIN="$(cygpath -w "$(pwd)/duckdb-2.0/duckdb.exe")"
           fi
+          # On the arm64 macOS runner, osx_amd64's v1.5.6 library is x86_64;
+          # run the universal CLI under Rosetta so it can load it.
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" && "$(uname -m)" == "arm64" ]]; then
+            printf '#!/bin/bash\nexec arch -x86_64 "%s" "$@"\n' "$DUCKDB_BIN" > duckdb-2.0/duckdb-x86
+            chmod +x duckdb-2.0/duckdb-x86
+            DUCKDB_BIN="$(pwd)/duckdb-2.0/duckdb-x86"
+          fi
           export DUCKDB_BIN
-          export DUCKDB_VERSION=v1.2.0
+          # The DuckDB 2.0 smoke tests exercise the v1.5.6-API build packaged above.
+          # The extension platform tag can't be probed through the Rosetta
+          # wrapper reliably, so pass the matrix platform explicitly.
+          export DUCKDB_PLATFORM="${{ matrix.platform }}"
+          if [[ "$DUCKDB_PLATFORM" == "linux_amd64_gcc4" ]]; then
+            DUCKDB_PLATFORM=linux_amd64
+          fi
+          export DUCKDB_VERSION=v1.5.6
+          export RASTER_H3_LIBRARY="$(pwd)/target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }}"
           chmod +x "$DUCKDB_BIN" || true
           cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
           # Signed install/load through CREATE EXTENSION REPOSITORY (no -unsigned), plus
