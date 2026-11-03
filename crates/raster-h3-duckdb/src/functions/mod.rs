@@ -38,6 +38,9 @@ pub use crate::encoding::fast_hex;
 pub use copy_function::register_copy_functions;
 /// Direct streaming export of H3 aggregations to Parquet files (`raster_h3_parquet`).
 pub mod parquet_table_function;
+/// Partitioned scans: `h3_raster_plan_partitions`, the `partition` scan parameter and the
+/// `h3_merge_partials` aggregates.
+pub mod partition_functions;
 /// Direct streaming export of H3 aggregations to PMTiles archives (`raster_h3_pmtiles`).
 pub mod pmtiles_table_function;
 /// Helper scalar functions such as `h3_to_string` and coordinate extractors.
@@ -61,6 +64,8 @@ pub use bind_utils::{
 pub use categorical_table_function::register_categorical_table_function;
 /// Registers the `raster_h3_parquet` DuckDB table function for direct Parquet export.
 pub use parquet_table_function::register_parquet_table_function;
+/// Registers `h3_raster_plan_partitions` and the partial-state merge aggregates.
+pub use partition_functions::{register_merge_functions, register_plan_partitions_function};
 /// Registers the `raster_h3_pmtiles` DuckDB table function for direct PMTiles export.
 pub use pmtiles_table_function::register_pmtiles_table_function;
 /// Registers helper scalar functions (e.g. `h3_to_string`) with DuckDB.

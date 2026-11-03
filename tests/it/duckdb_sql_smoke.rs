@@ -391,6 +391,171 @@ fn real_sql_h3_cell_to_geometry_alias() {
 
 /// Like `query`, but returns `Err(stderr)` when DuckDB fails instead of
 /// asserting — used for negative-path coverage.
+/// Plan a raster, scan every partition with `partition :=`, merge the partial rows with
+/// the merge aggregate, and compare the result with an unpartitioned scan, row for row.
+fn assert_partitions_match_single_scan(
+    duckdb: &DuckDbHarness,
+    tif: &Path,
+    function: &str,
+    merge: &str,
+    columns: &[&str],
+    target: usize,
+) -> usize {
+    let path = quoted(tif);
+    let specs: Vec<String> = duckdb
+        .query(&format!(
+            "SELECT spec FROM h3_raster_plan_partitions({path}, target_chunks := {target}) \
+             ORDER BY partition_index"
+        ))
+        .lines()
+        .map(|l| l.trim().trim_matches('"').replace("\"\"", "\""))
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert!(
+        specs.len() > 1,
+        "expected several partitions, got {specs:?}"
+    );
+    let parts = specs
+        .iter()
+        .map(|s| {
+            format!("SELECT * FROM {function}({path}, resolutions := '8,9', partition := '{s}')")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let cols = columns.join(", ");
+    let fields = columns
+        .iter()
+        .map(|c| format!("cell.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Doubles are rounded: partial states merge in another order than the single scan.
+    let rounded = columns
+        .iter()
+        .map(|c| match *c {
+            "histogram" | "majority_class" | "unique_classes" => c.to_string(),
+            _ => format!("round({c}, 9) AS {c}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let out = duckdb.query(&format!(
+        r#"
+        WITH parts AS ({parts}),
+        partitioned AS (
+            SELECT resolution, h3_index, {cols} FROM parts WHERE partial_state IS NULL
+            UNION ALL
+            SELECT resolution, h3_index, {fields} FROM (
+                SELECT resolution, h3_index, {merge}(partial_state) AS cell
+                FROM parts WHERE partial_state IS NOT NULL GROUP BY ALL)),
+        p AS (SELECT resolution, h3_index, {rounded} FROM partitioned),
+        s AS (SELECT resolution, h3_index, {rounded}
+              FROM {function}({path}, resolutions := '8,9'))
+        SELECT (SELECT count(*) FROM p) = (SELECT count(*) FROM s)
+           AND (SELECT count(DISTINCT (resolution, h3_index)) FROM p) = (SELECT count(*) FROM s)
+           AND (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM s)) = 0
+           AND (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM p)) = 0
+           AND (SELECT count(*) FROM parts WHERE partial_state IS NOT NULL) > 0;
+        "#
+    ));
+    assert_eq!(
+        out.trim(),
+        "true",
+        "{function}: partitioned result differs from the single scan"
+    );
+    specs.len()
+}
+
+#[test]
+#[ignore = "requires DuckDB CLI and a built cdylib (cargo build --lib)"]
+fn real_sql_partitioned_scans_merge_to_the_single_scan() {
+    use helpers::{write_geotiff, Crs, Layout};
+    let duckdb = DuckDbHarness::new();
+    let sf = Crs::Geographic {
+        lon: -122.45,
+        lat: 37.80,
+        pixel_deg: 0.0005,
+    };
+    let gradient = duckdb.path("partition-gradient.tif");
+    write_geotiff(
+        &gradient,
+        (160, 120),
+        Layout::Tiles(32, 32),
+        sf,
+        "-9999",
+        |c, r| ((c * 7 + r * 3) % 50) as f32 + 1.0,
+    );
+    let classes = duckdb.path("partition-classes.tif");
+    write_geotiff(&classes, (160, 120), Layout::Strips(8), sf, "0", |c, r| {
+        ((c / 5 + r / 7) % 4 + 1) as u8
+    });
+    assert_partitions_match_single_scan(
+        &duckdb,
+        &gradient,
+        "h3_raster_continuous_aggregate",
+        "h3_merge_partials",
+        &["mean", "stddev", "count", "min", "max", "sum"],
+        4,
+    );
+    assert_partitions_match_single_scan(
+        &duckdb,
+        &classes,
+        "h3_raster_categorical_aggregate",
+        "h3_merge_categorical_partials",
+        &[
+            "majority_class",
+            "majority_fraction",
+            "unique_classes",
+            "total_count",
+            "histogram",
+            "shannon_entropy",
+        ],
+        3,
+    );
+
+    // Misuse fails at bind time; a group of only NULL states merges to NULL.
+    let spec = duckdb
+        .query(&format!(
+            "SELECT spec FROM h3_raster_plan_partitions({}, target_chunks := 4) LIMIT 1",
+            quoted(&gradient)
+        ))
+        .trim()
+        .trim_matches('"')
+        .replace("\"\"", "\"");
+    let ext = quoted(&duckdb.extension);
+    for (sql, expected) in [
+        (
+            format!("SELECT * FROM h3_raster_continuous_aggregate({}, partition := '{{oops')", quoted(&gradient)),
+            "Invalid partition parameter",
+        ),
+        (
+            format!(
+                "SELECT * FROM h3_raster_continuous_aggregate({}, partition := '{spec}', quantiles := 'p50')",
+                quoted(&gradient)
+            ),
+            "quantiles",
+        ),
+        (
+            format!(
+                "SELECT * FROM h3_raster_categorical_aggregate({}, format := 'long', partition := '{spec}')",
+                quoted(&classes)
+            ),
+            "wide categorical format",
+        ),
+        (
+            format!("SELECT * FROM h3_raster_continuous_aggregate({}, partition := '{spec}')", quoted(&classes)),
+            "different mosaic",
+        ),
+    ] {
+        let err = try_query_cli(&duckdb.cli, &format!("LOAD {ext}; {sql}")).unwrap_err();
+        assert!(err.contains(expected), "expected {expected:?} in: {err}");
+    }
+    assert_eq!(
+        duckdb
+            .query("SELECT h3_merge_partials(NULL::BLOB) IS NULL")
+            .trim(),
+        "true"
+    );
+}
+
 fn try_query_cli(cli: &str, sql: &str) -> Result<String, String> {
     let result = Command::new(cli)
         .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", sql])
