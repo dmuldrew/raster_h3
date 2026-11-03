@@ -264,6 +264,57 @@ So when calling from inside a Rayon pool, set `aggregation_workers` and keep the
 aggregation budget at its default or larger. Calls from ordinary threads,
 including DuckDB's scan threads, are unaffected.
 
+### Partitioned scans
+
+A mosaic can be split across independent workers (for example Spark tasks) that each
+read a disjoint set of chunks, with results identical to a single scan up to
+floating-point summation order:
+
+1. **Plan** (driver, metadata only): `plan_partitions(&mosaic, target_chunks)` cuts each
+   tile's chunk grid into rectangles of about `target_chunks` chunks, packing small tiles
+   together. Each `ScanPartition` serializes with `to_json` / `from_json` and carries a
+   fingerprint of the mosaic layout (dimensions, chunk layouts, geotransforms, overlap
+   rule and the bbox-pruned chunk list, but not file paths).
+2. **Scan** (each worker): reopen the mosaic with the same sources, bbox, CRS override and
+   overlap rule (a different mosaic is refused), set `MultiResolutionConfig::partition`
+   and drain with `drain_partitioned_into(max, on_record, on_partial)`. Only the
+   partition's chunks are decoded; the rest of the pipeline is the single-node one.
+3. **Merge**: a finalized cell that no chunk outside the partition can reach is
+   *interior* and is emitted as a normal record. Any other cell is *boundary* and is
+   emitted as an unfiltered `PartialCell`. Ship partials with `encode_partial_state` (the
+   lossless spill format with a versioned `RH3P` header), merge them with
+   `PartialMerger::push_encoded` (built by the streamer's `partial_merger(&config)`), and
+   `finish()` applies the filters to the merged states.
+
+Classification is conservative: a cell is interior only when its padded lat/lon box misses
+the certified bounds of every outside chunk (`rejection_bounds`). Uncertified CRS bounds
+and cells near a pole or across the antimeridian count as boundary, which is always
+correct and only adds merge work. The test runs once per finalized cell, and an
+ancestor-level cache settles most interior cells without computing their boundary.
+Boundary cells are a perimeter effect and shrink as partitions grow. `partition_cell_counts()`
+reports the split.
+
+Partitioning adds no measurable CPU. The `partition_overhead` example scans a 6144 x 6144 px
+f32 raster (576 tiles of 256 px) once, then as all partitions plus the merge, and compares
+total process CPU time (median of 5 interleaved runs, 4 vCPUs):
+
+| resolutions | 4 partitions (144 tiles each) | 16 partitions (36 tiles each) |
+| :--- | :--- | :--- |
+| 8 | 0.99x CPU, 4.6% boundary cells | 0.98x, 13.2% |
+| 10 | 0.99x, 0.6% | 1.01x, 1.9% |
+| 7, 8, 9 | 0.97x, 2.3% | 1.02x, 6.8% |
+
+Ratios within a few percent of 1.0 are run-to-run noise on that machine. The merge takes
+milliseconds (under 3 ms for about 35,000 boundary cells at resolution 10).
+
+```bash
+cargo run --release -p raster-h3-core --example partition_overhead -- [--quick] [--json out.json]
+```
+
+Child compaction cannot be combined with a partition (sibling groups may span
+partitions), and record-only reads (`drain_completed_into`, `fetch_next_batch`) are
+refused so partials cannot be dropped silently.
+
 ## Columnar Model
 
 | Type | Role |

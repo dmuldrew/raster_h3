@@ -17,11 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
-    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+    plan_partitions, MultiCategoricalHorizonStreamer, MultiResolutionConfig,
+    MultiScanHorizonStreamer, ScanPartition,
 };
 use raster_h3_core::columnar::{
-    ArrowArrayStream, ArrowSchema, CategoricalBatchReader, CategoricalFormat, ColumnArray,
-    ColumnSchema, ContinuousBatchReader, RecordBatch,
+    merge_partial_batches, partitioned_output_schema, ArrowArrayStream, ArrowSchema,
+    CategoricalBatchReader, CategoricalFormat, ColumnArray, ColumnSchema, ContinuousBatchReader,
+    PartitionedBatchReader, RecordBatch, PARTIAL_STATE_COLUMN,
 };
 use raster_h3_core::error::{catch_unwind_or, safe_panic_payload_to_string, RasterH3Error, Result};
 use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
@@ -51,6 +53,10 @@ pub struct PyScanConfig {
     pub strict_transforms: bool,
     /// Receives the number of sample points dropped by failed transforms.
     pub transform_failure_counter: Option<Arc<AtomicU64>>,
+    /// Scan only this partition of the mosaic (see `plan_partitions`). The output gains a
+    /// nullable `partial_state` column; rows where it is set must be merged with
+    /// `merge_partials`.
+    pub partition: Option<ScanPartition>,
 }
 
 impl Default for PyScanConfig {
@@ -68,6 +74,7 @@ impl Default for PyScanConfig {
             limit: None,
             strict_transforms: false,
             transform_failure_counter: None,
+            partition: None,
         }
     }
 }
@@ -114,7 +121,13 @@ impl PyRasterScanner {
         }
         let base = self.base_schema();
         let mut indices = Vec::with_capacity(cols.len());
-        for name in cols {
+        // A partitioned scan appends `partial_state` itself, so the caller may list the
+        // output columns as they appear.
+        let partitioned = self.config.partition.is_some();
+        for name in cols
+            .iter()
+            .filter(|c| !(partitioned && *c == PARTIAL_STATE_COLUMN))
+        {
             let idx = base.index_of(name).ok_or_else(|| {
                 RasterH3Error::InvalidParameter(format!(
                     "Column '{}' not found in raster_h3 schema",
@@ -129,10 +142,37 @@ impl PyRasterScanner {
     /// Return the output [`ColumnSchema`] (respecting `columns` projection).
     pub fn schema(&self) -> Result<Arc<ColumnSchema>> {
         let base = self.base_schema();
+        if self.config.partition.is_some() {
+            self.check_partitionable()?;
+            let projection = self.resolve_projection()?;
+            return Ok(Arc::new(partitioned_output_schema(
+                base,
+                projection.as_deref(),
+            )?));
+        }
         match self.resolve_projection()? {
             Some(indices) => Ok(Arc::new(base.project(&indices)?)),
             None => Ok(Arc::new(base)),
         }
+    }
+
+    /// Options a partitioned scan cannot honour.
+    fn check_partitionable(&self) -> Result<()> {
+        if self.config.categorical && self.config.format == CategoricalFormat::Long {
+            return Err(RasterH3Error::InvalidParameter(
+                "partitioned scans support the wide categorical format only; \
+                 reshape the merged result to long format afterwards"
+                    .into(),
+            ));
+        }
+        if self.config.limit.is_some() {
+            return Err(RasterH3Error::InvalidParameter(
+                "limit cannot be combined with a partition: a per-partition row limit has no \
+                 meaning for the merged result"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Export an [`ArrowSchema`] struct for `__arrow_c_schema__`.
@@ -158,6 +198,26 @@ impl PyRasterScanner {
         mr_cfg.transform_failure_counter = self.config.transform_failure_counter.clone();
 
         let projection = self.resolve_projection()?;
+        if let Some(partition) = &self.config.partition {
+            self.check_partitionable()?;
+            mr_cfg.partition = Some(partition.clone());
+            let reader = if self.config.categorical {
+                PartitionedBatchReader::open_categorical(
+                    &paths,
+                    &mr_cfg,
+                    projection,
+                    self.config.batch_size,
+                )?
+            } else {
+                PartitionedBatchReader::open_continuous(
+                    &paths,
+                    &mr_cfg,
+                    projection,
+                    self.config.batch_size,
+                )?
+            };
+            return Ok((reader.schema(), Box::new(reader)));
+        }
         if !self.config.categorical {
             let reader = ContinuousBatchReader::open(
                 &paths,
@@ -739,6 +799,316 @@ pub unsafe extern "C" fn raster_h3_py_free_batch_reader(reader: *mut PyBatchRead
             let reader = Box::from_raw(reader);
             catch_unwind_or((), || drop(reader));
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Partitioned scans
+// -----------------------------------------------------------------------------
+
+/// Run `f`, converting errors and panics into `out_err` and a null result.
+///
+/// # Safety
+/// `out_err` must be null or a writable `char **`.
+unsafe fn ffi_call<T>(
+    what: &str,
+    out_err: *mut *mut c_char,
+    f: impl FnOnce() -> Result<T>,
+) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            // SAFETY: `out_err` meets `set_c_err`'s contract (caller contract).
+            unsafe { set_c_err(out_err, &e.to_string()) };
+            None
+        }
+        Err(payload) => {
+            let msg = safe_panic_payload_to_string(payload);
+            // SAFETY: as above.
+            unsafe { set_c_err(out_err, &format!("Panic in {what}: {msg}")) };
+            None
+        }
+    }
+}
+
+/// A stand-in partition for code paths that only need "this scan is partitioned" (schema
+/// and projection resolution), not a particular partition.
+fn placeholder_partition() -> ScanPartition {
+    ScanPartition {
+        index: 0,
+        count: 1,
+        mosaic_fingerprint: 0,
+        blocks: Vec::new(),
+    }
+}
+
+/// Parse the partition JSON argument of the `_partitioned` entry points.
+///
+/// # Safety
+/// `partition` must be null or a valid NUL-terminated string.
+unsafe fn parse_c_partition(partition: *const c_char) -> Result<ScanPartition> {
+    // SAFETY: null or NUL-terminated (caller contract), as `opt_cstr` requires.
+    let json = unsafe { opt_cstr(partition) }
+        .ok_or_else(|| RasterH3Error::InvalidParameter("Missing scan partition".into()))?;
+    ScanPartition::from_json(&json)
+}
+
+/// Plan the partitions of a raster scan: a JSON array of partition objects, each of which
+/// can be passed (re-serialized) to the `_partitioned` scan entry points. `crs` and `bbox`
+/// must match the scans'. Free the string with `raster_h3_py_free_string`.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL; `out_err` must be
+/// NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_plan_partitions(
+    path: *const c_char,
+    crs: *const c_char,
+    bbox: *const c_char,
+    target_chunks: i64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: the C string arguments are null or NUL-terminated and `out_err` is null or a
+    // writable `char **` (caller contract), as `build_py_scan_config` and `ffi_call` require.
+    unsafe {
+        ffi_call("plan_partitions", out_err, || {
+            let cfg = build_py_scan_config(
+                path,
+                ptr::null(),
+                0,
+                ptr::null(),
+                crs,
+                0,
+                0.0,
+                bbox,
+                ptr::null(),
+                -1,
+            )?;
+            let target = usize::try_from(target_chunks)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| {
+                    RasterH3Error::InvalidParameter("target_chunks must be at least 1".into())
+                })?;
+            // Open the mosaic exactly as the scans do, so the fingerprints match.
+            let paths = resolve_raster_sources(&cfg.path)?;
+            let mosaic =
+                MosaicReader::open(&paths, cfg.bbox, cfg.crs.as_deref(), OverlapRule::Cutline)?;
+            let plan = plan_partitions(&mosaic, target)?;
+            let json = serde_json::to_string(&plan)
+                .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+            Ok(CString::new(json).unwrap_or_default().into_raw())
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_create_arrow_schema`] for a partitioned scan: the projected columns plus
+/// `partial_state`.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_create_arrow_schema_partitioned(
+    categorical: c_int,
+    format: *const c_char,
+    columns: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowSchema {
+    // SAFETY: as for `raster_h3_py_create_arrow_schema`; the returned box is freed by
+    // `raster_h3_py_free_arrow_schema`.
+    unsafe {
+        ffi_call("create_arrow_schema_partitioned", out_err, || {
+            let cfg = build_py_scan_config(
+                c"schema".as_ptr(),
+                ptr::null(),
+                categorical,
+                format,
+                ptr::null(),
+                0,
+                0.0,
+                ptr::null(),
+                columns,
+                -1,
+            )?;
+            // The schema does not depend on which partition is scanned.
+            let scanner = PyRasterScanner::new(PyScanConfig {
+                partition: Some(placeholder_partition()),
+                ..cfg
+            });
+            Ok(Box::into_raw(Box::new(ArrowSchema::from_column_schema(
+                &*scanner.schema()?,
+            ))))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_create_arrow_stream_ex`] scanning one partition (`partition`: a JSON
+/// object from `raster_h3_py_plan_partitions`). `limit` must be negative (none).
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_create_arrow_stream_partitioned(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    strict_transforms: c_int,
+    partition: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowArrayStream {
+    // SAFETY: as for `raster_h3_py_create_arrow_stream_ex`; the returned box is freed by
+    // `raster_h3_py_free_arrow_stream`.
+    unsafe {
+        ffi_call("create_arrow_stream_partitioned", out_err, || {
+            let mut cfg = build_py_scan_config(
+                path,
+                resolutions,
+                categorical,
+                format,
+                crs,
+                has_nodata,
+                nodata,
+                bbox,
+                columns,
+                limit,
+            )?;
+            cfg.strict_transforms = strict_transforms != 0;
+            cfg.partition = Some(parse_c_partition(partition)?);
+            let stream = PyRasterScanner::new(cfg).to_arrow_c_stream()?;
+            Ok(Box::into_raw(Box::new(stream)))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_open_batch_reader_ex`] scanning one partition; see
+/// [`raster_h3_py_create_arrow_stream_partitioned`].
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_open_batch_reader_partitioned(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    batch_size: i64,
+    strict_transforms: c_int,
+    partition: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut PyBatchReader {
+    // SAFETY: as for `raster_h3_py_open_batch_reader_ex`; the returned box is freed by
+    // `raster_h3_py_free_batch_reader`.
+    unsafe {
+        ffi_call("open_batch_reader_partitioned", out_err, || {
+            let mut cfg = build_py_scan_config(
+                path,
+                resolutions,
+                categorical,
+                format,
+                crs,
+                has_nodata,
+                nodata,
+                bbox,
+                columns,
+                limit,
+            )?;
+            if batch_size > 0 {
+                cfg.batch_size = batch_size as usize;
+            }
+            let transform_failures = Arc::new(AtomicU64::new(0));
+            cfg.strict_transforms = strict_transforms != 0;
+            cfg.transform_failure_counter = Some(Arc::clone(&transform_failures));
+            cfg.partition = Some(parse_c_partition(partition)?);
+            let (schema, iter) = PyRasterScanner::new(cfg).batch_iter()?;
+            Ok(Box::into_raw(Box::new(PyBatchReader {
+                schema,
+                iter,
+                transform_failures,
+            })))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// Merge the partial rows of all partitions of a scan into final rows.
+///
+/// `input` is an `ArrowArrayStream` of `resolution` (UInt8), `h3_index` (UInt64) and
+/// `partial_state` (Binary, no nulls) columns. It is moved: on return the caller's struct is
+/// marked released, whatever the outcome. `categorical` and `columns` must match the scans'.
+/// Returns a stream of the merged, filtered rows (free with `raster_h3_py_free_arrow_stream`).
+///
+/// # Safety
+/// `input` must be null or point to a valid `ArrowArrayStream`; the other pointer arguments
+/// must be valid NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_merge_partials(
+    input: *mut ArrowArrayStream,
+    categorical: c_int,
+    columns: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowArrayStream {
+    // SAFETY: `out_err` meets `set_c_err`'s contract and `columns` is null or NUL-terminated
+    // (caller contract). Non-null `input` is a valid stream that we take over with move
+    // semantics: the struct is copied out and the caller's copy loses its `release`, so it
+    // is released exactly once, by `owned`'s `Drop`.
+    unsafe {
+        if input.is_null() {
+            set_c_err(out_err, "input stream is NULL");
+            return ptr::null_mut();
+        }
+        let mut owned = ptr::read(input);
+        (*input).release = None;
+        ffi_call("merge_partials", out_err, move || {
+            let (_, batches) = owned.collect_batches()?;
+            drop(owned);
+            let cfg = build_py_scan_config(
+                c"merge".as_ptr(),
+                ptr::null(),
+                categorical,
+                ptr::null(),
+                ptr::null(),
+                0,
+                0.0,
+                ptr::null(),
+                columns,
+                -1,
+            )?;
+            // Resolve `columns` as the partitioned scans did, so a listed `partial_state`
+            // (always appended by those scans) is accepted rather than unknown.
+            let projection = PyRasterScanner::new(PyScanConfig {
+                partition: Some(placeholder_partition()),
+                ..cfg.clone()
+            })
+            .resolve_projection()?;
+            // The Python bindings expose no filters or quantiles, so the defaults match.
+            let config = MultiResolutionConfig::new(cfg.resolutions.clone());
+            let (schema, merged) = merge_partial_batches(
+                &batches,
+                cfg.categorical,
+                &config,
+                projection.as_deref(),
+                cfg.batch_size,
+            )?;
+            let stream = ArrowArrayStream::from_iterator(schema, merged.into_iter().map(Ok));
+            Ok(Box::into_raw(Box::new(stream)))
+        })
+        .unwrap_or(ptr::null_mut())
     }
 }
 

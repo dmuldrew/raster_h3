@@ -4,6 +4,7 @@
 
 pub mod arrow_c;
 pub mod ipc;
+pub mod partitioned;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,10 @@ use crate::error::{RasterH3Error, Result};
 use crate::raster::mosaic::MosaicReader;
 
 pub use arrow_c::{ArrowArray, ArrowArrayStream, ArrowSchema};
+pub use partitioned::{
+    merge_partial_batches, partitioned_output_schema, with_partial_state_field,
+    PartitionedBatchReader, PARTIAL_STATE_COLUMN,
+};
 
 /// Columnar data types corresponding to Apache Arrow physical types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

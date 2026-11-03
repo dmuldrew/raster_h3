@@ -12,6 +12,8 @@ pub mod continuous_streamer;
 pub mod controller;
 pub mod coordinates;
 pub mod lifecycle;
+pub mod partial;
+pub mod partition;
 pub mod profile;
 pub mod sharded_map;
 pub mod spectral;
@@ -32,6 +34,8 @@ pub use continuous_streamer::MultiScanHorizonStreamer;
 pub use controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
 pub use coordinates::{is_point_in_bbox, CoordinateTransformer, RAD_TO_DEG, WGS84_A};
 pub use lifecycle::{OutputBuffer, StreamLifecycle, StreamState};
+pub use partial::{decode_partial_state, encode_partial_state, PartialMerger, PartialState};
+pub use partition::{mosaic_fingerprint, plan_partitions, ChunkBlock, PartialCell, ScanPartition};
 pub use sharded_map::{get_shard, AccumulatorMerge, ShardedResolutionMap, NUM_SHARDS};
 pub use walker::{
     is_slice_all_native_nodata, scanline_walk, walk_direct, walk_interleaved, ScanlineEngine,

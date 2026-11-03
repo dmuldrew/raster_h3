@@ -319,6 +319,11 @@ pub struct MultiResolutionConfig {
     /// system (e.g. a database file-system layer). None uses mmap for local
     /// files and the built-in HTTP range client for remote URLs.
     pub remote_source_factory: Option<crate::raster::http_range::RemoteSourceFactory>,
+    /// Stream only this part of the mosaic (see [`super::partition`]). Cells that other
+    /// partitions may also hold samples for are emitted as unfiltered partial states for a
+    /// later merge, so the stream must be drained with `drain_partitioned_into`.
+    /// Incompatible with child compaction.
+    pub partition: Option<super::partition::ScanPartition>,
 }
 
 impl MultiResolutionConfig {
@@ -354,6 +359,7 @@ impl MultiResolutionConfig {
             transform_failure_counter: None,
             strict_transforms: false,
             remote_source_factory: None,
+            partition: None,
         }
     }
 
@@ -434,6 +440,13 @@ impl MultiResolutionConfig {
                     r
                 )));
             }
+        }
+        if self.partition.is_some() && self.should_compact_h3_children() {
+            return Err(RasterH3Error::InvalidParameter(
+                "partitioned scans cannot compact H3 children: sibling groups may span partitions; \
+                 compact after merging the partials"
+                    .into(),
+            ));
         }
         if self.should_compact_h3_children() {
             let requested: std::collections::HashSet<u8> =

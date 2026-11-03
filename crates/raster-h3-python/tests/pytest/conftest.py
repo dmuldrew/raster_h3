@@ -35,23 +35,31 @@ def write_geotiff(
     dtype: str = "f32",
     origin: Tuple[float, float] = ORIGIN,
     pixel: float = PIXEL,
+    rows_per_strip: int = 0,
 ) -> None:
-    """Uncompressed little-endian single-band GeoTIFF (EPSG:4326 GeoKeys), one strip.
+    """Uncompressed little-endian single-band GeoTIFF (EPSG:4326 GeoKeys).
 
-    `dtype` is `"f32"` (IEEE float) or `"u8"`; `value(col, row)` gives each pixel.
+    `dtype` is `"f32"` (IEEE float) or `"u8"`; `value(col, row)` gives each pixel. The image
+    is one strip unless `rows_per_strip` is set.
     """
     fmt, bits, sample_format = {"f32": ("f", 32, 3), "u8": ("B", 8, 1)}[dtype]
     values = [value(c, r) for r in range(height) for c in range(width)]
     data = struct.pack(f"<{len(values)}{fmt}", *values)
+    rows = rows_per_strip or height
+    row_bytes = width * bits // 8
+    strips = [data[y * row_bytes : min(y + rows, height) * row_bytes] for y in range(0, height, rows)]
+    n = len(strips)
     scale = struct.pack("<3d", pixel, pixel, 0.0)
     tiepoint = struct.pack("<6d", 0.0, 0.0, 0.0, origin[0], origin[1], 0.0)
     geokeys = struct.pack("<12H", 1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326)
-    blobs = [scale, tiepoint, geokeys]
+    counts = struct.pack(f"<{n}I", *(len(strip) for strip in strips))
+    # Strip offsets are patched in once the data offset is known.
+    blobs = [scale, tiepoint, geokeys, counts, b"\0" * 4 * n]
     # (tag, type, count, value-or-blob-index); SHORT=3, LONG=4, DOUBLE=12
     entries = [
         (256, 3, 1, width), (257, 3, 1, height), (258, 3, 1, bits), (259, 3, 1, 1),
-        (262, 3, 1, 1), (273, 4, 1, "data"), (277, 3, 1, 1), (278, 3, 1, height),
-        (279, 4, 1, len(data)), (339, 3, 1, sample_format),
+        (262, 3, 1, 1), (273, 4, n, "offsets"), (277, 3, 1, 1), (278, 3, 1, rows),
+        (279, 4, n, "counts"), (339, 3, 1, sample_format),
         (33550, 12, 3, 0), (33922, 12, 6, 1), (34735, 3, 12, 2),
     ]
     offset = 8 + 2 + 12 * len(entries) + 4
@@ -59,12 +67,18 @@ def write_geotiff(
     for blob in blobs:
         blob_offsets.append(offset)
         offset += len(blob)
-    data_offset = offset
+    strip_offsets = []
+    for strip in strips:
+        strip_offsets.append(offset)
+        offset += len(strip)
+    blobs[4] = struct.pack(f"<{n}I", *strip_offsets)
 
     out = bytearray(b"II*\x00" + struct.pack("<I", 8) + struct.pack("<H", len(entries)))
     for tag, typ, count, val in entries:
-        if val == "data":
-            val = data_offset
+        if val == "offsets":
+            val = strip_offsets[0] if n == 1 else blob_offsets[4]
+        elif val == "counts":
+            val = len(strips[0]) if n == 1 else blob_offsets[3]
         elif tag in (33550, 33922, 34735):
             val = blob_offsets[val]
         if typ == 3 and count == 1:
@@ -74,7 +88,8 @@ def write_geotiff(
     out += struct.pack("<I", 0)
     for blob in blobs:
         out += blob
-    out += data
+    for strip in strips:
+        out += strip
     path.write_bytes(bytes(out))
 
 

@@ -32,6 +32,18 @@ pub struct CategoricalKernel {
     pub remapper: Option<Arc<CategoryRemapper>>,
 }
 
+impl CategoricalKernel {
+    /// The kernel a stream built from `config` uses (filters, band and options).
+    pub fn from_config(config: &MultiResolutionConfig) -> Self {
+        CategoricalKernel {
+            band: config.band,
+            min_count: config.min_count,
+            min_majority_fraction: config.min_majority_fraction,
+            remapper: config.remapper.clone(),
+        }
+    }
+}
+
 impl HorizonStreamKernel for CategoricalKernel {
     type Accumulator = CategoricalAccumulator;
     type Record = MultiCategoricalRecord;
@@ -117,12 +129,7 @@ impl MultiCategoricalHorizonStreamer {
 
     /// Initialize a new MultiCategoricalHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
-        let kernel = CategoricalKernel {
-            band: config.band,
-            min_count: config.min_count,
-            min_majority_fraction: config.min_majority_fraction,
-            remapper: config.remapper.clone(),
-        };
+        let kernel = CategoricalKernel::from_config(config);
         let remapper = kernel.remapper.clone();
         let inner = MultiHorizonStreamer::new(reader, config, kernel)?;
         Ok(Self { inner, remapper })
@@ -130,12 +137,7 @@ impl MultiCategoricalHorizonStreamer {
 
     /// Initialize a new MultiCategoricalHorizonStreamer from a multi-file MosaicReader
     pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
-        let kernel = CategoricalKernel {
-            band: config.band,
-            min_count: config.min_count,
-            min_majority_fraction: config.min_majority_fraction,
-            remapper: config.remapper.clone(),
-        };
+        let kernel = CategoricalKernel::from_config(config);
         let remapper = kernel.remapper.clone();
         let inner = MultiHorizonStreamer::new_mosaic(mosaic, config, kernel)?;
         Ok(Self { inner, remapper })
@@ -145,6 +147,37 @@ impl MultiCategoricalHorizonStreamer {
     #[inline(always)]
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<MultiCategoricalRecord>> {
         self.inner.fetch_next_batch(max_rows)
+    }
+
+    /// Drain a partitioned scan (`config.partition`): completed records into `on_record`
+    /// and partial cells into `on_partial`, up to `max_rows` in total. 0 means end of
+    /// stream. See [`super::partition`].
+    #[inline(always)]
+    pub fn drain_partitioned_into<F, G>(
+        &mut self,
+        max_rows: usize,
+        on_record: F,
+        on_partial: G,
+    ) -> Result<usize>
+    where
+        F: FnMut(usize, MultiCategoricalRecord),
+        G: FnMut(super::partition::PartialCell<CategoricalAccumulator>),
+    {
+        self.inner
+            .drain_partitioned_into(max_rows, on_record, on_partial)
+    }
+
+    /// For a partitioned scan, `(interior, boundary)` cells classified so far.
+    pub fn partition_cell_counts(&self) -> Option<(u64, u64)> {
+        self.inner.partition_cell_counts()
+    }
+
+    /// A merger turning all partitions' partial cells into final records with the
+    /// filters of `config`.
+    pub fn partial_merger(
+        config: &MultiResolutionConfig,
+    ) -> super::partial::PartialMerger<CategoricalKernel> {
+        super::partial::PartialMerger::new(CategoricalKernel::from_config(config))
     }
 
     /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation
