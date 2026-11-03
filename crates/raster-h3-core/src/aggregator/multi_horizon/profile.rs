@@ -2,7 +2,7 @@
 //! timers; normal builds compile hot-path measurement out entirely. The
 //! transform-failure diagnostic is always counted: it only runs when a sample
 //! is dropped.
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution};
 use serde::Serialize;
 use std::cell::Cell;
 
@@ -85,6 +85,31 @@ pub fn index(ll: LatLng, res: Resolution) -> CellIndex {
         v.set(p);
     });
     result
+}
+/// Index one point at every resolution, sharing h3o's projection work and
+/// reusing the indexer's last cell where the point's grid cell is unchanged.
+#[inline(always)]
+pub fn index_all(
+    indexer: &mut LatLngIndexer,
+    ll: LatLng,
+    resolutions: &[Resolution],
+    cells: &mut [u64],
+) {
+    #[cfg(feature = "stream-profile")]
+    let start = std::time::Instant::now();
+    for (cell, index) in cells
+        .iter_mut()
+        .zip(indexer.to_cells(ll, resolutions.iter().copied()))
+    {
+        *cell = u64::from(index);
+    }
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.h3_calls += resolutions.len() as u64;
+        p.h3_ns += start.elapsed().as_nanos() as u64;
+        v.set(p);
+    });
 }
 #[inline(always)]
 pub fn transform(
