@@ -906,8 +906,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     /// Drain a partitioned scan: up to `max_rows` completed (interior) records into
     /// `on_record` and partial (boundary) cells into `on_partial`, in total. Returns the
-    /// number drained; 0 means end of stream. Also works for unpartitioned scans, which
-    /// produce no partial cells.
+    /// number drained; with `max_rows >= 1`, 0 means end of stream. Like
+    /// [`Self::drain_completed_into`], `max_rows == 0` drains nothing and also returns 0, so
+    /// pass at least 1 (or check [`Self::is_finished`]). Also works for unpartitioned
+    /// scans, which produce no partial cells.
     pub fn drain_partitioned_into<F, G>(
         &mut self,
         max_rows: usize,

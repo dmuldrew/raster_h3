@@ -372,6 +372,43 @@ fn partitioned_scans_reject_unsupported_options() {
 }
 
 #[test]
+fn merge_accepts_the_scans_projection_including_partial_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = gradient(dir.path());
+    let columns = "h3_index,resolution,mean,partial_state";
+    let mut scan = Scan::of(&path);
+    scan.columns = Some(columns.into());
+    let spec = plan(&path, 4).unwrap().remove(1);
+    let batches = scan_partition(&scan, &spec).unwrap();
+    let partial = batches
+        .into_iter()
+        .find(|b| match b.column_by_name(PARTIAL_STATE_COLUMN) {
+            Some(ColumnArray::Binary { validity, .. }) => {
+                validity.as_ref().is_none_or(|v| v.iter().any(|&ok| ok))
+            }
+            _ => false,
+        })
+        .expect("a batch with partial rows");
+    let schema = partial.schema.clone();
+    let mut input = ArrowArrayStream::from_iterator(schema, std::iter::once(Ok(partial)));
+    let cols = CString::new(columns).unwrap();
+    let mut err: *mut c_char = ptr::null_mut();
+    // SAFETY: `input` is a valid stream (moved by the call) and `cols` a valid C string.
+    let out = unsafe { raster_h3_py_merge_partials(&mut input, 0, cols.as_ptr(), &mut err) };
+    // SAFETY: `err` was set by the library or left NULL.
+    if let Some(msg) = unsafe { take_err(err) } {
+        panic!("merge with the scan's projection failed: {msg}");
+    }
+    // SAFETY: a non-null result is a boxed, unreleased stream owned by us.
+    let mut out = unsafe { Box::from_raw(out) };
+    // SAFETY: `out` is the valid, unreleased stream returned above.
+    let (schema, merged) = unsafe { out.collect_batches() }.unwrap();
+    let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["h3_index", "resolution", "mean"]);
+    assert!(merged.iter().map(|b| b.num_rows).sum::<usize>() > 0);
+}
+
+#[test]
 fn merge_rejects_rows_without_a_state() {
     let batch = RecordBatch::try_new(
         key_schema(),

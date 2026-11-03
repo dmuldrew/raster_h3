@@ -598,6 +598,50 @@ fn partial_states_round_trip_and_reject_corruption() {
 }
 
 #[test]
+fn partitions_refuse_another_crs_or_bbox_with_the_same_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.tif");
+    write_tiled(&a, (300, 220), (32, 32), SF, "-9999", surface);
+    let paths = std::slice::from_ref(&a);
+    let opened = |bbox: Option<[f64; 4]>, crs: Option<&str>| {
+        Arc::new(MosaicReader::open(paths, bbox, crs, OverlapRule::Cutline).unwrap())
+    };
+    let scan = |mosaic: Arc<MosaicReader>, partition: &ScanPartition| {
+        let mut config = MultiResolutionConfig::new(vec![8]);
+        config.partition = Some(partition.clone());
+        MultiScanHorizonStreamer::new_mosaic(mosaic, &config).map(|_| ())
+    };
+
+    // A CRS override changes where every sample lands but not the chunk list.
+    let planned = opened(None, Some("EPSG:4326"));
+    let spec = plan_partitions(&planned, 8).unwrap().remove(0);
+    let other_crs = opened(None, Some("+proj=longlat +datum=WGS84 +pm=1 +no_defs"));
+    assert_eq!(other_crs.chunk_refs.len(), planned.chunk_refs.len());
+    assert!(scan(Arc::clone(&other_crs), &spec).is_err());
+    assert!(
+        scan(opened(None, None), &spec).is_err(),
+        "file CRS vs override"
+    );
+    assert!(scan(opened(None, Some("EPSG:4326")), &spec).is_ok());
+
+    // Both boxes keep every chunk (the raster spans -122.45..-122.30, 37.69..37.80), but the
+    // second clips the first pixel column, so their samples differ.
+    let wide = [-123.0, 37.0, -122.0, 38.0];
+    let clipped = [-122.4499, 37.0, -122.0, 38.0];
+    let spec = plan_partitions(&opened(Some(wide), None), 8)
+        .unwrap()
+        .remove(0);
+    let narrower = opened(Some(clipped), None);
+    assert_eq!(
+        narrower.chunk_refs.len(),
+        opened(Some(wide), None).chunk_refs.len()
+    );
+    let err = scan(narrower, &spec).unwrap_err();
+    assert!(err.to_string().contains("different mosaic"), "{err}");
+    assert!(scan(opened(Some(wide), None), &spec).is_ok());
+}
+
+#[test]
 fn partitions_refuse_other_mosaics_and_misuse() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.tif");

@@ -67,9 +67,9 @@ pub struct ScanPartition {
     /// Number of partitions in the plan.
     pub count: u32,
     /// [`mosaic_fingerprint`] of the mosaic the plan was made for. A worker whose mosaic
-    /// has another layout (other raster dimensions, chunking or georeferencing, bbox or
-    /// overlap rule) refuses the partition. Rasters that differ only in pixel values share
-    /// a layout, and a plan for one is valid for the others.
+    /// has another layout (other raster dimensions, chunking, georeferencing, effective CRS,
+    /// bbox or overlap rule) refuses the partition. Rasters that differ only in pixel values
+    /// share a layout, and a plan for one is valid for the others.
     pub mosaic_fingerprint: u64,
     /// Disjoint chunk rectangles; together, the plan's partitions cover every chunk once.
     pub blocks: Vec<ChunkBlock>,
@@ -155,10 +155,11 @@ fn chunk_col_row(mosaic: &MosaicReader, chunk: &MosaicChunkRef) -> (u32, u32) {
     (chunk.chunk_idx % across, chunk.chunk_idx / across)
 }
 
-/// A stable hash of everything that determines which chunks a mosaic streams and how its
-/// samples are owned: tile dimensions, chunk layouts, geotransforms, the overlap rule and
-/// the ordered chunk list (which reflects the bbox). File paths are left out so workers may
-/// mount the same files under different paths.
+/// A stable hash of everything that determines which chunks a mosaic streams, where its
+/// samples land and which of them count: tile dimensions, chunk layouts, geotransforms, each
+/// tile's effective CRS (override or file CRS), the overlap rule, the exact bbox (which clips
+/// samples) and the ordered chunk list. File paths are left out so workers may mount the same
+/// files under different paths.
 pub fn mosaic_fingerprint(mosaic: &MosaicReader) -> u64 {
     // FNV-1a: stable across processes and Rust versions, unlike `DefaultHasher`.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -170,6 +171,15 @@ pub fn mosaic_fingerprint(mosaic: &MosaicReader) -> u64 {
     };
     feed(mosaic.tiles.len() as u64);
     feed(mosaic.overlap_rule as u64);
+    match mosaic.bbox {
+        None => feed(0),
+        Some(bbox) => {
+            feed(1);
+            for v in bbox {
+                feed(v.to_bits());
+            }
+        }
+    }
     for tile in &mosaic.tiles {
         let md = &tile.reader.metadata;
         let layout = &tile.reader.chunk_layout;
@@ -186,6 +196,13 @@ pub fn mosaic_fingerprint(mosaic: &MosaicReader) -> u64 {
         let gt = &md.geotransform;
         for v in [gt.a, gt.b, gt.c0, gt.d, gt.e, gt.f0] {
             feed(v.to_bits());
+        }
+        let crs = tile.crs_identity().as_bytes();
+        feed(crs.len() as u64);
+        for chunk in crs.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            feed(u64::from_le_bytes(word));
         }
     }
     feed(mosaic.chunk_refs.len() as u64);
@@ -315,6 +332,7 @@ pub(crate) fn restrict_mosaic(
             .copied()
             .collect(),
         max_samples_per_pixel: mosaic.max_samples_per_pixel,
+        bbox: mosaic.bbox,
     })
 }
 
