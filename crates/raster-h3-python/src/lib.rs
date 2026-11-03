@@ -831,6 +831,17 @@ unsafe fn ffi_call<T>(
     }
 }
 
+/// A stand-in partition for code paths that only need "this scan is partitioned" (schema
+/// and projection resolution), not a particular partition.
+fn placeholder_partition() -> ScanPartition {
+    ScanPartition {
+        index: 0,
+        count: 1,
+        mosaic_fingerprint: 0,
+        blocks: Vec::new(),
+    }
+}
+
 /// Parse the partition JSON argument of the `_partitioned` entry points.
 ///
 /// # Safety
@@ -922,12 +933,7 @@ pub unsafe extern "C" fn raster_h3_py_create_arrow_schema_partitioned(
             )?;
             // The schema does not depend on which partition is scanned.
             let scanner = PyRasterScanner::new(PyScanConfig {
-                partition: Some(ScanPartition {
-                    index: 0,
-                    count: 1,
-                    mosaic_fingerprint: 0,
-                    blocks: Vec::new(),
-                }),
+                partition: Some(placeholder_partition()),
                 ..cfg
             });
             Ok(Box::into_raw(Box::new(ArrowSchema::from_column_schema(
@@ -1083,7 +1089,13 @@ pub unsafe extern "C" fn raster_h3_py_merge_partials(
                 columns,
                 -1,
             )?;
-            let projection = PyRasterScanner::new(cfg.clone()).resolve_projection()?;
+            // Resolve `columns` as the partitioned scans did, so a listed `partial_state`
+            // (always appended by those scans) is accepted rather than unknown.
+            let projection = PyRasterScanner::new(PyScanConfig {
+                partition: Some(placeholder_partition()),
+                ..cfg.clone()
+            })
+            .resolve_projection()?;
             // The Python bindings expose no filters or quantiles, so the defaults match.
             let config = MultiResolutionConfig::new(cfg.resolutions.clone());
             let (schema, merged) = merge_partial_batches(

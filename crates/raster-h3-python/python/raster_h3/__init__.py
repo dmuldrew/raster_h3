@@ -513,8 +513,9 @@ class RasterH3ArrowStream:
     def to_dict(self) -> Dict[str, List[Any]]:
         """Materialize the scan into a Python dictionary of column lists."""
         if self.partition is not None:
-            # The JSON path has no partial-state column; go through Arrow (needs pyarrow).
-            return self.to_pyarrow().to_pydict()
+            # The JSON path has no partial-state column; go through Arrow (needs pyarrow),
+            # batch by batch so the transform-failure count is reported like other scans.
+            return self._partition_table(stacklevel=4).to_pydict()
         lib = _get_lib()
         err = ctypes.c_void_p(0)
         failures = ctypes.c_uint64(0)
@@ -538,6 +539,38 @@ class RasterH3ArrowStream:
         # Warn only once the native result is freed: the warning may be raised as an error.
         _warn_transform_failures(failures.value, stacklevel=3)
         return result
+
+    def _partition_table(self, stacklevel: int) -> Any:
+        """A partitioned scan as a PyArrow Table, warning about dropped samples at the end."""
+        import pyarrow as pa  # type: ignore
+
+        lib = _get_lib()
+        err = ctypes.c_void_p(0)
+        reader = lib.raster_h3_py_open_batch_reader_partitioned(
+            *self._scan_args(),
+            0,
+            1 if self.strict_transforms else 0,
+            self._partition_arg(lib),
+            ctypes.byref(err),
+        )
+        _raise_if_err(err)
+        if not reader:
+            raise RuntimeError("Failed to open raster_h3 batch reader")
+        tables = []
+        try:
+            while True:
+                err = ctypes.c_void_p(0)
+                ptr = lib.raster_h3_py_batch_reader_next(reader, ctypes.byref(err))
+                _raise_if_err(err)
+                if not ptr:
+                    failures = lib.raster_h3_py_batch_reader_transform_failures(reader)
+                    break
+                tables.append(pa.table(_OwnedArrowStream(ptr)))
+        finally:
+            lib.raster_h3_py_free_batch_reader(reader)
+        table = pa.concat_tables(tables) if tables else pa.schema(self).empty_table()
+        _warn_transform_failures(failures, stacklevel=stacklevel)
+        return table
 
     def to_polars(self) -> Any:
         """Convert to a Polars DataFrame via the Arrow PyCapsule stream.

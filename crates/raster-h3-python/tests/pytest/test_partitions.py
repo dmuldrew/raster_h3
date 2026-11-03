@@ -121,6 +121,28 @@ def test_batches_and_dict_output(raster_h3, striped_gradient):
     assert pa.schema(stream).names[-1] == "partial_state"
 
 
+def test_merge_accepts_the_scans_columns_including_partial_state(raster_h3, striped_gradient):
+    columns = ["h3_index", "resolution", "mean", "partial_state"]
+    spec = raster_h3.plan_partitions(striped_gradient, target_chunks=4)[1]
+    table = pa.table(raster_h3.RasterH3ArrowStream(striped_gradient, RESOLUTIONS, columns=columns, partition=spec))
+    assert table.column_names == columns
+    partial = table.filter(pc.is_valid(table.column("partial_state")))
+    merged = raster_h3.merge_partials(partial, columns=columns)
+    assert merged.column_names == ["h3_index", "resolution", "mean"]
+    assert merged.num_rows > 0
+
+
+def test_partitioned_to_dict_warns_about_dropped_samples(raster_h3, tmp_path):
+    # 10 x 20 one-degree pixels from 95N: the top 5 rows (50 pixels) lie beyond the pole.
+    path = tmp_path / "past_pole.tif"
+    write_geotiff(path, 10, 20, lambda c, r: 3.0, origin=(0.0, 95.0), pixel=1.0, rows_per_strip=4)
+    spec = raster_h3.plan_partitions(path, target_chunks=100)[0]
+    stream = raster_h3.RasterH3ArrowStream(path, 3, partition=spec)
+    with pytest.warns(RuntimeWarning, match=r"50 valid sample\(s\) were dropped"):
+        result = stream.to_dict()
+    assert len(result["h3_index"]) > 0 and "partial_state" in result
+
+
 def test_misuse_raises(raster_h3, striped_gradient, striped_classes, tmp_path):
     spec = raster_h3.plan_partitions(striped_gradient, target_chunks=4)[0]
     stream = raster_h3.RasterH3ArrowStream
