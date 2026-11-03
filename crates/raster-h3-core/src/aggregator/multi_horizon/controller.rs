@@ -29,6 +29,7 @@ use super::compaction::HierarchicalCompactor;
 use super::config::MultiResolutionConfig;
 use super::coordinates::eviction_north_bound;
 use super::lifecycle::{OutputBuffer, StreamLifecycle};
+use super::partition::{restrict_mosaic, BoundaryClassifier, PartialCell};
 use super::sharded_map::{AccumulatorMerge, ShardedResolutionMap};
 use super::spill::{RunReader, SpillAccumulator, SpillRuns};
 use super::walker::WalkContext;
@@ -192,6 +193,14 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     peak_active_bytes: usize,
     worker_maps: Vec<CellMaps<K::Accumulator>>,
     metrics: super::profile::StreamProfile,
+    /// Set for partitioned scans (`MultiResolutionConfig::partition`).
+    partition: Option<PartitionOutput<K::Accumulator>>,
+}
+
+/// Interior/boundary classification and buffered partial cells of a partitioned scan.
+struct PartitionOutput<A> {
+    classifier: BoundaryClassifier,
+    partials: OutputBuffer<PartialCell<A>>,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -217,6 +226,19 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     ) -> Result<Self> {
         config.validate()?;
         let should_compact = config.should_compact_h3_children();
+        // A partition streams only its own chunks; cells that chunks outside it may also
+        // reach are classified against the full mosaic's chunk list.
+        let (mosaic, partition) = match &config.partition {
+            Some(spec) => {
+                let restricted = Arc::new(restrict_mosaic(&mosaic, spec)?);
+                let output = PartitionOutput {
+                    classifier: BoundaryClassifier::new(&mosaic, spec),
+                    partials: OutputBuffer::with_capacity(16),
+                };
+                (restricted, Some(output))
+            }
+            None => (mosaic, None),
+        };
 
         let mut resolutions = Vec::with_capacity(config.resolutions.len());
         let mut resolution_u8s = Vec::with_capacity(config.resolutions.len());
@@ -347,6 +369,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 worker_map_sets: worker_tasks as u64,
                 ..Default::default()
             },
+            partition,
         })
     }
 
@@ -404,6 +427,22 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// Emit one final cell. In sorted EOF order siblings are contiguous, so a
     /// parent's group is decomposed as soon as the stream moves past it.
     fn emit_final(&mut self, res_idx: usize, key: u64, acc: K::Accumulator) {
+        if let Some(partition) = &mut self.partition {
+            if !partition.classifier.is_interior(key) {
+                // Other partitions may hold samples of this cell: hand its state on
+                // unfiltered, since only the merged state can be filtered.
+                let bytes = size_of::<PartialCell<K::Accumulator>>() + acc.heap_bytes();
+                partition.partials.push_sized(
+                    PartialCell {
+                        resolution: self.resolution_u8s[res_idx],
+                        h3_index: key,
+                        accumulator: acc,
+                    },
+                    bytes,
+                );
+                return;
+            }
+        }
         if self.compactor.is_enabled() && self.finishing {
             let parent = CellIndex::try_from(key)
                 .ok()
@@ -676,11 +715,23 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         }
     }
 
+    /// Records plus (in a partitioned scan) partial cells awaiting the consumer.
+    fn buffered_len(&self) -> usize {
+        self.output_buffer.len() + self.partition.as_ref().map_or(0, |p| p.partials.len())
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.output_buffer.estimated_bytes()
+            + self
+                .partition
+                .as_ref()
+                .map_or(0, |p| p.partials.estimated_bytes())
+    }
+
     fn advance_inner(&mut self, min_rows: usize) -> Result<()> {
-        while self.output_buffer.len() < min_rows
+        while self.buffered_len() < min_rows
             && !self.lifecycle.is_finished()
-            && (self.output_buffer.is_empty()
-                || self.output_buffer.estimated_bytes() < self.output_byte_limit)
+            && (self.buffered_len() == 0 || self.buffered_bytes() < self.output_byte_limit)
         {
             if self.finishing {
                 if let Some(reader) = &mut self.final_reader {
@@ -761,7 +812,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     continue;
                 }
             }
-            if self.output_buffer.is_empty() && !self.spill_runs.iter().any(|r| r.has_spilled()) {
+            if self.buffered_len() == 0 && !self.spill_runs.iter().any(|r| r.has_spilled()) {
                 // Held sibling groups may still emit records north of the horizon.
                 self.current_lat_horizon = self
                     .eviction_horizon
@@ -814,6 +865,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     fn fail(&mut self, reason: String) -> RasterH3Error {
         self.prefetcher.take();
         self.output_buffer.clear();
+        if let Some(partition) = &mut self.partition {
+            partition.partials.clear();
+        }
         self.compactor.clear();
         self.resolution_shards.clear();
         self.worker_maps.clear();
@@ -824,6 +878,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<K::Record>> {
+        self.reject_partitioned()?;
         self.advance_until_completed(max_rows)?;
         Ok(self.output_buffer.take_batch(max_rows))
     }
@@ -833,8 +888,51 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     where
         F: FnMut(usize, K::Record),
     {
+        self.reject_partitioned()?;
         self.advance_until_completed(max_rows)?;
         Ok(self.output_buffer.drain_into(max_rows, consumer))
+    }
+
+    /// Record-only reads would silently lose a partitioned scan's partial cells.
+    fn reject_partitioned(&self) -> Result<()> {
+        if self.partition.is_some() {
+            return Err(RasterH3Error::InvalidParameter(
+                "partitioned scans emit partial cells; drain them with drain_partitioned_into"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drain a partitioned scan: up to `max_rows` completed (interior) records into
+    /// `on_record` and partial (boundary) cells into `on_partial`, in total. Returns the
+    /// number drained; 0 means end of stream. Also works for unpartitioned scans, which
+    /// produce no partial cells.
+    pub fn drain_partitioned_into<F, G>(
+        &mut self,
+        max_rows: usize,
+        on_record: F,
+        mut on_partial: G,
+    ) -> Result<usize>
+    where
+        F: FnMut(usize, K::Record),
+        G: FnMut(PartialCell<K::Accumulator>),
+    {
+        self.advance_until_completed(max_rows)?;
+        let records = self.output_buffer.drain_into(max_rows, on_record);
+        let partials = match &mut self.partition {
+            Some(p) => p
+                .partials
+                .drain_into(max_rows - records, |_, cell| on_partial(cell)),
+            None => 0,
+        };
+        Ok(records + partials)
+    }
+
+    /// For a partitioned scan, the number of finalized cells classified so far as
+    /// `(interior, boundary)`.
+    pub fn partition_cell_counts(&self) -> Option<(u64, u64)> {
+        self.partition.as_ref().map(|p| p.classifier.counts())
     }
 
     /// Bytes written to spill files, including intermediate merge outputs.
@@ -878,7 +976,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     /// Check if stream is fully drained and finished
     pub fn is_finished(&self) -> bool {
-        self.lifecycle.is_finished() && self.output_buffer.is_empty()
+        self.lifecycle.is_finished() && self.buffered_len() == 0
     }
 }
 
