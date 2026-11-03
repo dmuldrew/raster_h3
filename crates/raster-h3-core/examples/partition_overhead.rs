@@ -15,7 +15,6 @@
 //! are higher than for production-sized partitions of large rasters.
 
 #[path = "../tests/it/helpers.rs"]
-#[allow(dead_code)]
 mod helpers;
 
 use std::fmt::Write as _;
@@ -82,6 +81,15 @@ fn single_scan(path: &Path, config: &MultiResolutionConfig) -> usize {
         > 0
     {}
     cells
+}
+
+/// Per-repetition measurements of one partitioned configuration.
+#[derive(Default)]
+struct Samples {
+    cpu_s: Vec<f64>,
+    wall_s: Vec<f64>,
+    merge_cpu_s: Vec<f64>,
+    last: PartitionedRun,
 }
 
 #[derive(Default)]
@@ -185,8 +193,7 @@ fn main() {
         let config = MultiResolutionConfig::new(resolutions.clone());
         let expected = single_scan(&path, &config); // warm-up, and the reference cell count
         let mut single = (Vec::new(), Vec::new());
-        let mut parts: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, PartitionedRun)> =
-            targets.iter().map(|_| Default::default()).collect();
+        let mut parts: Vec<Samples> = targets.iter().map(|_| Samples::default()).collect();
         for _ in 0..reps {
             let c = measure(|| assert_eq!(single_scan(&path, &config), expected));
             single.0.push(c.cpu_s);
@@ -198,16 +205,21 @@ fn main() {
                     run.cells, expected,
                     "partitioned scan lost or duplicated cells"
                 );
-                parts[i].0.push(c.cpu_s);
-                parts[i].1.push(c.wall_s);
-                parts[i].2.push(run.merge.cpu_s);
-                parts[i].3 = run;
+                parts[i].cpu_s.push(c.cpu_s);
+                parts[i].wall_s.push(c.wall_s);
+                parts[i].merge_cpu_s.push(run.merge.cpu_s);
+                parts[i].last = run;
             }
         }
         let (single_cpu, single_wall) = (median(single.0), median(single.1));
         let label = format!("{resolutions:?}");
-        for ((cpu, wall, merge, run), &target) in parts.into_iter().zip(&targets) {
-            let (cpu, wall, merge) = (median(cpu), median(wall), median(merge));
+        for (samples, &target) in parts.into_iter().zip(&targets) {
+            let run = samples.last;
+            let (cpu, wall, merge) = (
+                median(samples.cpu_s),
+                median(samples.wall_s),
+                median(samples.merge_cpu_s),
+            );
             let boundary_pct =
                 100.0 * run.boundary as f64 / (run.interior + run.boundary).max(1) as f64;
             let ratio = cpu / single_cpu;

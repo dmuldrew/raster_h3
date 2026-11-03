@@ -7,7 +7,7 @@
 //! categorical data, filters and spilling.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::accumulator::H3Accumulator;

@@ -67,7 +67,9 @@ pub struct ScanPartition {
     /// Number of partitions in the plan.
     pub count: u32,
     /// [`mosaic_fingerprint`] of the mosaic the plan was made for. A worker whose mosaic
-    /// differs (other files, bbox, CRS override or overlap rule) refuses the partition.
+    /// has another layout (other raster dimensions, chunking or georeferencing, bbox or
+    /// overlap rule) refuses the partition. Rasters that differ only in pixel values share
+    /// a layout, and a plan for one is valid for the others.
     pub mosaic_fingerprint: u64,
     /// Disjoint chunk rectangles; together, the plan's partitions cover every chunk once.
     pub blocks: Vec<ChunkBlock>,

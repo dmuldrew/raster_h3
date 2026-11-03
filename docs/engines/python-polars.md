@@ -238,6 +238,46 @@ lf = raster_h3.scan_raster_h3("tiles/tile_*.tif", 8)
 lf = raster_h3.scan_raster_h3("tile_west.tif,tile_east.tif", 8, categorical=True)
 ```
 
+### Partitioned scans (Spark and other distributed engines)
+
+One raster can be split across independent workers that each read a disjoint set of TIFF
+tiles or strips, with results identical to a single scan (up to floating-point summation
+order). The driver plans from metadata only:
+
+```python
+specs = raster_h3.plan_partitions("dem.tif", target_chunks=256)  # list of JSON strings
+```
+
+Each worker scans one spec with the same path, `crs` and `bbox`:
+
+```python
+cells = pa.table(raster_h3.RasterH3ArrowStream("dem.tif", 8, partition=spec))
+```
+
+The table has the usual columns plus a nullable `partial_state` (binary) column:
+
+- **null**: a final cell, already complete;
+- **set**: this partition's share of a cell near a partition edge (its statistics cover
+  that share only). Gather these rows from every partition, keyed by `h3_index`, and merge:
+
+```python
+final = cells.filter(pc.is_null(cells["partial_state"])).drop(["partial_state"])
+merged = raster_h3.merge_partials(partial_rows_from_all_partitions)  # pyarrow.Table
+```
+
+`merge_partials` accepts PyArrow tables or batches, lists of them, or anything exposing
+`__arrow_c_stream__`, and casts Spark's signed `h3_index` / `resolution` types. Pass the
+scans' `categorical` and `columns` so the merged rows have the same columns. With Spark,
+scan one spec per task (`mapInArrow`), then `repartition("h3_index")` the partial rows and
+merge each group with `mapInArrow` as well.
+
+Partition specs carry a fingerprint of the raster layout (dimensions, chunking,
+georeferencing, bbox), so a worker that opens a raster with another layout refuses the spec.
+`limit` and the long categorical format cannot be combined with a partition, and a
+projection must keep `h3_index` and `resolution`. Boundary rows are typically a few percent
+of the output and shrink as partitions grow; partitioning adds no measurable CPU (see
+[Partitioned scans](core.md#partitioned-scans)).
+
 ### Categorical aggregation
 
 ```python
@@ -312,6 +352,8 @@ return errors through an out-parameter string freed with `raster_h3_py_free_stri
 | `raster_h3_py_create_arrow_stream` / `_free_arrow_stream` | Build / release an `ArrowArrayStream` for a scan |
 | `raster_h3_py_open_batch_reader` / `_batch_reader_next` / `_free_batch_reader` | Incremental reader; each `next` returns a one-batch stream, or null at EOF |
 | `raster_h3_py_scan_json` | Whole scan as a JSON object of columns (`to_dict`) |
+| `raster_h3_py_plan_partitions`, `raster_h3_py_create_arrow_{schema,stream}_partitioned`, `raster_h3_py_open_batch_reader_partitioned` | Partition planning and partitioned scans (`partition=`) |
+| `raster_h3_py_merge_partials` | Merge partial rows; moves its input `ArrowArrayStream` |
 | `raster_h3_py_h3_*` | Scalar helpers |
 | `raster_h3_py_export_parquet`, `raster_h3_py_export_pmtiles` | File exporters (return `-1` on error) |
 

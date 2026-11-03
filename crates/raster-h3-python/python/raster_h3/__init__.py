@@ -9,6 +9,8 @@ Provides:
 - Scalar and vectorized H3 helpers (`h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`,
   `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_polygon_to_cells`).
 - Direct file exporters (`raster_to_parquet`, `raster_to_pmtiles`).
+- Partitioned scans for distributed engines such as Spark (`plan_partitions`,
+  `RasterH3ArrowStream(partition=...)`, `merge_partials`).
 """
 
 from __future__ import annotations
@@ -157,6 +159,34 @@ def _get_lib() -> ctypes.CDLL:
         lib.raster_h3_py_batch_reader_transform_failures.argtypes = [ctypes.c_void_p]
         lib.raster_h3_py_batch_reader_transform_failures.restype = ctypes.c_uint64
 
+        # Partitioned scans (newer libraries).
+        if hasattr(lib, "raster_h3_py_merge_partials"):
+            lib.raster_h3_py_plan_partitions.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_int64,
+            ] + err_ptr
+            lib.raster_h3_py_plan_partitions.restype = ctypes.c_void_p
+            lib.raster_h3_py_create_arrow_schema_partitioned.argtypes = list(
+                lib.raster_h3_py_create_arrow_schema.argtypes
+            )
+            lib.raster_h3_py_create_arrow_schema_partitioned.restype = ctypes.c_void_p
+            lib.raster_h3_py_create_arrow_stream_partitioned.argtypes = (
+                scan_args + [ctypes.c_int, ctypes.c_char_p] + err_ptr
+            )
+            lib.raster_h3_py_create_arrow_stream_partitioned.restype = ctypes.c_void_p
+            lib.raster_h3_py_open_batch_reader_partitioned.argtypes = (
+                scan_args + [ctypes.c_int64, ctypes.c_int, ctypes.c_char_p] + err_ptr
+            )
+            lib.raster_h3_py_open_batch_reader_partitioned.restype = ctypes.c_void_p
+            lib.raster_h3_py_merge_partials.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+            ] + err_ptr
+            lib.raster_h3_py_merge_partials.restype = ctypes.c_void_p
+
     # Scalar C-ABI
     lib.raster_h3_py_h3_to_string.argtypes = [ctypes.c_uint64]
     lib.raster_h3_py_h3_to_string.restype = ctypes.c_void_p
@@ -261,6 +291,13 @@ ctypes.pythonapi.PyCapsule_GetName.restype = ctypes.c_void_p
 
 ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+
+
+# `PyCapsule_GetPointer` taking the capsule as a Python object (the prototype above takes
+# raw pointers, as the destructors receive them).
+_capsule_object_pointer = ctypes.PYFUNCTYPE(ctypes.c_void_p, ctypes.py_object, ctypes.c_char_p)(
+    ("PyCapsule_GetPointer", ctypes.pythonapi)
+)
 
 
 def _capsule_pointer(capsule_ptr: int) -> Optional[int]:
@@ -384,6 +421,7 @@ class RasterH3ArrowStream:
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         strict_transforms: bool = False,
+        partition: Optional[str] = None,
     ) -> None:
         self.path = str(path)
         self.resolutions = resolutions
@@ -395,6 +433,15 @@ class RasterH3ArrowStream:
         self.columns = list(columns) if columns is not None else None
         self.limit = limit
         self.strict_transforms = strict_transforms
+        # A partition spec from `plan_partitions`: scan only that part of the raster. The
+        # output gains a `partial_state` column; see `merge_partials`.
+        self.partition = partition
+
+    def _partition_arg(self, lib: ctypes.CDLL) -> bytes:
+        if not hasattr(lib, "raster_h3_py_merge_partials"):
+            raise RuntimeError("partitioned scans require a newer raster_h3 native library")
+        assert self.partition is not None
+        return self.partition.encode("utf-8")
 
     def _scan_args(self) -> Tuple[Any, ...]:
         return (
@@ -423,7 +470,11 @@ class RasterH3ArrowStream:
     def __arrow_c_schema__(self) -> Any:
         lib = _get_lib()
         err = ctypes.c_void_p(0)
-        ptr = lib.raster_h3_py_create_arrow_schema(
+        create = lib.raster_h3_py_create_arrow_schema
+        if self.partition is not None:
+            self._partition_arg(lib)
+            create = lib.raster_h3_py_create_arrow_schema_partitioned
+        ptr = create(
             1 if self.categorical else 0,
             self.format.encode("utf-8"),
             _encode_columns(self.columns),
@@ -439,7 +490,14 @@ class RasterH3ArrowStream:
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         lib = _get_lib()
         err = ctypes.c_void_p(0)
-        if self._has_ex(lib):
+        if self.partition is not None:
+            ptr = lib.raster_h3_py_create_arrow_stream_partitioned(
+                *self._scan_args(),
+                1 if self.strict_transforms else 0,
+                self._partition_arg(lib),
+                ctypes.byref(err),
+            )
+        elif self._has_ex(lib):
             ptr = lib.raster_h3_py_create_arrow_stream_ex(
                 *self._scan_args(), 1 if self.strict_transforms else 0, ctypes.byref(err)
             )
@@ -454,6 +512,9 @@ class RasterH3ArrowStream:
 
     def to_dict(self) -> Dict[str, List[Any]]:
         """Materialize the scan into a Python dictionary of column lists."""
+        if self.partition is not None:
+            # The JSON path has no partial-state column; go through Arrow (needs pyarrow).
+            return self.to_pyarrow().to_pydict()
         lib = _get_lib()
         err = ctypes.c_void_p(0)
         failures = ctypes.c_uint64(0)
@@ -490,7 +551,15 @@ class RasterH3ArrowStream:
         lib = _get_lib()
         err = ctypes.c_void_p(0)
         has_ex = self._has_ex(lib)
-        if has_ex:
+        if self.partition is not None:
+            reader = lib.raster_h3_py_open_batch_reader_partitioned(
+                *self._scan_args(),
+                int(batch_size) if batch_size else 0,
+                1 if self.strict_transforms else 0,
+                self._partition_arg(lib),
+                ctypes.byref(err),
+            )
+        elif has_ex:
             reader = lib.raster_h3_py_open_batch_reader_ex(
                 *self._scan_args(),
                 int(batch_size) if batch_size else 0,
@@ -696,6 +765,140 @@ def read_raster_h3(
 
 
 # -----------------------------------------------------------------------------
+# Partitioned scans (Spark and other distributed engines)
+# -----------------------------------------------------------------------------
+
+#: Column of a partitioned scan holding a boundary cell's encoded partial state.
+PARTIAL_STATE_COLUMN = "partial_state"
+
+
+def plan_partitions(
+    path: Union[str, Path],
+    *,
+    target_chunks: int = 256,
+    crs: Optional[str] = None,
+    bbox: Optional[Union[str, Sequence[float]]] = None,
+) -> List[str]:
+    """
+    Split a raster (or mosaic) scan into independent partitions of about
+    `target_chunks` TIFF tiles or strips each, reading only metadata.
+
+    Returns one JSON string per partition. Scan each with
+    `RasterH3ArrowStream(path, ..., partition=spec)` using the same `path`, `crs` and
+    `bbox` (a raster with another layout, or another bbox, refuses the spec); every TIFF
+    chunk belongs to exactly one partition, so no pixel is read twice.
+
+    Each partitioned scan returns the normal columns plus `partial_state`:
+
+    - rows where `partial_state` is null are final cells;
+    - rows where it is set are cells that other partitions also hold samples of. Collect
+      them from all partitions (grouped by `h3_index`) and pass them to `merge_partials`.
+
+    Larger partitions mean less per-task overhead and fewer partial rows; a few hundred
+    chunks per partition is a good start.
+    """
+    lib = _get_lib()
+    if not hasattr(lib, "raster_h3_py_plan_partitions"):
+        raise RuntimeError("plan_partitions requires a newer raster_h3 native library")
+    err = ctypes.c_void_p(0)
+    ptr = lib.raster_h3_py_plan_partitions(
+        str(path).encode("utf-8"),
+        crs.encode("utf-8") if crs else None,
+        _encode_bbox(bbox),
+        int(target_chunks),
+        ctypes.byref(err),
+    )
+    _raise_if_err(err)
+    if not ptr:
+        raise RuntimeError("Failed to plan partitions")
+    try:
+        plan = json.loads(ctypes.string_at(ptr).decode("utf-8"))
+    finally:
+        lib.raster_h3_py_free_string(ptr)
+    return [json.dumps(p, separators=(",", ":")) for p in plan]
+
+
+def _as_pyarrow_table(data: Any) -> Any:
+    import pyarrow as pa  # type: ignore
+
+    if isinstance(data, pa.Table):
+        return data
+    if isinstance(data, pa.RecordBatch):
+        return pa.Table.from_batches([data])
+    if isinstance(data, (list, tuple)):
+        if data and all(isinstance(b, pa.RecordBatch) for b in data):
+            return pa.Table.from_batches(list(data))
+        if data and all(isinstance(t, pa.Table) for t in data):
+            return pa.concat_tables(list(data))
+        if not data:
+            return None
+    if hasattr(data, "to_arrow") and not hasattr(data, "__arrow_c_stream__"):
+        return data.to_arrow()  # older Polars
+    return pa.table(data)
+
+
+def merge_partials(
+    partials: Any,
+    *,
+    categorical: bool = False,
+    columns: Optional[Sequence[str]] = None,
+) -> Any:
+    """
+    Merge the partial rows of every partition of a partitioned scan into final rows.
+
+    `partials` holds the rows whose `partial_state` is set, from all partitions (every
+    partial row of a cell must be included, in any order). It can be a PyArrow Table,
+    RecordBatch or list of them, or anything exposing `__arrow_c_stream__` (e.g. a Polars
+    DataFrame); only the `resolution`, `h3_index` and `partial_state` columns are read,
+    and integer types are cast as needed (e.g. Spark's signed `h3_index`).
+
+    `categorical` and `columns` must match the scans'. Returns a PyArrow Table with the
+    scan's output columns (without `partial_state`), sorted by resolution and h3_index.
+    Requires pyarrow.
+
+    With Spark, for example::
+
+        rows = cells.filter("partial_state IS NOT NULL")
+        merged = rows.repartition("h3_index").mapInArrow(
+            lambda batches: merge_partials(list(batches)).to_batches(), schema
+        )
+    """
+    import pyarrow as pa  # type: ignore
+
+    lib = _get_lib()
+    if not hasattr(lib, "raster_h3_py_merge_partials"):
+        raise RuntimeError("merge_partials requires a newer raster_h3 native library")
+    table = _as_pyarrow_table(partials)
+    keys = {"resolution": pa.uint8(), "h3_index": pa.uint64(), PARTIAL_STATE_COLUMN: pa.binary()}
+    if table is None:
+        table = pa.table({name: pa.array([], type=t) for name, t in keys.items()})
+    missing = [name for name in keys if name not in table.column_names]
+    if missing:
+        raise ValueError(f"partial rows need the columns {list(keys)}; missing {missing}")
+    state = table.column(PARTIAL_STATE_COLUMN)
+    if state.null_count:
+        raise ValueError(
+            f"{state.null_count} rows have no {PARTIAL_STATE_COLUMN}: pass only partial rows "
+            "(rows without a state are already final)"
+        )
+    narrow = pa.table({name: table.column(name).cast(t) for name, t in keys.items()}).combine_chunks()
+    capsule = narrow.__arrow_c_stream__()
+    stream = _capsule_object_pointer(capsule, b"arrow_array_stream")
+    err = ctypes.c_void_p(0)
+    out = lib.raster_h3_py_merge_partials(
+        stream,
+        1 if categorical else 0,
+        _encode_columns(columns),
+        ctypes.byref(err),
+    )
+    del capsule  # the native side moved the stream out; releasing the capsule is a no-op
+    _raise_if_err(err)
+    if not out:
+        raise RuntimeError("Failed to merge partial cells")
+    return pa.table(_OwnedArrowStream(out))
+
+
+# -----------------------------------------------------------------------------
 # H3 Scalar Functions & Direct Exporters
 # -----------------------------------------------------------------------------
 
@@ -876,7 +1079,10 @@ def raster_to_pmtiles(
 
 
 __all__ = [
+    "PARTIAL_STATE_COLUMN",
     "RasterH3ArrowStream",
+    "merge_partials",
+    "plan_partitions",
     "scan_raster_h3",
     "read_raster_h3",
     "h3_to_string",

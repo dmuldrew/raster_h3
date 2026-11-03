@@ -6,5 +6,6 @@ mod helpers;
 mod batch_reader;
 mod c_abi;
 mod exports;
+mod partitions;
 mod scalars;
 mod transform_failures;
