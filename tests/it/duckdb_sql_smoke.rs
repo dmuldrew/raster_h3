@@ -39,16 +39,25 @@ impl DuckDbHarness {
         let cli = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".into());
         // The CLI may print warnings (e.g. a Rosetta notice) before the value;
         // the platform itself is the last line of plain identifier characters.
-        let platform_out = run_cli(&cli, "PRAGMA platform");
-        let platform = platform_out
-            .lines()
-            .map(str::trim)
-            .rev()
-            .find(|line| {
-                !line.is_empty() && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-            .expect("PRAGMA platform did not report a platform")
-            .to_string();
+        // DUCKDB_PLATFORM overrides probing where the CLI output is unreliable.
+        let platform = std::env::var("DUCKDB_PLATFORM")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| {
+                let platform_out = run_cli(&cli, "PRAGMA platform");
+                platform_out
+                    .lines()
+                    .map(str::trim)
+                    .rev()
+                    .find(|line| {
+                        !line.is_empty()
+                            && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("PRAGMA platform did not report a platform:\n{platform_out}")
+                    })
+                    .to_string()
+            });
         let library = std::env::var_os("RASTER_H3_LIBRARY")
             .map(PathBuf::from)
             .unwrap_or_else(|| {

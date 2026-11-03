@@ -129,7 +129,12 @@ impl Harness {
         // `version()` is the release tag (e.g. `v2.0.0`), which is also the
         // `${REVISION}` directory DuckDB requests from a repository.
         harness.version_dir = lines.next().unwrap().to_string();
-        harness.platform = lines.next().unwrap().to_string();
+        // DUCKDB_PLATFORM overrides probing where the CLI output is unreliable
+        // (e.g. a Rosetta wrapper on osx_amd64 CI runners).
+        harness.platform = std::env::var("DUCKDB_PLATFORM")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| lines.next().unwrap().to_string());
 
         let major: u32 = harness
             .version_dir

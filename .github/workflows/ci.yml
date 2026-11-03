@@ -377,6 +377,12 @@ jobs:
           fi
           export DUCKDB_BIN
           # The DuckDB 2.0 smoke tests exercise the v1.5.6-API build packaged above.
+          # The extension platform tag can't be probed through the Rosetta
+          # wrapper reliably, so pass the matrix platform explicitly.
+          export DUCKDB_PLATFORM="${{ matrix.platform }}"
+          if [[ "$DUCKDB_PLATFORM" == "linux_amd64_gcc4" ]]; then
+            DUCKDB_PLATFORM=linux_amd64
+          fi
           export DUCKDB_VERSION=v1.5.6
           export RASTER_H3_LIBRARY="$(pwd)/target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }}"
           chmod +x "$DUCKDB_BIN" || true
