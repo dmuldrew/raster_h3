@@ -97,9 +97,12 @@ def merge_boundary_cells(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.Recor
     """
     import raster_h3
 
-    table = pa.Table.from_batches(list(batches), schema=ARROW_SCHEMA)
-    if table.num_rows == 0:
+    # Spark marks `partial_state` non-null after the IS NOT NULL filter, so take the
+    # batches' own schema rather than ARROW_SCHEMA.
+    batches = list(batches)
+    if not batches:
         return
+    table = pa.Table.from_batches(batches)
     for path in pc.unique(table.column("path")).to_pylist():
         rows = table.filter(pc.equal(table.column("path"), path))
         for merged in raster_h3.merge_partials(rows, columns=COLUMNS).to_batches():
