@@ -7,6 +7,7 @@ import pytest
 
 sedonadb = pytest.importorskip("sedonadb")
 
+import raster_h3_sedona  # noqa: E402
 from raster_h3_sedona import RasterH3Table  # noqa: E402
 
 
@@ -73,7 +74,9 @@ def raster(tmp_path):
 
 @pytest.fixture
 def sd():
-    return sedonadb.connect()
+    sd = sedonadb.connect()
+    sd.register(raster_h3_sedona.scalar_functions())
+    return sd
 
 
 def scalar(sd, sql):
@@ -122,6 +125,8 @@ POINT = "ST_SetSRID(ST_GeomFromWKT('POINT (-122.35 37.70)'), 4326)"
         f"ST_Intersects(wkb, {POLYGON})",
         f"ST_Within(wkb, {POLYGON})",
         f"ST_DWithin(wkb, {POINT}, 0.01)",
+        f"ST_Intersects({POLYGON}, h3_to_wkb(h3_index))",
+        "ST_Intersects(wkb, h3_to_wkb(613196570287931391))",
     ],
 )
 def test_spatial_filters_match_an_unpruned_scan(sd, raster, predicate):
@@ -156,6 +161,75 @@ def test_spatial_filter_prunes_the_scan(sd, raster):
     matched, scanned = map(int, match.groups())
     assert matched == 1
     assert scanned * 5 < total, plan
+
+
+def test_scalar_functions_register():
+    functions = raster_h3_sedona.scalar_functions()
+    names = functions.names
+    assert len(functions) == len(names) == len(set(names))
+    for name in ["h3_polygon_to_cells", "h3_to_wkb", "h3_to_geometry", "h3_cell_to_parent"]:
+        assert name in names
+    assert [f.name for f in functions] == names
+
+
+def test_scalar_functions(sd, raster):
+    sd.create_data_frame(RasterH3Table.continuous(raster, 8)).to_view("cells")
+    assert scalar(sd, "SELECT h3_to_string(599686042433355775)") == "85283473fffffff"
+    mismatches = scalar(
+        sd,
+        """SELECT COUNT(*) FROM cells
+           WHERE h3_to_string(h3_index) <> h3_hex
+              OR h3_get_resolution(h3_index) <> 8
+              OR h3_get_resolution(h3_cell_to_parent(h3_index, 6)) <> 6
+              OR NOT ST_Equals(h3_to_wkb(h3_index), wkb)
+              OR NOT ST_Equals(h3_cell_to_geometry(h3_hex), wkb)""",
+    )
+    assert mismatches == 0
+    assert rows(sd, "SELECT ST_SRID(h3_to_wkb(599686042433355775))") == [(4326,)]
+
+
+def test_polygon_to_cells_joins_on_h3_index(sd, raster):
+    sd.create_data_frame(RasterH3Table.continuous(raster, 8)).to_view("cells")
+    sd.sql(f"SELECT 'aoi' AS name, {POLYGON} AS geom").to_view("areas")
+    joined = rows(
+        sd,
+        """WITH aoi AS (
+               SELECT name, unnest(h3_polygon_to_cells(geom, 8, 'covers')) AS h3_index
+               FROM areas
+           )
+           SELECT c.h3_index FROM aoi JOIN cells AS c ON c.h3_index = aoi.h3_index
+           ORDER BY c.h3_index""",
+    )
+    assert len(joined) > 1
+    # Every polyfilled cell overlaps the polygon, and every cell whose centre lies inside it
+    # is polyfilled.
+    covered = {h for (h,) in joined}
+    overlapping = {
+        h for (h,) in rows(sd, f"SELECT h3_index FROM cells WHERE ST_Intersects(wkb, {POLYGON})")
+    }
+    centred = {
+        h
+        for (h,) in rows(
+            sd, f"SELECT h3_index FROM cells WHERE ST_Intersects(ST_Centroid(wkb), {POLYGON})"
+        )
+    }
+    assert centred <= covered <= overlapping
+    # The default containment keeps cells whose centre is inside.
+    default = {
+        h
+        for (h,) in rows(
+            sd, "SELECT unnest(h3_polygon_to_cells(geom, 8)) FROM areas"
+        )
+    }
+    assert default == centred
+
+
+def test_polygon_to_cells_rejects_projected_geometry(sd):
+    with pytest.raises(Exception):
+        sd.sql(
+            "SELECT h3_polygon_to_cells(ST_SetSRID(ST_GeomFromWKT("
+            "'POLYGON ((0 0, 1 0, 1 1, 0 0))'), 3857), 8)"
+        ).to_pandas()
 
 
 def test_categorical(sd, raster):

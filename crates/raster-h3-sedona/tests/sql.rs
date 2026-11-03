@@ -217,3 +217,151 @@ async fn bad_arguments_fail_at_planning() {
         assert!(ctx.sql(sql).await.is_err(), "{sql} should not plan");
     }
 }
+
+fn polygon_wkb(ring: &[(f64, f64)]) -> Vec<u8> {
+    let mut wkb = vec![1u8];
+    wkb.extend(3u32.to_le_bytes());
+    wkb.extend(1u32.to_le_bytes());
+    wkb.extend((ring.len() as u32).to_le_bytes());
+    for (x, y) in ring {
+        wkb.extend(x.to_le_bytes());
+        wkb.extend(y.to_le_bytes());
+    }
+    wkb
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+fn cells(batches: &[datafusion::arrow::array::RecordBatch]) -> Vec<u64> {
+    batches
+        .iter()
+        .flat_map(|b| b.column(0).as_primitive::<UInt64Type>().values().to_vec())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn polygon_to_cells_polyfills_and_joins_on_h3_index() {
+    let ctx = context();
+    let cell = 0x8828308281fffffu64;
+
+    // A cell's own polygon holds exactly its own centroid at its resolution.
+    let own = collect(
+        &ctx,
+        &format!("SELECT unnest(h3_polygon_to_cells(h3_to_wkb({cell}), 8))"),
+    )
+    .await;
+    assert_eq!(cells(&own), vec![cell]);
+    // `covers` adds the neighbours it overlaps; the list is sorted and unique.
+    let covers = cells(
+        &collect(
+            &ctx,
+            &format!("SELECT unnest(h3_polygon_to_cells(h3_to_wkb({cell}), 8, 'covers'))"),
+        )
+        .await,
+    );
+    assert!(covers.len() > 1 && covers.contains(&cell));
+    assert!(covers.windows(2).all(|w| w[0] < w[1]));
+    // NULL in, NULL out.
+    let null = collect(&ctx, "SELECT h3_polygon_to_cells(NULL, 8) IS NULL").await;
+    assert!(null[0].column(0).as_boolean().value(0));
+
+    // Join raster cells to a polyfilled polygon on the shared index.
+    let tif = gradient_tif(64, 64);
+    let src = source(&tif);
+    let ring = [
+        (-122.44, 37.75),
+        (-122.40, 37.75),
+        (-122.40, 37.79),
+        (-122.44, 37.79),
+        (-122.44, 37.75),
+    ];
+    let wkb = polygon_wkb(&ring);
+    let joined = cells(
+        &collect(
+            &ctx,
+            &format!(
+                "WITH aoi AS (SELECT unnest(h3_polygon_to_cells(X'{}', 8, 'covers')) AS h3_index) \
+                 SELECT r.h3_index FROM h3_raster_continuous_aggregate('{src}', 8) r \
+                 JOIN aoi ON r.h3_index = aoi.h3_index ORDER BY r.h3_index",
+                hex(&wkb)
+            ),
+        )
+        .await,
+    );
+    let expected = raster_h3_core::scalar_ops::h3_polygon_to_cells_wkb(
+        &wkb,
+        8,
+        raster_h3_core::scalar_ops::ContainmentMode::Covers,
+    )
+    .unwrap();
+    let all = cells(
+        &collect(
+            &ctx,
+            &format!("SELECT h3_index FROM h3_raster_continuous_aggregate('{src}', 8)"),
+        )
+        .await,
+    );
+    let mut want: Vec<u64> = all.into_iter().filter(|c| expected.contains(c)).collect();
+    want.sort_unstable();
+    assert!(!want.is_empty());
+    assert_eq!(joined, want);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn polygon_to_cells_rejects_bad_input() {
+    let ctx = context();
+    let wkb = hex(&polygon_wkb(&[
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 0.0),
+    ]));
+    for sql in [
+        format!("SELECT h3_polygon_to_cells(X'{wkb}', 8, 'nearby')"),
+        format!("SELECT h3_polygon_to_cells(X'{wkb}', 16)"),
+        "SELECT h3_polygon_to_cells(X'0102', 8)".to_string(),
+    ] {
+        let result = match ctx.sql(&sql).await {
+            Ok(df) => df.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(result.is_err(), "{sql} should fail");
+    }
+    for sql in [
+        "SELECT h3_polygon_to_cells('POLYGON EMPTY', 8)",
+        "SELECT h3_polygon_to_cells(X'00', 8.5)",
+        "SELECT h3_polygon_to_cells(X'00')",
+    ] {
+        assert!(ctx.sql(sql).await.is_err(), "{sql} should not plan");
+    }
+
+    // A geometry tagged with a projected CRS is refused at planning.
+    use datafusion::arrow::array::BinaryArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    let field = Field::new("geom", DataType::Binary, false).with_metadata(
+        [
+            (
+                "ARROW:extension:name".to_string(),
+                GEOARROW_WKB_EXTENSION.to_string(),
+            ),
+            (
+                "ARROW:extension:metadata".to_string(),
+                r#"{"crs":"EPSG:3857"}"#.to_string(),
+            ),
+        ]
+        .into(),
+    );
+    let batch = datafusion::arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![field])),
+        vec![Arc::new(BinaryArray::from_vec(vec![b"x".as_slice()]))],
+    )
+    .unwrap();
+    ctx.register_batch("projected", batch).unwrap();
+    let err = ctx
+        .sql("SELECT h3_polygon_to_cells(geom, 8) FROM projected")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("lon/lat"), "{err}");
+}

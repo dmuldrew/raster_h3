@@ -6,14 +6,21 @@
 //! ([`ExportedTableProvider`]), so any SedonaDB context can scan it with projection,
 //! `LIMIT`, threshold and spatial filter pushdown.
 //!
+//! `raster_h3_sedona.scalar_functions()` exports the `raster_h3` SQL functions (including
+//! `h3_polygon_to_cells` and `h3_to_wkb`) as `sedonadb_scalar_kernel` capsules.
+//!
 //! ```python
 //! import sedonadb
+//! import raster_h3_sedona
 //! from raster_h3_sedona import RasterH3Table
 //!
 //! sd = sedonadb.connect()
+//! sd.register(raster_h3_sedona.scalar_functions())
 //! sd.create_data_frame(RasterH3Table.continuous("dem.tif", 8)).to_view("dem")
 //! sd.sql("SELECT h3_index, mean FROM dem WHERE count >= 4").show()
 //! ```
+
+mod functions;
 
 use std::sync::{Arc, OnceLock};
 
@@ -182,6 +189,9 @@ impl PyRasterH3Table {
 #[pymodule(name = "raster_h3_sedona")]
 fn raster_h3_sedona_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRasterH3Table>()?;
+    m.add_class::<functions::PyScalarFunction>()?;
+    m.add_class::<functions::PyScalarFunctions>()?;
+    m.add_function(wrap_pyfunction!(functions::scalar_functions, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

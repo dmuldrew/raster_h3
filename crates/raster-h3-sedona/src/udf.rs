@@ -15,11 +15,15 @@ use raster_h3_datafusion::default_scalar_udfs;
 
 use crate::convert::{from_column_array, geometry_field, to_arrow_type, to_column_array};
 
-/// All `raster_h3` scalar functions, ready for `SessionContext::register_udf`.
+/// All `raster_h3` scalar functions, ready for `SessionContext::register_udf`: the
+/// `raster-h3-datafusion` H3 functions plus [`H3PolygonToCells`](crate::H3PolygonToCells).
 pub fn scalar_udfs() -> Vec<ScalarUDF> {
     default_scalar_udfs()
         .into_iter()
         .map(|inner| ScalarUDF::new_from_impl(RasterH3ScalarUdf::new(inner)))
+        .chain([ScalarUDF::new_from_impl(
+            crate::polyfill::H3PolygonToCells::default(),
+        )])
         .collect()
 }
 

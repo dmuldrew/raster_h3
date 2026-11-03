@@ -303,7 +303,7 @@ ctx.sql(
 | Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
 | Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals`, and `ST_DWithin(..., d)` with a non-negative numeric literal `d`, between a cell's geometry (`wkb`, or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)` under any alias) and a constant geometry push an `Inexact` `FilterPredicate::Bbox`. The constant is a `geoarrow.wkb` literal in `OGC:CRS84` / `EPSG:4326` with planar edges (what `ST_SetSRID(ST_GeomFromWKT(...), 4326)` folds to) or `h3_to_wkb(<cell literal>)`. The box is the constant's envelope, grown by `d` degrees for `ST_DWithin` (planar distance in CRS units) and clamped to lon/lat range. `raster-h3-datafusion` then widens it past the largest cell before clipping samples (see `Bbox(b)` above), so every cell the predicate can match keeps its full aggregate; DataFusion re-applies the predicate to drop the extra cells. Compacted tables accept the filter but do not prune. |
 | Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
-| Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types. |
+| Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types, plus `h3_polygon_to_cells(geometry, resolution [, containment])` → `List<UInt64>`, as in DuckDB (a WKB polygon in lon/lat; a `geoarrow.wkb` argument tagged with another CRS is a planning error). |
 | Geometry | The `wkb` column and `h3_to_wkb` results are `geoarrow.wkb` fields with CRS `OGC:CRS84` (planar edges, as in the GeoParquet export), so Sedona's `ST_*` functions accept them directly. |
 
 The crate is a standalone Cargo workspace (listed in the root `exclude`), so DataFusion
@@ -328,7 +328,23 @@ sd.sql("SELECT h3_index, mean FROM dem WHERE ST_DWithin(wkb, ST_SetSRID(ST_Point
 
 `RasterH3Table.continuous(source, resolutions=8, *, crs, nodata, band, bbox)` and
 `RasterH3Table.categorical(source, resolutions=8, *, crs, nodata, bbox)` take the common
-options. The capsule ABI follows the pinned SedonaDB revision, which matches the
+options. `raster_h3_sedona.scalar_functions()` exports the scalar UDFs above, under every
+name and alias, as `sedonadb_scalar_kernel` capsules; `sd.register(...)` installs them all
+(`__sedonadb_extension__`), or register single entries by iterating. Geometry arguments
+must be planar lon/lat or have no CRS, and `h3_to_wkb` returns `OGC:CRS84` geometry, so
+it composes with Sedona's `ST_*` functions and with spatial pushdown:
+
+```python
+sd.register(raster_h3_sedona.scalar_functions())
+sd.read_pyogrio("tracts.geojson").to_view("tracts")
+sd.sql("""
+    SELECT t.name, AVG(d.mean) AS mean_elevation
+    FROM (SELECT name, unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index
+          FROM tracts) AS t
+    JOIN dem AS d ON d.h3_index = t.h3_index
+    GROUP BY t.name
+""").show()
+``` The capsule ABI follows the pinned SedonaDB revision, which matches the
 `sedonadb` 0.5.0 wheel.
 
 ## Testing

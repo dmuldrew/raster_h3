@@ -161,59 +161,61 @@ also reject invalid resolutions; every resolution must be between 0 and 15. See 
 
 #### SedonaDB (Python)
 
-SedonaDB is a spatial engine, so the tracts don't need polyfilling: it joins each hexagon's
-`wkb` polygon to the tract polygons it intersects.
-
 ```python
 # Build the bindings: cd crates/raster-h3-sedona/python && maturin develop --release
 # pip install "sedonadb==0.5.0" geoarrow-pyarrow pandas pyogrio pyproj
 import sedonadb
+import raster_h3_sedona
 from raster_h3_sedona import RasterH3Table
 
 sd = sedonadb.connect()
+sd.register(raster_h3_sedona.scalar_functions())  # h3_polygon_to_cells, h3_to_wkb, ...
 
 # 1. Aggregate the 30m land cover raster into H3 hexagons (scanned lazily by each query)
 sd.create_data_frame(
     RasterH3Table.categorical("nlcd_landcover_2021.tif", 8)
 ).to_view("canopy_h3")
 
-# 2. Read the census tracts as-is: no polyfill, the join below is spatial
+# 2. Polyfill vector census tracts into H3 cells & compute population density
+#    ('covers' returns every hexagon that overlaps the tract, plus the enclosing hexagon for
+#    tracts smaller than one cell, so no tract drops out; border hexagons count for both neighbours)
 sd.read_pyogrio("census_tracts.geojson").to_view("census_tracts")
-
-# 3. JOIN raster hexagons to the tracts they intersect
-#    (like 'covers': border hexagons count for both neighbours, and a tract smaller
-#    than one cell still matches the hexagon that contains it)
-result = sd.sql("""
-    WITH tracts AS (
-        SELECT
-            tract_name,
-            median_income,
-            -- EPSG:5070 (CONUS Albers, NLCD's native CRS) gives areas in m²
-            round(total_population / (ST_Area(ST_Transform(wkb_geometry, 'EPSG:5070')) / 1e6), 0)
-                AS pop_density_per_sqkm,
-            wkb_geometry
-        FROM census_tracts
-    )
+sd.sql("""
     SELECT
-        t.tract_name,
-        t.median_income,
-        t.pop_density_per_sqkm,
-        c.majority_class    AS dominant_landcover,
-        c.majority_fraction AS canopy_purity
-    FROM tracts AS t
-    JOIN canopy_h3 AS c
-      ON ST_Intersects(c.wkb, t.wkb_geometry)
-    WHERE c.majority_class    = 41       -- Deciduous forest (NLCD code)
-      AND c.majority_fraction < 0.30     -- Less than 30% tree canopy
-      AND t.median_income     < 45000    -- Low-income tracts
-      AND t.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
+        tract_name,
+        median_income,
+        -- EPSG:5070 (CONUS Albers, NLCD's native CRS) gives areas in m²
+        round(total_population / (ST_Area(ST_Transform(wkb_geometry, 'EPSG:5070')) / 1e6), 0)
+            AS pop_density_per_sqkm,
+        unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index
+    FROM census_tracts
+""").to_view("census_tracts_h3")
+
+# 3. JOIN raster results with census tracts on the shared H3 index
+result = sd.sql("""
+    SELECT
+        c.tract_name,
+        c.median_income,
+        c.pop_density_per_sqkm,
+        t.majority_class    AS dominant_landcover,
+        t.majority_fraction AS canopy_purity
+    FROM census_tracts_h3 AS c
+    JOIN canopy_h3 AS t
+      ON c.h3_index = t.h3_index
+    WHERE t.majority_class    = 41       -- Deciduous forest (NLCD code)
+      AND t.majority_fraction < 0.30     -- Less than 30% tree canopy
+      AND c.median_income     < 45000    -- Low-income tracts
+      AND c.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
     ORDER BY canopy_purity
 """).to_pandas()
 ```
 
-The join runs as SedonaDB's `SpatialJoinExec`. A filter against a constant geometry, such as
-`ST_Intersects(wkb, ST_GeomFromWKT(...))`, is pushed into the raster scan instead, so only the
-hexagons near it are aggregated. See
+SedonaDB can also skip the polyfill: `census_tracts AS c JOIN canopy_h3 AS t ON
+ST_Intersects(t.wkb, c.wkb_geometry)` joins each hexagon's polygon to the tract polygons
+directly and runs as SedonaDB's `SpatialJoinExec`. The `h3_index` join above is a plain hash
+join on a 64-bit integer, so it is cheaper when the polyfilled tracts are reused.
+A filter against a constant geometry, such as `ST_Intersects(wkb, ST_GeomFromWKT(...))`, is
+pushed into the raster scan, so only the hexagons near it are aggregated. See
 [DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
 
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.

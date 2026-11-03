@@ -160,7 +160,7 @@ fn constant_envelope(expr: &Expr, untagged: Untagged) -> Option<[f64; 4]> {
 
 /// Whether GeoArrow extension metadata declares planar edges in a lon/lat CRS. An unknown
 /// or missing CRS is rejected: pruning with coordinates in another CRS would drop rows.
-fn is_planar_lnglat(metadata: &str) -> bool {
+pub(crate) fn is_planar_lnglat(metadata: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(metadata) else {
         return false;
     };
