@@ -368,6 +368,15 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             DUCKDB_BIN="$(cygpath -w "$(pwd)/duckdb-2.0/duckdb.exe")"
           fi
+          # On the arm64 macOS runner, osx_amd64's v1.5.6 library is x86_64;
+          # run the universal CLI under Rosetta so it can load it.
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" && "$(uname -m)" == "arm64" ]]; then
+            printf '#!/bin/bash
+exec arch -x86_64 "%s" "$@"
+' "$DUCKDB_BIN" > duckdb-2.0/duckdb-x86
+            chmod +x duckdb-2.0/duckdb-x86
+            DUCKDB_BIN="$(pwd)/duckdb-2.0/duckdb-x86"
+          fi
           export DUCKDB_BIN
           # The DuckDB 2.0 smoke tests exercise the v1.5.6-API build packaged above.
           export DUCKDB_VERSION=v1.5.6
