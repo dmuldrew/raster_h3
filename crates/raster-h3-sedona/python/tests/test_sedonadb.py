@@ -140,6 +140,12 @@ def test_spatial_filters_match_an_unpruned_scan(sd, raster, predicate):
     assert rows(sd, query.format("cells", predicate)) == expected
 
 
+def test_spatial_filter_off_the_raster_is_empty(sd, raster):
+    sd.create_data_frame(RasterH3Table.continuous(raster, 8)).to_view("cells")
+    far = "ST_SetSRID(ST_GeomFromWKT('POINT (-100 40)'), 4326)"
+    assert scalar(sd, f"SELECT COUNT(*) FROM cells WHERE ST_Intersects(wkb, {far})") == 0
+
+
 def test_spatial_filter_prunes_the_scan(sd, raster):
     """The predicate reaches the scan across SedonaDB's extension ABI.
 

@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DataFusion: a pushed `FilterPredicate::Bbox` that misses every raster tile now scans empty instead of failing with "No mosaic tiles intersect the requested bounding box", so a spatial filter over an area without data returns no rows. A table-definition `with_bbox` that misses the raster still errors. Core exports the message as `raster::mosaic::NO_TILES_IN_BBOX`.
 - DataFusion `FilterPredicate::Bbox` pushdown no longer changes the aggregates of cells straddling the box edge. The pushed box is widened by more than the largest cell diameter at the coarsest resolution, so every cell intersecting the box keeps the values of an unfiltered scan and the pushdown is a true `Inexact` superset. It is not pushed when compaction is on. `with_bbox` keeps its pixel-clipping semantics.
 
 ## [0.5.0] - 2026-10-28

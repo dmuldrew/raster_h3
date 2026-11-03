@@ -59,3 +59,33 @@ pub fn rows(batches: &[RecordBatch]) -> usize {
 pub fn source(tif: &NamedTempFile) -> String {
     tif.path().to_string_lossy().into_owned()
 }
+
+/// A float32 raster without GeoKeys (pass the CRS to the provider): `width` x `height`
+/// square pixels of `pixel` CRS units from the top-left corner `origin`, valued `value(x, y)`.
+pub fn write_tif_grid(
+    width: u32,
+    height: u32,
+    origin: (f64, f64),
+    pixel: f64,
+    value: impl Fn(u32, u32) -> f32,
+) -> NamedTempFile {
+    let tmp = NamedTempFile::new().unwrap();
+    let file = File::create(tmp.path()).unwrap();
+    let mut encoder = TiffEncoder::new(file).unwrap();
+    let mut img = encoder.new_image::<Gray32Float>(width, height).unwrap();
+    img.encoder()
+        .write_tag(tiff::tags::Tag::Unknown(33550), &[pixel, pixel, 0.0f64][..])
+        .unwrap();
+    img.encoder()
+        .write_tag(
+            tiff::tags::Tag::Unknown(33922),
+            &[0.0f64, 0.0, 0.0, origin.0, origin.1, 0.0][..],
+        )
+        .unwrap();
+    let data: Vec<f32> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .map(|(x, y)| value(x, y))
+        .collect();
+    img.write_data(&data).unwrap();
+    tmp
+}

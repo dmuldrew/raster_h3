@@ -108,7 +108,7 @@ narrows it with the filters and returns an `ExecutionPlan`.
 | `MinMean(v)`, `MaxMean(v)` | Exact | Unsupported | Keeps the stricter bound |
 | `MinMajorityFraction(v)` | Unsupported | Exact | Keeps the stricter bound |
 | `Resolution(r)` | Exact | Exact | Restricts the scan to `r`; an `r` outside the configured set yields an empty scan |
-| `Bbox(b)` | Inexact | Inexact | Widens `b` by more than the largest cell diameter at the coarsest resolution, then intersects it with the configured bbox (a disjoint box yields an empty scan). Every cell that intersects `b` keeps the aggregates of an unfiltered scan; the extra cells near the widened edge are partial, so the caller must re-apply the predicate. Not pushed when `with_compact(true)` is set |
+| `Bbox(b)` | Inexact | Inexact | Widens `b` by more than the largest cell diameter at the coarsest resolution, then intersects it with the configured bbox (a disjoint box yields an empty scan). Every cell that intersects `b` keeps the aggregates of an unfiltered scan; the extra cells near the widened edge are partial, so the caller must re-apply the predicate. Not pushed when `with_compact(true)` is set. A pushed box that misses every raster tile scans empty |
 | `Other(_)` | Unsupported | Unsupported | Ignored by the scan |
 
 Filters only ever narrow the table. A pushed `Bbox` differs from `with_bbox`: `with_bbox` is
