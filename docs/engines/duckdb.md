@@ -273,6 +273,32 @@ SELECT * FROM h3_raster_continuous_aggregate(
 
 > 💡 **Tip**: For optimal remote streaming and maximum local throughput, source rasters should be formatted as tiled WGS84 COGs with $512 \times 512$ blocks. See [Optimal Raster Format & Ingestion Speed](../optimal-raster-format.md).
 
+These reads use the extension's built-in HTTP/S3 client, configured through `AWS_*`
+environment variables, and accept `http(s)://` and `s3://` paths only. Other schemes
+such as `gs://` fail with an "Unsupported remote protocol" error unless the DuckDB file
+system below is enabled.
+
+### DuckDB file system & secrets (DuckDB 2.0 build)
+
+On the [DuckDB 2.0 build](#extension-builds), `SET raster_h3_use_duckdb_fs = true` opens
+rasters through DuckDB's own file system instead. Remote reads then follow the loaded
+`httpfs` configuration and `CREATE SECRET` credentials, and any scheme DuckDB serves works:
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+CREATE SECRET (TYPE gcs, KEY_ID '...', SECRET '...');
+SET raster_h3_use_duckdb_fs = true;
+
+SELECT * FROM h3_raster_continuous_aggregate('gs://my-bucket/dem.tif', resolution := 8);
+```
+
+Byte ranges are still coalesced and prefetched by the extension (`fetch_workers` reads in
+parallel, each on its own DuckDB file handle). With the option on, local files are read
+through DuckDB too, so they lose the memory-mapped fast path; leave it off for local-only
+work. The `RASTER_H3_USE_DUCKDB_FS` environment variable turns it on as well. See
+[session options](../sql-api-reference.md#session-options-duckdb-20-build) for the related
+`raster_h3_fetch_workers`, `raster_h3_decode_budget_mb` and `raster_h3_workers` settings.
+
 ### Multi-file mosaics
 
 ```sql
@@ -344,6 +370,28 @@ name that doesn't exist returns `status = 'ERROR: H3 column ... not found ...; a
 with `total_hexagons = 0` and writes no file.
 
 See [PMTiles & Multi-Resolution](../pmtiles.md) for zoom mapping and viewer setup.
+
+### COPY to PMTiles (DuckDB 2.0 build)
+
+Any query whose first column is an H3 cell can be written straight to PMTiles; the other
+columns become feature properties named `column_2`, `column_3`, …:
+
+```sql
+COPY (
+    SELECT h3_index, mean, count
+    FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8)
+    WHERE count > 4
+) TO 'dem_filtered.pmtiles' (FORMAT pmtiles);
+
+-- Keep zoom 10-13 only, cap row buffering at 64 MiB, write to S3
+COPY (SELECT cell, population FROM census_cells)
+TO 's3://my-bucket/census.pmtiles' (FORMAT pmtiles, min_zoom 10, max_zoom 13, memory_budget_mb 64);
+```
+
+Inputs larger than `memory_budget_mb` (default 256) are sorted through temporary files in
+DuckDB's `temp_directory`. See the
+[reference](../sql-api-reference.md#copy-to-pmtiles-copy-query-to-path-format-pmtiles--duckdb-20-build)
+for accepted column types and NULL/invalid-cell handling.
 
 ## Client Languages (Python, Node.js, R)
 
@@ -438,7 +486,7 @@ makefiles (git submodule), which is what the
 `build: cargo`. It builds the root crate and appends the footer with DuckDB's own
 `append_extension_metadata.py` (stable `C_STRUCT` ABI, minimum DuckDB `v1.2.0`).
 
-Two extension builds ship in the repository: `v1.2.0/<platform>/` contains the build against the v1.2.0 C API (loads on DuckDB 1.2 through 1.5), and `v2.0.0/<platform>/` contains a build against the **v1.5.6 C extension API** (loads on DuckDB 2.0+), which adds DuckDB file-system raster reads (`SET raster_h3_use_duckdb_fs = true`), session options (`SET raster_h3_fetch_workers`, `SET raster_h3_decode_budget_mb`, `SET raster_h3_workers`), `COPY (SELECT ...) TO <path> (FORMAT pmtiles, min_zoom N, max_zoom N)`, plan-time argument validation on `h3_polygon_to_cells`, and native `GEOMETRY` types. Build it locally with `cargo build --release --features duckdb-api-v1_5_6` and package it with `package_extension --duckdb-version v1.5.6` (the C API version DuckDB checks in the footer; `v2.0.0` is rejected). Place the result under `v2.0.0/<platform>/` in the repository. `COPY ... (FORMAT pmtiles, memory_budget_mb N)` buffers at most about N MiB of input rows (default 256) and sorts larger inputs through temporary files in DuckDB's `temp_directory`, which it creates only when it actually spills.
+The community build above targets the v1.2.0 C API; see [extension builds](#extension-builds) for the DuckDB 2.0 build.
 
 ```bash
 git submodule update --init
@@ -452,12 +500,35 @@ It is a copy of the file submitted to `duckdb/community-extensions` as
 `extensions/raster_h3/description.yml`; `repo.ref` must name a commit on this repository that
 contains the `Makefile` and submodule.
 
+### Extension builds
+
+Two builds of the extension ship in each release repository:
+
+| Directory | Built with | C API version (footer) | Loads on | Adds |
+| :--- | :--- | :--- | :--- | :--- |
+| `v1.2.0/<platform>/` | `cargo build --release --lib` | `v1.2.0` | DuckDB 1.2 – 1.5 | — |
+| `v2.0.0/<platform>/` | `cargo build --release --lib --features duckdb-api-v1_5_6` | `v1.5.6` | DuckDB 2.0+ | [DuckDB file system & secrets](#duckdb-file-system--secrets-duckdb-20-build), [session options](../sql-api-reference.md#session-options-duckdb-20-build), [`COPY ... (FORMAT pmtiles)`](#copy-to-pmtiles-duckdb-20-build), plan-time validation of constant `h3_polygon_to_cells` arguments, and native `GEOMETRY` everywhere |
+
+DuckDB asks a repository for `<prefix>/<its own version>/<platform>/`, so DuckDB 2.0
+fetches the `v2.0.0` tree. Package the DuckDB 2.0 build with the C API version it was
+built against; DuckDB rejects `v2.0.0` in the footer:
+
+```bash
+cargo build --release --lib --features duckdb-api-v1_5_6
+cargo run --release --bin package_extension -- \
+  --input target/release/libraster_h3.so \
+  --output dist/v2.0.0/linux_amd64/raster_h3.duckdb_extension \
+  --platform linux_amd64 --duckdb-version v1.5.6
+```
+
+CI builds it into a separate `target-v156/` directory so both builds come from one job.
+
 ## Entry Points
 
 | Symbol | Called by | Behaviour |
 | :--- | :--- | :--- |
 | `raster_h3_init_c_api(info, access)` | DuckDB ≥ 1.2 (C-API extensions) | Fetches the database handle from the access table and calls `raster_h3_init`. A panic is reported through `access->set_error`. |
-| `raster_h3_init(db)` | Older loaders, and `raster_h3_init_c_api` | Opens a connection (closed by an RAII guard on every path) and registers all functions. Returns `false` if any registration fails. |
+| `raster_h3_init(db)` | Older loaders, and `raster_h3_init_c_api` | Opens a connection (closed by an RAII guard on every path) and registers all functions; the DuckDB 2.0 build also registers its session options and the `pmtiles` COPY format there. Returns `false` if any function registration fails. A session option that DuckDB refuses (because an option of that name already exists) is reported on stderr and does not stop loading. |
 | `raster_h3_version()` | DuckDB | Returns the C-API version string `v0.0.1`. |
 
 The root crate keeps these symbols in the shared library through
@@ -471,7 +542,9 @@ The root crate keeps these symbols in the shared library through
 | `h3_raster_categorical_aggregate` | table (`format := 'wide' \| 'long'`) | [`categorical_table_function.rs`](../../crates/raster-h3-duckdb/src/functions/categorical_table_function.rs) |
 | `h3_raster_to_parquet` | table (1 summary row) | [`parquet_table_function.rs`](../../crates/raster-h3-duckdb/src/functions/parquet_table_function.rs) |
 | `h3_raster_to_pmtiles`, `h3_parquet_to_pmtiles` | table (1 summary row) | [`pmtiles_table_function.rs`](../../crates/raster-h3-duckdb/src/functions/pmtiles_table_function.rs) |
-| `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid` (UBIGINT/VARCHAR), `h3_to_wkb` (UBIGINT/VARCHAR), `h3_cell_to_parent` (UBIGINT/VARCHAR), `h3_to_geometry` / `h3_cell_to_geometry` (UBIGINT/VARCHAR), `h3_polygon_to_cells` (BLOB, plus GEOMETRY on DuckDB ≥ 1.5; returns `UBIGINT[]`) | scalar | [`scalar.rs`](../../crates/raster-h3-duckdb/src/functions/scalar.rs) |
+| `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid` (UBIGINT/VARCHAR), `h3_to_wkb` (UBIGINT/VARCHAR), `h3_cell_to_parent` (UBIGINT/VARCHAR), `h3_to_geometry` / `h3_cell_to_geometry` (UBIGINT/VARCHAR), `h3_polygon_to_cells` (BLOB, plus GEOMETRY on DuckDB ≥ 1.5; returns `UBIGINT[]`; on the DuckDB 2.0 build a bind callback rejects invalid constant arguments at plan time) | scalar | [`scalar.rs`](../../crates/raster-h3-duckdb/src/functions/scalar.rs) |
+| `pmtiles` (DuckDB 2.0 build) | `COPY ... TO ... (FORMAT pmtiles)` format | [`copy_function.rs`](../../crates/raster-h3-duckdb/src/functions/copy_function.rs) |
+| `raster_h3_use_duckdb_fs`, `raster_h3_fetch_workers`, `raster_h3_decode_budget_mb`, `raster_h3_workers` (DuckDB 2.0 build) | session options (`SET`) | [`config.rs`](../../crates/raster-h3-duckdb/src/functions/config.rs) |
 
 The scalar kernels call `raster_h3_core::scalar_ops`, so their results match the other
 engines (with the `0` vs `NULL` differences listed in the
@@ -519,7 +592,9 @@ sequenceDiagram
 host DuckDB version at runtime (`dlsym` / `GetProcAddress`) and can probe whether the
 `spatial` extension is loaded. `h3_to_geometry` / `h3_cell_to_geometry` return the native
 `GEOMETRY` type on DuckDB ≥ 1.5; on older versions they return a WKB `BLOB` aliased as
-`GEOMETRY`, the convention the `spatial` extension uses. `h3_to_wkb` always returns a
+`GEOMETRY`, the convention the `spatial` extension uses. The DuckDB 2.0 build always uses
+the native type (for these functions, the `geom` column of the table functions and the
+`GEOMETRY` overload of `h3_polygon_to_cells`), so `typeof(...)` reads `GEOMETRY`. `h3_to_wkb` always returns a
 plain `BLOB`. Cells crossing the antimeridian are `MULTIPOLYGON`s and the two pole cells
 are polar-cap polygons; see [cell geometry](../sql-api-reference.md#cell-geometry).
 
@@ -573,7 +648,8 @@ README's [Troubleshooting](../../README.md#troubleshooting--common-pitfalls) sec
 
 | Test | Scope |
 | :--- | :--- |
-| `crates/raster-h3-duckdb/tests/it/ffi_sql.rs`, `tests/it/duckdb_sql_smoke.rs` | SQL through a real DuckDB CLI when available |
+| `crates/raster-h3-duckdb/tests/it/ffi_sql.rs` | Mock C-API harness emulating the v1.2.0 function table; compiled only for the default build |
+| `tests/it/duckdb_sql_smoke.rs` | SQL through a real DuckDB CLI when available; `real_sql_v156_features` covers the DuckDB 2.0 build (session options, DuckDB file-system reads, `COPY ... (FORMAT pmtiles)` including spilling and overwrite, plan-time validation, native `GEOMETRY`) and runs when `DUCKDB_VERSION=v1.5.6` |
 | `tests/it/package_extension.rs` | Extension footer packaging |
 | `tests/it/multi_engine_e2e.rs` | DuckDB results compared with the other engines when `duckdb` is on `PATH` |
 | `cargo test -p raster-h3-duckdb` | Crate unit tests and its `tests/it` binary (uses the core `test-hooks` feature) |

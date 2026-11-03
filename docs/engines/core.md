@@ -201,6 +201,25 @@ range that needs the same budget. Handles remain valid after the queue is droppe
 All engine adapters use this core prefetcher; `RemotePrefetchConfig` is a Rust
 queue-level API, not an additional SQL, Python or CLI option.
 
+### Custom byte sources
+
+By default local paths are memory-mapped and remote URLs use the built-in HTTP/S3
+client (`http(s)://` and `s3://`; any other `scheme://` path counts as remote but is
+rejected by that client). An engine can supply its own byte source instead:
+
+- Implement `raster::http_range::RemoteTransport` (`fetch_range(start, end, expected_total)`
+  returning exactly those bytes, and `probe(initial_len)` reporting the total size). It must
+  be safe to call from several threads, because prefetch and decode workers share it.
+- Wrap a closure that opens one in `RemoteSourceFactory::new(|path| ...)`, building the
+  source with `RemoteHttpSource::from_transport(path, Box::new(transport))`.
+- Set `MultiResolutionConfig::remote_source_factory`, or call
+  `GeoTiffStreamReader::open_with_remote_source_factory` /
+  `MosaicReader::open_with_remote_source_factory`.
+
+When a factory is set it opens **every** path, local ones included, and the prefetcher,
+cache and coalescing work on top of it unchanged. The DuckDB 2.0 build uses this to read
+through DuckDB's file system (`SET raster_h3_use_duckdb_fs = true`).
+
 ### Mosaic decoder cache
 
 `PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF
@@ -403,6 +422,9 @@ floats become `null`; binary columns (`wkb`) are lowercase hex strings.
 | `H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, path, ParquetExportConfig)` / `write_categorical_streamer_to_parquet` | Parquet or OGC GeoParquet 1.1 (`config.geoparquet`); the file is published only after the stream completes successfully. |
 | `H3PmtilesTiler::process_raster_source_to_pmtiles(source, path, config)` / `process_categorical_source_to_pmtiles` | PMTiles v3 archive with one zoom range per requested resolution. See [PMTiles & Multi-Resolution](../pmtiles.md). |
 | `transcode::process_parquet_to_pmtiles` | Pre-aggregated H3 Parquet → PMTiles. An explicit `h3_column_name` that isn't in the schema returns `Err` listing available columns; `None` auto-detects. |
+| `H3PmtilesTiler::export_h3_features(features, path)` | PMTiles v3 from `H3Feature`s in any order, with bounded memory (external sort by latitude, 256 MiB buffer). Invalid H3 indexes are counted in `PmtilesExportSummary::invalid_features_dropped`. |
+| `pmtiles::ExternalFeatureExport::new(budget_bytes, spill_dir)` → `push(feature)` → `finish(path)` / `finish_into(writer)` | The exporter behind `export_h3_features`, with a custom buffer budget, spill directory (created only when a run is spilled) and output; `finish_into` streams the archive to any `std::io::Write`, such as a database file system. |
+| `PmtilesWriter::new_in(..., spill_dir)` / `finish_into(writer)` | Low-level archive writer: tile spill file in a chosen directory, and the finished archive streamed to any writer (`finish(path)` writes atomically via a temporary file next to `path`). |
 
 ## Errors
 

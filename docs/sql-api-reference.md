@@ -6,6 +6,8 @@ This document is the complete **SQL** reference for the `raster_h3` DuckDB exten
 
 The other engines accept a subset of these parameters; see their deep dives under [Engines](engines/README.md). Statistic definitions and output column meanings apply to every engine.
 
+Sections marked **DuckDB 2.0 build** need the extension built against the v1.5.6 C API, which ships under `v2.0.0/<platform>/` and loads on DuckDB 2.0 and later (see [extension builds](engines/duckdb.md#extension-builds)). The v1.2.0 build used by DuckDB 1.2–1.5 doesn't have them.
+
 ## Continuous Rasters: `h3_raster_continuous_aggregate(file_path, [resolution], ...)`
 *(Alias: `h3_raster_continuous`)*
 
@@ -48,6 +50,8 @@ The other engines accept a subset of these parameters; see their deep dives unde
 | `geom` | `BOOLEAN` | `false` | Emit a `geometry` column of the cell geometries (enables DuckDB Spatial interop); see [cell geometry](#cell-geometry). |
 | `quantiles` | `VARCHAR` | `None` | Streaming quantile targets: percentiles such as `'p50,p90,p99.5'` or `'0.05'`, aliases `median`/`q1`/`q2`/`q3`/`iqr`, or presets `'default'`, `'box'` (p25, p50, p75, iqr), `'tails'`, `'deciles'`. Percentiles must be finite and strictly between 0 and 100 (decimals between 0 and 1). Adds one nullable column per target; per-cell sketches are only built when the query selects or filters on one of these columns. |
 | `percentiles` | `VARCHAR` | `None` | Alias for `quantiles`. |
+
+On the DuckDB 2.0 build, `workers`, `fetch_workers` and `decode_budget_mb` can also come from [session options](#session-options-duckdb-20-build); an argument passed here takes precedence.
 
 ### Output Schema
 | Column Name | Logical Type | Description |
@@ -158,6 +162,8 @@ Every engine reads these from the GeoTIFF and applies them the same way:
 | `min_count` | `DOUBLE` | `None` | Minimum weighted pixel count threshold for output. |
 | `min_majority_fraction` | `DOUBLE` | `None` | Minimum majority class fraction — cells below this threshold are excluded. |
 | `remap` | `VARCHAR` | `None` | Category remapping rules: exact (`'10=Forest,20=Urban'`), range (`'20-29=Urban'`), wildcard (`'*=Other'`). |
+
+On the DuckDB 2.0 build, `workers`, `fetch_workers` and `decode_budget_mb` can also come from [session options](#session-options-duckdb-20-build); an argument passed here takes precedence.
 | `geom` | `BOOLEAN` | `false` | Emit a `geometry` column with OGC WKB 2D Polygon hexagons. |
 
 ### Wide Format Output Schema (`format := 'wide'`, Default)
@@ -316,6 +322,67 @@ Returns the same 8-column summary schema as `h3_raster_to_pmtiles` (`total_hexag
 
 ---
 
+## COPY to PMTiles: `COPY (query) TO path (FORMAT pmtiles, ...)` (DuckDB 2.0 build)
+
+Writes the rows of any query to a PMTiles v3 vector archive, one hexagon feature per row.
+
+```sql
+COPY (
+    SELECT h3_index, mean, count FROM h3_stats WHERE count > 10
+) TO 'stats.pmtiles' (FORMAT pmtiles, min_zoom 8, max_zoom 13);
+
+-- Remote destinations go through DuckDB's file system (httpfs + CREATE SECRET)
+COPY (SELECT cell, population FROM census_cells)
+TO 's3://my-bucket/census.pmtiles' (FORMAT pmtiles);
+```
+
+### Input columns
+| Column | Accepted types | Meaning |
+| :--- | :--- | :--- |
+| First | `UBIGINT`, `BIGINT` or hex `VARCHAR` | The H3 cell. Rows where it is `NULL` are skipped. Any other value that is not a valid H3 cell (a negative `BIGINT`, unparsable hex, or an invalid index) fails the `COPY`. |
+| Every other | `UBIGINT`, `BIGINT`, `UINTEGER`, `INTEGER`, `USMALLINT`, `SMALLINT`, `UTINYINT`, `TINYINT`, `DOUBLE`, `FLOAT`, `BOOLEAN`, `VARCHAR` | A feature property. The stable C API does not expose column names, so the property is named `column_<n>`, where `n` is the column's 1-based position (the first property column is `column_2`). `NULL` values and columns of other types are left out of the feature. |
+
+Every feature also gets `h3_index`, `h3_hex` and `resolution` properties, like the other PMTiles exports. Cells go in the `h3_hexagons` layer at the zoom given by their resolution (see [zoom mapping](pmtiles.md#h3-resolution-to-pmtiles-zoom-level-mapping)).
+
+### Options
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `min_zoom` | integer 0–255 | `None` | Drop rows whose cell's tile zoom is below this. |
+| `max_zoom` | integer 0–255 | `None` | Drop rows whose cell's tile zoom is above this. Must be ≥ `min_zoom`. |
+| `memory_budget_mb` | integer 1–1048576 | `256` | Approximate memory for buffered input rows, in MiB. Beyond it, rows are sorted into temporary files and merged at the end, so inputs larger than memory work. The archive bytes do not depend on the budget. |
+
+Option names are case-insensitive. Any other option is rejected with an error naming the supported ones.
+
+### Behaviour
+- Rows can arrive in any order. The export sorts them by latitude (north first) and writes each tile as soon as no later row can reach it, so peak memory is about `memory_budget_mb` plus the tiles of one latitude band.
+- Temporary files go to DuckDB's `temp_directory` (created only when the budget is exceeded, as DuckDB does) and fall back to the system temp directory if it is unset or can't be created.
+- The destination is opened through DuckDB's file system when the `COPY` starts and replaced if it exists. The archive streams straight to it, with no local copy first.
+
+---
+
+## Session Options (DuckDB 2.0 build)
+
+The DuckDB 2.0 build registers these options, so a session can `SET` them once instead of passing arguments to every call:
+
+```sql
+SET raster_h3_use_duckdb_fs = true;   -- read rasters through DuckDB's file system
+SET raster_h3_fetch_workers = 16;
+SET raster_h3_decode_budget_mb = 512;
+SET raster_h3_workers = 8;
+SELECT current_setting('raster_h3_fetch_workers');
+```
+
+| Option | Type | Default | Environment fallback | Effect |
+| :--- | :--- | :--- | :--- | :--- |
+| `raster_h3_use_duckdb_fs` | `BOOLEAN` | `false` | `RASTER_H3_USE_DUCKDB_FS` (`1`, `true`, `on`, `yes`) | Open every raster through DuckDB's file system instead of the built-in readers. Remote paths then use the loaded `httpfs` configuration and `CREATE SECRET` credentials, and any scheme DuckDB serves works (`s3://`, `gs://`, `az://`, `abfss://`, `hf://`, `http(s)://`, …). Local files are read through DuckDB too, so they lose the memory-mapped fast path. See [DuckDB file system](engines/duckdb.md#duckdb-file-system--secrets-duckdb-20-build). |
+| `raster_h3_fetch_workers` | `BIGINT` | `0` (unset) | `RASTER_H3_FETCH_WORKERS` | Default for the `fetch_workers` argument. |
+| `raster_h3_decode_budget_mb` | `BIGINT` | `0` (unset) | `RASTER_H3_DECODE_BUDGET_MB` | Default for the `decode_budget_mb` argument. |
+| `raster_h3_workers` | `BIGINT` | `0` (unset) | `RASTER_H3_WORKERS` | Default for the `workers` argument. |
+
+They apply to `h3_raster_continuous_aggregate`, `h3_raster_categorical_aggregate`, `h3_raster_to_parquet` and `h3_raster_to_pmtiles`, and are read when the query is planned. For the worker and budget options the order is: the function's own argument, then a positive session value, then the environment variable, then the built-in default. `raster_h3_use_duckdb_fs` is on when the session sets it to `true` or the environment variable is set. The environment variables are read only by the DuckDB 2.0 build.
+
+---
+
 ## Scalar Helper Functions
 
 | Function | Signature | Return Type | Description |
@@ -372,9 +439,9 @@ not supported.
 | :--- | :--- |
 | Any argument `NULL` | `NULL` |
 | `geometry` is not a valid WKB `POLYGON`/`MULTIPOLYGON` (e.g. a `POINT`), or has non-finite coordinates | `NULL` |
-| `resolution` outside `0..=15` | `NULL` |
+| `resolution` outside `0..=15` | `NULL`. On the DuckDB 2.0 build a constant `resolution` outside the range is a query error at plan time instead. |
 | `POLYGON EMPTY` / `MULTIPOLYGON EMPTY` | `[]` |
-| Unknown `containment` name | Query error that lists the accepted names |
+| Unknown `containment` name | Query error that lists the accepted names. On the DuckDB 2.0 build a constant name is checked when the query is planned, before any row runs. |
 | h3o's pre-tiling estimate exceeds 10,000,000 cells for a row | Query error. Use a coarser resolution or split the polygon (for example with `ST_Subdivide`-style tiling) |
 
 #### Examples

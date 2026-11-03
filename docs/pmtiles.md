@@ -123,6 +123,25 @@ To ensure optimal visual density on screen (150 to 2,500 hexagons per 512px tile
 | **Res 9** | 0.105 km² (10.5 ha) | 174 m | Parcel / Intersection | **Z14 – Z15** | ~700 – 2,200 |
 | **Res 10** | 0.015 km² (1.5 ha) | 65.9 m | Building Footprint / Lot | **Z16 – Z17** | ~800 – 2,500 |
 
+## Exporting Any H3 Table
+
+Rasters stream into tiles north to south, so a tile can be written as soon as the scan passes
+its southern edge. Arbitrary H3 tables have no such order. Two routes write them to PMTiles:
+
+* **SQL (DuckDB 2.0 build)**: `COPY (SELECT cell, ...) TO 'out.pmtiles' (FORMAT pmtiles)` writes
+  any query, with `min_zoom`/`max_zoom` filters and an optional `memory_budget_mb`. See the
+  [reference](sql-api-reference.md#copy-to-pmtiles-copy-query-to-path-format-pmtiles--duckdb-20-build).
+  For a Parquet file on any DuckDB version, `h3_parquet_to_pmtiles` also works.
+* **Rust**: `H3PmtilesTiler::export_h3_features(features, path)` takes `H3Feature`s in any order.
+  `pmtiles::ExternalFeatureExport` is the same exporter with a custom memory budget, spill
+  directory, and output (`finish_into` streams to any `std::io::Write`).
+
+Both sort the cells by latitude first. Input beyond the memory budget (256 MiB by default) is
+written to temporary files as sorted runs and merged, and each tile is written out once the merge
+has passed it. Memory therefore stays near the budget plus one latitude band of open tiles,
+whatever the input size. The sort order is fixed (latitude, then H3 index), so the archive is
+byte-for-byte the same whether or not it spilled.
+
 ## Cell Geometry in Vector Tiles
 
 Each feature's exterior ring has positive area in tile coordinates, as MVT 2.1 requires.
