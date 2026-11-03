@@ -1,0 +1,26 @@
+[package]
+name = "raster-h3-sedona-python"
+publish = false
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.94"
+authors = ["raster_h3 contributors"]
+license = "MIT"
+repository = "https://github.com/dmuldrew/raster_h3"
+description = "SedonaDB Python bindings for raster_h3: RasterH3Table as a sedonadb_table_provider capsule"
+
+[lib]
+name = "raster_h3_sedona_python"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+raster-h3-sedona = { version = "0.5.0", path = ".." }
+raster-h3-datafusion = { version = "0.5.0", path = "../../raster-h3-datafusion" }
+datafusion = { version = "=54.1.0", default-features = false }
+# SedonaDB's C extension ABI. Same revision as the `sedona` dev dependency of raster-h3-sedona;
+# the table-provider ABI there matches the `sedonadb` 0.5.0 wheel.
+sedona-extension = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc06fae0ff5662e99608d7e8b1" }
+# `extension-module` and `abi3-py310` are added by maturin (see pyproject.toml), so plain
+# `cargo build` / `cargo clippy` link against libpython normally.
+pyo3 = "0.30"
+tokio = { version = "1", features = ["rt-multi-thread"] }

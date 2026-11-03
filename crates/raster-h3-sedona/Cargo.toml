@@ -11,7 +11,9 @@ description = "Apache DataFusion / SedonaDB adapter for raster_h3 table function
 
 # Standalone workspace: DataFusion is pinned to SedonaDB's version, and keeping it out of
 # the main workspace leaves the root Cargo.lock, `cargo deny` and `--workspace` CI untouched.
+# `python` holds the SedonaDB Python bindings (built with maturin).
 [workspace]
+members = [".", "python"]
 
 [lib]
 name = "raster_h3_sedona"
@@ -25,7 +27,6 @@ arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt"] }
 async-trait = "0.1"
-h3o = "0.11"
 serde_json = "1.0"
 # Only for the `sedona-e2e` tests; pinned to the SedonaDB revision this adapter was checked against.
 sedona = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc06fae0ff5662e99608d7e8b1", default-features = false, features = ["geo"], optional = true }
@@ -35,6 +36,9 @@ sedona = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc0
 sedona-e2e = ["dep:sedona"]
 
 [dev-dependencies]
+h3o = "0.11"
+# SedonaDB's extension ABI, for the `extension_abi` round-trip tests (same revision as `sedona`).
+sedona-extension = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc06fae0ff5662e99608d7e8b1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
 tiff = "0.11"

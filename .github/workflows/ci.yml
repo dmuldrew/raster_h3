@@ -431,8 +431,8 @@ jobs:
       - name: Run pg-extension tests
         run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
 
-  # raster-h3-sedona is a standalone workspace (DataFusion pinned to SedonaDB's version), so
-  # the --workspace jobs above never see it. The `sedona-e2e` suite is left to manual runs:
+  # raster-h3-sedona is a standalone workspace (DataFusion pinned to SedonaDB's version, plus
+  # its Python bindings), so the --workspace jobs above never see it. The `sedona-e2e` suite is left to manual runs:
   # it compiles SedonaDB from git.
   sedona-adapter:
     name: DataFusion / SedonaDB adapter
@@ -465,6 +465,19 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --no-fail-fast
+
+      # The SedonaDB Python bindings: build the abi3 module and scan it from the sedonadb wheel.
+      - name: Clippy (Python bindings)
+        run: cargo clippy -p raster-h3-sedona-python --all-targets --locked -- -D warnings
+
+      - name: Test Python bindings against sedonadb
+        working-directory: crates/raster-h3-sedona/python
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin build --release --locked --out dist
+          .venv/bin/pip install dist/*.whl pytest pandas geoarrow-pyarrow "sedonadb==0.5.0"
+          .venv/bin/pytest -v
 
   # All supply-chain checks are blocking; exceptions belong in deny.toml with a reason.
   deny:

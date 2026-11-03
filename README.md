@@ -257,7 +257,7 @@ returns the same cells and statistics for the same input.
 | **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) · [Polars API Reference](docs/polars-api-reference.md) |
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
-| **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version) | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
+| **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version); SedonaDB Python: `maturin build` in `crates/raster-h3-sedona/python` | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
 | **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 
@@ -572,7 +572,7 @@ cargo build --release -p raster-h3-pg --features pg-extension  # PostgreSQL modu
 | `raster-h3-core` | [`crates/raster-h3-core`](crates/raster-h3-core) |
 | `raster-h3-duckdb` | [`crates/raster-h3-duckdb`](crates/raster-h3-duckdb) |
 | `raster-h3-datafusion` | [`crates/raster-h3-datafusion`](crates/raster-h3-datafusion) |
-| `raster-h3-sedona` | [`crates/raster-h3-sedona`](crates/raster-h3-sedona) (standalone workspace) |
+| `raster-h3-sedona` | [`crates/raster-h3-sedona`](crates/raster-h3-sedona) (standalone workspace; Python bindings in `python/`) |
 | `raster-h3-python` | [`crates/raster-h3-python`](crates/raster-h3-python) |
 | `raster-h3-pg` | [`crates/raster-h3-pg`](crates/raster-h3-pg) |
 | `raster-h3-cli` | [`crates/raster-h3-cli`](crates/raster-h3-cli) |

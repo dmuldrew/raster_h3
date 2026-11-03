@@ -16,7 +16,6 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::ExecutionPlan;
-use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::columnar::ArrowArrayStream;
 use raster_h3_datafusion::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
@@ -24,7 +23,7 @@ use raster_h3_datafusion::{
 
 use crate::convert::{to_arrow_schema, to_df_error};
 use crate::filters::translate;
-use crate::spatial::cell_margin_km;
+use crate::spatial::Untagged;
 
 /// Which aggregation a table runs; selects the columns filters may be pushed into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,52 +36,53 @@ pub enum TableKind {
 ///
 /// Projection and `LIMIT` are pushed into the scanline aggregator, and so are filters on
 /// `count` / `total_count`, `mean`, `majority_fraction` and `resolution`, and spatial
-/// predicates on `wkb` against a constant lon/lat geometry (see the `filters` and
-/// `spatial` modules). Aggregation runs on DataFusion's blocking thread pool and streams
-/// batches back through the Arrow C Stream Interface without copying.
+/// predicates (`ST_Intersects`-style and `ST_DWithin`) between `wkb` or
+/// `h3_to_wkb(h3_index)` and a constant lon/lat geometry (see the `filters` and `spatial`
+/// modules). Aggregation runs on DataFusion's blocking thread pool and streams batches back
+/// through the Arrow C Stream Interface without copying.
 pub struct RasterH3Table {
     inner: Arc<dyn raster_h3_datafusion::TableProvider>,
     kind: TableKind,
     schema: arrow::datatypes::SchemaRef,
-    /// Bound on cell size for spatial pushdown; `None` disables it.
-    bbox_margin_km: Option<f64>,
+    untagged: Untagged,
 }
 
 impl RasterH3Table {
     /// Wrap a configured continuous provider (CRS, nodata, quantiles, ...).
     pub fn continuous(provider: ContinuousRasterTableProvider) -> Self {
-        let margin = bbox_margin_km(&provider.config);
-        Self::new(Arc::new(provider), TableKind::Continuous, margin)
+        Self::new(Arc::new(provider), TableKind::Continuous)
     }
 
     /// Wrap a configured categorical provider (format, remapper, ...).
     pub fn categorical(provider: CategoricalRasterTableProvider) -> Self {
-        let margin = bbox_margin_km(&provider.config);
-        Self::new(Arc::new(provider), TableKind::Categorical, margin)
+        Self::new(Arc::new(provider), TableKind::Categorical)
     }
 
-    fn new(
-        inner: Arc<dyn raster_h3_datafusion::TableProvider>,
-        kind: TableKind,
-        bbox_margin_km: Option<f64>,
-    ) -> Self {
+    fn new(inner: Arc<dyn raster_h3_datafusion::TableProvider>, kind: TableKind) -> Self {
         let schema = to_arrow_schema(&inner.schema());
         Self {
             inner,
             kind,
             schema,
-            bbox_margin_km,
+            untagged: Untagged::Reject,
         }
     }
-}
 
-/// Margin covering the largest cell the scan can emit: the coarsest configured resolution.
-/// Compaction merges children into coarser parents, so it gets no margin.
-fn bbox_margin_km(config: &MultiResolutionConfig) -> Option<f64> {
-    if config.compact || config.compact_h3_children {
-        return None;
+    /// Treat `Binary` literals without `geoarrow.wkb` metadata in spatial predicates as
+    /// geometries in the cells' CRS (`OGC:CRS84`), so they push down too.
+    ///
+    /// Enable this only when filters come from SedonaDB's planner across its extension ABI
+    /// (as in the Python bindings): `datafusion-proto` strips literal metadata there, and
+    /// SedonaDB has already rejected predicates whose geometries differ in CRS. In a plain
+    /// DataFusion context an untagged literal could be in any CRS, so it is not pushed.
+    pub fn with_untagged_wkb_as_lnglat(mut self, enabled: bool) -> Self {
+        self.untagged = if enabled {
+            Untagged::LngLat
+        } else {
+            Untagged::Reject
+        };
+        self
     }
-    cell_margin_km(*config.resolutions.iter().min()?)
 }
 
 impl fmt::Debug for RasterH3Table {
@@ -110,7 +110,7 @@ impl TableProvider for RasterH3Table {
         Ok(filters
             .iter()
             .map(|f| {
-                translate(f, self.kind, self.bbox_margin_km)
+                translate(f, self.kind, self.untagged)
                     .map_or(TableProviderFilterPushDown::Unsupported, |t| t.pushdown)
             })
             .collect())
@@ -135,7 +135,7 @@ impl TableProvider for RasterH3Table {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let predicates: Vec<FilterPredicate> = filters
             .iter()
-            .filter_map(|f| translate(f, self.kind, self.bbox_margin_km))
+            .filter_map(|f| translate(f, self.kind, self.untagged))
             .flat_map(|t| t.predicates)
             .collect();
 

@@ -3,14 +3,14 @@
 //! The core aggregator's thresholds are inclusive (`count >= min_count`, `min_mean <= mean
 //! <= max_mean`), so inclusive comparisons push down `Exact`. Strict comparisons push the
 //! inclusive bound down as `Inexact` (a superset) and DataFusion re-applies the predicate.
-//! Spatial predicates on `wkb` push a widened `Bbox` (see the `spatial` module).
+//! Spatial predicates on a cell's geometry push a `Bbox` (see the `spatial` module).
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use raster_h3_datafusion::FilterPredicate;
 
-use crate::spatial::translate_spatial;
+use crate::spatial::{translate_spatial, Untagged};
 use crate::table::TableKind;
 
 /// Predicates to push into the scan for one filter, and how exactly they implement it.
@@ -19,16 +19,10 @@ pub(crate) struct Translated {
     pub pushdown: TableProviderFilterPushDown,
 }
 
-/// `bbox_margin_km` is `None` when the table's cells have no bounded size (compacted
-/// output), which disables spatial pushdown.
-pub(crate) fn translate(
-    expr: &Expr,
-    kind: TableKind,
-    bbox_margin_km: Option<f64>,
-) -> Option<Translated> {
+pub(crate) fn translate(expr: &Expr, kind: TableKind, untagged: Untagged) -> Option<Translated> {
     match expr {
         Expr::ScalarFunction(_) => {
-            let bbox = translate_spatial(expr, bbox_margin_km?)?;
+            let bbox = translate_spatial(expr, untagged)?;
             single(
                 FilterPredicate::Bbox(bbox),
                 TableProviderFilterPushDown::Inexact,
@@ -170,7 +164,7 @@ mod tests {
         expr: Expr,
         kind: TableKind,
     ) -> Option<(Vec<FilterPredicate>, TableProviderFilterPushDown)> {
-        translate(&expr, kind, None).map(|t| (t.predicates, t.pushdown))
+        translate(&expr, kind, Untagged::Reject).map(|t| (t.predicates, t.pushdown))
     }
 
     #[test]

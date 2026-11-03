@@ -79,16 +79,19 @@ async fn sedona_spatial_predicates_on_raster_cells() {
     assert!(rows(&joined) > 0);
 }
 
+const POLYGON: &str = "ST_SetSRID(ST_GeomFromWKT( \
+    'POLYGON ((-122.40 37.72, -122.38 37.72, -122.38 37.74, -122.40 37.74, -122.40 37.72))'), 4326)";
+
 /// Cells of `table` intersecting a small polygon, as `h3_index,mean,count` lines.
 async fn cells_in_polygon(ctx: &SedonaContext, table: &str) -> Vec<String> {
+    cells_matching(ctx, table, &format!("ST_Intersects(wkb, {POLYGON})")).await
+}
+
+/// Cells of `table` matching `predicate`, as `h3_index,mean,count` lines.
+async fn cells_matching(ctx: &SedonaContext, table: &str, predicate: &str) -> Vec<String> {
     let batches = query(
         ctx,
-        &format!(
-            "SELECT h3_index, mean, count FROM {table} \
-             WHERE ST_Intersects(wkb, ST_SetSRID(ST_GeomFromWKT( \
-               'POLYGON ((-122.40 37.72, -122.38 37.72, -122.38 37.74, -122.40 37.74, -122.40 37.72))'), 4326)) \
-             ORDER BY h3_index"
-        ),
+        &format!("SELECT h3_index, mean, count FROM {table} WHERE {predicate} ORDER BY h3_index"),
     )
     .await;
     let mut out = Vec::new();
@@ -161,4 +164,44 @@ async fn bbox_pushdown_keeps_edge_cells_whole() {
         .register_table("naive", Arc::new(RasterH3Table::continuous(naive)))
         .unwrap();
     assert_ne!(cells_in_polygon(&ctx, "naive").await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dwithin_and_h3_to_wkb_predicates_match_an_unpruned_scan() {
+    let tif = gradient_tif(200, 200);
+    let ctx = sedona().await;
+    let src = source(&tif);
+    let scan = format!("h3_raster_continuous_aggregate('{src}', 8)");
+    query(
+        &ctx,
+        &format!("CREATE TABLE full_scan AS SELECT * FROM {scan}"),
+    )
+    .await;
+    // A res-8 cell inside the raster, for the constant `h3_to_wkb` case.
+    let cell = query(
+        &ctx,
+        "SELECT h3_index FROM full_scan WHERE ST_Intersects(wkb, \
+         ST_SetSRID(ST_GeomFromWKT('POINT (-122.35 37.70)'), 4326))",
+    )
+    .await;
+    let cell = cell[0]
+        .column(0)
+        .as_primitive::<datafusion::arrow::datatypes::UInt64Type>()
+        .value(0);
+
+    for predicate in [
+        "ST_DWithin(wkb, ST_SetSRID(ST_GeomFromWKT('POINT (-122.35 37.70)'), 4326), 0.01)"
+            .to_string(),
+        format!("ST_Intersects({POLYGON}, h3_to_wkb(h3_index))"),
+        format!("ST_Intersects(wkb, h3_to_wkb({cell}))"),
+        format!("ST_Intersects(h3_to_wkb(h3_hex), h3_to_wkb({cell}))"),
+    ] {
+        let expected = cells_matching(&ctx, "full_scan", &predicate).await;
+        assert!(!expected.is_empty(), "{predicate}");
+        assert_eq!(
+            cells_matching(&ctx, &scan, &predicate).await,
+            expected,
+            "{predicate}"
+        );
+    }
 }

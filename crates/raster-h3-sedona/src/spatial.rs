@@ -1,17 +1,26 @@
 //! `Bbox` pushdown from spatial predicates such as `ST_Intersects(wkb, <constant geometry>)`.
 //!
-//! The core `bbox` keeps only the *samples* inside the box, so pushing the query geometry's
-//! envelope down unchanged would aggregate the cells on its edge from part of their pixels
-//! and return the wrong `mean` / `count` for them. The pushed box is therefore the envelope
-//! widened by [`cell_margin_km`], more than the diameter of any cell the table can emit:
-//! every cell that touches the envelope then lies wholly inside the box and keeps all its
-//! samples. The partial cells near the widened edge do not touch the envelope, so they fail
-//! the predicate, which DataFusion re-applies (the pushdown is `Inexact`).
+//! A predicate between a cell's geometry and a constant lon/lat geometry `g` is translated
+//! into the envelope of `g` (for `ST_DWithin(..., d)`, the envelope grown by `d` degrees)
+//! and pushed down as a [`FilterPredicate::Bbox`](raster_h3_datafusion::FilterPredicate).
+//! `raster-h3-datafusion` widens that box past the largest cell before clipping samples, so
+//! cells on the box edge keep their full aggregates. The pushdown is `Inexact`: DataFusion
+//! re-applies the predicate to drop the extra cells.
+//!
+//! A cell's geometry is the `wkb` column or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)`,
+//! which `raster_h3` encodes identically. The constant is a `geoarrow.wkb` literal in a
+//! lon/lat CRS with planar edges (what Sedona's `ST_GeomFromWKT` / `ST_SetSRID` fold to),
+//! or `h3_to_wkb(<cell literal>)`.
+//!
+//! Filters that cross SedonaDB's extension ABI are serialized with `datafusion-proto`,
+//! which drops literal field metadata, so a constant geometry arrives as a bare `Binary`
+//! literal. SedonaDB's planner has already required every geometry argument of an `ST_*`
+//! predicate to share one CRS and planar edges, so with [`Untagged::LngLat`] such literals
+//! are taken to be in the cells' `OGC:CRS84`.
 
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::Expr;
-use h3o::Resolution;
 
 use crate::convert::{GEOARROW_WKB_EXTENSION, WKB_COLUMN};
 
@@ -28,58 +37,125 @@ const BBOX_PREDICATES: &[&str] = &[
     "st_equals",
 ];
 
-/// Kilometres per degree of latitude, rounded down so degree margins come out larger.
-const KM_PER_DEG_LAT: f64 = 110.0;
-/// Kilometres per degree of longitude at the equator, rounded down likewise.
-const KM_PER_DEG_LON_EQUATOR: f64 = 111.0;
-/// Beyond this latitude the widened box spans every longitude.
-const POLAR_LAT: f64 = 89.0;
+/// `ST_DWithin(a, b, distance)`: the planar distance between `a` and `b` is at most
+/// `distance`, in CRS units (degrees for lon/lat).
+const DWITHIN: &str = "st_dwithin";
 
-/// A distance larger than the diameter of any H3 cell at `resolution`, including the
-/// samples a cell owns along its geodesic edges.
-///
-/// The largest cells have edges about 1.4× the average and a diameter about 2× their edge,
-/// so roughly 2.8× the average edge; 4× leaves headroom (checked by
-/// `margin_exceeds_every_cell_diameter` over every cell at resolutions 0 to 3).
-pub(crate) fn cell_margin_km(resolution: u8) -> Option<f64> {
-    Resolution::try_from(resolution)
-        .ok()
-        .map(|r| 4.0 * r.edge_length_km())
+/// Names (and aliases) of the `raster_h3` UDF that encodes a cell as its WKB polygon.
+const H3_TO_WKB: &[&str] = &["h3_to_wkb", "h3_to_geometry", "h3_cell_to_geometry"];
+
+/// Cell-index columns `h3_to_wkb` turns into the same polygon as the `wkb` column.
+const CELL_COLUMNS: &[&str] = &["h3_index", "h3_hex"];
+
+/// How to read a `Binary` literal without `geoarrow.wkb` metadata in a spatial predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Untagged {
+    /// Its CRS is unknown: do not push the predicate down.
+    #[default]
+    Reject,
+    /// A WKB geometry in the cells' CRS (`OGC:CRS84`, planar).
+    LngLat,
 }
 
-/// Translate a spatial predicate on the `wkb` column into a lon/lat box to push down, or
-/// `None` when it is not one (or the geometry is not a lon/lat `geoarrow.wkb` literal).
-pub(crate) fn translate_spatial(expr: &Expr, margin_km: f64) -> Option<[f64; 4]> {
+/// Translate a spatial predicate on a cell's geometry into a lon/lat box to push down, or
+/// `None` when it is not one (or the other geometry is not a constant lon/lat geometry).
+pub(crate) fn translate_spatial(expr: &Expr, untagged: Untagged) -> Option<[f64; 4]> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return None;
     };
     let name = func.name().to_ascii_lowercase();
-    if !BBOX_PREDICATES.contains(&name.as_str()) {
-        return None;
-    }
-    let [a, b] = args.as_slice() else {
-        return None;
+    let (a, b, distance) = match args.as_slice() {
+        [a, b] if BBOX_PREDICATES.contains(&name.as_str()) => (a, b, 0.0),
+        [a, b, d] if name == DWITHIN => (a, b, distance_literal(d)?),
+        _ => return None,
     };
     let geometry = match (a, b) {
-        (Expr::Column(c), g) | (g, Expr::Column(c)) if c.name == WKB_COLUMN => g,
+        (cell, g) | (g, cell) if is_cell_geometry(cell) => g,
         _ => return None,
     };
-    let Expr::Literal(value, Some(metadata)) = geometry else {
+    let envelope = constant_envelope(geometry, untagged)?;
+    grow(envelope, distance)
+}
+
+/// The `wkb` column, or `h3_to_wkb` of a cell-index column.
+fn is_cell_geometry(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(c) => c.name == WKB_COLUMN,
+        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            is_h3_to_wkb(func.name())
+                && matches!(args.as_slice(), [Expr::Column(c)] if CELL_COLUMNS.contains(&c.name.as_str()))
+        }
+        _ => false,
+    }
+}
+
+fn is_h3_to_wkb(name: &str) -> bool {
+    H3_TO_WKB.iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// A non-negative, finite numeric literal.
+fn distance_literal(expr: &Expr) -> Option<f64> {
+    let Expr::Literal(value, _) = expr else {
         return None;
     };
-    let metadata = metadata.inner();
-    if metadata.get("ARROW:extension:name").map(String::as_str) != Some(GEOARROW_WKB_EXTENSION)
-        || !is_planar_lnglat(metadata.get("ARROW:extension:metadata")?)
-    {
+    if !value.data_type().is_numeric() {
         return None;
     }
-    let bytes = match value {
-        ScalarValue::Binary(Some(b))
-        | ScalarValue::LargeBinary(Some(b))
-        | ScalarValue::BinaryView(Some(b)) => b,
-        _ => return None,
-    };
-    expand(wkb_envelope(bytes)?, margin_km)
+    match value
+        .cast_to(&datafusion::arrow::datatypes::DataType::Float64)
+        .ok()?
+    {
+        ScalarValue::Float64(Some(d)) if d.is_finite() && d >= 0.0 => Some(d),
+        _ => None,
+    }
+}
+
+/// Envelope of a constant lon/lat geometry: a `geoarrow.wkb` literal, or `h3_to_wkb` of a
+/// cell literal (which DataFusion may not have folded).
+fn constant_envelope(expr: &Expr, untagged: Untagged) -> Option<[f64; 4]> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Binary(Some(b))
+            | ScalarValue::LargeBinary(Some(b))
+            | ScalarValue::BinaryView(Some(b)),
+            None,
+        ) if untagged == Untagged::LngLat => wkb_envelope(b),
+        Expr::Literal(value, Some(metadata)) => {
+            let metadata = metadata.inner();
+            if metadata.get("ARROW:extension:name").map(String::as_str)
+                != Some(GEOARROW_WKB_EXTENSION)
+                || !is_planar_lnglat(metadata.get("ARROW:extension:metadata")?)
+            {
+                return None;
+            }
+            match value {
+                ScalarValue::Binary(Some(b))
+                | ScalarValue::LargeBinary(Some(b))
+                | ScalarValue::BinaryView(Some(b)) => wkb_envelope(b),
+                _ => None,
+            }
+        }
+        Expr::ScalarFunction(ScalarFunction { func, args }) if is_h3_to_wkb(func.name()) => {
+            let [Expr::Literal(cell, _)] = args.as_slice() else {
+                return None;
+            };
+            let wkb = match cell {
+                ScalarValue::Utf8(Some(s))
+                | ScalarValue::Utf8View(Some(s))
+                | ScalarValue::LargeUtf8(Some(s)) => raster_h3_core::scalar_ops::h3_to_wkb_str(s),
+                v if v.data_type().is_integer() => match v
+                    .cast_to(&datafusion::arrow::datatypes::DataType::UInt64)
+                    .ok()?
+                {
+                    ScalarValue::UInt64(Some(c)) => raster_h3_core::scalar_ops::h3_to_wkb_u64(c),
+                    _ => None,
+                },
+                _ => None,
+            }?;
+            wkb_envelope(&wkb)
+        }
+        _ => None,
+    }
 }
 
 /// Whether GeoArrow extension metadata declares planar edges in a lon/lat CRS. An unknown
@@ -111,36 +187,26 @@ fn is_planar_lnglat(metadata: &str) -> bool {
     }
 }
 
-/// Widen `[min_lon, min_lat, max_lon, max_lat]` by `margin_km` on every side, producing an
-/// antimeridian-crossing box (`min_lon > max_lon`) when it wraps. `None` for envelopes
-/// outside lon/lat range, which the core box test would wrap differently than the query.
-pub(crate) fn expand(envelope: [f64; 4], margin_km: f64) -> Option<[f64; 4]> {
+/// Grow `[min_lon, min_lat, max_lon, max_lat]` by `distance` degrees on every side, clamped
+/// to lon/lat range. `None` for envelopes outside that range, which the core box test would
+/// wrap differently than the query.
+///
+/// Planar distance does not wrap: cell polygons lie within [-180, 180], so a cell within
+/// `distance` of the geometry has an envelope meeting the grown box, and clamping keeps
+/// every such cell.
+pub(crate) fn grow(envelope: [f64; 4], distance: f64) -> Option<[f64; 4]> {
     let [min_lon, min_lat, max_lon, max_lat] = envelope;
     let in_range =
         |lon: f64, lat: f64| (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat);
     if !(in_range(min_lon, min_lat) && in_range(max_lon, max_lat)) {
         return None;
     }
-    let lat_margin = margin_km / KM_PER_DEG_LAT;
-    let lo_lat = (min_lat - lat_margin).max(-90.0);
-    let hi_lat = (max_lat + lat_margin).min(90.0);
-    let widest = lo_lat.abs().max(hi_lat.abs());
-    if widest >= POLAR_LAT {
-        return Some([-180.0, lo_lat, 180.0, hi_lat]);
-    }
-    let lon_margin = margin_km / (KM_PER_DEG_LON_EQUATOR * widest.to_radians().cos());
-    if max_lon - min_lon + 2.0 * lon_margin >= 360.0 {
-        return Some([-180.0, lo_lat, 180.0, hi_lat]);
-    }
-    let mut lo_lon = min_lon - lon_margin;
-    let mut hi_lon = max_lon + lon_margin;
-    if lo_lon < -180.0 {
-        lo_lon += 360.0;
-    }
-    if hi_lon > 180.0 {
-        hi_lon -= 360.0;
-    }
-    Some([lo_lon, lo_lat, hi_lon, hi_lat])
+    Some([
+        (min_lon - distance).max(-180.0),
+        (min_lat - distance).max(-90.0),
+        (max_lon + distance).min(180.0),
+        (max_lat + distance).min(90.0),
+    ])
 }
 
 /// Envelope `[min_x, min_y, max_x, max_y]` of any WKB / EWKB geometry (2D, Z, M, ZM; either
@@ -328,43 +394,17 @@ mod tests {
     }
 
     #[test]
-    fn expand_wraps_and_saturates() {
-        let m = 110.0; // one degree of latitude
+    fn grow_clamps_to_lnglat_range() {
+        assert_eq!(grow([0.0, 0.0, 1.0, 1.0], 0.0), Some([0.0, 0.0, 1.0, 1.0]));
         assert_eq!(
-            expand([0.0, 0.0, 1.0, 1.0], 0.0),
-            Some([0.0, 0.0, 1.0, 1.0])
+            grow([10.0, 10.0, 11.0, 11.0], 0.5),
+            Some([9.5, 9.5, 11.5, 11.5])
         );
-        let [lo, s, hi, n] = expand([10.0, 10.0, 11.0, 11.0], m).unwrap();
-        assert_eq!((s, n), (9.0, 12.0));
-        assert!(lo < 9.0 && hi > 12.0);
-        // Crossing the antimeridian yields min_lon > max_lon.
-        let [lo, _, hi, _] = expand([179.5, 0.0, 179.9, 1.0], m).unwrap();
-        assert!(lo > hi && lo < 179.5 && hi > -180.0);
-        // Near a pole, or wider than the globe, every longitude is kept.
-        assert_eq!(expand([0.0, 88.5, 1.0, 88.6], m).unwrap()[0], -180.0);
-        assert_eq!(expand([-179.5, 0.0, 179.5, 1.0], m).unwrap()[2], 180.0);
-        assert_eq!(expand([190.0, 0.0, 191.0, 1.0], m), None);
-    }
-
-    #[test]
-    fn margin_exceeds_every_cell_diameter() {
-        for res in 0..=3u8 {
-            let margin = cell_margin_km(res).unwrap();
-            let r = Resolution::try_from(res).unwrap();
-            let widest = CellIndex::base_cells()
-                .flat_map(|c| c.children(r))
-                .map(|cell| {
-                    let b: Vec<_> = cell.boundary().iter().copied().collect();
-                    b.iter()
-                        .flat_map(|p| b.iter().map(move |q| p.distance_km(*q)))
-                        .fold(0.0, f64::max)
-                })
-                .fold(0.0, f64::max);
-            assert!(
-                widest * 1.25 < margin,
-                "res {res}: widest {widest} km, margin {margin} km"
-            );
-        }
+        assert_eq!(
+            grow([179.5, 89.5, 179.9, 89.9], 1.0),
+            Some([178.5, 88.5, 180.0, 90.0])
+        );
+        assert_eq!(grow([190.0, 0.0, 191.0, 1.0], 0.0), None);
     }
 
     fn predicate(name: &str, args: Vec<Expr>) -> Expr {
@@ -372,7 +412,7 @@ mod tests {
         use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
         let udf = create_udf(
             name,
-            vec![DataType::Binary, DataType::Binary],
+            vec![DataType::Binary; args.len()],
             DataType::Boolean,
             Volatility::Immutable,
             std::sync::Arc::new(|_: &[ColumnarValue]| unreachable!()),
@@ -398,20 +438,75 @@ mod tests {
     }
 
     #[test]
-    fn spatial_predicates_translate_to_widened_boxes() {
-        use datafusion::prelude::col;
+    fn spatial_predicates_translate_to_envelopes() {
+        use datafusion::prelude::{col, lit};
         let pt = || geometry(point_wkb(-122.4, 37.7), "OGC:CRS84");
-        let bbox =
-            translate_spatial(&predicate("ST_Intersects", vec![col("wkb"), pt()]), 2.0).unwrap();
-        assert!(bbox[0] < -122.4 && bbox[2] > -122.4 && bbox[1] < 37.7 && bbox[3] > 37.7);
+        let point_box = Some([-122.4, 37.7, -122.4, 37.7]);
+        assert_eq!(
+            translate_spatial(
+                &predicate("ST_Intersects", vec![col("wkb"), pt()]),
+                Untagged::Reject
+            ),
+            point_box
+        );
         // Either argument order; any envelope-implying predicate.
         assert_eq!(
-            translate_spatial(&predicate("st_within", vec![pt(), col("wkb")]), 2.0),
-            Some(bbox)
+            translate_spatial(
+                &predicate("st_within", vec![pt(), col("wkb")]),
+                Untagged::Reject
+            ),
+            point_box
         );
+        // `h3_to_wkb` of a cell column is the cell's geometry, under any alias.
+        for (f, c) in [("h3_to_wkb", "h3_index"), ("h3_cell_to_geometry", "h3_hex")] {
+            let cell = predicate(f, vec![col(c)]);
+            assert_eq!(
+                translate_spatial(
+                    &predicate("st_intersects", vec![cell, pt()]),
+                    Untagged::Reject
+                ),
+                point_box
+            );
+        }
+        // `ST_DWithin` grows the envelope by the distance (degrees).
+        let [lo_lon, lo_lat, hi_lon, hi_lat] = translate_spatial(
+            &predicate("st_dwithin", vec![col("wkb"), pt(), lit(0.25)]),
+            Untagged::Reject,
+        )
+        .unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(lo_lon, -122.65) && close(hi_lon, -122.15));
+        assert!(close(lo_lat, 37.45) && close(hi_lat, 37.95));
+        assert_eq!(
+            translate_spatial(
+                &predicate("st_dwithin", vec![pt(), col("wkb"), lit(0)]),
+                Untagged::Reject
+            ),
+            point_box
+        );
+        // A constant `h3_to_wkb(<cell>)` contributes the cell's envelope.
+        let cell = CellIndex::try_from(0x8828308281fffff).unwrap();
+        let expected =
+            wkb_envelope(&raster_h3_core::scalar_ops::h3_to_wkb_u64(u64::from(cell)).unwrap());
+        for literal in [lit(u64::from(cell)), lit(cell.to_string())] {
+            let g = predicate("h3_to_wkb", vec![literal]);
+            assert_eq!(
+                translate_spatial(
+                    &predicate("st_intersects", vec![col("wkb"), g]),
+                    Untagged::Reject
+                ),
+                expected
+            );
+        }
+
         for rejected in [
             predicate("st_disjoint", vec![col("wkb"), pt()]),
             predicate("st_intersects", vec![col("other"), pt()]),
+            predicate("st_intersects", vec![col("wkb"), col("wkb")]),
+            predicate(
+                "st_intersects",
+                vec![predicate("h3_to_wkb", vec![col("mean")]), pt()],
+            ),
             predicate(
                 "st_intersects",
                 vec![col("wkb"), geometry(point_wkb(0.0, 0.0), "EPSG:3857")],
@@ -423,9 +518,41 @@ mod tests {
                     Expr::Literal(ScalarValue::Binary(Some(point_wkb(0.0, 0.0))), None),
                 ],
             ),
+            // A distance that is negative, NULL, non-numeric or not a literal.
+            predicate("st_dwithin", vec![col("wkb"), pt(), lit(-1.0)]),
+            predicate(
+                "st_dwithin",
+                vec![col("wkb"), pt(), lit(ScalarValue::Float64(None))],
+            ),
+            predicate("st_dwithin", vec![col("wkb"), pt(), lit("1")]),
+            predicate("st_dwithin", vec![col("wkb"), pt(), col("mean")]),
+            predicate("st_dwithin", vec![col("wkb"), pt()]),
+            predicate("st_intersects", vec![col("wkb"), pt(), lit(1.0)]),
         ] {
-            assert_eq!(translate_spatial(&rejected, 2.0), None, "{rejected}");
+            assert_eq!(
+                translate_spatial(&rejected, Untagged::Reject),
+                None,
+                "{rejected}"
+            );
         }
+
+        // An untagged WKB literal (as filters arrive over SedonaDB's extension ABI) is
+        // pushed only when the table opts in.
+        let bare = predicate(
+            "st_intersects",
+            vec![
+                col("wkb"),
+                Expr::Literal(ScalarValue::Binary(Some(point_wkb(-122.4, 37.7))), None),
+            ],
+        );
+        assert_eq!(translate_spatial(&bare, Untagged::Reject), None);
+        assert_eq!(translate_spatial(&bare, Untagged::LngLat), point_box);
+        // A literal tagged with another CRS is still rejected.
+        let other_crs = predicate(
+            "st_intersects",
+            vec![col("wkb"), geometry(point_wkb(0.0, 0.0), "EPSG:3857")],
+        );
+        assert_eq!(translate_spatial(&other_crs, Untagged::LngLat), None);
     }
 
     #[test]

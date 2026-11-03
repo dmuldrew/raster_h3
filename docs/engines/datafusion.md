@@ -301,16 +301,35 @@ ctx.sql(
 | :--- | :--- |
 | `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) and `LIMIT` are pushed down. |
 | Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
-| Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals` between `wkb` and a constant `geoarrow.wkb` geometry in `OGC:CRS84` / `EPSG:4326` push an `Inexact` `bbox`. Core's `bbox` drops *samples* outside the box, so the query geometry's envelope is widened by 4× the average edge length at the coarsest resolution, which is more than any cell's diameter. Every cell touching the envelope then keeps all its samples, and the partial cells near the widened edge fail the re-applied predicate. Compacted tables (`with_compact(true)`) skip spatial pushdown because their cells have no size bound. |
+| Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals`, and `ST_DWithin(..., d)` with a non-negative numeric literal `d`, between a cell's geometry (`wkb`, or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)` under any alias) and a constant geometry push an `Inexact` `FilterPredicate::Bbox`. The constant is a `geoarrow.wkb` literal in `OGC:CRS84` / `EPSG:4326` with planar edges (what `ST_SetSRID(ST_GeomFromWKT(...), 4326)` folds to) or `h3_to_wkb(<cell literal>)`. The box is the constant's envelope, grown by `d` degrees for `ST_DWithin` (planar distance in CRS units) and clamped to lon/lat range. `raster-h3-datafusion` then widens it past the largest cell before clipping samples (see `Bbox(b)` above), so every cell the predicate can match keeps its full aggregate; DataFusion re-applies the predicate to drop the extra cells. Compacted tables accept the filter but do not prune. |
 | Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
 | Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types. |
 | Geometry | The `wkb` column and `h3_to_wkb` results are `geoarrow.wkb` fields with CRS `OGC:CRS84` (planar edges, as in the GeoParquet export), so Sedona's `ST_*` functions accept them directly. |
 
 The crate is a standalone Cargo workspace (listed in the root `exclude`), so DataFusion
-never enters the root `Cargo.lock` or the `--workspace` CI jobs. Not yet covered:
-registering from SedonaDB's Python API
-(which takes a `sedonadb_table_provider` capsule; `sedona_extension::ExportedTableProvider`
-can wrap `RasterH3Table` for that).
+never enters the root `Cargo.lock` or the `--workspace` CI jobs.
+
+### From SedonaDB's Python API
+
+[`crates/raster-h3-sedona/python`](../../crates/raster-h3-sedona/python) builds the
+`raster_h3_sedona` Python module (maturin, abi3). Its `RasterH3Table` implements
+`__sedonadb_table_provider__`, returning a `sedonadb_table_provider` capsule that wraps
+`RasterH3Table` in `sedona_extension::ExportedTableProvider`. Filters reach the scan
+through SedonaDB's extension ABI, so the pushdown above applies unchanged:
+
+```python
+import sedonadb
+from raster_h3_sedona import RasterH3Table
+
+sd = sedonadb.connect()
+sd.create_data_frame(RasterH3Table.continuous("dem.tif", [7, 8], crs="EPSG:4326")).to_view("dem")
+sd.sql("SELECT h3_index, mean FROM dem WHERE ST_DWithin(wkb, ST_SetSRID(ST_Point(-122.42, 37.77), 4326), 0.01)").show()
+```
+
+`RasterH3Table.continuous(source, resolutions=8, *, crs, nodata, band, bbox)` and
+`RasterH3Table.categorical(source, resolutions=8, *, crs, nodata, bbox)` take the common
+options. The capsule ABI follows the pinned SedonaDB revision, which matches the
+`sedonadb` 0.5.0 wheel.
 
 ## Testing
 
@@ -319,6 +338,8 @@ cargo test -p raster-h3-datafusion
 # DataFusion / SedonaDB adapter (standalone workspace)
 cargo test --manifest-path crates/raster-h3-sedona/Cargo.toml
 cargo test --manifest-path crates/raster-h3-sedona/Cargo.toml --features sedona-e2e  # inside a real SedonaContext
+# SedonaDB Python bindings
+(cd crates/raster-h3-sedona/python && maturin develop --release --extras test && pytest)
 ```
 
 Unit tests cover projection, limit, filter narrowing (resolution and bbox), the Arrow C
