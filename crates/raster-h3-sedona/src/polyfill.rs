@@ -10,7 +10,8 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use raster_h3_core::scalar_ops::{
-    h3_polygon_to_cells_wkb, parse_containment_mode, ContainmentMode, H3_CONTAINMENT_MODES,
+    h3_polygon_to_cells_wkb, parse_containment_mode, ContainmentMode, PolygonToCellsError,
+    H3_CONTAINMENT_MODES,
 };
 
 use crate::convert::GEOARROW_WKB_EXTENSION;
@@ -24,8 +25,10 @@ const NAME: &str = "h3_polygon_to_cells";
 /// `geoarrow.wkb` field whose CRS is `OGC:CRS84` / `EPSG:4326` or unset). Returns the cells
 /// at `resolution` sorted ascending without duplicates, like DuckDB's function of the same
 /// name. `containment` is one of `raster_h3_core::scalar_ops::H3_CONTAINMENT_MODES`
-/// (default `contains_centroid`; `covers` keeps every cell that overlaps the polygon). A
-/// NULL argument gives NULL; an invalid polygon, resolution or mode is an error.
+/// (default `contains_centroid`; `covers` keeps every cell that overlaps the polygon).
+/// NULLs and errors follow DuckDB: a NULL argument, a geometry that is not a valid
+/// `POLYGON` / `MULTIPOLYGON`, or a resolution outside `0..=15` gives NULL; an unknown
+/// containment name or a polygon above the 10,000,000-cell limit fails the query.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct H3PolygonToCells {
     signature: Signature,
@@ -136,6 +139,12 @@ impl ScalarUDFImpl for H3PolygonToCells {
                     out.values().append_slice(&cells);
                     out.append(true);
                 }
+                // As in DuckDB: a row that is not a polygon, or an out-of-range resolution,
+                // gives NULL; only the cell limit fails the query.
+                Err(
+                    PolygonToCellsError::InvalidGeometry(_)
+                    | PolygonToCellsError::InvalidResolution(_),
+                ) => out.append_null(),
                 Err(e) => return exec_err!("{NAME}: {e}"),
             }
         }

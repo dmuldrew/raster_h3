@@ -344,6 +344,13 @@ ascending with duplicates removed. It wraps h3o's
 [`ToCells`](https://docs.rs/h3o/0.6/h3o/geom/trait.ToCells.html) polyfill (the h3o
 counterpart of H3's `polygonToCells`).
 
+The same function is available in Apache DataFusion and SedonaDB through
+[`raster-h3-sedona`](engines/datafusion.md#using-with-apache-datafusion-and-sedonadb)
+(`register_all` in Rust, `sd.register(raster_h3_sedona.scalar_functions())` in Python). There it
+returns `List<UInt64>`, takes `Binary` WKB or a geometry column, and refuses at planning a
+geometry whose CRS is set to something other than lon/lat. The containment modes, NULL
+handling and limits below are the same.
+
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
 | `geometry` | `BLOB` (WKB) or `GEOMETRY` | A `POLYGON` or `MULTIPOLYGON` in WGS84 longitude/latitude degrees (x = longitude, y = latitude). The `BLOB` form accepts ISO/OGC WKB (2D, Z, M, ZM) and PostGIS EWKB (including an embedded SRID) in either byte order. Z/M values are ignored and the SRID is not checked, so reproject other CRSs to EPSG:4326 first. Holes (interior rings) are respected. The `GEOMETRY` overload is registered on DuckDB 1.5+, where `GEOMETRY` is a built-in type. On older versions with the spatial extension, pass `ST_AsWKB(geom)`. |

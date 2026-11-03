@@ -310,7 +310,7 @@ async fn polygon_to_cells_polyfills_and_joins_on_h3_index() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn polygon_to_cells_rejects_bad_input() {
+async fn polygon_to_cells_handles_bad_input_like_duckdb() {
     let ctx = context();
     let wkb = hex(&polygon_wkb(&[
         (0.0, 0.0),
@@ -318,17 +318,27 @@ async fn polygon_to_cells_rejects_bad_input() {
         (1.0, 1.0),
         (0.0, 0.0),
     ]));
+    // As in DuckDB: an invalid polygon or resolution is NULL, an unknown mode an error.
     for sql in [
-        format!("SELECT h3_polygon_to_cells(X'{wkb}', 8, 'nearby')"),
-        format!("SELECT h3_polygon_to_cells(X'{wkb}', 16)"),
-        "SELECT h3_polygon_to_cells(X'0102', 8)".to_string(),
+        format!("SELECT h3_polygon_to_cells(X'{wkb}', 16) IS NULL"),
+        "SELECT h3_polygon_to_cells(X'0102', 8) IS NULL".to_string(),
     ] {
-        let result = match ctx.sql(&sql).await {
-            Ok(df) => df.collect().await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        assert!(result.is_err(), "{sql} should fail");
+        let b = collect(&ctx, &sql).await;
+        assert!(b[0].column(0).as_boolean().value(0), "{sql}");
     }
+    let unknown_mode = ctx
+        .sql(&format!(
+            "SELECT h3_polygon_to_cells(X'{wkb}', 8, 'nearby')"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(
+        unknown_mode.to_string().contains("contains_centroid"),
+        "{unknown_mode}"
+    );
     for sql in [
         "SELECT h3_polygon_to_cells('POLYGON EMPTY', 8)",
         "SELECT h3_polygon_to_cells(X'00', 8.5)",
