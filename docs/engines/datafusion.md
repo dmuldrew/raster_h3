@@ -309,6 +309,28 @@ ctx.sql(
 The crate is a standalone Cargo workspace (listed in the root `exclude`), so DataFusion
 never enters the root `Cargo.lock` or the `--workspace` CI jobs.
 
+### Partitioned scans
+
+`with_partition(spec)` on either provider (specs from `provider.plan_partitions(n)`)
+scans one partition and adds a nullable `partial_state` column; merge the partial rows of
+all partitions with `merge_partial_batches`. Partitioned scans push down only
+`resolution` filters: value thresholds would drop partial rows, and a bbox would change
+the planned layout. In SQL (`raster_h3_sedona::register_all`):
+
+```sql
+SELECT partition_index, spec FROM h3_raster_plan_partitions('dem.tif', 256);
+
+-- the spec is passed as a string argument
+SELECT * FROM h3_raster_continuous_aggregate('dem.tif', 8, '<spec>');
+
+SELECT h3_index, resolution, h3_merge_partials(partial_state) AS cell
+FROM partial_rows GROUP BY h3_index, resolution;
+```
+
+`h3_merge_partials` / `h3_merge_categorical_partials` return a struct of the scan's
+statistics columns; DataFusion's multi-phase aggregation merges the encoded states in
+parallel. See [Partitioned scans](core.md#partitioned-scans).
+
 ### From SedonaDB's Python API
 
 [`crates/raster-h3-sedona/python`](../../crates/raster-h3-sedona/python) builds the
