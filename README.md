@@ -65,7 +65,7 @@ A city planning department has two datasets:
 
 **The question**: *Which low-income, densely populated neighborhoods have the least tree canopy coverage?*
 
-Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in two engines:
+Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in three engines:
 
 #### DuckDB (SQL)
 
@@ -159,7 +159,64 @@ instead of silently ignoring them or using defaults. Parquet and PMTiles exports
 also reject invalid resolutions; every resolution must be between 0 and 15. See the
 [Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
 
-> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars.
+#### SedonaDB (Python)
+
+SedonaDB is a spatial engine, so the tracts don't need polyfilling: it joins each hexagon's
+`wkb` polygon to the tract polygons it intersects.
+
+```python
+# Build the bindings: cd crates/raster-h3-sedona/python && maturin develop --release
+# pip install "sedonadb==0.5.0" geoarrow-pyarrow pandas pyogrio pyproj
+import sedonadb
+from raster_h3_sedona import RasterH3Table
+
+sd = sedonadb.connect()
+
+# 1. Aggregate the 30m land cover raster into H3 hexagons (scanned lazily by each query)
+sd.create_data_frame(
+    RasterH3Table.categorical("nlcd_landcover_2021.tif", 8)
+).to_view("canopy_h3")
+
+# 2. Read the census tracts as-is: no polyfill, the join below is spatial
+sd.read_pyogrio("census_tracts.geojson").to_view("census_tracts")
+
+# 3. JOIN raster hexagons to the tracts they intersect
+#    (like 'covers': border hexagons count for both neighbours, and a tract smaller
+#    than one cell still matches the hexagon that contains it)
+result = sd.sql("""
+    WITH tracts AS (
+        SELECT
+            tract_name,
+            median_income,
+            -- EPSG:5070 (CONUS Albers, NLCD's native CRS) gives areas in m²
+            round(total_population / (ST_Area(ST_Transform(wkb_geometry, 'EPSG:5070')) / 1e6), 0)
+                AS pop_density_per_sqkm,
+            wkb_geometry
+        FROM census_tracts
+    )
+    SELECT
+        t.tract_name,
+        t.median_income,
+        t.pop_density_per_sqkm,
+        c.majority_class    AS dominant_landcover,
+        c.majority_fraction AS canopy_purity
+    FROM tracts AS t
+    JOIN canopy_h3 AS c
+      ON ST_Intersects(c.wkb, t.wkb_geometry)
+    WHERE c.majority_class    = 41       -- Deciduous forest (NLCD code)
+      AND c.majority_fraction < 0.30     -- Less than 30% tree canopy
+      AND t.median_income     < 45000    -- Low-income tracts
+      AND t.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
+    ORDER BY canopy_purity
+""").to_pandas()
+```
+
+The join runs as SedonaDB's `SpatialJoinExec`. A filter against a constant geometry, such as
+`ST_Intersects(wkb, ST_GeomFromWKT(...))`, is pushed into the raster scan instead, so only the
+hexagons near it are aggregated. See
+[DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
+
+> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
 
 ### Why Intermediate H3 Aggregations Change Everything
 
