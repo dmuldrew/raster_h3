@@ -162,26 +162,39 @@ def write_sample(path: str, side: int = 2048, tile: int = 256) -> None:
 
 
 def verify(cells, paths: List[str], resolutions: List[int]) -> None:
-    """Compare the distributed result with one unpartitioned scan of each raster."""
+    """Compare the distributed result with one unpartitioned scan of each raster: the same
+    cells, each exactly once, with equal statistics (up to summation order) and geometry."""
     import raster_h3
 
     got = cells.toArrow()
+    stats = ["mean", "stddev", "count", "min", "max"]
 
-    def means(table):
+    def rows(table):
         keys = zip(table["resolution"].to_pylist(), table["h3_index"].to_pylist())
-        return dict(zip(keys, table["mean"].to_pylist()))
+        values = zip(*(table[c].to_pylist() for c in stats))
+        return dict(zip(keys, values))
 
     for path in paths:
         mine = got.filter(pc.equal(got.column("path"), path))
         want = pa.table(raster_h3.RasterH3ArrowStream(path, resolutions, columns=COLUMNS))
-        a, b = means(want), means(mine)
+        a, b = rows(want), rows(mine)
         assert len(b) == mine.num_rows, f"{path}: a cell appears twice"
         assert a.keys() == b.keys(), (
             f"{path}: {len(a.keys() - b.keys())} cells missing, {len(b.keys() - a.keys())} extra"
         )
-        worst = max(abs(a[k] - b[k]) for k in a)
-        assert worst < 1e-9 * max(1.0, max(abs(v) for v in a.values())), f"{path}: means differ by {worst}"
-        print(f"verified {path}: {len(a)} cells identical to a single scan (max |mean difference| {worst:.1e})")
+        worst = {c: 0.0 for c in stats}
+        for key, expected in a.items():
+            for c, x, y in zip(stats, expected, b[key]):
+                if x is None or y is None:
+                    assert x is y, f"{path}: {c} of {key} is {y}, expected {x}"
+                    continue
+                gap = abs(x - y)
+                assert gap <= 1e-9 * max(1.0, abs(x)), f"{path}: {c} of {key} is {y}, expected {x}"
+                worst[c] = max(worst[c], gap)
+        wkb = lambda t: dict(zip(zip(t["resolution"].to_pylist(), t["h3_index"].to_pylist()), t["wkb"].to_pylist()))
+        assert wkb(want) == wkb(mine), f"{path}: cell geometries differ"
+        detail = ", ".join(f"{c} {v:.1e}" for c, v in worst.items())
+        print(f"verified {path}: {len(a)} cells identical to a single scan (max differences: {detail})")
 
 
 def main() -> None:
