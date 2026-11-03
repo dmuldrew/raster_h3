@@ -11,20 +11,23 @@
 //! - supported options are `MIN_ZOOM`/`MAX_ZOOM`, which filter cells by the
 //!   PMTiles tile zoom derived from their H3 resolution.
 //!
-//! The archive is assembled by `H3PmtilesTiler::export_h3_features` into a
-//! temporary file, then streamed to the destination through DuckDB's file
-//! system (so `s3://`/`file://` and `CREATE SECRET` credentials apply), falling
-//! back to a local copy when the file layer is unavailable.
+//! - `MEMORY_BUDGET_MB` (default 256) caps the memory used to buffer input
+//!   rows; beyond it rows are sorted into temporary run files.
 //!
-//! All input features are held in memory until finalize, so the COPY needs
-//! memory proportional to the number of input rows.
+//! Rows go through [`ExternalFeatureExport`], which external-sorts them by
+//! latitude so finished tiles are written out as the merge moves south. Its
+//! temporary files live in DuckDB's `temp_directory` (the system temp
+//! directory if that is unset or unusable). The finished archive streams
+//! straight to the destination through DuckDB's file system (so `s3://`,
+//! `file://` and `CREATE SECRET` credentials apply), with a plain local file
+//! as the fallback when no client context is available.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 
 use raster_h3_core::pmtiles::features::H3Feature;
 use raster_h3_core::pmtiles::mvt::MvtValue;
-use raster_h3_core::pmtiles::tiler::H3PmtilesTiler;
+use raster_h3_core::pmtiles::{ExternalFeatureExport, DEFAULT_EXPORT_MEMORY_BUDGET};
 
 use crate::ffi::*;
 use crate::functions::bind_utils::delete_boxed;
@@ -33,16 +36,28 @@ use crate::functions::fast_hex::parse_hex_u64;
 /// One sink column's logical type, resolved at bind time.
 type CopyColumns = Vec<DuckDBType>;
 
-struct PmtilesCopyBindData {
-    column_types: CopyColumns,
+/// Largest accepted `MEMORY_BUDGET_MB` (1 TiB), so the byte count cannot
+/// overflow.
+const MAX_MEMORY_BUDGET_MB: i64 = 1 << 20;
+
+/// Options parsed from the `COPY ... (FORMAT pmtiles, ...)` clause.
+#[derive(Debug, Default, Clone, Copy)]
+struct CopyOptions {
     min_zoom: Option<u8>,
     max_zoom: Option<u8>,
+    memory_budget_mb: Option<u64>,
+}
+
+struct PmtilesCopyBindData {
+    column_types: CopyColumns,
+    options: CopyOptions,
 }
 
 struct PmtilesCopyGlobal {
     file_path: String,
     writer: Option<Mutex<DuckDbFileWriter>>,
-    features: Mutex<Vec<H3Feature>>,
+    /// `None` once finalize has taken it.
+    exporter: Mutex<Option<ExternalFeatureExport>>,
     // Kept alive for the writer's lifetime: the file handle is only valid
     // while its file system is.
     _file_system: Option<DuckDbFileSystem>,
@@ -77,11 +92,8 @@ fn copy_finalize_error(info: duckdb_copy_function_finalize_info, msg: String) {
 ///
 /// # Safety
 /// `info` must be the live copy-bind handle.
-unsafe fn parse_copy_options(
-    info: duckdb_copy_function_bind_info,
-) -> Result<(Option<u8>, Option<u8>), String> {
-    let mut min_zoom = None;
-    let mut max_zoom = None;
+unsafe fn parse_copy_options(info: duckdb_copy_function_bind_info) -> Result<CopyOptions, String> {
+    let mut opts = CopyOptions::default();
     // SAFETY: `info` is the live bind handle; the returned options value is
     // owned by us and destroyed below.
     let mut options = unsafe { duckdb_copy_function_bind_get_options(info) };
@@ -91,7 +103,7 @@ unsafe fn parse_copy_options(
             // SAFETY: `options` is our owned value.
             unsafe { duckdb_destroy_value(&mut options) };
         }
-        return Ok((min_zoom, max_zoom));
+        return Ok(opts);
     }
     // The options value is a STRUCT {option_name: value}.
     let result = (|| {
@@ -150,32 +162,31 @@ unsafe fn parse_copy_options(
                 // SAFETY: `child` is our owned value.
                 unsafe { duckdb_destroy_value(&mut child) };
             }
-            // A NULL option value means "unset"; any other value that is
-            // not an integer in 0..=255 is a user error, not a silent default.
+            // A NULL option value means "unset"; any other value outside the
+            // option's range is a user error, not a silent default.
+            let expect_int = |lo: i64, hi: i64| -> Result<Option<i64>, String> {
+                if child_was_null {
+                    return Ok(None);
+                }
+                match int_val {
+                    Some(v) if (lo..=hi).contains(&v) => Ok(Some(v)),
+                    Some(v) => Err(format!(
+                        "pmtiles copy option {name} expects an integer {lo}-{hi}, got {v}"
+                    )),
+                    None => Err(format!(
+                        "pmtiles copy option {name} expects an integer {lo}-{hi}"
+                    )),
+                }
+            };
             match name.as_str() {
-                "MIN_ZOOM" | "MAX_ZOOM" => {
-                    if !child_was_null {
-                        let zoom = int_val
-                            .ok_or_else(|| {
-                                format!("pmtiles copy option {name} expects an integer 0-255")
-                            })
-                            .and_then(|v| {
-                                u8::try_from(v).map_err(|_| {
-                                    format!(
-                                        "pmtiles copy option {name} expects an integer 0-255, got {v}"
-                                    )
-                                })
-                            })?;
-                        if name == "MIN_ZOOM" {
-                            min_zoom = Some(zoom);
-                        } else {
-                            max_zoom = Some(zoom);
-                        }
-                    }
+                "MIN_ZOOM" => opts.min_zoom = expect_int(0, 255)?.map(|v| v as u8),
+                "MAX_ZOOM" => opts.max_zoom = expect_int(0, 255)?.map(|v| v as u8),
+                "MEMORY_BUDGET_MB" => {
+                    opts.memory_budget_mb = expect_int(1, MAX_MEMORY_BUDGET_MB)?.map(|v| v as u64)
                 }
                 _ => {
                     return Err(format!(
-                        "unsupported pmtiles copy option {name}; supported: MIN_ZOOM, MAX_ZOOM"
+                        "unsupported pmtiles copy option {name}; supported: MIN_ZOOM, MAX_ZOOM, MEMORY_BUDGET_MB"
                     ));
                 }
             }
@@ -183,11 +194,16 @@ unsafe fn parse_copy_options(
         // NB: the logical types returned by `duckdb_get_value_type` and
         // `duckdb_copy_function_bind_get_column_type` are borrowed in this
         // API revision; destroying them corrupts DuckDB internals.
-        Ok((min_zoom, max_zoom))
+        Ok(opts)
     })();
     // SAFETY: `options` is our owned value.
     unsafe { duckdb_destroy_value(&mut options) };
-    if let Ok((Some(min), Some(max))) = result {
+    if let Ok(CopyOptions {
+        min_zoom: Some(min),
+        max_zoom: Some(max),
+        ..
+    }) = result
+    {
         if min > max {
             return Err("MIN_ZOOM must be <= MAX_ZOOM".to_string());
         }
@@ -218,7 +234,7 @@ unsafe extern "C" fn pmtiles_copy_bind(info: duckdb_copy_function_bind_info) {
                 column_types.push(duckdb_get_type_id(lt));
                 // `lt` is borrowed from the bind input; do not destroy it.
             }
-            let (min_zoom, max_zoom) = match parse_copy_options(info) {
+            let options = match parse_copy_options(info) {
                 Ok(v) => v,
                 Err(e) => {
                     copy_bind_error(info, e);
@@ -227,8 +243,7 @@ unsafe extern "C" fn pmtiles_copy_bind(info: duckdb_copy_function_bind_info) {
             };
             let bind_data = Box::new(PmtilesCopyBindData {
                 column_types,
-                min_zoom,
-                max_zoom,
+                options,
             });
             duckdb_copy_function_bind_set_bind_data(
                 info,
@@ -265,16 +280,30 @@ unsafe extern "C" fn pmtiles_copy_global_init(info: duckdb_copy_function_global_
             // surface that error instead of bypassing its file policy with a
             // plain local write; the std::fs fallback is only for the
             // (unexpected) case of no client context at all.
+            let bind_ptr =
+                duckdb_copy_function_global_init_get_bind_data(info) as *const PmtilesCopyBindData;
+            if bind_ptr.is_null() {
+                copy_init_error(info, "missing pmtiles copy bind data".to_string());
+                return;
+            }
+            let options = (*bind_ptr).options;
+
             let ctx = duckdb_copy_function_global_init_get_client_context(info);
             let mut fs_opt = None;
+            let mut spill_dir = None;
             if !ctx.is_null() {
                 let mut ctx = ctx;
+                spill_dir = crate::functions::config::duckdb_temp_directory(ctx);
                 let fs_handle = duckdb_client_context_get_file_system(ctx);
                 duckdb_destroy_client_context(&mut ctx);
                 if !fs_handle.is_null() {
                     fs_opt = Some(DuckDbFileSystem::from_raw(fs_handle));
                 }
             }
+            let budget = options
+                .memory_budget_mb
+                .map_or(DEFAULT_EXPORT_MEMORY_BUDGET, |mb| (mb as usize) << 20);
+            let exporter = ExternalFeatureExport::new(budget, spill_dir.as_deref());
             let mut writer = None;
             if let Some(fs) = fs_opt.as_ref() {
                 match fs.open_write(&file_path) {
@@ -294,7 +323,7 @@ unsafe extern "C" fn pmtiles_copy_global_init(info: duckdb_copy_function_global_
             let global = Box::new(PmtilesCopyGlobal {
                 file_path,
                 writer,
-                features: Mutex::new(Vec::new()),
+                exporter: Mutex::new(Some(exporter)),
                 _file_system: fs_opt,
             });
             duckdb_copy_function_global_init_set_global_state(
@@ -406,14 +435,6 @@ unsafe extern "C" fn pmtiles_copy_sink(
                 property_vectors.push((vector, validity, ty));
             }
 
-            let mut features = match global.features.lock() {
-                Ok(f) => f,
-                Err(e) => {
-                    copy_sink_error(info, format!("pmtiles feature lock poisoned: {e}"));
-                    return;
-                }
-            };
-
             if !matches!(
                 cell_ty,
                 DuckDBType::UBigInt | DuckDBType::BigInt | DuckDBType::Varchar
@@ -431,6 +452,10 @@ unsafe extern "C" fn pmtiles_copy_sink(
                 return;
             }
 
+            // Convert the chunk without holding the exporter lock, then hand
+            // it over in one go.
+            let opts = bind_data.options;
+            let mut features = Vec::with_capacity(row_count as usize);
             for row in 0..row_count {
                 // A NULL cell has no location; skip the row like other
                 // spatial writers do. Anything non-NULL must be a valid cell.
@@ -449,12 +474,10 @@ unsafe extern "C" fn pmtiles_copy_sink(
                         parse_hex_u64(text).ok_or_else(|| format!("'{text}'"))
                     }
                 };
-                let h3_index = match raw.and_then(|v| {
-                    h3o::CellIndex::try_from(v)
-                        .map(u64::from)
-                        .map_err(|_| v.to_string())
-                }) {
-                    Ok(v) => v,
+                let cell = match raw
+                    .and_then(|v| h3o::CellIndex::try_from(v).map_err(|_| v.to_string()))
+                {
+                    Ok(c) => c,
                     Err(shown) => {
                         copy_sink_error(
                             info,
@@ -463,6 +486,15 @@ unsafe extern "C" fn pmtiles_copy_sink(
                         return;
                     }
                 };
+                // Apply the zoom filter here so excluded rows never reach the
+                // buffer.
+                let zoom =
+                    raster_h3_core::pmtiles::pyramid::h3_res_to_zoom(u8::from(cell.resolution()));
+                if opts.min_zoom.is_some_and(|z| zoom < z)
+                    || opts.max_zoom.is_some_and(|z| zoom > z)
+                {
+                    continue;
+                }
 
                 let mut properties = Vec::with_capacity(property_vectors.len());
                 for (i, (vector, validity, ty)) in property_vectors.iter().enumerate() {
@@ -473,9 +505,30 @@ unsafe extern "C" fn pmtiles_copy_sink(
                     }
                 }
                 features.push(H3Feature {
-                    h3_index,
+                    h3_index: u64::from(cell),
                     properties,
                 });
+            }
+
+            let mut exporter = match global.exporter.lock() {
+                Ok(e) => e,
+                Err(e) => {
+                    copy_sink_error(info, format!("pmtiles exporter lock poisoned: {e}"));
+                    return;
+                }
+            };
+            let Some(exporter) = exporter.as_mut() else {
+                copy_sink_error(info, "pmtiles copy already finalized".to_string());
+                return;
+            };
+            for feature in features {
+                if let Err(e) = exporter.push(feature) {
+                    copy_sink_error(
+                        info,
+                        format!("COPY (FORMAT pmtiles): spilling rows to disk failed: {e}"),
+                    );
+                    return;
+                }
             }
         }
     };
@@ -489,66 +542,42 @@ unsafe extern "C" fn pmtiles_copy_finalize(info: duckdb_copy_function_finalize_i
     let run = || {
         // SAFETY: `info` is the live finalize handle.
         unsafe {
-            let bind_ptr =
-                duckdb_copy_function_finalize_get_bind_data(info) as *const PmtilesCopyBindData;
             let global_ptr =
                 duckdb_copy_function_finalize_get_global_state(info) as *const PmtilesCopyGlobal;
-            if bind_ptr.is_null() || global_ptr.is_null() {
+            if global_ptr.is_null() {
                 copy_finalize_error(info, "missing pmtiles copy state".to_string());
                 return;
             }
-            let bind_data = &*bind_ptr;
             let global = &*global_ptr;
-            let features = match global.features.lock() {
-                Ok(mut f) => std::mem::take(&mut *f),
+            let exporter = match global.exporter.lock() {
+                Ok(mut e) => e.take(),
                 Err(e) => {
-                    copy_finalize_error(info, format!("pmtiles feature lock poisoned: {e}"));
+                    copy_finalize_error(info, format!("pmtiles exporter lock poisoned: {e}"));
                     return;
                 }
             };
-            // Every feature's index was validated in the sink.
-            let filtered = features.into_iter().filter(|f| {
-                let res = h3o::CellIndex::try_from(f.h3_index)
-                    .map(|c| u8::from(c.resolution()))
-                    .unwrap_or_default();
-                let zoom = raster_h3_core::pmtiles::pyramid::h3_res_to_zoom(res);
-                bind_data.min_zoom.is_none_or(|z| zoom >= z)
-                    && bind_data.max_zoom.is_none_or(|z| zoom <= z)
-            });
-
-            static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let tmp_path = std::env::temp_dir().join(format!(
-                "raster_h3_copy_{}_{}.pmtiles",
-                std::process::id(),
-                TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            if let Err(e) = H3PmtilesTiler::export_h3_features(filtered, &tmp_path) {
-                copy_finalize_error(info, format!("pmtiles export failed: {e}"));
-                let _ = std::fs::remove_file(&tmp_path);
+            let Some(exporter) = exporter else {
+                copy_finalize_error(info, "pmtiles copy already finalized".to_string());
                 return;
-            }
-            // Stream the finished archive in chunks instead of materializing
-            // it again in memory (the feature set is already held by the
-            // PMTiles pyramid builder).
-            let copy_result = (|| -> Result<(), String> {
-                let mut src = std::fs::File::open(&tmp_path)
-                    .map_err(|e| format!("reading pmtiles temp file failed: {e}"))?;
+            };
+            // Stream the archive straight to the destination: no temporary
+            // copy of the finished file.
+            let result = (|| -> Result<(), String> {
                 if let Some(writer) = global.writer.as_ref() {
                     let mut w = writer
                         .lock()
                         .map_err(|e| format!("writer lock poisoned: {e}"))?;
-                    std::io::copy(&mut src, &mut *w).map_err(|e| e.to_string())?;
-                    use std::io::Write;
-                    w.flush().map_err(|e| e.to_string())?;
+                    let mut out = std::io::BufWriter::with_capacity(1 << 20, &mut *w);
+                    exporter.finish_into(&mut out).map_err(|e| e.to_string())?;
                 } else {
-                    let mut dst =
+                    let file =
                         std::fs::File::create(&global.file_path).map_err(|e| e.to_string())?;
-                    std::io::copy(&mut src, &mut dst).map_err(|e| e.to_string())?;
+                    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+                    exporter.finish_into(&mut out).map_err(|e| e.to_string())?;
                 }
                 Ok(())
             })();
-            let _ = std::fs::remove_file(&tmp_path);
-            if let Err(e) = copy_result {
+            if let Err(e) = result {
                 copy_finalize_error(info, format!("writing {} failed: {e}", global.file_path));
             }
         }

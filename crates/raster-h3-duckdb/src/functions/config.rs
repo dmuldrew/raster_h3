@@ -331,3 +331,35 @@ unsafe fn apply_options_impl(
 fn env_i64(name: &str) -> Option<i64> {
     std::env::var(name).ok()?.parse().ok().filter(|&v| v > 0)
 }
+
+/// DuckDB's `temp_directory` setting, for spill files. Not created here:
+/// like DuckDB, the exporter creates it only when it actually spills.
+/// `None` when the setting is empty (spilling disabled in DuckDB) or cannot be
+/// read; callers then use the system temp directory.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub(crate) fn duckdb_temp_directory(
+    ctx: crate::ffi::duckdb_client_context,
+) -> Option<std::path::PathBuf> {
+    use crate::ffi::*;
+    let c_name = option_cstring("temp_directory");
+    let mut scope = DuckDBConfigOptionScope::Invalid;
+    // SAFETY: `ctx`/`c_name` valid; the returned value is owned by us.
+    let mut value =
+        unsafe { duckdb_client_context_get_config_option(ctx, c_name.as_ptr(), &mut scope) };
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `value` is a live owned value; the string is DuckDB-allocated
+    // and freed by `from_duckdb_string`.
+    let dir = unsafe {
+        if duckdb_is_null_value(value) {
+            None
+        } else {
+            from_duckdb_string(duckdb_get_varchar(value))
+        }
+    };
+    // SAFETY: owned value, destroyed once.
+    unsafe { duckdb_destroy_value(&mut value) };
+    dir.filter(|d| !d.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}

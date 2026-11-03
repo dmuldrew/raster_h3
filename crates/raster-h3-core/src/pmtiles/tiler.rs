@@ -19,11 +19,10 @@ use crate::aggregator::multi_horizon::{
     MultiResolutionConfig, MultiScanHorizonStreamer, RecordStreamer,
 };
 use crate::pmtiles::mvt::{
-    FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, MvtValue, PropertyFilter,
-    PROP_CAT_COUNT, PROP_CAT_DISTINCT_CLASSES, PROP_CAT_ENTROPY, PROP_CAT_H3_HEX,
-    PROP_CAT_H3_INDEX, PROP_CAT_MAJORITY, PROP_CAT_MAJORITY_FRACTION, PROP_CAT_RESOLUTION,
-    PROP_COUNT, PROP_H3_HEX, PROP_H3_INDEX, PROP_MAX, PROP_MEAN, PROP_MIN, PROP_RESOLUTION,
-    PROP_STDDEV, PROP_SUM,
+    FeatureProperties, MercatorPoint, MvtFeature, MvtLayer, PropertyFilter, PROP_CAT_COUNT,
+    PROP_CAT_DISTINCT_CLASSES, PROP_CAT_ENTROPY, PROP_CAT_H3_HEX, PROP_CAT_H3_INDEX,
+    PROP_CAT_MAJORITY, PROP_CAT_MAJORITY_FRACTION, PROP_CAT_RESOLUTION, PROP_COUNT, PROP_H3_HEX,
+    PROP_H3_INDEX, PROP_MAX, PROP_MEAN, PROP_MIN, PROP_RESOLUTION, PROP_STDDEV, PROP_SUM,
 };
 use crate::pmtiles::overview::Overview;
 use crate::pmtiles::writer::PmtilesWriter;
@@ -174,107 +173,25 @@ fn reject_compaction<S: RecordStreamer>(
 pub struct H3PmtilesTiler;
 
 impl H3PmtilesTiler {
-    /// Export any collection of generic H3 features (with strict H3 validation) to a PMTiles v3 archive
+    /// Export any collection of generic H3 features (with strict H3 validation) to a PMTiles v3 archive.
+    ///
+    /// Features may arrive in any order. Memory stays near
+    /// [`DEFAULT_EXPORT_MEMORY_BUDGET`](crate::pmtiles::DEFAULT_EXPORT_MEMORY_BUDGET):
+    /// larger inputs are sorted externally through temporary files (see
+    /// [`ExternalFeatureExport`](crate::pmtiles::ExternalFeatureExport), which
+    /// also allows a custom budget, spill directory or output writer).
     pub fn export_h3_features<P: AsRef<Path>, I: IntoIterator<Item = H3Feature>>(
         features: I,
         output_path: P,
     ) -> Result<PmtilesExportSummary, Box<dyn std::error::Error + Send + Sync>> {
-        let mut accumulator = TilePyramidAccumulator::new(0.0);
-
-        let mut total_features = 0usize;
-        let mut valid_features = 0usize;
-        let mut invalid_dropped = 0usize;
-        let mut bounds_acc = Wgs84BoundsAccumulator::new();
-
-        let mut min_zoom = 255u8;
-        let mut max_zoom = 0u8;
-
-        for feat in features {
-            total_features += 1;
-
-            // Strict H3 Mathematical Validation: mode, base cell range, resolution bounds, directional digits
-            let cell = match CellIndex::try_from(feat.h3_index) {
-                Ok(c) => c,
-                Err(_) => {
-                    invalid_dropped += 1;
-                    continue;
-                }
-            };
-
-            valid_features += 1;
-            bounds_acc.record_cell(cell);
-            let center: LatLng = cell.into();
-            let c_lat = center.lat();
-            let c_lon = center.lng();
-
-            let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
-            let (v_merc, v_count) = cell_boundary_mercator(cell);
-            let vertices_merc = &v_merc[..v_count];
-
-            let res_u8: u8 = cell.resolution().into();
-            let zoom = h3_res_to_zoom(res_u8);
-            if zoom < min_zoom {
-                min_zoom = zoom;
-            }
-            if zoom > max_zoom {
-                max_zoom = zoom;
-            }
-
-            let mut properties = feat.properties;
-            if !properties.iter().any(|(k, _)| k == "h3_index") {
-                properties.push((Cow::Borrowed("h3_index"), MvtValue::UInt(feat.h3_index)));
-            }
-            if !properties.iter().any(|(k, _)| k == "h3_hex") {
-                properties.push((
-                    Cow::Borrowed("h3_hex"),
-                    MvtValue::from_hex_u64(feat.h3_index),
-                ));
-            }
-            if !properties.iter().any(|(k, _)| k == "resolution") {
-                properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));
-            }
-
-            accumulator.add_hexagon_mercator(
-                feat.h3_index,
-                center_merc,
-                vertices_merc,
-                zoom,
-                properties,
-            );
-        }
-
-        if valid_features == 0 {
-            min_zoom = 0;
-            max_zoom = 0;
-        }
-        let bbox = bounds_acc.finish([-180.0, -85.0, 180.0, 85.0]);
-
-        let metadata = build_pmtiles_metadata(
-            "h3_pmtiles_export",
-            "H3 vector hexagon tile pyramid exported by raster_h3",
-            min_zoom,
-            max_zoom,
-            "h3_hexagons",
-            "H3 hexagonal vector polygons with attributes",
-            build_default_pmtiles_fields(),
+        let mut exporter = crate::pmtiles::ExternalFeatureExport::new(
+            crate::pmtiles::DEFAULT_EXPORT_MEMORY_BUDGET,
             None,
         );
-
-        let mut writer = PmtilesWriter::new(min_zoom, max_zoom, bbox, metadata.to_string())?;
-
-        let total_tiles = accumulator.active_tile_count();
-        accumulator.flush_all(&mut writer)?;
-
-        writer.finish(output_path)?;
-
-        Ok(PmtilesExportSummary {
-            total_features,
-            valid_features,
-            invalid_features_dropped: invalid_dropped,
-            total_tiles,
-            min_zoom,
-            max_zoom,
-        })
+        for feature in features {
+            exporter.push(feature)?;
+        }
+        Ok(exporter.finish(output_path)?)
     }
     /// Stream continuous raster data from GeoTIFF across target resolutions and write PMTiles v3 archive
     pub fn generate_from_continuous_streamer<S, P: AsRef<Path>>(

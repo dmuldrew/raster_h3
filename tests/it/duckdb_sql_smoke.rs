@@ -526,6 +526,65 @@ fn real_sql_v156_features() {
         assert!(err.contains(needle), "missing {needle} in: {err}");
     }
 
+    // Bounded memory: ~23k res-9 cells with a 1 MiB budget spill several
+    // sorted runs, and the merged archive matches the unspilled one byte for
+    // byte. Spill files go to DuckDB's temp_directory, which only the
+    // spilling COPY creates (as DuckDB itself does).
+    let polygon = "010300000001000000050000000000000000a05ec00000000000c042400000000000805ec0\
+                   0000000000c042400000000000805ec000000000000043400000000000a05ec0000000000000\
+                   43400000000000a05ec00000000000c04240";
+    let spill_dir = duckdb.path("duckdb_spill");
+    let unspilled = duckdb.path("unspilled.pmtiles");
+    let spilled = duckdb.path("spilled.pmtiles");
+    let cells = format!(
+        "SELECT cell, 'cell-' || cell::VARCHAR AS name, (cell % 1000)::DOUBLE AS v \
+         FROM (SELECT unnest(h3_polygon_to_cells(from_hex('{polygon}'), 9)) AS cell)"
+    );
+    duckdb.query(&format!(
+        r#"
+        SET temp_directory = {spill_dir};
+        COPY ({cells}) TO {unspilled} (FORMAT pmtiles);
+    "#,
+        spill_dir = quoted(&spill_dir),
+        unspilled = quoted(&unspilled),
+    ));
+    assert!(
+        !spill_dir.exists(),
+        "a COPY that fits in memory created temp_directory"
+    );
+    duckdb.query(&format!(
+        "SET temp_directory = {spill_dir}; \
+         COPY ({cells}) TO {spilled} (FORMAT pmtiles, memory_budget_mb 1);",
+        spill_dir = quoted(&spill_dir),
+        spilled = quoted(&spilled),
+    ));
+    let unspilled_bytes = std::fs::read(&unspilled).unwrap();
+    let spilled_bytes = std::fs::read(&spilled).unwrap();
+    assert_eq!(&spilled_bytes[..7], b"PMTiles");
+    assert!(
+        spilled_bytes == unspilled_bytes,
+        "spilled archive ({} bytes) differs from unspilled ({} bytes)",
+        spilled_bytes.len(),
+        unspilled_bytes.len()
+    );
+    assert!(
+        spill_dir.is_dir(),
+        "COPY did not use temp_directory {}",
+        spill_dir.display()
+    );
+
+    // MEMORY_BUDGET_MB must be a positive integer.
+    let err = try_query_cli(
+        &duckdb.cli,
+        &format!(
+            "LOAD {}; COPY (SELECT 599686042433355775::UBIGINT c) TO {} (FORMAT pmtiles, memory_budget_mb 0);",
+            quoted(&duckdb.extension),
+            quoted(&duckdb.path("zero_budget.pmtiles"))
+        ),
+    )
+    .unwrap_err();
+    assert!(err.contains("MEMORY_BUDGET_MB"), "unexpected error: {err}");
+
     // Native GEOMETRY return type on the v1.5.6 build (no BLOB/alias fallback).
     let out = duckdb.query("SELECT typeof(h3_cell_to_geometry(599686042433355775::UBIGINT));");
     assert_eq!(out.trim(), "GEOMETRY");
