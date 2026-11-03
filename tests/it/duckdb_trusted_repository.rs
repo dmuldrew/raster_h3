@@ -119,7 +119,13 @@ impl Harness {
         let probe = harness.run("SELECT version(); PRAGMA platform;");
         assert!(probe.status.success(), "{}", output_text(&probe));
         let stdout = String::from_utf8(probe.stdout).unwrap();
-        let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+        // The CLI may print warnings (e.g. a Rosetta notice) before the result
+        // rows; keep only lines of identifier characters.
+        let mut lines = stdout.lines().map(str::trim).filter(|l| {
+            !l.is_empty()
+                && l.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
         // `version()` is the release tag (e.g. `v2.0.0`), which is also the
         // `${REVISION}` directory DuckDB requests from a repository.
         harness.version_dir = lines.next().unwrap().to_string();
