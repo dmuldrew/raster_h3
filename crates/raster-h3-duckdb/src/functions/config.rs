@@ -2,8 +2,9 @@
 //! factory.
 //!
 //! The v1.5.6 API build registers `raster_h3_*` extension options on the
-//! loading connection so sessions can `SET` them (environment variables remain
-//! as fallbacks). On the default v1.2.0 build every entry point is a no-op.
+//! loading connection so sessions can `SET` them, with the `RASTER_H3_*`
+//! environment variables as fallbacks. On the default v1.2.0 build the
+//! bind-time entry points are no-ops.
 
 use raster_h3_core::raster::http_range::RemoteSourceFactory;
 
@@ -46,20 +47,18 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Register the `raster_h3_*` extension options on the loading connection.
-/// No-op on the v1.2.0 API build.
+/// Register the `raster_h3_*` extension options on the loading connection
+/// (v1.5.6 API build only). Returns the names of options DuckDB refused to
+/// register, which happens when an option of that name already exists.
 ///
 /// # Safety
 /// `con` must be the live connection passed to the extension entry point.
 #[cfg(feature = "duckdb-api-v1_5_6")]
-pub(crate) unsafe fn register_duckdb_config_options(con: duckdb_connection) {
-    #[cfg(feature = "duckdb-api-v1_5_6")]
+pub(crate) unsafe fn register_duckdb_config_options(
+    con: duckdb_connection,
+) -> Result<(), Vec<&'static str>> {
     // SAFETY: `con` is the live extension-init connection (caller contract).
-    unsafe {
-        register_options_impl(con)
-    };
-    #[cfg(not(feature = "duckdb-api-v1_5_6"))]
-    let _ = con;
+    unsafe { register_options_impl(con) }
 }
 
 /// Build a raster source factory that opens every source through the DuckDB
@@ -110,22 +109,24 @@ fn option_cstring(name: &str) -> std::ffi::CString {
 }
 
 #[cfg(feature = "duckdb-api-v1_5_6")]
-unsafe fn register_options_impl(con: duckdb_connection) {
+unsafe fn register_options_impl(con: duckdb_connection) -> Result<(), Vec<&'static str>> {
     use crate::ffi::*;
 
+    /// Returns whether DuckDB accepted the option.
     fn register_one(
         con: duckdb_connection,
         name: &std::ffi::CStr,
         ty: DuckDBType,
         default: duckdb_value,
         description: &std::ffi::CStr,
-    ) {
+    ) -> bool {
         // SAFETY: all temporaries created here are owned by us and released
         // as documented; `con` is the live init connection (caller contract).
         unsafe {
             let option = duckdb_create_config_option();
             if option.is_null() {
-                return;
+                duckdb_destroy_value(&mut { default });
+                return false;
             }
             duckdb_config_option_set_name(option, name.as_ptr());
             let logical = duckdb_create_logical_type(ty);
@@ -139,43 +140,58 @@ unsafe fn register_options_impl(con: duckdb_connection) {
             duckdb_config_option_set_default_scope(option, DuckDBConfigOptionScope::Session);
             duckdb_config_option_set_description(option, description.as_ptr());
             // `register` copies; failure means the option already exists.
-            let _ = duckdb_register_config_option(con, option);
+            let ok = duckdb_register_config_option(con, option) == DuckDBState::Success;
             let mut option = option;
             duckdb_destroy_config_option(&mut option);
+            ok
         }
     }
 
-    // SAFETY: wrapper call into the initialized DuckDB C API;
-    // pointer args are non-null and borrowed per call contract.
+    let mut failed = Vec::new();
+    // SAFETY: wrapper calls into the initialized DuckDB C API; each default
+    // value is freshly created and handed to `register_one`, which destroys it.
     unsafe {
-        register_one(
+        if !register_one(
             con,
             c"raster_h3_use_duckdb_fs",
             DuckDBType::Boolean,
             duckdb_create_bool(false),
             c"Route raster reads through the DuckDB file system (httpfs, S3/Azure/GCS, secrets)",
-        );
-        register_one(
-            con,
-            c"raster_h3_fetch_workers",
-            DuckDBType::BigInt,
-            duckdb_create_int64(0),
-            c"Remote prefetch worker count (0 = default)",
-        );
-        register_one(
-            con,
-            c"raster_h3_decode_budget_mb",
-            DuckDBType::BigInt,
-            duckdb_create_int64(0),
-            c"Decoded raster sample budget in MiB (0 = default)",
-        );
-        register_one(
-            con,
-            c"raster_h3_workers",
-            DuckDBType::BigInt,
-            duckdb_create_int64(0),
-            c"Dedicated aggregation worker pool size (0 = default)",
-        );
+        ) {
+            failed.push(USE_DUCKDB_FS_OPTION);
+        }
+        for (name, c_name, description) in [
+            (
+                FETCH_WORKERS_OPTION,
+                c"raster_h3_fetch_workers",
+                c"Remote prefetch worker count (0 = default)",
+            ),
+            (
+                DECODE_BUDGET_MB_OPTION,
+                c"raster_h3_decode_budget_mb",
+                c"Decoded raster sample budget in MiB (0 = default)",
+            ),
+            (
+                WORKERS_OPTION,
+                c"raster_h3_workers",
+                c"Dedicated aggregation worker pool size (0 = default)",
+            ),
+        ] {
+            if !register_one(
+                con,
+                c_name,
+                DuckDBType::BigInt,
+                duckdb_create_int64(0),
+                description,
+            ) {
+                failed.push(name);
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed)
     }
 }
 
@@ -198,9 +214,7 @@ fn read_option_bool(ctx: crate::ffi::duckdb_client_context, name: &str) -> Optio
     if value.is_null() {
         return None;
     }
-    // SAFETY: `value` is an owned duckdb_value we destroy once.
-    // SAFETY: `context` is a valid client context; `value` is the owned
-    // option value returned by DuckDB.
+    // SAFETY: `value` is the owned option value returned by DuckDB.
     let result = unsafe {
         if duckdb_is_null_value(value) {
             None
@@ -244,20 +258,18 @@ unsafe fn factory_for_bind_impl(info: duckdb_bind_info) -> Option<RemoteSourceFa
     use std::sync::Arc;
 
     let mut ctx = bind_client_context(info);
-    let enabled = if ctx.is_null() {
-        env_truthy(USE_DUCKDB_FS_ENV)
-    } else {
-        // SAFETY: ctx is a live client context handle.
-        read_option_bool(ctx, USE_DUCKDB_FS_OPTION).unwrap_or_else(|| env_truthy(USE_DUCKDB_FS_ENV))
-    };
-    if !enabled {
-        if !ctx.is_null() {
-            // SAFETY: ctx is owned by us.
-            unsafe { duckdb_destroy_client_context(&mut ctx) };
-        }
+    if ctx.is_null() {
+        // No client context means no DuckDB file system to route through.
         return None;
     }
-    if ctx.is_null() {
+    // The option is registered with a default of `false`, so DuckDB always
+    // returns a value; only an explicit `true` counts as set, and the
+    // environment variable is the fallback otherwise.
+    let enabled =
+        read_option_bool(ctx, USE_DUCKDB_FS_OPTION) == Some(true) || env_truthy(USE_DUCKDB_FS_ENV);
+    if !enabled {
+        // SAFETY: ctx is owned by us.
+        unsafe { duckdb_destroy_client_context(&mut ctx) };
         return None;
     }
     // SAFETY: ctx is a live client context; returned file-system handle is
@@ -291,7 +303,6 @@ unsafe fn apply_options_impl(
     if ctx.is_null() {
         return;
     }
-    // SAFETY: ctx is a live client context handle owned by us.
     {
         if execution.fetch_workers.is_none() {
             execution.fetch_workers = read_option_i64(ctx, FETCH_WORKERS_OPTION)

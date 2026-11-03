@@ -251,46 +251,26 @@ pub fn h3_polygon_to_cells_wkb(
     res: i64,
     mode: ContainmentMode,
 ) -> Result<Vec<u64>, PolygonToCellsError> {
-    let resolution = u8::try_from(res)
-        .ok()
-        .and_then(|r| Resolution::try_from(r).ok())
-        .ok_or(PolygonToCellsError::InvalidResolution(res))?;
-    let multi = wkb_to_multipolygon(wkb).map_err(PolygonToCellsError::InvalidGeometry)?;
-    if multi.0.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut tiler = TilerBuilder::new(resolution).containment_mode(mode).build();
-    tiler
-        .add_batch(multi)
-        .map_err(|_| PolygonToCellsError::InvalidGeometry("non-finite coordinates"))?;
-    let estimate = tiler.coverage_size_hint();
-    if estimate > H3_POLYGON_TO_CELLS_MAX_CELLS {
-        return Err(PolygonToCellsError::TooManyCells {
-            estimate,
-            limit: H3_POLYGON_TO_CELLS_MAX_CELLS,
-        });
-    }
-    let mut cells: Vec<u64> = tiler.into_coverage().map(u64::from).collect();
-    // Overlapping members of a MULTIPOLYGON (and some modes) can emit a cell twice.
-    cells.sort_unstable();
-    cells.dedup();
+    let mut cells = Vec::new();
+    h3_polygon_to_cells_wkb_into(wkb, res, mode, &mut cells)?;
     Ok(cells)
 }
 
-/// [`h3_polygon_to_cells_wkb`] variant writing into a caller-supplied buffer
-/// (reused across rows to avoid a fresh allocation per call).
+/// [`h3_polygon_to_cells_wkb`] writing into a caller-supplied buffer, so a
+/// caller handling many rows can reuse one allocation. `out` is cleared first;
+/// on error its contents are unspecified.
 pub fn h3_polygon_to_cells_wkb_into(
     wkb: &[u8],
     res: i64,
     mode: ContainmentMode,
     out: &mut Vec<u64>,
 ) -> Result<(), PolygonToCellsError> {
+    out.clear();
     let resolution = u8::try_from(res)
         .ok()
         .and_then(|r| Resolution::try_from(r).ok())
         .ok_or(PolygonToCellsError::InvalidResolution(res))?;
     let multi = wkb_to_multipolygon(wkb).map_err(PolygonToCellsError::InvalidGeometry)?;
-    out.clear();
     if multi.0.is_empty() {
         return Ok(());
     }
@@ -306,6 +286,7 @@ pub fn h3_polygon_to_cells_wkb_into(
         });
     }
     out.extend(tiler.into_coverage().map(u64::from));
+    // Overlapping members of a MULTIPOLYGON (and some modes) can emit a cell twice.
     out.sort_unstable();
     out.dedup();
     Ok(())

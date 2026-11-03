@@ -251,8 +251,9 @@ duckdb_api_v156! {
         info: duckdb_bind_info,
         error: *const c_char,
     );
+    // Takes the scalar *bind* info (DuckDB names it `info` in both cases).
     [513] pub fn duckdb_scalar_function_get_client_context(
-        info: duckdb_function_info,
+        info: duckdb_bind_info,
         out_context: *mut duckdb_client_context,
     );
     [514] pub fn duckdb_scalar_function_set_bind_data(

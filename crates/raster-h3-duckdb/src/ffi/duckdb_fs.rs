@@ -17,11 +17,27 @@ fn fs_err(message: String) -> RasterH3Error {
     RasterH3Error::InvalidParameter(message)
 }
 
-/// Owned `duckdb_error_data` that formats its message on request.
-struct ErrorData(duckdb_error_data);
+/// Owned `duckdb_error_data` that formats its message on request and is
+/// destroyed on drop.
+pub(crate) struct ErrorData(duckdb_error_data);
 
 impl ErrorData {
-    fn message(&self) -> String {
+    /// Take ownership of a (possibly null) `duckdb_error_data`.
+    ///
+    /// # Safety
+    /// `raw` must be null or an error-data handle owned by the caller; it is
+    /// destroyed on drop.
+    pub(crate) unsafe fn from_raw(raw: duckdb_error_data) -> Self {
+        Self(raw)
+    }
+
+    /// Whether this handle carries an error (null handles carry none).
+    pub(crate) fn has_error(&self) -> bool {
+        // SAFETY: non-null handle owned by us.
+        !self.0.is_null() && unsafe { duckdb_error_data_has_error(self.0) }
+    }
+
+    pub(crate) fn message(&self) -> String {
         if self.0.is_null() {
             return "unknown DuckDB error".to_string();
         }
@@ -83,7 +99,7 @@ impl DuckDbFileSystem {
         self.open(path, false)
     }
 
-    /// Open `path` for writing (created/truncated).
+    /// Open `path` for writing, creating it or truncating an existing file.
     pub fn open_write(&self, path: &str) -> Result<DuckDbFileHandle> {
         self.open(path, true)
     }
@@ -101,7 +117,10 @@ impl DuckDbFileSystem {
         let state = unsafe {
             if for_write {
                 duckdb_file_open_options_set_flag(options, DuckDBFileFlag::Write, true);
-                duckdb_file_open_options_set_flag(options, DuckDBFileFlag::Create, true);
+                // CREATE_NEW maps to DuckDB's FILE_CREATE_NEW (create or
+                // truncate). Plain CREATE keeps existing bytes, which leaves
+                // stale data past the end when overwriting a larger file.
+                duckdb_file_open_options_set_flag(options, DuckDBFileFlag::CreateNew, true);
             } else {
                 duckdb_file_open_options_set_flag(options, DuckDBFileFlag::Read, true);
             }
@@ -130,9 +149,6 @@ impl Drop for DuckDbFileSystem {
     }
 }
 
-// DuckDB flag setting for open options is per-flag, not bitmask-combinable.
-// Correcting the open() helper above.
-
 /// Owned DuckDB file handle. Not internally synchronized: wrap in a mutex or
 /// pool when accessed from multiple threads (as [`DuckDbFileTransport`] does).
 pub struct DuckDbFileHandle {
@@ -151,8 +167,10 @@ impl DuckDbFileHandle {
 
     /// Seek to an absolute byte offset.
     pub fn seek(&self, offset: u64) -> Result<()> {
+        let location = i64::try_from(offset)
+            .map_err(|_| fs_err(format!("seek offset {offset} exceeds i64::MAX")))?;
         // SAFETY: handle is live.
-        let state = unsafe { duckdb_file_handle_seek(self.handle, offset as i64) };
+        let state = unsafe { duckdb_file_handle_seek(self.handle, location) };
         if state != DuckDBState::Success {
             return Err(fs_err(format!(
                 "DuckDB seek to offset {offset} failed: {}",
@@ -199,16 +217,6 @@ impl DuckDbFileHandle {
             buf = &buf[n as usize..];
         }
         Ok(())
-    }
-
-    /// Current file position.
-    pub fn tell(&self) -> Result<u64> {
-        // SAFETY: handle is live.
-        let pos = unsafe { duckdb_file_handle_tell(self.handle) };
-        if pos < 0 {
-            return Err(fs_err(format!("DuckDB tell failed: {}", self.last_error())));
-        }
-        Ok(pos as u64)
     }
 
     /// Total file size in bytes.
@@ -342,7 +350,7 @@ impl RemoteTransport for DuckDbFileTransport {
     }
 }
 
-/// `io::Write`/`io::Seek` adapter over a write [`DuckDbFileHandle`], so
+/// `io::Write` adapter over a write [`DuckDbFileHandle`], so
 /// `COPY ... TO` outputs can be written through the DuckDB file layer to
 /// `file://`, `s3://`, and other DuckDB-scheme destinations.
 pub struct DuckDbFileWriter {
@@ -353,11 +361,6 @@ impl DuckDbFileWriter {
     /// Take ownership of a handle already opened for writing.
     pub fn new(handle: DuckDbFileHandle) -> Self {
         Self { handle }
-    }
-
-    /// Flush buffered data to the underlying file system.
-    pub fn sync(&self) -> Result<()> {
-        self.handle.sync()
     }
 }
 
@@ -371,29 +374,5 @@ impl std::io::Write for DuckDbFileWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.handle.sync().map_err(std::io::Error::other)
-    }
-}
-
-impl std::io::Seek for DuckDbFileWriter {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let target = match pos {
-            std::io::SeekFrom::Start(o) => o as i64,
-            std::io::SeekFrom::Current(d) => {
-                self.handle.tell().map_err(std::io::Error::other)? as i64 + d
-            }
-            std::io::SeekFrom::End(d) => {
-                self.handle.size().map_err(std::io::Error::other)? as i64 + d
-            }
-        };
-        if target < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "seek before start of file",
-            ));
-        }
-        self.handle
-            .seek(target as u64)
-            .map_err(std::io::Error::other)?;
-        Ok(target as u64)
     }
 }

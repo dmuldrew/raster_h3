@@ -423,12 +423,16 @@ fn real_sql_v156_features() {
 
     // COPY ... (FORMAT pmtiles): H3 index in the first column, remaining
     // columns become feature properties, output through DuckDB's file system.
+    // The destination already holds a larger file: COPY must truncate it, not
+    // leave stale bytes after the new archive.
     let pmtiles = duckdb.path("copy_out.pmtiles");
+    std::fs::write(&pmtiles, vec![0xAB_u8; 4 << 20]).unwrap();
     let sql = format!(
         r#"
         COPY (
             SELECT h3_cell::UBIGINT AS c, 4.5::DOUBLE AS mean, 7::INTEGER AS count
-            FROM (VALUES (598859756008570879::BIGINT), (598859759200591871::BIGINT)) t(h3_cell)
+            -- 85283473fffffff (res 5, zoom 8) and its res-4 parent (zoom 7)
+            FROM (VALUES (599686042433355775::BIGINT), (595182446027210751::BIGINT)) t(h3_cell)
         ) TO {pmtiles} (FORMAT pmtiles, min_zoom 7, max_zoom 9);
     "#,
         pmtiles = quoted(&pmtiles)
@@ -436,6 +440,32 @@ fn real_sql_v156_features() {
     duckdb.query(&sql);
     let bytes = std::fs::read(&pmtiles).unwrap();
     assert_eq!(&bytes[..7], b"PMTiles");
+    // PMTiles v3 header: tile data is the last section, at offset 56 with its
+    // length at 64, so the archive must end exactly where the tile data ends.
+    let le_u64 = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    assert_eq!(
+        bytes.len() as u64,
+        le_u64(56) + le_u64(64),
+        "stale bytes left after the archive"
+    );
+    // Both cells survive the zoom filter, so the archive is not empty.
+    assert!(le_u64(72) > 0, "no tiles written: {} addressed", le_u64(72));
+
+    // A non-NULL value that is not an H3 cell fails the COPY instead of being
+    // dropped silently.
+    let err = try_query_cli(
+        &duckdb.cli,
+        &format!(
+            "LOAD {}; COPY (SELECT 1::UBIGINT c, 2.0 v) TO {} (FORMAT pmtiles);",
+            quoted(&duckdb.extension),
+            quoted(&duckdb.path("invalid_cell.pmtiles"))
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("not a valid H3 cell index"),
+        "unexpected error: {err}"
+    );
 
     // Unknown COPY option names are rejected, not silently ignored.
     let err = try_query_cli(

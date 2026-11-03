@@ -3,9 +3,11 @@
 //!
 //! Contract for the source query:
 //! - column 1 must be the H3 cell index as `UBIGINT`/`BIGINT` or a
-//!   hex `VARCHAR`;
-//! - every remaining column becomes an MVT property named `column_<i>`
-//!   (the stable C API does not expose input column names);
+//!   hex `VARCHAR`; rows whose index is NULL are skipped, and any other value
+//!   that is not a valid H3 cell fails the COPY;
+//! - every remaining column becomes an MVT property named `column_<i>`, where
+//!   `i` is its 1-based position in the query (the stable C API does not
+//!   expose input column names);
 //! - supported options are `MIN_ZOOM`/`MAX_ZOOM`, which filter cells by the
 //!   PMTiles tile zoom derived from their H3 resolution.
 //!
@@ -13,6 +15,9 @@
 //! temporary file, then streamed to the destination through DuckDB's file
 //! system (so `s3://`/`file://` and `CREATE SECRET` credentials apply), falling
 //! back to a local copy when the file layer is unavailable.
+//!
+//! All input features are held in memory until finalize, so the COPY needs
+//! memory proportional to the number of input rows.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -80,9 +85,8 @@ unsafe fn parse_copy_options(
     // SAFETY: `info` is the live bind handle; the returned options value is
     // owned by us and destroyed below.
     let mut options = unsafe { duckdb_copy_function_bind_get_options(info) };
-    // SAFETY: `options` is either null or a valid DuckDB value.
-    let options_is_null = unsafe { duckdb_is_null_value(options) };
-    if options.is_null() || options_is_null {
+    // SAFETY: `options` is checked for null before it is inspected.
+    if options.is_null() || unsafe { duckdb_is_null_value(options) } {
         if !options.is_null() {
             // SAFETY: `options` is our owned value.
             unsafe { duckdb_destroy_value(&mut options) };
@@ -94,9 +98,8 @@ unsafe fn parse_copy_options(
         // SAFETY: `options` is a live owned value; the returned logical type
         // is borrowed from it (see note at the end of this function).
         let ty = unsafe { duckdb_get_value_type(options) };
-        // SAFETY: `ty` is either null or a valid logical type.
-        let ty_id = unsafe { duckdb_get_type_id(ty) };
-        if ty.is_null() || ty_id != DuckDBType::Struct {
+        // SAFETY: `ty` is checked for null before it is inspected.
+        if ty.is_null() || unsafe { duckdb_get_type_id(ty) } != DuckDBType::Struct {
             return Err("expected STRUCT copy options".to_string());
         }
         // SAFETY: `ty` is a valid STRUCT logical type.
@@ -115,15 +118,18 @@ unsafe fn parse_copy_options(
             // value is owned by us and destroyed below.
             let mut child = unsafe { duckdb_get_struct_child(options, i) };
             let mut int_val = None;
-            // SAFETY: `child` is either null or a valid DuckDB value.
-            let child_is_null = unsafe { duckdb_is_null_value(child) };
-            let child_was_null = child.is_null() || child_is_null;
+            // SAFETY: `child` is checked for null before it is inspected.
+            let child_was_null = child.is_null() || unsafe { duckdb_is_null_value(child) };
             if !child_was_null {
                 // SAFETY: `child` is a live owned value; the returned logical
                 // type is borrowed from it.
                 let c_ty = unsafe { duckdb_get_value_type(child) };
-                // SAFETY: `c_ty` is either null or a valid logical type.
-                let id = unsafe { duckdb_get_type_id(c_ty) };
+                let id = if c_ty.is_null() {
+                    DuckDBType::Invalid
+                } else {
+                    // SAFETY: `c_ty` is a valid logical type.
+                    unsafe { duckdb_get_type_id(c_ty) }
+                };
                 // SAFETY: `child` is a live DuckDB value; integer getters
                 // coerce when the underlying type is integer-compatible.
                 int_val = unsafe {
@@ -408,34 +414,51 @@ unsafe extern "C" fn pmtiles_copy_sink(
                 }
             };
 
+            if !matches!(
+                cell_ty,
+                DuckDBType::UBigInt | DuckDBType::BigInt | DuckDBType::Varchar
+            ) {
+                copy_sink_error(
+                    info,
+                    "first column of COPY (FORMAT pmtiles) must be UBIGINT, BIGINT, or hex VARCHAR"
+                        .to_string(),
+                );
+                return;
+            }
+            let cell_data = duckdb_vector_get_data(cell_vector);
+            if cell_data.is_null() {
+                copy_sink_error(info, "pmtiles input chunk has no cell data".to_string());
+                return;
+            }
+
             for row in 0..row_count {
+                // A NULL cell has no location; skip the row like other
+                // spatial writers do. Anything non-NULL must be a valid cell.
                 if !duckdb_validity_is_valid(cell_validity, row) {
                     continue;
                 }
-                let cell_data = duckdb_vector_get_data(cell_vector);
-                if cell_data.is_null() {
-                    break;
-                }
-                let h3_index = match cell_ty {
-                    DuckDBType::UBigInt => *(cell_data as *const u64).add(row as usize),
+                let raw = match cell_ty {
+                    DuckDBType::UBigInt => Ok(*(cell_data as *const u64).add(row as usize)),
                     DuckDBType::BigInt => {
                         let v = *(cell_data as *const i64).add(row as usize);
-                        if v < 0 {
-                            continue;
-                        }
-                        v as u64
-                    }
-                    DuckDBType::Varchar => {
-                        let elem = (cell_data as *const duckdb_string_t).add(row as usize);
-                        match parse_hex_u64((*elem).as_str()) {
-                            Some(v) => v,
-                            None => continue,
-                        }
+                        u64::try_from(v).map_err(|_| v.to_string())
                     }
                     _ => {
+                        let elem = (cell_data as *const duckdb_string_t).add(row as usize);
+                        let text = (*elem).as_str();
+                        parse_hex_u64(text).ok_or_else(|| format!("'{text}'"))
+                    }
+                };
+                let h3_index = match raw.and_then(|v| {
+                    h3o::CellIndex::try_from(v)
+                        .map(u64::from)
+                        .map_err(|_| v.to_string())
+                }) {
+                    Ok(v) => v,
+                    Err(shown) => {
                         copy_sink_error(
                             info,
-                            "first column of COPY (FORMAT pmtiles) must be UBIGINT, BIGINT, or hex VARCHAR".to_string(),
+                            format!("COPY (FORMAT pmtiles): {shown} is not a valid H3 cell index"),
                         );
                         return;
                     }
@@ -483,10 +506,11 @@ unsafe extern "C" fn pmtiles_copy_finalize(info: duckdb_copy_function_finalize_i
                     return;
                 }
             };
+            // Every feature's index was validated in the sink.
             let filtered = features.into_iter().filter(|f| {
                 let res = h3o::CellIndex::try_from(f.h3_index)
                     .map(|c| u8::from(c.resolution()))
-                    .unwrap_or(0);
+                    .unwrap_or_default();
                 let zoom = raster_h3_core::pmtiles::pyramid::h3_res_to_zoom(res);
                 bind_data.min_zoom.is_none_or(|z| zoom >= z)
                     && bind_data.max_zoom.is_none_or(|z| zoom <= z)
