@@ -21,7 +21,7 @@ services:
   # Apache Sedona (Spark) with the raster-h3 Python package installed. Behind a
   # profile so `docker compose up` doesn't build it; naming the service enables it:
   #   docker compose up --build sedona     # JupyterLab on http://localhost:8888
-  #   docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py
+  #   docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py --verify
   sedona:
     profiles: ["sedona"]
     build:

@@ -9,7 +9,7 @@
 ARG SEDONA_VERSION=1.9.1
 
 # ==============================================================================
-# Stage 1: build the raster-h3 wheel and the sample GeoTIFF
+# Stage 1: build the raster-h3 wheel
 # ==============================================================================
 FROM rust:bookworm AS rust
 
@@ -36,8 +36,7 @@ COPY examples/ ./examples/
 
 ENV RASTER_H3_WORKSPACE=/build
 RUN pip install --no-cache-dir "hatchling>=1.26" \
-    && pip wheel --no-deps --no-build-isolation -w /wheels crates/raster-h3-python \
-    && cargo run --locked --release --example generate_sample -- /wheels/sample_sf.tif
+    && pip wheel --no-deps --no-build-isolation -w /wheels crates/raster-h3-python
 
 # ==============================================================================
 # Stage 2: Sedona + raster-h3
@@ -52,8 +51,6 @@ COPY --from=wheel /wheels/ /tmp/wheels/
 # raster_h3 Arrow stream batch by batch.
 RUN pip3 install --no-cache-dir --break-system-packages \
         "$(ls /tmp/wheels/raster_h3-*.whl)" "pyarrow>=15" \
-    && mkdir -p /opt/raster_h3 \
-    && mv /tmp/wheels/sample_sf.tif /opt/raster_h3/sample_sf.tif \
     && rm -rf /tmp/wheels \
     && python3 -c "import raster_h3; print('raster_h3 OK:', raster_h3.h3_to_string(0x8828308281fffff))"
 
@@ -61,4 +58,3 @@ COPY examples/sedona_spark/ /opt/raster_h3/examples/
 
 # The base image sets PYSPARK_DRIVER_PYTHON=jupyter so `pyspark` opens a notebook.
 # That also breaks `spark-submit script.py`; run demos with `python3` instead.
-ENV RASTER_H3_SAMPLE=/opt/raster_h3/sample_sf.tif
