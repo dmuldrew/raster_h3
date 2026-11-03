@@ -12,20 +12,48 @@ fn quoted(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
+fn clean_stdout(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    // Strip ANSI escapes, then drop the CLI's Rosetta warning banner: it is
+    // printed on every invocation when running under binary translation.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out.lines()
+        .filter(|l| {
+            let t = l.trim();
+            t != "WARNING:" && !t.contains("binary translation")
+        })
+        .skip_while(|l| l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn run_cli(cli: &str, sql: &str) -> String {
     let result = Command::new(cli)
         .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", sql])
         .output()
         .expect("run DuckDB CLI");
+    let stdout = clean_stdout(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         result.status.success() && !stderr.contains("Error:"),
         "DuckDB failed with status {:?}:\nstdout: {}\nstderr: {}",
         result.status.code(),
-        String::from_utf8_lossy(&result.stdout),
+        stdout,
         stderr
     );
-    String::from_utf8(result.stdout).unwrap()
+    stdout
 }
 
 struct DuckDbHarness {
