@@ -12,20 +12,48 @@ fn quoted(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
+fn clean_stdout(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    // Strip ANSI escapes, then drop the CLI's Rosetta warning banner: it is
+    // printed on every invocation when running under binary translation.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out.lines()
+        .filter(|l| {
+            let t = l.trim();
+            t != "WARNING:" && !t.contains("binary translation")
+        })
+        .skip_while(|l| l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn run_cli(cli: &str, sql: &str) -> String {
     let result = Command::new(cli)
         .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", sql])
         .output()
         .expect("run DuckDB CLI");
+    let stdout = clean_stdout(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         result.status.success() && !stderr.contains("Error:"),
         "DuckDB failed with status {:?}:\nstdout: {}\nstderr: {}",
         result.status.code(),
-        String::from_utf8_lossy(&result.stdout),
+        stdout,
         stderr
     );
-    String::from_utf8(result.stdout).unwrap()
+    stdout
 }
 
 struct DuckDbHarness {
@@ -37,7 +65,27 @@ struct DuckDbHarness {
 impl DuckDbHarness {
     fn new() -> Self {
         let cli = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".into());
-        let platform = run_cli(&cli, "PRAGMA platform");
+        // The CLI may print warnings (e.g. a Rosetta notice) before the value;
+        // the platform itself is the last line of plain identifier characters.
+        // DUCKDB_PLATFORM overrides probing where the CLI output is unreliable.
+        let platform = std::env::var("DUCKDB_PLATFORM")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| {
+                let platform_out = run_cli(&cli, "PRAGMA platform");
+                platform_out
+                    .lines()
+                    .map(str::trim)
+                    .rev()
+                    .find(|line| {
+                        !line.is_empty()
+                            && line.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("PRAGMA platform did not report a platform:\n{platform_out}")
+                    })
+                    .to_string()
+            });
         let library = std::env::var_os("RASTER_H3_LIBRARY")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -339,4 +387,205 @@ fn real_sql_h3_cell_to_geometry_alias() {
         "true",
         "DuckDB version: {version}"
     );
+}
+
+/// Like `query`, but returns `Err(stderr)` when DuckDB fails instead of
+/// asserting — used for negative-path coverage.
+fn try_query_cli(cli: &str, sql: &str) -> Result<String, String> {
+    let result = Command::new(cli)
+        .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", sql])
+        .output()
+        .expect("run DuckDB CLI");
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    if result.status.success() && !stderr.contains("Error:") {
+        Ok(String::from_utf8(result.stdout).unwrap())
+    } else {
+        Err(format!(
+            "{}{stderr}",
+            String::from_utf8_lossy(&result.stdout)
+        ))
+    }
+}
+
+/// Coverage for the v1.5.6 C extension API build: session options, DuckDB
+/// file-system raster reads, COPY output, and bind-time constant folding.
+/// Runs only when the packaged library is the v1.5.6 build (signalled by
+/// `DUCKDB_VERSION=v1.5.6`, the packaged C API version).
+#[test]
+#[ignore = "requires DuckDB CLI 2.0 and the v1.5.6-API cdylib"]
+fn real_sql_v156_features() {
+    if std::env::var("DUCKDB_VERSION").as_deref() != Ok("v1.5.6") {
+        eprintln!("skipping: packaged library is not the v1.5.6-API build");
+        return;
+    }
+    let duckdb = DuckDbHarness::new();
+
+    // Session configuration options: SET + current_setting round-trip, and
+    // a raster read routed through DuckDB's file system (local file here;
+    // the same path covers httpfs/S3 secrets).
+    let (_file, tif) = helpers::TestGeoTiffBuilder::new(24, 24)
+        .with_geokeys(false)
+        .create_constant_tempfile(42.0_f32);
+    let parquet = duckdb.path("fs_export.parquet");
+    let sql = format!(
+        r#"
+        SET raster_h3_use_duckdb_fs = true;
+        SET raster_h3_workers = 2;
+        SET raster_h3_fetch_workers = 4;
+        SET raster_h3_decode_budget_mb = 8;
+        SELECT current_setting('raster_h3_use_duckdb_fs')::BOOLEAN = true
+            AND current_setting('raster_h3_workers')::INTEGER = 2
+            AND current_setting('raster_h3_fetch_workers')::INTEGER = 4
+            AND current_setting('raster_h3_decode_budget_mb')::INTEGER = 8;
+        SELECT status = 'SUCCESS' AND total_hexagons > 0
+        FROM h3_raster_to_parquet({tif}, {parquet}, crs := 'EPSG:4326',
+            resolutions := '7');
+    "#,
+        tif = quoted(&tif),
+        parquet = quoted(&parquet)
+    );
+    assert_eq!(
+        duckdb.query(&sql).lines().collect::<Vec<_>>(),
+        vec!["true"; 2]
+    );
+
+    // COPY ... (FORMAT pmtiles): H3 index in the first column, remaining
+    // columns become feature properties, output through DuckDB's file system.
+    // The destination already holds a larger file: COPY must truncate it, not
+    // leave stale bytes after the new archive.
+    let pmtiles = duckdb.path("copy_out.pmtiles");
+    std::fs::write(&pmtiles, vec![0xAB_u8; 4 << 20]).unwrap();
+    let sql = format!(
+        r#"
+        COPY (
+            SELECT h3_cell::UBIGINT AS c, 4.5::DOUBLE AS mean, 7::INTEGER AS count
+            -- 85283473fffffff (res 5, zoom 8) and its res-4 parent (zoom 7)
+            FROM (VALUES (599686042433355775::BIGINT), (595182446027210751::BIGINT)) t(h3_cell)
+        ) TO {pmtiles} (FORMAT pmtiles, min_zoom 7, max_zoom 9);
+    "#,
+        pmtiles = quoted(&pmtiles)
+    );
+    duckdb.query(&sql);
+    let bytes = std::fs::read(&pmtiles).unwrap();
+    assert_eq!(&bytes[..7], b"PMTiles");
+    // PMTiles v3 header: tile data is the last section, at offset 56 with its
+    // length at 64, so the archive must end exactly where the tile data ends.
+    let le_u64 = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    assert_eq!(
+        bytes.len() as u64,
+        le_u64(56) + le_u64(64),
+        "stale bytes left after the archive"
+    );
+    // Both cells survive the zoom filter, so the archive is not empty.
+    assert!(le_u64(72) > 0, "no tiles written: {} addressed", le_u64(72));
+
+    // A non-NULL value that is not an H3 cell fails the COPY instead of being
+    // dropped silently.
+    let err = try_query_cli(
+        &duckdb.cli,
+        &format!(
+            "LOAD {}; COPY (SELECT 1::UBIGINT c, 2.0 v) TO {} (FORMAT pmtiles);",
+            quoted(&duckdb.extension),
+            quoted(&duckdb.path("invalid_cell.pmtiles"))
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("not a valid H3 cell index"),
+        "unexpected error: {err}"
+    );
+
+    // Unknown COPY option names are rejected, not silently ignored.
+    let err = try_query_cli(
+        &duckdb.cli,
+        &format!(
+            "LOAD {}; COPY (SELECT 1::UBIGINT c, 2.0 v) TO {} (FORMAT pmtiles, bogus_opt 1);",
+            quoted(&duckdb.extension),
+            quoted(&duckdb.path("never.pmtiles"))
+        ),
+    )
+    .unwrap_err();
+    assert!(err.contains("BOGUS_OPT"), "unexpected error: {err}");
+
+    // Bind-time folding: invalid constant resolution / mode fail at plan time.
+    for (args, needle) in [
+        ("from_hex('00'), 99", "outside 0..=15"),
+        (
+            "from_hex('00'), 8, 'no_such_mode'",
+            "unknown containment mode",
+        ),
+    ] {
+        let err = try_query_cli(
+            &duckdb.cli,
+            &format!(
+                "LOAD {}; SELECT h3_polygon_to_cells({args});",
+                quoted(&duckdb.extension)
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains(needle), "missing {needle} in: {err}");
+    }
+
+    // Bounded memory: ~23k res-9 cells with a 1 MiB budget spill several
+    // sorted runs, and the merged archive matches the unspilled one byte for
+    // byte. Spill files go to DuckDB's temp_directory, which only the
+    // spilling COPY creates (as DuckDB itself does).
+    let polygon = "010300000001000000050000000000000000a05ec00000000000c042400000000000805ec0\
+                   0000000000c042400000000000805ec000000000000043400000000000a05ec0000000000000\
+                   43400000000000a05ec00000000000c04240";
+    let spill_dir = duckdb.path("duckdb_spill");
+    let unspilled = duckdb.path("unspilled.pmtiles");
+    let spilled = duckdb.path("spilled.pmtiles");
+    let cells = format!(
+        "SELECT cell, 'cell-' || cell::VARCHAR AS name, (cell % 1000)::DOUBLE AS v \
+         FROM (SELECT unnest(h3_polygon_to_cells(from_hex('{polygon}'), 9)) AS cell)"
+    );
+    duckdb.query(&format!(
+        r#"
+        SET temp_directory = {spill_dir};
+        COPY ({cells}) TO {unspilled} (FORMAT pmtiles);
+    "#,
+        spill_dir = quoted(&spill_dir),
+        unspilled = quoted(&unspilled),
+    ));
+    assert!(
+        !spill_dir.exists(),
+        "a COPY that fits in memory created temp_directory"
+    );
+    duckdb.query(&format!(
+        "SET temp_directory = {spill_dir}; \
+         COPY ({cells}) TO {spilled} (FORMAT pmtiles, memory_budget_mb 1);",
+        spill_dir = quoted(&spill_dir),
+        spilled = quoted(&spilled),
+    ));
+    let unspilled_bytes = std::fs::read(&unspilled).unwrap();
+    let spilled_bytes = std::fs::read(&spilled).unwrap();
+    assert_eq!(&spilled_bytes[..7], b"PMTiles");
+    assert!(
+        spilled_bytes == unspilled_bytes,
+        "spilled archive ({} bytes) differs from unspilled ({} bytes)",
+        spilled_bytes.len(),
+        unspilled_bytes.len()
+    );
+    assert!(
+        spill_dir.is_dir(),
+        "COPY did not use temp_directory {}",
+        spill_dir.display()
+    );
+
+    // MEMORY_BUDGET_MB must be a positive integer.
+    let err = try_query_cli(
+        &duckdb.cli,
+        &format!(
+            "LOAD {}; COPY (SELECT 599686042433355775::UBIGINT c) TO {} (FORMAT pmtiles, memory_budget_mb 0);",
+            quoted(&duckdb.extension),
+            quoted(&duckdb.path("zero_budget.pmtiles"))
+        ),
+    )
+    .unwrap_err();
+    assert!(err.contains("MEMORY_BUDGET_MB"), "unexpected error: {err}");
+
+    // Native GEOMETRY return type on the v1.5.6 build (no BLOB/alias fallback).
+    let out = duckdb.query("SELECT typeof(h3_cell_to_geometry(599686042433355775::UBIGINT));");
+    assert_eq!(out.trim(), "GEOMETRY");
 }

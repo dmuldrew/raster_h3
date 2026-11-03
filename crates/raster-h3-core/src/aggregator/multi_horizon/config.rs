@@ -315,6 +315,10 @@ pub struct MultiResolutionConfig {
     /// as soon as any valid sample point is dropped by a failed coordinate
     /// transform, instead of skipping it and only counting it.
     pub strict_transforms: bool,
+    /// Optional factory resolving raster byte sources through a host file
+    /// system (e.g. a database file-system layer). None uses mmap for local
+    /// files and the built-in HTTP range client for remote URLs.
+    pub remote_source_factory: Option<crate::raster::http_range::RemoteSourceFactory>,
 }
 
 impl MultiResolutionConfig {
@@ -349,6 +353,7 @@ impl MultiResolutionConfig {
             remapper: None,
             transform_failure_counter: None,
             strict_transforms: false,
+            remote_source_factory: None,
         }
     }
 

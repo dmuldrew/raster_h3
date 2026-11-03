@@ -25,8 +25,17 @@
 pub mod bind_utils;
 /// Categorical raster aggregation table function (`raster_h3_categorical`).
 pub mod categorical_table_function;
+/// DuckDB session configuration options (`SET raster_h3_*`) and the DuckDB
+/// file-system raster source factory.
+pub mod config;
+/// `COPY ... TO (FORMAT pmtiles)` streaming PMTiles export (v1.5.6 build).
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub mod copy_function;
 /// Fast zero-allocation hexadecimal formatting and parsing for 64-bit H3 cell indices (re-exported from crate::encoding).
 pub use crate::encoding::fast_hex;
+/// Registers the `pmtiles` COPY format function (v1.5.6 build).
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub use copy_function::register_copy_functions;
 /// Direct streaming export of H3 aggregations to Parquet files (`raster_h3_parquet`).
 pub mod parquet_table_function;
 /// Direct streaming export of H3 aggregations to PMTiles archives (`raster_h3_pmtiles`).

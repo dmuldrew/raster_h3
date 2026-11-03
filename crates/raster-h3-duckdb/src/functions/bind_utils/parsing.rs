@@ -43,13 +43,13 @@ mod tests {
         let empty_paths: Vec<PathBuf> = Vec::new();
         let resolutions = vec![8, 9];
         assert_eq!(
-            estimate_raster_cardinality(&empty_paths, &resolutions),
+            estimate_raster_cardinality(&empty_paths, &resolutions, None),
             20_000
         );
 
         let non_existent = vec![PathBuf::from("/non/existent/path.tif")];
         assert_eq!(
-            estimate_raster_cardinality(&non_existent, &resolutions),
+            estimate_raster_cardinality(&non_existent, &resolutions, None),
             20_000
         );
     }

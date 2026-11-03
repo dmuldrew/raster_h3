@@ -35,6 +35,8 @@ pub struct PmtilesBindData {
     pub is_categorical: bool,
     pub properties: Option<String>,
     pub execution: ExecutionParams,
+    /// Routes raster reads through the DuckDB file system (v1.5.6 build).
+    pub remote_source_factory: Option<raster_h3_core::raster::http_range::RemoteSourceFactory>,
 }
 
 /// Global execution state for the single-row generator
@@ -110,6 +112,9 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
             let Some(execution) = bind.parse_execution() else {
                 return;
             };
+            // SAFETY: `info` is the live bind handle (callback contract).
+            let remote_source_factory =
+                crate::functions::config::raster_source_factory_for_bind(info);
 
             add_pmtiles_summary_columns(&bind);
 
@@ -127,6 +132,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
                 is_categorical,
                 properties,
                 execution,
+                remote_source_factory,
             });
             duckdb_bind_set_bind_data(
                 info,
@@ -194,6 +200,7 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
             config.bbox = bind_data.bbox;
             config.properties = bind_data.properties.clone();
             bind_data.execution.apply(&mut config);
+            config.remote_source_factory = bind_data.remote_source_factory.clone();
             let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             config.transform_failure_counter = Some(std::sync::Arc::clone(&failures));
 

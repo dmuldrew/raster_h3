@@ -3,6 +3,7 @@
 //! Provides zero-intermediate-file streaming aggregation of GeoTIFF rasters
 //! into Mapbox Vector Tile (MVT) format and single-file PMTiles v3 archives.
 
+pub mod external_export;
 pub mod features;
 pub mod mvt;
 mod overview;
@@ -12,6 +13,7 @@ pub mod tiler;
 pub mod writer;
 
 pub use crate::transcode::{process_parquet_to_pmtiles, RowGroupExtent};
+pub use external_export::{ExternalFeatureExport, DEFAULT_EXPORT_MEMORY_BUDGET};
 pub use features::{
     build_default_pmtiles_fields, build_pmtiles_metadata, H3Feature, PmtilesExportSummary,
     ResolutionAccumulatorStats, TileEvictionEntry, TilePyramidAccumulator,

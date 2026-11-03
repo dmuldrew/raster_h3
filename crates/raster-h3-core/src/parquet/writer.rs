@@ -570,12 +570,15 @@ impl H3ParquetWriter {
                 let streamer = MultiCategoricalHorizonStreamer::new(reader, &config)?;
                 Self::write_categorical_streamer_to_parquet(streamer, parquet_path, parquet_config)
             } else {
-                let mosaic = std::sync::Arc::new(crate::raster::mosaic::MosaicReader::open(
-                    &resolved_paths,
-                    config.bbox,
-                    config.custom_crs.as_deref(),
-                    config.overlap_rule,
-                )?);
+                let mosaic = std::sync::Arc::new(
+                    crate::raster::mosaic::MosaicReader::open_with_remote_source_factory(
+                        &resolved_paths,
+                        config.bbox,
+                        config.custom_crs.as_deref(),
+                        config.overlap_rule,
+                        config.remote_source_factory.as_ref(),
+                    )?,
+                );
                 let streamer = MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config)?;
                 Self::write_categorical_streamer_to_parquet(streamer, parquet_path, parquet_config)
             }
@@ -589,12 +592,15 @@ impl H3ParquetWriter {
                 let streamer = MultiScanHorizonStreamer::new(reader, &config)?;
                 Self::write_continuous_streamer_to_parquet(streamer, parquet_path, parquet_config)
             } else {
-                let mosaic = std::sync::Arc::new(crate::raster::mosaic::MosaicReader::open(
-                    &resolved_paths,
-                    config.bbox,
-                    config.custom_crs.as_deref(),
-                    config.overlap_rule,
-                )?);
+                let mosaic = std::sync::Arc::new(
+                    crate::raster::mosaic::MosaicReader::open_with_remote_source_factory(
+                        &resolved_paths,
+                        config.bbox,
+                        config.custom_crs.as_deref(),
+                        config.overlap_rule,
+                        config.remote_source_factory.as_ref(),
+                    )?,
+                );
                 let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)?;
                 Self::write_continuous_streamer_to_parquet(streamer, parquet_path, parquet_config)
             }

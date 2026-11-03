@@ -227,7 +227,22 @@ impl PmtilesWriter {
         bbox: [f64; 4],
         metadata_json: String,
     ) -> io::Result<Self> {
-        let spill_file = tempfile::tempfile()?;
+        Self::new_in(min_zoom, max_zoom, bbox, metadata_json, None)
+    }
+
+    /// [`PmtilesWriter::new`] with the tile spill file created in `spill_dir`
+    /// (the system temp directory when `None`).
+    pub fn new_in(
+        min_zoom: u8,
+        max_zoom: u8,
+        bbox: [f64; 4],
+        metadata_json: String,
+        spill_dir: Option<&Path>,
+    ) -> io::Result<Self> {
+        let spill_file = match spill_dir {
+            Some(dir) => tempfile::tempfile_in(dir)?,
+            None => tempfile::tempfile()?,
+        };
         Ok(Self {
             spill_file,
             entries: Vec::new(),
@@ -282,8 +297,32 @@ impl PmtilesWriter {
         self.entries.len()
     }
 
-    /// Finalize and write the complete PMTiles v3 single-file archive to disk
-    pub fn finish<P: AsRef<Path>>(mut self, path: P) -> io::Result<()> {
+    /// Finalize and write the complete PMTiles v3 single-file archive to disk.
+    /// The archive is written to a temporary file next to `path` and renamed
+    /// into place, so readers never see a partial file.
+    pub fn finish<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        let mut writer = io::BufWriter::with_capacity(1024 * 1024, temp_file);
+        self.finish_into(&mut writer)?;
+        let temp_file = writer
+            .into_inner()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        temp_file
+            .persist(path)
+            .map_err(|e| io::Error::new(e.error.kind(), e.error.to_string()))?;
+        Ok(())
+    }
+
+    /// Finalize the archive and stream it, start to end, into `writer`
+    /// (which is flushed but not closed). Use this to write somewhere other
+    /// than a local path, such as a database file system.
+    pub fn finish_into<W: Write>(mut self, writer: &mut W) -> io::Result<()> {
         self.spill_file.flush()?;
 
         // Sort entries by canonical Hilbert Tile ID
@@ -388,17 +427,6 @@ impl PmtilesWriter {
         header.extend_from_slice(&((center_lon * 1e7) as i32).to_le_bytes());
         header.extend_from_slice(&((center_lat * 1e7) as i32).to_le_bytes());
 
-        // Write complete archive atomically via temporary file in target directory
-        let path = path.as_ref();
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
-        let mut writer = io::BufWriter::with_capacity(1024 * 1024, temp_file);
         writer.write_all(&header)?;
         writer.write_all(&root_dir_bytes)?;
         writer.write_all(&metadata_bytes)?;
@@ -430,12 +458,6 @@ impl PmtilesWriter {
         }
 
         writer.flush()?;
-        let temp_file = writer
-            .into_inner()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        temp_file
-            .persist(path)
-            .map_err(|e| io::Error::new(e.error.kind(), e.error.to_string()))?;
         Ok(())
     }
 }

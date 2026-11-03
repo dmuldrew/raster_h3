@@ -16,9 +16,15 @@ pub const H3_AREA_M2: [f64; 16] = [
 ];
 
 /// Estimate query cardinality (number of H3 cells emitted) for a set of raster sources and resolutions
-pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8]) -> u64 {
+pub fn estimate_raster_cardinality(
+    resolved_paths: &[PathBuf],
+    resolutions: &[u8],
+    remote_source_factory: Option<&raster_h3_core::raster::http_range::RemoteSourceFactory>,
+) -> u64 {
     if let Some(first_path) = resolved_paths.first() {
-        if let Ok(reader) = GeoTiffStreamReader::open(first_path) {
+        if let Ok(reader) =
+            GeoTiffStreamReader::open_with_remote_source_factory(first_path, remote_source_factory)
+        {
             let w = reader.metadata.width as f64;
             let h = reader.metadata.height as f64;
             let total_pixels = (w * h) as u64 * resolved_paths.len() as u64;
@@ -126,8 +132,15 @@ pub unsafe fn open_mosaic_or_set_error(
     bbox: Option<[f64; 4]>,
     source_crs: Option<&str>,
     overlap_rule: OverlapRule,
+    remote_source_factory: Option<&raster_h3_core::raster::http_range::RemoteSourceFactory>,
 ) -> Option<Arc<MosaicReader>> {
-    match MosaicReader::open(paths, bbox, source_crs, overlap_rule) {
+    match MosaicReader::open_with_remote_source_factory(
+        paths,
+        bbox,
+        source_crs,
+        overlap_rule,
+        remote_source_factory,
+    ) {
         Ok(m) => Some(Arc::new(m)),
         Err(e) => {
             let err_msg = CString::new(format!("Failed to open raster mosaic: {}", e))

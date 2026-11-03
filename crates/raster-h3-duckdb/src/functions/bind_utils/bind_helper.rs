@@ -422,14 +422,19 @@ impl BindHelper {
             }
             Ok(None)
         };
-        Some(ExecutionParams {
+        let mut execution = ExecutionParams {
             aggregation_workers: positive(&["workers", "threads"]).ok()?,
             decode_workers: positive(&["decode_workers"]).ok()?,
             fetch_workers: positive(&["fetch_workers"]).ok()?,
             decode_budget_mb: positive(&["decode_budget_mb"]).ok()?,
             compaction_budget_mb: positive(&["compaction_budget_mb"]).ok()?,
             strict_transforms: self.get_named_bool("strict_transforms").unwrap_or(false),
-        })
+        };
+        // Fill unset values from `SET raster_h3_*` session options (v1.5.6
+        // build) or `RASTER_H3_*` environment fallbacks.
+        // SAFETY: `self.info` is the live bind handle (struct invariant).
+        unsafe { crate::functions::config::apply_duckdb_config_options(self.info, &mut execution) };
+        Some(execution)
     }
 
     /// Parse common raster parameters shared across continuous and categorical aggregations
@@ -491,6 +496,10 @@ impl BindHelper {
             overlap_rule,
             emit_geom,
             execution,
+            // SAFETY: `self.info` is the live bind handle (struct invariant).
+            remote_source_factory: unsafe {
+                crate::functions::config::raster_source_factory_for_bind(self.info)
+            },
         })
     }
 }
@@ -517,6 +526,9 @@ pub struct CommonRasterParams {
     pub overlap_rule: OverlapRule,
     pub emit_geom: bool,
     pub execution: ExecutionParams,
+    /// Routes raster byte-range reads through the DuckDB file system when
+    /// `raster_h3_use_duckdb_fs` is set (v1.5.6 build only).
+    pub remote_source_factory: Option<raster_h3_core::raster::http_range::RemoteSourceFactory>,
 }
 
 /// SQL execution limits and options. Each `None` keeps the streamer default.

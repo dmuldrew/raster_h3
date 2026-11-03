@@ -58,3 +58,4 @@ duckdb_unittest_tempdir/
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
+target-v156/
