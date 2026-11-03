@@ -53,7 +53,7 @@ src/                         # Root crate: libraster_h3 (DuckDB extension) and `
     ├── convert_to_pmtiles.rs     # High-speed standalone TIFF-to-PMTiles converter
     ├── download_burn_probability.rs # USFS Burn Probability tile downloader
     ├── inspect_tif.rs       # GeoTIFF metadata & CRS inspection tool
-    └── package_extension.rs # Pure-Rust DuckDB extension packager & footer generator
+    └── package_extension.rs # Pure-Rust DuckDB extension packager, RSA-2048 signer & repo manifest generator
 
 crates/
 ├── raster-h3-core/          # Engine: raster I/O, CRS, aggregation, columnar, Parquet, PMTiles

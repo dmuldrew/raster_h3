@@ -542,6 +542,23 @@ Outputs: `target/release/libraster_h3.dylib` (macOS) / `.so` (Linux) / `.dll` (W
 
 To build the packaged `build/release/raster_h3.duckdb_extension` the way the DuckDB community-extensions CI does, run `git submodule update --init && make configure && make release` ([Community Extension Build](docs/engines/duckdb.md#community-extension-build)).
 
+To package, sign and verify the extension yourself, use the `package_extension` binary:
+
+```bash
+# Append the 534-byte DuckDB metadata footer (unsigned; load with allow_unsigned_extensions)
+cargo run --release --bin package_extension -- \
+    -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension
+
+# Sign with an RSA-2048 key (-k, or DUCKDB_EXTENSION_SIGNING_KEY), write DuckDB 2.0's
+# .well-known/duckdb-extension-repo.json (-m) for CREATE EXTENSION REPOSITORY, and verify
+cargo run --release --bin package_extension -- \
+    -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension \
+    -k signing_key.pem -m dist/.well-known/duckdb-extension-repo.json \
+    --verify target/release/raster_h3.duckdb_extension
+```
+
+`--help` lists every flag (`--gzip`, `--public-key`, `--platform`, `--print-platform`, …); the DuckDB deep dive covers the [signing scheme](docs/engines/duckdb.md#build-package-load) and the [trusted-repository workflow](docs/engines/duckdb.md#option-b-install-via-custom-repository).
+
 Other workspace members build individually:
 
 ```bash

@@ -9,6 +9,7 @@ explains how to run each group and what CI runs. The counts below are the number
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
 | [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 310 |
+| [`crates/raster-h3-core/tests/memory/`](../crates/raster-h3-core/tests/memory) (`memory`, one child process per scenario variant) | 7 scenarios, 1 binary | 38 checks |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
 | [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
@@ -159,8 +160,41 @@ Results must not depend on thread count, scheduling or pool nesting.
 | [`core/memory_budgets.rs`](../crates/raster-h3-core/tests/it/memory_budgets.rs) (2) | The decoded-chunk budget bounds held chunks without changing results; the compaction limit decomposes groups without losing or duplicating samples. |
 | [`core/sparse_chunks_and_spilling.rs`](../crates/raster-h3-core/tests/it/sparse_chunks_and_spilling.rs) (4) | Sparse COG chunks are filled with a non-zero NoData and skipped; a low aggregation budget creates spill runs (`spill_run_count() > 0`) and the external merge matches an in-memory reference; with resolutions 6 and 8, compaction and four aggregation workers, a budget that spills only resolution 8 (resolution 6 stays in memory, checked per resolution) reproduces the in-memory continuous (count, sum, min, max, p50) and categorical (heap class maps) output exactly. |
 | Unit: `multi_horizon/spill.rs` (5) | Spill file writing and merging. |
+| [`memory`](../crates/raster-h3-core/tests/memory/scenarios.rs) (7 scenarios, 38 checks) | Measured, not estimated, memory. A counting allocator records peak live heap and allocations; each scenario variant runs in its own process. `spill_sorted_run`: the sorted vector built for a spill run is the only new heap while the map's shards drain (accumulators move, nothing is cloned), it fits within the map's accounted bytes, and the map is freed afterwards (plain, quantile and categorical maps). `spill_stream_quantiles`, `categorical_high_cardinality`: p50/p90 sketches and ~46-class heap histograms forced to spill reproduce the in-memory output bit for bit per cell, stay within the budget and lower peak heap. `slow_http_consumer`: with a slow consumer, held response bytes stay within `max_buffered_bytes`, peak heap within twice it and under half of the chunk-count bound alone, with one request per coalesced range. `slow_parquet_writer`: a writer that sleeps per row group adds at most three row-group buffers. `many_tiny_chunks`: 512 one-row strips cost at most 16 allocations each and coalesce into one HTTP range. `concurrent_streams`: four streams use at most 5× the heap of one. |
 
 See [Engineering Architecture](engineering.md) for what the budgets cover.
+
+### Memory benchmarks
+
+`cargo test --release -p raster-h3-core --test memory` runs every scenario (a name
+filter after `--` selects some). The binary re-runs itself once per scenario variant, so
+allocator peaks and RSS high-water marks never mix, and builds fixtures before measuring.
+Checks compare allocator bytes (requested sizes, the same on every platform) with
+configured budgets or with another variant, plus HTTP request counts, spill runs and
+exact output digests, so they hold on any machine. Streams pin two decode and two
+aggregation workers so the numbers do not scale with core count. RSS (high-water mark
+reset after fixtures on Linux, whole-process maximum on macOS, absent on Windows) and wall
+time are reported only; compare them on one machine with
+`-- --repeat 5 --json mem.json` (medians of five processes per variant). In CI the
+tables go to the job summary and one `::notice` annotation lists each scenario's checks
+and peaks.
+
+**Prefetch byte budget (#60), before and after.** The same program streamed a 64 MiB
+remote GeoTIFF (4096×4096 f32) through `RemoteChunkPrefetchQueue` with the default
+configuration (8 workers, 2 MiB ranges, 32 MiB budget, 2 ms server latency), built
+against the commit before #60 and against #60, five processes each on a 4-core Linux VM
+(medians; requests were identical, 32):
+
+| Strips, consumer hold per chunk | Peak heap MiB | RSS growth MiB | Allocated MiB | Wall ms |
+| :--- | ---: | ---: | ---: | ---: |
+| 512 KiB, 5 ms | 49.0 → 32.0 | 65.8 → 32.3 | 128.6 → 64.6 | 686 → 675 |
+| 128 KiB, 1 ms | 25.5 → 24.1 | 39.7 → 26.4 | 128.7 → 64.8 | 599 → 588 |
+| 32 KiB, none | 18.2 → 16.3 | 32.2 → 16.7 | 129.0 → 65.3 | 74 → 56 |
+
+Before #60 the queue counted ready chunks (64) and copied each out of its response, so a
+slow consumer of large chunks held 64 chunks plus eight ranges in flight; with the budget
+the peak is the 32 MiB budget, and shared response buffers halve the bytes allocated.
+`slow_http_consumer` keeps checking the same effect at a small scale.
 
 ## 11. Failure propagation & resilience
 
@@ -234,9 +268,10 @@ See [PMTiles & Multi-Resolution](pmtiles.md).
 | Suite | What it checks |
 | :--- | :--- |
 | [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (6) | Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, quantile sketches built only when a quantile column is projected (`geom` and `wkb` excluded) with reordered/repeated quantile columns matching a full scan, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
-| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (4, ignored) | Real SQL through DuckDB v1.2.0 and v1.5.6: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 to serialize native geometry as WKB. |
+| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (4, ignored) | Real SQL through DuckDB v1.2.0, v1.5.6, and v2.0.0: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 and v2.0.0 to serialize native geometry as WKB. |
+| [`root/duckdb_trusted_repository.rs`](../tests/it/duckdb_trusted_repository.rs) (1, ignored) | DuckDB 2.0+ trusted repository end to end, with signature checking on (no `-unsigned`) and an isolated `HOME`: a repository with a signed extension and `.well-known/duckdb-extension-repo.json` is created from a local prefix, the pinned fingerprint matches the key, `INSTALL`/`LOAD ... FROM` run the extension, a later session reloads it without opting in, and extensions that are unsigned or signed with an unpinned key are rejected. No-op against DuckDB < 2.0. |
 | [`test/sql/raster_h3.test`](../test/sql/raster_h3.test) (sqllogictest) | Packaged `build/release/raster_h3.duckdb_extension` from `make release` loads through DuckDB's Python sqllogictest runner (the community-extensions test path); `h3_to_string` is absent before `require raster_h3` and returns the expected cell after. |
-| [`root/package_extension.rs`](../tests/it/package_extension.rs) (2) | Extension footer layout: custom section headers, ABI fields, version and platform strings, zeroed signature, gzip output. |
+| [`root/package_extension.rs`](../tests/it/package_extension.rs) (6) | Extension footer layout: custom section headers, ABI fields, version and platform strings (including `v2.0.0`) and `--print-platform` parity, zeroed signature, gzip output, 1 MiB chunked SHA-256 RSA-2048 signing and verification, tamper and mismatched-key rejection, inline PEM env-var signing, and DuckDB 2.0 `.well-known/duckdb-extension-repo.json` manifest generation. |
 | Unit: `raster-h3-duckdb` (28) | `ffi/duckdb_c.rs` (9: `duckdb_string_t` layout), `ffi/mod.rs` (3), `bind_utils/parsing.rs` (6), `bind_helper.rs` (2), `chunk_writer.rs` (3), `record_queue.rs` (1), `scalar.rs` (4). |
 
 See [DuckDB](engines/duckdb.md).
@@ -325,6 +360,7 @@ cargo test --release --workspace                    # every crate: unit tests + 
 cargo test --release -p raster-h3-core              # core only; does not compile other engines
 cargo test --release -p raster-h3-core --test it threading::  # one suite (module filter)
 cargo test --release -p raster-h3-core prefetch     # tests matching a filter
+cargo test --release -p raster-h3-core --test memory -- spill  # memory benchmarks (name filter)
 cargo test --release --workspace -- --ignored       # only the gated tests
 RASTER_H3_PG_MAJOR=16 cargo test --release -p raster-h3-pg --features pg-extension  # adds the fmgr suites
 ```
@@ -356,8 +392,8 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 
 | Workflow | Command | Covers |
 | :--- | :--- | :--- |
-| [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded) |
-| `ci.yml` | `cargo build --release --lib` then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs | Real-SQL coverage on both DuckDB versions, packaging with each CLI's `PRAGMA platform` tag |
+| [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded), and the core `memory` benchmark checks |
+| `ci.yml` | `cargo build --release --lib` then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0, v1.5.6 and v2.0.0 CLIs, and `duckdb_trusted_repository` against v2.0.0 | Real-SQL coverage on all three DuckDB versions, packaging with each CLI's `PRAGMA platform` tag; signed install through `CREATE EXTENSION REPOSITORY` |
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
 | `ci.yml` (`test-crates`, Linux) | `cargo test --release -p raster-h3-core -p raster-h3-duckdb -p raster-h3-datafusion -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
