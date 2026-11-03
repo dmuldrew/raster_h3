@@ -416,6 +416,29 @@ column is projected (or the full schema is requested). The schema is unchanged;
 with one sketch sweep per cell, sharing repeated probabilities. See the
 [core engine guide](docs/engines/core.md#batched-quantile-evaluation) for details.
 
+### Partitioned scans (distributed workers)
+
+One raster or mosaic can be split across independent workers (Spark tasks, batch jobs)
+that each read a disjoint set of TIFF tiles, with results identical to a single scan:
+plan the partitions from metadata, scan each one, then merge the few cells that straddle
+a partition edge. Rows whose `partial_state` column is null are final; the others are
+merged per cell.
+
+```python
+import pyarrow as pa, pyarrow.compute as pc, raster_h3
+
+specs = raster_h3.plan_partitions("dem.tif", target_chunks=256)          # driver
+parts = [pa.table(raster_h3.RasterH3ArrowStream("dem.tif", 8, partition=s))  # workers
+         for s in specs]
+cells = pa.concat_tables(parts)
+final = cells.filter(pc.is_null(cells["partial_state"])).drop(["partial_state"])
+merged = raster_h3.merge_partials(cells.filter(pc.is_valid(cells["partial_state"])))
+```
+
+In Rust the same steps are `plan_partitions`, `MultiResolutionConfig::partition` and
+`PartialMerger`. See [Partitioned scans](docs/engines/core.md#partitioned-scans) and the
+[Python guide](docs/engines/python-polars.md#partitioned-scans-spark-and-other-distributed-engines).
+
 ---
 
 ## Core Engineering Architecture

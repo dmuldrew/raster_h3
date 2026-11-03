@@ -29,6 +29,7 @@ use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
 use serde_json::{json, Value};
 
 /// Process CPU seconds (user + system, all threads).
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     // SAFETY: `getrusage` only writes the zero-initialized struct we pass it.
     let usage = unsafe {
@@ -38,6 +39,13 @@ fn cpu_seconds() -> f64 {
     };
     let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
     secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
+/// Process CPU time is only measured on Unix (`getrusage`); elsewhere CPU columns read NaN
+/// and only wall times are meaningful.
+#[cfg(not(unix))]
+fn cpu_seconds() -> f64 {
+    f64::NAN
 }
 
 #[derive(Clone, Copy, Default)]
