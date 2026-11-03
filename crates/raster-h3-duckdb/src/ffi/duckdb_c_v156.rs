@@ -104,10 +104,7 @@ duckdb_api_v156! {
         info: duckdb_copy_function_bind_info,
         error: *const c_char,
     );
-    [440] pub fn duckdb_copy_function_bind_get_client_context(
-        info: duckdb_copy_function_bind_info,
-        out_context: *mut duckdb_client_context,
-    );
+    [440] pub fn duckdb_copy_function_bind_get_client_context(info: duckdb_copy_function_bind_info) -> duckdb_client_context;
     [441] pub fn duckdb_copy_function_bind_get_column_count(
         info: duckdb_copy_function_bind_info,
     ) -> idx_t;
@@ -131,10 +128,7 @@ duckdb_api_v156! {
         info: duckdb_copy_function_global_init_info,
         error: *const c_char,
     );
-    [448] pub fn duckdb_copy_function_global_init_get_client_context(
-        info: duckdb_copy_function_global_init_info,
-        out_context: *mut duckdb_client_context,
-    );
+    [448] pub fn duckdb_copy_function_global_init_get_client_context(info: duckdb_copy_function_global_init_info) -> duckdb_client_context;
     [449] pub fn duckdb_copy_function_global_init_get_bind_data(
         info: duckdb_copy_function_global_init_info,
     ) -> *mut c_void;
@@ -154,10 +148,7 @@ duckdb_api_v156! {
         info: duckdb_copy_function_sink_info,
         error: *const c_char,
     );
-    [455] pub fn duckdb_copy_function_sink_get_client_context(
-        info: duckdb_copy_function_sink_info,
-        out_context: *mut duckdb_client_context,
-    );
+    [455] pub fn duckdb_copy_function_sink_get_client_context(info: duckdb_copy_function_sink_info) -> duckdb_client_context;
     [456] pub fn duckdb_copy_function_sink_get_bind_data(
         info: duckdb_copy_function_sink_info,
     ) -> *mut c_void;
@@ -172,10 +163,7 @@ duckdb_api_v156! {
         info: duckdb_copy_function_finalize_info,
         error: *const c_char,
     );
-    [461] pub fn duckdb_copy_function_finalize_get_client_context(
-        info: duckdb_copy_function_finalize_info,
-        out_context: *mut duckdb_client_context,
-    );
+    [461] pub fn duckdb_copy_function_finalize_get_client_context(info: duckdb_copy_function_finalize_info) -> duckdb_client_context;
     [462] pub fn duckdb_copy_function_finalize_get_bind_data(
         info: duckdb_copy_function_finalize_info,
     ) -> *mut c_void;

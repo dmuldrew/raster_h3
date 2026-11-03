@@ -38,6 +38,9 @@ struct PmtilesCopyGlobal {
     file_path: String,
     writer: Option<Mutex<DuckDbFileWriter>>,
     features: Mutex<Vec<H3Feature>>,
+    // Kept alive for the writer's lifetime: the file handle is only valid
+    // while its file system is.
+    _file_system: Option<DuckDbFileSystem>,
 }
 
 fn copy_bind_error(info: duckdb_copy_function_bind_info, msg: String) {
@@ -114,7 +117,8 @@ unsafe fn parse_copy_options(
             let mut int_val = None;
             // SAFETY: `child` is either null or a valid DuckDB value.
             let child_is_null = unsafe { duckdb_is_null_value(child) };
-            if !child.is_null() && !child_is_null {
+            let child_was_null = child.is_null() || child_is_null;
+            if !child_was_null {
                 // SAFETY: `child` is a live owned value; the returned logical
                 // type is borrowed from it.
                 let c_ty = unsafe { duckdb_get_value_type(child) };
@@ -140,10 +144,29 @@ unsafe fn parse_copy_options(
                 // SAFETY: `child` is our owned value.
                 unsafe { duckdb_destroy_value(&mut child) };
             }
-            let zoom = int_val.and_then(|v| u8::try_from(v).ok());
+            // A NULL option value means "unset"; any other value that is
+            // not an integer in 0..=255 is a user error, not a silent default.
             match name.as_str() {
-                "MIN_ZOOM" => min_zoom = zoom,
-                "MAX_ZOOM" => max_zoom = zoom,
+                "MIN_ZOOM" | "MAX_ZOOM" => {
+                    if !child_was_null {
+                        let zoom = int_val
+                            .ok_or_else(|| {
+                                format!("pmtiles copy option {name} expects an integer 0-255")
+                            })
+                            .and_then(|v| {
+                                u8::try_from(v).map_err(|_| {
+                                    format!(
+                                        "pmtiles copy option {name} expects an integer 0-255, got {v}"
+                                    )
+                                })
+                            })?;
+                        if name == "MIN_ZOOM" {
+                            min_zoom = Some(zoom);
+                        } else {
+                            max_zoom = Some(zoom);
+                        }
+                    }
+                }
                 _ => {
                     return Err(format!(
                         "unsupported pmtiles copy option {name}; supported: MIN_ZOOM, MAX_ZOOM"
@@ -232,29 +255,41 @@ unsafe extern "C" fn pmtiles_copy_global_init(info: duckdb_copy_function_global_
                 .into_owned();
 
             // Open the destination through DuckDB's file layer so httpfs/S3
-            // destinations and secrets apply; fall back to a plain local file.
-            let mut ctx: duckdb_client_context = std::ptr::null_mut();
-            duckdb_copy_function_global_init_get_client_context(info, &mut ctx);
-            let writer = if ctx.is_null() {
-                None
-            } else {
+            // destinations and secrets apply. If DuckDB rejects the path we
+            // surface that error instead of bypassing its file policy with a
+            // plain local write; the std::fs fallback is only for the
+            // (unexpected) case of no client context at all.
+            let ctx = duckdb_copy_function_global_init_get_client_context(info);
+            let mut fs_opt = None;
+            if !ctx.is_null() {
+                let mut ctx = ctx;
                 let fs_handle = duckdb_client_context_get_file_system(ctx);
                 duckdb_destroy_client_context(&mut ctx);
-                if fs_handle.is_null() {
-                    None
-                } else {
-                    let fs = DuckDbFileSystem::from_raw(fs_handle);
-                    match fs.open_write(&file_path) {
-                        Ok(h) => Some(Mutex::new(DuckDbFileWriter::new(h))),
-                        Err(_) => None,
+                if !fs_handle.is_null() {
+                    fs_opt = Some(DuckDbFileSystem::from_raw(fs_handle));
+                }
+            }
+            let mut writer = None;
+            if let Some(fs) = fs_opt.as_ref() {
+                match fs.open_write(&file_path) {
+                    Ok(h) => writer = Some(Mutex::new(DuckDbFileWriter::new(h))),
+                    Err(e) => {
+                        copy_init_error(
+                            info,
+                            format!(
+                                "cannot open COPY destination {file_path} via DuckDB file system: {e}"
+                            ),
+                        );
+                        return;
                     }
                 }
-            };
+            }
 
             let global = Box::new(PmtilesCopyGlobal {
                 file_path,
                 writer,
                 features: Mutex::new(Vec::new()),
+                _file_system: fs_opt,
             });
             duckdb_copy_function_global_init_set_global_state(
                 info,
@@ -468,36 +503,28 @@ unsafe extern "C" fn pmtiles_copy_finalize(info: duckdb_copy_function_finalize_i
                 let _ = std::fs::remove_file(&tmp_path);
                 return;
             }
-            let bytes = match std::fs::read(&tmp_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    copy_finalize_error(info, format!("reading pmtiles temp file failed: {e}"));
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return;
+            // Stream the finished archive in chunks instead of materializing
+            // it again in memory (the feature set is already held by the
+            // PMTiles pyramid builder).
+            let copy_result = (|| -> Result<(), String> {
+                let mut src = std::fs::File::open(&tmp_path)
+                    .map_err(|e| format!("reading pmtiles temp file failed: {e}"))?;
+                if let Some(writer) = global.writer.as_ref() {
+                    let mut w = writer
+                        .lock()
+                        .map_err(|e| format!("writer lock poisoned: {e}"))?;
+                    std::io::copy(&mut src, &mut *w).map_err(|e| e.to_string())?;
+                    use std::io::Write;
+                    w.flush().map_err(|e| e.to_string())?;
+                } else {
+                    let mut dst =
+                        std::fs::File::create(&global.file_path).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut src, &mut dst).map_err(|e| e.to_string())?;
                 }
-            };
+                Ok(())
+            })();
             let _ = std::fs::remove_file(&tmp_path);
-
-            if let Some(writer) = global.writer.as_ref() {
-                let handle_result = writer
-                    .lock()
-                    .map_err(|e| format!("writer lock poisoned: {e}"))
-                    .and_then(|mut w| {
-                        use std::io::Write;
-                        w.write_all(&bytes)
-                            .and_then(|()| w.flush())
-                            .map_err(|e| e.to_string())
-                    });
-                if let Err(e) = handle_result {
-                    copy_finalize_error(
-                        info,
-                        format!(
-                            "writing {} via DuckDB file system failed: {e}",
-                            global.file_path
-                        ),
-                    );
-                }
-            } else if let Err(e) = std::fs::write(&global.file_path, &bytes) {
+            if let Err(e) = copy_result {
                 copy_finalize_error(info, format!("writing {} failed: {e}", global.file_path));
             }
         }
