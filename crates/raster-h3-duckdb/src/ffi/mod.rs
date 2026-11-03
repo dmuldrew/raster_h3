@@ -1,7 +1,15 @@
 pub mod duckdb_c;
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub mod duckdb_c_v156;
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub mod duckdb_fs;
 pub mod spatial_detect;
 
 pub use duckdb_c::*;
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub use duckdb_c_v156::*;
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub use duckdb_fs::*;
 pub use spatial_detect::*;
 
 use std::ffi::{CStr, CString};

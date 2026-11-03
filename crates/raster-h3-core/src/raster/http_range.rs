@@ -229,6 +229,22 @@ pub enum ProbeResult {
     Partial { data: Vec<u8>, total_size: u64 },
 }
 
+/// Byte-range backend for a RemoteHttpSource: the built-in HTTP range
+/// client or a host-provided file-system adapter (e.g. DuckDB's
+/// duckdb_file_system). Implementations must be safe to call concurrently
+/// from prefetch and decode worker threads.
+pub trait RemoteTransport: Send + Sync {
+    /// Fetch the inclusive byte range [start, end] and return exactly the
+    /// requested bytes. Returning fewer bytes is treated as an error by the
+    /// caller.
+    fn fetch_range(&self, start: u64, end: u64, expected_total: Option<u64>) -> Result<Vec<u8>>;
+
+    /// Discover the source's total size and prefetch its first bytes.
+    /// Transports that already know the file size after opening should
+    /// override this and may report Complete for small files.
+    fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult>;
+}
+
 /// Remote HTTP transport handling connections, retries, headers, and range requests.
 #[derive(Clone)]
 pub struct HttpTransport {
@@ -239,6 +255,16 @@ pub struct HttpTransport {
 }
 
 #[allow(clippy::result_large_err)]
+impl RemoteTransport for HttpTransport {
+    fn fetch_range(&self, start: u64, end: u64, expected_total: Option<u64>) -> Result<Vec<u8>> {
+        HttpTransport::fetch_range(self, start, end, expected_total)
+    }
+
+    fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult> {
+        HttpTransport::probe(self, initial_fetch_len)
+    }
+}
+
 impl HttpTransport {
     /// Create a new transport client with configured connection pooling and timeouts
     pub fn new(url: &str) -> Result<Self> {
@@ -303,6 +329,7 @@ impl HttpTransport {
     }
 
     /// Probe remote server to determine byte-range capability and initial header data.
+    #[allow(clippy::result_large_err)]
     pub fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult> {
         let range_header = format!("bytes=0-{}", initial_fetch_len.saturating_sub(1));
         let resp = self.execute_request(|| {
@@ -390,6 +417,7 @@ impl HttpTransport {
     }
 
     /// Fetch an arbitrary byte range directly from the remote server with retry and verification
+    #[allow(clippy::result_large_err)]
     pub fn fetch_range(
         &self,
         start: u64,
@@ -538,8 +566,38 @@ impl ByteCache {
 pub struct RemoteHttpSource {
     pub url: String,
     pub total_size: u64,
-    transport: HttpTransport,
+    transport: Box<dyn RemoteTransport>,
     cache: ByteCache,
+}
+
+/// Factory opening a [`RemoteHttpSource`] for a path. Engine adapters (e.g.
+/// the DuckDB file-system layer) supply one to route raster reads through
+/// their own credentials and remote file handling; the built-in HTTP/S3
+/// client is used when no factory is supplied.
+type RemoteSourceOpener = dyn Fn(&str) -> Result<Arc<RemoteHttpSource>> + Send + Sync;
+
+#[derive(Clone)]
+pub struct RemoteSourceFactory(Arc<RemoteSourceOpener>);
+
+impl RemoteSourceFactory {
+    /// Wrap a source-opening closure.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str) -> Result<Arc<RemoteHttpSource>> + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    /// Open a remote byte source for path.
+    pub fn open(&self, path: &str) -> Result<Arc<RemoteHttpSource>> {
+        (self.0)(path)
+    }
+}
+
+impl std::fmt::Debug for RemoteSourceFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RemoteSourceFactory")
+    }
 }
 
 impl RemoteHttpSource {
@@ -547,6 +605,12 @@ impl RemoteHttpSource {
     pub fn open(raw_url: &str) -> Result<Self> {
         let url = normalize_url(raw_url)?;
         let transport = HttpTransport::new(&url)?;
+        Self::from_transport(url, Box::new(transport))
+    }
+
+    /// Open a source over a caller-provided transport, probing its size and
+    /// fetching the initial header block.
+    pub fn from_transport(url: String, transport: Box<dyn RemoteTransport>) -> Result<Self> {
         let probe = transport.probe(DEFAULT_BLOCK_SIZE)?;
 
         let (cache, total_size) = match probe {
@@ -579,6 +643,7 @@ impl RemoteHttpSource {
     }
 
     /// Fetch an arbitrary byte range directly from the remote server with retry
+    #[allow(clippy::result_large_err)]
     pub fn fetch_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
         self.transport
             .fetch_range(start, end, Some(self.total_size))
@@ -836,7 +901,7 @@ mod tests {
         let source = RemoteHttpSource {
             url: "http://example.com/test.tif".to_string(),
             total_size: 5,
-            transport,
+            transport: Box::new(transport),
             cache,
         };
 

@@ -126,8 +126,11 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
                 }
             }
 
-            let estimated_cardinality =
-                estimate_raster_cardinality(&common.resolved_paths, &common.resolutions);
+            let estimated_cardinality = estimate_raster_cardinality(
+                &common.resolved_paths,
+                &common.resolutions,
+                common.remote_source_factory.as_ref(),
+            );
             duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
 
             let bind_data = Box::new(RasterH3CategoricalBindData {
@@ -174,6 +177,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
                 bind_data.common.bbox,
                 bind_data.common.source_crs.as_deref(),
                 bind_data.common.overlap_rule,
+                bind_data.common.remote_source_factory.as_ref(),
             ) {
                 Some(m) => m,
                 None => return,

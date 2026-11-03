@@ -340,3 +340,115 @@ fn real_sql_h3_cell_to_geometry_alias() {
         "DuckDB version: {version}"
     );
 }
+
+/// Like `query`, but returns `Err(stderr)` when DuckDB fails instead of
+/// asserting — used for negative-path coverage.
+fn try_query_cli(cli: &str, sql: &str) -> Result<String, String> {
+    let result = Command::new(cli)
+        .args(["-unsigned", "-batch", "-csv", "-noheader", "-c", sql])
+        .output()
+        .expect("run DuckDB CLI");
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    if result.status.success() && !stderr.contains("Error:") {
+        Ok(String::from_utf8(result.stdout).unwrap())
+    } else {
+        Err(format!(
+            "{}{stderr}",
+            String::from_utf8_lossy(&result.stdout)
+        ))
+    }
+}
+
+/// Coverage for the v1.5.6 C extension API build: session options, DuckDB
+/// file-system raster reads, COPY output, and bind-time constant folding.
+/// Runs only when the packaged library is the v1.5.6 build (signalled by
+/// `DUCKDB_VERSION=v1.5.6`, the packaged C API version).
+#[test]
+#[ignore = "requires DuckDB CLI 2.0 and the v1.5.6-API cdylib"]
+fn real_sql_v156_features() {
+    if std::env::var("DUCKDB_VERSION").as_deref() != Ok("v1.5.6") {
+        eprintln!("skipping: packaged library is not the v1.5.6-API build");
+        return;
+    }
+    let duckdb = DuckDbHarness::new();
+
+    // Session configuration options: SET + current_setting round-trip, and
+    // a raster read routed through DuckDB's file system (local file here;
+    // the same path covers httpfs/S3 secrets).
+    let (_file, tif) = helpers::TestGeoTiffBuilder::new(24, 24)
+        .with_geokeys(false)
+        .create_constant_tempfile(42.0_f32);
+    let parquet = duckdb.path("fs_export.parquet");
+    let sql = format!(
+        r#"
+        SET raster_h3_use_duckdb_fs = true;
+        SET raster_h3_workers = 2;
+        SET raster_h3_fetch_workers = 4;
+        SET raster_h3_decode_budget_mb = 8;
+        SELECT current_setting('raster_h3_use_duckdb_fs')::BOOLEAN = true
+            AND current_setting('raster_h3_workers')::INTEGER = 2
+            AND current_setting('raster_h3_fetch_workers')::INTEGER = 4
+            AND current_setting('raster_h3_decode_budget_mb')::INTEGER = 8;
+        SELECT status = 'SUCCESS' AND total_hexagons > 0
+        FROM h3_raster_to_parquet({tif}, {parquet}, crs := 'EPSG:4326',
+            resolutions := '7');
+    "#,
+        tif = quoted(&tif),
+        parquet = quoted(&parquet)
+    );
+    assert_eq!(
+        duckdb.query(&sql).lines().collect::<Vec<_>>(),
+        vec!["true"; 2]
+    );
+
+    // COPY ... (FORMAT pmtiles): H3 index in the first column, remaining
+    // columns become feature properties, output through DuckDB's file system.
+    let pmtiles = duckdb.path("copy_out.pmtiles");
+    let sql = format!(
+        r#"
+        COPY (
+            SELECT h3_cell::UBIGINT AS c, 4.5::DOUBLE AS mean, 7::INTEGER AS count
+            FROM (VALUES (598859756008570879::BIGINT), (598859759200591871::BIGINT)) t(h3_cell)
+        ) TO {pmtiles} (FORMAT pmtiles, min_zoom 7, max_zoom 9);
+    "#,
+        pmtiles = quoted(&pmtiles)
+    );
+    duckdb.query(&sql);
+    let bytes = std::fs::read(&pmtiles).unwrap();
+    assert_eq!(&bytes[..7], b"PMTiles");
+
+    // Unknown COPY option names are rejected, not silently ignored.
+    let err = try_query_cli(
+        &duckdb.cli,
+        &format!(
+            "LOAD {}; COPY (SELECT 1::UBIGINT c, 2.0 v) TO {} (FORMAT pmtiles, bogus_opt 1);",
+            quoted(&duckdb.extension),
+            quoted(&duckdb.path("never.pmtiles"))
+        ),
+    )
+    .unwrap_err();
+    assert!(err.contains("BOGUS_OPT"), "unexpected error: {err}");
+
+    // Bind-time folding: invalid constant resolution / mode fail at plan time.
+    for (args, needle) in [
+        ("from_hex('00'), 99", "outside 0..=15"),
+        (
+            "from_hex('00'), 8, 'no_such_mode'",
+            "unknown containment mode",
+        ),
+    ] {
+        let err = try_query_cli(
+            &duckdb.cli,
+            &format!(
+                "LOAD {}; SELECT h3_polygon_to_cells({args});",
+                quoted(&duckdb.extension)
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains(needle), "missing {needle} in: {err}");
+    }
+
+    // Native GEOMETRY return type on the v1.5.6 build (no BLOB/alias fallback).
+    let out = duckdb.query("SELECT typeof(h3_cell_to_geometry(599686042433355775::UBIGINT));");
+    assert_eq!(out.trim(), "GEOMETRY");
+}

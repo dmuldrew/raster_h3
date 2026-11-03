@@ -135,7 +135,26 @@ pub unsafe extern "C" fn raster_h3_init_c_api(
         // `duckdb_database` handle owned by DuckDB.
         let db = unsafe { *db_ptr };
         // SAFETY: `db` is the database DuckDB is loading the extension into.
-        unsafe { raster_h3_init(db) }
+        let ok = unsafe { raster_h3_init(db) };
+        if !ok {
+            return false;
+        }
+        // v1.5.6-only registrations: session options and COPY format.
+        #[cfg(feature = "duckdb-api-v1_5_6")]
+        // SAFETY: wrapper call into the initialized DuckDB C API;
+        // pointer args are non-null and borrowed per call contract.
+        unsafe {
+            let mut raw_con: duckdb_connection = ptr::null_mut();
+            if duckdb_connect(db, &mut raw_con) != DuckDBState::Success {
+                return false;
+            }
+            let guard = ConnectionGuard(raw_con);
+            functions::config::register_duckdb_config_options(guard.0);
+            if functions::register_copy_functions(guard.0).is_err() {
+                return false;
+            }
+        }
+        true
     }));
 
     match result {

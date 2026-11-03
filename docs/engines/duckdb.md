@@ -438,6 +438,8 @@ makefiles (git submodule), which is what the
 `build: cargo`. It builds the root crate and appends the footer with DuckDB's own
 `append_extension_metadata.py` (stable `C_STRUCT` ABI, minimum DuckDB `v1.2.0`).
 
+Two extension builds ship in the repository: `v1.2.0/<platform>/` contains the build against the v1.2.0 C API (loads on DuckDB 1.2 through 1.5), and `v2.0.0/<platform>/` contains a build against the **v1.5.6 C extension API** (loads on DuckDB 2.0+), which adds DuckDB file-system raster reads (`SET raster_h3_use_duckdb_fs = true`), session options (`SET raster_h3_fetch_workers`, `SET raster_h3_decode_budget_mb`, `SET raster_h3_workers`), `COPY (SELECT ...) TO <path> (FORMAT pmtiles, min_zoom N, max_zoom N)`, plan-time argument validation on `h3_polygon_to_cells`, and native `GEOMETRY` types. Build it locally with `cargo build --release --features duckdb-api-v1_5_6`; the resulting library still packages with `package_extension -d v2.0.0`.
+
 ```bash
 git submodule update --init
 make configure      # Python venv (duckdb + sqllogictest runner), platform and version detection

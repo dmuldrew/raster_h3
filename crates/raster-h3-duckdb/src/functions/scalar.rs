@@ -644,6 +644,139 @@ pub unsafe extern "C" fn scalar_h3_cell_to_parent_str(
     }
 }
 
+#[cfg(feature = "duckdb-api-v1_5_6")]
+/// Per-executor scratch state for `h3_polygon_to_cells` (registered via
+/// `duckdb_scalar_function_set_init`): a reusable output buffer avoiding a
+/// fresh allocation per row.
+struct PolygonCellsScratch {
+    cells: Vec<u64>,
+}
+
+#[cfg(feature = "duckdb-api-v1_5_6")]
+unsafe extern "C" fn polygon_cells_init(info: duckdb_init_info) {
+    let state = Box::new(PolygonCellsScratch { cells: Vec::new() });
+    // SAFETY: `info` is the live scalar-init handle; ownership of the box moves
+    // to DuckDB, which calls `delete_boxed` once per executor state.
+    unsafe {
+        duckdb_scalar_function_init_set_state(
+            info,
+            Box::into_raw(state) as *mut std::ffi::c_void,
+            Some(crate::functions::bind_utils::delete_boxed::<PolygonCellsScratch>),
+        );
+    }
+}
+
+#[cfg(feature = "duckdb-api-v1_5_6")]
+/// Bind callback for `h3_polygon_to_cells`: folds constant `resolution` and
+/// `containment` arguments and rejects invalid values at plan time instead of
+/// failing per row.
+unsafe extern "C" fn polygon_cells_bind(info: duckdb_bind_info) {
+    let run = || {
+        // SAFETY: `info` is the live scalar-bind handle.
+        unsafe {
+            let mut ctx: duckdb_client_context = std::ptr::null_mut();
+            duckdb_scalar_function_get_client_context(info, &mut ctx);
+            let argc = duckdb_scalar_function_bind_get_argument_count(info);
+
+            // Argument 1: resolution — fold and range-check.
+            if argc > 1 {
+                let mut expr = duckdb_scalar_function_bind_get_argument(info, 1);
+                if !expr.is_null() && duckdb_expression_is_foldable(expr) && !ctx.is_null() {
+                    let mut val: duckdb_value = std::ptr::null_mut();
+                    let err = duckdb_expression_fold(ctx, expr, &mut val);
+                    if !err.is_null() {
+                        let msg = error_data_message_string(err);
+                        let mut err_mut = err;
+                        duckdb_destroy_error_data(&mut err_mut);
+                        let c = to_c_string(&format!("h3_polygon_to_cells: {msg}"));
+                        duckdb_scalar_function_bind_set_error(info, c.as_ptr());
+                        duckdb_destroy_expression(&mut expr);
+                        duckdb_destroy_client_context(&mut ctx);
+                        return;
+                    }
+                    if !val.is_null() {
+                        let res = duckdb_get_int64(val);
+                        duckdb_destroy_value(&mut { val });
+                        if !(0..=15).contains(&res) {
+                            let c = to_c_string(&format!(
+                                "h3_polygon_to_cells: resolution {res} is outside 0..=15"
+                            ));
+                            duckdb_scalar_function_bind_set_error(info, c.as_ptr());
+                            duckdb_destroy_expression(&mut expr);
+                            duckdb_destroy_client_context(&mut ctx);
+                            return;
+                        }
+                    }
+                }
+                if !expr.is_null() {
+                    duckdb_destroy_expression(&mut expr);
+                }
+            }
+
+            // Argument 2: containment mode — fold and name-check.
+            if argc > 2 {
+                let mut expr = duckdb_scalar_function_bind_get_argument(info, 2);
+                if !expr.is_null() && duckdb_expression_is_foldable(expr) && !ctx.is_null() {
+                    let mut val: duckdb_value = std::ptr::null_mut();
+                    let err = duckdb_expression_fold(ctx, expr, &mut val);
+                    if !err.is_null() {
+                        let msg = error_data_message_string(err);
+                        let mut err_mut = err;
+                        duckdb_destroy_error_data(&mut err_mut);
+                        let c = to_c_string(&format!("h3_polygon_to_cells: {msg}"));
+                        duckdb_scalar_function_bind_set_error(info, c.as_ptr());
+                        duckdb_destroy_expression(&mut expr);
+                        duckdb_destroy_client_context(&mut ctx);
+                        return;
+                    }
+                    if !val.is_null() {
+                        let name = from_duckdb_string(duckdb_get_varchar(val));
+                        duckdb_destroy_value(&mut { val });
+                        if let Some(name) = name {
+                            if scalar_ops::parse_containment_mode(&name).is_none() {
+                                let c = to_c_string(&format!(
+                                    "h3_polygon_to_cells: unknown containment mode `{name}`"
+                                ));
+                                duckdb_scalar_function_bind_set_error(info, c.as_ptr());
+                                duckdb_destroy_expression(&mut expr);
+                                duckdb_destroy_client_context(&mut ctx);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if !expr.is_null() {
+                    duckdb_destroy_expression(&mut expr);
+                }
+            }
+
+            if !ctx.is_null() {
+                duckdb_destroy_client_context(&mut ctx);
+            }
+        }
+    };
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        let msg = safe_panic_payload_to_string(payload);
+        let c = to_c_string(&format!("Panic in h3_polygon_to_cells bind: {msg}"));
+        // SAFETY: `info` is the live scalar-bind handle.
+        unsafe { duckdb_scalar_function_bind_set_error(info, c.as_ptr()) };
+    }
+}
+
+#[cfg(feature = "duckdb-api-v1_5_6")]
+fn error_data_message_string(err: duckdb_error_data) -> String {
+    // SAFETY: `err` is a live error_data owned by the caller; its message is
+    // NUL-terminated while the handle lives.
+    let ptr = unsafe { duckdb_error_data_message(err) };
+    if ptr.is_null() {
+        return "unknown error".to_string();
+    }
+    // SAFETY: NUL-terminated string owned by the error data.
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Shared body of `h3_polygon_to_cells(geom, res[, containment])` -> `UBIGINT[]`.
 ///
 /// Rows with a NULL argument, invalid WKB or a resolution outside `0..=15` yield NULL. An
@@ -740,8 +873,28 @@ unsafe fn polygon_to_cells_kernel(
                 scalar_ops::ContainmentMode::ContainsCentroid
             };
             let wkb = (*p_geom.add(i as usize)).as_bytes();
-            let cells = match scalar_ops::h3_polygon_to_cells_wkb(wkb, *p_res.add(i as usize), mode)
-            {
+            #[cfg(feature = "duckdb-api-v1_5_6")]
+            let cells = {
+                // SAFETY: the init state (if registered) is owned by this
+                // executor thread and only mutated here.
+                let state = duckdb_scalar_function_get_state(info) as *mut PolygonCellsScratch;
+                if state.is_null() {
+                    scalar_ops::h3_polygon_to_cells_wkb(wkb, *p_res.add(i as usize), mode)
+                } else {
+                    let scratch = &mut *state;
+                    scratch.cells.clear();
+                    scalar_ops::h3_polygon_to_cells_wkb_into(
+                        wkb,
+                        *p_res.add(i as usize),
+                        mode,
+                        &mut scratch.cells,
+                    )
+                    .map(|()| std::mem::take(&mut scratch.cells))
+                }
+            };
+            #[cfg(not(feature = "duckdb-api-v1_5_6"))]
+            let cells = scalar_ops::h3_polygon_to_cells_wkb(wkb, *p_res.add(i as usize), mode);
+            let cells = match cells {
                 Ok(cells) => cells,
                 Err(err @ scalar_ops::PolygonToCellsError::TooManyCells { .. }) => {
                     let msg = to_c_string(&format!("h3_polygon_to_cells: {err}"));
@@ -841,6 +994,21 @@ unsafe fn register_scalar_fn_set(
     name: &str,
     overloads: &[ScalarOverload<'_>],
 ) -> Result<(), String> {
+    // SAFETY: forwarded; `with_bind_init` off means identical behaviour.
+    unsafe { register_scalar_fn_set_ex(con, name, overloads, false) }
+}
+
+/// Register a scalar overload set, optionally attaching the v1.5.6
+/// bind/init callbacks used by `h3_polygon_to_cells`.
+///
+/// # Safety
+/// Same contract as [`register_scalar_fn_set`].
+unsafe fn register_scalar_fn_set_ex(
+    con: duckdb_connection,
+    name: &str,
+    overloads: &[ScalarOverload<'_>],
+    #[allow(unused_variables)] with_bind_init: bool,
+) -> Result<(), String> {
     // SAFETY: `con` is a live connection and every logical type in `overloads` is live
     // (caller contract). Names are NUL-terminated CStrings outliving each call, each
     // created function/set is destroyed exactly once after DuckDB has copied it into the
@@ -857,6 +1025,11 @@ unsafe fn register_scalar_fn_set(
             }
             duckdb_scalar_function_set_return_type(scalar_fn, return_type);
             duckdb_scalar_function_set_function(scalar_fn, func);
+            #[cfg(feature = "duckdb-api-v1_5_6")]
+            if with_bind_init {
+                duckdb_scalar_function_set_bind(scalar_fn, polygon_cells_bind);
+                duckdb_scalar_function_set_init(scalar_fn, polygon_cells_init);
+            }
             ok &= duckdb_add_scalar_function_to_set(set, scalar_fn) == DuckDBState::Success;
             duckdb_destroy_scalar_function(&mut scalar_fn);
         }
@@ -1039,10 +1212,11 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
                 ]
             })
             .collect();
-        results.push(register_scalar_fn_set(
+        results.push(register_scalar_fn_set_ex(
             con,
             "h3_polygon_to_cells",
             &polygon_overloads,
+            cfg!(feature = "duckdb-api-v1_5_6"),
         ));
         let mut type_cell_list_mut = type_cell_list;
         duckdb_destroy_logical_type(&mut type_cell_list_mut);

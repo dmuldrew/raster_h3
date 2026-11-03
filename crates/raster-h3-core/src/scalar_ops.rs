@@ -277,6 +277,18 @@ pub fn h3_polygon_to_cells_wkb(
     Ok(cells)
 }
 
+/// [`h3_polygon_to_cells_wkb`] variant writing into a caller-supplied buffer
+/// (reused across rows to avoid a fresh allocation per call).
+pub fn h3_polygon_to_cells_wkb_into(
+    wkb: &[u8],
+    res: i64,
+    mode: ContainmentMode,
+    out: &mut Vec<u64>,
+) -> Result<(), PolygonToCellsError> {
+    *out = h3_polygon_to_cells_wkb(wkb, res, mode)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -155,6 +155,25 @@ pub unsafe fn is_spatial_loaded_query(con: duckdb_connection) -> bool {
 /// # Safety
 /// The DuckDB C API must be initialized. The caller owns the returned
 /// type and must release it with `duckdb_destroy_logical_type`.
+/// Creates a DuckDB GEOMETRY logical type using the native storage type
+/// (guaranteed by the v1.5.6 API).
+///
+/// # Safety
+/// The DuckDB C API must be initialized. The caller owns the returned
+/// type and must release it with `duckdb_destroy_logical_type`.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+pub unsafe fn create_geometry_logical_type() -> duckdb_logical_type {
+    // SAFETY: type ids are DuckDB-owned; we create our own handle.
+    unsafe { duckdb_create_logical_type(DuckDBType::Geometry) }
+}
+
+/// Creates a DuckDB GEOMETRY logical type (or the BLOB-based alias fallback
+/// on DuckDB < 1.5, where `DUCKDB_TYPE_GEOMETRY` is unavailable).
+///
+/// # Safety
+/// The DuckDB C API must be initialized. The caller owns the returned
+/// type and must release it with `duckdb_destroy_logical_type`.
+#[cfg(not(feature = "duckdb-api-v1_5_6"))]
 pub unsafe fn create_geometry_logical_type() -> duckdb_logical_type {
     // SAFETY: the C API is initialized (caller contract). `Geometry` (40) is only
     // requested from DuckDB >= 1.5, which defines it; ownership of the returned

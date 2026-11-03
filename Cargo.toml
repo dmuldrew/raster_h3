@@ -84,6 +84,7 @@ path = "crates/raster-h3-cli/src/bin/raster_h3.rs"
 
 [features]
 default = []
+duckdb-api-v1_5_6 = ["raster-h3-duckdb/duckdb-api-v1_5_6"]
 stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
 
 [dependencies]

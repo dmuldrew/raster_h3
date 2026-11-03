@@ -475,6 +475,18 @@ impl MosaicReader {
         custom_crs: Option<&str>,
         overlap_rule: OverlapRule,
     ) -> Result<Self> {
+        Self::open_with_remote_source_factory(paths, bbox, custom_crs, overlap_rule, None)
+    }
+
+    /// Open a mosaic, resolving tile byte sources through
+    /// remote_source_factory when set.
+    pub fn open_with_remote_source_factory(
+        paths: &[PathBuf],
+        bbox: Option<[f64; 4]>,
+        custom_crs: Option<&str>,
+        overlap_rule: OverlapRule,
+        remote_source_factory: Option<&crate::raster::http_range::RemoteSourceFactory>,
+    ) -> Result<Self> {
         if paths.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
                 "Mosaic paths list cannot be empty".to_string(),
@@ -489,7 +501,8 @@ impl MosaicReader {
         let mut max_spp = 1u16;
 
         for (idx, p) in paths.iter().enumerate() {
-            let reader = GeoTiffStreamReader::open(p)?;
+            let reader =
+                GeoTiffStreamReader::open_with_remote_source_factory(p, remote_source_factory)?;
             max_spp = max_spp.max(reader.metadata.samples_per_pixel);
             let desc = TileDescriptor::new(idx, reader, custom_crs)?;
 
