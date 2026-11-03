@@ -9,7 +9,7 @@ members = [
     "crates/raster-h3-python",
     "crates/raster-h3-pg",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "crates/raster-h3-sedona"]
 
 [workspace.package]
 version = "0.5.0"

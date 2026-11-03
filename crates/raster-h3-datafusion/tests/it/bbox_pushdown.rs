@@ -172,3 +172,31 @@ fn limit_is_not_spent_on_cells_outside_a_pushed_bbox() {
         assert_eq!(reapply(&limited), expected, "{name}");
     }
 }
+
+#[test]
+fn pushed_bbox_off_the_raster_scans_empty() {
+    let (_tmp, path) = TestGeoTiffBuilder::new(64, 64)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|c, r| (c + r) as f32);
+    let src = path.to_str().unwrap();
+    // A degree away from the raster, even after widening by the cell margin.
+    let away = [-121.0, 36.0, -120.9, 36.1];
+    let bbox = [FilterPredicate::Bbox(away)];
+    let cont = ContinuousRasterTableProvider::try_new(src, vec![8]).unwrap();
+    let cat = CategoricalRasterTableProvider::try_new(src, vec![8]).unwrap();
+    for (name, provider) in [
+        ("continuous", &cont as &dyn TableProvider),
+        ("categorical", &cat as &dyn TableProvider),
+    ] {
+        // A pushed filter only narrows the table, so no data means no rows.
+        let pushed = plan_table(provider.scan(None, &bbox, None).unwrap());
+        assert!(pushed.1.is_empty(), "{name}: {} rows", pushed.1.len());
+    }
+    // A table-definition bbox that misses the raster still reports the mistake.
+    let defined = ContinuousRasterTableProvider::try_new(src, vec![8])
+        .unwrap()
+        .with_bbox(away)
+        .scan(None, &[], None)
+        .unwrap();
+    assert!(defined.execute().is_err());
+}

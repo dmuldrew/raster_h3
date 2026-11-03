@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "raster-h3-sedona"
+description = "raster_h3 rasters as SedonaDB tables (sedonadb_table_provider)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest", "pandas", "geoarrow-pyarrow", "sedonadb==0.5.0"]
+
+[tool.maturin]
+features = ["pyo3/extension-module", "pyo3/abi3-py310"]
+module-name = "raster_h3_sedona"
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# SedonaDB warns when PROJ / GDAL are not installed; these tests need neither.
+filterwarnings = ["ignore:Failed to configure:UserWarning"]

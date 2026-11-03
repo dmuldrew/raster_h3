@@ -404,6 +404,11 @@ pub struct MosaicReader {
     pub max_samples_per_pixel: u16,
 }
 
+/// The [`RasterH3Error::InvalidParameter`] message [`MosaicReader::open`] returns when
+/// the configured bbox misses every tile. Callers for which the bbox only narrows a scan
+/// (filter pushdown) match it to return an empty result instead.
+pub const NO_TILES_IN_BBOX: &str = "No mosaic tiles intersect the requested bounding box";
+
 impl MosaicReader {
     /// Create a 1-tile MosaicReader from an existing single GeoTiffStreamReader
     pub fn from_single_reader(
@@ -524,7 +529,7 @@ impl MosaicReader {
 
         if tiles.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
-                "No mosaic tiles intersect the requested bounding box".to_string(),
+                NO_TILES_IN_BBOX.to_string(),
             ));
         }
 

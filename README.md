@@ -65,7 +65,7 @@ A city planning department has two datasets:
 
 **The question**: *Which low-income, densely populated neighborhoods have the least tree canopy coverage?*
 
-Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in two engines:
+Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in three engines:
 
 #### DuckDB (SQL)
 
@@ -159,7 +159,69 @@ instead of silently ignoring them or using defaults. Parquet and PMTiles exports
 also reject invalid resolutions; every resolution must be between 0 and 15. See the
 [Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
 
-> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars.
+#### SedonaDB (Python)
+
+SedonaDB is a spatial engine, so the tracts don't need polyfilling: it joins each hexagon's
+`wkb` polygon to the tract polygons it intersects.
+
+```python
+# Build the bindings: cd crates/raster-h3-sedona/python && maturin develop --release
+# pip install "sedonadb==0.5.0" geoarrow-pyarrow pandas pyogrio pyproj
+import sedonadb
+from raster_h3_sedona import RasterH3Table
+
+sd = sedonadb.connect()
+
+# 1. Aggregate the 30m land cover raster into H3 hexagons (scanned lazily by each query)
+sd.create_data_frame(
+    RasterH3Table.categorical("nlcd_landcover_2021.tif", 8)
+).to_view("canopy_h3")
+
+# 2. Read the census tracts as-is: no polyfill, the join below is spatial
+sd.read_pyogrio("census_tracts.geojson").to_view("census_tracts")
+
+# 3. JOIN raster hexagons to the tracts they intersect
+#    (like 'covers': border hexagons count for both neighbours, and a tract smaller
+#    than one cell still matches the hexagon that contains it)
+result = sd.sql("""
+    WITH tracts AS (
+        SELECT
+            tract_name,
+            median_income,
+            -- EPSG:5070 (CONUS Albers, NLCD's native CRS) gives areas in m²
+            round(total_population / (ST_Area(ST_Transform(wkb_geometry, 'EPSG:5070')) / 1e6), 0)
+                AS pop_density_per_sqkm,
+            wkb_geometry
+        FROM census_tracts
+    )
+    SELECT
+        t.tract_name,
+        t.median_income,
+        t.pop_density_per_sqkm,
+        c.majority_class    AS dominant_landcover,
+        c.majority_fraction AS canopy_purity
+    FROM tracts AS t
+    JOIN canopy_h3 AS c
+      ON ST_Intersects(c.wkb, t.wkb_geometry)
+    WHERE c.majority_class    = 41       -- Deciduous forest (NLCD code)
+      AND c.majority_fraction < 0.30     -- Less than 30% tree canopy
+      AND t.median_income     < 45000    -- Low-income tracts
+      AND t.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
+    ORDER BY canopy_purity
+""").to_pandas()
+```
+
+The join runs as SedonaDB's `SpatialJoinExec`. To join on hex ids instead, as in the DuckDB
+and Polars versions, register the raster_h3 SQL functions with
+`sd.register(raster_h3_sedona.scalar_functions())` and polyfill the tracts with
+`unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index`; joining
+`ON c.h3_index = t.h3_index` is then a plain hash join on a 64-bit integer, which is cheaper when
+the polyfilled tracts are reused. A filter against a constant geometry, such as
+`ST_Intersects(wkb, ST_GeomFromWKT(...))`, is pushed into the raster scan instead, so only the
+hexagons near it are aggregated. See
+[DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
+
+> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
 
 ### Why Intermediate H3 Aggregations Change Everything
 
@@ -257,6 +319,7 @@ returns the same cells and statistics for the same input.
 | **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) · [Polars API Reference](docs/polars-api-reference.md) |
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
+| **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version); SedonaDB Python: `maturin build` in `crates/raster-h3-sedona/python` | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
 | **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 
@@ -321,6 +384,17 @@ let ctx = RasterH3SessionCatalog::new();
 let provider = ctx.h3_raster_continuous_aggregate("dem.tif", vec![8])?;
 let plan = provider.scan(Some(&[0, 2]), &[FilterPredicate::MinCount(10.0)], Some(1000))?;
 for batch in plan.execute()? { /* RecordBatch with h3_index, mean */ }
+```
+
+**Apache DataFusion / SedonaDB**
+
+```rust
+let ctx = sedona::context::SedonaContext::new_local_interactive().await?;
+raster_h3_sedona::register_all(&ctx.ctx); // or a plain datafusion SessionContext
+ctx.sql("SELECT h3_index, mean FROM h3_raster_continuous_aggregate('dem.tif', 8) WHERE count >= 10")
+    .await?
+    .show()
+    .await?;
 ```
 
 **Rust library**
@@ -560,6 +634,7 @@ cargo build --release -p raster-h3-pg --features pg-extension  # PostgreSQL modu
 | `raster-h3-core` | [`crates/raster-h3-core`](crates/raster-h3-core) |
 | `raster-h3-duckdb` | [`crates/raster-h3-duckdb`](crates/raster-h3-duckdb) |
 | `raster-h3-datafusion` | [`crates/raster-h3-datafusion`](crates/raster-h3-datafusion) |
+| `raster-h3-sedona` | [`crates/raster-h3-sedona`](crates/raster-h3-sedona) (standalone workspace; Python bindings in `python/`) |
 | `raster-h3-python` | [`crates/raster-h3-python`](crates/raster-h3-python) |
 | `raster-h3-pg` | [`crates/raster-h3-pg`](crates/raster-h3-pg) |
 | `raster-h3-cli` | [`crates/raster-h3-cli`](crates/raster-h3-cli) |

@@ -14,8 +14,8 @@ use raster_h3_core::columnar::{
     ArrowArrayStream, CategoricalBatchReader, CategoricalFormat, ColumnSchema,
     ContinuousBatchReader, RecordBatch,
 };
-use raster_h3_core::error::Result;
-use raster_h3_core::raster::mosaic::{resolve_raster_sources, OverlapRule};
+use raster_h3_core::error::{RasterH3Error, Result};
+use raster_h3_core::raster::mosaic::{resolve_raster_sources, OverlapRule, NO_TILES_IN_BBOX};
 use raster_h3_core::scalar_ops::estimate_raster_cardinality;
 
 /// Cardinality statistics exposed to query planners.
@@ -284,6 +284,31 @@ mod bbox_tests {
     }
 }
 
+/// Whether a pushed `Bbox` changed the scan's bbox. Such a box only narrows the scan, so a
+/// box that misses every raster tile means an empty result, not an error.
+fn bbox_pushed(
+    original: &MultiResolutionConfig,
+    scanned: &MultiResolutionConfig,
+    filters: &[FilterPredicate],
+) -> bool {
+    filters
+        .iter()
+        .any(|f| matches!(f, FilterPredicate::Bbox(_)))
+        && original.bbox != scanned.bbox
+}
+
+/// Open a batch reader, mapping "no tile intersects the bbox" to `None` when the bbox came
+/// from filter pushdown.
+fn open_or_empty<R>(bbox_pushed: bool, open: impl FnOnce() -> Result<R>) -> Result<Option<R>> {
+    match open() {
+        Ok(reader) => Ok(Some(reader)),
+        Err(RasterH3Error::InvalidParameter(msg)) if bbox_pushed && msg == NO_TILES_IN_BBOX => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Physical execution plan for continuous H3 raster aggregation.
 pub struct ContinuousRasterExec {
     paths: Vec<PathBuf>,
@@ -294,6 +319,8 @@ pub struct ContinuousRasterExec {
     limit: Option<usize>,
     /// Pushed-down filters exclude every row (e.g. an unconfigured resolution).
     empty: bool,
+    /// The bbox was narrowed by a pushed `Bbox` filter (see [`bbox_pushed`]).
+    bbox_pushed: bool,
 }
 
 impl ExecutionPlan for ContinuousRasterExec {
@@ -305,14 +332,19 @@ impl ExecutionPlan for ContinuousRasterExec {
         if self.empty {
             return Ok(Box::new(std::iter::empty()));
         }
-        let reader = ContinuousBatchReader::open(
-            &self.paths,
-            &self.config,
-            self.projection.clone(),
-            self.batch_size,
-            self.limit,
-        )?;
-        Ok(Box::new(reader))
+        let reader = open_or_empty(self.bbox_pushed, || {
+            ContinuousBatchReader::open(
+                &self.paths,
+                &self.config,
+                self.projection.clone(),
+                self.batch_size,
+                self.limit,
+            )
+        })?;
+        Ok(match reader {
+            Some(reader) => Box::new(reader),
+            None => Box::new(std::iter::empty()),
+        })
     }
 }
 
@@ -473,6 +505,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             }
         }
 
+        let bbox_pushed = bbox_pushed(&self.config, &config, filters);
         let base_schema = self.schema();
         let schema = match projection {
             Some(indices) => Arc::new(base_schema.project(indices)?),
@@ -487,6 +520,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             batch_size: self.batch_size,
             limit: reader_limit(filters, limit),
             empty,
+            bbox_pushed,
         }))
     }
 }
@@ -502,6 +536,8 @@ pub struct CategoricalRasterExec {
     limit: Option<usize>,
     /// Pushed-down filters exclude every row (e.g. an unconfigured resolution).
     empty: bool,
+    /// The bbox was narrowed by a pushed `Bbox` filter (see [`bbox_pushed`]).
+    bbox_pushed: bool,
 }
 
 impl ExecutionPlan for CategoricalRasterExec {
@@ -513,15 +549,20 @@ impl ExecutionPlan for CategoricalRasterExec {
         if self.empty {
             return Ok(Box::new(std::iter::empty()));
         }
-        let reader = CategoricalBatchReader::open(
-            &self.paths,
-            &self.config,
-            self.format,
-            self.projection.clone(),
-            self.batch_size,
-            self.limit,
-        )?;
-        Ok(Box::new(reader))
+        let reader = open_or_empty(self.bbox_pushed, || {
+            CategoricalBatchReader::open(
+                &self.paths,
+                &self.config,
+                self.format,
+                self.projection.clone(),
+                self.batch_size,
+                self.limit,
+            )
+        })?;
+        Ok(match reader {
+            Some(reader) => Box::new(reader),
+            None => Box::new(std::iter::empty()),
+        })
     }
 }
 
@@ -652,6 +693,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             }
         }
 
+        let bbox_pushed = bbox_pushed(&self.config, &config, filters);
         let base_schema = self.schema();
         let schema = match projection {
             Some(indices) => Arc::new(base_schema.project(indices)?),
@@ -667,6 +709,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             batch_size: self.batch_size,
             limit: reader_limit(filters, limit),
             empty,
+            bbox_pushed,
         }))
     }
 }
