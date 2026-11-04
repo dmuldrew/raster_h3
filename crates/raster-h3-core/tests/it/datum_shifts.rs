@@ -169,7 +169,6 @@ fn grid_shift_datums_are_rejected_clearly() {
     }
 }
 
-
 #[test]
 fn raster_cell_assignment_uses_independent_proj_datum_references() {
     use crate::helpers::TestGeoTiffBuilder;
