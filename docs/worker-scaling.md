@@ -95,3 +95,36 @@ Do not parallelise the merge yet. Remove the dominant serial cost first:
 3. **Re-run this benchmark.** Parallelise the merge itself, sharded by cell hash (the
    horizon map already has 32 shards), only if it still exceeds 20% of wall time on a
    common workload.
+
+## Follow-up: eviction keys in the workers
+
+Decision 1 is implemented. Each parallel job now computes `compute_cell_south_lat` for
+its map's cells that are not yet in the horizon map, into buffers reused across waves.
+The serial merge uses those values in map order and computes a key itself only if one
+is missing; `StreamProfile::eviction_key_fallbacks` counts those, and stays 0 in
+practice. The keys are the same values as before, so eviction timing and output are
+unchanged; no approximate bound was needed.
+
+Measured with the same 4-vCPU setup, at a 2 GiB budget, against the previous `main`
+build, run back to back on an otherwise idle machine:
+
+| Workload | Workers | Wall before (s) | Wall after (s) | Merge before (s) | Merge after (s) | Merge share after |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| res 9 | 4 | 1.72 | 1.55 | 0.26 | 0.06 | 3.5% |
+| res 11 | 1 | 22.8 | 22.9 | 11.0 | 1.6 | 7.2% |
+| res 11 | 2 | 19.4 | 14.7 | 11.5 | 1.8 | 12.1% |
+| res 11 | 4 | 18.0 | 10.6 | 12.1 | 2.0 | 18.5% |
+| res 7, 9, 11 | 1 | 26.1 | 26.1 | 11.5 | 1.7 | 6.6% |
+| res 7, 9, 11 | 4 | 17.3 | 15.7 | 12.4 | 10.6 | 67.3% |
+
+- **At one worker the total is unchanged.** The work moved off the merging thread
+  rather than disappearing, so the gain grows with the worker count: resolution 11
+  goes from 1.26× to 2.16× at 4 workers.
+- **The remaining merge is ~110–130 ns per new cell** (hash insert and eviction-heap
+  push). At resolution 11 and 4 workers that is 18.5% of wall time, under the 20%
+  threshold, so the merge itself stays serial for now.
+- **The multi-resolution run is bound by spilling, not the merge.** With 2 or more
+  workers it spills 8–10 s even at a 2 GiB budget, before and after this change, and
+  `merge_ns` includes that spill time. Why more workers make it spill is a separate
+  question for decision 2.
+
