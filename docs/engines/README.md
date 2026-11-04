@@ -51,15 +51,17 @@ keep working. `cargo build --release` at the root still produces
 | Categorical aggregation (long) | ✅ | ✅ | ✅ | — | ✅ |
 | Multiple resolutions per scan | ✅ | ✅ | ✅ | — (one `h3_res`) | ✅ |
 | CRS override / NoData override / bbox | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Sub-pixel sampling, band, spectral formulas, quantiles | ✅ | ✅ (builder) | — | — | — |
-| Category remapping, `min_majority_fraction` | ✅ | ✅ | — | — | — |
+| Sub-pixel sampling, band, spectral formulas | ✅ | ✅ (builder) | ✅ | — | — |
+| Quantiles | ✅ | ✅ (builder) | — | — | — |
+| Category remapping | ✅ | ✅ | — | — | — |
+| `min_majority_fraction` | ✅ | ✅ | ✅ | — | — |
 | Column projection pushdown | ✅ | ✅ | ✅ | — | ✅ (`--columns`) |
 | Row-limit pushdown | — (DuckDB stops pulling) | ✅ | ✅ | — (SRF stops on `LIMIT`) | ✅ (`--limit`) |
 | Filter pushdown | named params | `FilterPredicate` | — (applied per batch) | — | — |
 | Parquet / GeoParquet export | ✅ | — | ✅ | — | ✅ |
 | PMTiles v3 export | ✅ | — | ✅ | — | ✅ |
 | Partitioned scans (plan, scan, merge) | ✅ | ✅ (and SedonaDB SQL) | ✅ | — | ✅ (`plan`, `--partition`, `merge`) |
-| Parquet → PMTiles transcoding | ✅ | — | — | — | — |
+| Parquet → PMTiles transcoding | ✅ | — | ✅ (`parquet_to_pmtiles`) | — | — |
 | H3 scalar helpers | ✅ | ✅ (vectorized) | ✅ | ✅ | — |
 | Output transport | DuckDB `DataChunk` | `RecordBatch` / `ArrowArrayStream` | Arrow PyCapsule | heap tuples (value-per-call SRF) | `RH3IPC01` / NDJSON / files |
 
@@ -80,8 +82,8 @@ Each deep dive has a recipes section covering the same tasks. The core calls, si
 | Recipes | [DuckDB](duckdb.md#sql-usage--recipes) | [Python](python-polars.md#recipes) | [PostgreSQL](postgresql.md#recipes) | [CLI](cli.md#recipes) | [DataFusion](datafusion.md#recipes) |
 
 Mosaics (globs, comma-separated lists, VRT) are accepted by every adapter through
-`resolve_raster_sources`. DuckDB exposes the `overlap_rule` choice; DataFusion exposes it via
-`with_overlap_rule`; Python, PostgreSQL and the CLI always use `cutline`.
+`resolve_raster_sources`. DuckDB and Python expose the `overlap_rule` choice; DataFusion
+exposes it via `with_overlap_rule`; PostgreSQL and the CLI always use `cutline`.
 
 ## Shared Semantics
 

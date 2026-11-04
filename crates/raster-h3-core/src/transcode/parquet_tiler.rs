@@ -68,12 +68,17 @@ pub fn scan_row_group_h3_extent(
         }
     };
 
+    // A nullable (OPTIONAL) column, as Polars, PyArrow and DuckDB write by default, needs
+    // a definition-level buffer: without one `read_records` fails. `vals` receives only the
+    // non-null values either way.
+    let mut def_levels: Vec<i16> = Vec::with_capacity(8192);
     match col_reader {
         parquet::column::reader::ColumnReader::Int64ColumnReader(mut r) => {
             let mut vals = Vec::with_capacity(8192);
             loop {
                 vals.clear();
-                let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
+                def_levels.clear();
+                let (read, _, _) = r.read_records(8192, Some(&mut def_levels), None, &mut vals)?;
                 if read == 0 {
                     break;
                 }
@@ -86,7 +91,8 @@ pub fn scan_row_group_h3_extent(
             let mut vals = Vec::with_capacity(8192);
             loop {
                 vals.clear();
-                let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
+                def_levels.clear();
+                let (read, _, _) = r.read_records(8192, Some(&mut def_levels), None, &mut vals)?;
                 if read == 0 {
                     break;
                 }
@@ -99,7 +105,8 @@ pub fn scan_row_group_h3_extent(
             let mut vals = Vec::with_capacity(8192);
             loop {
                 vals.clear();
-                let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
+                def_levels.clear();
+                let (read, _, _) = r.read_records(8192, Some(&mut def_levels), None, &mut vals)?;
                 if read == 0 {
                     break;
                 }
@@ -116,7 +123,8 @@ pub fn scan_row_group_h3_extent(
             let mut vals = Vec::with_capacity(8192);
             loop {
                 vals.clear();
-                let (read, _, _) = r.read_records(8192, None, None, &mut vals)?;
+                def_levels.clear();
+                let (read, _, _) = r.read_records(8192, Some(&mut def_levels), None, &mut vals)?;
                 if read == 0 {
                     break;
                 }

@@ -72,6 +72,26 @@ impl SpectralFormula {
         }
     }
 
+    /// The 1-indexed bands this formula reads.
+    pub fn bands(&self) -> Vec<usize> {
+        match *self {
+            Self::Ndvi { nir_band, red_band } => vec![nir_band, red_band],
+            Self::Ndwi {
+                green_band,
+                nir_band,
+            } => vec![green_band, nir_band],
+            Self::Nbr {
+                nir_band,
+                swir_band,
+            } => vec![nir_band, swir_band],
+            Self::Evi {
+                nir_band,
+                red_band,
+                blue_band,
+            } => vec![nir_band, red_band, blue_band],
+        }
+    }
+
     /// Evaluate the spectral formula for given physical band reflectance values.
     /// Returns None if the denominator is within [-1e-12, 1e-12] (division-by-zero protection).
     pub fn compute(&self, nir: f64, red: f64, green: f64, blue: f64, swir: f64) -> Option<f64> {

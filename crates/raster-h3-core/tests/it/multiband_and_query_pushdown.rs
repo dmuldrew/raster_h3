@@ -631,3 +631,49 @@ fn borrowed_interleaved_windows_match_across_job_sizes() {
         assert_eq!(stream.metrics().worker.copied_bytes, 0);
     }
 }
+
+/// A band (or spectral formula band) the raster does not have is refused when the stream
+/// opens, for continuous and categorical streams alike; the kernels used to clamp it to the
+/// last band and silently aggregate that band instead.
+#[test]
+fn test_band_beyond_raster_is_refused() {
+    let rgba = create_test_rgba_geotiff(16, 16, 10, 20, 30, 255);
+    let open = |config: &MultiResolutionConfig| {
+        MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(rgba.path()).unwrap(), config)
+            .err()
+            .map(|e| e.to_string())
+    };
+
+    let mut config = MultiResolutionConfig::new(vec![9]);
+    config.band = 4;
+    assert_eq!(open(&config), None, "band 4 of an RGBA raster exists");
+    config.band = 5;
+    let err = open(&config).expect("band 5 of an RGBA raster must be refused");
+    assert!(
+        err.contains("band 5 does not exist") && err.contains("4 band(s)"),
+        "{err}"
+    );
+
+    let mut config = MultiResolutionConfig::new(vec![9]);
+    config.spectral_formula = Some(SpectralFormula::Ndvi {
+        nir_band: 6,
+        red_band: 1,
+    });
+    let err = open(&config).expect("NDVI from band 6 must be refused");
+    assert!(
+        err.contains("spectral formula band 6 does not exist"),
+        "{err}"
+    );
+
+    let gray = create_test_gray8_geotiff(16, 16, |_, _| 1);
+    let mut config = MultiResolutionConfig::new(vec![9]);
+    config.band = 2;
+    let err = MultiCategoricalHorizonStreamer::new(
+        GeoTiffStreamReader::open(gray.path()).unwrap(),
+        &config,
+    )
+    .err()
+    .map(|e| e.to_string())
+    .expect("band 2 of a one-band raster must be refused");
+    assert!(err.contains("band 2 does not exist"), "{err}");
+}

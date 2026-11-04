@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
     plan_partitions, MultiCategoricalHorizonStreamer, MultiResolutionConfig,
-    MultiScanHorizonStreamer, ScanPartition,
+    MultiScanHorizonStreamer, ScanPartition, SpectralFormula,
 };
+use raster_h3_core::aggregator::SamplingPattern;
 use raster_h3_core::columnar::{
     merge_partial_batches, partitioned_output_schema, ArrowArrayStream, ArrowSchema,
     CategoricalBatchReader, CategoricalFormat, ColumnArray, ColumnSchema, ContinuousBatchReader,
@@ -57,6 +58,16 @@ pub struct PyScanConfig {
     /// nullable `partial_state` column; rows where it is set must be merged with
     /// `merge_partials`.
     pub partition: Option<ScanPartition>,
+    /// 1-indexed raster band to aggregate.
+    pub band: usize,
+    /// Sub-pixel sampling pattern (default: one sample at each pixel centre).
+    pub sampling: SamplingPattern,
+    /// How overlapping mosaic tiles are resolved (default `Cutline`).
+    pub overlap_rule: OverlapRule,
+    /// Categorical only: drop cells whose majority class covers less than this fraction.
+    pub min_majority_fraction: Option<f64>,
+    /// Continuous only: aggregate a spectral index computed from several bands.
+    pub spectral_formula: Option<SpectralFormula>,
 }
 
 impl Default for PyScanConfig {
@@ -75,6 +86,11 @@ impl Default for PyScanConfig {
             strict_transforms: false,
             transform_failure_counter: None,
             partition: None,
+            band: 1,
+            sampling: SamplingPattern::default(),
+            overlap_rule: OverlapRule::Cutline,
+            min_majority_fraction: None,
+            spectral_formula: None,
         }
     }
 }
@@ -172,6 +188,15 @@ impl PyRasterScanner {
                     .into(),
             ));
         }
+        if self.config.min_majority_fraction.is_some() {
+            // `merge_partials` rebuilds the scan's filters from its own arguments, which do
+            // not carry this one, so merged boundary cells would escape it.
+            return Err(RasterH3Error::InvalidParameter(
+                "min_majority_fraction cannot be combined with a partition yet; filter the \
+                 merged result on majority_fraction instead"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -193,7 +218,11 @@ impl PyRasterScanner {
         mr_cfg.custom_crs = self.config.crs.clone();
         mr_cfg.custom_nodata = self.config.nodata;
         mr_cfg.bbox = self.config.bbox;
-        mr_cfg.overlap_rule = OverlapRule::Cutline;
+        mr_cfg.overlap_rule = self.config.overlap_rule;
+        mr_cfg.band = self.config.band;
+        mr_cfg.sampling = self.config.sampling.clone();
+        mr_cfg.min_majority_fraction = self.config.min_majority_fraction;
+        mr_cfg.spectral_formula = self.config.spectral_formula;
         mr_cfg.strict_transforms = self.config.strict_transforms;
         mr_cfg.transform_failure_counter = self.config.transform_failure_counter.clone();
 
@@ -446,6 +475,181 @@ unsafe fn build_py_scan_config(
             limit: limit_opt,
             ..Default::default()
         })
+    }
+}
+
+/// Scan options beyond the positional C-ABI arguments, passed to the `_v2` entry points as
+/// a JSON object. Every field is optional; unknown fields are rejected so a typo is an
+/// error rather than a silently ignored option.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PyScanOptions {
+    band: Option<i64>,
+    sampling: Option<String>,
+    overlap_rule: Option<String>,
+    min_majority_fraction: Option<f64>,
+    spectral_formula: Option<String>,
+    nir_band: Option<i64>,
+    red_band: Option<i64>,
+    green_band: Option<i64>,
+    blue_band: Option<i64>,
+    swir_band: Option<i64>,
+}
+
+/// Names accepted for `sampling`, as in DuckDB's `sampling :=`.
+const SAMPLING_NAMES: &str = "center, 5point, gaussian, rgss, hex, 8rooks, 9point, 16point";
+/// Names accepted for `overlap_rule`, as in DuckDB's `overlap_rule :=`.
+const OVERLAP_RULE_NAMES: &str = "cutline, first, average";
+/// Names accepted for `spectral_formula`.
+const SPECTRAL_FORMULA_NAMES: &str = "ndvi, ndwi, nbr, evi";
+
+/// Core's [`SamplingPattern::parse`] falls back to the centre pattern for unknown names;
+/// reject them instead.
+fn parse_sampling_strict(name: &str) -> Result<SamplingPattern> {
+    let pattern = SamplingPattern::parse(name);
+    let is_center_name = matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "center" | "centre" | "1"
+    );
+    if pattern == SamplingPattern::center() && !is_center_name {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "Invalid sampling '{name}': expected one of {SAMPLING_NAMES}"
+        )));
+    }
+    Ok(pattern)
+}
+
+/// Core's [`OverlapRule::parse`] falls back to `Cutline` for unknown names; reject them
+/// instead.
+fn parse_overlap_rule_strict(name: &str) -> Result<OverlapRule> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "cutline" | "voronoi" | "nearest" | "first" | "priority" | "painter" | "average"
+        | "mean" | "all" | "multi_temporal" => Ok(OverlapRule::parse(name)),
+        _ => Err(RasterH3Error::InvalidParameter(format!(
+            "Invalid overlap_rule '{name}': expected one of {OVERLAP_RULE_NAMES}"
+        ))),
+    }
+}
+
+/// A 1-indexed band number option, or `default` when unset.
+fn band_option(name: &str, value: Option<i64>, default: usize) -> Result<usize> {
+    match value {
+        None => Ok(default),
+        Some(b) if b >= 1 => usize::try_from(b)
+            .map_err(|_| RasterH3Error::InvalidParameter(format!("{name} {b} is too large"))),
+        Some(b) => Err(RasterH3Error::InvalidParameter(format!(
+            "{name} must be at least 1 (bands are 1-indexed), got {b}"
+        ))),
+    }
+}
+
+/// Parse the `options` JSON of the `_v2` entry points (NULL or empty means none) and apply
+/// it to `cfg`, whose `categorical` flag must already be set.
+fn apply_scan_options(cfg: &mut PyScanConfig, options: Option<&str>) -> Result<()> {
+    let Some(json) = options else {
+        return Ok(());
+    };
+    let opts: PyScanOptions = serde_json::from_str(json)
+        .map_err(|e| RasterH3Error::InvalidParameter(format!("Invalid scan options: {e}")))?;
+
+    cfg.band = band_option("band", opts.band, 1)?;
+    if let Some(name) = &opts.sampling {
+        cfg.sampling = parse_sampling_strict(name)?;
+    }
+    if let Some(name) = &opts.overlap_rule {
+        cfg.overlap_rule = parse_overlap_rule_strict(name)?;
+    }
+    if let Some(frac) = opts.min_majority_fraction {
+        if !cfg.categorical {
+            return Err(RasterH3Error::InvalidParameter(
+                "min_majority_fraction applies to categorical scans only".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&frac) {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "min_majority_fraction must be between 0 and 1, got {frac}"
+            )));
+        }
+        cfg.min_majority_fraction = Some(frac);
+    }
+
+    let band_args = [
+        opts.nir_band,
+        opts.red_band,
+        opts.green_band,
+        opts.blue_band,
+        opts.swir_band,
+    ];
+    match &opts.spectral_formula {
+        None => {
+            if band_args.iter().any(Option::is_some) {
+                return Err(RasterH3Error::InvalidParameter(
+                    "nir_band, red_band, green_band, blue_band and swir_band need a \
+                     spectral_formula"
+                        .into(),
+                ));
+            }
+        }
+        Some(name) => {
+            if cfg.categorical {
+                return Err(RasterH3Error::InvalidParameter(
+                    "spectral_formula applies to continuous scans only".into(),
+                ));
+            }
+            // Defaults match DuckDB's `nir_band := 4, red_band := 3, ...`.
+            let formula = SpectralFormula::parse(
+                name,
+                band_option("nir_band", opts.nir_band, 4)?,
+                band_option("red_band", opts.red_band, 3)?,
+                band_option("green_band", opts.green_band, 2)?,
+                band_option("blue_band", opts.blue_band, 1)?,
+                band_option("swir_band", opts.swir_band, 6)?,
+            )
+            .ok_or_else(|| {
+                RasterH3Error::InvalidParameter(format!(
+                    "Invalid spectral_formula '{name}': expected one of {SPECTRAL_FORMULA_NAMES}"
+                ))
+            })?;
+            cfg.spectral_formula = Some(formula);
+        }
+    }
+    Ok(())
+}
+
+/// [`build_py_scan_config`] plus the `_v2` `options` JSON.
+///
+/// # Safety
+/// Every C string argument must be null or a valid NUL-terminated string.
+#[allow(clippy::too_many_arguments)]
+unsafe fn build_py_scan_config_v2(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    options: *const c_char,
+) -> Result<PyScanConfig> {
+    // SAFETY: every C string argument is null or NUL-terminated (caller contract).
+    unsafe {
+        let mut cfg = build_py_scan_config(
+            path,
+            resolutions,
+            categorical,
+            format,
+            crs,
+            has_nodata,
+            nodata,
+            bbox,
+            columns,
+            limit,
+        )?;
+        apply_scan_options(&mut cfg, opt_cstr(options).as_deref())?;
+        Ok(cfg)
     }
 }
 
@@ -868,39 +1072,8 @@ pub unsafe extern "C" fn raster_h3_py_plan_partitions(
     target_chunks: i64,
     out_err: *mut *mut c_char,
 ) -> *mut c_char {
-    // SAFETY: the C string arguments are null or NUL-terminated and `out_err` is null or a
-    // writable `char **` (caller contract), as `build_py_scan_config` and `ffi_call` require.
-    unsafe {
-        ffi_call("plan_partitions", out_err, || {
-            let cfg = build_py_scan_config(
-                path,
-                ptr::null(),
-                0,
-                ptr::null(),
-                crs,
-                0,
-                0.0,
-                bbox,
-                ptr::null(),
-                -1,
-            )?;
-            let target = usize::try_from(target_chunks)
-                .ok()
-                .filter(|&n| n > 0)
-                .ok_or_else(|| {
-                    RasterH3Error::InvalidParameter("target_chunks must be at least 1".into())
-                })?;
-            // Open the mosaic exactly as the scans do, so the fingerprints match.
-            let paths = resolve_raster_sources(&cfg.path)?;
-            let mosaic =
-                MosaicReader::open(&paths, cfg.bbox, cfg.crs.as_deref(), OverlapRule::Cutline)?;
-            let plan = plan_partitions(&mosaic, target)?;
-            let json = serde_json::to_string(&plan)
-                .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
-            Ok(CString::new(json).unwrap_or_default().into_raw())
-        })
-        .unwrap_or(ptr::null_mut())
-    }
+    // SAFETY: forwards the caller's arguments, which meet the `_v2` contract, with no options.
+    unsafe { raster_h3_py_plan_partitions_v2(path, crs, bbox, target_chunks, ptr::null(), out_err) }
 }
 
 /// [`raster_h3_py_create_arrow_schema`] for a partitioned scan: the projected columns plus
@@ -1645,6 +1818,284 @@ pub unsafe extern "C" fn raster_h3_py_export_pmtiles_with_stats(
                 -1
             }
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// `_v2` scan entry points: the positional arguments plus an `options` JSON object
+// -----------------------------------------------------------------------------
+
+/// The optional partition argument of the `_v2` entry points: NULL or empty scans the
+/// whole raster.
+///
+/// # Safety
+/// `partition` must be null or a valid NUL-terminated string.
+unsafe fn parse_c_opt_partition(partition: *const c_char) -> Result<Option<ScanPartition>> {
+    // SAFETY: null or NUL-terminated (caller contract), as `opt_cstr` requires.
+    unsafe { opt_cstr(partition) }
+        .map(|json| ScanPartition::from_json(&json))
+        .transpose()
+}
+
+/// [`raster_h3_py_create_arrow_stream_ex`] that also takes `partition` (NULL for a whole
+/// scan, else a JSON object from `raster_h3_py_plan_partitions_v2`) and `options`, a JSON
+/// object of further scan options (NULL for none): `band`, `sampling`, `overlap_rule`,
+/// `min_majority_fraction`, `spectral_formula` and `nir_band` / `red_band` /
+/// `green_band` / `blue_band` / `swir_band`.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL; `out_err` must be
+/// NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_create_arrow_stream_v2(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    strict_transforms: c_int,
+    partition: *const c_char,
+    options: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowArrayStream {
+    // SAFETY: the C string arguments are null or NUL-terminated and `out_err` is null or a
+    // writable `char **` (caller contract). The returned box is freed by
+    // `raster_h3_py_free_arrow_stream`.
+    unsafe {
+        ffi_call("create_arrow_stream_v2", out_err, || {
+            let mut cfg = build_py_scan_config_v2(
+                path,
+                resolutions,
+                categorical,
+                format,
+                crs,
+                has_nodata,
+                nodata,
+                bbox,
+                columns,
+                limit,
+                options,
+            )?;
+            cfg.strict_transforms = strict_transforms != 0;
+            cfg.partition = parse_c_opt_partition(partition)?;
+            let stream = PyRasterScanner::new(cfg).to_arrow_c_stream()?;
+            Ok(Box::into_raw(Box::new(stream)))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_open_batch_reader_ex`] with the `partition` and `options` arguments of
+/// [`raster_h3_py_create_arrow_stream_v2`].
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL; `out_err` must be
+/// NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_open_batch_reader_v2(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    batch_size: i64,
+    strict_transforms: c_int,
+    partition: *const c_char,
+    options: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut PyBatchReader {
+    // SAFETY: as for `raster_h3_py_create_arrow_stream_v2`; the returned box is freed by
+    // `raster_h3_py_free_batch_reader`.
+    unsafe {
+        ffi_call("open_batch_reader_v2", out_err, || {
+            let mut cfg = build_py_scan_config_v2(
+                path,
+                resolutions,
+                categorical,
+                format,
+                crs,
+                has_nodata,
+                nodata,
+                bbox,
+                columns,
+                limit,
+                options,
+            )?;
+            if batch_size > 0 {
+                cfg.batch_size = batch_size as usize;
+            }
+            let transform_failures = Arc::new(AtomicU64::new(0));
+            cfg.strict_transforms = strict_transforms != 0;
+            cfg.transform_failure_counter = Some(Arc::clone(&transform_failures));
+            cfg.partition = parse_c_opt_partition(partition)?;
+            let (schema, iter) = PyRasterScanner::new(cfg).batch_iter()?;
+            Ok(Box::into_raw(Box::new(PyBatchReader {
+                schema,
+                iter,
+                transform_failures,
+            })))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_scan_json_ex`] with the `options` argument of
+/// [`raster_h3_py_create_arrow_stream_v2`].
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL;
+/// `out_transform_failures` must be NULL or point to a writable `u64`; `out_err` must be
+/// NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_scan_json_v2(
+    path: *const c_char,
+    resolutions: *const c_char,
+    categorical: c_int,
+    format: *const c_char,
+    crs: *const c_char,
+    has_nodata: c_int,
+    nodata: f64,
+    bbox: *const c_char,
+    columns: *const c_char,
+    limit: i64,
+    strict_transforms: c_int,
+    options: *const c_char,
+    out_transform_failures: *mut u64,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: as for `raster_h3_py_scan_json_ex`; the returned JSON string is freed with
+    // `raster_h3_py_free_string`.
+    unsafe {
+        let failures = Arc::new(AtomicU64::new(0));
+        let out = ffi_call("scan_json_v2", out_err, || {
+            let mut cfg = build_py_scan_config_v2(
+                path,
+                resolutions,
+                categorical,
+                format,
+                crs,
+                has_nodata,
+                nodata,
+                bbox,
+                columns,
+                limit,
+                options,
+            )?;
+            cfg.strict_transforms = strict_transforms != 0;
+            cfg.transform_failure_counter = Some(Arc::clone(&failures));
+            let json = PyRasterScanner::new(cfg).to_columnar_json()?;
+            Ok(CString::new(json).unwrap_or_default().into_raw())
+        });
+        if !out_transform_failures.is_null() {
+            *out_transform_failures = failures.load(Ordering::Relaxed);
+        }
+        out.unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_plan_partitions`] with an `options` JSON object (NULL for none). Only
+/// `overlap_rule` affects the plan, but the object must match the scans' so the partition
+/// fingerprints agree; the other options are validated and otherwise ignored.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL; `out_err` must be
+/// NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_plan_partitions_v2(
+    path: *const c_char,
+    crs: *const c_char,
+    bbox: *const c_char,
+    target_chunks: i64,
+    options: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: the C string arguments are null or NUL-terminated and `out_err` is null or a
+    // writable `char **` (caller contract), as `build_py_scan_config` and `ffi_call` require.
+    unsafe {
+        ffi_call("plan_partitions", out_err, || {
+            let mut cfg = build_py_scan_config(
+                path,
+                ptr::null(),
+                0,
+                ptr::null(),
+                crs,
+                0,
+                0.0,
+                bbox,
+                ptr::null(),
+                -1,
+            )?;
+            // Category- or value-specific options are checked against the scan, not here.
+            if let Some(json) = opt_cstr(options) {
+                let opts: PyScanOptions = serde_json::from_str(&json).map_err(|e| {
+                    RasterH3Error::InvalidParameter(format!("Invalid scan options: {e}"))
+                })?;
+                if let Some(name) = &opts.overlap_rule {
+                    cfg.overlap_rule = parse_overlap_rule_strict(name)?;
+                }
+            }
+            let target = usize::try_from(target_chunks)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| {
+                    RasterH3Error::InvalidParameter("target_chunks must be at least 1".into())
+                })?;
+            // Open the mosaic exactly as the scans do, so the fingerprints match.
+            let paths = resolve_raster_sources(&cfg.path)?;
+            let mosaic =
+                MosaicReader::open(&paths, cfg.bbox, cfg.crs.as_deref(), cfg.overlap_rule)?;
+            let plan = plan_partitions(&mosaic, target)?;
+            let json = serde_json::to_string(&plan)
+                .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+            Ok(CString::new(json).unwrap_or_default().into_raw())
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// Transcode an H3-indexed Parquet file into a PMTiles v3 archive (DuckDB's
+/// `h3_parquet_to_pmtiles`). `h3_column` names the H3 column (integer or hex string,
+/// matched case-insensitively); NULL auto-detects `h3_index`, `h3_hex`, `h3`, `cell` or
+/// `hex`. Returns the number of hexagon features written, or `-1` with `out_err` set.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL; `out_err` must be
+/// NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_parquet_to_pmtiles(
+    parquet_path: *const c_char,
+    pmtiles_path: *const c_char,
+    h3_column: *const c_char,
+    out_err: *mut *mut c_char,
+) -> i64 {
+    // SAFETY: the C string arguments are null or NUL-terminated and `out_err` is null or a
+    // writable `char **` (caller contract), as `opt_cstr` and `ffi_call` require.
+    unsafe {
+        ffi_call("parquet_to_pmtiles", out_err, || {
+            let in_str = opt_cstr(parquet_path)
+                .ok_or_else(|| RasterH3Error::InvalidParameter("Missing parquet_path".into()))?;
+            let out_str = opt_cstr(pmtiles_path)
+                .ok_or_else(|| RasterH3Error::InvalidParameter("Missing pmtiles_path".into()))?;
+            let column = opt_cstr(h3_column);
+            let summary = H3PmtilesTiler::process_parquet_to_pmtiles(
+                Path::new(&in_str),
+                Path::new(&out_str),
+                column.as_deref(),
+            )
+            .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+            Ok(summary.valid_features as i64)
+        })
+        .unwrap_or(-1)
     }
 }
 
