@@ -22,6 +22,8 @@ raster-h3-cli ipc     <input> [options]        Stream RH3IPC01 batches to stdout
 raster-h3-cli jsonl   <input> [options]        Stream JSONEachRow (NDJSON) to stdout or -o <file>
 raster-h3-cli parquet <input> -o <out> [opts]  Write GeoParquet
 raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
+raster-h3-cli plan    <input> [options]        Print partition specs (JSON Lines), see Partitioned scans
+raster-h3-cli merge   <part>... [options]      Combine partitioned `ipc` outputs into final cells
 ```
 
 `<input>` can be a path, glob, comma-separated list or VRT (it may also be given with
@@ -38,6 +40,8 @@ raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
 | `--bbox <min_lon,min_lat,max_lon,max_lat>` | all | WGS84 bounding box |
 | `--columns <c1,c2,…>` | `ipc`, `jsonl` | Column projection, in the given order |
 | `--limit <N>` | `ipc`, `jsonl` | Maximum rows |
+| `--partition <SPEC\|@FILE>` | `ipc` | Scan one partition (see [Partitioned scans](#partitioned-scans)) |
+| `--partition-index <K>` | `ipc` | Line `K` of the plan file given as `--partition @FILE` |
 | `-o, --output <PATH\|->` | all | Output file; `-` or omitted means stdout (required for `parquet` and `pmtiles`) |
 | `-h, --help` | | Help |
 
@@ -187,6 +191,49 @@ LIMIT 10;
 For ClickHouse's `executable`, the command must be in the server's `user_scripts`
 directory (or referenced through a wrapper script there).
 
+### Partitioned scans
+
+One raster or mosaic can be split across processes (`xargs -P`, GNU parallel, batch-job
+arrays), each reading a disjoint set of TIFF tiles or strips. The result has exactly the
+cells and values of a single scan.
+
+```bash
+# 1. Plan from metadata: one JSON spec per line, ~256 tiles/strips each.
+raster-h3-cli plan dem.tif --target-chunks 256 -o plan.jsonl
+
+# 2. Scan each partition (any process or machine that can read dem.tif).
+seq 0 $(( $(wc -l < plan.jsonl) - 1 )) | xargs -P 8 -I{} \
+  raster-h3-cli ipc dem.tif -r 8 --partition @plan.jsonl --partition-index {} -o parts/{}.rh3
+
+# 3. Merge: final rows pass through, cells split across partitions are combined.
+raster-h3-cli merge parts/*.rh3 -o dem_r8.rh3          # or --jsonl
+```
+
+- `plan` takes `--target-chunks <N>` (default 256), `--crs`, `--bbox` and `-o`. Plan and
+  scan with the same input, `--crs` and `--bbox`: a raster with another layout, or a scan
+  with another bbox, refuses the spec (`different mosaic`). Rasters that differ only in
+  pixel values share a layout, so one plan serves them all.
+- `--partition` takes a spec inline (one line of the plan, e.g. from
+  `xargs -d '\n' -I{} … --partition '{}'`) or `@FILE`: a file with one spec, or a plan file
+  with `--partition-index`.
+- A partition file is a small `RH3PART1` header (magic, `u32` length, JSON naming the
+  partition spec, the input and the value-changing options) followed by the normal
+  `RH3IPC01` stream with a nullable `partial_state` column: null rows are final cells, set
+  rows are this partition's share of a cell that other partitions also reach. Only `ipc`
+  output is accepted (that is what `merge` reads);
+  `--limit`, `--format long`, `parquet` and `pmtiles` are refused with `--partition`, and
+  `--columns` must keep `h3_index` and `resolution`.
+- `merge` first checks the headers and columns of all files, and refuses before writing
+  anything unless they are every partition of one plan exactly once (it names missing or
+  repeated partitions), scanned from the same input with the same resolutions, `--crs`,
+  `--nodata`, `--raw-values`, `--bbox`, categorical mode and `--columns`. It then streams
+  the files one batch at a time, writing every final row, then the merged rows; only
+  partial rows are kept in memory.
+  Categorical input is recognised from its columns; pass `-c` when the projection has
+  only shared columns (`h3_index`, `h3_hex`, `resolution`, `wkb`). The output's columns
+  are the scan's, without `partial_state`, so it can be used as an unpartitioned `ipc`
+  result (rows in a different order).
+
 ### Shell pipelines
 
 ```bash
@@ -203,13 +250,16 @@ The binary is a thin wrapper over [`src/lib.rs`](../../crates/raster-h3-cli/src/
 | Item | Purpose |
 | :--- | :--- |
 | `parse_stream_args(args, default_format)` | Parse arguments into `CliStreamOptions` and an optional output path |
-| `CliStreamOptions` | `input_path`, `resolutions`, `categorical`, `categorical_format`, `source_crs`, `nodata`, `apply_scale_offset` (true), `bbox`, `columns`, `batch_size` (2048), `limit`, `output_format` |
+| `CliStreamOptions` | `input_path`, `resolutions`, `categorical`, `categorical_format`, `source_crs`, `nodata`, `apply_scale_offset` (true), `bbox`, `columns`, `batch_size` (2048), `limit`, `output_format`, `partition` |
 | `stream_raster_to_writer(&opts, &mut impl Write)` | Stream IPC or JSONL to any writer; returns rows written |
 | `export_raster_to_parquet(...)`, `export_raster_to_pmtiles(...)` | File exports |
+| `plan_raster_partitions(input, target_chunks, crs, bbox)`, `write_plan(&plan, w)` | Plan partitions; write them as JSON Lines |
+| `read_partition_spec(spec, index)` | Parse a spec, or `@FILE` (with `index` for a plan file); sets `CliStreamOptions::partition` |
+| `merge_partition_files(&CliMergeOptions, w)` | Merge partition files; `parse_plan_args` / `parse_merge_args` parse the subcommands |
 
 ## Testing
 
 ```bash
-cargo test -p raster-h3-cli        # argument parsing, IPC round trip, JSONL
+cargo test -p raster-h3-cli        # argument parsing, IPC round trip, JSONL, plan/partition/merge vs one scan
 cargo test -p raster_h3 --test it multi_engine_e2e # runs the built binary for all four subcommands
 ```

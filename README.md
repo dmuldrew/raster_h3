@@ -445,6 +445,9 @@ SELECT h3_index, resolution, h3_merge_partials(partial_state) AS cell
 FROM partial_rows GROUP BY h3_index, resolution;   -- cell.mean, cell.count, ...
 ```
 
+From a shell, `raster-h3-cli plan` / `ipc --partition` / `merge` fan out with `xargs -P`
+or batch jobs ([CLI guide](docs/engines/cli.md#partitioned-scans)).
+
 In Rust the same steps are `plan_partitions`, `MultiResolutionConfig::partition` and
 `PartialMerger` (DataFusion providers: `plan_partitions` / `with_partition`). See
 [Partitioned scans](docs/engines/core.md#partitioned-scans) and the

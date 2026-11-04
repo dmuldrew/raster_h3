@@ -1,15 +1,25 @@
 //! Unified `raster-h3-cli` executable supporting `ipc` (Arrow/Columnar IPC to stdout or file),
 //! `jsonl` (`JSONEachRow` to stdout for ClickHouse executable table functions),
-//! `parquet`, and `pmtiles` exports.
+//! `parquet`, and `pmtiles` exports, plus `plan` / `merge` for partitioned scans.
 
 use std::fs::File;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use raster_h3_cli::{
-    export_raster_to_parquet, export_raster_to_pmtiles, parse_stream_args, stream_raster_to_writer,
-    StreamOutputFormat,
+    export_raster_to_parquet, export_raster_to_pmtiles, merge_partition_files, parse_merge_args,
+    parse_plan_args, parse_stream_args, plan_raster_partitions, stream_raster_to_writer,
+    write_plan, StreamOutputFormat,
 };
+use raster_h3_core::error::Result;
+
+/// Run `f` on a buffered writer for `path`, or stdout when `None`.
+fn with_output<T>(path: Option<String>, f: impl FnOnce(&mut dyn Write) -> Result<T>) -> Result<T> {
+    match path {
+        Some(path) => f(&mut BufWriter::new(File::create(path)?)),
+        None => f(&mut BufWriter::new(io::stdout().lock())),
+    }
+}
 
 fn print_help() {
     eprintln!(
@@ -18,7 +28,9 @@ fn print_help() {
           raster-h3-cli ipc <input.tif> [options]        Stream binary Columnar IPC to stdout or -o <file>\n  \
           raster-h3-cli jsonl <input.tif> [options]      Stream JSONEachRow (NDJSON) to stdout or -o <file>\n  \
           raster-h3-cli parquet <input.tif> -o <out>     Export directly to Parquet / GeoParquet\n  \
-          raster-h3-cli pmtiles <input.tif> -o <out>     Export directly to PMTiles v3 archive\n\n\
+          raster-h3-cli pmtiles <input.tif> -o <out>     Export directly to PMTiles v3 archive\n  \
+          raster-h3-cli plan <input.tif> [options]       Print partition specs (JSON Lines) for parallel scans\n  \
+          raster-h3-cli merge <part.rh3>... [-o <out>]   Combine partitioned `ipc` outputs into final cells\n\n\
         Options:\n  \
           -r, --resolutions <LIST>   H3 resolutions (e.g. 8 or 7,8,9; default: 8)\n  \
           -c, --categorical          Enable categorical aggregation\n  \
@@ -29,8 +41,27 @@ fn print_help() {
           --bbox <minx,miny,maxx,maxy> WGS84 bounding box filter\n  \
           --columns <col1,col2,...>  Column projection pushdown\n  \
           --limit <N>                Maximum number of rows to emit\n  \
-          -o, --output <PATH|->      Output file path (default: '-' for stdout on ipc/jsonl)"
+          -o, --output <PATH|->      Output file path (default: '-' for stdout on ipc/jsonl/plan/merge)\n\n\
+        Partitioned scans (shell fan-out; plan and scan with the same --crs and --bbox):\n  \
+          plan --target-chunks <N>       TIFF tiles/strips per partition (default: 256)\n  \
+          ipc --partition <SPEC|@FILE>   Scan one partition (adds a partial_state column)\n  \
+          ipc --partition-index <K>      Line K of the plan file given as --partition @FILE\n  \
+          merge -c                       Categorical partitions (else inferred from columns)\n  \
+          merge --jsonl                  Write JSONEachRow instead of IPC\n\n  \
+          raster-h3-cli plan dem.tif -o plan.jsonl\n  \
+          seq 0 $(( $(wc -l < plan.jsonl) - 1 )) | xargs -P 8 -I{{}} \\\n      \
+            raster-h3-cli ipc dem.tif -r 8 --partition @plan.jsonl --partition-index {{}} -o part-{{}}.rh3\n  \
+          raster-h3-cli merge part-*.rh3 -o dem.rh3"
     );
+}
+
+fn reject_partition(opts: &raster_h3_cli::CliStreamOptions, subcmd: &str) -> Result<()> {
+    if opts.partition.is_some() {
+        return Err(raster_h3_core::error::RasterH3Error::InvalidParameter(format!(
+            "{subcmd} does not take --partition: scan partitions with `ipc` and combine them with `merge`"
+        )));
+    }
+    Ok(())
 }
 
 fn main() {
@@ -48,26 +79,25 @@ fn main() {
 
     let result = match subcmd {
         "ipc" => parse_stream_args(rest, StreamOutputFormat::Ipc).and_then(|(opts, out)| {
-            if let Some(path) = out {
-                let mut writer = BufWriter::new(File::create(path)?);
-                stream_raster_to_writer(&opts, &mut writer)
-            } else {
-                let stdout = io::stdout();
-                let mut writer = BufWriter::new(stdout.lock());
-                stream_raster_to_writer(&opts, &mut writer)
-            }
+            with_output(out, |mut w| stream_raster_to_writer(&opts, &mut w))
         }),
         "jsonl" => parse_stream_args(rest, StreamOutputFormat::Jsonl).and_then(|(opts, out)| {
-            if let Some(path) = out {
-                let mut writer = BufWriter::new(File::create(path)?);
-                stream_raster_to_writer(&opts, &mut writer)
-            } else {
-                let stdout = io::stdout();
-                let mut writer = BufWriter::new(stdout.lock());
-                stream_raster_to_writer(&opts, &mut writer)
-            }
+            with_output(out, |mut w| stream_raster_to_writer(&opts, &mut w))
         }),
+        "plan" => parse_plan_args(rest).and_then(|args| {
+            let plan = plan_raster_partitions(
+                &args.input_path,
+                args.target_chunks,
+                args.source_crs.as_deref(),
+                args.bbox,
+            )?;
+            with_output(args.output, |mut w| write_plan(&plan, &mut w))?;
+            Ok(plan.len())
+        }),
+        "merge" => parse_merge_args(rest)
+            .and_then(|(opts, out)| with_output(out, |mut w| merge_partition_files(&opts, &mut w))),
         "parquet" => parse_stream_args(rest, StreamOutputFormat::Ipc).and_then(|(opts, out)| {
+            reject_partition(&opts, "parquet")?;
             let out_path = out.ok_or_else(|| {
                 raster_h3_core::error::RasterH3Error::InvalidParameter(
                     "Missing -o / --output path for parquet export".into(),
@@ -86,6 +116,7 @@ fn main() {
             )
         }),
         "pmtiles" => parse_stream_args(rest, StreamOutputFormat::Ipc).and_then(|(opts, out)| {
+            reject_partition(&opts, "pmtiles")?;
             let out_path = out.ok_or_else(|| {
                 raster_h3_core::error::RasterH3Error::InvalidParameter(
                     "Missing -o / --output path for pmtiles export".into(),
