@@ -154,10 +154,12 @@ result = (
 )
 ```
 
-Python scans reject malformed `resolutions`, `format` and `bbox` with `RuntimeError`
-instead of silently ignoring them or using defaults. Parquet and PMTiles exports
-also reject invalid resolutions; every resolution must be between 0 and 15. See the
-[Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
+`columns=` is pushed into the scan, so unused columns such as `wkb` are never built. The
+`.filter()` is not: Polars applies it to each batch after the hexagons are aggregated. To skip
+raster outside the tracts, pass `bbox=tracts.total_bounds` to the scan (hexagons on its edge are
+aggregated from the pixels inside it). `h3_polygon_to_cells` takes one geometry at a time, hence
+the list comprehension, and the `UInt64` cast matches the scan's `h3_index` type for the join.
+See the [Python scan parameters](docs/engines/python-polars.md#scan-parameters).
 
 #### SedonaDB (Python)
 
