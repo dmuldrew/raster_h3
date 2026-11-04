@@ -6,6 +6,7 @@ mod helpers;
 mod bbox_pushdown;
 mod categorical_options;
 mod continuous_options;
+mod partitions;
 mod rows;
 mod scalar_udfs;
 mod statistics;

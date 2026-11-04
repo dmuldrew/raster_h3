@@ -15,6 +15,10 @@ use crate::functions::bind_utils::{
     register_common_raster_named_parameters, set_table_function_init_data, BindHelper, ChunkWriter,
     ConcurrentRecordQueue, TableFunctionLocalData,
 };
+use crate::functions::partition_functions::{
+    drain_categorical, parse_partition_param, write_partial_state_column, ScanRow,
+    PARTIAL_STATE_COLUMN,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoricalOutputFormat {
@@ -28,16 +32,20 @@ pub struct RasterH3CategoricalBindData {
     pub min_count: Option<f64>,
     pub min_majority_fraction: Option<f64>,
     pub remapper: Option<Arc<CategoryRemapper>>,
+    /// `partition`: scan one partition of a plan (wide format), adding `partial_state`.
+    pub partition: Option<crate::aggregator::multi_horizon::ScanPartition>,
 }
 
 pub struct RasterH3CategoricalGlobalData {
     pub streamer: Mutex<MultiCategoricalHorizonStreamer>,
-    pub record_queue: ConcurrentRecordQueue<MultiCategoricalRecord>,
+    pub record_queue: ConcurrentRecordQueue<ScanRow<MultiCategoricalRecord>>,
     pub format: CategoricalOutputFormat,
     pub projected_columns: Vec<usize>,
     /// Long format: the one cell currently being expanded into rows.
     pub long_cursor: Mutex<CategoricalLongCursor>,
     pub emit_geom: bool,
+    /// Column index of `partial_state` for a partitioned scan.
+    pub partial_state_column: Option<usize>,
 }
 
 pub type RasterH3CategoricalLocalData = TableFunctionLocalData;
@@ -82,6 +90,21 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
                 None
             };
 
+            let partition = match parse_partition_param(&bind) {
+                Ok(p) => p,
+                Err(e) => {
+                    bind.set_error(&format!("Invalid partition parameter: {e}"));
+                    return;
+                }
+            };
+            if partition.is_some() && format == CategoricalOutputFormat::Long {
+                bind.set_error(
+                    "partition supports the wide categorical format only; reshape the merged \
+                     result to long format afterwards",
+                );
+                return;
+            }
+
             // Define result columns based on format
             bind.add_result_column("h3_index", DuckDBType::UBigInt);
             bind.add_result_column("h3_hex", DuckDBType::Varchar);
@@ -104,6 +127,9 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
                         let mut type_geom = crate::ffi::create_geometry_logical_type();
                         bind.add_custom_result_column("geom", type_geom);
                         duckdb_destroy_logical_type(&mut type_geom);
+                    }
+                    if partition.is_some() {
+                        bind.add_result_column(PARTIAL_STATE_COLUMN, DuckDBType::Blob);
                     }
                 }
                 CategoricalOutputFormat::Long => {
@@ -139,6 +165,7 @@ pub unsafe extern "C" fn raster_h3_categorical_bind(info: duckdb_bind_info) {
                 min_count,
                 min_majority_fraction,
                 remapper,
+                partition,
             });
 
             duckdb_bind_set_bind_data(
@@ -198,6 +225,7 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
             config.compact_h3_children = bind_data.common.compact;
             config.remapper = bind_data.remapper.clone();
             bind_data.common.execution.apply(&mut config);
+            config.partition = bind_data.partition.clone();
 
             let streamer = match MultiCategoricalHorizonStreamer::new_mosaic(mosaic, &config) {
                 Ok(s) => s,
@@ -221,6 +249,11 @@ pub unsafe extern "C" fn raster_h3_categorical_init(info: duckdb_init_info) {
                 projected_columns,
                 long_cursor: Mutex::new(CategoricalLongCursor::new(with_entropy)),
                 emit_geom: bind_data.common.emit_geom,
+                // Wide columns: 0..=12, then `geom` when emitted, then `partial_state`.
+                partial_state_column: bind_data
+                    .partition
+                    .as_ref()
+                    .map(|_| 13 + usize::from(bind_data.common.emit_geom)),
             };
 
             set_table_function_init_data(info, global_data);
@@ -274,11 +307,17 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 
             match global_data.format {
                 CategoricalOutputFormat::Wide => {
-                    let batch_opt = global_data
-                        .record_queue
-                        .pop_or_refill(&global_data.streamer, |s, max_rows, f| {
-                            s.drain_completed_into(max_rows, f)
-                        });
+                    let batch_opt = global_data.record_queue.pop_or_refill(
+                        &global_data.streamer,
+                        |s, max_rows, f| {
+                            drain_categorical(
+                                s,
+                                max_rows,
+                                global_data.partial_state_column.is_some(),
+                                f,
+                            )
+                        },
+                    );
 
                     let batch = match batch_opt {
                         Ok(Some(b)) if !b.is_empty() => b,
@@ -321,6 +360,7 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                     let mut out_entropy: Option<usize> = None;
                     let mut out_idx_wkb: Option<usize> = None;
                     let mut out_idx_geom: Option<usize> = None;
+                    let mut out_idx_state: Option<usize> = None;
 
                     // Schema column mapping (Wide):
                     // 0: h3_index UBIGINT
@@ -374,6 +414,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                             10 => out_entropy = Some(out_idx),
                             11 => out_distinct = Some(out_idx),
                             12 => out_idx_wkb = Some(out_idx),
+                            c if Some(c) == global_data.partial_state_column => {
+                                out_idx_state = Some(out_idx)
+                            }
                             13 if global_data.emit_geom => out_idx_geom = Some(out_idx),
                             _ => {}
                         }
@@ -424,6 +467,9 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
                         batch.iter().map(|r| &r.h3_index),
                         wkb_buf,
                     );
+                    if let Some(col) = out_idx_state {
+                        write_partial_state_column(&writer, col, &batch);
+                    }
 
                     writer.set_size(batch_len);
                 }
@@ -604,6 +650,7 @@ pub unsafe fn register_categorical_table_function(con: duckdb_connection) -> Res
             add_named_parameter(tf, "min_majority_fraction", DuckDBType::Double);
             add_named_parameter(tf, "geom", DuckDBType::Boolean);
             add_named_parameter(tf, "remap", DuckDBType::Varchar);
+            add_named_parameter(tf, "partition", DuckDBType::Varchar);
 
             duckdb_table_function_set_bind(tf, raster_h3_categorical_bind);
             duckdb_table_function_set_init(tf, raster_h3_categorical_init);

@@ -393,6 +393,40 @@ DuckDB's `temp_directory`. See the
 [reference](../sql-api-reference.md#copy-to-pmtiles-copy-query-to-path-format-pmtiles--duckdb-20-build)
 for accepted column types and NULL/invalid-cell handling.
 
+### Partitioned scans
+
+One raster can be split across independent DuckDB processes (serverless jobs, batch
+workers) or processed piece by piece, with results identical to a single scan up to
+floating-point summation order. Plan from metadata, scan each partition, then merge the
+rows of cells that straddle a partition edge:
+
+```sql
+-- 1. Plan: one row per partition (pass the scans' crs / bbox / overlap_rule here too).
+SELECT partition_index, spec
+FROM h3_raster_plan_partitions('dem.tif', target_chunks := 256);
+
+-- 2. Scan one partition per worker; a `partial_state` BLOB column is appended.
+COPY (SELECT * FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8,
+                                                    partition := '<spec>'))
+  TO 'out/part_042.parquet';
+
+-- 3. Merge: rows with a NULL partial_state are final; the others are merged per cell.
+SELECT h3_index, resolution, mean, stddev, count, min, max, sum
+FROM 'out/*.parquet' WHERE partial_state IS NULL
+UNION ALL
+SELECT h3_index, resolution, cell.mean, cell.stddev, cell.count, cell.min, cell.max, cell.sum
+FROM (SELECT h3_index, resolution, h3_merge_partials(partial_state) AS cell
+      FROM 'out/*.parquet' WHERE partial_state IS NOT NULL GROUP BY ALL);
+```
+
+`h3_merge_categorical_partials` does the same for categorical scans, returning
+`majority_class`, `majority_fraction`, `majority_count`, `unique_classes`, `total_count`,
+`histogram`, `shannon_entropy`, `entropy` and `distinct_classes`. Value filters
+(`min_count`, `min_mean`, ...) on a partitioned scan apply to final rows only; filter the
+merged rows for the same result. `partition` cannot be combined with `quantiles` or the long
+categorical format, and table function arguments are constants, so the fan-out over specs
+runs in the client or orchestrator. See [Partitioned scans](core.md#partitioned-scans).
+
 ## Client Languages (Python, Node.js, R)
 
 These examples load the extension from each language's DuckDB client. For the native

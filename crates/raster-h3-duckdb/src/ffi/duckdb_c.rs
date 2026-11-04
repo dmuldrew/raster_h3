@@ -337,6 +337,34 @@ pub type duckdb_scalar_function_t = unsafe extern "C" fn(
 );
 pub type duckdb_delete_callback_t = unsafe extern "C" fn(data: *mut c_void);
 
+// Aggregate functions (stable C API v1.2.0, `duckdb_ext_api_v1` slots 226-237).
+pub type duckdb_aggregate_function = *mut c_void;
+/// Points at `state_size` bytes of aggregate state owned by DuckDB.
+pub type duckdb_aggregate_state = *mut c_void;
+pub type duckdb_aggregate_state_size = unsafe extern "C" fn(info: duckdb_function_info) -> idx_t;
+pub type duckdb_aggregate_init_t =
+    unsafe extern "C" fn(info: duckdb_function_info, state: duckdb_aggregate_state);
+pub type duckdb_aggregate_destroy_t =
+    unsafe extern "C" fn(states: *mut duckdb_aggregate_state, count: idx_t);
+pub type duckdb_aggregate_update_t = unsafe extern "C" fn(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    states: *mut duckdb_aggregate_state,
+);
+pub type duckdb_aggregate_combine_t = unsafe extern "C" fn(
+    info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    target: *mut duckdb_aggregate_state,
+    count: idx_t,
+);
+pub type duckdb_aggregate_finalize_t = unsafe extern "C" fn(
+    info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    result: duckdb_vector,
+    count: idx_t,
+    offset: idx_t,
+);
+
 // === Stable C API v1.5.6 handle types ===
 //
 // These handles are opaque pointers; the versions they exist in are enforced
@@ -406,6 +434,12 @@ duckdb_api! {
     [156] pub fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb_logical_type;
     [184] pub fn duckdb_destroy_logical_type(type_: *mut duckdb_logical_type);
     [159] pub fn duckdb_create_list_type(type_: duckdb_logical_type) -> duckdb_logical_type;
+    [163] pub fn duckdb_create_struct_type(
+        member_types: *mut duckdb_logical_type,
+        member_names: *mut *const c_char,
+        member_count: idx_t,
+    ) -> duckdb_logical_type;
+    [203] pub fn duckdb_struct_vector_get_child(vector: duckdb_vector, index: idx_t) -> duckdb_vector;
     [158] pub fn duckdb_logical_type_set_alias(type_: duckdb_logical_type, alias: *const c_char);
     [157] pub fn duckdb_logical_type_get_alias(type_: duckdb_logical_type) -> *mut c_char;
 
@@ -568,6 +602,39 @@ duckdb_api! {
         con: duckdb_connection,
         set: duckdb_scalar_function_set,
     ) -> DuckDBState;
+
+    // Aggregate functions
+    [226] pub fn duckdb_create_aggregate_function() -> duckdb_aggregate_function;
+    [227] pub fn duckdb_destroy_aggregate_function(aggregate_function: *mut duckdb_aggregate_function);
+    [228] pub fn duckdb_aggregate_function_set_name(
+        aggregate_function: duckdb_aggregate_function,
+        name: *const c_char,
+    );
+    [229] pub fn duckdb_aggregate_function_add_parameter(
+        aggregate_function: duckdb_aggregate_function,
+        type_: duckdb_logical_type,
+    );
+    [230] pub fn duckdb_aggregate_function_set_return_type(
+        aggregate_function: duckdb_aggregate_function,
+        type_: duckdb_logical_type,
+    );
+    [231] pub fn duckdb_aggregate_function_set_functions(
+        aggregate_function: duckdb_aggregate_function,
+        state_size: duckdb_aggregate_state_size,
+        state_init: duckdb_aggregate_init_t,
+        update: duckdb_aggregate_update_t,
+        combine: duckdb_aggregate_combine_t,
+        finalize: duckdb_aggregate_finalize_t,
+    );
+    [232] pub fn duckdb_aggregate_function_set_destructor(
+        aggregate_function: duckdb_aggregate_function,
+        destroy: duckdb_aggregate_destroy_t,
+    );
+    [233] pub fn duckdb_register_aggregate_function(
+        con: duckdb_connection,
+        aggregate_function: duckdb_aggregate_function,
+    ) -> DuckDBState;
+    [237] pub fn duckdb_aggregate_function_set_error(info: duckdb_function_info, error: *const c_char);
 
     [7] pub fn duckdb_library_version() -> *const c_char;
 

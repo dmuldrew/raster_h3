@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use crate::aggregator::multi_horizon::{
     MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantilePlan,
-    QuantileTarget,
+    QuantileTarget, ScanPartition,
 };
 use crate::encoding::{WkbBuf, WKB_BUF_LEN};
 use crate::ffi::duckdb_c::*;
@@ -14,6 +14,10 @@ use crate::functions::bind_utils::{
     register_common_raster_named_parameters, set_table_function_init_data, BindHelper, ChunkWriter,
     ConcurrentRecordQueue, TableFunctionLocalData,
 };
+use crate::functions::partition_functions::{
+    drain_continuous, parse_partition_param, write_partial_state_column, ScanRow,
+    PARTIAL_STATE_COLUMN,
+};
 
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
@@ -23,15 +27,19 @@ pub struct RasterH3BindData {
     pub min_mean: Option<f64>,
     pub max_mean: Option<f64>,
     pub quantiles: Vec<QuantileTarget>,
+    /// `partition`: scan one partition of a plan, adding a `partial_state` column.
+    pub partition: Option<ScanPartition>,
 }
 
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
 pub struct RasterH3GlobalData {
     pub streamer: Mutex<MultiScanHorizonStreamer>,
-    pub record_queue: ConcurrentRecordQueue<MultiContinuousRecord>,
+    pub record_queue: ConcurrentRecordQueue<ScanRow<MultiContinuousRecord>>,
     pub projected_columns: Vec<usize>,
     pub quantiles: Vec<QuantileTarget>,
     pub emit_geom: bool,
+    /// Column index of `partial_state` for a partitioned scan.
+    pub partial_state_column: Option<usize>,
 }
 
 /// Thread-local state for parallel DuckDB execution threads (scratch buffers for hex string and WKB encoding)
@@ -102,6 +110,20 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
                 }
             }
 
+            let partition = match parse_partition_param(&bind) {
+                Ok(p) => p,
+                Err(e) => {
+                    bind.set_error(&format!("Invalid partition parameter: {e}"));
+                    return;
+                }
+            };
+            if partition.is_some() && !quantiles.is_empty() {
+                bind.set_error(
+                    "partition cannot be combined with quantiles: merged cells carry no sketches",
+                );
+                return;
+            }
+
             // Add Output Columns:
             bind.add_result_column("h3_index", DuckDBType::UBigInt);
             bind.add_result_column("h3_hex", DuckDBType::Varchar);
@@ -123,6 +145,9 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
             for target in &quantiles {
                 bind.add_result_column(target.column_name(), DuckDBType::Double);
             }
+            if partition.is_some() {
+                bind.add_result_column(PARTIAL_STATE_COLUMN, DuckDBType::Blob);
+            }
 
             let estimated_cardinality = estimate_raster_cardinality(
                 &common.resolved_paths,
@@ -138,6 +163,7 @@ pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
                 min_mean,
                 max_mean,
                 quantiles,
+                partition,
             });
 
             duckdb_bind_set_bind_data(
@@ -210,6 +236,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
                 config.quantiles = bind_data.quantiles.clone();
             }
             bind_data.common.execution.apply(&mut config);
+            config.partition = bind_data.partition.clone();
 
             let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
                 Ok(s) => s,
@@ -228,6 +255,7 @@ pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
                 projected_columns,
                 quantiles: bind_data.quantiles.clone(),
                 emit_geom: bind_data.common.emit_geom,
+                partial_state_column: bind_data.partition.as_ref().map(|_| q_end_col),
             };
 
             set_table_function_init_data(info, global_data);
@@ -275,11 +303,12 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                 duckdb_function_get_local_init_data(info) as *mut RasterH3LocalData;
 
             // Retrieve next batch of completed records concurrently across DuckDB worker threads
-            let batch_opt = global_data
-                .record_queue
-                .pop_or_refill(&global_data.streamer, |s, max_rows, f| {
-                    s.drain_completed_into(max_rows, f)
-                });
+            let batch_opt =
+                global_data
+                    .record_queue
+                    .pop_or_refill(&global_data.streamer, |s, max_rows, f| {
+                        drain_continuous(s, max_rows, global_data.partial_state_column.is_some(), f)
+                    });
 
             let batch = match batch_opt {
                 Ok(Some(b)) if !b.is_empty() => b,
@@ -316,6 +345,7 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             let q_start_col = if global_data.emit_geom { 11 } else { 10 };
             let mut out_idx_wkb: Option<usize> = None;
             let mut out_idx_geom: Option<usize> = None;
+            let mut out_idx_state: Option<usize> = None;
 
             // Evaluate every projected quantile column with one sketch sweep
             // per cell, rather than one sweep per (cell, column).
@@ -399,6 +429,9 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                     10 if global_data.emit_geom => {
                         out_idx_geom = Some(out_idx);
                     }
+                    c if Some(c) == global_data.partial_state_column => {
+                        out_idx_state = Some(out_idx);
+                    }
                     c if c >= q_start_col => {
                         if let Ok(slot) = q_targets.binary_search(&(c - q_start_col)) {
                             writer.fill_column(out_idx, batch_len, q_values[slot].iter().copied());
@@ -414,6 +447,9 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                 batch.iter().map(|r| &r.h3_index),
                 wkb_buf,
             );
+            if let Some(col) = out_idx_state {
+                write_partial_state_column(&writer, col, &batch);
+            }
 
             writer.set_size(batch_len);
         });
@@ -463,6 +499,7 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), Stri
             add_named_parameter(tf, "geom", DuckDBType::Boolean);
             add_named_parameter(tf, "quantiles", DuckDBType::Varchar);
             add_named_parameter(tf, "percentiles", DuckDBType::Varchar);
+            add_named_parameter(tf, "partition", DuckDBType::Varchar);
 
             // Set callbacks including parallel init_local and projection pushdown
             duckdb_table_function_set_bind(tf, raster_h3_bind);

@@ -14,9 +14,10 @@ pub mod table_provider;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub use raster_h3_core::aggregator::multi_horizon::ScanPartition;
 pub use raster_h3_core::columnar::{
-    ArrowArray, ArrowArrayStream, ArrowDataType, ArrowSchema, CategoricalFormat, ColumnArray,
-    ColumnField, ColumnSchema, RecordBatch,
+    merge_partial_batches, ArrowArray, ArrowArrayStream, ArrowDataType, ArrowSchema,
+    CategoricalFormat, ColumnArray, ColumnField, ColumnSchema, RecordBatch, PARTIAL_STATE_COLUMN,
 };
 use raster_h3_core::error::{RasterH3Error, Result};
 pub use scalar_udf::{
@@ -26,7 +27,7 @@ pub use scalar_udf::{
 pub use table_provider::{
     CategoricalRasterExec, CategoricalRasterTableProvider, ContinuousRasterExec,
     ContinuousRasterTableProvider, ExecutionPlan, FilterPredicate, FilterPushdownStatus,
-    TableProvider, TableStatistics,
+    PartitionedRasterExec, TableProvider, TableStatistics,
 };
 
 /// Return all standard `raster_h3` vectorized scalar UDFs.

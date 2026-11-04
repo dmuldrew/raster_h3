@@ -19,6 +19,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use raster_h3_core::columnar::ArrowArrayStream;
 use raster_h3_datafusion::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
+    PARTIAL_STATE_COLUMN,
 };
 
 use crate::convert::{to_arrow_schema, to_df_error};
@@ -45,6 +46,9 @@ pub struct RasterH3Table {
     kind: TableKind,
     schema: arrow::datatypes::SchemaRef,
     untagged: Untagged,
+    /// A partitioned scan: only `resolution` filters may be pushed (see
+    /// `raster_h3_datafusion::ContinuousRasterTableProvider::with_partition`).
+    partitioned: bool,
 }
 
 impl RasterH3Table {
@@ -59,12 +63,15 @@ impl RasterH3Table {
     }
 
     fn new(inner: Arc<dyn raster_h3_datafusion::TableProvider>, kind: TableKind) -> Self {
-        let schema = to_arrow_schema(&inner.schema());
+        let core_schema = inner.schema();
+        let partitioned = core_schema.index_of(PARTIAL_STATE_COLUMN).is_some();
+        let schema = to_arrow_schema(&core_schema);
         Self {
             inner,
             kind,
             schema,
             untagged: Untagged::Reject,
+            partitioned,
         }
     }
 
@@ -82,6 +89,23 @@ impl RasterH3Table {
             Untagged::Reject
         };
         self
+    }
+}
+
+impl RasterH3Table {
+    /// Translate a filter for pushdown. A partitioned scan keeps partial rows whole, so
+    /// only filters that reduce to `resolution` predicates are pushed there.
+    fn translate(&self, filter: &Expr) -> Option<crate::filters::Translated> {
+        let translated = translate(filter, self.kind, self.untagged)?;
+        if self.partitioned
+            && !translated
+                .predicates
+                .iter()
+                .all(|p| matches!(p, FilterPredicate::Resolution(_)))
+        {
+            return None;
+        }
+        Some(translated)
     }
 }
 
@@ -110,7 +134,7 @@ impl TableProvider for RasterH3Table {
         Ok(filters
             .iter()
             .map(|f| {
-                translate(f, self.kind, self.untagged)
+                self.translate(f)
                     .map_or(TableProviderFilterPushDown::Unsupported, |t| t.pushdown)
             })
             .collect())
@@ -135,7 +159,7 @@ impl TableProvider for RasterH3Table {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let predicates: Vec<FilterPredicate> = filters
             .iter()
-            .filter_map(|f| translate(f, self.kind, self.untagged))
+            .filter_map(|f| self.translate(f))
             .flat_map(|t| t.predicates)
             .collect();
 

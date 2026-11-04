@@ -77,7 +77,14 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
                 return false;
             }
 
-            // 6. v1.5.6 API only: `SET raster_h3_*` session options and the
+            // 6. Partitioned scans: planning and partial-state merge aggregates
+            if functions::register_plan_partitions_function(con).is_err()
+                || functions::register_merge_functions(con).is_err()
+            {
+                return false;
+            }
+
+            // 7. v1.5.6 API only: `SET raster_h3_*` session options and the
             //    `COPY ... (FORMAT pmtiles)` function.
             #[cfg(feature = "duckdb-api-v1_5_6")]
             {

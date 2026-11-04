@@ -435,9 +435,22 @@ final = cells.filter(pc.is_null(cells["partial_state"])).drop(["partial_state"])
 merged = raster_h3.merge_partials(cells.filter(pc.is_valid(cells["partial_state"])))
 ```
 
+The SQL engines merge with an aggregate, so a `GROUP BY` gathers each cell's partial rows:
+
+```sql
+-- DuckDB (SedonaDB SQL is the same, with the spec as a string argument)
+SELECT spec FROM h3_raster_plan_partitions('dem.tif', target_chunks := 256);
+SELECT * FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8, partition := '<spec>');
+SELECT h3_index, resolution, h3_merge_partials(partial_state) AS cell
+FROM partial_rows GROUP BY h3_index, resolution;   -- cell.mean, cell.count, ...
+```
+
 In Rust the same steps are `plan_partitions`, `MultiResolutionConfig::partition` and
-`PartialMerger`. See [Partitioned scans](docs/engines/core.md#partitioned-scans) and the
-[Python guide](docs/engines/python-polars.md#partitioned-scans-spark-and-other-distributed-engines).
+`PartialMerger` (DataFusion providers: `plan_partitions` / `with_partition`). See
+[Partitioned scans](docs/engines/core.md#partitioned-scans) and the
+[Python](docs/engines/python-polars.md#partitioned-scans-spark-and-other-distributed-engines),
+[DuckDB](docs/engines/duckdb.md#partitioned-scans) and
+[DataFusion / SedonaDB](docs/engines/datafusion.md#partitioned-scans) guides.
 
 ---
 
