@@ -1041,7 +1041,8 @@ def scan_raster_h3(
             scan_resolutions: Union[int, str, Sequence[int]] = resolutions
             if predicate is not None:
                 pushed = _pushdown_bounds(predicate, categorical, format)
-                options = _narrow_options(options, pushed)
+                if _native_has_scan_options():
+                    options = _narrow_options(options, pushed)
                 allowed = pushed.get("resolutions")
                 if allowed is not None:
                     configured = _resolution_list(resolutions)
@@ -1100,15 +1101,30 @@ def _quantile_columns(quantiles: Union[str, Sequence[Union[str, float]]]) -> Lis
 
 
 def _resolution_list(resolutions: Union[int, str, Sequence[int]]) -> Optional[List[int]]:
-    """The scan's resolutions as ints, or None if they cannot be read (the scan reports it)."""
+    """The scan's resolutions as ints when they are valid (non-empty, each 0 to 15; repeats
+    are dropped, as the native parser does), else None. Pushdown narrows only a valid set, so an invalid one still
+    reaches the native scan and raises its usual error instead of being filtered away."""
     try:
+        if isinstance(resolutions, bool):
+            return None
         if isinstance(resolutions, int):
-            return [resolutions]
-        if isinstance(resolutions, str):
-            return [int(t) for t in resolutions.replace(",", " ").split()]
-        return [int(r) for r in resolutions]
+            values = [resolutions]
+        elif isinstance(resolutions, str):
+            values = [int(t) for t in resolutions.replace(",", " ").split()]
+        else:
+            values = [int(r) for r in resolutions]
     except (TypeError, ValueError):
         return None
+    if not values or any(not 0 <= r <= 15 for r in values):
+        return None
+    return sorted(set(values))
+
+
+def _native_has_scan_options() -> bool:
+    """Whether the native library takes scan options (the `_v2` entry points). Pushdown
+    adds filter options only then: with an older library the predicate is simply applied
+    by Polars, as before."""
+    return hasattr(_get_lib(), "raster_h3_py_create_arrow_stream_v2")
 
 
 _FLIPPED = {"Gt": "Lt", "GtEq": "LtEq", "Lt": "Gt", "LtEq": "GtEq", "Eq": "Eq", "NotEq": "NotEq"}

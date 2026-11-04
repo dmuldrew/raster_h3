@@ -334,3 +334,26 @@ def test_pushdown_with_row_limit(raster_h3, gradient_tif):
     got = lf.filter(expr).head(5).collect()
     assert got.height == 5
     assert got.filter(~expr).is_empty()
+
+
+@pytest.mark.parametrize("resolutions", [[16], [8, 16], [], "8,x"])
+def test_resolution_pushdown_keeps_invalid_resolutions_an_error(raster_h3, gradient_tif, resolutions):
+    """A resolution filter must not hide an invalid `resolutions` argument."""
+    lf = raster_h3.scan_raster_h3(gradient_tif, resolutions)
+    # Polars wraps the native error in a ComputeError in some versions, not in others.
+    with pytest.raises(Exception, match="Invalid resolutions"):
+        lf.filter(pl.col("resolution") == 8).collect()
+
+
+def test_pushdown_without_native_scan_options(raster_h3, gradient_tif, scans, monkeypatch):
+    """With a native library predating the `_v2` entry points, filters are applied by Polars
+    only: no options are pushed, so the scan does not fail for lack of them."""
+    monkeypatch.setattr(raster_h3, "_native_has_scan_options", lambda: False)
+    lf = raster_h3.scan_raster_h3(gradient_tif, MULTI)
+    expr = (pl.col("count") > 10) & (pl.col("mean") < 9) & (pl.col("resolution") == RES)
+    expected = lf.collect().filter(expr)
+    scans.clear()
+    got = lf.filter(expr).collect()
+    assert_frames_close(got, expected)
+    # Narrowing the resolutions needs no new native entry point, so it still happens.
+    assert scans and all(s["options"] == {} and s["resolutions"] == [RES] for s in scans), scans
