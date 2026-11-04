@@ -518,7 +518,6 @@ fn malformed_calibration_metadata_is_rejected_in_all_modes() {
     }
 }
 
-
 #[test]
 fn calibration_overflow_drops_only_nonfinite_physical_values() {
     use raster_h3_core::aggregator::sampling::SamplingPattern;
