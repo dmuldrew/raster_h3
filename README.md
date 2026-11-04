@@ -111,13 +111,11 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
-DuckDB has the widest coverage: every engine option is a named SQL parameter, including
-compaction, single-cell lookups and memory budgets that the other engines lack. It installs as
-a pre-built extension, usable from the DuckDB CLI or from Python, Node.js and R, and its
-spatial extension reads the tracts in the same SQL. Results export straight to GeoParquet or
-PMTiles, and storing `canopy_h3` as a table lets later queries reuse it without re-reading the
-raster. The trade-off: `WHERE` filters apply after aggregation, so narrow the scan with
-parameters such as `bbox := '...'` or `min_count := ...`.
+DuckDB's advantage is reach: the same SQL runs from the DuckDB CLI or from Python, Node.js and
+R, and one session joins the raster with vector files, Parquet and S3 data through DuckDB's
+other extensions. It also exposes every engine option, including compaction and memory budgets.
+Unlike SedonaDB, `WHERE` filters apply after aggregation, so narrow the scan with parameters
+such as `bbox := '...'`.
 
 #### Python & Polars
 
