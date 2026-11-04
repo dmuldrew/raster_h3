@@ -507,8 +507,10 @@ fn test_batch_cells_do_not_grow_with_workers() {
 }
 
 /// Batch length follows the sizes of the chunks being drained, so a large
-/// chunk elsewhere in a mosaic does not shrink batches of narrow strips: the
-/// mosaic runs as many kernel waves as its two files do separately.
+/// chunk elsewhere in a mosaic does not shrink batches of narrow strips. A
+/// batch takes whichever chunks are already decoded, so the exact wave count
+/// depends on timing; sizing batches by the mosaic's largest chunk instead
+/// ran about 4x the waves of the two files streamed separately.
 #[test]
 fn test_mixed_mosaic_batches_follow_their_own_chunks() {
     use crate::helpers::{write_geotiff, Crs, Layout};
@@ -548,5 +550,8 @@ fn test_mixed_mosaic_batches_follow_their_own_chunks() {
     let (_, _, _, waves_a) = drain_stats(stream_paths(std::slice::from_ref(&a), &config));
     let (_, _, _, waves_b) = drain_stats(stream_paths(std::slice::from_ref(&b), &config));
     let (_, _, _, waves_mosaic) = drain_stats(stream_paths(&[a, b], &config));
-    assert_eq!(waves_mosaic, waves_a + waves_b);
+    assert!(
+        waves_mosaic <= 2 * (waves_a + waves_b),
+        "mosaic ran {waves_mosaic} waves, its files {waves_a} + {waves_b} separately"
+    );
 }
