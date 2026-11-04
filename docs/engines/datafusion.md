@@ -399,7 +399,13 @@ options. `raster_h3_sedona.scalar_functions()` exports the scalar UDFs above, un
 name and alias, as `sedonadb_scalar_kernel` capsules; `sd.register(...)` installs them all
 (`__sedonadb_extension__`), or register single entries by iterating. Geometry arguments
 must be planar lon/lat or have no CRS, and `h3_to_wkb` returns `OGC:CRS84` geometry, so
-it composes with Sedona's `ST_*` functions and with spatial pushdown:
+it composes with Sedona's `ST_*` functions and with spatial pushdown.
+
+A join `ON ST_Intersects(d.wkb, t.wkb_geometry)` runs as SedonaDB's `SpatialJoinExec`. To join
+on hex ids instead, as the DuckDB and Polars versions do, polyfill the polygons with
+`unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index`; joining
+`ON d.h3_index = t.h3_index` is then a plain hash join on a 64-bit integer, which is cheaper
+when the polyfilled polygons are reused across queries:
 
 ```python
 sd.register(raster_h3_sedona.scalar_functions())

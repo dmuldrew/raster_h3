@@ -111,6 +111,12 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
+DuckDB's advantage is reach: the same SQL runs from the DuckDB CLI or from Python, Node.js and
+R, and one session joins the raster with vector files, Parquet and S3 data through DuckDB's
+other extensions. It also exposes every engine option, including compaction and memory budgets.
+Unlike SedonaDB, `WHERE` filters apply after aggregation, so narrow the scan with parameters
+such as `bbox := '...'`.
+
 #### Python & Polars
 
 ```python
@@ -154,10 +160,12 @@ result = (
 )
 ```
 
-Python scans reject malformed `resolutions`, `format` and `bbox` with `RuntimeError`
-instead of silently ignoring them or using defaults. Parquet and PMTiles exports
-also reject invalid resolutions; every resolution must be between 0 and 15. See the
-[Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
+In Polars, the raster is a `LazyFrame`, read only when `.collect()` runs, and it combines freely
+with other Polars and GeoPandas data. `columns=` and `.filter()` comparisons on `count`, `mean`,
+`majority_fraction` or `resolution` are pushed into the scan, but spatial conditions are
+not; pass `bbox=tracts.total_bounds` to read less of the raster. `h3_polygon_to_cells`
+takes one geometry at a time, hence the list comprehension, and the `UInt64` cast matches the
+scan's `h3_index`. See the [Python scan parameters](docs/engines/python-polars.md#scan-parameters).
 
 #### SedonaDB (Python)
 
@@ -211,15 +219,14 @@ result = sd.sql("""
 """).to_pandas()
 ```
 
-The join runs as SedonaDB's `SpatialJoinExec`. To join on hex ids instead, as in the DuckDB
-and Polars versions, register the raster_h3 SQL functions with
-`sd.register(raster_h3_sedona.scalar_functions())` and polyfill the tracts with
-`unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index`; joining
-`ON c.h3_index = t.h3_index` is then a plain hash join on a 64-bit integer, which is cheaper when
-the polyfilled tracts are reused. A filter against a constant geometry, such as
-`ST_Intersects(wkb, ST_GeomFromWKT(...))`, is pushed into the raster scan instead, so only the
-hexagons near it are aggregated. See
-[DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
+In SedonaDB, the tracts don't need converting to hexagons; the join matches hexagon shapes to
+tract shapes directly. It is also the only one of the three that skips raster from a spatial
+condition: a condition against a fixed shape, such as `ST_Intersects(wkb,
+ST_GeomFromWKT(...))`, limits the scan to the tiles near it, and `majority_fraction >= 0.5`
+drops hexagons inside the scan rather than after it. The tract join and the filters in this
+example don't narrow the scan; the whole raster is still aggregated. To join on hex ids
+instead, as DuckDB and Polars do, see [DataFusion &
+SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
 
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
 
