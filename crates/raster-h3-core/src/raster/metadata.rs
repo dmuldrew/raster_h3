@@ -512,6 +512,16 @@ fn user_defined_geokeys_to_proj(
 pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
     let upper = extract_projcs(&s.to_uppercase())?;
 
+    // This narrow parser cannot carry an explicit WKT1 datum operation into
+    // the reconstructed definition. Do not silently discard it.
+    if upper.match_indices("TOWGS84").any(|(i, _)| {
+        upper[i + "TOWGS84".len()..]
+            .trim_start()
+            .starts_with('[')
+    }) {
+        return None;
+    }
+
     // Datum by name only; ellipsoid names (e.g. GRS 1980) are shared by
     // several datums and do not identify one.
     let datum_name = section_name(&upper, "DATUM[")?;
@@ -943,6 +953,13 @@ mod tests {
 
         let osgb = wkt.replace("North_American_Datum_1983", "OSGB_1936");
         assert_eq!(parse_wkt_or_ascii_to_proj(&osgb), None);
+        for shift in ["TOWGS84[1,2,3]", "TOWGS84[1,2,3,4,5,6,7]"] {
+            let shifted = wkt.replace(
+                "SPHEROID[\"GRS 1980\",6378137,298.257222101]",
+                &format!("SPHEROID[\"GRS 1980\",6378137,298.257222101],{shift}"),
+            );
+            assert_eq!(parse_wkt_or_ascii_to_proj(&shifted), None);
+        }
         let paris = wkt.replace(r#"PRIMEM["Greenwich",0]"#, r#"PRIMEM["Paris",2.33722917]"#);
         assert_eq!(parse_wkt_or_ascii_to_proj(&paris), None);
         let no_scale = wkt.replace(r#"PARAMETER["scale_factor",0.9999],"#, "");
@@ -973,3 +990,4 @@ mod tests {
         );
     }
 }
+
