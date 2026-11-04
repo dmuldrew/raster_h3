@@ -6,7 +6,7 @@ mod common;
 use std::io::Read;
 use std::path::Path;
 
-use datafusion::arrow::array::{Array, AsArray};
+use datafusion::arrow::array::AsArray;
 use datafusion::arrow::datatypes::UInt64Type;
 use datafusion::prelude::SessionContext;
 use raster_h3_core::pmtiles::pyramid::h3_res_to_zoom;
@@ -170,7 +170,7 @@ async fn null_cells_are_skipped_and_signed_and_hex_columns_work() {
     )
     .await;
     assert_eq!(written, 2);
-    assert_eq!(std::fs::read(&hex).unwrap().len() > 127, true);
+    assert!(std::fs::read(&hex).unwrap().len() > 127);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -212,7 +212,7 @@ async fn sedona_copies_a_spatial_query_to_pmtiles() {
     let tif = gradient_tif(64, 64);
     let ctx = sedona().await;
     let src = source(&tif);
-    let aoi = "ST_GeomFromWKT('POLYGON((-122.45 37.76, -122.41 37.76, -122.41 37.80, -122.45 37.80, -122.45 37.76))')";
+    let aoi = "ST_SetSRID(ST_GeomFromWKT('POLYGON((-122.45 37.76, -122.41 37.76, -122.41 37.80, -122.45 37.80, -122.45 37.76))'), 4326)";
     let query = format!(
         "SELECT h3_index, mean FROM h3_raster_continuous_aggregate('{src}', 8) \
          WHERE ST_Intersects(wkb, {aoi})"
