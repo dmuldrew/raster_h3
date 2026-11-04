@@ -44,3 +44,8 @@ sedona-extension = { git = "https://github.com/apache/sedona-db", rev = "55da508
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
 tiff = "0.11"
+
+# Keep in sync with the workspace `[patch.crates-io]`: this crate is its own
+# workspace, so the root patch does not apply here.
+[patch.crates-io]
+h3o = { git = "https://github.com/dmuldrew/h3o", branch = "raster-row-indexing" }
