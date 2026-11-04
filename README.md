@@ -212,7 +212,7 @@ result = sd.sql("""
 ```
 
 Unlike the DuckDB and Polars versions, where the scan is narrowed only by parameters such as
-`bbox` and any `WHERE` clause or `.filter()` runs after the hexagons are aggregated, SedonaDB
+`bbox` and any `WHERE` clause or `.filter()` runs after all hexagons are aggregated, SedonaDB
 pushes filters on the raster table down into the scan, so the raster is only read and
 aggregated where the query needs it. A predicate against a constant geometry, such as
 `ST_Intersects(wkb, ST_GeomFromWKT(...))` or `ST_DWithin(wkb, ..., d)`, becomes a bounding box
