@@ -22,6 +22,8 @@ raster-h3-cli ipc     <input> [options]        Stream RH3IPC01 batches to stdout
 raster-h3-cli jsonl   <input> [options]        Stream JSONEachRow (NDJSON) to stdout or -o <file>
 raster-h3-cli parquet <input> -o <out> [opts]  Write GeoParquet
 raster-h3-cli pmtiles <input> -o <out> [opts]  Write a PMTiles v3 archive
+raster-h3-cli parquet-to-pmtiles <in.parquet> -o <out> [--h3-column NAME]
+                                               Transcode any H3-indexed Parquet file to PMTiles v3
 raster-h3-cli plan    <input> [options]        Print partition specs (JSON Lines), see Partitioned scans
 raster-h3-cli merge   <part>... [options]      Combine partitioned `ipc` outputs into final cells
 ```
@@ -42,7 +44,8 @@ raster-h3-cli merge   <part>... [options]      Combine partitioned `ipc` outputs
 | `--limit <N>` | `ipc`, `jsonl` | Maximum rows |
 | `--partition <SPEC\|@FILE>` | `ipc` | Scan one partition (see [Partitioned scans](#partitioned-scans)) |
 | `--partition-index <K>` | `ipc` | Line `K` of the plan file given as `--partition @FILE` |
-| `-o, --output <PATH\|->` | all | Output file; `-` or omitted means stdout (required for `parquet` and `pmtiles`) |
+| `-o, --output <PATH\|->` | all | Output file; `-` or omitted means stdout (required for `parquet`, `pmtiles` and `parquet-to-pmtiles`, which cannot write to stdout) |
+| `--h3-column <NAME>` (alias `--h3-col`) | `parquet-to-pmtiles` | H3 column, integer or hex string, matched case-insensitively (default: the first of `h3_index`, `h3_hex`, `h3`, `cell`, `hex`) |
 | `-h, --help` | | Help |
 
 Arguments are validated strictly: unknown flags, missing values, resolutions outside
@@ -84,6 +87,24 @@ on stdout. `pmtiles` writes one zoom range per requested resolution (see
 ```bash
 raster-h3-cli parquet dem.tif -r 7,8 -o dem_h3.parquet
 raster-h3-cli pmtiles landcover.tif -c -r 5,6,7,8 -o landcover.pmtiles
+```
+
+### `parquet-to-pmtiles`
+
+Turns any Parquet file with an H3 column into a PMTiles v3 archive, one hexagon feature per
+row with the other columns as properties, the same transcoder as DuckDB's
+[`h3_parquet_to_pmtiles`](../sql-api-reference.md#parquet-pmtiles-v3-export-h3_parquet_to_pmtilesparquet_path-output_pmtiles-)
+and Python's `parquet_to_pmtiles`. The input can come from `raster-h3-cli parquet`, or from
+any engine that writes Parquet (DuckDB `COPY`, Spark, Polars), so cells can be filtered,
+joined or aggregated there before tiling. Zoom levels follow the cells' resolutions (see
+[PMTiles & Multi-Resolution](../pmtiles.md)). Raster options (`-r`, `--crs`, ...) do not
+apply and are rejected.
+
+Rows whose H3 value is null or not a valid cell are skipped, and their count is reported
+on stderr; nothing is written to stdout.
+
+```bash
+raster-h3-cli parquet-to-pmtiles census_h3.parquet -o census_h3.pmtiles --h3-column cell_id
 ```
 
 ## Recipes
@@ -142,6 +163,12 @@ raster-h3-cli jsonl worldcover_2021.tif -c --format long -r 8 \
 raster-h3-cli parquet elevation.tif -r 8 -o elevation_h3.parquet
 raster-h3-cli pmtiles california_elevation.tif -r 6,7,8 -o california_elevation.pmtiles
 raster-h3-cli pmtiles worldcover_2021.tif -c -r 5,6,7,8 -o worldcover.pmtiles
+
+# Filter or join in another engine, then tile the result
+raster-h3-cli parquet elevation.tif -r 8 -o elevation_h3.parquet
+duckdb -c "COPY (SELECT h3_index, mean FROM 'elevation_h3.parquet' WHERE mean > 500)
+           TO 'highlands.parquet'"
+raster-h3-cli parquet-to-pmtiles highlands.parquet -o highlands.pmtiles
 ```
 
 ### Remote COG & S3 streaming

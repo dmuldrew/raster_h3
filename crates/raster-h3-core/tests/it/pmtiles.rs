@@ -1307,3 +1307,57 @@ fn wrapped_writer_bounds_preserve_center_after_metadata_update() {
         assert_eq!(coord(123), -20.0);
     }
 }
+
+/// Polars, PyArrow and DuckDB write nullable (OPTIONAL) columns by default. The row-group
+/// pre-scan used to read them without a definition-level buffer, which fails; the error
+/// was swallowed and an empty archive written.
+#[test]
+fn test_parquet_to_pmtiles_nullable_h3_column() {
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("nullable.parquet");
+    let message_type = "
+        message schema {
+            OPTIONAL INT64 h3_index;
+            OPTIONAL DOUBLE value;
+        }
+    ";
+    let schema = Arc::new(parse_message_type(message_type).unwrap());
+    let props = Arc::new(WriterProperties::builder().build());
+    let file = File::create(&parquet_path).unwrap();
+    let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+    let mut row_group = writer.next_row_group().unwrap();
+
+    // Three rows: two cells and a null H3 index.
+    let def_levels = [1i16, 0, 1];
+    let mut col_writer = row_group.next_column().unwrap().unwrap();
+    col_writer
+        .typed::<parquet::data_type::Int64Type>()
+        .write_batch(
+            &[0x8828308281fffff, 0x8828308283fffff],
+            Some(&def_levels),
+            None,
+        )
+        .unwrap();
+    col_writer.close().unwrap();
+    let mut col_writer = row_group.next_column().unwrap().unwrap();
+    col_writer
+        .typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[1.5, 2.5, 3.5], Some(&[1, 1, 1]), None)
+        .unwrap();
+    col_writer.close().unwrap();
+    row_group.close().unwrap();
+    writer.close().unwrap();
+
+    let pmtiles_path = dir.path().join("nullable.pmtiles");
+    let summary =
+        H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
+    assert_eq!(summary.total_features, 3);
+    assert_eq!(summary.valid_features, 2);
+    assert_eq!(summary.invalid_features_dropped, 1);
+    assert!(summary.total_tiles > 0);
+}

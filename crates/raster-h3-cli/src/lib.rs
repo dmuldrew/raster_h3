@@ -5,6 +5,7 @@
 //! - Newline-delimited JSON (`JSONEachRow` / NDJSON) streaming to `stdout` for ClickHouse
 //!   executable table functions and shell pipelines
 //! - Native Parquet / GeoParquet and PMTiles v3 exports
+//! - Transcoding any H3-indexed Parquet file to PMTiles v3 ([`transcode_parquet_to_pmtiles`])
 //! - Partitioned scans for shell fan-outs: [`plan_raster_partitions`], a partition per
 //!   [`CliStreamOptions::partition`] scan, and [`merge_partition_files`]
 
@@ -29,7 +30,7 @@ use raster_h3_core::columnar::{
 };
 use raster_h3_core::error::{RasterH3Error, Result};
 use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
-use raster_h3_core::pmtiles::H3PmtilesTiler;
+use raster_h3_core::pmtiles::{H3PmtilesTiler, PmtilesExportSummary};
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 use raster_h3_core::scalar_ops::{parse_bbox_str, try_parse_resolutions_str};
 
@@ -782,6 +783,88 @@ pub fn export_raster_to_pmtiles(
     .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
     warn_transform_failures(failures.load(Ordering::Relaxed));
     Ok(tiles)
+}
+
+/// Transcode an H3-indexed Parquet file (from `raster-h3-cli parquet`, DuckDB, Spark, Polars,
+/// ...) into a PMTiles v3 archive: one hexagon feature per row, the other columns as
+/// properties. `h3_column` names the H3 column (integer or hex string, matched
+/// case-insensitively); `None` picks the first of `h3_index`, `h3_hex`, `h3`, `cell`, `hex`.
+/// Rows whose H3 value is null or not a valid cell are skipped and counted in
+/// [`PmtilesExportSummary::invalid_features_dropped`].
+pub fn transcode_parquet_to_pmtiles(
+    input_path: &Path,
+    output_path: &Path,
+    h3_column: Option<&str>,
+) -> Result<PmtilesExportSummary> {
+    if !input_path.is_file() {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "Input Parquet file does not exist: {}",
+            input_path.display()
+        )));
+    }
+    H3PmtilesTiler::process_parquet_to_pmtiles(input_path, output_path, h3_column)
+        .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
+}
+
+/// Arguments of the `parquet-to-pmtiles` subcommand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CliTranscodeArgs {
+    pub input_path: String,
+    pub output_path: String,
+    pub h3_column: Option<String>,
+}
+
+/// Parse `parquet-to-pmtiles <input.parquet> -o <out.pmtiles> [--h3-column NAME]`. The
+/// archive needs a seekable file, so `-o` is required and cannot be stdout.
+pub fn parse_parquet_to_pmtiles_args(args: &[String]) -> Result<CliTranscodeArgs> {
+    let mut input_path: Option<String> = None;
+    let mut output_path: Option<String> = None;
+    let mut h3_column: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let flag = arg.as_str();
+        let mut value = || {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| RasterH3Error::InvalidParameter(format!("Missing value for {flag}")))
+        };
+        match flag {
+            "-i" | "--input" => input_path = Some(value()?),
+            "-o" | "--output" => {
+                let v = value()?;
+                if v == "-" {
+                    return Err(RasterH3Error::InvalidParameter(
+                        "parquet-to-pmtiles cannot write to stdout: pass a file with -o".into(),
+                    ));
+                }
+                output_path = Some(v);
+            }
+            "--h3-column" | "--h3-col" => h3_column = Some(value()?),
+            _ if flag.starts_with('-') && flag != "-" => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unknown option '{flag}' for parquet-to-pmtiles"
+                )));
+            }
+            _ if input_path.is_none() => input_path = Some(flag.to_string()),
+            _ => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unexpected argument '{flag}' (input path already set to '{}')",
+                    input_path.unwrap_or_default()
+                )));
+            }
+        }
+    }
+    let input_path = input_path.ok_or_else(|| {
+        RasterH3Error::InvalidParameter("Missing required input Parquet path".into())
+    })?;
+    let output_path = output_path.ok_or_else(|| {
+        RasterH3Error::InvalidParameter("Missing -o / --output path for parquet-to-pmtiles".into())
+    })?;
+    Ok(CliTranscodeArgs {
+        input_path,
+        output_path,
+        h3_column,
+    })
 }
 
 /// Parse CLI arguments into [`CliStreamOptions`] and an optional output file path (`None` = stdout).

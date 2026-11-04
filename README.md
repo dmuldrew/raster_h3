@@ -332,8 +332,9 @@ returns the same cells and statistics for the same input.
 
 Feature coverage differs per engine: DuckDB exposes every parameter (sampling, bands,
 spectral formulas, quantiles, remapping, budgets), DataFusion exposes most of them through
-builders, and PostgreSQL, Python and the CLI expose the common subset (resolutions, CRS,
-NoData, bbox, categorical layout). The [Engines Overview](docs/engines/README.md) has the
+builders, Python exposes all but compaction, single-cell pushdown and resource budgets
+(and pushes Polars filters into the engine), and PostgreSQL and the CLI expose the common subset (resolutions, CRS, NoData, bbox,
+categorical layout). The [Engines Overview](docs/engines/README.md) has the
 full capability matrix, shared output schemas, a side-by-side cheat sheet and the
 cross-engine parity tests. Each engine deep dive covers install, recipes (basic and
 advanced scans, scalar helpers, joins, exports, remote COGs, mosaics, categorical queries),

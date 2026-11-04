@@ -228,6 +228,9 @@ pub struct ExternalFeatureExport {
     total_features: usize,
     valid_features: usize,
     evict_every: usize,
+    /// Extra `vector_layers` fields (name -> `"Number"` / `"String"` / `"Boolean"`) listed
+    /// in the archive metadata next to the default `h3_index`, `h3_hex` and `resolution`.
+    layer_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ExternalFeatureExport {
@@ -254,7 +257,24 @@ impl ExternalFeatureExport {
             total_features: 0,
             valid_features: 0,
             evict_every: EVICT_EVERY,
+            layer_fields: serde_json::Map::new(),
         }
+    }
+
+    /// List the features' property names and types in the archive's `vector_layers`
+    /// metadata (TileJSON field types: `"Number"`, `"String"` or `"Boolean"`), in addition
+    /// to the default `h3_index`, `h3_hex` and `resolution`. Map clients use the list to
+    /// offer styling by property; it does not change the tiles.
+    pub fn with_layer_fields<I, K>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = (K, &'static str)>,
+        K: Into<String>,
+    {
+        for (name, kind) in fields {
+            self.layer_fields
+                .insert(name.into(), serde_json::Value::from(kind));
+        }
+        self
     }
 
     /// Number of sorted runs spilled to disk so far.
@@ -350,6 +370,18 @@ impl ExternalFeatureExport {
         Ok(summary)
     }
 
+    /// The default fields plus [`Self::with_layer_fields`]'s, the caller's types winning.
+    fn fields_metadata(&self) -> serde_json::Value {
+        let mut fields = match build_default_pmtiles_fields() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        for (name, kind) in &self.layer_fields {
+            fields.insert(name.clone(), kind.clone());
+        }
+        serde_json::Value::Object(fields)
+    }
+
     /// Merge everything into a ready-to-finish writer.
     fn build(mut self) -> io::Result<(PmtilesExportSummary, PmtilesWriter)> {
         let (min_zoom, max_zoom) = if self.valid_features == 0 {
@@ -365,7 +397,7 @@ impl ExternalFeatureExport {
             max_zoom,
             "h3_hexagons",
             "H3 hexagonal vector polygons with attributes",
-            build_default_pmtiles_fields(),
+            self.fields_metadata(),
             None,
         );
         // Spill once more before choosing the writer's directory, so a merge
@@ -520,6 +552,48 @@ mod tests {
         let mut out = Vec::new();
         let summary = exporter.finish_into(&mut out).unwrap();
         (summary, runs, out)
+    }
+
+    /// The archive's gzipped JSON metadata.
+    fn metadata(archive: &[u8]) -> serde_json::Value {
+        let offset = u64::from_le_bytes(archive[24..32].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(archive[32..40].try_into().unwrap()) as usize;
+        let mut json = String::new();
+        flate2::read::GzDecoder::new(&archive[offset..offset + len])
+            .read_to_string(&mut json)
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn layer_fields_are_listed_in_the_metadata() {
+        let fields = |exporter: ExternalFeatureExport| {
+            let mut exporter = exporter;
+            for f in sample_features() {
+                exporter.push(f).unwrap();
+            }
+            let mut out = Vec::new();
+            exporter.finish_into(&mut out).unwrap();
+            metadata(&out)["vector_layers"][0]["fields"].clone()
+        };
+        let defaults = fields(ExternalFeatureExport::new(usize::MAX, None));
+        assert_eq!(
+            defaults,
+            serde_json::json!({"h3_index": "Number", "h3_hex": "String", "resolution": "Number"})
+        );
+        let listed = fields(
+            ExternalFeatureExport::new(usize::MAX, None)
+                .with_layer_fields([("name", "String"), ("value", "Number"), ("flag", "Boolean")])
+                // A caller-supplied `h3_index` keeps the caller's type.
+                .with_layer_fields([("h3_index", "String")]),
+        );
+        assert_eq!(
+            listed,
+            serde_json::json!({
+                "h3_index": "String", "h3_hex": "String", "resolution": "Number",
+                "name": "String", "value": "Number", "flag": "Boolean"
+            })
+        );
     }
 
     #[test]

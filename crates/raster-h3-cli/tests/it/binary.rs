@@ -395,3 +395,158 @@ fn bad_invocations_exit_non_zero_with_a_message() {
         "a failed export must not leave a parquet file"
     );
 }
+
+#[test]
+fn parquet_to_pmtiles_round_trips_the_cli_parquet_export() {
+    let (_tmp, path) = classes_tif();
+    let dir = tempfile::tempdir().unwrap();
+    let parquet = dir.path().join("cells.parquet");
+    run_ok(&["parquet", s(&path), "-c", "-r", "7,8", "-o", s(&parquet)]);
+
+    let cli_out = dir.path().join("cli.pmtiles");
+    let out = run_ok(&["parquet-to-pmtiles", s(&parquet), "-o", s(&cli_out)]);
+    assert!(out.stdout.is_empty(), "nothing is written to stdout");
+    assert!(
+        out.stderr.is_empty(),
+        "no rows were skipped: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let core_out = dir.path().join("core.pmtiles");
+    let summary = H3PmtilesTiler::process_parquet_to_pmtiles(&parquet, &core_out, None).unwrap();
+    let rows = SerializedFileReader::new(File::open(&parquet).unwrap())
+        .unwrap()
+        .metadata()
+        .file_metadata()
+        .num_rows() as usize;
+    assert_eq!(summary.valid_features, rows);
+    let cli_bytes = std::fs::read(&cli_out).unwrap();
+    assert_eq!(&cli_bytes[..7], b"PMTiles");
+    assert_eq!(cli_bytes, std::fs::read(&core_out).unwrap());
+
+    // Naming the auto-detected column explicitly (any case) gives the same archive.
+    let named = dir.path().join("named.pmtiles");
+    run_ok(&[
+        "parquet-to-pmtiles",
+        s(&parquet),
+        "--h3-column",
+        "H3_INDEX",
+        "-o",
+        s(&named),
+    ]);
+    assert_eq!(std::fs::read(&named).unwrap(), cli_bytes);
+}
+
+/// A nullable hex-string column under a custom name, with a null and an invalid value: the
+/// two bad rows are skipped and reported on stderr.
+#[test]
+fn parquet_to_pmtiles_reads_nullable_hex_columns_and_reports_skipped_rows() {
+    use parquet::data_type::{ByteArray, ByteArrayType, DoubleType};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parquet = dir.path().join("hex.parquet");
+    let schema = Arc::new(
+        parse_message_type(
+            "message schema { OPTIONAL BYTE_ARRAY cell_id (UTF8); REQUIRED DOUBLE value; }",
+        )
+        .unwrap(),
+    );
+    let mut writer = SerializedFileWriter::new(
+        File::create(&parquet).unwrap(),
+        schema,
+        Arc::new(WriterProperties::builder().build()),
+    )
+    .unwrap();
+    let mut rg = writer.next_row_group().unwrap();
+    let mut col = rg.next_column().unwrap().unwrap();
+    let cells = ["8828308281fffff", "not-a-cell", "8828308283fffff"].map(ByteArray::from);
+    col.typed::<ByteArrayType>()
+        .write_batch(&cells, Some(&[1, 1, 0, 1]), None)
+        .unwrap();
+    col.close().unwrap();
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<DoubleType>()
+        .write_batch(&[1.0, 2.0, 3.0, 4.0], None, None)
+        .unwrap();
+    col.close().unwrap();
+    rg.close().unwrap();
+    writer.close().unwrap();
+
+    let out = dir.path().join("hex.pmtiles");
+    let result = run_ok(&[
+        "parquet-to-pmtiles",
+        s(&parquet),
+        "--h3-column",
+        "cell_id",
+        "-o",
+        s(&out),
+    ]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("skipped 2 of 4 rows"), "{stderr}");
+    assert_eq!(&std::fs::read(&out).unwrap()[..7], b"PMTiles");
+}
+
+#[test]
+fn parquet_to_pmtiles_bad_invocations() {
+    let (_tmp, path) = gradient_tif();
+    let dir = tempfile::tempdir().unwrap();
+    let parquet = dir.path().join("cells.parquet");
+    run_ok(&["parquet", s(&path), "-o", s(&parquet)]);
+    let out = dir.path().join("out.pmtiles");
+
+    run_err(
+        &["parquet-to-pmtiles"],
+        "Missing required input Parquet path",
+    );
+    run_err(
+        &["parquet-to-pmtiles", s(&parquet)],
+        "Missing -o / --output path for parquet-to-pmtiles",
+    );
+    run_err(
+        &["parquet-to-pmtiles", s(&parquet), "-o", "-"],
+        "cannot write to stdout",
+    );
+    run_err(
+        &["parquet-to-pmtiles", s(&parquet), "-o", s(&out), "-r", "8"],
+        "Unknown option '-r' for parquet-to-pmtiles",
+    );
+    run_err(
+        &[
+            "parquet-to-pmtiles",
+            s(&parquet),
+            "x.parquet",
+            "-o",
+            s(&out),
+        ],
+        "Unexpected argument",
+    );
+    run_err(
+        &["parquet-to-pmtiles", s(&parquet), "--h3-column"],
+        "Missing value for --h3-column",
+    );
+    run_err(
+        &[
+            "parquet-to-pmtiles",
+            s(&parquet),
+            "--h3-column",
+            "nope",
+            "-o",
+            s(&out),
+        ],
+        "H3 column 'nope' not found",
+    );
+    let missing = dir.path().join("missing.parquet");
+    run_err(
+        &["parquet-to-pmtiles", s(&missing), "-o", s(&out)],
+        "does not exist",
+    );
+    run_err(&["parquet-to-pmtiles", s(&path), "-o", s(&out)], "Error:");
+    assert!(
+        !out.exists(),
+        "a failed transcode must not leave an archive"
+    );
+}
