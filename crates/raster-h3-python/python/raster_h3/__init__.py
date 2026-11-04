@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import sys
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -214,6 +216,25 @@ def _get_lib() -> ctypes.CDLL:
         ] + err_ptr
         lib.raster_h3_py_plan_partitions_v2.restype = ctypes.c_void_p
 
+    if hasattr(lib, "raster_h3_py_merge_partials_v2"):
+        lib.raster_h3_py_merge_partials_v2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+        ] + err_ptr
+        lib.raster_h3_py_merge_partials_v2.restype = ctypes.c_void_p
+        lib.raster_h3_py_create_arrow_schema_v2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+        ] + err_ptr
+        lib.raster_h3_py_create_arrow_schema_v2.restype = ctypes.c_void_p
+        lib.raster_h3_py_quantile_columns.argtypes = [ctypes.c_char_p] + err_ptr
+        lib.raster_h3_py_quantile_columns.restype = ctypes.c_void_p
+
     if hasattr(lib, "raster_h3_py_parquet_to_pmtiles"):
         lib.raster_h3_py_parquet_to_pmtiles.argtypes = [
             ctypes.c_char_p,
@@ -390,48 +411,115 @@ def _encode_columns(columns: Optional[Sequence[str]]) -> Optional[bytes]:
     return ",".join(columns).encode("utf-8")
 
 
-def _encode_scan_options(
-    *,
-    band: Optional[int] = None,
-    sampling: Optional[str] = None,
-    overlap_rule: Optional[str] = None,
-    min_majority_fraction: Optional[float] = None,
-    spectral_formula: Optional[str] = None,
-    nir_band: Optional[int] = None,
-    red_band: Optional[int] = None,
-    green_band: Optional[int] = None,
-    blue_band: Optional[int] = None,
-    swir_band: Optional[int] = None,
-) -> Optional[bytes]:
-    """The options JSON of the `_v2` entry points, or None when every option is unset."""
+#: Scan options sent to the `_v2` entry points as one JSON object, beyond the original
+#: positional C-ABI arguments. Every one defaults to `None` (unset).
+_SCAN_OPTIONS = (
+    "band",
+    "sampling",
+    "overlap_rule",
+    "spectral_formula",
+    "nir_band",
+    "red_band",
+    "green_band",
+    "blue_band",
+    "swir_band",
+    "quantiles",
+    "remap",
+    "min_count",
+    "min_mean",
+    "max_mean",
+    "min_majority_fraction",
+)
+
+_INT_OPTIONS = ("band", "nir_band", "red_band", "green_band", "blue_band", "swir_band")
+_STR_OPTIONS = ("sampling", "overlap_rule", "spectral_formula")
+_FLOAT_OPTIONS = ("min_count", "min_mean", "max_mean", "min_majority_fraction")
+
+
+def _encode_quantiles(value: Union[str, Sequence[Union[str, float]]]) -> str:
+    """`"p50,p90"`, `["p50", "iqr"]` or `[0.5, 0.9]` as DuckDB's `quantiles :=` string."""
+    if isinstance(value, str):
+        return value
+    items = list(value)
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (str, int, float)):
+            raise TypeError(
+                f"quantiles entries must be str or float, got {type(item).__name__}"
+            )
+    # An empty sequence asks for no quantile columns.
+    return ",".join(str(item) for item in items) or "none"
+
+
+def _encode_remap(value: Union[str, Mapping[Any, Optional[int]]]) -> str:
+    """A remap spec string, or a mapping as DuckDB's `remap :=` string.
+
+    Keys are class codes (`int`), `range`s of codes (step 1), or `"else"` / `"default"` for
+    every other class; values are the new class code, or `None` to drop the class.
+    """
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError(f"remap must be a str or a mapping, got {type(value).__name__}")
+    entries = []
+    for key, target in value.items():
+        if isinstance(key, bool):
+            raise TypeError("remap keys must be int, range or 'else'")
+        if isinstance(key, int):
+            src = str(key)
+        elif isinstance(key, range):
+            if key.step != 1 or len(key) == 0:
+                raise ValueError(f"remap range keys must be non-empty with step 1, got {key!r}")
+            src = f"{key.start}..={key.stop - 1}"
+        elif isinstance(key, str) and key.strip().lower() in ("else", "default", "*", "_"):
+            src = key.strip()
+        else:
+            raise TypeError(f"remap keys must be int, range or 'else', got {key!r}")
+        if target is None:
+            dst = "null"
+        elif isinstance(target, int) and not isinstance(target, bool):
+            dst = str(target)
+        else:
+            raise TypeError(f"remap targets must be int or None, got {target!r}")
+        entries.append(f"{src}: {dst}")
+    if not entries:
+        raise ValueError("remap mapping is empty")
+    return ", ".join(entries)
+
+
+def _encode_scan_options(options: Mapping[str, Any]) -> Optional[bytes]:
+    """The options JSON of the `_v2` entry points, or None when every option is unset.
+
+    Types are checked here; names, ranges and which scans accept an option are checked by
+    the native side.
+    """
     opts: Dict[str, Any] = {}
-    for key, value in (
-        ("band", band),
-        ("nir_band", nir_band),
-        ("red_band", red_band),
-        ("green_band", green_band),
-        ("blue_band", blue_band),
-        ("swir_band", swir_band),
-    ):
-        if value is not None:
+    for key, value in options.items():
+        if value is None:
+            continue
+        if key in _INT_OPTIONS:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{key} must be an int, got {type(value).__name__}")
             opts[key] = value
-    for key, value in (
-        ("sampling", sampling),
-        ("overlap_rule", overlap_rule),
-        ("spectral_formula", spectral_formula),
-    ):
-        if value is not None:
+        elif key in _STR_OPTIONS:
             if not isinstance(value, str):
                 raise TypeError(f"{key} must be a str, got {type(value).__name__}")
             opts[key] = value
-    if min_majority_fraction is not None:
-        fraction = float(min_majority_fraction)
-        # Checked here too: JSON has no NaN, so the native check would see a parse error.
-        if not 0.0 <= fraction <= 1.0:
-            raise ValueError(f"min_majority_fraction must be between 0 and 1, got {fraction}")
-        opts["min_majority_fraction"] = fraction
+        elif key in _FLOAT_OPTIONS:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{key} must be a number, got {type(value).__name__}")
+            number = float(value)
+            # JSON has no NaN or infinity, so these are checked here rather than natively.
+            if not math.isfinite(number):
+                raise ValueError(f"{key} must be finite, got {number}")
+            if key == "min_majority_fraction" and not 0.0 <= number <= 1.0:
+                raise ValueError(f"min_majority_fraction must be between 0 and 1, got {number}")
+            opts[key] = number
+        elif key == "quantiles":
+            opts[key] = _encode_quantiles(value)
+        elif key == "remap":
+            opts[key] = _encode_remap(value)
+        else:
+            raise TypeError(f"unknown scan option {key!r}")
     return json.dumps(opts).encode("utf-8") if opts else None
 
 
@@ -505,13 +593,18 @@ class RasterH3ArrowStream:
         band: Optional[int] = None,
         sampling: Optional[str] = None,
         overlap_rule: Optional[str] = None,
-        min_majority_fraction: Optional[float] = None,
         spectral_formula: Optional[str] = None,
         nir_band: Optional[int] = None,
         red_band: Optional[int] = None,
         green_band: Optional[int] = None,
         blue_band: Optional[int] = None,
         swir_band: Optional[int] = None,
+        quantiles: Optional[Union[str, Sequence[Union[str, float]]]] = None,
+        remap: Optional[Union[str, Mapping[Any, Optional[int]]]] = None,
+        min_count: Optional[float] = None,
+        min_mean: Optional[float] = None,
+        max_mean: Optional[float] = None,
+        min_majority_fraction: Optional[float] = None,
     ) -> None:
         self.path = str(path)
         self.resolutions = resolutions
@@ -529,18 +622,12 @@ class RasterH3ArrowStream:
         # Options beyond the original positional C-ABI arguments, sent as one JSON object
         # to the `_v2` entry points. Encoding here rejects wrongly typed values early; the
         # native side validates names and ranges.
-        self._options = _encode_scan_options(
-            band=band,
-            sampling=sampling,
-            overlap_rule=overlap_rule,
-            min_majority_fraction=min_majority_fraction,
-            spectral_formula=spectral_formula,
-            nir_band=nir_band,
-            red_band=red_band,
-            green_band=green_band,
-            blue_band=blue_band,
-            swir_band=swir_band,
-        )
+        _locals = locals()
+        #: The set scan options (see `_SCAN_OPTIONS`), by name.
+        self.options: Dict[str, Any] = {
+            k: _locals[k] for k in _SCAN_OPTIONS if _locals[k] is not None
+        }
+        self._options = _encode_scan_options(self.options)
 
     def _has_v2(self, lib: ctypes.CDLL) -> bool:
         """Whether to call the `_v2` scan variants; the extra scan options require them."""
@@ -548,8 +635,8 @@ class RasterH3ArrowStream:
             return True
         if self._options is not None:
             raise RuntimeError(
-                "band, sampling, overlap_rule, min_majority_fraction and spectral_formula "
-                "require a newer raster_h3 native library"
+                f"the scan options {sorted(self.options)} require a newer raster_h3 native "
+                "library"
             )
         return False
 
@@ -586,6 +673,24 @@ class RasterH3ArrowStream:
     def __arrow_c_schema__(self) -> Any:
         lib = _get_lib()
         err = ctypes.c_void_p(0)
+        if hasattr(lib, "raster_h3_py_create_arrow_schema_v2"):
+            if self.partition is not None:
+                self._partition_arg(lib)
+            ptr = lib.raster_h3_py_create_arrow_schema_v2(
+                1 if self.categorical else 0,
+                self.format.encode("utf-8"),
+                _encode_columns(self.columns),
+                1 if self.partition is not None else 0,
+                self._options,
+                ctypes.byref(err),
+            )
+            _raise_if_err(err)
+            if not ptr:
+                raise RuntimeError("Failed to create ArrowSchema")
+            return ctypes.pythonapi.PyCapsule_New(
+                ptr, b"arrow_schema", _schema_capsule_destructor
+            )
+        self._has_v2(lib)  # raises when options need a newer library
         create = lib.raster_h3_py_create_arrow_schema
         if self.partition is not None:
             self._partition_arg(lib)
@@ -779,13 +884,18 @@ def scan_raster_h3(
     band: Optional[int] = None,
     sampling: Optional[str] = None,
     overlap_rule: Optional[str] = None,
-    min_majority_fraction: Optional[float] = None,
     spectral_formula: Optional[str] = None,
     nir_band: Optional[int] = None,
     red_band: Optional[int] = None,
     green_band: Optional[int] = None,
     blue_band: Optional[int] = None,
     swir_band: Optional[int] = None,
+    quantiles: Optional[Union[str, Sequence[Union[str, float]]]] = None,
+    remap: Optional[Union[str, Mapping[Any, Optional[int]]]] = None,
+    min_count: Optional[float] = None,
+    min_mean: Optional[float] = None,
+    max_mean: Optional[float] = None,
+    min_majority_fraction: Optional[float] = None,
 ) -> Any:
     """
     Scan a GeoTIFF / COG into H3 hexagonal cells.
@@ -809,19 +919,21 @@ def scan_raster_h3(
     - `spectral_formula` (continuous): aggregate `ndvi`, `ndwi`, `nbr` or `evi` computed
       per pixel from several bands, chosen with `nir_band` (default 4), `red_band` (3),
       `green_band` (2), `blue_band` (1) and `swir_band` (6).
+    - `quantiles` (continuous): streaming quantile columns, e.g. `"p50,p90"`,
+      `["median", "iqr"]`, `[0.05, 0.95]` or a preset (`"default"`, `"box"`, `"tails"`,
+      `"deciles"`). Each target adds a nullable `Float64` column named after it.
+    - `remap` (categorical): class remapping applied to every pixel, as DuckDB's
+      `remap :=` string or a mapping such as `{range(11, 20): 1, 21: 2, "else": None}`
+      (`None` drops the class).
+    - `min_count`, `min_mean` / `max_mean` (continuous) and `min_majority_fraction`
+      (categorical): drop cells outside these bounds inside the engine.
+
+    A Polars `filter` on `count` (`total_count` for categorical scans), `mean`,
+    `majority_fraction` or `resolution`, combined with `&`, is also pushed into the scan
+    as these bounds; Polars still applies the full predicate afterwards.
     """
-    extra = dict(
-        band=band,
-        sampling=sampling,
-        overlap_rule=overlap_rule,
-        min_majority_fraction=min_majority_fraction,
-        spectral_formula=spectral_formula,
-        nir_band=nir_band,
-        red_band=red_band,
-        green_band=green_band,
-        blue_band=blue_band,
-        swir_band=swir_band,
-    )
+    _locals = locals()
+    extra = {k: _locals[k] for k in _SCAN_OPTIONS}
     stream = RasterH3ArrowStream(
         path=path,
         resolutions=resolutions,
@@ -885,6 +997,10 @@ def scan_raster_h3(
                 "wkb": pl.Binary,
             }
 
+        if not categorical and quantiles is not None:
+            for name in _quantile_columns(quantiles):
+                pl_schema[name] = pl.Float64
+
         if columns:
             pl_schema = {k: pl_schema[k] for k in columns if k in pl_schema}
 
@@ -921,9 +1037,22 @@ def scan_raster_h3(
             else:
                 scan_limit = limit
                 remaining = n_rows
+            options = dict(extra)
+            scan_resolutions: Union[int, str, Sequence[int]] = resolutions
+            if predicate is not None:
+                pushed = _pushdown_bounds(predicate, categorical, format)
+                options = _narrow_options(options, pushed)
+                allowed = pushed.get("resolutions")
+                if allowed is not None:
+                    configured = _resolution_list(resolutions)
+                    if configured is not None:
+                        kept = [r for r in configured if r in allowed]
+                        if not kept:
+                            return  # the predicate rejects every scanned resolution
+                        scan_resolutions = kept
             s = RasterH3ArrowStream(
                 path=path,
-                resolutions=resolutions,
+                resolutions=scan_resolutions,
                 categorical=categorical,
                 format=format,
                 crs=crs,
@@ -932,7 +1061,7 @@ def scan_raster_h3(
                 columns=pushed_cols,
                 limit=scan_limit,
                 strict_transforms=strict_transforms,
-                **extra,
+                **options,
             )
             if remaining is not None and remaining <= 0:
                 return
@@ -950,6 +1079,170 @@ def scan_raster_h3(
         return register_io_source(_source_gen, schema=pl_schema)
     except ImportError:
         return stream
+
+
+def _quantile_columns(quantiles: Union[str, Sequence[Union[str, float]]]) -> List[str]:
+    """Output column names of a `quantiles` option, from the native parser."""
+    lib = _get_lib()
+    if not hasattr(lib, "raster_h3_py_quantile_columns"):
+        raise RuntimeError("quantiles require a newer raster_h3 native library")
+    err = ctypes.c_void_p(0)
+    ptr = lib.raster_h3_py_quantile_columns(
+        _encode_quantiles(quantiles).encode("utf-8"), ctypes.byref(err)
+    )
+    _raise_if_err(err)
+    if not ptr:
+        raise RuntimeError("Failed to parse quantiles")
+    try:
+        return list(json.loads(ctypes.string_at(ptr).decode("utf-8")))
+    finally:
+        lib.raster_h3_py_free_string(ptr)
+
+
+def _resolution_list(resolutions: Union[int, str, Sequence[int]]) -> Optional[List[int]]:
+    """The scan's resolutions as ints, or None if they cannot be read (the scan reports it)."""
+    try:
+        if isinstance(resolutions, int):
+            return [resolutions]
+        if isinstance(resolutions, str):
+            return [int(t) for t in resolutions.replace(",", " ").split()]
+        return [int(r) for r in resolutions]
+    except (TypeError, ValueError):
+        return None
+
+
+_FLIPPED = {"Gt": "Lt", "GtEq": "LtEq", "Lt": "Gt", "LtEq": "GtEq", "Eq": "Eq", "NotEq": "NotEq"}
+_COMPARE = {
+    "Gt": lambda a, b: a > b,
+    "GtEq": lambda a, b: a >= b,
+    "Lt": lambda a, b: a < b,
+    "LtEq": lambda a, b: a <= b,
+    "Eq": lambda a, b: a == b,
+    "NotEq": lambda a, b: a != b,
+}
+
+
+def _literal_number(node: Any) -> Optional[float]:
+    """The number in a serialized Polars literal (`{"Dyn": {"Int": 10}}`,
+    `{"Scalar": {"UInt8": 4}}`, ...), or None for anything else."""
+    for _ in range(8):
+        if isinstance(node, bool):
+            return None
+        if isinstance(node, (int, float)):
+            number = float(node)
+            return number if math.isfinite(number) else None
+        if not isinstance(node, dict):
+            return None
+        if "value" in node:
+            node = node["value"]
+        elif len(node) == 1:
+            node = next(iter(node.values()))
+        else:
+            return None
+    return None
+
+
+def _comparisons(node: Any) -> Iterable[Tuple[str, str, float]]:
+    """`(column, op, number)` for every `column <op> literal` joined by AND at the top of a
+    serialized Polars expression. Other terms (OR, casts, functions) yield nothing, which is
+    safe: they only make the pushed bounds looser than the predicate."""
+    if not isinstance(node, dict):
+        return
+    if "Function" in node:
+        # `col.is_between(lo, hi)`: whatever its `closed`, the inclusive bounds keep a superset.
+        func = node["Function"]
+        if not isinstance(func, dict) or "IsBetween" not in json.dumps(func.get("function")):
+            return
+        args = func.get("input")
+        if (
+            isinstance(args, list)
+            and len(args) == 3
+            and isinstance(args[0], dict)
+            and set(args[0]) == {"Column"}
+            and isinstance(args[0]["Column"], str)
+            and all(isinstance(a, dict) and set(a) == {"Literal"} for a in args[1:])
+        ):
+            lo, hi = (_literal_number(a["Literal"]) for a in args[1:])
+            if lo is not None:
+                yield args[0]["Column"], "GtEq", lo
+            if hi is not None:
+                yield args[0]["Column"], "LtEq", hi
+        return
+    if "BinaryExpr" not in node:
+        return
+    expr = node["BinaryExpr"]
+    if not isinstance(expr, dict):
+        return
+    op, left, right = expr.get("op"), expr.get("left"), expr.get("right")
+    if op in ("And", "LogicalAnd"):
+        yield from _comparisons(left)
+        yield from _comparisons(right)
+        return
+    if op not in _COMPARE:
+        return
+    for col_side, lit_side, cmp in ((left, right, op), (right, left, _FLIPPED[op])):
+        if isinstance(col_side, dict) and set(col_side) == {"Column"}:
+            if isinstance(lit_side, dict) and set(lit_side) == {"Literal"}:
+                number = _literal_number(lit_side["Literal"])
+                if number is not None and isinstance(col_side["Column"], str):
+                    yield col_side["Column"], cmp, number
+            return
+
+
+def _pushdown_bounds(predicate: Any, categorical: bool, format: str) -> Dict[str, Any]:
+    """Scan bounds implied by a Polars predicate: `min_count`, `min_mean`, `max_mean`,
+    `min_majority_fraction` and the set of allowed `resolutions`.
+
+    Every bound keeps a superset of the rows the predicate keeps (the engine's filters are
+    inclusive: `count >= min_count`, ...), so applying the predicate afterwards gives the
+    exact result. An expression this cannot read pushes nothing.
+    """
+    try:
+        tree = json.loads(predicate.meta.serialize(format="json"))
+    except Exception:  # older Polars, or an expression that cannot be serialized
+        return {}
+    count_col = "total_count" if categorical else "count"
+    lower: Dict[str, float] = {}
+    upper: Dict[str, float] = {}
+    resolutions: Optional[set] = None
+    for column, op, value in _comparisons(tree):
+        if column == "resolution":
+            allowed = {r for r in range(16) if _COMPARE[op](r, value)}
+            resolutions = allowed if resolutions is None else resolutions & allowed
+            continue
+        if column == count_col:
+            key_lo, key_hi = "min_count", None
+        elif column == "mean" and not categorical:
+            key_lo, key_hi = "min_mean", "max_mean"
+        elif column == "majority_fraction" and categorical and format.lower() != "long":
+            if value < 0.0:
+                continue  # every fraction passes; nothing to push
+            key_lo, key_hi = "min_majority_fraction", None
+            value = min(value, 1.0)  # `> 1.5` keeps nothing; `>= 1` keeps a superset
+        else:
+            continue
+        if op in ("Gt", "GtEq", "Eq"):
+            lower[key_lo] = max(lower.get(key_lo, value), value)
+        if key_hi is not None and op in ("Lt", "LtEq", "Eq"):
+            upper[key_hi] = min(upper.get(key_hi, value), value)
+    bounds: Dict[str, Any] = {**lower, **upper}
+    if resolutions is not None:
+        bounds["resolutions"] = resolutions
+    return bounds
+
+
+def _narrow_options(options: Dict[str, Any], pushed: Mapping[str, Any]) -> Dict[str, Any]:
+    """`options` with pushed bounds combined into the caller's: lower bounds take the max,
+    upper bounds the min, so pushdown only ever narrows the scan."""
+    out = dict(options)
+    for key in ("min_count", "min_mean", "min_majority_fraction"):
+        if key in pushed:
+            out[key] = pushed[key] if out.get(key) is None else max(out[key], pushed[key])
+    if "max_mean" in pushed:
+        out["max_mean"] = (
+            pushed["max_mean"] if out.get("max_mean") is None else min(out["max_mean"], pushed["max_mean"])
+        )
+    return out
 
 
 def read_raster_h3(
@@ -1009,7 +1302,7 @@ def plan_partitions(
         _encode_bbox(bbox),
         int(target_chunks),
     )
-    options = _encode_scan_options(overlap_rule=overlap_rule)
+    options = _encode_scan_options({"overlap_rule": overlap_rule})
     if hasattr(lib, "raster_h3_py_plan_partitions_v2"):
         ptr = lib.raster_h3_py_plan_partitions_v2(*args, options, ctypes.byref(err))
     elif options is not None:
@@ -1050,6 +1343,11 @@ def merge_partials(
     *,
     categorical: bool = False,
     columns: Optional[Sequence[str]] = None,
+    quantiles: Optional[Union[str, Sequence[Union[str, float]]]] = None,
+    min_count: Optional[float] = None,
+    min_mean: Optional[float] = None,
+    max_mean: Optional[float] = None,
+    min_majority_fraction: Optional[float] = None,
 ) -> Any:
     """
     Merge the partial rows of every partition of a partitioned scan into final rows.
@@ -1060,7 +1358,8 @@ def merge_partials(
     DataFrame); only the `resolution`, `h3_index` and `partial_state` columns are read,
     and integer types are cast as needed (e.g. Spark's signed `h3_index`).
 
-    `categorical` and `columns` must match the scans'. Returns a PyArrow Table with the
+    `categorical`, `columns`, `quantiles` and the filters (`min_count`, `min_mean`,
+    `max_mean`, `min_majority_fraction`) must match the scans'. Returns a PyArrow Table with the
     scan's output columns (without `partial_state`), sorted by resolution and h3_index.
     Requires pyarrow.
 
@@ -1076,6 +1375,19 @@ def merge_partials(
     lib = _get_lib()
     if not hasattr(lib, "raster_h3_py_merge_partials"):
         raise RuntimeError("merge_partials requires a newer raster_h3 native library")
+    options = _encode_scan_options(
+        dict(
+            quantiles=quantiles,
+            min_count=min_count,
+            min_mean=min_mean,
+            max_mean=max_mean,
+            min_majority_fraction=min_majority_fraction,
+        )
+    )
+    if options is not None and not hasattr(lib, "raster_h3_py_merge_partials_v2"):
+        raise RuntimeError(
+            "quantiles and filters in merge_partials require a newer raster_h3 native library"
+        )
     table = _as_pyarrow_table(partials)
     keys = {"resolution": pa.uint8(), "h3_index": pa.uint64(), PARTIAL_STATE_COLUMN: pa.binary()}
     if table is None:
@@ -1093,12 +1405,21 @@ def merge_partials(
     capsule = narrow.__arrow_c_stream__()
     stream = _capsule_object_pointer(capsule, b"arrow_array_stream")
     err = ctypes.c_void_p(0)
-    out = lib.raster_h3_py_merge_partials(
-        stream,
-        1 if categorical else 0,
-        _encode_columns(columns),
-        ctypes.byref(err),
-    )
+    if hasattr(lib, "raster_h3_py_merge_partials_v2"):
+        out = lib.raster_h3_py_merge_partials_v2(
+            stream,
+            1 if categorical else 0,
+            _encode_columns(columns),
+            options,
+            ctypes.byref(err),
+        )
+    else:
+        out = lib.raster_h3_py_merge_partials(
+            stream,
+            1 if categorical else 0,
+            _encode_columns(columns),
+            ctypes.byref(err),
+        )
     del capsule  # the native side moved the stream out; releasing the capsule is a no-op
     _raise_if_err(err)
     if not out:

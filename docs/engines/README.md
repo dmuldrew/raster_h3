@@ -52,12 +52,12 @@ keep working. `cargo build --release` at the root still produces
 | Multiple resolutions per scan | ✅ | ✅ | ✅ | — (one `h3_res`) | ✅ |
 | CRS override / NoData override / bbox | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Sub-pixel sampling, band, spectral formulas | ✅ | ✅ (builder) | ✅ | — | — |
-| Quantiles | ✅ | ✅ (builder) | — | — | — |
-| Category remapping | ✅ | ✅ | — | — | — |
-| `min_majority_fraction` | ✅ | ✅ | ✅ | — | — |
+| Quantiles | ✅ | ✅ (builder) | ✅ | — | — |
+| Category remapping | ✅ | ✅ | ✅ | — | — |
+| `min_count`, `min_mean`, `max_mean`, `min_majority_fraction` | ✅ | ✅ | ✅ | — | — |
 | Column projection pushdown | ✅ | ✅ | ✅ | — | ✅ (`--columns`) |
 | Row-limit pushdown | — (DuckDB stops pulling) | ✅ | ✅ | — (SRF stops on `LIMIT`) | ✅ (`--limit`) |
-| Filter pushdown | named params | `FilterPredicate` | — (applied per batch) | — | — |
+| Filter pushdown | named params | `FilterPredicate` | Polars predicates on `count`, `mean`, `majority_fraction`, `resolution` | — | — |
 | Parquet / GeoParquet export | ✅ | — | ✅ | — | ✅ |
 | PMTiles v3 export | ✅ | — | ✅ | — | ✅ |
 | Partitioned scans (plan, scan, merge) | ✅ | ✅ (and SedonaDB SQL) | ✅ | — | ✅ (`plan`, `--partition`, `merge`) |

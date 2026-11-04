@@ -232,18 +232,10 @@ def test_min_majority_fraction_rejects_continuous(raster_h3, gradient_tif):
 
 @pytest.mark.parametrize("fraction", [-0.1, 1.5, float("nan")])
 def test_min_majority_fraction_range(raster_h3, classes_tif, fraction):
-    with pytest.raises(ValueError, match="min_majority_fraction must be between 0 and 1"):
+    with pytest.raises(ValueError, match="min_majority_fraction must be (between 0 and 1|finite)"):
         raster_h3.RasterH3ArrowStream(
             classes_tif, RES, categorical=True, min_majority_fraction=fraction
         ).to_dict()
-
-
-def test_min_majority_fraction_refuses_partitions(raster_h3, classes_tif):
-    spec = raster_h3.plan_partitions(classes_tif, target_chunks=1)[0]
-    with pytest.raises(RuntimeError, match="cannot be combined with a partition"):
-        raster_h3.RasterH3ArrowStream(
-            classes_tif, RES, categorical=True, partition=spec, min_majority_fraction=0.5
-        ).to_pyarrow()
 
 
 # -----------------------------------------------------------------------------

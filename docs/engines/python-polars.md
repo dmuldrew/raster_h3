@@ -73,14 +73,17 @@ raster_h3.raster_to_pmtiles("dem.tif", "dem.pmtiles", resolutions=[6, 7, 8])
 | `overlap_rule` | `str` | `None` (`"cutline"`) | Mosaic overlaps: `cutline`, `first` or `average` |
 | `min_majority_fraction` | `float` | `None` | Categorical only: drop cells whose majority class covers less than this fraction |
 | `spectral_formula` | `str` | `None` | Continuous only: `ndvi`, `ndwi`, `nbr` or `evi`, from `nir_band` (4), `red_band` (3), `green_band` (2), `blue_band` (1), `swir_band` (6) |
+| `quantiles` | `str \| Sequence` | `None` | Continuous only: quantile columns, e.g. `"p50,p90"`, `[0.05, 0.95]`, `"box"` |
+| `remap` | `str \| Mapping` | `None` | Categorical only: class remapping, e.g. `{range(11, 20): 1, "else": None}` |
+| `min_count`, `min_mean`, `max_mean` | `float` | `None` | Inclusive cell filters applied in the engine (`min_mean` / `max_mean` continuous only) |
 
 An invalid `resolutions`, `format`, `bbox`, `sampling`, `overlap_rule` or `spectral_formula`,
 or a `band` the raster does not have, raises `RuntimeError` (as does an invalid
 `resolutions` passed to the export functions) rather than being ignored or defaulted.
 
 Columns are the canonical core schemas (see the [overview](README.md#output-schemas)).
-Quantiles, remapping and the `min_count` / `min_mean` / `max_mean` filters are not exposed
-in Python; use DuckDB or the Rust APIs for those, or a Polars `filter` for the filters.
+Compaction, single-cell pushdown (`h3_cell`), resource budgets and the `geom` column are
+DuckDB-only; see the [fixed behaviour](../polars-api-reference.md#fixed-behaviour) table.
 
 ### `RasterH3ArrowStream`
 
@@ -110,7 +113,7 @@ returns a `LazyFrame` backed by an IO source; otherwise it returns the
 | :--- | :--- |
 | `with_columns` (projection) | Pushed into the engine as `columns` |
 | `n_rows` (slice) | Pushed into the engine as `limit` when there is no predicate; with a predicate it caps the rows that survive the filter instead |
-| `predicate` | Evaluated by Polars on each batch inside the source (not pushed into aggregation) |
+| `predicate` | Comparisons on `count` / `total_count`, `mean`, `majority_fraction` and `resolution` joined by `&` are pushed into the engine as `min_count`, `min_mean`, `max_mean`, `min_majority_fraction` and a narrower set of resolutions; Polars then applies the full predicate to each batch. See [Query optimisation](../polars-api-reference.md#query-optimisation) |
 | `batch_size` | Passed to `iter_batches` |
 
 The declared `LazyFrame` schema has no quantile columns, which matches the Python API
@@ -301,14 +304,16 @@ merged = raster_h3.merge_partials(partial_rows_from_all_partitions)  # pyarrow.T
 
 `merge_partials` accepts PyArrow tables or batches, lists of them, or anything exposing
 `__arrow_c_stream__`, and casts Spark's signed `h3_index` / `resolution` types. Pass the
-scans' `categorical` and `columns` so the merged rows have the same columns. With Spark,
+scans' `categorical`, `columns`, `quantiles` and filters (`min_count`, `min_mean`,
+`max_mean`, `min_majority_fraction`) so the merged rows have the same columns and pass the
+same filters; options that act on pixels (`remap`, `band`, `sampling`, ...) are already
+applied to the partial states. With Spark,
 scan one spec per task (`mapInArrow`), then `repartition("h3_index")` the partial rows and
 merge each group with `mapInArrow` as well.
 
 Partition specs carry a fingerprint of the raster layout (dimensions, chunking,
 georeferencing, bbox), so a worker that opens a raster with another layout refuses the spec.
-`limit`, `min_majority_fraction` and the long categorical format cannot be combined with a
-partition, and a
+`limit` and the long categorical format cannot be combined with a partition, and a
 projection must keep `h3_index` and `resolution`. Boundary rows are typically a few percent
 of the output and shrink as partitions grow; partitioning adds no measurable CPU (see
 [Partitioned scans](core.md#partitioned-scans)).
@@ -376,7 +381,7 @@ gdf = gpd.GeoDataFrame(
 | `scan_raster_h3` returns a `RasterH3ArrowStream`, not a `LazyFrame` | Polars is not installed or is too old to have `polars.io.plugins.register_io_source`. Install the `polars` extra. |
 | `RuntimeWarning: raster_h3: N valid sample(s) were dropped ...` from `raster_to_parquet` / `raster_to_pmtiles` / `scan_raster_h3` | Some valid pixels could not be placed because their coordinate transform failed or fell outside the valid latitude/longitude range. Check `crs`; see [transform-failure diagnostics](core.md#transform-failure-diagnostics). |
 | `RuntimeError: ... No CRS detected ...` | Pass `crs="EPSG:…"`. See the README's [Troubleshooting](../../README.md#troubleshooting--common-pitfalls). |
-| Need quantiles or remapping | Not exposed in Python. Use [DuckDB](duckdb.md) (for example via `duckdb` from Python) or the Rust [DataFusion](datafusion.md) / [Core](core.md) APIs. |
+| Need compaction or `h3_cell` pushdown | Not exposed in Python. Use [DuckDB](duckdb.md) (for example via `duckdb` from Python) or the Rust [DataFusion](datafusion.md) / [Core](core.md) APIs. |
 
 ## Native C ABI
 
@@ -392,7 +397,8 @@ return errors through an out-parameter string freed with `raster_h3_py_free_stri
 | `raster_h3_py_scan_json` | Whole scan as a JSON object of columns (`to_dict`) |
 | `raster_h3_py_plan_partitions`, `raster_h3_py_create_arrow_{schema,stream}_partitioned`, `raster_h3_py_open_batch_reader_partitioned` | Partition planning and partitioned scans (`partition=`) |
 | `raster_h3_py_merge_partials` | Merge partial rows; moves its input `ArrowArrayStream` |
-| `raster_h3_py_create_arrow_stream_v2`, `raster_h3_py_open_batch_reader_v2`, `raster_h3_py_scan_json_v2`, `raster_h3_py_plan_partitions_v2` | The scans above with an optional partition and an `options` JSON object (`band`, `sampling`, `overlap_rule`, `min_majority_fraction`, `spectral_formula`, `*_band`); unknown keys are rejected. Older symbols keep their signatures |
+| `raster_h3_py_create_arrow_stream_v2`, `raster_h3_py_open_batch_reader_v2`, `raster_h3_py_scan_json_v2`, `raster_h3_py_create_arrow_schema_v2`, `raster_h3_py_plan_partitions_v2`, `raster_h3_py_merge_partials_v2` | The calls above with an optional partition and an `options` JSON object (`band`, `sampling`, `overlap_rule`, `spectral_formula`, `*_band`, `quantiles`, `remap`, `min_count`, `min_mean`, `max_mean`, `min_majority_fraction`); unknown keys are rejected. Older symbols keep their signatures, and `raster_h3_py_merge_partials` applies no filters or quantiles |
+| `raster_h3_py_quantile_columns` | Output column names of a `quantiles` specification (JSON array) |
 | `raster_h3_py_parquet_to_pmtiles` | Parquet → PMTiles transcoding (returns `-1` on error) |
 | `raster_h3_py_h3_*` | Scalar helpers |
 | `raster_h3_py_export_parquet`, `raster_h3_py_export_pmtiles` | File exporters (return `-1` on error) |

@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
     plan_partitions, MultiCategoricalHorizonStreamer, MultiResolutionConfig,
-    MultiScanHorizonStreamer, ScanPartition, SpectralFormula,
+    MultiScanHorizonStreamer, QuantileTarget, ScanPartition, SpectralFormula,
 };
-use raster_h3_core::aggregator::SamplingPattern;
+use raster_h3_core::aggregator::{CategoryRemapper, SamplingPattern};
 use raster_h3_core::columnar::{
     merge_partial_batches, partitioned_output_schema, ArrowArrayStream, ArrowSchema,
     CategoricalBatchReader, CategoricalFormat, ColumnArray, ColumnSchema, ContinuousBatchReader,
@@ -68,6 +68,29 @@ pub struct PyScanConfig {
     pub min_majority_fraction: Option<f64>,
     /// Continuous only: aggregate a spectral index computed from several bands.
     pub spectral_formula: Option<SpectralFormula>,
+    /// Continuous only: streaming quantile columns appended to the output.
+    pub quantiles: Vec<QuantileTarget>,
+    /// Categorical only: class remapping applied to every sample.
+    pub remapper: Option<Arc<CategoryRemapper>>,
+    /// Drop cells with fewer samples (`count`, or `total_count` for categorical scans).
+    pub min_count: Option<f64>,
+    /// Continuous only: drop cells whose mean is below this value.
+    pub min_mean: Option<f64>,
+    /// Continuous only: drop cells whose mean is above this value.
+    pub max_mean: Option<f64>,
+}
+
+impl PyScanConfig {
+    /// Copy the options that shape aggregated cells (filters and quantiles) onto a core
+    /// config. Scans and `merge_partials` both use it, so merged boundary cells get the same
+    /// filters and quantile columns as the scans' interior cells.
+    fn apply_cell_options(&self, mr_cfg: &mut MultiResolutionConfig) {
+        mr_cfg.min_majority_fraction = self.min_majority_fraction;
+        mr_cfg.quantiles = self.quantiles.clone();
+        mr_cfg.min_count = self.min_count;
+        mr_cfg.min_mean = self.min_mean;
+        mr_cfg.max_mean = self.max_mean;
+    }
 }
 
 impl Default for PyScanConfig {
@@ -91,6 +114,11 @@ impl Default for PyScanConfig {
             overlap_rule: OverlapRule::Cutline,
             min_majority_fraction: None,
             spectral_formula: None,
+            quantiles: Vec::new(),
+            remapper: None,
+            min_count: None,
+            min_mean: None,
+            max_mean: None,
         }
     }
 }
@@ -119,7 +147,7 @@ impl PyRasterScanner {
 
     fn base_schema(&self) -> ColumnSchema {
         if !self.config.categorical {
-            ColumnSchema::continuous(&[])
+            ColumnSchema::continuous(&self.config.quantiles)
         } else {
             match self.config.format {
                 CategoricalFormat::Wide => ColumnSchema::categorical_wide(),
@@ -188,15 +216,6 @@ impl PyRasterScanner {
                     .into(),
             ));
         }
-        if self.config.min_majority_fraction.is_some() {
-            // `merge_partials` rebuilds the scan's filters from its own arguments, which do
-            // not carry this one, so merged boundary cells would escape it.
-            return Err(RasterH3Error::InvalidParameter(
-                "min_majority_fraction cannot be combined with a partition yet; filter the \
-                 merged result on majority_fraction instead"
-                    .into(),
-            ));
-        }
         Ok(())
     }
 
@@ -221,8 +240,9 @@ impl PyRasterScanner {
         mr_cfg.overlap_rule = self.config.overlap_rule;
         mr_cfg.band = self.config.band;
         mr_cfg.sampling = self.config.sampling.clone();
-        mr_cfg.min_majority_fraction = self.config.min_majority_fraction;
         mr_cfg.spectral_formula = self.config.spectral_formula;
+        mr_cfg.remapper = self.config.remapper.clone();
+        self.config.apply_cell_options(&mut mr_cfg);
         mr_cfg.strict_transforms = self.config.strict_transforms;
         mr_cfg.transform_failure_counter = self.config.transform_failure_counter.clone();
 
@@ -494,6 +514,11 @@ struct PyScanOptions {
     green_band: Option<i64>,
     blue_band: Option<i64>,
     swir_band: Option<i64>,
+    quantiles: Option<String>,
+    remap: Option<String>,
+    min_count: Option<f64>,
+    min_mean: Option<f64>,
+    max_mean: Option<f64>,
 }
 
 /// Names accepted for `sampling`, as in DuckDB's `sampling :=`.
@@ -529,6 +554,11 @@ fn parse_overlap_rule_strict(name: &str) -> Result<OverlapRule> {
             "Invalid overlap_rule '{name}': expected one of {OVERLAP_RULE_NAMES}"
         ))),
     }
+}
+
+/// Quantile targets in DuckDB's `quantiles :=` syntax (repeated targets are dropped).
+fn parse_quantiles(spec: &str) -> Result<Vec<QuantileTarget>> {
+    QuantileTarget::parse_list(spec)
 }
 
 /// A 1-indexed band number option, or `default` when unset.
@@ -572,6 +602,32 @@ fn apply_scan_options(cfg: &mut PyScanConfig, options: Option<&str>) -> Result<(
         }
         cfg.min_majority_fraction = Some(frac);
     }
+    if let Some(spec) = &opts.quantiles {
+        if cfg.categorical {
+            return Err(RasterH3Error::InvalidParameter(
+                "quantiles apply to continuous scans only".into(),
+            ));
+        }
+        cfg.quantiles = parse_quantiles(spec)?;
+    }
+    if let Some(spec) = &opts.remap {
+        if !cfg.categorical {
+            return Err(RasterH3Error::InvalidParameter(
+                "remap applies to categorical scans only".into(),
+            ));
+        }
+        cfg.remapper = Some(CategoryRemapper::parse(spec)?.into_arc());
+    }
+    cfg.min_count = opts.min_count;
+    for (name, value) in [("min_mean", opts.min_mean), ("max_mean", opts.max_mean)] {
+        if value.is_some() && cfg.categorical {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "{name} applies to continuous scans only"
+            )));
+        }
+    }
+    cfg.min_mean = opts.min_mean;
+    cfg.max_mean = opts.max_mean;
 
     let band_args = [
         opts.nir_band,
@@ -1236,10 +1292,29 @@ pub unsafe extern "C" fn raster_h3_py_merge_partials(
     columns: *const c_char,
     out_err: *mut *mut c_char,
 ) -> *mut ArrowArrayStream {
-    // SAFETY: `out_err` meets `set_c_err`'s contract and `columns` is null or NUL-terminated
-    // (caller contract). Non-null `input` is a valid stream that we take over with move
-    // semantics: the struct is copied out and the caller's copy loses its `release`, so it
-    // is released exactly once, by `owned`'s `Drop`.
+    // SAFETY: forwards the caller's arguments, which meet the `_v2` contract, with no options.
+    unsafe { raster_h3_py_merge_partials_v2(input, categorical, columns, ptr::null(), out_err) }
+}
+
+/// [`raster_h3_py_merge_partials`] with the scans' `options` JSON object (NULL for none), so
+/// merged cells get the same filters (`min_count`, `min_mean`, `max_mean`,
+/// `min_majority_fraction`) and quantile columns as the scans' final rows. Options that only
+/// affect reading pixels are validated and otherwise ignored.
+///
+/// # Safety
+/// As for [`raster_h3_py_merge_partials`]; `options` must be NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_merge_partials_v2(
+    input: *mut ArrowArrayStream,
+    categorical: c_int,
+    columns: *const c_char,
+    options: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowArrayStream {
+    // SAFETY: `out_err` meets `set_c_err`'s contract and `columns` / `options` are null or
+    // NUL-terminated (caller contract). Non-null `input` is a valid stream that we take over
+    // with move semantics: the struct is copied out and the caller's copy loses its
+    // `release`, so it is released exactly once, by `owned`'s `Drop`.
     unsafe {
         if input.is_null() {
             set_c_err(out_err, "input stream is NULL");
@@ -1250,7 +1325,7 @@ pub unsafe extern "C" fn raster_h3_py_merge_partials(
         ffi_call("merge_partials", out_err, move || {
             let (_, batches) = owned.collect_batches()?;
             drop(owned);
-            let cfg = build_py_scan_config(
+            let cfg = build_py_scan_config_v2(
                 c"merge".as_ptr(),
                 ptr::null(),
                 categorical,
@@ -1261,6 +1336,7 @@ pub unsafe extern "C" fn raster_h3_py_merge_partials(
                 ptr::null(),
                 columns,
                 -1,
+                options,
             )?;
             // Resolve `columns` as the partitioned scans did, so a listed `partial_state`
             // (always appended by those scans) is accepted rather than unknown.
@@ -1269,8 +1345,8 @@ pub unsafe extern "C" fn raster_h3_py_merge_partials(
                 ..cfg.clone()
             })
             .resolve_projection()?;
-            // The Python bindings expose no filters or quantiles, so the defaults match.
-            let config = MultiResolutionConfig::new(cfg.resolutions.clone());
+            let mut config = MultiResolutionConfig::new(cfg.resolutions.clone());
+            cfg.apply_cell_options(&mut config);
             let (schema, merged) = merge_partial_batches(
                 &batches,
                 cfg.categorical,
@@ -2056,6 +2132,76 @@ pub unsafe extern "C" fn raster_h3_py_plan_partitions_v2(
                 MosaicReader::open(&paths, cfg.bbox, cfg.crs.as_deref(), cfg.overlap_rule)?;
             let plan = plan_partitions(&mosaic, target)?;
             let json = serde_json::to_string(&plan)
+                .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+            Ok(CString::new(json).unwrap_or_default().into_raw())
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// [`raster_h3_py_create_arrow_schema`] honouring the `options` JSON object (quantile
+/// columns change the schema); `partitioned` non-zero adds the `partial_state` column.
+///
+/// # Safety
+/// Pointer arguments must be valid NUL-terminated C strings or NULL; `out_err` must be
+/// NULL or a writable `char **`. Free the result with `raster_h3_py_free_arrow_schema`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_create_arrow_schema_v2(
+    categorical: c_int,
+    format: *const c_char,
+    columns: *const c_char,
+    partitioned: c_int,
+    options: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut ArrowSchema {
+    // SAFETY: the C string arguments are null or NUL-terminated and `out_err` is null or a
+    // writable `char **` (caller contract).
+    unsafe {
+        ffi_call("create_arrow_schema_v2", out_err, || {
+            let mut cfg = build_py_scan_config_v2(
+                c"schema".as_ptr(),
+                ptr::null(),
+                categorical,
+                format,
+                ptr::null(),
+                0,
+                0.0,
+                ptr::null(),
+                columns,
+                -1,
+                options,
+            )?;
+            if partitioned != 0 {
+                // The schema does not depend on which partition is scanned.
+                cfg.partition = Some(placeholder_partition());
+            }
+            Ok(Box::into_raw(Box::new(ArrowSchema::from_column_schema(
+                &*PyRasterScanner::new(cfg).schema()?,
+            ))))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// The output column names of a `quantiles` specification, as a JSON array of strings, in
+/// output order. Free the string with `raster_h3_py_free_string`.
+///
+/// # Safety
+/// `spec` must be NULL or NUL-terminated; `out_err` must be NULL or a writable `char **`.
+#[no_mangle]
+pub unsafe extern "C" fn raster_h3_py_quantile_columns(
+    spec: *const c_char,
+    out_err: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: `spec` is null or NUL-terminated and `out_err` null or writable (caller contract).
+    unsafe {
+        ffi_call("quantile_columns", out_err, || {
+            let targets = match opt_cstr(spec) {
+                Some(spec) => parse_quantiles(&spec)?,
+                None => Vec::new(),
+            };
+            let names: Vec<&str> = targets.iter().map(QuantileTarget::column_name).collect();
+            let json = serde_json::to_string(&names)
                 .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
             Ok(CString::new(json).unwrap_or_default().into_raw())
         })
