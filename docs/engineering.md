@@ -38,6 +38,17 @@ limit, compaction output is deterministic and its memory is unbounded. Decoded c
 separate budget (`decode_budget_bytes`, default 256 MiB). Output and runtime
 overhead also use RAM.
 
+Each resolution's horizon map may use a quarter of the aggregation budget divided by
+the number of resolutions before it spills. Cells are evicted between batches, so a
+map holds at least one batch of cells. A batch is about two waves of worker windows
+(`2 × workers × worker window pixels`), but never less than one chunk (a strip or
+tile). At resolutions where cells are about as small as pixels, that is roughly one
+chunk's pixels times ~230 bytes for continuous statistics (more with quantiles or
+categories). For example, a 4096-pixel-wide raster stored in 64-row strips holds about
+230,000 resolution-11 cells (~53 MiB) per batch. So it needs an aggregation budget of
+about 212 MiB for one such resolution, or 640 MiB for three, to stay in memory; under
+the 64 MiB default it spills. Spilling is always correct, only slower.
+
 ## 2. Sequential H3 Spans & In-Register Run Accumulation
 Every candidate pixel center is indexed directly. Consecutive equal-cell pixels
 share accumulation work. The first differing cell is reused by the next run;

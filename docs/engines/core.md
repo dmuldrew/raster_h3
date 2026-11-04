@@ -62,6 +62,11 @@ resolutions, so a fine resolution can spill while a coarse one stays in memory. 
 resolution has spilled, the eviction horizon stops advancing: cells of in-memory
 resolutions south of it are held until EOF and then emitted from memory, never from runs.
 
+A horizon map holds at least one batch of cells, and a batch is never smaller than one
+chunk, so fine resolutions over wide strips or large tiles can need more than the
+64 MiB default. See [budget sizing](../engineering.md#1-southernmost-scan-line-horizon-eviction)
+for an estimate.
+
 ### Transform-failure diagnostics
 
 `transform_failures()` on both streamers and both batch readers counts valid sample points
