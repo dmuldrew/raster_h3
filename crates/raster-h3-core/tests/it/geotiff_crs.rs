@@ -13,13 +13,10 @@ use tiff::tags::Tag;
 
 const ALBERS_WKT: &str = r#"PROJCS["Albers_Conic_Equal_Area",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-96.0],PARAMETER["Standard_Parallel_1",29.5],PARAMETER["Standard_Parallel_2",45.5],PARAMETER["Latitude_Of_Origin",23.0],UNIT["Meter",1.0]]"#;
 
-/// GDAL writes user-defined ESRI projections as a citation of the form
-/// `ESRI PE String = PROJCS[...]|` in GeoAsciiParamsTag.
-#[test]
-fn esri_pe_string_citation_is_detected_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("esri_pe.tif");
-    let citation = format!("ESRI PE String = {ALBERS_WKT}|");
+/// Write a 4x4 projected GeoTIFF whose user-defined CRS is given only by a
+/// GDAL-style `ESRI PE String = PROJCS[...]|` citation in GeoAsciiParamsTag.
+fn write_esri_pe_geotiff(path: &std::path::Path, wkt: &str) {
+    let citation = format!("ESRI PE String = {wkt}|");
     // ModelTypeProjected, user-defined ProjectedCRS, citation in GeoAsciiParams.
     let geokeys: [u16; 16] = [
         1,
@@ -39,22 +36,29 @@ fn esri_pe_string_citation_is_detected_on_open() {
         1,
         32767,
     ];
-    {
-        let mut encoder = TiffEncoder::new(BufWriter::new(File::create(&path).unwrap())).unwrap();
-        let mut image = encoder.new_image::<colortype::Gray32Float>(4, 4).unwrap();
-        let enc = image.encoder();
-        enc.write_tag(
-            Tag::ModelTiepointTag,
-            &[0.0, 0.0, 0.0, 1_500_000.0, 1_900_000.0, 0.0][..],
-        )
+    let mut encoder = TiffEncoder::new(BufWriter::new(File::create(path).unwrap())).unwrap();
+    let mut image = encoder.new_image::<colortype::Gray32Float>(4, 4).unwrap();
+    let enc = image.encoder();
+    enc.write_tag(
+        Tag::ModelTiepointTag,
+        &[0.0, 0.0, 0.0, 1_500_000.0, 1_900_000.0, 0.0][..],
+    )
+    .unwrap();
+    enc.write_tag(Tag::ModelPixelScaleTag, &[30.0, 30.0, 0.0][..])
         .unwrap();
-        enc.write_tag(Tag::ModelPixelScaleTag, &[30.0, 30.0, 0.0][..])
-            .unwrap();
-        enc.write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
-        enc.write_tag(Tag::Unknown(34737), citation.as_str())
-            .unwrap();
-        image.write_data(&[1.0f32; 16]).unwrap();
-    }
+    enc.write_tag(Tag::Unknown(34735), &geokeys[..]).unwrap();
+    enc.write_tag(Tag::Unknown(34737), citation.as_str())
+        .unwrap();
+    image.write_data(&[1.0f32; 16]).unwrap();
+}
+
+/// GDAL writes user-defined ESRI projections as a citation of the form
+/// `ESRI PE String = PROJCS[...]|` in GeoAsciiParamsTag.
+#[test]
+fn esri_pe_string_citation_is_detected_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("esri_pe.tif");
+    write_esri_pe_geotiff(&path, ALBERS_WKT);
 
     let reader = GeoTiffStreamReader::open(&path).unwrap();
     assert_eq!(reader.metadata.epsg, None);
@@ -74,6 +78,36 @@ fn esri_pe_string_citation_is_detected_on_open() {
         ref5070.transform_point(1_500_000.0, 1_900_000.0).unwrap(),
     );
     assert!((a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
+}
+
+/// A nonzero TOWGS84 shift cannot be carried by `+datum=NAD83`, so the CRS
+/// is reported as undetected and hexification requires an explicit CRS; an
+/// all-zero shift, as GDAL commonly writes, is still detected.
+#[test]
+fn esri_pe_citation_with_datum_shift_is_not_detected() {
+    let spheroid = r#"SPHEROID["GRS_1980",6378137.0,298.257222101]"#;
+    let with = |towgs84: &str| ALBERS_WKT.replace(spheroid, &format!("{spheroid},{towgs84}"));
+    let dir = tempfile::tempdir().unwrap();
+
+    let zero = dir.path().join("zero_shift.tif");
+    write_esri_pe_geotiff(&zero, &with("TOWGS84[0,0,0,0,0,0,0]"));
+    let reader = GeoTiffStreamReader::open(&zero).unwrap();
+    assert!(reader
+        .metadata
+        .proj_string
+        .as_deref()
+        .is_some_and(|p| p.contains("+datum=NAD83")));
+
+    let shifted = dir.path().join("shifted.tif");
+    write_esri_pe_geotiff(&shifted, &with("TOWGS84[1,2,3]"));
+    let reader = GeoTiffStreamReader::open(&shifted).unwrap();
+    assert_eq!(reader.metadata.epsg, None);
+    assert_eq!(reader.metadata.proj_string, None);
+    match MultiScanHorizonStreamer::new(reader, &MultiResolutionConfig::single(4)) {
+        Err(RasterH3Error::CrsNotDetected(_)) => {}
+        Err(e) => panic!("expected CrsNotDetected, got {e:?}"),
+        Ok(_) => panic!("expected CrsNotDetected for a shifted datum"),
+    }
 }
 
 #[test]
