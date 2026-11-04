@@ -111,7 +111,7 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
-**What's different in DuckDB:** it has the most scan options (sub-pixel sampling, band
+DuckDB has the most scan options (sub-pixel sampling, band
 selection, spectral formulas, quantiles, category remapping) and exports straight to Parquet or
 PMTiles with `COPY ... TO`. Saving `canopy_h3` as a table means the raster is read once and
 reused by later queries. A `WHERE` clause runs only after every hexagon is computed; to read
@@ -160,7 +160,7 @@ result = (
 )
 ```
 
-**What's different in Polars:** the raster is a `LazyFrame`, read only when `.collect()` runs,
+In Polars, the raster is a `LazyFrame`, read only when `.collect()` runs,
 and it combines freely with other Polars and GeoPandas data. `columns=` limits the work to the
 columns you ask for, but `.filter()` runs after every hexagon is computed; pass
 `bbox=tracts.total_bounds` to read less of the raster. Sampling, band selection, spectral
@@ -220,7 +220,7 @@ result = sd.sql("""
 """).to_pandas()
 ```
 
-**What's different in SedonaDB:** the tracts don't need converting to hexagons; the join
+In SedonaDB, the tracts don't need converting to hexagons; the join
 matches hexagon shapes to tract shapes directly. It is also the only one of the three that reads
 the `WHERE` clause to skip raster: a condition against a fixed shape, such as
 `ST_Intersects(wkb, ST_GeomFromWKT(...))`, limits the scan to the tiles near it, and
