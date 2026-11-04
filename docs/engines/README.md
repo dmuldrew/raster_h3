@@ -51,15 +51,17 @@ keep working. `cargo build --release` at the root still produces
 | Categorical aggregation (long) | ✅ | ✅ | ✅ | — | ✅ |
 | Multiple resolutions per scan | ✅ | ✅ | ✅ | — (one `h3_res`) | ✅ |
 | CRS override / NoData override / bbox | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Sub-pixel sampling, band, spectral formulas, quantiles | ✅ | ✅ (builder) | — | — | — |
-| Category remapping, `min_majority_fraction` | ✅ | ✅ | — | — | — |
+| Sub-pixel sampling, band, spectral formulas | ✅ | ✅ (builder) | ✅ | — | — |
+| Quantiles | ✅ | ✅ (builder) | ✅ | — | — |
+| Category remapping | ✅ | ✅ | ✅ | — | — |
+| `min_count`, `min_mean`, `max_mean`, `min_majority_fraction` | ✅ | ✅ | ✅ | — | — |
 | Column projection pushdown | ✅ | ✅ | ✅ | — | ✅ (`--columns`) |
 | Row-limit pushdown | — (DuckDB stops pulling) | ✅ | ✅ | — (SRF stops on `LIMIT`) | ✅ (`--limit`) |
-| Filter pushdown | named params | `FilterPredicate` | — (applied per batch) | — | — |
+| Filter pushdown | named params | `FilterPredicate` | Polars predicates on `count`, `mean`, `majority_fraction`, `resolution` | — | — |
 | Parquet / GeoParquet export | ✅ | — | ✅ | — | ✅ |
-| PMTiles v3 export | ✅ | — | ✅ | — | ✅ |
+| PMTiles v3 export | ✅ | ✅ (SedonaDB / DataFusion `COPY ... TO '*.pmtiles'` from any query) | ✅ | — | ✅ |
 | Partitioned scans (plan, scan, merge) | ✅ | ✅ (and SedonaDB SQL) | ✅ | — | ✅ (`plan`, `--partition`, `merge`) |
-| Parquet → PMTiles transcoding | ✅ | — | — | — | — |
+| Parquet → PMTiles transcoding | ✅ | — | ✅ (`parquet_to_pmtiles`) | — | ✅ (`parquet-to-pmtiles`) |
 | H3 scalar helpers | ✅ | ✅ (vectorized) | ✅ | ✅ | — |
 | Output transport | DuckDB `DataChunk` | `RecordBatch` / `ArrowArrayStream` | Arrow PyCapsule | heap tuples (value-per-call SRF) | `RH3IPC01` / NDJSON / files |
 
@@ -76,12 +78,13 @@ Each deep dive has a recipes section covering the same tasks. The core calls, si
 | Band scale/offset | `scale_offset := false` opts out | always applied | always applied | `--raw-values` opts out | `with_scale_offset(false)` opts out |
 | Fail on dropped samples | `strict_transforms := true` | `strict_transforms=True` | — (`WARNING` only) | — (stderr warning only) | `with_strict_transforms(true)` |
 | GeoParquet export | `h3_raster_to_parquet(...)` | `raster_to_parquet(...)` | — (`COPY` to CSV) | `raster-h3-cli parquet ... -o` | — (core `H3ParquetWriter`) |
-| PMTiles export | `h3_raster_to_pmtiles(...)` | `raster_to_pmtiles(...)` | — | `raster-h3-cli pmtiles ... -o` | — (core `H3PmtilesTiler`) |
+| PMTiles export | `h3_raster_to_pmtiles(...)` | `raster_to_pmtiles(...)` | — | `raster-h3-cli pmtiles ... -o` | `COPY (query) TO 'out.pmtiles'` (`raster-h3-sedona`) |
+| Parquet → PMTiles | `h3_parquet_to_pmtiles(...)` | `parquet_to_pmtiles(...)` | — | `raster-h3-cli parquet-to-pmtiles ... -o` | — (core `process_parquet_to_pmtiles`) |
 | Recipes | [DuckDB](duckdb.md#sql-usage--recipes) | [Python](python-polars.md#recipes) | [PostgreSQL](postgresql.md#recipes) | [CLI](cli.md#recipes) | [DataFusion](datafusion.md#recipes) |
 
 Mosaics (globs, comma-separated lists, VRT) are accepted by every adapter through
-`resolve_raster_sources`. DuckDB exposes the `overlap_rule` choice; DataFusion exposes it via
-`with_overlap_rule`; Python, PostgreSQL and the CLI always use `cutline`.
+`resolve_raster_sources`. DuckDB and Python expose the `overlap_rule` choice; DataFusion
+exposes it via `with_overlap_rule`; PostgreSQL and the CLI always use `cutline`.
 
 ## Shared Semantics
 

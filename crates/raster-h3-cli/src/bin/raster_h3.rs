@@ -1,6 +1,7 @@
 //! Unified `raster-h3-cli` executable supporting `ipc` (Arrow/Columnar IPC to stdout or file),
 //! `jsonl` (`JSONEachRow` to stdout for ClickHouse executable table functions),
-//! `parquet`, and `pmtiles` exports, plus `plan` / `merge` for partitioned scans.
+//! `parquet`, and `pmtiles` exports, `parquet-to-pmtiles` transcoding, plus `plan` / `merge`
+//! for partitioned scans.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -8,8 +9,8 @@ use std::path::Path;
 
 use raster_h3_cli::{
     export_raster_to_parquet, export_raster_to_pmtiles, merge_partition_files, parse_merge_args,
-    parse_plan_args, parse_stream_args, plan_raster_partitions, stream_raster_to_writer,
-    write_plan, StreamOutputFormat,
+    parse_parquet_to_pmtiles_args, parse_plan_args, parse_stream_args, plan_raster_partitions,
+    stream_raster_to_writer, transcode_parquet_to_pmtiles, write_plan, StreamOutputFormat,
 };
 use raster_h3_core::error::Result;
 
@@ -29,6 +30,7 @@ fn print_help() {
           raster-h3-cli jsonl <input.tif> [options]      Stream JSONEachRow (NDJSON) to stdout or -o <file>\n  \
           raster-h3-cli parquet <input.tif> -o <out>     Export directly to Parquet / GeoParquet\n  \
           raster-h3-cli pmtiles <input.tif> -o <out>     Export directly to PMTiles v3 archive\n  \
+          raster-h3-cli parquet-to-pmtiles <in.parquet> -o <out>  Transcode H3-indexed Parquet to PMTiles v3\n  \
           raster-h3-cli plan <input.tif> [options]       Print partition specs (JSON Lines) for parallel scans\n  \
           raster-h3-cli merge <part.rh3>... [-o <out>]   Combine partitioned `ipc` outputs into final cells\n\n\
         Options:\n  \
@@ -41,7 +43,9 @@ fn print_help() {
           --bbox <minx,miny,maxx,maxy> WGS84 bounding box filter\n  \
           --columns <col1,col2,...>  Column projection pushdown\n  \
           --limit <N>                Maximum number of rows to emit\n  \
-          -o, --output <PATH|->      Output file path (default: '-' for stdout on ipc/jsonl/plan/merge)\n\n\
+          -o, --output <PATH|->      Output file path (default: '-' for stdout on ipc/jsonl/plan/merge)\n  \
+          --h3-column <NAME>         parquet-to-pmtiles: H3 column, integer or hex (default: h3_index,\n  \
+          \x20                          h3_hex, h3, cell or hex, whichever comes first)\n\n\
         Partitioned scans (shell fan-out; plan and scan with the same --crs and --bbox):\n  \
           plan --target-chunks <N>       TIFF tiles/strips per partition (default: 256)\n  \
           ipc --partition <SPEC|@FILE>   Scan one partition (adds a partial_state column)\n  \
@@ -132,6 +136,20 @@ fn main() {
                 opts.bbox,
                 opts.apply_scale_offset,
             )
+        }),
+        "parquet-to-pmtiles" => parse_parquet_to_pmtiles_args(rest).and_then(|args| {
+            let summary = transcode_parquet_to_pmtiles(
+                Path::new(&args.input_path),
+                Path::new(&args.output_path),
+                args.h3_column.as_deref(),
+            )?;
+            if summary.invalid_features_dropped > 0 {
+                eprintln!(
+                    "raster-h3-cli: skipped {} of {} rows whose H3 value was null or not a valid cell",
+                    summary.invalid_features_dropped, summary.total_features
+                );
+            }
+            Ok(summary.valid_features)
         }),
         other => {
             eprintln!("Unknown subcommand: '{}'", other);

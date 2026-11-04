@@ -48,6 +48,30 @@ type CellMaps<A> = Vec<HashMap<u64, A, H3BuildHasher>>;
 /// Per resolution, `(cell, compute_cell_south_lat(cell))` in map order.
 type SouthKeys = Vec<Vec<(u64, f64)>>;
 
+/// Refuse a `band` (or spectral formula band) that some mosaic tile does not have. The
+/// sample kernels index pixels by band without a bounds check that fails the scan, so an
+/// out-of-range band would otherwise read another band's values.
+fn check_bands_exist(mosaic: &MosaicReader, config: &MultiResolutionConfig) -> Result<()> {
+    let bands = match &config.spectral_formula {
+        Some(formula) => formula.bands(),
+        None => vec![config.band],
+    };
+    for tile in &mosaic.tiles {
+        let available = usize::from(tile.reader.metadata.samples_per_pixel.max(1));
+        if let Some(&band) = bands.iter().find(|&&b| b == 0 || b > available) {
+            let what = if config.spectral_formula.is_some() {
+                "spectral formula band"
+            } else {
+                "band"
+            };
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "{what} {band} does not exist: the raster has {available} band(s), numbered from 1"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Dedicated aggregation pool of `threads` workers, shared by all live
 /// streams requesting the same size so concurrent queries do not each spawn
 /// their own threads.
@@ -234,6 +258,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         kernel: K,
     ) -> Result<Self> {
         config.validate()?;
+        check_bands_exist(&mosaic, config)?;
         let should_compact = config.should_compact_h3_children();
         // A partition streams only its own chunks; cells that chunks outside it may also
         // reach are classified against the full mosaic's chunk list.

@@ -249,3 +249,75 @@ def test_invalid_arguments():
         RasterH3Table.continuous("x.tif", 16)
     with pytest.raises(ValueError):
         RasterH3Table.continuous("/nonexistent/raster.tif", 8)
+
+
+# -----------------------------------------------------------------------------
+# write_pmtiles
+# -----------------------------------------------------------------------------
+
+
+def pmtiles_metadata(path):
+    """The archive's JSON metadata (gzipped after the root directory)."""
+    import gzip
+    import json
+
+    data = path.read_bytes()
+    assert data[:7] == b"PMTiles" and data[7] == 3
+    offset, length = struct.unpack_from("<QQ", data, 24)
+    return json.loads(gzip.decompress(data[offset : offset + length]))
+
+
+def test_write_pmtiles_from_a_sedonadb_query(sd, raster, tmp_path):
+    sd.create_data_frame(RasterH3Table.continuous(raster, [7, 8])).to_view("cells")
+    query = "SELECT h3_index, mean, count, resolution, wkb FROM cells WHERE count >= 4"
+    expected = scalar(sd, f"SELECT COUNT(*) FROM ({query})")
+    out = tmp_path / "cells.pmtiles"
+    assert raster_h3_sedona.write_pmtiles(sd.sql(query), out) == expected > 0
+
+    meta = pmtiles_metadata(out)
+    fields = meta["vector_layers"][0]["fields"]
+    assert fields["mean"] == "Number" and fields["count"] == "Number"
+    # The geometry column is not a property: each feature already is the cell polygon.
+    assert "wkb" not in fields
+
+    # Only resolution 8's zoom.
+    z8 = meta["maxzoom"]
+    only8 = tmp_path / "res8.pmtiles"
+    written = raster_h3_sedona.write_pmtiles(sd.sql(query), str(only8), min_zoom=z8, memory_budget_mb=1)
+    assert written == scalar(sd, f"SELECT COUNT(*) FROM ({query}) WHERE resolution = 8")
+
+
+def test_write_pmtiles_from_arrow_and_hex_columns(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    table = pa.table(
+        {
+            "name": ["a", "b", "c"],
+            "cell_id": ["8828308281fffff", None, "8828308283fffff"],
+            "value": pa.array([1.5, 2.5, None]),
+        }
+    )
+    out = tmp_path / "hex.pmtiles"
+    assert raster_h3_sedona.write_pmtiles(table, out, h3_column="cell_id") == 2
+    fields = pmtiles_metadata(out)["vector_layers"][0]["fields"]
+    assert fields["name"] == "String" and fields["value"] == "Number"
+
+    signed = pa.table({"h3_index": pa.array([613196570331971583], pa.int64())})
+    assert raster_h3_sedona.write_pmtiles(signed, tmp_path / "signed.pmtiles") == 1
+
+
+def test_write_pmtiles_errors(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    out = tmp_path / "x.pmtiles"
+    with pytest.raises(TypeError, match="__arrow_c_stream__"):
+        raster_h3_sedona.write_pmtiles([1, 2, 3], out)
+    with pytest.raises(ValueError, match="42 is not a valid H3 cell"):
+        raster_h3_sedona.write_pmtiles(pa.table({"h3_index": pa.array([42], pa.uint64())}), out)
+    with pytest.raises(ValueError, match="h3_column 'nope' not found"):
+        raster_h3_sedona.write_pmtiles(pa.table({"h3_index": pa.array([42], pa.uint64())}), out, h3_column="nope")
+    with pytest.raises(ValueError, match="has type Float64"):
+        raster_h3_sedona.write_pmtiles(pa.table({"mean": [1.0]}), out)
+    with pytest.raises(ValueError, match="must not be greater than max_zoom"):
+        raster_h3_sedona.write_pmtiles(pa.table({"h3_index": pa.array([42], pa.uint64())}), out, min_zoom=9, max_zoom=3)
+    with pytest.raises(ValueError, match="memory_budget_mb"):
+        raster_h3_sedona.write_pmtiles(pa.table({"h3_index": pa.array([42], pa.uint64())}), out, memory_budget_mb=0)
+    assert not out.exists(), "a failed write must not leave an archive"

@@ -14,6 +14,7 @@ pc = pytest.importorskip("pyarrow.compute")
 from conftest import class_value, gradient_value, write_geotiff  # noqa: E402
 
 RESOLUTIONS = [8, 9]
+MERGE_OPTIONS = ("quantiles", "min_count", "min_mean", "max_mean", "min_majority_fraction")
 
 
 @pytest.fixture(scope="module")
@@ -44,10 +45,14 @@ def run_partitioned(raster_h3, path, target_chunks, **kwargs):
         is_partial = pc.is_valid(table.column(raster_h3.PARTIAL_STATE_COLUMN))
         finals.append(table.filter(pc.invert(is_partial)).drop([raster_h3.PARTIAL_STATE_COLUMN]))
         partials.append(table.filter(is_partial))
+    # The merge must see the scans' cell options; the pixel options (remap, band, ...) are
+    # already applied to the partial states.
+    merge_options = {k: kwargs[k] for k in MERGE_OPTIONS if k in kwargs}
     merged = raster_h3.merge_partials(
         partials,
         categorical=kwargs.get("categorical", False),
         columns=kwargs.get("columns"),
+        **merge_options,
     )
     combined = sort(pa.concat_tables(finals + [merged]))
     return combined, len(plan), sum(p.num_rows for p in partials)
@@ -165,3 +170,52 @@ def test_misuse_raises(raster_h3, striped_gradient, striped_classes, tmp_path):
         raster_h3.merge_partials(table)  # includes final rows
     with pytest.raises(ValueError, match="missing"):
         raster_h3.merge_partials(table.drop(["partial_state"]))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"quantiles": "p10,median,iqr"},
+        {"min_count": 30.0, "min_mean": 6.0, "max_mean": 12.0},
+        {"quantiles": [0.9], "min_count": 20.0, "columns": ["h3_index", "resolution", "p90"]},
+    ],
+    ids=["quantiles", "filters", "quantiles-filters-projection"],
+)
+def test_continuous_options_survive_the_merge(raster_h3, striped_gradient, options):
+    single = sort(pa.table(raster_h3.RasterH3ArrowStream(striped_gradient, RESOLUTIONS, **options)))
+    combined, partitions, partials = run_partitioned(raster_h3, striped_gradient, 4, **options)
+    assert partitions > 1 and partials > 0
+    assert_tables_match(single, combined)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"min_majority_fraction": 0.6}, {"remap": {1: 10, 2: 10, "else": None}}, {"min_count": 40.0}],
+    ids=["majority", "remap", "min_count"],
+)
+def test_categorical_options_survive_the_merge(raster_h3, striped_classes, options):
+    single = sort(
+        pa.table(
+            raster_h3.RasterH3ArrowStream(striped_classes, RESOLUTIONS, categorical=True, **options)
+        )
+    )
+    combined, partitions, partials = run_partitioned(
+        raster_h3, striped_classes, 3, categorical=True, **options
+    )
+    assert partitions > 1 and partials > 0
+    assert_tables_match(single, combined)
+
+
+def test_merge_without_the_scans_filters_keeps_merged_cells(raster_h3, striped_gradient):
+    """The filters are applied to merged cells only when passed to `merge_partials` too."""
+    plan = raster_h3.plan_partitions(striped_gradient, target_chunks=4)
+    partials = []
+    for spec in plan:
+        table = pa.table(
+            raster_h3.RasterH3ArrowStream(striped_gradient, RESOLUTIONS, partition=spec, min_count=1e9)
+        )
+        partials.append(table.filter(pc.is_valid(table.column(raster_h3.PARTIAL_STATE_COLUMN))))
+        # No interior cell has a billion samples.
+        assert table.filter(pc.is_null(table.column(raster_h3.PARTIAL_STATE_COLUMN))).num_rows == 0
+    assert raster_h3.merge_partials(partials, min_count=1e9).num_rows == 0
+    assert raster_h3.merge_partials(partials).num_rows > 0
