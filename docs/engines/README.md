@@ -58,7 +58,7 @@ keep working. `cargo build --release` at the root still produces
 | Filter pushdown | named params | `FilterPredicate` | — (applied per batch) | — | — |
 | Parquet / GeoParquet export | ✅ | — | ✅ | — | ✅ |
 | PMTiles v3 export | ✅ | — | ✅ | — | ✅ |
-| Partitioned scans (plan, scan, merge) | ✅ | ✅ (and SedonaDB SQL) | ✅ | — | — |
+| Partitioned scans (plan, scan, merge) | ✅ | ✅ (and SedonaDB SQL) | ✅ | — | ✅ (`plan`, `--partition`, `merge`) |
 | Parquet → PMTiles transcoding | ✅ | — | — | — | — |
 | H3 scalar helpers | ✅ | ✅ (vectorized) | ✅ | ✅ | — |
 | Output transport | DuckDB `DataChunk` | `RecordBatch` / `ArrowArrayStream` | Arrow PyCapsule | heap tuples (value-per-call SRF) | `RH3IPC01` / NDJSON / files |

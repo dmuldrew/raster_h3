@@ -4,3 +4,4 @@
 mod helpers;
 
 mod binary;
+mod partitions;
