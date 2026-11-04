@@ -390,3 +390,42 @@ fn test_dedicated_pool_under_shared_mutex_does_not_deadlock() -> Result<()> {
     assert_eq!(counts.iter().sum::<f64>(), 2.0 * 256.0 * 256.0);
     Ok(())
 }
+
+/// The workers precompute the eviction key of every cell the serial merge
+/// inserts, so the merge never computes one itself, and the output still
+/// matches a single-worker run cell for cell.
+#[test]
+fn test_workers_precompute_every_eviction_key() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("eviction_keys.tif");
+    helpers::create_temp_geotiff(&path, 512, 512, CompressionMethod::None)?;
+    let mut config = MultiResolutionConfig::new(vec![6, 8, 10]);
+    config.aggregation_workers = Some(1);
+    let mut streamer = MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path)?, &config)?;
+    let mut reference = HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(128)? {
+            reference.insert(record.h3_index, record.accumulator);
+        }
+    }
+    assert_eq!(streamer.metrics().eviction_key_fallbacks, 0);
+
+    config.aggregation_workers = Some(4);
+    let mut streamer = MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path)?, &config)?;
+    let mut map = HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(128)? {
+            assert!(map.insert(record.h3_index, record.accumulator).is_none());
+        }
+    }
+    assert_eq!(streamer.metrics().eviction_key_fallbacks, 0);
+    assert!(streamer.metrics().jobs > 1);
+    assert_eq!(map.len(), reference.len());
+    for (k, v) in &reference {
+        let o = &map[k];
+        assert_eq!(v.count, o.count);
+        assert!((v.sum - o.sum).abs() <= 1e-9 * v.sum.abs().max(1.0));
+        assert_eq!((v.min, v.max), (o.min, o.max));
+    }
+    Ok(())
+}

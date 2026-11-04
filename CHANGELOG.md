@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Horizon eviction keys (`compute_cell_south_lat`, a cell-boundary computation of ~584 ns) are now computed in the parallel aggregation workers instead of on the serial merge thread. Keys and output are unchanged. At resolution 11 with 4 workers the merge drops from 12.1 s to 2.0 s and the stream from 18.0 s to 10.6 s; see `docs/worker-scaling.md`. `StreamProfile::eviction_key_fallbacks` counts keys the merge still had to compute itself (normally 0).
+
 ### Added
 
 - `worker_scaling` example and `profile.yml` job: wall, kernel, merge and spill time for six workloads at 1/2/4/8 aggregation workers, with output-equality checks (`--budget-mb`, `--only`, `--quick`). Results and the decision not to parallelise the merge yet are in `docs/worker-scaling.md`: the serial merge's main cost is computing each new cell's eviction latitude (~584 ns per cell). `metrics()` on `MultiCategoricalHorizonStreamer`.

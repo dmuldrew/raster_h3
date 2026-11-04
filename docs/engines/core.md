@@ -125,6 +125,7 @@ collected even without `stream-profile`:
 | `waves` | Non-empty kernel dispatches, each containing up to `worker_tasks` window jobs (`jobs` counts the individual jobs). |
 | `bridged_waves` | Waves sent to a dedicated aggregation pool via a newly spawned helper OS thread because the caller is a worker of another Rayon pool. |
 | `serial_waves` | Waves executed serially on the caller: it is already a worker of the dedicated pool, or is a Rayon worker with no dedicated pool. |
+| `eviction_key_fallbacks` | New horizon-map cells whose eviction key the serial merge computed itself because the workers had not precomputed it. Normally 0. |
 
 Direct non-Rayon callers dispatch in parallel using the dedicated pool when
 configured, otherwise the ambient global pool; neither subtype counter increases.

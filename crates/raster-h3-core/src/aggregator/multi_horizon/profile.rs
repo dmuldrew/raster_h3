@@ -167,6 +167,9 @@ pub struct StreamProfile {
     /// Waves run serially on the calling thread: the caller was already a
     /// worker of the dedicated pool, or a Rayon worker with no dedicated pool.
     pub serial_waves: u64,
+    /// New horizon-map cells whose eviction key the merge computed itself
+    /// because the parallel workers had not precomputed it (normally 0).
+    pub eviction_key_fallbacks: u64,
     pub worker_map_sets: u64,
     pub peak_worker_bytes: usize,
     pub decoded_bytes: u64,
