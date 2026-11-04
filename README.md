@@ -211,14 +211,11 @@ result = sd.sql("""
 """).to_pandas()
 ```
 
-Unlike the DuckDB and Polars versions, where the scan is narrowed only by parameters such as
-`bbox` and any `WHERE` clause or `.filter()` runs after all hexagons are aggregated, SedonaDB
-pushes filters on the raster table down into the scan, so the raster is only read and
-aggregated where the query needs it. A predicate against a constant geometry, such as
-`ST_Intersects(wkb, ST_GeomFromWKT(...))` or `ST_DWithin(wkb, ..., d)`, becomes a bounding box
-that limits the scan to the tiles and hexagons near it, and `resolution = 8` or lower bounds such
-as `majority_fraction >= 0.5` narrow it the same way. The tract join itself runs as SedonaDB's
-`SpatialJoinExec`; to join on hex ids instead, as in the DuckDB and Polars versions, see
+SedonaDB pushes filters down into the raster scan, so only the hexagons a query needs are
+aggregated: `ST_Intersects` or `ST_DWithin` against a constant geometry limits the scan to the
+tiles near it, and `resolution = 8` or `majority_fraction >= 0.5` narrow it further. In DuckDB
+and Polars, only parameters such as `bbox` narrow the scan; `WHERE` and `.filter()` run after
+all hexagons are aggregated. The join here is a `SpatialJoinExec`; for hex-id joins, see
 [DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
 
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
