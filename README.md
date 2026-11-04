@@ -211,14 +211,12 @@ result = sd.sql("""
 """).to_pandas()
 ```
 
-The join runs as SedonaDB's `SpatialJoinExec`. To join on hex ids instead, as in the DuckDB
-and Polars versions, register the raster_h3 SQL functions with
-`sd.register(raster_h3_sedona.scalar_functions())` and polyfill the tracts with
-`unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index`; joining
-`ON c.h3_index = t.h3_index` is then a plain hash join on a 64-bit integer, which is cheaper when
-the polyfilled tracts are reused. A filter against a constant geometry, such as
-`ST_Intersects(wkb, ST_GeomFromWKT(...))`, is pushed into the raster scan instead, so only the
-hexagons near it are aggregated. See
+Filters on the raster table are pushed down into the scan, so the raster is only read and
+aggregated where the query needs it. A predicate against a constant geometry, such as
+`ST_Intersects(wkb, ST_GeomFromWKT(...))` or `ST_DWithin(wkb, ..., d)`, becomes a bounding box
+that limits the scan to the tiles and hexagons near it, and `resolution = 8` or lower bounds such
+as `majority_fraction >= 0.5` narrow it the same way. The tract join itself runs as SedonaDB's
+`SpatialJoinExec`; to join on hex ids instead, as in the DuckDB and Polars versions, see
 [DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
 
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
