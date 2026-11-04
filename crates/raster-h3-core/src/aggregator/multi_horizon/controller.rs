@@ -191,7 +191,10 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     /// Dedicated kernel pool (`aggregation_workers`); None uses the ambient pool.
     pool: Option<Arc<rayon::ThreadPool>>,
     worker_budget: usize,
+    /// Most chunks per batch.
     batch_size: usize,
+    /// Pixels after which a batch stops, about two waves of worker windows.
+    batch_pixels: usize,
     output_byte_limit: usize,
     peak_active_bytes: usize,
     worker_maps: Vec<CellMaps<K::Accumulator>>,
@@ -325,25 +328,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             None => rayon::current_num_threads().clamp(1, 8),
         }
         .min(worker_budget / per_pixel);
+        let batch_size = (worker_tasks * 2).min((n_chunks / 4).max(1));
         let worker_pixels = (worker_budget / worker_tasks / per_pixel).clamp(1, 16384);
-        // Horizon maps hold every cell of a batch until it is merged, so size
-        // batches by pixels, not chunks: about two waves of windows, which keeps
-        // every worker busy. Counting chunks made batches of large strips or
-        // tiles grow with the worker count, and fine resolutions then spilled.
-        let chunk_pixels = mosaic
-            .tiles
-            .iter()
-            .map(|t| {
-                t.reader.chunk_layout.chunk_width as usize
-                    * t.reader.chunk_layout.chunk_height as usize
-            })
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let batch_size = (2 * worker_tasks * worker_pixels)
-            .div_ceil(chunk_pixels)
-            .clamp(1, worker_tasks * 2)
-            .min((n_chunks / 4).max(1));
+        // Horizon maps hold every cell of a batch until it is merged, so a
+        // batch also stops at about two waves of windows (see `next_batch_len`).
+        let batch_pixels = 2 * worker_tasks * worker_pixels;
         let output_byte_limit = config.aggregation_budget_bytes / 4;
 
         Ok(Self {
@@ -379,6 +368,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             pool,
             worker_budget,
             batch_size,
+            batch_pixels,
             output_byte_limit,
             peak_active_bytes: 0,
             worker_maps: (0..worker_tasks)
@@ -922,9 +912,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
 
             let t0 = std::time::Instant::now();
-            let mut items = Vec::with_capacity(self.batch_size);
+            let batch_len = self.next_batch_len();
+            let mut items = Vec::with_capacity(batch_len);
             if let Some(prefetcher) = &self.prefetcher {
-                prefetcher.drain_chunk_batch_into(&mut items, 1, self.batch_size);
+                prefetcher.drain_chunk_batch_into(&mut items, 1, batch_len);
             }
             let elapsed = t0.elapsed().as_nanos() as u64;
             self.metrics.prefetch_wait_ns += elapsed;
@@ -961,6 +952,32 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
         }
         Ok(())
+    }
+
+    /// Chunks to take for the next batch. Horizon maps hold every cell of a
+    /// batch until it is merged, so a batch stops once its chunks reach
+    /// `batch_pixels` (about two waves of worker windows, enough to keep every
+    /// worker busy), or at `batch_size` chunks. Counting only chunks let
+    /// batches of large strips or tiles grow with the worker count, and fine
+    /// resolutions then spilled. Chunks arrive in `chunk_refs` order, so the
+    /// upcoming chunks' sizes are known here, even in mixed mosaics.
+    fn next_batch_len(&self) -> usize {
+        let upcoming = self
+            .mosaic
+            .chunk_refs
+            .get(self.processed_chunk_count..)
+            .unwrap_or_default();
+        let mut pixels = 0usize;
+        let mut len = 0;
+        for chunk in upcoming.iter().take(self.batch_size) {
+            let layout = &self.mosaic.tiles[chunk.tile_idx].reader.chunk_layout;
+            pixels += layout.chunk_width as usize * layout.chunk_height as usize;
+            len += 1;
+            if pixels >= self.batch_pixels {
+                break;
+            }
+        }
+        len.max(1)
     }
 
     /// Latch failures so subsequent reads cannot mistake a failed stream for EOF.
