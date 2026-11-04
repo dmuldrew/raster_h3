@@ -567,12 +567,11 @@ fn test_spectral_formula_zero_denominator_and_nodata_resilience() {
 }
 
 #[test]
-fn test_spectral_formula_out_of_bounds_band_clamping() {
-    // Request Band 99 on a 4-band raster. Clamped safely to spp-1 (Band 4)
+fn test_spectral_formula_out_of_bounds_band_is_refused() {
+    // Band 99 on a 4-band raster used to be clamped to band 4, silently computing NDVI from
+    // the alpha band; it is now refused when the stream opens.
     let temp_raster = create_test_rgba_geotiff(64, 64, 50, 100, 150, 200);
-    let raster_path = temp_raster.path();
-
-    let reader = GeoTiffStreamReader::open(raster_path).unwrap();
+    let reader = GeoTiffStreamReader::open(temp_raster.path()).unwrap();
 
     let config = MultiResolutionConfig {
         resolutions: vec![8],
@@ -583,13 +582,15 @@ fn test_spectral_formula_out_of_bounds_band_clamping() {
         ..Default::default()
     };
 
-    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000).unwrap();
-    assert!(!records.is_empty());
-    // Band 99 is clamped to Band 4 (NIR=200), Red is Band 1 (Red=50) -> NDVI = 0.60
-    for rec in &records {
-        assert!((rec.accumulator.mean() - 0.60).abs() < 1e-6);
-    }
+    let err = MultiScanHorizonStreamer::new(reader, &config)
+        .err()
+        .expect("NDVI from band 99 of a 4-band raster must be refused")
+        .to_string();
+    assert!(
+        err.contains("spectral formula band 99 does not exist"),
+        "{err}"
+    );
+    assert!(err.contains("4 band(s)"), "{err}");
 }
 
 #[test]

@@ -138,7 +138,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/multiband_and_query_pushdown.rs`](../crates/raster-h3-core/tests/it/multiband_and_query_pushdown.rs) (12), [`duckdb/cell_bbox_pushdown.rs`](../crates/raster-h3-duckdb/tests/it/cell_bbox_pushdown.rs) (2) | Band selection and samples-per-pixel; NDVI, NDWI, NBR and EVI on the fly; zero-denominator and NoData resilience; out-of-range band clamping; borrowed interleaved windows match across job sizes; `min_count`/`min_mean`/`min_majority_fraction` pushdown; `h3_cell`/`h3_hex` bbox pushdown at high latitude and across the antimeridian without dropping raster samples. |
+| [`core/multiband_and_query_pushdown.rs`](../crates/raster-h3-core/tests/it/multiband_and_query_pushdown.rs) (13), [`duckdb/cell_bbox_pushdown.rs`](../crates/raster-h3-duckdb/tests/it/cell_bbox_pushdown.rs) (2) | Band selection and samples-per-pixel; NDVI, NDWI, NBR and EVI on the fly; zero-denominator and NoData resilience; out-of-range bands (and spectral formula bands) refused when the stream opens; borrowed interleaved windows match across job sizes; `min_count`/`min_mean`/`min_majority_fraction` pushdown; `h3_cell`/`h3_hex` bbox pushdown at high latitude and across the antimeridian without dropping raster samples. |
 | Unit: `multi_horizon/spectral.rs` (5) | Formula evaluation and singularity guards. |
 
 ## 9. Threading & concurrency

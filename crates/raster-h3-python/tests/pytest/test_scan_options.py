@@ -55,18 +55,18 @@ def assert_matches(df, expected) -> None:
 
 @pytest.mark.parametrize("band", [1, 2])
 def test_band_selects_that_band(raster_h3, two_band_tif, band):
-    df = raster_h3.scan_raster_h3(two_band_tif, RES, band=band).collect()
+    df = raster_h3.read_raster_h3(two_band_tif, RES, band=band)
     assert_matches(df, per_cell(lambda c, r: two_band_value(c, r)[band - 1]))
 
 
 def test_default_band_is_one(raster_h3, two_band_tif):
-    default = sort(raster_h3.scan_raster_h3(two_band_tif, RES).collect())
-    assert default.equals(sort(raster_h3.scan_raster_h3(two_band_tif, RES, band=1).collect()))
+    default = sort(raster_h3.read_raster_h3(two_band_tif, RES))
+    assert default.equals(sort(raster_h3.read_raster_h3(two_band_tif, RES, band=1)))
 
 
 def test_band_beyond_raster_is_an_error(raster_h3, two_band_tif):
     with pytest.raises(RuntimeError, match="band 3 does not exist: the raster has 2 band"):
-        raster_h3.scan_raster_h3(two_band_tif, RES, band=3).collect()
+        raster_h3.read_raster_h3(two_band_tif, RES, band=3)
 
 
 @pytest.mark.parametrize("band", [0, -1])
@@ -86,9 +86,9 @@ def test_band_must_be_an_int(raster_h3, two_band_tif):
 
 
 def test_ndvi_from_chosen_bands(raster_h3, two_band_tif):
-    df = raster_h3.scan_raster_h3(
+    df = raster_h3.read_raster_h3(
         two_band_tif, RES, spectral_formula="NDVI", nir_band=2, red_band=1
-    ).collect()
+    )
 
     def ndvi(c, r):
         red, nir = two_band_value(c, r)
@@ -100,7 +100,7 @@ def test_ndvi_from_chosen_bands(raster_h3, two_band_tif):
 def test_spectral_formula_default_bands_must_exist(raster_h3, two_band_tif):
     # NDVI defaults to nir_band=4, red_band=3, as in DuckDB.
     with pytest.raises(RuntimeError, match="spectral formula band 4 does not exist"):
-        raster_h3.scan_raster_h3(two_band_tif, RES, spectral_formula="ndvi").collect()
+        raster_h3.read_raster_h3(two_band_tif, RES, spectral_formula="ndvi")
 
 
 def test_unknown_spectral_formula_is_an_error(raster_h3, two_band_tif):
@@ -126,15 +126,15 @@ def test_spectral_formula_rejects_categorical(raster_h3, classes_tif):
 
 
 def test_center_sampling_is_the_default(raster_h3, two_band_tif):
-    default = sort(raster_h3.scan_raster_h3(two_band_tif, RES).collect())
-    center = sort(raster_h3.scan_raster_h3(two_band_tif, RES, sampling="center").collect())
+    default = sort(raster_h3.read_raster_h3(two_band_tif, RES))
+    center = sort(raster_h3.read_raster_h3(two_band_tif, RES, sampling="center"))
     assert center.equals(default)
 
 
 @pytest.mark.parametrize("pattern", ["rgss", "hex", "16point"])
 def test_sub_pixel_sampling_spreads_each_pixel_over_cells(raster_h3, two_band_tif, pattern):
-    center = raster_h3.scan_raster_h3(two_band_tif, RES).collect()
-    sampled = raster_h3.scan_raster_h3(two_band_tif, RES, sampling=pattern).collect()
+    center = raster_h3.read_raster_h3(two_band_tif, RES)
+    sampled = raster_h3.read_raster_h3(two_band_tif, RES, sampling=pattern)
     # Sample weights sum to one per pixel, so the totals are unchanged...
     assert sampled["count"].sum() == pytest.approx(center["count"].sum())
     assert sampled["sum"].sum() == pytest.approx(center["sum"].sum())
@@ -166,7 +166,7 @@ def overlapping_mosaic(tmp_path_factory) -> str:
 
 def test_overlap_rules(raster_h3, overlapping_mosaic):
     def scan(rule):
-        return raster_h3.scan_raster_h3(overlapping_mosaic, RES, overlap_rule=rule).collect()
+        return raster_h3.read_raster_h3(overlapping_mosaic, RES, overlap_rule=rule)
 
     pixels, overlap = 2 * W * H, (W - 16) * H
     cutline, first, average = scan("cutline"), scan("first"), scan("average")
@@ -186,7 +186,7 @@ def test_unknown_overlap_rule_is_an_error(raster_h3, overlapping_mosaic):
 
 def test_partitions_follow_the_overlap_rule(raster_h3, overlapping_mosaic):
     whole = sort(
-        raster_h3.scan_raster_h3(overlapping_mosaic, RES, overlap_rule="first").collect()
+        raster_h3.read_raster_h3(overlapping_mosaic, RES, overlap_rule="first")
     )
     specs = raster_h3.plan_partitions(overlapping_mosaic, target_chunks=1, overlap_rule="first")
     assert len(specs) == 2
@@ -216,10 +216,10 @@ def test_partitions_follow_the_overlap_rule(raster_h3, overlapping_mosaic):
 
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 0.75, 1.0])
 def test_min_majority_fraction_filters_cells(raster_h3, classes_tif, fraction):
-    everything = raster_h3.scan_raster_h3(classes_tif, RES, categorical=True).collect()
-    kept = raster_h3.scan_raster_h3(
+    everything = raster_h3.read_raster_h3(classes_tif, RES, categorical=True)
+    kept = raster_h3.read_raster_h3(
         classes_tif, RES, categorical=True, min_majority_fraction=fraction
-    ).collect()
+    )
     expected = everything.filter(pl.col("majority_fraction") >= fraction)
     assert 0 < expected.height or fraction == 1.0
     assert sort(kept).equals(sort(expected))
@@ -244,7 +244,10 @@ def test_min_majority_fraction_range(raster_h3, classes_tif, fraction):
 
 
 def test_options_reach_every_scan_path(raster_h3, two_band_tif):
-    expected = sort(raster_h3.scan_raster_h3(two_band_tif, RES, band=2).collect())
+    expected = sort(raster_h3.read_raster_h3(two_band_tif, RES, band=2))
+    lazy = raster_h3.scan_raster_h3(two_band_tif, RES, band=2)
+    if isinstance(lazy, pl.LazyFrame):  # Polars >= 1.4 (register_io_source)
+        assert sort(lazy.collect()).equals(expected)
     stream = raster_h3.RasterH3ArrowStream(two_band_tif, RES, band=2)
     assert sort(stream.to_polars()).equals(expected)
     assert sort(pl.concat(list(stream.iter_batches(7)))).equals(expected)
@@ -252,7 +255,6 @@ def test_options_reach_every_scan_path(raster_h3, two_band_tif):
     no_wkb = expected.drop("wkb")
     as_dict = pl.DataFrame(stream.to_dict()).select(no_wkb.columns).cast(dict(no_wkb.schema))
     assert sort(as_dict).equals(no_wkb)
-    assert sort(raster_h3.read_raster_h3(two_band_tif, RES, band=2)).equals(expected)
 
 
 # -----------------------------------------------------------------------------
@@ -270,7 +272,7 @@ def test_parquet_to_pmtiles(raster_h3, gradient_tif, tmp_path):
 
 def test_parquet_to_pmtiles_named_hex_column(raster_h3, gradient_tif, tmp_path):
     parquet = tmp_path / "hex.parquet"
-    df = raster_h3.scan_raster_h3(gradient_tif, RES, columns=["h3_hex", "mean"]).collect()
+    df = raster_h3.read_raster_h3(gradient_tif, RES, columns=["h3_hex", "mean"])
     df.rename({"h3_hex": "Cell_ID"}).write_parquet(parquet)
     out = tmp_path / "hex.pmtiles"
     assert raster_h3.parquet_to_pmtiles(parquet, out, h3_column="cell_id") == df.height
