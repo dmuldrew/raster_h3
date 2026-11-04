@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Horizon batches are sized by pixels (about two waves of worker windows, at least one chunk) instead of `aggregation_workers × 2` chunks. A horizon map holds a whole batch of cells, so with large strips or tiles each extra worker added whole chunks of cells, and a three-resolution run spilled even at a 2 GiB budget. That run is now 1.5× faster at 4 workers with no spill, and resolution 9 with quantiles no longer spills under the 64 MiB default (2.1× faster at 4 workers). Peak horizon-map memory no longer grows with the worker count. `docs/engineering.md` adds an aggregation-budget sizing estimate for fine resolutions.
 - Horizon eviction keys (`compute_cell_south_lat`, a cell-boundary computation of ~584 ns) are now computed in the parallel aggregation workers instead of on the serial merge thread. Keys and output are unchanged. At resolution 11 with 4 workers the merge drops from 12.1 s to 2.0 s and the stream from 18.0 s to 10.6 s; see `docs/worker-scaling.md`. `StreamProfile::eviction_key_fallbacks` counts keys the merge still had to compute itself (normally 0).
 
 ### Added
