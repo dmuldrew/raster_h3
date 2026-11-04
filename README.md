@@ -221,11 +221,9 @@ result = sd.sql("""
 In SedonaDB, the tracts don't need converting to hexagons; the join matches hexagon shapes to
 tract shapes directly. It is also the only one of the three that skips raster from a spatial
 condition: a condition against a fixed shape, such as `ST_Intersects(wkb,
-ST_GeomFromWKT(...))`, limits the scan to the tiles near it. If the table was created with
-several resolutions (e.g. `[7, 8, 9]`), a `WHERE resolution = 8` clause computes only that one,
-and `majority_fraction >= 0.5` drops hexagons inside the scan rather than after it. To join on
-hex ids instead, as DuckDB and Polars do, see [DataFusion &
-SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
+ST_GeomFromWKT(...))`, limits the scan to the tiles near it, and `majority_fraction >= 0.5`
+drops hexagons inside the scan rather than after it. To join on hex ids instead, as DuckDB and
+Polars do, see [DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
 
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
 
