@@ -287,7 +287,6 @@ pub fn process_continuous_borrowed_into(
     true
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
