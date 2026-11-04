@@ -111,10 +111,13 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
-DuckDB alone offers compaction, single-cell lookups (`h3_cell`) and thread and memory budgets
-for very large rasters. Saving `canopy_h3` as a table means the raster is read once and reused
-by later queries. A `WHERE` clause runs only after every hexagon is computed; to read less of
-the raster, pass options such as `bbox := '...'` or `min_count := ...` to the scan.
+DuckDB has the widest coverage: every engine option is a named SQL parameter, including
+compaction, single-cell lookups and memory budgets that the other engines lack. It installs as
+a pre-built extension, usable from the DuckDB CLI or from Python, Node.js and R, and its
+spatial extension reads the tracts in the same SQL. Results export straight to GeoParquet or
+PMTiles, and storing `canopy_h3` as a table lets later queries reuse it without re-reading the
+raster. The trade-off: `WHERE` filters apply after aggregation, so narrow the scan with
+parameters such as `bbox := '...'` or `min_count := ...`.
 
 #### Python & Polars
 
