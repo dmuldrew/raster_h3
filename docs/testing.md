@@ -425,3 +425,57 @@ name any branch, even one without the file.
 - The real PostgreSQL test and the Hawaii-dataset tests never run in CI.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - EPSG:6933 and EPSG:7856 have no coverage tests.
+
+
+## Accuracy and weighting contracts
+
+Projection accuracy and datum accuracy are separate. The 0.01 m golden-point
+checks in `geodetic_reference.rs` isolate projection mathematics by using the
+source ellipsoid. They do not promise centimetre-level WGS84 positioning.
+`datum_shifts.rs` checks the supported Helmert operations against PROJ with
+identical parameters, then separately compares with PROJ's preferred operation
+using the selected operation's published accuracy. These finite fixtures are
+regression checks, not proof of accuracy everywhere in an operation's area of use.
+
+The raster-to-cell datum test places a GeoTIFF pixel center at each stored PROJ
+reference coordinate and checks the emitted H3 cell, count and sum at resolutions
+5, 9 and 12. Expected geographic coordinates come directly from the PROJ fixture;
+they are never generated using `CrsTransformer`. H3 indexing still uses h3o on
+both sides, so this tests the raster/CRS integration rather than independently
+validating the H3 implementation. See the fixture comments for operation IDs,
+reference provenance and accuracy tolerances.
+
+EPSG:4269 (NAD83) is treated as WGS84 without a datum shift. NAD83 Albers fast
+paths likewise invert the projection without a grid-based datum correction.
+ETRS89/WGS84 equivalence is also approximate and epoch dependent. Metre-scale
+position errors can change H3 assignment near a boundary at any resolution;
+finer cells increase the practical sensitivity. Unsupported grid shifts are
+rejected. Reproject externally using an appropriate operation, grids and epoch
+when that accuracy is needed.
+
+Counts and category fractions measure pixel contributions. With built-in
+supersampling presets, a valid pixel contributes total weight one before spatial
+filtering; sum is the sum of values times their sample weights, and mean divides
+that sum by retained weight. These weights are not square metres. Equal angular
+pixels have different ground areas at different latitudes, and fixed-point
+supersampling is not exact pixel/hexagon intersection. The geographic weighting
+regression contrasts pixel means at the equator and 60 degrees north with an
+independent spherical rectangle-area calculation. There is no ground-area
+weighting mode implied by these statistics. Variance for fractional weights is
+an outstanding issue and is not validated by the weighting regression.
+
+Calibration is applied after stored-value nodata checks. Non-finite calibrated
+samples are omitted from continuous statistics and quantiles. Spectral indices
+also omit pixels with non-finite calibrated input bands, non-finite numerator or
+denominator, an effectively zero denominator, or a non-finite quotient. This
+policy applies to direct pixels, interleaved bands and spans. Finite statistics
+can still exceed floating-point range when accumulating extreme finite data;
+these tests do not establish arbitrary-precision aggregation.
+
+Run the added regressions with:
+
+```sh
+cargo test -p raster-h3-core calibrated_overflow_agrees_between_samples_and_spans
+cargo test -p raster-h3-core --test it band_calibration
+cargo test -p raster-h3-core --test it datum_shifts
+```
