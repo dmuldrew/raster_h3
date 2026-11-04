@@ -737,6 +737,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 if self.strict_transforms && failures > 0 {
                     return Err(RasterH3Error::TransformFailures(failures));
                 }
+                let key_bytes: usize = south_keys
+                    .iter()
+                    .flatten()
+                    .map(|k| k.capacity() * size_of::<(u64, f64)>())
+                    .sum();
                 let bytes: usize = maps
                     .iter()
                     .flatten()
@@ -744,7 +749,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         super::spill::table_bytes::<u64, K::Accumulator>(m.capacity())
                             + m.values().map(|a| a.heap_bytes()).sum::<usize>()
                     })
-                    .sum();
+                    .sum::<usize>()
+                    + key_bytes;
                 self.metrics.peak_worker_bytes = self.metrics.peak_worker_bytes.max(bytes);
                 let t = std::time::Instant::now();
                 // Map sets past this wave's jobs are empty; their key lists may
@@ -758,6 +764,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 if bytes > self.worker_budget {
                     for map in maps.iter_mut().flatten() {
                         map.shrink_to_fit();
+                    }
+                    for keys in south_keys.iter_mut().flatten() {
+                        keys.clear();
+                        keys.shrink_to_fit();
                     }
                 }
             }
