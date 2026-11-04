@@ -216,13 +216,19 @@ raster-h3-cli merge parts/*.rh3 -o dem_r8.rh3          # or --jsonl
 - `--partition` takes a spec inline (one line of the plan, e.g. from
   `xargs -d '\n' -I{} … --partition '{}'`) or `@FILE`: a file with one spec, or a plan file
   with `--partition-index`.
-- A partition's output is the normal `ipc` stream plus a nullable `partial_state` column:
-  null rows are final cells, set rows are this partition's share of a cell that other
-  partitions also reach. Only `ipc` output is accepted (that is what `merge` reads);
+- A partition file is a small `RH3PART1` header (magic, `u32` length, JSON naming the
+  partition spec, the input and the value-changing options) followed by the normal
+  `RH3IPC01` stream with a nullable `partial_state` column: null rows are final cells, set
+  rows are this partition's share of a cell that other partitions also reach. Only `ipc`
+  output is accepted (that is what `merge` reads);
   `--limit`, `--format long`, `parquet` and `pmtiles` are refused with `--partition`, and
   `--columns` must keep `h3_index` and `resolution`.
-- `merge` reads the partition files of one scan (same options and columns, enforced),
-  writes every final row, then the merged rows. Only partial rows are kept in memory.
+- `merge` first checks the headers and columns of all files, and refuses before writing
+  anything unless they are every partition of one plan exactly once (it names missing or
+  repeated partitions), scanned from the same input with the same resolutions, `--crs`,
+  `--nodata`, `--raw-values`, `--bbox`, categorical mode and `--columns`. It then streams
+  the files one batch at a time, writing every final row, then the merged rows; only
+  partial rows are kept in memory.
   Categorical input is recognised from its columns; pass `-c` when the projection has
   only shared columns (`h3_index`, `h3_hex`, `resolution`, `wkb`). The output's columns
   are the scan's, without `partial_state`, so it can be used as an unpartitioned `ipc`

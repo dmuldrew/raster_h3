@@ -74,6 +74,19 @@ fn striped_classes(dir: &Path) -> PathBuf {
     path
 }
 
+/// Skip the `RH3PART1` header of a partition file's bytes, leaving its IPC stream.
+fn partition_stream(bytes: &[u8]) -> &[u8] {
+    assert_eq!(&bytes[..8], b"RH3PART1");
+    let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    &bytes[12 + len..]
+}
+
+fn read_part(path: &Path) -> (ColumnSchema, Vec<RecordBatch>) {
+    let bytes = std::fs::read(path).unwrap();
+    let (schema, batches) = read_ipc_stream(&mut partition_stream(&bytes)).unwrap();
+    ((*schema).clone(), batches)
+}
+
 fn read_ipc(path: &Path) -> (ColumnSchema, Vec<RecordBatch>) {
     let (schema, batches) =
         read_ipc_stream(&mut BufReader::new(File::open(path).unwrap())).unwrap();
@@ -178,7 +191,7 @@ fn fan_out(dir: &Path, raster: &Path, target_chunks: &str, scan_args: &[&str]) -
     // With several partitions some cells straddle an edge, so the merge has work to do.
     let partial_rows: usize = parts
         .iter()
-        .flat_map(|p| read_ipc(p).1)
+        .flat_map(|p| read_part(p).1)
         .map(|b| match b.column_by_name("partial_state") {
             Some(c) => c.len() - c.null_count(),
             None => panic!("partition output lacks partial_state"),
@@ -241,16 +254,21 @@ fn categorical_and_projected_fan_out_match_single_scan() {
         "-o",
         s(&single),
     ]);
-    let (_, merged) = fan_out(dir.path(), &raster, "4", &["-r", "8", "--columns", cols]);
+    let (count, merged) = fan_out(dir.path(), &raster, "4", &["-r", "8", "--columns", cols]);
     let ((schema, batches), (single_schema, single_batches)) =
         (read_ipc(&merged), read_ipc(&single));
     assert_eq!(schema, single_schema);
     assert_same_rows(&single_batches, &batches);
 
     // JSONL output of the merge has one line per cell.
-    let jsonl = run_ok(&["merge", s(&dir.path().join("part-4-0.rh3")), "--jsonl"]);
-    let text = String::from_utf8(jsonl.stdout).unwrap();
-    assert!(text.lines().count() > 0 && text.lines().all(|l| l.contains("\"mean\"")));
+    let parts: Vec<PathBuf> = (0..count)
+        .map(|k| dir.path().join(format!("part-4-{k}.rh3")))
+        .collect();
+    let mut args = vec!["merge", "--jsonl"];
+    args.extend(parts.iter().map(|p| s(p)));
+    let text = String::from_utf8(run_ok(&args).stdout).unwrap();
+    assert_eq!(text.lines().count(), rows(&single_batches).len());
+    assert!(text.lines().all(|l| l.contains("\"mean\"")));
     assert!(!text.contains("partial_state"));
 }
 
@@ -273,7 +291,9 @@ fn a_spec_on_the_command_line_and_the_plan_on_stdout() {
     std::fs::write(&one, specs[1]).unwrap();
     let from_file = run_ok(&["ipc", s(&raster), "--partition", &format!("@{}", s(&one))]);
     assert_eq!(inline.stdout, from_file.stdout);
-    let schema = read_ipc_stream(&mut inline.stdout.as_slice()).unwrap().0;
+    let schema = read_ipc_stream(&mut partition_stream(&inline.stdout))
+        .unwrap()
+        .0;
     assert_eq!(schema.fields.last().unwrap().name, "partial_state");
 }
 
@@ -327,28 +347,87 @@ fn misuse_is_rejected() {
     run_err(&["merge", "/no/such/part.rh3"], "cannot open");
     let single = dir.path().join("single.rh3");
     run_ok(&["ipc", r, "-o", s(&single)]);
-    run_err(&["merge", s(&single)], "no partial_state column");
-    let (a, b) = (dir.path().join("a.rh3"), dir.path().join("b.rh3"));
-    run_ok(&[&["ipc", r, "-o", s(&a)][..], &p0].concat());
-    run_ok(
-        &[
-            &[
-                "ipc",
-                r,
-                "--columns",
-                "h3_index,resolution,mean",
-                "-o",
-                s(&b),
-            ][..],
-            &p0,
-        ]
-        .concat(),
-    );
-    run_err(&["merge", s(&a), s(&b)], "other columns");
-    run_err(&["merge", s(&a), "-c"], "not a categorical scan column");
+    run_err(&["merge", s(&single)], "not a partition file");
     std::fs::write(dir.path().join("junk.rh3"), b"not ipc").unwrap();
     run_err(
         &["merge", s(&dir.path().join("junk.rh3"))],
-        "not a raster-h3-cli IPC stream",
+        "not a partition file",
     );
+
+    // Partition `k` of `plan` scanned from `raster` with `extra` options.
+    let scan = |raster: &str, plan: &str, k: usize, extra: &[&str], name: &str| {
+        let out = dir.path().join(name);
+        let (spec, index) = (format!("@{plan}"), k.to_string());
+        let mut args = vec![
+            "ipc",
+            raster,
+            "--partition",
+            &spec,
+            "--partition-index",
+            &index,
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["-o", s(&out)]);
+        run_ok(&args);
+        out
+    };
+    let n = std::fs::read_to_string(&plan).unwrap().lines().count();
+    assert!(n > 2);
+    let full: Vec<PathBuf> = (0..n)
+        .map(|k| scan(r, s(&plan), k, &[], &format!("full-{k}.rh3")))
+        .collect();
+    let merge = |files: &[&PathBuf], extra: &[&str], needle: &str| {
+        let mut args = vec!["merge"];
+        args.extend(files.iter().map(|p| s(p)));
+        args.extend_from_slice(extra);
+        run_err(&args, needle);
+    };
+    let all: Vec<&PathBuf> = full.iter().collect();
+    run_ok(
+        &[
+            &["merge"][..],
+            &all.iter().map(|p| s(p)).collect::<Vec<_>>(),
+        ]
+        .concat(),
+    );
+
+    // Every partition is required, once.
+    merge(&all[1..], &[], "missing partition(s) 0 of");
+    merge(
+        &[&all[..], &[all[1]]].concat(),
+        &[],
+        "partition 1 is given twice",
+    );
+    // All partitions come from one scan: same options, columns, input and plan.
+    let last = n - 1;
+
+    let nodata = scan(r, s(&plan), last, &["--nodata", "5"], "nodata.rh3");
+    merge(&swap(&all, &nodata), &[], "other options");
+    let res = scan(r, s(&plan), last, &["-r", "9"], "res.rh3");
+    merge(&swap(&all, &res), &[], "other options");
+    let cols = scan(
+        r,
+        s(&plan),
+        last,
+        &["--columns", "h3_index,resolution,mean"],
+        "cols.rh3",
+    );
+    merge(&swap(&all, &cols), &[], "other columns");
+    let copy = dir.path().join("copy.tif");
+    std::fs::copy(&raster, &copy).unwrap();
+    let other_input = scan(s(&copy), s(&plan), last, &[], "copy.rh3");
+    merge(&swap(&all, &other_input), &[], "other options");
+    let plan2 = dir.path().join("plan2.jsonl");
+    run_ok(&["plan", r, "--target-chunks", "1000", "-o", s(&plan2)]);
+    let whole = scan(r, s(&plan2), 0, &[], "whole.rh3");
+    merge(&[all[0], &whole], &[], "another plan");
+    // Continuous partitions are not categorical.
+    merge(&all, &["-c"], "not a categorical scan column");
+}
+
+/// `files` with its last entry replaced by `other`.
+fn swap<'a>(files: &[&'a PathBuf], other: &'a PathBuf) -> Vec<&'a PathBuf> {
+    let mut files = files.to_vec();
+    *files.last_mut().unwrap() = other;
+    files
 }

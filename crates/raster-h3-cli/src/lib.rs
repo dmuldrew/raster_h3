@@ -10,16 +10,16 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
-    plan_partitions, MultiCategoricalHorizonStreamer, MultiResolutionConfig,
+    plan_partitions, ChunkBlock, MultiCategoricalHorizonStreamer, MultiResolutionConfig,
     MultiScanHorizonStreamer, ScanPartition,
 };
-use raster_h3_core::columnar::ipc::{read_ipc_stream, write_ipc_stream, write_jsonl_stream};
+use raster_h3_core::columnar::ipc::{write_ipc_stream, write_jsonl_stream, IpcStreamReader};
 use raster_h3_core::columnar::partitioned::{
     merge_partial_batches, PartitionedBatchReader, PARTIAL_STATE_COLUMN,
 };
@@ -206,10 +206,77 @@ fn stream_partition<W: Write>(
         let projection = resolve_projection_indices(&full, &columns)?;
         PartitionedBatchReader::open_continuous(paths, config, projection, opts.batch_size)?
     };
+    let header = PartitionHeader {
+        partition: config
+            .partition
+            .clone()
+            .expect("a partitioned scan has a partition"),
+        scan: scan_identity(opts),
+    };
+    write_partition_header(writer, &header)?;
     let schema = reader.schema();
     let rows = write_ipc_stream(writer, &schema, &mut reader)?;
     warn_transform_failures(reader.transform_failures());
     Ok(rows)
+}
+
+/// Magic prefix of a partition file: the header below, then an `RH3IPC01` stream.
+const PARTITION_MAGIC: &[u8; 8] = b"RH3PART1";
+
+/// What a partition file was scanned from, so `merge` can check that its inputs are the
+/// complete set of partitions of one scan.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PartitionHeader {
+    partition: ScanPartition,
+    /// The scan's input and the options that change its values (columns are checked
+    /// through the stream schema).
+    scan: serde_json::Value,
+}
+
+fn scan_identity(opts: &CliStreamOptions) -> serde_json::Value {
+    serde_json::json!({
+        "input": opts.input_path,
+        "resolutions": opts.resolutions,
+        "categorical": opts.categorical,
+        "crs": opts.source_crs,
+        "nodata": opts.nodata,
+        "apply_scale_offset": opts.apply_scale_offset,
+        "bbox": opts.bbox,
+    })
+}
+
+fn write_partition_header<W: Write>(writer: &mut W, header: &PartitionHeader) -> Result<()> {
+    let json =
+        serde_json::to_vec(header).map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+    writer.write_all(PARTITION_MAGIC)?;
+    writer.write_all(&(json.len() as u32).to_le_bytes())?;
+    writer.write_all(&json)?;
+    Ok(())
+}
+
+/// Largest header accepted, guarding against reading a huge length from a corrupt file.
+const MAX_PARTITION_HEADER: usize = 64 << 20;
+
+fn read_partition_header<R: Read>(reader: &mut R) -> Result<PartitionHeader> {
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != PARTITION_MAGIC {
+        return Err(RasterH3Error::InvalidParameter(
+            "not a partition file (missing RH3PART1 header)".into(),
+        ));
+    }
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_PARTITION_HEADER {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "partition header of {len} bytes is too large"
+        )));
+    }
+    let mut json = vec![0u8; len];
+    reader.read_exact(&mut json)?;
+    serde_json::from_slice(&json)
+        .map_err(|e| RasterH3Error::InvalidParameter(format!("invalid partition header: {e}")))
 }
 
 /// Split a raster or mosaic scan into partitions of about `target_chunks` TIFF tiles or
@@ -277,7 +344,8 @@ pub fn read_partition_spec(spec: &str, index: Option<usize>) -> Result<ScanParti
 /// Options for [`merge_partition_files`].
 #[derive(Debug, Clone)]
 pub struct CliMergeOptions {
-    /// IPC files written by partitioned `ipc` scans of the same raster with the same options.
+    /// Partition files written by `ipc --partition`: every partition of one plan, once,
+    /// scanned from the same input with the same options and columns.
     pub inputs: Vec<PathBuf>,
     /// Categorical partitions (also inferred from categorical-only columns).
     pub categorical: bool,
@@ -287,17 +355,44 @@ pub struct CliMergeOptions {
 
 /// Combine the partition files of a scan into its final rows: every file's final rows are
 /// passed through (without `partial_state`), then the partial rows of all files are merged
-/// per cell. The result equals an unpartitioned scan's rows, in another order. Only the
-/// partial rows are held in memory. Returns the number of rows written.
+/// per cell. The result equals an unpartitioned scan's rows, in another order.
+///
+/// Before writing anything, the files' headers are checked to be every partition of one
+/// plan exactly once, scanned from the same input with the same options. Files are then
+/// streamed one batch at a time; only partial rows are held in memory. Returns the number
+/// of rows written.
 pub fn merge_partition_files<W: Write>(opts: &CliMergeOptions, writer: &mut W) -> Result<usize> {
+    if opts.inputs.is_empty() {
+        return Err(RasterH3Error::InvalidParameter(
+            "merge needs at least one partition file".into(),
+        ));
+    }
+    let mut headers = Vec::with_capacity(opts.inputs.len());
+    let mut schema: Option<Arc<ColumnSchema>> = None;
+    for path in &opts.inputs {
+        let (header, stream) = open_partition_file(path)?;
+        match &schema {
+            None => schema = Some(stream.schema()),
+            Some(first) if **first != *stream.schema() => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "'{}' has other columns than '{}'; merge the partitions of one scan",
+                    path.display(),
+                    opts.inputs[0].display()
+                )))
+            }
+            Some(_) => {}
+        }
+        headers.push(header);
+    }
+    check_partition_set(&opts.inputs, &headers)?;
+
     let mut files: VecDeque<PathBuf> = opts.inputs.iter().cloned().collect();
-    let first_path = files.pop_front().ok_or_else(|| {
-        RasterH3Error::InvalidParameter("merge needs at least one partition file".into())
-    })?;
-    let (input_schema, first) = read_partition_file(&first_path)?;
+    let first_path = files.pop_front().expect("inputs are not empty");
+    let (_, first) = open_partition_file(&first_path)?;
+    let input_schema = first.schema();
     let state_idx = input_schema.index_of(PARTIAL_STATE_COLUMN).ok_or_else(|| {
         RasterH3Error::InvalidParameter(format!(
-            "'{}' has no {PARTIAL_STATE_COLUMN} column: is it the output of a partitioned scan (ipc --partition)?",
+            "'{}' has no {PARTIAL_STATE_COLUMN} column",
             first_path.display()
         ))
     })?;
@@ -336,7 +431,7 @@ pub fn merge_partition_files<W: Write>(opts: &CliMergeOptions, writer: &mut W) -
         input_schema: Arc::clone(&input_schema),
         state_idx,
         keep,
-        queue: first.into(),
+        current: Some(first),
         partials: Vec::new(),
         merged: VecDeque::new(),
         merge: Some(MergeSpec {
@@ -352,16 +447,107 @@ pub fn merge_partition_files<W: Write>(opts: &CliMergeOptions, writer: &mut W) -
     Ok(rows)
 }
 
-fn read_partition_file(path: &Path) -> Result<(Arc<ColumnSchema>, Vec<RecordBatch>)> {
+type PartitionStream = IpcStreamReader<BufReader<File>>;
+
+/// Open a partition file: its header, and a reader positioned at its first batch.
+fn open_partition_file(path: &Path) -> Result<(PartitionHeader, PartitionStream)> {
+    let context = |e: RasterH3Error| {
+        RasterH3Error::InvalidParameter(format!(
+            "'{}' is not a partition file written by `ipc --partition`: {e}",
+            path.display()
+        ))
+    };
     let file = File::open(path).map_err(|e| {
         RasterH3Error::InvalidParameter(format!("cannot open '{}': {e}", path.display()))
     })?;
-    read_ipc_stream(&mut BufReader::new(file)).map_err(|e| {
-        RasterH3Error::InvalidParameter(format!(
-            "'{}' is not a raster-h3-cli IPC stream: {e}",
-            path.display()
-        ))
-    })
+    let mut reader = BufReader::new(file);
+    let header = read_partition_header(&mut reader).map_err(context)?;
+    let stream = IpcStreamReader::new(reader).map_err(context)?;
+    Ok((header, stream))
+}
+
+/// Check that `headers` are every partition of one plan exactly once, from one scan.
+fn check_partition_set(paths: &[PathBuf], headers: &[PartitionHeader]) -> Result<()> {
+    let invalid = |msg: String| Err(RasterH3Error::InvalidParameter(msg));
+    let first = &headers[0];
+    let name = |i: usize| paths[i].display().to_string();
+    for (i, h) in headers.iter().enumerate().skip(1) {
+        if h.scan != first.scan {
+            return invalid(format!(
+                "'{}' was scanned with other options than '{}' ({} vs {}); merge the partitions of one scan",
+                name(i),
+                name(0),
+                h.scan,
+                first.scan
+            ));
+        }
+        if h.partition.count != first.partition.count
+            || h.partition.mosaic_fingerprint != first.partition.mosaic_fingerprint
+        {
+            return invalid(format!(
+                "'{}' belongs to another plan than '{}'",
+                name(i),
+                name(0)
+            ));
+        }
+    }
+    let count = first.partition.count as usize;
+    let mut seen: Vec<Option<usize>> = vec![None; count];
+    for (i, h) in headers.iter().enumerate() {
+        let index = h.partition.index as usize;
+        match seen.get_mut(index) {
+            None => {
+                return invalid(format!(
+                    "'{}' has partition index {index} of {count}",
+                    name(i)
+                ))
+            }
+            Some(Some(j)) => {
+                return invalid(format!(
+                    "partition {index} is given twice ('{}' and '{}')",
+                    name(*j),
+                    name(i)
+                ))
+            }
+            Some(slot) => *slot = Some(i),
+        }
+    }
+    let missing: Vec<String> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .map(|(k, _)| k.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return invalid(format!(
+            "missing partition(s) {} of {count}: merge needs every partition of the plan",
+            missing.join(", ")
+        ));
+    }
+    // Plans with the same partition count for one layout could still differ; their
+    // partitions would then overlap.
+    let blocks: Vec<(usize, &ChunkBlock)> = headers
+        .iter()
+        .enumerate()
+        .flat_map(|(i, h)| h.partition.blocks.iter().map(move |b| (i, b)))
+        .collect();
+    for (a, (i, x)) in blocks.iter().enumerate() {
+        for (j, y) in &blocks[a + 1..] {
+            let overlap = x.tile_idx == y.tile_idx
+                && x.col_start < y.col_end
+                && y.col_start < x.col_end
+                && x.row_start < y.row_end
+                && y.row_start < x.row_end;
+            if overlap {
+                return invalid(format!(
+                    "'{}' and '{}' cover the same chunks: they come from different plans",
+                    name(*i),
+                    name(*j)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct MergeSpec {
@@ -370,15 +556,15 @@ struct MergeSpec {
     batch_size: usize,
 }
 
-/// Yields every file's final rows, reading the files one at a time and keeping their
-/// partial rows, then the merged partial rows.
+/// Yields every file's final rows, streaming the files one batch at a time and keeping
+/// their partial rows, then the merged partial rows.
 struct PartitionMerge {
     files: VecDeque<PathBuf>,
     input_schema: Arc<ColumnSchema>,
     state_idx: usize,
     keep: Vec<usize>,
-    /// Batches of the current file, not yet split.
-    queue: VecDeque<RecordBatch>,
+    /// The file being read.
+    current: Option<PartitionStream>,
     partials: Vec<RecordBatch>,
     /// Merged output batches.
     merged: VecDeque<RecordBatch>,
@@ -387,27 +573,32 @@ struct PartitionMerge {
 }
 
 impl PartitionMerge {
-    /// Queue the next output batch; `Ok(None)` when done.
+    /// The next output batch; `Ok(None)` when done.
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         loop {
             if let Some(batch) = self.merged.pop_front() {
                 return Ok(Some(batch));
             }
-            if let Some(batch) = self.queue.pop_front() {
-                if let Some(finals) = self.split(batch)? {
-                    return Ok(Some(finals));
+            if let Some(stream) = &mut self.current {
+                match stream.next().transpose()? {
+                    Some(batch) => {
+                        if let Some(finals) = self.split(batch)? {
+                            return Ok(Some(finals));
+                        }
+                    }
+                    None => self.current = None,
                 }
                 continue;
             }
             if let Some(path) = self.files.pop_front() {
-                let (schema, batches) = read_partition_file(&path)?;
-                if *schema != *self.input_schema {
+                let (_, stream) = open_partition_file(&path)?;
+                if *stream.schema() != *self.input_schema {
                     return Err(RasterH3Error::InvalidParameter(format!(
-                        "'{}' has other columns than the first partition file; merge the partitions of one scan",
+                        "'{}' changed while merging",
                         path.display()
                     )));
                 }
-                self.queue = batches.into();
+                self.current = Some(stream);
                 continue;
             }
             let Some(spec) = self.merge.take() else {
