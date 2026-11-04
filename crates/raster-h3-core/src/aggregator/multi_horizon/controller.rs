@@ -325,8 +325,25 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             None => rayon::current_num_threads().clamp(1, 8),
         }
         .min(worker_budget / per_pixel);
-        let batch_size = (worker_tasks * 2).min((n_chunks / 4).max(1));
         let worker_pixels = (worker_budget / worker_tasks / per_pixel).clamp(1, 16384);
+        // Horizon maps hold every cell of a batch until it is merged, so size
+        // batches by pixels, not chunks: about two waves of windows, which keeps
+        // every worker busy. Counting chunks made batches of large strips or
+        // tiles grow with the worker count, and fine resolutions then spilled.
+        let chunk_pixels = mosaic
+            .tiles
+            .iter()
+            .map(|t| {
+                t.reader.chunk_layout.chunk_width as usize
+                    * t.reader.chunk_layout.chunk_height as usize
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let batch_size = (2 * worker_tasks * worker_pixels)
+            .div_ceil(chunk_pixels)
+            .clamp(1, worker_tasks * 2)
+            .min((n_chunks / 4).max(1));
         let output_byte_limit = config.aggregation_budget_bytes / 4;
 
         Ok(Self {
