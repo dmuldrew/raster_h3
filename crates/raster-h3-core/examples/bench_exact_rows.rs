@@ -14,6 +14,7 @@
 //!
 //! `REPS` sets the repetitions per case (default 3) and `CASES` keeps only
 //! the cases whose label (e.g. `albers5070 30m rotated res [8]`) contains it.
+//! `PROFILE=1` prints where each continuous run's wall time went.
 
 #[path = "../tests/it/helpers.rs"]
 mod helpers;
@@ -66,6 +67,21 @@ fn continuous(path: &Path, res: &[u8], rotated: bool, out: &mut String) -> f64 {
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
+    if std::env::var_os("PROFILE").is_some() {
+        let m = streamer.metrics();
+        let ms = |ns: u64| ns as f64 * 1e-6;
+        eprintln!(
+            "  wall {:.0} ms: kernel {:.0} ms (worker cpu {:.0} ms), merge {:.0} ms, \
+             prefetch wait {:.0} ms; {} waves, {} jobs",
+            elapsed * 1e3,
+            ms(m.kernel_wall_ns),
+            ms(m.worker_ns),
+            ms(m.merge_ns),
+            ms(m.prefetch_wait_ns),
+            m.waves,
+            m.jobs
+        );
+    }
     rows.sort_by_key(|r| (r.0, r.1));
     for (res, cell, count, sum, min, max) in rows {
         writeln!(out, "{res} {cell:x} {count} {sum} {min} {max}").unwrap();
