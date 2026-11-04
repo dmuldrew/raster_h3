@@ -9,14 +9,17 @@
 //! pattern and resolution count, not by row or raster size.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
-use h3o::{GeographicRow, LatLng, LatLngIndexer, Resolution, RowPath};
+use h3o::{GeographicRow, LatLng, LatLngIndexer, Resolution, RowPath, SpanBounds};
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::aggregator::sampling::{SamplePoint, SamplingPattern};
-use crate::crs::transformer::{web_mercator_lat, web_mercator_lon, AlbersInverse, CrsTransformer};
+use crate::crs::transformer::{
+    mercator_line_bounds, web_mercator_lat, web_mercator_lon, wgs84_line_bounds, AlbersInverse,
+    CrsTransformer, RowPathBounds,
+};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::metadata::BandScaling;
 use crate::raster::mosaic::MosaicReader;
@@ -225,7 +228,7 @@ fn walk<T, Acc, E, N, R>(
     let pruner = RowPruner::new(ctx);
     let mut projector = SampleProjector::new(ctx);
     let mut runs = Runs::new(num_res, engine);
-    let mut row_indexer = ParallelRowIndexer::take(num_res, ctx.sampling.points.len());
+    let mut row_indexer = RowIndexer::take(num_res, ctx.sampling.points.len());
     let total_weight = ctx.sampling.points.iter().map(|sp| sp.weight).sum::<f64>();
     let mut positions: Vec<(LatLng, f64)> = Vec::with_capacity(ctx.sampling.points.len());
     let mut assignments: Vec<(u64, f64)> = Vec::with_capacity(ctx.sampling.points.len());
@@ -275,7 +278,7 @@ fn walk<T, Acc, E, N, R>(
         if batch && ctx.owner.is_none() && ctx.bbox.is_none() {
             let sp = ctx.sampling.points[0];
             let col_offset = chunk.col_offset as usize;
-            if let Some(mut path) = projector.parallel_row(row_idx, col_offset, 0, sp, &cols) {
+            if let Some(mut path) = projector.grid_row(row_idx, col_offset, 0, sp, &cols) {
                 row_indexer.walk(
                     &mut path,
                     cols.clone(),
@@ -419,6 +422,7 @@ enum RowCache<'a> {
 struct SampleProjector<'a> {
     transformer: CoordinateTransformer<'a>,
     gt: &'a GeoTransform,
+    crs: &'a CrsTransformer,
     cache: RowCache<'a>,
 }
 
@@ -442,6 +446,7 @@ impl<'a> SampleProjector<'a> {
         Self {
             transformer: CoordinateTransformer::new(ctx.gt, ctx.crs),
             gt: ctx.gt,
+            crs: ctx.crs,
             cache,
         }
     }
@@ -475,34 +480,48 @@ impl<'a> SampleProjector<'a> {
         }
     }
 
-    /// Sample point `k` of a north-up raster row, as an exact `RowPath`:
-    /// `point(c)` reproduces `project(col_offset + c, row_idx, k, sp)` bit for
-    /// bit. WGS84 and Web Mercator rows are parallels (constant
-    /// latitude, longitude affine in the column); Albers rows have constant
-    /// projected y, with bounds derived from the analytic inverse. `None`
-    /// keeps the per-pixel path (other CRSs, rotated grids, rows that may
-    /// reach a pole).
-    fn parallel_row(
+    /// Sample point `k` of a raster row, as an exact `RowPath`: `point(c)`
+    /// reproduces `project(col_offset + c, row_idx, k, sp)` bit for bit.
+    ///
+    /// North-up WGS84 and Web Mercator rows are parallels (constant latitude,
+    /// longitude affine in the column); north-up Albers rows have constant
+    /// projected y, with bounds derived from the analytic inverse. Rotated or
+    /// sheared rows (`gt.d != 0`) are straight lines of projected
+    /// coordinates, bounded per span. `None` keeps the per-pixel path (other
+    /// CRSs, rows that may reach a pole or the Albers cone apex).
+    fn grid_row(
         &self,
         row_idx: usize,
         col_offset: usize,
         k: usize,
         sp: SamplePoint,
         cols: &Range<usize>,
-    ) -> Option<ParallelRow<'_>> {
+    ) -> Option<GridRow<'_>> {
         if !exact_rows_enabled() {
             return None;
         }
         let gt = self.gt;
-        if ![gt.c0, gt.a, gt.b, sp.dx, sp.dy]
+        if ![gt.c0, gt.a, gt.b, gt.f0, gt.d, gt.e, sp.dx, sp.dy]
             .iter()
             .all(|v| v.is_finite())
         {
             return None;
         }
         let row = row_idx as f64 + sp.dy;
-        let (kind, speed, accel, noise) = match &self.cache {
-            RowCache::Wgs84(lats) | RowCache::Mercator(lats) => {
+        let mut path = GridRow {
+            gt,
+            row,
+            col_offset,
+            dx: sp.dx,
+            kind: RowKind::Wgs84Line,
+            bounds: RowPathBounds {
+                speed: 0.0,
+                accel: 0.0,
+                noise: 0.0,
+            },
+        };
+        match (&self.cache, self.crs) {
+            (RowCache::Wgs84(lats) | RowCache::Mercator(lats), _) => {
                 let lat = *lats.get(k)?;
                 if !(-90.0..=90.0).contains(&lat) {
                     return None;
@@ -515,42 +534,38 @@ impl<'a> SampleProjector<'a> {
                     gt.a
                 };
                 let bounds = GeographicRow::new(lat, 0.0, step);
-                (
-                    RowKind::Geographic { lat, mercator },
-                    bounds.speed_bound(),
-                    bounds.accel_bound(),
-                    0.0,
-                )
+                path.kind = RowKind::Geographic { lat, mercator };
+                path.bounds = RowPathBounds {
+                    speed: bounds.speed_bound(),
+                    accel: bounds.accel_bound(),
+                    noise: 0.0,
+                };
             }
-            RowCache::Albers(inverse, Some(yps)) => {
+            (RowCache::Albers(inverse, Some(yps)), _) => {
                 let (y_p, y_p_sq) = *yps.get(k)?;
                 // `index_row` samples `cols.start..=cols.end`.
-                let x_of = |c: usize| gt.pixel_to_coord((col_offset + c) as f64 + sp.dx, row).0;
-                let (x0, x1) = (x_of(cols.start), x_of(cols.end));
-                let bounds = inverse.row_path_bounds(x0.min(x1), x0.max(x1), y_p, gt.a)?;
-                (
-                    RowKind::Albers {
-                        inverse,
-                        y_p,
-                        y_p_sq,
-                    },
-                    bounds.speed,
-                    bounds.accel,
-                    bounds.noise,
-                )
+                let (x0, x1) = (path.coord(cols.start).0, path.coord(cols.end).0);
+                path.bounds = inverse.row_path_bounds(x0.min(x1), x0.max(x1), y_p, gt.a)?;
+                path.kind = RowKind::Albers {
+                    inverse,
+                    y_p,
+                    y_p_sq,
+                };
+            }
+            (RowCache::Albers(inverse, None), _) => {
+                path.kind = RowKind::AlbersLine(inverse);
+                path.bounds = path.line_bounds(cols.start, cols.end)?;
+            }
+            (RowCache::None, CrsTransformer::Wgs84Identity) => {
+                path.bounds = path.line_bounds(cols.start, cols.end)?;
+            }
+            (RowCache::None, CrsTransformer::WebMercatorFast) => {
+                path.kind = RowKind::MercatorLine;
+                path.bounds = path.line_bounds(cols.start, cols.end)?;
             }
             _ => return None,
-        };
-        Some(ParallelRow {
-            gt,
-            row,
-            col_offset,
-            dx: sp.dx,
-            kind,
-            speed,
-            accel,
-            noise,
-        })
+        }
+        Some(path)
     }
 
     /// Project sampling point k, skipping samples outside the projection's domain.
@@ -585,37 +600,76 @@ fn exact_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("RASTER_H3_EXACT_ROWS").map_or(true, |v| v != "0"))
 }
 
-/// How a [`ParallelRow`] turns projected x into a location.
+/// How a [`GridRow`] turns projected coordinates into a location.
 enum RowKind<'a> {
-    /// Constant latitude; longitude is x (WGS84) or `web_mercator_lon(x)`.
-    Geographic { lat: f64, mercator: bool },
-    /// Albers with the row's hoisted `y_p` terms.
+    /// North-up: constant latitude; longitude is x (WGS84) or
+    /// `web_mercator_lon(x)`.
+    Geographic {
+        lat: f64,
+        mercator: bool,
+    },
+    /// North-up Albers with the row's hoisted `y_p` terms.
     Albers {
         inverse: &'a AlbersInverse<'a>,
         y_p: f64,
         y_p_sq: f64,
     },
+    /// Rotated or sheared rows, where x and y both change along the row:
+    /// `CrsTransformer::transform_point(x, y)` for each CRS.
+    Wgs84Line,
+    MercatorLine,
+    AlbersLine(&'a AlbersInverse<'a>),
 }
 
-/// See [`SampleProjector::parallel_row`].
-struct ParallelRow<'a> {
+/// See [`SampleProjector::grid_row`].
+struct GridRow<'a> {
     gt: &'a GeoTransform,
     row: f64,
     col_offset: usize,
     dx: f64,
     kind: RowKind<'a>,
-    speed: f64,
-    accel: f64,
-    noise: f64,
+    /// Bounds for the whole call.
+    bounds: RowPathBounds,
 }
 
-impl RowPath for ParallelRow<'_> {
+impl GridRow<'_> {
+    /// Projected coordinates of column `c`, exactly as `SampleProjector`
+    /// computes them.
+    #[inline(always)]
+    fn coord(&self, c: usize) -> (f64, f64) {
+        self.gt
+            .pixel_to_coord((self.col_offset + c) as f64 + self.dx, self.row)
+    }
+
+    /// Bounds for the locations `first..=last` of a rotated or sheared row
+    /// (the `*Line` kinds): a straight line of projected coordinates.
+    fn line_bounds(&self, first: usize, last: usize) -> Option<RowPathBounds> {
+        let gt = self.gt;
+        let (start, end) = (self.coord(first), self.coord(last));
+        let step = (gt.a, gt.d);
+        let col = |c: usize| ((self.col_offset + c) as f64 + self.dx).abs();
+        let col_max = col(first).max(col(last));
+        // Magnitude of the terms `pixel_to_coord` sums, which sizes the
+        // rounding of x and y.
+        let coord_mag = gt.c0.abs()
+            + (col_max * gt.a).abs()
+            + (self.row * gt.b).abs()
+            + gt.f0.abs()
+            + (col_max * gt.d).abs()
+            + (self.row * gt.e).abs();
+        match self.kind {
+            RowKind::Wgs84Line => wgs84_line_bounds(start, end, step, coord_mag),
+            RowKind::MercatorLine => mercator_line_bounds(start, end, step, coord_mag),
+            RowKind::AlbersLine(inverse) => inverse.line_path_bounds(start, end, step, coord_mag),
+            RowKind::Geographic { .. } | RowKind::Albers { .. } => None,
+        }
+    }
+}
+
+impl RowPath for GridRow<'_> {
     #[inline]
     fn point(&mut self, c: usize) -> LatLng {
-        let x = self
-            .gt
-            .pixel_to_coord((self.col_offset + c) as f64 + self.dx, self.row)
-            .0;
+        let (x, y) = self.coord(c);
         let (lon, lat) = match self.kind {
             RowKind::Geographic { lat, mercator } => {
                 (if mercator { web_mercator_lon(x) } else { x }, lat)
@@ -625,27 +679,47 @@ impl RowPath for ParallelRow<'_> {
                 y_p,
                 y_p_sq,
             } => inverse.transform_with_yp(x, y_p, y_p_sq),
+            RowKind::Wgs84Line => (x, y),
+            RowKind::MercatorLine => (web_mercator_lon(x), web_mercator_lat(y)),
+            RowKind::AlbersLine(inverse) => inverse.transform_point(x, y),
         };
         LatLng::new(lat, lon).expect("finite coordinate")
     }
 
     fn speed_bound(&self) -> f64 {
-        self.speed
+        self.bounds.speed
     }
 
     fn accel_bound(&self) -> f64 {
-        self.accel
+        self.bounds.accel
     }
 
     fn noise_bound(&self) -> f64 {
-        self.noise
+        self.bounds.noise
+    }
+
+    /// Rotated rows report bounds per span: near a pole (WGS84, Web
+    /// Mercator) or the cone apex (Albers), the path-wide bounds can be much
+    /// looser than a short span's.
+    fn span_bounds(&mut self, first: usize, last: usize) -> Option<SpanBounds> {
+        let bounds = match self.kind {
+            RowKind::Geographic { .. } | RowKind::Albers { .. } => self.bounds,
+            RowKind::Wgs84Line | RowKind::MercatorLine | RowKind::AlbersLine(_) => {
+                self.line_bounds(first, last)?
+            }
+        };
+        Some(SpanBounds {
+            speed: bounds.speed,
+            accel: bounds.accel,
+            noise: bounds.noise,
+        })
     }
 }
 
 /// Indexes whole rows with `LatLngIndexer::index_row` and replays the cell
 /// changes through `Runs` exactly as the per-pixel loops would.
 #[derive(Default)]
-struct ParallelRowIndexer {
+struct RowIndexer {
     indexer: LatLngIndexer,
     /// (first column, cell) of each run of the current row, per resolution
     /// and sample point: `row_runs[i * num_samples + k]`.
@@ -657,12 +731,12 @@ struct ParallelRowIndexer {
 }
 
 thread_local! {
-    /// Per-thread `ParallelRowIndexer` reused across chunks, so a stream of
+    /// Per-thread `RowIndexer` reused across chunks, so a stream of
     /// small chunks doesn't reallocate (and regrow) its row buffers each time.
-    static ROW_INDEXER: RefCell<ParallelRowIndexer> = RefCell::default();
+    static ROW_INDEXER: RefCell<RowIndexer> = RefCell::default();
 }
 
-impl ParallelRowIndexer {
+impl RowIndexer {
     /// This thread's indexer, sized for `num_res * num_samples` row paths.
     /// Hand it back with [`Self::release`]; if the walk panics it is dropped
     /// and the next walk starts from empty buffers.
@@ -682,7 +756,7 @@ impl ParallelRowIndexer {
     }
 
     /// Index every sample point of a row. False keeps the per-pixel path, for
-    /// rows where some sample point has no `ParallelRow`.
+    /// rows where some sample point has no `GridRow`.
     fn index_samples(
         &mut self,
         projector: &SampleProjector<'_>,
@@ -699,7 +773,7 @@ impl ParallelRowIndexer {
         }
         let num_samples = self.num_samples;
         for (k, &sp) in ctx.sampling.points.iter().enumerate() {
-            let Some(mut path) = projector.parallel_row(row_idx, col_offset, k, sp, cols) else {
+            let Some(mut path) = projector.grid_row(row_idx, col_offset, k, sp, cols) else {
                 return false;
             };
             let row_runs = &mut self.row_runs;
@@ -779,7 +853,7 @@ impl ParallelRowIndexer {
     #[allow(clippy::too_many_arguments)]
     fn walk<T, Acc, E, R>(
         &mut self,
-        path: &mut ParallelRow<'_>,
+        path: &mut GridRow<'_>,
         cols: Range<usize>,
         row: &[T],
         spp: usize,
@@ -1270,5 +1344,179 @@ mod tests {
         let nine = SamplingPattern::nine_point();
         let cols = pruned(160.0, [170.0, -20.0, 171.0, -15.0], &nine).unwrap();
         assert!(cols.start <= 99 && cols.end >= 111);
+    }
+
+    /// A rotated `GeoTransform` with `size` units per pixel, turned by
+    /// `angle` radians, and a little extra shear.
+    fn rotated_gt(c0: f64, f0: f64, size: f64, angle: f64) -> GeoTransform {
+        let (sin, cos) = angle.sin_cos();
+        GeoTransform {
+            c0,
+            a: size * cos,
+            b: size * (sin + 0.05),
+            f0,
+            d: size * sin,
+            e: -size * cos,
+        }
+    }
+
+    /// Rotated and sheared rows go through `index_row` (with per-span
+    /// bounds), and every pixel gets the cell the per-pixel projection gives.
+    #[test]
+    fn rotated_rows_index_like_per_pixel_projection() {
+        use crate::crs::transformer::AlbersConicFast;
+        use h3o::CellIndex;
+
+        if !exact_rows_enabled() {
+            return;
+        }
+        let resolutions = [
+            Resolution::Five,
+            Resolution::Eight,
+            Resolution::Ten,
+            Resolution::Twelve,
+        ];
+        let width = 3000;
+        let chunk = RasterChunk {
+            col_offset: 1_000,
+            row_offset: 0,
+            width,
+            height: 1,
+        };
+        let cases = [
+            // (CRS, origin x, origin y, pixel size)
+            (CrsTransformer::Wgs84Identity, -105.2, 40.1, 2.7e-4),
+            (CrsTransformer::Wgs84Identity, 12.0, -71.5, 1e-3),
+            (CrsTransformer::Wgs84Identity, 179.5, 3.0, 8e-5),
+            (
+                CrsTransformer::WebMercatorFast,
+                -13_627_665.0,
+                4_547_675.0,
+                30.0,
+            ),
+            (
+                CrsTransformer::WebMercatorFast,
+                2_000_000.0,
+                -9_000_000.0,
+                75.0,
+            ),
+            (
+                CrsTransformer::AlbersConic(AlbersConicFast::epsg_5070()),
+                -1_500_000.0,
+                2_100_000.0,
+                30.0,
+            ),
+            (
+                CrsTransformer::AlbersConic(AlbersConicFast::with_offsets(
+                    -18.0, -36.0, -25.0, 132.0, 12345.0, -9876.0,
+                )),
+                -400_000.0,
+                -1_200_000.0,
+                90.0,
+            ),
+        ];
+        let (mut rows, mut decisions) = (0, 0);
+        for (n, (crs, x0, y0, size)) in cases.iter().enumerate() {
+            for angle in [0.01_f64, -0.3, 0.7, 1.2] {
+                let gt = rotated_gt(*x0, *y0, *size, angle);
+                for sampling in [SamplingPattern::center(), SamplingPattern::rgss()] {
+                    let ctx = WalkContext {
+                        chunk: &chunk,
+                        resolutions: &resolutions,
+                        crs,
+                        gt: &gt,
+                        sampling: &sampling,
+                        bbox: None,
+                        stride: width,
+                        samples_per_pixel: 1,
+                        owner: None,
+                        band_scaling: &[],
+                        alpha_sample: None,
+                    };
+                    let mut projector = SampleProjector::new(&ctx);
+                    let col_offset = chunk.col_offset as usize;
+                    let cols = 0..width as usize;
+                    for row_idx in [0, 1_777] {
+                        projector.start_row(&ctx, row_idx);
+                        for (k, &sp) in sampling.points.iter().enumerate() {
+                            let mut path = projector
+                                .grid_row(row_idx, col_offset, k, sp, &cols)
+                                .unwrap_or_else(|| panic!("case {n} angle {angle}: no row path"));
+                            let mut cells = vec![vec![None::<CellIndex>; cols.len()]; 4];
+                            let stats = LatLngIndexer::new().index_row(
+                                &mut path,
+                                cols.clone(),
+                                &resolutions,
+                                |i, span, cell| cells[i][span].fill(Some(cell)),
+                            );
+                            rows += 1;
+                            decisions += stats.decisions;
+                            for c in cols.clone() {
+                                let (lon, lat) =
+                                    projector.project(col_offset + c, row_idx, k, sp).unwrap();
+                                assert!((-90.0..=90.0).contains(&lat));
+                                let ll = LatLng::new(lat, lon).unwrap();
+                                assert_eq!(path.point(c), ll, "case {n} col {c}");
+                                for (i, &res) in resolutions.iter().enumerate() {
+                                    assert_eq!(
+                                        cells[i][c],
+                                        Some(ll.to_cell(res)),
+                                        "case {n} angle {angle} row {row_idx} col {c} {res:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, cases.len() * 4 * 2 * (1 + 4));
+        // Most pixels are decided by interpolation, not `to_cell`.
+        assert!(decisions > rows * 4 * 100, "only {decisions} decisions");
+    }
+
+    /// Rotated rows that reach a pole (WGS84) or leave Web Mercator's range
+    /// keep the per-pixel path.
+    #[test]
+    fn rotated_rows_near_poles_keep_per_pixel_path() {
+        if !exact_rows_enabled() {
+            return;
+        }
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 100,
+            height: 1,
+        };
+        let sampling = SamplingPattern::center();
+        for (crs, gt) in [
+            // Latitude passes 90 (WGS84) or 89 (Web Mercator, y = 4e7 is 89.8°).
+            (
+                CrsTransformer::Wgs84Identity,
+                rotated_gt(10.0, 89.9, 0.01, 1.0),
+            ),
+            (
+                CrsTransformer::WebMercatorFast,
+                rotated_gt(0.0, 4.0e7, 1_000.0, 0.5),
+            ),
+        ] {
+            let ctx = WalkContext {
+                chunk: &chunk,
+                resolutions: &[Resolution::Nine],
+                crs: &crs,
+                gt: &gt,
+                sampling: &sampling,
+                bbox: None,
+                stride: 100,
+                samples_per_pixel: 1,
+                owner: None,
+                band_scaling: &[],
+                alpha_sample: None,
+            };
+            let mut projector = SampleProjector::new(&ctx);
+            projector.start_row(&ctx, 0);
+            let sp = sampling.points[0];
+            assert!(projector.grid_row(0, 0, 0, sp, &(0..100)).is_none());
+        }
     }
 }

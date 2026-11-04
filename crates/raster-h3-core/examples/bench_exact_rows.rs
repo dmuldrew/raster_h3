@@ -1,6 +1,7 @@
 //! A/B harness for exact row indexing (`h3o::LatLngIndexer::index_row`).
 //!
-//! Streams north-up WGS84 and Web Mercator rasters and prints the median wall
+//! Streams WGS84, Web Mercator and Albers rasters (north-up, and rotated by
+//! [`ROTATION`] radians through the geotransform) and prints the median wall
 //! time per case, plus a fingerprint of every output record (resolution, cell,
 //! count, sum, min, max). Pixel values are small integers, so the sums are
 //! exact whatever the merge order and fingerprints must match bit for bit.
@@ -10,6 +11,9 @@
 //! RASTER_H3_EXACT_ROWS=1 cargo run --release -p raster-h3-core --example bench_exact_rows -- on.txt
 //! diff off.txt on.txt
 //! ```
+//!
+//! `REPS` sets the repetitions per case (default 3) and `CASES` keeps only
+//! the cases whose label (e.g. `albers5070 30m rotated res [8]`) contains it.
 
 #[path = "../tests/it/helpers.rs"]
 mod helpers;
@@ -31,8 +35,22 @@ fn value(col: u32, row: u32) -> f32 {
     }
 }
 
-fn continuous(path: &Path, res: &[u8], out: &mut String) -> f64 {
-    let reader = GeoTiffStreamReader::open(path).unwrap();
+/// Angle of the rotated cases (about 17°).
+const ROTATION: f64 = 0.3;
+
+fn open(path: &Path, rotated: bool) -> GeoTiffStreamReader {
+    let mut reader = GeoTiffStreamReader::open(path).unwrap();
+    if rotated {
+        let gt = &mut reader.metadata.geotransform;
+        let size = gt.a;
+        let (sin, cos) = ROTATION.sin_cos();
+        (gt.a, gt.b, gt.d, gt.e) = (size * cos, size * sin, size * sin, -size * cos);
+    }
+    reader
+}
+
+fn continuous(path: &Path, res: &[u8], rotated: bool, out: &mut String) -> f64 {
+    let reader = open(path, rotated);
     let config = MultiResolutionConfig::new(res.to_vec());
     let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
     let start = Instant::now();
@@ -55,8 +73,8 @@ fn continuous(path: &Path, res: &[u8], out: &mut String) -> f64 {
     elapsed
 }
 
-fn categorical(path: &Path, res: &[u8], out: &mut String) -> f64 {
-    let reader = GeoTiffStreamReader::open(path).unwrap();
+fn categorical(path: &Path, res: &[u8], rotated: bool, out: &mut String) -> f64 {
+    let reader = open(path, rotated);
     let config = MultiResolutionConfig::new(res.to_vec());
     let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
     let start = Instant::now();
@@ -90,6 +108,8 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
+    // Only run cases whose label ("name res [..]") contains this.
+    let filter = std::env::var("CASES").unwrap_or_default();
     let mode = std::env::var("RASTER_H3_EXACT_ROWS").unwrap_or_else(|_| "1".into());
     let size = 3000;
 
@@ -121,42 +141,64 @@ fn main() {
 
     let mut fingerprint = String::new();
     println!("mode RASTER_H3_EXACT_ROWS={mode}, {size}x{size} px, median of {reps}");
-    let cases: [(&str, &Path, &[u8], bool); 14] = [
-        ("wgs84 27m", &wgs84.1, &[6], false),
-        ("wgs84 27m", &wgs84.1, &[8], false),
-        ("wgs84 27m", &wgs84.1, &[9], false),
-        ("wgs84 27m", &wgs84.1, &[10], false),
-        ("wgs84 27m", &wgs84.1, &[6, 8, 10], false),
-        ("mercator 30m", &mercator.1, &[8], false),
-        ("mercator 30m", &mercator.1, &[6, 8, 10], false),
-        ("wgs84 27m categorical", &classes.1, &[8], true),
-        ("wgs84 27m categorical", &classes.1, &[6, 8, 10], true),
-        ("albers5070 30m", &albers.1, &[8], false),
-        ("albers5070 30m", &albers.1, &[9], false),
-        ("albers5070 30m", &albers.1, &[10], false),
-        ("albers5070 30m", &albers.1, &[6, 8, 10], false),
+    let cases: [(&str, &Path, &[u8], bool, bool); 20] = [
+        ("wgs84 27m", &wgs84.1, &[6], false, false),
+        ("wgs84 27m", &wgs84.1, &[8], false, false),
+        ("wgs84 27m", &wgs84.1, &[9], false, false),
+        ("wgs84 27m", &wgs84.1, &[10], false, false),
+        ("wgs84 27m", &wgs84.1, &[6, 8, 10], false, false),
+        ("mercator 30m", &mercator.1, &[8], false, false),
+        ("mercator 30m", &mercator.1, &[6, 8, 10], false, false),
+        ("wgs84 27m categorical", &classes.1, &[8], true, false),
+        (
+            "wgs84 27m categorical",
+            &classes.1,
+            &[6, 8, 10],
+            true,
+            false,
+        ),
+        ("albers5070 30m", &albers.1, &[8], false, false),
+        ("albers5070 30m", &albers.1, &[9], false, false),
+        ("albers5070 30m", &albers.1, &[10], false, false),
+        ("albers5070 30m", &albers.1, &[6, 8, 10], false, false),
         (
             "albers5070 30m categorical",
             &albers_classes.1,
             &[6, 8, 10],
             true,
+            false,
+        ),
+        ("wgs84 27m rotated", &wgs84.1, &[8], false, true),
+        ("wgs84 27m rotated", &wgs84.1, &[10], false, true),
+        ("mercator 30m rotated", &mercator.1, &[8], false, true),
+        ("albers5070 30m rotated", &albers.1, &[8], false, true),
+        ("albers5070 30m rotated", &albers.1, &[10], false, true),
+        (
+            "albers5070 30m rotated",
+            &albers.1,
+            &[6, 8, 10],
+            false,
+            true,
         ),
     ];
-    for (name, path, res, is_cat) in cases {
+    for (name, path, res, is_cat, rotated) in cases {
+        if !format!("{name} res {res:?}").contains(filter.as_str()) {
+            continue;
+        }
         let mut times = Vec::new();
         let mut out = String::new();
         for _ in 0..reps {
             out.clear();
             times.push(if is_cat {
-                categorical(path, res, &mut out)
+                categorical(path, res, rotated, &mut out)
             } else {
-                continuous(path, res, &mut out)
+                continuous(path, res, rotated, &mut out)
             });
         }
         times.sort_by(f64::total_cmp);
         let lines = out.lines().count();
         println!(
-            "{name:<24} res {res:?}: {:>8.3} s  ({lines} records)",
+            "{name:<26} res {res:?}: {:>8.3} s  ({lines} records)",
             times[reps / 2]
         );
         writeln!(fingerprint, "# {name} {res:?}").unwrap();
