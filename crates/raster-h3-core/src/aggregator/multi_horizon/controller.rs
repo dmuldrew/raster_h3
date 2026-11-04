@@ -11,6 +11,7 @@
 //! optionally limited (`compaction_budget_bytes`). Metadata is not budgeted.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
+use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -44,6 +45,8 @@ type WindowJob<'a> = (
 );
 /// One worker's per-resolution cell maps.
 type CellMaps<A> = Vec<HashMap<u64, A, H3BuildHasher>>;
+/// Per resolution, `(cell, compute_cell_south_lat(cell))` in map order.
+type SouthKeys = Vec<Vec<(u64, f64)>>;
 
 /// Dedicated aggregation pool of `threads` workers, shared by all live
 /// streams requesting the same size so concurrent queries do not each spawn
@@ -192,6 +195,9 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     output_byte_limit: usize,
     peak_active_bytes: usize,
     worker_maps: Vec<CellMaps<K::Accumulator>>,
+    /// Per worker map set and resolution: eviction keys the worker computed
+    /// for cells new to the horizon map. Reused across waves.
+    worker_south_keys: Vec<SouthKeys>,
     metrics: super::profile::StreamProfile,
     /// Set for partitioned scans (`MultiResolutionConfig::partition`).
     partition: Option<PartitionOutput<K::Accumulator>>,
@@ -365,6 +371,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         .collect()
                 })
                 .collect(),
+            worker_south_keys: Vec::new(),
             metrics: super::profile::StreamProfile {
                 worker_map_sets: worker_tasks as u64,
                 ..Default::default()
@@ -476,16 +483,41 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         Ok(())
     }
 
+    /// Merge one job's worker maps into the horizon maps. `south_keys[i]`
+    /// holds the eviction keys the worker precomputed for resolution `i`'s
+    /// cells that were new to the horizon map, in the map's iteration order;
+    /// a cell missing from it gets its key computed here.
     fn merge_window(
         &mut self,
         maps: &mut [HashMap<u64, K::Accumulator, H3BuildHasher>],
+        south_keys: &[Vec<(u64, f64)>],
     ) -> Result<()> {
         for (i, map) in maps.iter_mut().enumerate() {
+            let precomputed = south_keys.get(i).map_or(&[][..], Vec::as_slice);
+            let mut cursor = 0;
             for (key, acc) in map.drain() {
                 if acc.memory_bytes() > self.accumulator_limit {
                     return Err(RasterH3Error::InvalidParameter("single accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
                 }
-                if self.resolution_shards[i].merge_owned(key, acc) > self.accumulator_limit {
+                // `drain` visits keys in the order the worker listed them, so
+                // a matching entry is always next. The key may already be in
+                // the horizon map (another worker merged it first); then the
+                // entry is skipped unused.
+                let south = match precomputed.get(cursor) {
+                    Some(&(k, south)) if k == key => {
+                        cursor += 1;
+                        Some(south)
+                    }
+                    _ => None,
+                };
+                let fallbacks = &mut self.metrics.eviction_key_fallbacks;
+                let merged = self.resolution_shards[i].merge_owned_with(key, acc, || {
+                    south.unwrap_or_else(|| {
+                        *fallbacks += 1;
+                        compute_cell_south_lat(key)
+                    })
+                });
+                if merged > self.accumulator_limit {
                     return Err(RasterH3Error::InvalidParameter("merged accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
                 }
                 self.peak_active_bytes = self.peak_active_bytes.max(
@@ -512,6 +544,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     ) -> Result<()> {
         use super::borrowed::BorrowedSamples;
         let mut maps = std::mem::take(&mut self.worker_maps);
+        let mut south_keys = std::mem::take(&mut self.worker_south_keys);
+        south_keys.resize_with(maps.len(), Vec::new);
         let result = (|| {
             let mut index = 0;
             let (mut row, mut col) = (0usize, 0usize);
@@ -576,7 +610,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 }
                 let t = std::time::Instant::now();
                 let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
-                let process = |(job, maps): (&WindowJob<'_>, &mut CellMaps<K::Accumulator>)| {
+                let process = |((job, maps), keys): (
+                    (&WindowJob<'_>, &mut CellMaps<K::Accumulator>),
+                    &mut SouthKeys,
+                )| {
                     peak.fetch_max(
                         active.fetch_add(1, Ordering::Relaxed) + 1,
                         Ordering::Relaxed,
@@ -608,13 +645,34 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         self.nodata.or(tile.reader.metadata.nodata),
                         maps,
                     );
+                    // Eviction keys cost a cell-boundary computation each, so
+                    // compute them here, in parallel, for the cells the serial
+                    // merge will insert. The horizon maps are read-only here.
+                    keys.resize_with(maps.len(), Vec::new);
+                    for ((map, shard), out) in maps
+                        .iter()
+                        .zip(&self.resolution_shards)
+                        .zip(keys.iter_mut())
+                    {
+                        out.clear();
+                        if shard.tracks_eviction() {
+                            out.extend(
+                                map.keys()
+                                    .filter(|&&key| !shard.contains(key))
+                                    .map(|&key| (key, compute_cell_south_lat(key))),
+                            );
+                        }
+                    }
                     active.fetch_sub(1, Ordering::Relaxed);
                     (scope.snapshot(), start.elapsed().as_nanos() as u64)
                 };
                 results.clear();
-                let parallel = |maps: &mut [CellMaps<K::Accumulator>], results: &mut Vec<_>| {
+                let parallel = |maps: &mut [CellMaps<K::Accumulator>],
+                                keys: &mut [SouthKeys],
+                                results: &mut Vec<_>| {
                     jobs.par_iter()
                         .zip(maps.par_iter_mut())
+                        .zip(keys.par_iter_mut())
                         .map(&process)
                         .collect_into_vec(results)
                 };
@@ -629,22 +687,36 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 match &self.pool {
                     Some(pool) if pool.current_thread_index().is_some() => {
                         self.metrics.serial_waves += 1;
-                        results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
+                        results.extend(
+                            jobs.iter()
+                                .zip(maps.iter_mut())
+                                .zip(south_keys.iter_mut())
+                                .map(&process),
+                        )
                     }
                     Some(pool) if rayon::current_thread_index().is_some() => {
                         self.metrics.bridged_waves += 1;
                         std::thread::scope(|s| {
-                            s.spawn(|| pool.install(|| parallel(&mut maps, &mut results)))
-                                .join()
-                                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                            s.spawn(|| {
+                                pool.install(|| parallel(&mut maps, &mut south_keys, &mut results))
+                            })
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
                         })
                     }
-                    Some(pool) => pool.install(|| parallel(&mut maps, &mut results)),
+                    Some(pool) => {
+                        pool.install(|| parallel(&mut maps, &mut south_keys, &mut results))
+                    }
                     None if rayon::current_thread_index().is_some() => {
                         self.metrics.serial_waves += 1;
-                        results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
+                        results.extend(
+                            jobs.iter()
+                                .zip(maps.iter_mut())
+                                .zip(south_keys.iter_mut())
+                                .map(&process),
+                        )
                     }
-                    None => parallel(&mut maps, &mut results),
+                    None => parallel(&mut maps, &mut south_keys, &mut results),
                 }
                 self.metrics.peak_concurrent_jobs = self
                     .metrics
@@ -675,8 +747,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     .sum();
                 self.metrics.peak_worker_bytes = self.metrics.peak_worker_bytes.max(bytes);
                 let t = std::time::Instant::now();
-                for m in &mut maps {
-                    self.merge_window(m)?;
+                // Map sets past this wave's jobs are empty; their key lists may
+                // be stale, so pair only the sets that ran.
+                for (m, keys) in maps.iter_mut().zip(&south_keys).take(jobs.len()) {
+                    self.merge_window(m, keys)?;
                 }
                 let ns = t.elapsed().as_nanos() as u64;
                 self.metrics.merge_ns += ns;
@@ -690,6 +764,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             Ok(())
         })();
         self.worker_maps = maps;
+        self.worker_south_keys = south_keys;
         result
     }
 
@@ -871,6 +946,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         self.compactor.clear();
         self.resolution_shards.clear();
         self.worker_maps.clear();
+        self.worker_south_keys.clear();
         self.spill_runs.clear();
         self.final_reader = None;
         self.lifecycle.latch_failure(reason)
