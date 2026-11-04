@@ -168,3 +168,98 @@ fn grid_shift_datums_are_rejected_clearly() {
         }
     }
 }
+
+
+#[test]
+fn raster_cell_assignment_uses_independent_proj_datum_references() {
+    use crate::helpers::TestGeoTiffBuilder;
+    use h3o::{LatLng, Resolution};
+    use raster_h3_core::aggregator::multi_horizon::{
+        MultiResolutionConfig, MultiScanHorizonStreamer,
+    };
+    use raster_h3_core::raster::GeoTiffStreamReader;
+    use std::collections::HashMap;
+
+    for r in REFERENCES {
+        // The sole pixel's center is the PROJ reference coordinate. Expected
+        // locations never pass through the production CRS transformer.
+        let (_file, path) = TestGeoTiffBuilder::new(1, 1)
+            .origin(r.xy.0 - 0.5, r.xy.1 + 0.5)
+            .pixel_size(1.0)
+            .epsg(u16::try_from(r.epsg).unwrap())
+            .create_f32_tempfile(|_, _| 7.0);
+        let cfg = MultiResolutionConfig {
+            resolutions: vec![5, 9, 12],
+            strict_transforms: true,
+            ..Default::default()
+        };
+        let reader = GeoTiffStreamReader::open(&path).unwrap();
+        let mut stream = MultiScanHorizonStreamer::new(reader, &cfg).unwrap();
+        let mut actual = HashMap::new();
+        loop {
+            let batch = stream.fetch_next_batch(16).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for record in batch {
+                assert!(actual
+                    .insert((record.resolution, record.h3_index), record.accumulator)
+                    .is_none());
+            }
+        }
+        assert_eq!(actual.len(), cfg.resolutions.len(), "EPSG:{}", r.epsg);
+        for resolution in cfg.resolutions {
+            // h3o is shared; the datum/projection oracle is independent PROJ.
+            let expected = LatLng::new(r.same_helmert.1, r.same_helmert.0)
+                .unwrap()
+                .to_cell(Resolution::try_from(resolution).unwrap());
+            let acc = actual
+                .get(&(resolution, u64::from(expected)))
+                .unwrap_or_else(|| panic!("EPSG:{} res {resolution}: expected {expected}", r.epsg));
+            assert_eq!(acc.count, 1.0);
+            assert_eq!(acc.sum, 7.0);
+        }
+    }
+}
+
+#[test]
+fn geographic_pixel_weights_are_not_ground_area_weights() {
+    use crate::helpers::TestGeoTiffBuilder;
+    use raster_h3_core::aggregator::multi_horizon::{
+        MultiResolutionConfig, MultiScanHorizonStreamer,
+    };
+    use raster_h3_core::raster::GeoTiffStreamReader;
+
+    for north in [1.0_f64, 61.0] {
+        let (_file, path) = TestGeoTiffBuilder::new(1, 2)
+            .origin(10.0, north)
+            .pixel_size(1.0)
+            .create_f32_tempfile(|_, row| if row == 0 { 0.0 } else { 100.0 });
+        let reader = GeoTiffStreamReader::open(&path).unwrap();
+        let mut stream =
+            MultiScanHorizonStreamer::new(reader, &MultiResolutionConfig::single(3)).unwrap();
+        let (mut count, mut sum) = (0.0, 0.0);
+        loop {
+            let batch = stream.fetch_next_batch(16).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for record in batch {
+                count += record.accumulator.count;
+                sum += record.accumulator.sum;
+            }
+        }
+        assert_eq!(count, 2.0);
+        assert_eq!(sum / count, 50.0);
+        // Exact spherical areas of equal-longitude rectangles are proportional
+        // to sin(north) - sin(south). Radius and longitude width cancel.
+        let upper = north.to_radians().sin() - (north - 1.0).to_radians().sin();
+        let lower = (north - 1.0).to_radians().sin() - (north - 2.0).to_radians().sin();
+        let area_mean = 100.0 * lower / (upper + lower);
+        if north == 1.0 {
+            assert!((area_mean - 50.0).abs() < 1e-12);
+        } else {
+            assert!((area_mean - 50.0).abs() > 0.7);
+        }
+    }
+}
