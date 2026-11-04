@@ -3149,6 +3149,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "datafusion",
+ "flate2",
  "futures",
  "h3o",
  "raster-h3-core",
