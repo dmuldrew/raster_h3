@@ -111,11 +111,10 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
-DuckDB has the most scan options (sub-pixel sampling, band
-selection, spectral formulas, quantiles, category remapping) and exports straight to Parquet or
-PMTiles with `COPY ... TO`. Saving `canopy_h3` as a table means the raster is read once and
-reused by later queries. A `WHERE` clause runs only after every hexagon is computed; to read
-less of the raster, pass options such as `bbox := '...'` or `min_count := ...` to the scan.
+DuckDB alone offers compaction, single-cell lookups (`h3_cell`) and thread and memory budgets
+for very large rasters. Saving `canopy_h3` as a table means the raster is read once and reused
+by later queries. A `WHERE` clause runs only after every hexagon is computed; to read less of
+the raster, pass options such as `bbox := '...'` or `min_count := ...` to the scan.
 
 #### Python & Polars
 
@@ -160,13 +159,12 @@ result = (
 )
 ```
 
-In Polars, the raster is a `LazyFrame`, read only when `.collect()` runs,
-and it combines freely with other Polars and GeoPandas data. `columns=` limits the work to the
-columns you ask for, but `.filter()` runs after every hexagon is computed; pass
-`bbox=tracts.total_bounds` to read less of the raster. Sampling, band selection, spectral
-formulas and quantiles aren't available from Python. `h3_polygon_to_cells` takes one geometry
-at a time, hence the list comprehension, and the `UInt64` cast matches the scan's `h3_index`.
-See the [Python scan parameters](docs/engines/python-polars.md#scan-parameters).
+In Polars, the raster is a `LazyFrame`, read only when `.collect()` runs, and it combines freely
+with other Polars and GeoPandas data. `columns=` and `.filter()` comparisons on `count`, `mean`,
+`majority_fraction` or `resolution` are pushed into the scan, but spatial conditions are
+not; pass `bbox=tracts.total_bounds` to read less of the raster. `h3_polygon_to_cells`
+takes one geometry at a time, hence the list comprehension, and the `UInt64` cast matches the
+scan's `h3_index`. See the [Python scan parameters](docs/engines/python-polars.md#scan-parameters).
 
 #### SedonaDB (Python)
 
@@ -221,8 +219,8 @@ result = sd.sql("""
 ```
 
 In SedonaDB, the tracts don't need converting to hexagons; the join
-matches hexagon shapes to tract shapes directly. It is also the only one of the three that reads
-the `WHERE` clause to skip raster: a condition against a fixed shape, such as
+matches hexagon shapes to tract shapes directly. It is also the only one of the three that skips
+raster from a spatial condition: a condition against a fixed shape, such as
 `ST_Intersects(wkb, ST_GeomFromWKT(...))`, limits the scan to the tiles near it, and
 `resolution = 8` or `majority_fraction >= 0.5` narrow it further. To join on hex ids instead, as
 DuckDB and Polars do, see [DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
