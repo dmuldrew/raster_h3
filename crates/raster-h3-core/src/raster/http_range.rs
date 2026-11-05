@@ -580,6 +580,16 @@ impl RemoteHttpSource {
 
     /// Fetch an arbitrary byte range directly from the remote server with retry
     pub fn fetch_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        // Servers that ignore Range headers hand us the complete file at probe
+        // time; serve ranged requests from that cache — the server could not
+        // answer them over HTTP anyway.
+        if self.cache.is_complete() && start <= end && end < self.total_size {
+            let mut buf = vec![0u8; (end - start + 1) as usize];
+            if let Some(n) = self.cache.copy_from_complete(start, &mut buf)? {
+                buf.truncate(n);
+                return Ok(buf);
+            }
+        }
         self.transport
             .fetch_range(start, end, Some(self.total_size))
     }
@@ -852,5 +862,30 @@ mod tests {
         assert!(source.read_exact_range(1, usize::MAX).is_err());
         assert!(source.read_exact_range(u64::MAX, 2).is_err());
         assert_eq!(source.read_exact_range(5, 0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn fetch_range_serves_complete_file_from_cache() {
+        let data: Vec<u8> = (0..100).collect();
+        let cache = ByteCache::new_with_complete(data.clone(), 16);
+        let transport = HttpTransport::new("http://example.com/test.tif").unwrap();
+        let source = RemoteHttpSource {
+            url: "http://example.com/test.tif".to_string(),
+            total_size: data.len() as u64,
+            transport,
+            cache,
+        };
+
+        // Servers that ignore Range headers hand us the complete file at probe
+        // time; fetch_range must serve from that cache rather than issuing an
+        // HTTP request the server cannot honor anyway.
+        assert_eq!(source.fetch_range(0, 9).unwrap(), data[..10]);
+        assert_eq!(source.fetch_range(90, 99).unwrap(), data[90..]);
+        assert_eq!(source.fetch_range(0, 99).unwrap(), data);
+
+        // Out-of-bounds and inverted ranges are still rejected by transport
+        // validation before any request.
+        assert!(source.fetch_range(99, 100).is_err());
+        assert!(source.fetch_range(50, 40).is_err());
     }
 }
