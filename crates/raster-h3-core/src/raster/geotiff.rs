@@ -588,13 +588,19 @@ impl<'a> ChunkDecoder<'a> {
             CompressionMethod::Deflate | CompressionMethod::OldDeflate => {
                 let decompressor = libdeflater
                     .ok_or_else(|| RasterH3Error::InvalidMetadata("no decompressor".into()))?;
-                let decomp_res = decompressor.zlib_decompress(compressed, out);
-                let decomp_ok = match decomp_res {
-                    Ok(_) => true,
-                    Err(_) => decompressor.deflate_decompress(compressed, out).is_ok(),
+                // zlib_decompress/deflate_decompress return the number of bytes
+                // written; a chunk that decompresses short leaves stale bytes in
+                // the buffer tail, so the output must exactly fill `out`.
+                let decompressed = match decompressor.zlib_decompress(compressed, out) {
+                    Ok(n) => n,
+                    Err(_) => decompressor
+                        .deflate_decompress(compressed, out)
+                        .map_err(|_| RasterH3Error::InvalidMetadata("decompress failed".into()))?,
                 };
-                if !decomp_ok {
-                    return Err(RasterH3Error::InvalidMetadata("decompress failed".into()));
+                if decompressed != out.len() {
+                    return Err(RasterH3Error::InvalidMetadata(
+                        "deflate chunk did not fill its declared layout".into(),
+                    ));
                 }
             }
             CompressionMethod::LZW => {
@@ -1128,5 +1134,52 @@ impl GeoTiffStreamReader {
     pub fn read_chunk(&self, chunk_index: u32) -> Result<(RasterChunk, DecodingResult)> {
         let mut decoder = self.open_decoder()?;
         decoder.read_chunk(chunk_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deflate_compress(src: &[u8]) -> Vec<u8> {
+        let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+        let mut out = vec![0u8; compressor.deflate_compress_bound(src.len())];
+        let n = compressor.deflate_compress(src, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    // Regression: a deflate chunk decompressing short used to be accepted,
+    // leaving stale bytes from the previous chunk in the buffer tail.
+    #[test]
+    fn deflate_short_fill_is_rejected() {
+        let compressed = deflate_compress(&[1, 2, 3, 4]);
+        let mut decompressor = libdeflater::Decompressor::new();
+        let mut out = [0xAAu8; 16];
+        assert!(ChunkDecoder::decode_chunk_bytes_into(
+            Some(&mut decompressor),
+            None,
+            CompressionMethod::Deflate,
+            &compressed,
+            &mut out,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn deflate_exact_fill_is_accepted() {
+        let payload = [9u8; 16];
+        let compressed = deflate_compress(&payload);
+        let mut decompressor = libdeflater::Decompressor::new();
+        let mut out = [0u8; 16];
+        ChunkDecoder::decode_chunk_bytes_into(
+            Some(&mut decompressor),
+            None,
+            CompressionMethod::Deflate,
+            &compressed,
+            &mut out,
+        )
+        .expect("exact-fill deflate chunk decodes");
+        assert_eq!(out, payload);
     }
 }
