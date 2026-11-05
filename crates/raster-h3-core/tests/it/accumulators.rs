@@ -517,3 +517,20 @@ fn apply_affine_matches_accumulating_transformed_values() {
     empty.apply_affine(-3.0, 1.0);
     assert_eq!(empty, H3Accumulator::default());
 }
+
+#[test]
+fn weighted_sample_variance_handles_fractional_weights_and_merges() {
+    // Weighted sample variance uses M2 / (W - sum(w_i^2) / W).
+    // For 100 and 200 with weights 0.4 and 0.6, M2 is 2400 and
+    // the denominator is 0.48, giving 5000.
+    for factor in [0.5, 1.0, 2.0, 10.0] {
+        let mut direct = H3Accumulator::new_weighted(100.0, 0.4 * factor);
+        direct.update_weighted(200.0, 0.6 * factor);
+        assert!((direct.variance() - 5000.0).abs() < 1e-8);
+        assert!((direct.stddev() - 5000.0_f64.sqrt()).abs() < 1e-8);
+
+        let mut merged = H3Accumulator::new_weighted(100.0, 0.4 * factor);
+        merged.merge(&H3Accumulator::new_weighted(200.0, 0.6 * factor));
+        assert!((merged.variance() - direct.variance()).abs() < 1e-8);
+    }
+}
