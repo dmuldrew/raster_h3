@@ -148,9 +148,11 @@ impl MvtValue {
     #[inline(always)]
     pub fn from_hex_u64(h3_index: u64) -> Self {
         let mut buf = [0u8; 16];
-        let bytes = crate::encoding::fast_hex_u64(h3_index, &mut buf);
-        let len = bytes.len() as u8;
-        MvtValue::HexStr(buf, len)
+        // fast_hex_u64 writes the digits right-aligned; HexStr consumers read
+        // buf[..len], so shift the digits back to the front of the buffer.
+        let len = crate::encoding::fast_hex_u64(h3_index, &mut buf).len();
+        buf.copy_within(16 - len.., 0);
+        MvtValue::HexStr(buf, len as u8)
     }
 
     /// Serialize an MVT Value message into protobuf bytes
@@ -1096,5 +1098,35 @@ impl MvtLayer {
         tile_buf.extend_from_slice(&layer_buf);
 
         tile_buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test: fast_hex_u64 writes digits right-aligned, but HexStr
+    // consumers read buf[..len] — a leading NUL and a dropped last digit was
+    // previously written into every h3_hex property.
+    #[test]
+    fn hex_value_contains_full_left_aligned_index() {
+        let v = MvtValue::from_hex_u64(0x8828308281fffff);
+        assert_eq!(v, MvtValue::String("8828308281fffff".to_string()));
+
+        let mut buf = Vec::new();
+        v.write_to(&mut buf);
+        // tag (0x0A) + length (15) + the 15 ASCII digits, no NUL padding.
+        assert_eq!(buf[0], 0x0A);
+        assert_eq!(buf[1], 15);
+        assert_eq!(&buf[2..], b"8828308281fffff");
+    }
+
+    #[test]
+    fn hex_value_handles_zero_and_max_indices() {
+        assert_eq!(MvtValue::from_hex_u64(0), MvtValue::String("0".into()));
+        assert_eq!(
+            MvtValue::from_hex_u64(u64::MAX),
+            MvtValue::String("ffffffffffffffff".into())
+        );
     }
 }
