@@ -631,3 +631,17 @@ fn borrowed_interleaved_windows_match_across_job_sizes() {
         assert_eq!(stream.metrics().worker.copied_bytes, 0);
     }
 }
+
+#[test]
+fn test_planar_configuration_rejected() {
+    let temp_file = NamedTempFile::new().unwrap();
+    crate::codecs::write_planar_geotiff(temp_file.path(), 32, 32, 4);
+    let err = match GeoTiffStreamReader::open(temp_file.path()) {
+        Ok(_) => panic!("planar TIFF must be rejected at open"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("PlanarConfiguration"),
+        "unexpected error: {err}"
+    );
+}

@@ -1281,3 +1281,79 @@ fn test_lzw_buffer_auto_resizing_hardening() {
         _ => panic!("Expected U16 results"),
     }
 }
+
+/// Write a well-formed `PlanarConfiguration=Planar` GeoTIFF: `bands` planes of
+/// `width × height` u8 samples, one strip per plane. The chunk layout itself is
+/// valid, so opening must fail at the explicit planar rejection, not earlier.
+pub fn write_planar_geotiff(path: &Path, width: u32, height: u32, bands: u32) {
+    let mut file = BufWriter::new(File::create(path).unwrap());
+    file.write_all(b"II\x2a\x00\x08\x00\x00\x00").unwrap();
+
+    // One strip of `width*height` bytes per band plane, starting at 4096.
+    let strip_bytes = (width * height) as usize;
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    let mut strip_offsets = Vec::with_capacity(bands as usize);
+    for band in 0..bands {
+        strip_offsets.push(file.stream_position().unwrap());
+        file.write_all(&vec![(band * 40 + 10) as u8; strip_bytes])
+            .unwrap();
+    }
+
+    // Metadata arrays right after the header (offset 8).
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let tiepoint_offset = file.stream_position().unwrap();
+    for v in [0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0] {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+    let scale_offset = file.stream_position().unwrap();
+    for v in [0.001f64, 0.001, 0.0] {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+    let bits_offset = file.stream_position().unwrap();
+    for _ in 0..bands {
+        file.write_all(&8u16.to_le_bytes()).unwrap();
+    }
+    let geokeys_offset = file.stream_position().unwrap();
+    for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+    let offsets_pos = file.stream_position().unwrap();
+    for off in &strip_offsets {
+        file.write_all(&(*off as u32).to_le_bytes()).unwrap();
+    }
+    let counts_pos = file.stream_position().unwrap();
+    for _ in 0..bands {
+        file.write_all(&(strip_bytes as u32).to_le_bytes()).unwrap();
+    }
+
+    let ifd_offset = file.stream_position().unwrap() as u32;
+    file.seek(SeekFrom::Start(4)).unwrap();
+    file.write_all(&ifd_offset.to_le_bytes()).unwrap();
+    file.seek(SeekFrom::Start(ifd_offset as u64)).unwrap();
+
+    let write_tag = |f: &mut BufWriter<File>, tag: u16, typ: u16, count: u32, val_or_off: u32| {
+        f.write_all(&tag.to_le_bytes()).unwrap();
+        f.write_all(&typ.to_le_bytes()).unwrap();
+        f.write_all(&count.to_le_bytes()).unwrap();
+        f.write_all(&val_or_off.to_le_bytes()).unwrap();
+    };
+
+    // Tags in ascending order; SHORT count=1 values sit inline (low bytes).
+    file.write_all(&13u16.to_le_bytes()).unwrap();
+    write_tag(&mut file, 256, 4, 1, width); // ImageWidth LONG
+    write_tag(&mut file, 257, 4, 1, height); // ImageLength LONG
+    write_tag(&mut file, 258, 3, bands, bits_offset as u32); // BitsPerSample SHORT[]
+    write_tag(&mut file, 259, 3, 1, 1); // Compression SHORT = none
+    write_tag(&mut file, 262, 3, 1, 2); // PhotometricInterpretation SHORT = RGB
+    write_tag(&mut file, 273, 4, bands, offsets_pos as u32); // StripOffsets LONG[]
+    write_tag(&mut file, 277, 3, 1, bands); // SamplesPerPixel SHORT
+    write_tag(&mut file, 278, 4, 1, height); // RowsPerStrip LONG
+    write_tag(&mut file, 279, 4, bands, counts_pos as u32); // StripByteCounts LONG[]
+    write_tag(&mut file, 284, 3, 1, 2); // PlanarConfiguration SHORT = Planar
+    write_tag(&mut file, 33550, 12, 3, scale_offset as u32); // ModelPixelScaleTag DOUBLE[3]
+    write_tag(&mut file, 33922, 12, 6, tiepoint_offset as u32); // ModelTiepointTag DOUBLE[6]
+    write_tag(&mut file, 34735, 3, 12, geokeys_offset as u32); // GeoKeyDirectoryTag SHORT[12]
+
+    file.write_all(&0u32.to_le_bytes()).unwrap(); // next IFD offset
+    file.flush().unwrap();
+}

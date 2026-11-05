@@ -910,6 +910,16 @@ impl GeoTiffStreamReader {
             .or_else(|_| decoder.get_tag_u32(Tag::Unknown(277)))
             .map(|v| v as u16)
             .unwrap_or(1);
+        // PlanarConfiguration=Planar stores each band in its own strips/tiles,
+        // so the offset/bytecount arrays hold samples_per_pixel × more entries
+        // than this layout's chunk indexing models. Reject it rather than
+        // silently decode the wrong samples.
+        let planar_config = decoder.get_tag_u32(Tag::PlanarConfiguration).unwrap_or(1);
+        if planar_config != 1 && samples_per_pixel > 1 {
+            return Err(RasterH3Error::InvalidMetadata(format!(
+                "unsupported PlanarConfiguration {planar_config} for a {samples_per_pixel}-band raster: only chunky (interleaved) layouts are supported"
+            )));
+        }
         let band_scaling = extract_band_scaling(decoder, samples_per_pixel)?;
         let alpha_sample = extract_alpha_sample(decoder, samples_per_pixel);
 
