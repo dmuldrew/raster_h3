@@ -116,9 +116,18 @@ part of the table definition and clips individual pixels, so cells straddling it
 aggregated from only their pixels inside the box. `supports_filters_pushdown(&filters)` returns the
 classification above so a planner knows which predicates it still has to evaluate.
 
+When compaction is enabled (`with_compact` or `compact_h3_children`), that classification does not
+apply: `supports_filters_pushdown` reports every predicate as `Unsupported`, and `scan` leaves all
+of them to the caller as residual filters. Compaction changes both row identity and aggregate
+values, so a `Resolution` or value filter applied inside the scan would drop compacted parent rows
+the residual predicate is meant to see, or keep statistics computed from the filtered children.
+The scan emits the full compacted table instead.
+
 - **Projection**: `Some(&[indices])` projects the schema; only those columns are built.
 - **Limit**: passed to the batch reader, which stops draining once the limit is reached.
-  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out.
+  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out,
+  and on compacted scans whenever predicates are present, since the caller re-applies them after
+  the limit would have been spent.
 - **Statistics**: `statistics()` returns `TableStatistics { num_rows, is_exact: false }`
   from `estimate_raster_cardinality`.
 
