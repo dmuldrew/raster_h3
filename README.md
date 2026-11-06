@@ -10,6 +10,8 @@ A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, C
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
+Statistics use pixel contributions, not ground-area weights. CRS projection tolerances do not imply the same absolute WGS84 datum accuracy; NAD83 and ETRS89 paths include documented approximations. See [accuracy and weighting contracts](docs/testing.md#accuracy-and-weighting-contracts) for interpretation and regression coverage.
+
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
 | **H3 table / Arrow stream** | SQL analytics, JOINs, DataFrames | DuckDB, Python/Polars, PostgreSQL, DataFusion, CLI (NDJSON / `RH3IPC01`) |
@@ -65,7 +67,7 @@ A city planning department has two datasets:
 
 **The question**: *Which low-income, densely populated neighborhoods have the least tree canopy coverage?*
 
-Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in two engines:
+Without a shared spatial index, answering this requires an expensive GIS overlay: reprojecting rasters, clipping polygons, rasterizing geometries, and managing gigabytes of temporary scratch files. With `raster_h3`, both datasets meet on the H3 hexagonal grid. The same analysis in three engines:
 
 #### DuckDB (SQL)
 
@@ -111,6 +113,12 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
+DuckDB's advantage is reach: the same SQL runs from the DuckDB CLI or from Python, Node.js and
+R, and one session joins the raster with vector files, Parquet and S3 data through DuckDB's
+other extensions. It also exposes every engine option, including compaction and memory budgets.
+Unlike SedonaDB, `WHERE` filters apply after aggregation, so narrow the scan with parameters
+such as `bbox := '...'`.
+
 #### Python & Polars
 
 ```python
@@ -154,12 +162,75 @@ result = (
 )
 ```
 
-Python scans reject malformed `resolutions`, `format` and `bbox` with `RuntimeError`
-instead of silently ignoring them or using defaults. Parquet and PMTiles exports
-also reject invalid resolutions; every resolution must be between 0 and 15. See the
-[Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
+In Polars, the raster is a `LazyFrame`, read only when `.collect()` runs, and it combines freely
+with other Polars and GeoPandas data. `columns=` and `.filter()` comparisons on `count`, `mean`,
+`majority_fraction` or `resolution` are pushed into the scan, but spatial conditions are
+not; pass `bbox=tracts.total_bounds` to read less of the raster. `h3_polygon_to_cells`
+takes one geometry at a time, hence the list comprehension, and the `UInt64` cast matches the
+scan's `h3_index`. See the [Python scan parameters](docs/engines/python-polars.md#scan-parameters).
 
-> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars.
+#### SedonaDB (Python)
+
+SedonaDB is a spatial engine, so the tracts don't need polyfilling: it joins each hexagon's
+`wkb` polygon to the tract polygons it intersects.
+
+```python
+# Build the bindings: cd crates/raster-h3-sedona/python && maturin develop --release
+# pip install "sedonadb==0.5.0" geoarrow-pyarrow pandas pyogrio pyproj
+import sedonadb
+from raster_h3_sedona import RasterH3Table
+
+sd = sedonadb.connect()
+
+# 1. Aggregate the 30m land cover raster into H3 hexagons (scanned lazily by each query)
+sd.create_data_frame(
+    RasterH3Table.categorical("nlcd_landcover_2021.tif", 8)
+).to_view("canopy_h3")
+
+# 2. Read the census tracts as-is: no polyfill, the join below is spatial
+sd.read_pyogrio("census_tracts.geojson").to_view("census_tracts")
+
+# 3. JOIN raster hexagons to the tracts they intersect
+#    (like 'covers': border hexagons count for both neighbours, and a tract smaller
+#    than one cell still matches the hexagon that contains it)
+result = sd.sql("""
+    WITH tracts AS (
+        SELECT
+            tract_name,
+            median_income,
+            -- EPSG:5070 (CONUS Albers, NLCD's native CRS) gives areas in m²
+            round(total_population / (ST_Area(ST_Transform(wkb_geometry, 'EPSG:5070')) / 1e6), 0)
+                AS pop_density_per_sqkm,
+            wkb_geometry
+        FROM census_tracts
+    )
+    SELECT
+        t.tract_name,
+        t.median_income,
+        t.pop_density_per_sqkm,
+        c.majority_class    AS dominant_landcover,
+        c.majority_fraction AS canopy_purity
+    FROM tracts AS t
+    JOIN canopy_h3 AS c
+      ON ST_Intersects(c.wkb, t.wkb_geometry)
+    WHERE c.majority_class    = 41       -- Deciduous forest (NLCD code)
+      AND c.majority_fraction < 0.30     -- Less than 30% tree canopy
+      AND t.median_income     < 45000    -- Low-income tracts
+      AND t.pop_density_per_sqkm > 3000  -- Densely populated urban neighborhoods
+    ORDER BY canopy_purity
+""").to_pandas()
+```
+
+In SedonaDB, the tracts don't need converting to hexagons; the join matches hexagon shapes to
+tract shapes directly. It is also the only one of the three that skips raster from a spatial
+condition: a condition against a fixed shape, such as `ST_Intersects(wkb,
+ST_GeomFromWKT(...))`, limits the scan to the tiles near it, and `majority_fraction >= 0.5`
+drops hexagons inside the scan rather than after it. The tract join and the filters in this
+example don't narrow the scan; the whole raster is still aggregated. To join on hex ids
+instead, as DuckDB and Polars do, see [DataFusion &
+SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
+
+> No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
 
 ### Why Intermediate H3 Aggregations Change Everything
 
@@ -257,13 +328,15 @@ returns the same cells and statistics for the same input.
 | **Python / Polars** | `raster-h3-python` | `pip install ./crates/raster-h3-python` (wheels are built in CI; not yet on PyPI) | [Python & Polars](docs/engines/python-polars.md) · [Polars API Reference](docs/polars-api-reference.md) |
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
+| **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version); SedonaDB Python: `maturin build` in `crates/raster-h3-sedona/python` | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
 | **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 
 Feature coverage differs per engine: DuckDB exposes every parameter (sampling, bands,
 spectral formulas, quantiles, remapping, budgets), DataFusion exposes most of them through
-builders, and PostgreSQL, Python and the CLI expose the common subset (resolutions, CRS,
-NoData, bbox, categorical layout). The [Engines Overview](docs/engines/README.md) has the
+builders, Python exposes all but compaction, single-cell pushdown and resource budgets
+(and pushes Polars filters into the engine), and PostgreSQL and the CLI expose the common subset (resolutions, CRS, NoData, bbox,
+categorical layout). The [Engines Overview](docs/engines/README.md) has the
 full capability matrix, shared output schemas, a side-by-side cheat sheet and the
 cross-engine parity tests. Each engine deep dive covers install, recipes (basic and
 advanced scans, scalar helpers, joins, exports, remote COGs, mosaics, categorical queries),
@@ -323,6 +396,17 @@ let plan = provider.scan(Some(&[0, 2]), &[FilterPredicate::MinCount(10.0)], Some
 for batch in plan.execute()? { /* RecordBatch with h3_index, mean */ }
 ```
 
+**Apache DataFusion / SedonaDB**
+
+```rust
+let ctx = sedona::context::SedonaContext::new_local_interactive().await?;
+raster_h3_sedona::register_all(&ctx.ctx); // or a plain datafusion SessionContext
+ctx.sql("SELECT h3_index, mean FROM h3_raster_continuous_aggregate('dem.tif', 8) WHERE count >= 10")
+    .await?
+    .show()
+    .await?;
+```
+
 **Rust library**
 
 ```rust
@@ -342,6 +426,45 @@ column is projected (or the full schema is requested). The schema is unchanged;
 with one sketch sweep per cell, sharing repeated probabilities. See the
 [core engine guide](docs/engines/core.md#batched-quantile-evaluation) for details.
 
+### Partitioned scans (distributed workers)
+
+One raster or mosaic can be split across independent workers (Spark tasks, batch jobs)
+that each read a disjoint set of TIFF tiles, with results identical to a single scan:
+plan the partitions from metadata, scan each one, then merge the few cells that straddle
+a partition edge. Rows whose `partial_state` column is null are final; the others are
+merged per cell.
+
+```python
+import pyarrow as pa, pyarrow.compute as pc, raster_h3
+
+specs = raster_h3.plan_partitions("dem.tif", target_chunks=256)          # driver
+parts = [pa.table(raster_h3.RasterH3ArrowStream("dem.tif", 8, partition=s))  # workers
+         for s in specs]
+cells = pa.concat_tables(parts)
+final = cells.filter(pc.is_null(cells["partial_state"])).drop(["partial_state"])
+merged = raster_h3.merge_partials(cells.filter(pc.is_valid(cells["partial_state"])))
+```
+
+The SQL engines merge with an aggregate, so a `GROUP BY` gathers each cell's partial rows:
+
+```sql
+-- DuckDB (SedonaDB SQL is the same, with the spec as a string argument)
+SELECT spec FROM h3_raster_plan_partitions('dem.tif', target_chunks := 256);
+SELECT * FROM h3_raster_continuous_aggregate('dem.tif', resolution := 8, partition := '<spec>');
+SELECT h3_index, resolution, h3_merge_partials(partial_state) AS cell
+FROM partial_rows GROUP BY h3_index, resolution;   -- cell.mean, cell.count, ...
+```
+
+From a shell, `raster-h3-cli plan` / `ipc --partition` / `merge` fan out with `xargs -P`
+or batch jobs ([CLI guide](docs/engines/cli.md#partitioned-scans)).
+
+In Rust the same steps are `plan_partitions`, `MultiResolutionConfig::partition` and
+`PartialMerger` (DataFusion providers: `plan_partitions` / `with_partition`). See
+[Partitioned scans](docs/engines/core.md#partitioned-scans) and the
+[Python](docs/engines/python-polars.md#partitioned-scans-spark-and-other-distributed-engines),
+[DuckDB](docs/engines/duckdb.md#partitioned-scans) and
+[DataFusion / SedonaDB](docs/engines/datafusion.md#partitioned-scans) guides.
+
 ---
 
 ## Core Engineering Architecture
@@ -353,7 +476,7 @@ with one sketch sweep per cell, sharing repeated probabilities. See the
 | 1 | **Southernmost Scan-Line Horizon Eviction** | Bounded aggregation memory: cells are emitted as soon as they are certified complete; disk spilling otherwise |
 | 2 | **Sequential H3 Spans & In-Register Run Accumulation** | One H3 lookup per pixel, but ~98% fewer hash table updates: equal-cell runs accumulate in registers and flush once |
 | 3 | **ROI Bounding Box Chunk Pruning** | Non-intersecting chunks skipped before any read or decompression, for CRSs with certified bounds, including EPSG:3413/3031 polar grids ([details](docs/crs-and-projection.md#bounding-boxes-and-pruning)) |
-| 4 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine; DuckDB additionally scans with one `init_local` state per thread |
+| 4 | **Work-Stealing Parallelism** | Rayon kernel windows in every engine, which also compute each new cell's eviction key so the serial merge stays short ([measurements](docs/worker-scaling.md)); DuckDB additionally scans with one `init_local` state per thread |
 | 5 | **Bounded Prefetch & Decode Pipeline** | `memmap2` zero-copy reads, parallel decompression into a single-hop in-order ring, and recycled buffers under `decode_budget_bytes` |
 | 6 | **Coalesced Cloud Range Reads** | Adjacent COG/S3 tile ranges merged into single HTTP requests and prefetched ahead of the decoders |
 | 7 | **Exact CRS Transformation with Analytical Fast Paths** | Every sample transformed at its true position; identity and analytical Web Mercator/Albers paths skip Proj4 and supply the certified bounds that pruning and eviction rely on |
@@ -530,6 +653,23 @@ Outputs: `target/release/libraster_h3.dylib` (macOS) / `.so` (Linux) / `.dll` (W
 
 To build the packaged `build/release/raster_h3.duckdb_extension` the way the DuckDB community-extensions CI does, run `git submodule update --init && make configure && make release` ([Community Extension Build](docs/engines/duckdb.md#community-extension-build)).
 
+To package, sign and verify the extension yourself, use the `package_extension` binary:
+
+```bash
+# Append the 534-byte DuckDB metadata footer (unsigned; load with allow_unsigned_extensions)
+cargo run --release --bin package_extension -- \
+    -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension
+
+# Sign with an RSA-2048 key (-k, or DUCKDB_EXTENSION_SIGNING_KEY), write DuckDB 2.0's
+# .well-known/duckdb-extension-repo.json (-m) for CREATE EXTENSION REPOSITORY, and verify
+cargo run --release --bin package_extension -- \
+    -i target/release/libraster_h3.so -o target/release/raster_h3.duckdb_extension \
+    -k signing_key.pem -m dist/.well-known/duckdb-extension-repo.json \
+    --verify target/release/raster_h3.duckdb_extension
+```
+
+`--help` lists every flag (`--gzip`, `--public-key`, `--platform`, `--print-platform`, …); the DuckDB deep dive covers the [signing scheme](docs/engines/duckdb.md#build-package-load) and the [trusted-repository workflow](docs/engines/duckdb.md#option-b-install-via-custom-repository).
+
 Other workspace members build individually:
 
 ```bash
@@ -543,6 +683,7 @@ cargo build --release -p raster-h3-pg --features pg-extension  # PostgreSQL modu
 | `raster-h3-core` | [`crates/raster-h3-core`](crates/raster-h3-core) |
 | `raster-h3-duckdb` | [`crates/raster-h3-duckdb`](crates/raster-h3-duckdb) |
 | `raster-h3-datafusion` | [`crates/raster-h3-datafusion`](crates/raster-h3-datafusion) |
+| `raster-h3-sedona` | [`crates/raster-h3-sedona`](crates/raster-h3-sedona) (standalone workspace; Python bindings in `python/`) |
 | `raster-h3-python` | [`crates/raster-h3-python`](crates/raster-h3-python) |
 | `raster-h3-pg` | [`crates/raster-h3-pg`](crates/raster-h3-pg) |
 | `raster-h3-cli` | [`crates/raster-h3-cli`](crates/raster-h3-cli) |
@@ -568,6 +709,7 @@ docker run --rm -v "$(pwd)":/build -w /build rust:bookworm cargo test --release 
 ```bash
 cargo run --release --example benchmark_bottleneck path/to/raster.tif
 cargo run --release --example benchmark_scaling
+cargo run --release -p raster-h3-core --example worker_scaling -- --quick  # kernel vs. serial-merge time per worker count
 cargo run --release --example raster_to_pmtiles -- --input data/sample_sf.tif --output data/sample_sf.pmtiles
 ```
 

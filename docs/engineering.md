@@ -38,6 +38,17 @@ limit, compaction output is deterministic and its memory is unbounded. Decoded c
 separate budget (`decode_budget_bytes`, default 256 MiB). Output and runtime
 overhead also use RAM.
 
+Each resolution's horizon map may use a quarter of the aggregation budget divided by
+the number of resolutions before it spills. Cells are evicted between batches, so a
+map holds at least one batch of cells. A batch is about two waves of worker windows
+(`2 × workers × worker window pixels`), but never less than one chunk (a strip or
+tile). At resolutions where cells are about as small as pixels, that is roughly one
+chunk's pixels times ~230 bytes for continuous statistics (more with quantiles or
+categories). For example, a 4096-pixel-wide raster stored in 64-row strips holds about
+230,000 resolution-11 cells (~53 MiB) per batch. So it needs an aggregation budget of
+about 212 MiB for one such resolution, or 640 MiB for three, to stay in memory; under
+the 64 MiB default it spills. Spilling is always correct, only slower.
+
 ## 2. Sequential H3 Spans & In-Register Run Accumulation
 Every candidate pixel center is indexed directly. Consecutive equal-cell pixels
 share accumulation work. The first differing cell is reused by the next run;
@@ -55,7 +66,7 @@ Queries specifying a spatial Region of Interest (ROI) bounding box (`min_lat`, `
 ## 4. Work-Stealing Parallelism
 Every engine (DuckDB, DataFusion, PostgreSQL, Python/Polars, CLI) drives the same multi-resolution controller, so aggregation parallelism is shared:
 - **Parallel Kernel Windows**: Decoded chunks are grouped into waves of worker windows. Rayon processes the windows of a wave in parallel (`par_iter`), each into its own cell maps, so pixel accumulation takes no shared lock. The worker count defaults to Rayon's thread count capped at 8, or `aggregation_workers` (1–64), and is further limited by the aggregation budget.
-- **Horizon Merge**: After each wave, the worker maps are merged into the per-resolution horizon maps, where eviction and spilling happen. Worker map bytes count against the aggregation budget.
+- **Horizon Merge**: After each wave, the calling thread merges the worker maps into the per-resolution horizon maps, where eviction and spilling happen. Worker map bytes count against the aggregation budget. The merge is serial, but the eviction key of each new cell (its southern edge, a cell-boundary computation) is computed by the parallel workers beforehand; [Worker Scaling](worker-scaling.md) measures the merge's share of wall time.
 - **Deadlock-Safe Execution**: A wave started from inside a Rayon worker either runs on the dedicated pool through a helper OS thread, or runs serially, so a joining worker never steals a task that needs a lock its caller holds.
 - **DuckDB `init_local`**: DuckDB additionally registers a per-thread local state for its scan callbacks. Its threads pull completed records from a shared record queue and write them to output vectors in parallel; aggregation itself runs in the kernel windows above.
 - **Cardinality Estimate**: `estimate_raster_cardinality()` gives DuckDB's optimizer an approximate output row count from the raster extent and H3 cell area at each requested resolution.

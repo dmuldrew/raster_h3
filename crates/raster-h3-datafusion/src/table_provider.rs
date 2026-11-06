@@ -6,16 +6,18 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
-    MultiResolutionConfig, QuantileTarget, SpectralFormula,
+    plan_partitions, MultiResolutionConfig, QuantileTarget, ScanPartition, SpectralFormula,
 };
 use raster_h3_core::aggregator::remap::CategoryRemapper;
 use raster_h3_core::aggregator::sampling::SamplingPattern;
 use raster_h3_core::columnar::{
-    ArrowArrayStream, CategoricalBatchReader, CategoricalFormat, ColumnSchema,
-    ContinuousBatchReader, RecordBatch,
+    with_partial_state_field, ArrowArrayStream, CategoricalBatchReader, CategoricalFormat,
+    ColumnSchema, ContinuousBatchReader, PartitionedBatchReader, RecordBatch,
 };
-use raster_h3_core::error::Result;
-use raster_h3_core::raster::mosaic::{resolve_raster_sources, OverlapRule};
+use raster_h3_core::error::{RasterH3Error, Result};
+use raster_h3_core::raster::mosaic::{
+    resolve_raster_sources, MosaicReader, OverlapRule, NO_TILES_IN_BBOX,
+};
 use raster_h3_core::scalar_ops::estimate_raster_cardinality;
 
 /// Cardinality statistics exposed to query planners.
@@ -284,6 +286,181 @@ mod bbox_tests {
     }
 }
 
+/// Whether a pushed `Bbox` changed the scan's bbox. Such a box only narrows the scan, so a
+/// box that misses every raster tile means an empty result, not an error.
+fn bbox_pushed(
+    original: &MultiResolutionConfig,
+    scanned: &MultiResolutionConfig,
+    filters: &[FilterPredicate],
+) -> bool {
+    filters
+        .iter()
+        .any(|f| matches!(f, FilterPredicate::Bbox(_)))
+        && original.bbox != scanned.bbox
+}
+
+/// Open a batch reader, mapping "no tile intersects the bbox" to `None` when the bbox came
+/// from filter pushdown.
+fn open_or_empty<R>(bbox_pushed: bool, open: impl FnOnce() -> Result<R>) -> Result<Option<R>> {
+    match open() {
+        Ok(reader) => Ok(Some(reader)),
+        Err(RasterH3Error::InvalidParameter(msg)) if bbox_pushed && msg == NO_TILES_IN_BBOX => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// -----------------------------------------------------------------------------------------
+// Partitioned scans
+// -----------------------------------------------------------------------------------------
+
+/// Pushdown support on a partitioned scan. Only `Resolution` is safe:
+///
+/// - value thresholds (`MinCount`, `MinMean`, `MaxMean`, `MinMajorityFraction`) must not drop
+///   partial rows, which hold only this partition's share of a cell; filter the merged rows;
+/// - a `Bbox` would prune the mosaic's chunk list and change the layout the partition was
+///   planned for.
+fn partitioned_pushdown(filter: &FilterPredicate) -> FilterPushdownStatus {
+    match filter {
+        FilterPredicate::Resolution(_) => FilterPushdownStatus::Exact,
+        _ => FilterPushdownStatus::Unsupported,
+    }
+}
+
+/// Plan partitions of `paths` scanned with `config` (see [`plan_partitions`]).
+fn plan_for(
+    paths: &[PathBuf],
+    config: &MultiResolutionConfig,
+    target_chunks: usize,
+) -> Result<Vec<ScanPartition>> {
+    let mosaic = MosaicReader::open(
+        paths,
+        config.bbox,
+        config.custom_crs.as_deref(),
+        config.overlap_rule,
+    )?;
+    plan_partitions(&mosaic, target_chunks)
+}
+
+/// The reader projection for a partitioned scan and the mapping from its output to the
+/// requested columns. `projection` indexes the partitioned schema (`base` columns, then
+/// `partial_state`). The reader always outputs `h3_index`, `resolution` and `partial_state`
+/// so partial rows stay mergeable; columns the query did not ask for are dropped afterwards.
+fn partitioned_projection(
+    base: &ColumnSchema,
+    projection: Option<&[usize]>,
+) -> (Vec<usize>, Vec<usize>) {
+    let state = base.fields.len();
+    let requested: Vec<usize> = match projection {
+        Some(p) => p.to_vec(),
+        None => (0..=state).collect(),
+    };
+    let mut reader: Vec<usize> = Vec::new();
+    for &i in requested.iter().filter(|&&i| i < state) {
+        if !reader.contains(&i) {
+            reader.push(i);
+        }
+    }
+    for key in ["h3_index", "resolution"] {
+        if let Some(i) = base.index_of(key) {
+            if !reader.contains(&i) {
+                reader.push(i);
+            }
+        }
+    }
+    let out = requested
+        .iter()
+        .map(|&i| {
+            if i >= state {
+                reader.len()
+            } else {
+                reader.iter().position(|&r| r == i).unwrap_or(0)
+            }
+        })
+        .collect();
+    (reader, out)
+}
+
+/// Physical plan of a partitioned scan (either provider with a partition set).
+pub struct PartitionedRasterExec {
+    paths: Vec<PathBuf>,
+    config: MultiResolutionConfig,
+    categorical: bool,
+    reader_projection: Vec<usize>,
+    output_columns: Vec<usize>,
+    schema: Arc<ColumnSchema>,
+    batch_size: usize,
+    empty: bool,
+}
+
+impl ExecutionPlan for PartitionedRasterExec {
+    fn schema(&self) -> Arc<ColumnSchema> {
+        Arc::clone(&self.schema)
+    }
+
+    fn execute(&self) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + Send>> {
+        if self.empty {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let projection = Some(self.reader_projection.clone());
+        let reader = if self.categorical {
+            PartitionedBatchReader::open_categorical(
+                &self.paths,
+                &self.config,
+                projection,
+                self.batch_size,
+            )?
+        } else {
+            PartitionedBatchReader::open_continuous(
+                &self.paths,
+                &self.config,
+                projection,
+                self.batch_size,
+            )?
+        };
+        let columns = self.output_columns.clone();
+        Ok(Box::new(reader.map(move |batch| batch?.project(&columns))))
+    }
+}
+
+/// Build the plan of a partitioned scan: only `Resolution` filters are applied, and the
+/// row limit is left to the caller (it would cut partial rows short).
+#[allow(clippy::too_many_arguments)]
+fn partitioned_scan(
+    paths: &[PathBuf],
+    config: &MultiResolutionConfig,
+    categorical: bool,
+    base: &ColumnSchema,
+    full: Arc<ColumnSchema>,
+    projection: Option<&[usize]>,
+    filters: &[FilterPredicate],
+    batch_size: usize,
+) -> Result<Box<dyn ExecutionPlan>> {
+    let mut config = config.clone();
+    let mut empty = false;
+    for f in filters {
+        if let FilterPredicate::Resolution(_) = f {
+            empty |= !apply_shared_filter(&mut config, f);
+        }
+    }
+    let (reader_projection, output_columns) = partitioned_projection(base, projection);
+    let schema = match projection {
+        Some(indices) => Arc::new(full.project(indices)?),
+        None => full,
+    };
+    Ok(Box::new(PartitionedRasterExec {
+        paths: paths.to_vec(),
+        config,
+        categorical,
+        reader_projection,
+        output_columns,
+        schema,
+        batch_size,
+        empty,
+    }))
+}
+
 /// Physical execution plan for continuous H3 raster aggregation.
 pub struct ContinuousRasterExec {
     paths: Vec<PathBuf>,
@@ -294,6 +471,8 @@ pub struct ContinuousRasterExec {
     limit: Option<usize>,
     /// Pushed-down filters exclude every row (e.g. an unconfigured resolution).
     empty: bool,
+    /// The bbox was narrowed by a pushed `Bbox` filter (see [`bbox_pushed`]).
+    bbox_pushed: bool,
 }
 
 impl ExecutionPlan for ContinuousRasterExec {
@@ -305,14 +484,19 @@ impl ExecutionPlan for ContinuousRasterExec {
         if self.empty {
             return Ok(Box::new(std::iter::empty()));
         }
-        let reader = ContinuousBatchReader::open(
-            &self.paths,
-            &self.config,
-            self.projection.clone(),
-            self.batch_size,
-            self.limit,
-        )?;
-        Ok(Box::new(reader))
+        let reader = open_or_empty(self.bbox_pushed, || {
+            ContinuousBatchReader::open(
+                &self.paths,
+                &self.config,
+                self.projection.clone(),
+                self.batch_size,
+                self.limit,
+            )
+        })?;
+        Ok(match reader {
+            Some(reader) => Box::new(reader),
+            None => Box::new(std::iter::empty()),
+        })
     }
 }
 
@@ -424,11 +608,29 @@ impl ContinuousRasterTableProvider {
         self.batch_size = batch_size.max(1);
         self
     }
+
+    /// Scan only `partition` (from [`Self::plan_partitions`] on an identically configured
+    /// provider). The table gains a nullable `partial_state` column; rows where it is set
+    /// must be merged across partitions (see `merge_partial_batches`). Value filters and
+    /// bboxes are then no longer pushed down, and the row limit is not applied in the scan.
+    pub fn with_partition(mut self, partition: ScanPartition) -> Self {
+        self.config.partition = Some(partition);
+        self
+    }
+
+    /// Split this scan into partitions of about `target_chunks` TIFF chunks each.
+    pub fn plan_partitions(&self, target_chunks: usize) -> Result<Vec<ScanPartition>> {
+        plan_for(&self.paths, &self.config, target_chunks)
+    }
 }
 
 impl TableProvider for ContinuousRasterTableProvider {
     fn schema(&self) -> Arc<ColumnSchema> {
-        Arc::new(ColumnSchema::continuous(&self.config.quantiles))
+        let base = ColumnSchema::continuous(&self.config.quantiles);
+        match self.config.partition {
+            Some(_) => Arc::new(with_partial_state_field(&base)),
+            None => Arc::new(base),
+        }
     }
 
     fn statistics(&self) -> TableStatistics {
@@ -440,6 +642,9 @@ impl TableProvider for ContinuousRasterTableProvider {
     }
 
     fn supports_filters_pushdown(&self, filters: &[FilterPredicate]) -> Vec<FilterPushdownStatus> {
+        if self.config.partition.is_some() {
+            return filters.iter().map(partitioned_pushdown).collect();
+        }
         filters
             .iter()
             .map(|f| match f {
@@ -459,6 +664,19 @@ impl TableProvider for ContinuousRasterTableProvider {
         filters: &[FilterPredicate],
         limit: Option<usize>,
     ) -> Result<Box<dyn ExecutionPlan>> {
+        if self.config.partition.is_some() {
+            let base = ColumnSchema::continuous(&self.config.quantiles);
+            return partitioned_scan(
+                &self.paths,
+                &self.config,
+                false,
+                &base,
+                self.schema(),
+                projection,
+                filters,
+                self.batch_size,
+            );
+        }
         let mut config = self.config.clone();
         let mut empty = false;
         for f in filters {
@@ -473,6 +691,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             }
         }
 
+        let bbox_pushed = bbox_pushed(&self.config, &config, filters);
         let base_schema = self.schema();
         let schema = match projection {
             Some(indices) => Arc::new(base_schema.project(indices)?),
@@ -487,6 +706,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             batch_size: self.batch_size,
             limit: reader_limit(filters, limit),
             empty,
+            bbox_pushed,
         }))
     }
 }
@@ -502,6 +722,8 @@ pub struct CategoricalRasterExec {
     limit: Option<usize>,
     /// Pushed-down filters exclude every row (e.g. an unconfigured resolution).
     empty: bool,
+    /// The bbox was narrowed by a pushed `Bbox` filter (see [`bbox_pushed`]).
+    bbox_pushed: bool,
 }
 
 impl ExecutionPlan for CategoricalRasterExec {
@@ -513,15 +735,20 @@ impl ExecutionPlan for CategoricalRasterExec {
         if self.empty {
             return Ok(Box::new(std::iter::empty()));
         }
-        let reader = CategoricalBatchReader::open(
-            &self.paths,
-            &self.config,
-            self.format,
-            self.projection.clone(),
-            self.batch_size,
-            self.limit,
-        )?;
-        Ok(Box::new(reader))
+        let reader = open_or_empty(self.bbox_pushed, || {
+            CategoricalBatchReader::open(
+                &self.paths,
+                &self.config,
+                self.format,
+                self.projection.clone(),
+                self.batch_size,
+                self.limit,
+            )
+        })?;
+        Ok(match reader {
+            Some(reader) => Box::new(reader),
+            None => Box::new(std::iter::empty()),
+        })
     }
 }
 
@@ -603,13 +830,29 @@ impl CategoricalRasterTableProvider {
         self.batch_size = batch_size.max(1);
         self
     }
+
+    /// Scan only `partition`; see [`ContinuousRasterTableProvider::with_partition`].
+    /// Partitioned scans use the wide format (the long format fails at scan time).
+    pub fn with_partition(mut self, partition: ScanPartition) -> Self {
+        self.config.partition = Some(partition);
+        self
+    }
+
+    /// Split this scan into partitions of about `target_chunks` TIFF chunks each.
+    pub fn plan_partitions(&self, target_chunks: usize) -> Result<Vec<ScanPartition>> {
+        plan_for(&self.paths, &self.config, target_chunks)
+    }
 }
 
 impl TableProvider for CategoricalRasterTableProvider {
     fn schema(&self) -> Arc<ColumnSchema> {
-        match self.format {
-            CategoricalFormat::Wide => Arc::new(ColumnSchema::categorical_wide()),
-            CategoricalFormat::Long => Arc::new(ColumnSchema::categorical_long()),
+        let base = match self.format {
+            CategoricalFormat::Wide => ColumnSchema::categorical_wide(),
+            CategoricalFormat::Long => ColumnSchema::categorical_long(),
+        };
+        match self.config.partition {
+            Some(_) => Arc::new(with_partial_state_field(&base)),
+            None => Arc::new(base),
         }
     }
 
@@ -622,6 +865,9 @@ impl TableProvider for CategoricalRasterTableProvider {
     }
 
     fn supports_filters_pushdown(&self, filters: &[FilterPredicate]) -> Vec<FilterPushdownStatus> {
+        if self.config.partition.is_some() {
+            return filters.iter().map(partitioned_pushdown).collect();
+        }
         filters
             .iter()
             .map(|f| match f {
@@ -640,6 +886,23 @@ impl TableProvider for CategoricalRasterTableProvider {
         filters: &[FilterPredicate],
         limit: Option<usize>,
     ) -> Result<Box<dyn ExecutionPlan>> {
+        if self.config.partition.is_some() {
+            if self.format == CategoricalFormat::Long {
+                return Err(RasterH3Error::InvalidParameter(
+                    "partitioned scans support the wide categorical format only".into(),
+                ));
+            }
+            return partitioned_scan(
+                &self.paths,
+                &self.config,
+                true,
+                &ColumnSchema::categorical_wide(),
+                self.schema(),
+                projection,
+                filters,
+                self.batch_size,
+            );
+        }
         let mut config = self.config.clone();
         let mut empty = false;
         for f in filters {
@@ -652,6 +915,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             }
         }
 
+        let bbox_pushed = bbox_pushed(&self.config, &config, filters);
         let base_schema = self.schema();
         let schema = match projection {
             Some(indices) => Arc::new(base_schema.project(indices)?),
@@ -667,6 +931,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             batch_size: self.batch_size,
             limit: reader_limit(filters, limit),
             empty,
+            bbox_pushed,
         }))
     }
 }

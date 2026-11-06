@@ -25,10 +25,8 @@ RUN cargo build --release --workspace && \
     cargo test --release --workspace && \
     cargo build --release --examples && \
     cargo run --release --example generate_sample -- sample_sf.tif && \
-    PLAT=$(cargo run --release --bin package_extension -- \
-        --input target/release/libraster_h3.so \
-        --output target/release/raster_h3.duckdb_extension \
-        --duckdb-version "${DUCKDB_VERSION}" | awk '/Platform:/ {print $2}') && \
+    PLAT=$(cargo run --quiet --release --bin package_extension -- \
+        --print-platform --duckdb-version "${DUCKDB_VERSION}") && \
     cargo run --release --bin package_extension -- \
         --input target/release/libraster_h3.so \
         --output target/release/raster_h3.duckdb_extension \

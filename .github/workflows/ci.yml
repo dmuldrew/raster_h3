@@ -204,6 +204,9 @@ jobs:
       - name: Test hotspot harness ownership sampling
         run: cargo test --locked --release -p raster-h3-core --example profile_hotspots
 
+      - name: Test worker-scaling benchmark output equality
+        run: cargo test --locked --release -p raster-h3-core --example worker_scaling
+
       - name: Build Dynamic Library & Binaries
         run: cargo build --locked --release --target ${{ matrix.target }}
 
@@ -250,6 +253,39 @@ jobs:
               --gzip
             cp dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension target/${{ matrix.target }}/release/raster_h3-linux_amd64.duckdb_extension
             cp dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension.gz target/${{ matrix.target }}/release/raster_h3-linux_amd64.duckdb_extension.gz
+          fi
+
+          # DuckDB requests `<prefix>/<its own version>/<platform>/...` from a repository, so DuckDB 2.0
+          # (`INSTALL raster_h3 FROM <repo>`) needs a v2.0.0 tree. Its Linux x86_64 tag is linux_amd64.
+          # The v2.0.0 tree ships a separate build against the v1.5.6 C extension API, enabling
+          # DuckDB file-system access, COPY output, session options and scalar bind/init.
+          V2_PLATFORM="${{ matrix.platform }}"
+          if [[ "$V2_PLATFORM" == "linux_amd64_gcc4" ]]; then
+            V2_PLATFORM=linux_amd64
+          fi
+          mkdir -p "dist/v2.0.0/$V2_PLATFORM"
+
+          CARGO_TARGET_DIR=target-v156 cargo build --locked --release --target ${{ matrix.target }} \
+            -p raster_h3 --lib --features duckdb-api-v1_5_6
+
+          cargo run --release --bin package_extension -- \
+            --input target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+            --output "dist/v2.0.0/$V2_PLATFORM/raster_h3.duckdb_extension" \
+            --platform "$V2_PLATFORM" \
+            --duckdb-version v1.5.6
+
+          cargo run --release --bin package_extension -- \
+            --input target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }} \
+            --output "dist/v2.0.0/$V2_PLATFORM/raster_h3.duckdb_extension.gz" \
+            --platform "$V2_PLATFORM" \
+            --duckdb-version v1.5.6 \
+            --gzip
+
+          # Signed builds must verify before they are uploaded for release
+          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
+            for ext in dist/v*/*/raster_h3.duckdb_extension*; do
+              cargo run --release --bin package_extension -- --verify "$ext"
+            done
           fi
 
       - name: Verify Extension Loading with DuckDB CLI
@@ -335,10 +371,28 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             DUCKDB_BIN="$(cygpath -w "$(pwd)/duckdb-2.0/duckdb.exe")"
           fi
+          # On the arm64 macOS runner, osx_amd64's v1.5.6 library is x86_64;
+          # run the universal CLI under Rosetta so it can load it.
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" && "$(uname -m)" == "arm64" ]]; then
+            printf '#!/bin/bash\nexec arch -x86_64 "%s" "$@"\n' "$DUCKDB_BIN" > duckdb-2.0/duckdb-x86
+            chmod +x duckdb-2.0/duckdb-x86
+            DUCKDB_BIN="$(pwd)/duckdb-2.0/duckdb-x86"
+          fi
           export DUCKDB_BIN
-          export DUCKDB_VERSION=v1.2.0
+          # The DuckDB 2.0 smoke tests exercise the v1.5.6-API build packaged above.
+          # The extension platform tag can't be probed through the Rosetta
+          # wrapper reliably, so pass the matrix platform explicitly.
+          export DUCKDB_PLATFORM="${{ matrix.platform }}"
+          if [[ "$DUCKDB_PLATFORM" == "linux_amd64_gcc4" ]]; then
+            DUCKDB_PLATFORM=linux_amd64
+          fi
+          export DUCKDB_VERSION=v1.5.6
+          export RASTER_H3_LIBRARY="$(pwd)/target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }}"
           chmod +x "$DUCKDB_BIN" || true
           cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
+          # Signed install/load through CREATE EXTENSION REPOSITORY (no -unsigned), plus
+          # rejection of unsigned and wrong-key extensions
+          cargo test --release -p raster_h3 --test it duckdb_trusted_repository -- --ignored
 
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -349,7 +403,7 @@ jobs:
             target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz
             target/${{ matrix.target }}/release/raster_h3-*.duckdb_extension
             target/${{ matrix.target }}/release/raster_h3-*.duckdb_extension.gz
-            dist/v1.2.0/**/*
+            dist/**/*
           if-no-files-found: error
 
   # Builds through the extension-ci-tools Makefile the way duckdb/community-extensions
@@ -411,6 +465,54 @@ jobs:
 
       - name: Run pg-extension tests
         run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
+
+  # raster-h3-sedona is a standalone workspace (DataFusion pinned to SedonaDB's version, plus
+  # its Python bindings), so the --workspace jobs above never see it. The `sedona-e2e` suite is left to manual runs:
+  # it compiles SedonaDB from git.
+  sedona-adapter:
+    name: DataFusion / SedonaDB adapter
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: crates/raster-h3-sedona
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: crates/raster-h3-sedona
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --no-fail-fast
+
+      # The SedonaDB Python bindings: build the abi3 module and scan it from the sedonadb wheel.
+      - name: Clippy (Python bindings)
+        run: cargo clippy -p raster-h3-sedona-python --all-targets --locked -- -D warnings
+
+      - name: Test Python bindings against sedonadb
+        working-directory: crates/raster-h3-sedona/python
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin build --release --locked --out dist
+          .venv/bin/pip install dist/*.whl pytest pandas geoarrow-pyarrow "sedonadb==0.5.0"
+          .venv/bin/pytest -v
 
   # All supply-chain checks are blocking; exceptions belong in deny.toml with a reason.
   deny:
@@ -475,13 +577,16 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, lint, msrv, community-build, test-crates, deny, metadata, package-check, wheel-validation, safety]
+    needs: [build, lint, msrv, community-build, test-crates, sedona-adapter, deny, metadata, package-check, wheel-validation, safety]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
+    env:
+      DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
+      DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -499,41 +604,55 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
 
+      # The trusted-repository manifest is only emitted for signed builds, so the
+      # packager is only needed when a signing key is configured.
       - name: Set up Rust toolchain for release packaging
-        if: env.DUCKDB_EXTENSION_SIGNING_KEY != '' || env.DUCKDB_EXTENSION_PUBLIC_KEY != ''
-        env:
-          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
-          DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
+        if: env.DUCKDB_EXTENSION_SIGNING_KEY != ''
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: '1.97.1'
 
       - name: Prepare Release Assets and Repository Bundle
         shell: bash
-        env:
-          DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
-          DUCKDB_EXTENSION_PUBLIC_KEY: ${{ secrets.DUCKDB_EXTENSION_PUBLIC_KEY }}
         run: |
           mkdir -p release-assets
-          mkdir -p duckdb-repository/v1.2.0
+          mkdir -p duckdb-repository
 
           # Copy flat release binaries (both uncompressed and gzipped)
           find all-artifacts -name "raster_h3-*.duckdb_extension*" -exec cp {} release-assets/ \;
 
-          # Assemble repository layout: v1.2.0/<platform>/raster_h3.duckdb_extension[.gz]
-          find all-artifacts -path "*/dist/v1.2.0/*" -type f | while read -r file; do
-            plat=$(basename $(dirname "$file"))
-            mkdir -p "duckdb-repository/v1.2.0/$plat"
-            cp "$file" "duckdb-repository/v1.2.0/$plat/"
+          # Assemble repository layout: <duckdb_version>/<platform>/raster_h3.duckdb_extension[.gz]
+          # (v1.2.0 for custom_extension_repository on DuckDB 1.2, v2.0.0 for CREATE EXTENSION REPOSITORY)
+          find all-artifacts -path "*/dist/v*/*" -type f | while read -r file; do
+            plat=$(basename "$(dirname "$file")")
+            ver=$(basename "$(dirname "$(dirname "$file")")")
+            mkdir -p "duckdb-repository/$ver/$plat"
+            cp "$file" "duckdb-repository/$ver/$plat/"
           done
 
-          # If a signing or public key is configured, emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json`
-          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" || -n "${DUCKDB_EXTENSION_PUBLIC_KEY:-}" ]]; then
-            cargo run --release --bin package_extension -- \
-              --repo-manifest duckdb-repository/.well-known/duckdb-extension-repo.json
+          # Emit DuckDB 2.0's `.well-known/duckdb-extension-repo.json` only for signed builds: the
+          # build job signs only when DUCKDB_EXTENSION_SIGNING_KEY is set, and a manifest that pins
+          # a key over unsigned extensions makes `INSTALL ... FROM <repo>` fail verification.
+          if [[ -z "${DUCKDB_EXTENSION_SIGNING_KEY:-}" && -n "${DUCKDB_EXTENSION_PUBLIC_KEY:-}" ]]; then
+            echo "::warning::DUCKDB_EXTENSION_PUBLIC_KEY is set without DUCKDB_EXTENSION_SIGNING_KEY; extensions are unsigned, so no trusted repository manifest is published."
+          fi
+          if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
+            cargo build --locked --release --bin package_extension
+            PACKAGER=target/release/package_extension
+            "$PACKAGER" --repo-manifest duckdb-repository/.well-known/duckdb-extension-repo.json
+
+            # Every bundled and flat extension must verify against the manifest key (the public key
+            # when configured, else the one derived from the signing key). This also fails the
+            # release when the two configured secrets are not a matching key pair.
+            find duckdb-repository/v* release-assets -type f -name "*.duckdb_extension*" -print0 |
+              while IFS= read -r -d '' ext; do
+                "$PACKAGER" --verify "$ext"
+              done
             cp duckdb-repository/.well-known/duckdb-extension-repo.json release-assets/duckdb-extension-repo.json
-            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0 .well-known)
+            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v* .well-known)
           else
             # Archive repository bundle for custom_extension_repository distribution
-            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v1.2.0)
+            (cd duckdb-repository && zip -r ../release-assets/duckdb-extension-repository-v1.2.0.zip v*)
           fi
 
           cp all-wheels/*.whl release-assets/

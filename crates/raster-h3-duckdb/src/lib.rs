@@ -76,6 +76,30 @@ pub unsafe extern "C" fn raster_h3_init(db: duckdb_database) -> bool {
             if functions::register_parquet_table_function(con).is_err() {
                 return false;
             }
+
+            // 6. Partitioned scans: planning and partial-state merge aggregates
+            if functions::register_plan_partitions_function(con).is_err()
+                || functions::register_merge_functions(con).is_err()
+            {
+                return false;
+            }
+
+            // 7. v1.5.6 API only: `SET raster_h3_*` session options and the
+            //    `COPY ... (FORMAT pmtiles)` function.
+            #[cfg(feature = "duckdb-api-v1_5_6")]
+            {
+                if let Err(failed) = functions::config::register_duckdb_config_options(con) {
+                    // Registration only fails when an option of that name
+                    // already exists; keep loading, but say which one.
+                    safe_eprintln(
+                        "[raster_h3] could not register session option",
+                        &failed.join(", "),
+                    );
+                }
+                if functions::register_copy_functions(con).is_err() {
+                    return false;
+                }
+            }
         }
 
         true

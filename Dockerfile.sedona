@@ -1,0 +1,63 @@
+# Apache Sedona (Spark) with the raster-h3 Python package on every executor.
+#
+# Used by the `sedona` service in docker-compose.yml:
+#   docker compose up --build sedona     # JupyterLab on http://localhost:8888
+#
+# The base is the official apache/sedona image (Spark standalone master + worker,
+# PySpark, Sedona and JupyterLab in one container). It is Ubuntu 24.04 (glibc 2.39),
+# so a wheel built on Debian bookworm (glibc 2.36) loads in it.
+ARG SEDONA_VERSION=1.9.1
+
+# ==============================================================================
+# Stage 1: build the raster-h3 wheel
+# ==============================================================================
+FROM rust:bookworm AS rust
+
+# python:*-bookworm already has pip and a C toolchain; add Rust by copying it from the
+# official image instead of installing anything with apt.
+FROM python:3.12-bookworm AS wheel
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+
+WORKDIR /build
+
+# The wheel's build hook runs `cargo build -p raster-h3-python -p raster-h3-cli`
+# against the whole workspace, so every member manifest must be present.
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ ./.cargo/
+COPY crates/ ./crates/
+COPY src/ ./src/
+COPY tests/ ./tests/
+COPY examples/ ./examples/
+
+ENV RASTER_H3_WORKSPACE=/build
+# Drop Cargo's build directory in the same step: only the wheel is needed, and keeping
+# target/ would leave several GB in the build cache.
+RUN pip install --no-cache-dir "hatchling>=1.26" \
+    && pip wheel --no-deps --no-build-isolation -w /wheels crates/raster-h3-python \
+    && rm -rf /build/target
+
+# ==============================================================================
+# Stage 2: Sedona + raster-h3
+# ==============================================================================
+FROM apache/sedona:${SEDONA_VERSION}
+
+COPY --from=wheel /wheels/ /tmp/wheels/
+
+# The image installs its Python packages into the system interpreter (PEP 668 is
+# bypassed the same way upstream does it). pyarrow>=15 is needed for
+# `pyarrow.RecordBatchReader.from_stream`, which the demo uses to read the
+# raster_h3 Arrow stream batch by batch.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        "$(ls /tmp/wheels/raster_h3-*.whl)" "pyarrow>=15" \
+    && rm -rf /tmp/wheels \
+    && python3 -c "import raster_h3; print('raster_h3 OK:', raster_h3.h3_to_string(0x8828308281fffff))"
+
+COPY examples/sedona_spark/ /opt/raster_h3/examples/
+
+# The base image sets PYSPARK_DRIVER_PYTHON=jupyter so `pyspark` opens a notebook.
+# That also breaks `spark-submit script.py`; run demos with `python3` instead.

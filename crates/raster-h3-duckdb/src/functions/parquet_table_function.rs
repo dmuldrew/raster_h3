@@ -47,6 +47,8 @@ pub struct ParquetBindData {
     pub bbox: Option<[f64; 4]>,
     pub geoparquet: bool,
     pub execution: ExecutionParams,
+    /// Routes raster reads through the DuckDB file system (v1.5.6 build).
+    pub remote_source_factory: Option<raster_h3_core::raster::http_range::RemoteSourceFactory>,
 }
 
 /// Global execution state for the single-row generator
@@ -109,6 +111,9 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
             let Some(execution) = bind.parse_execution() else {
                 return;
             };
+            // SAFETY: `info` is the live bind handle (callback contract).
+            let remote_source_factory =
+                crate::functions::config::raster_source_factory_for_bind(info);
 
             let mut compression = Compression::SNAPPY;
             if let Some(s) = bind.get_named_string("compression") {
@@ -157,6 +162,7 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
                 bbox,
                 geoparquet,
                 execution,
+                remote_source_factory,
             });
             duckdb_bind_set_bind_data(
                 info,
@@ -223,6 +229,7 @@ pub unsafe extern "C" fn parquet_scan(info: duckdb_function_info, output: duckdb
             config.overlap_rule = bind_data.overlap_rule;
             config.bbox = bind_data.bbox;
             bind_data.execution.apply(&mut config);
+            config.remote_source_factory = bind_data.remote_source_factory.clone();
             let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             config.transform_failure_counter = Some(std::sync::Arc::clone(&failures));
 

@@ -72,25 +72,24 @@ impl SpectralFormula {
         }
     }
 
-    /// Every 1-indexed band this formula reads.
-    pub fn band_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        let (a, b, c) = match *self {
-            Self::Ndvi { nir_band, red_band } => (nir_band, red_band, 0),
+    /// The 1-indexed bands this formula reads.
+    pub fn bands(&self) -> Vec<usize> {
+        match *self {
+            Self::Ndvi { nir_band, red_band } => vec![nir_band, red_band],
             Self::Ndwi {
                 green_band,
                 nir_band,
-            } => (green_band, nir_band, 0),
+            } => vec![green_band, nir_band],
             Self::Nbr {
                 nir_band,
                 swir_band,
-            } => (nir_band, swir_band, 0),
+            } => vec![nir_band, swir_band],
             Self::Evi {
                 nir_band,
                 red_band,
                 blue_band,
-            } => (nir_band, red_band, blue_band),
-        };
-        [a, b, c].into_iter().filter(|&band| band > 0)
+            } => vec![nir_band, red_band, blue_band],
+        }
     }
 
     /// Evaluate the spectral formula for given physical band reflectance values.

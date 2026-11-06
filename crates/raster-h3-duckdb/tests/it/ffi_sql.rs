@@ -66,6 +66,24 @@ struct RegisteredScalarFn {
 struct MockConnection {
     table_functions: Vec<RegisteredTableFn>,
     scalar_functions: Vec<RegisteredScalarFn>,
+    aggregate_functions: Vec<RegisteredAggregateFn>,
+}
+
+struct RegisteredAggregateFn {
+    name: String,
+    params: Vec<DuckDBType>,
+    ret: DuckDBType,
+    has_functions: bool,
+    has_destructor: bool,
+}
+
+#[derive(Default)]
+struct MockAggregateFunction {
+    name: String,
+    params: Vec<DuckDBType>,
+    ret: Option<DuckDBType>,
+    has_functions: bool,
+    has_destructor: bool,
 }
 
 struct MockTableFunction {
@@ -262,6 +280,118 @@ pub unsafe extern "C" fn duckdb_create_logical_type(type_: DuckDBType) -> duckdb
         ty: type_,
         alias: None,
     })) as duckdb_logical_type
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_create_struct_type(
+    _member_types: *mut duckdb_logical_type,
+    _member_names: *mut *const c_char,
+    _member_count: idx_t,
+) -> duckdb_logical_type {
+    // SAFETY: test mock of the DuckDB C API; forwards to another mock with the same contract.
+    unsafe { duckdb_create_logical_type(DuckDBType::Struct) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_create_aggregate_function() -> duckdb_aggregate_function {
+    Box::into_raw(Box::<MockAggregateFunction>::default()) as duckdb_aggregate_function
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_destroy_aggregate_function(
+    aggregate_function: *mut duckdb_aggregate_function,
+) {
+    // SAFETY: test mock of the DuckDB C API: `*aggregate_function` came from
+    // `duckdb_create_aggregate_function` and is destroyed once.
+    unsafe {
+        if !aggregate_function.is_null() && !(*aggregate_function).is_null() {
+            drop(Box::from_raw(
+                *aggregate_function as *mut MockAggregateFunction,
+            ));
+            *aggregate_function = ptr::null_mut();
+        }
+    }
+}
+
+/// # Safety
+/// `f` must come from `duckdb_create_aggregate_function` and not be aliased.
+unsafe fn mock_agg<'a>(f: duckdb_aggregate_function) -> &'a mut MockAggregateFunction {
+    // SAFETY: caller contract.
+    unsafe { &mut *(f as *mut MockAggregateFunction) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_aggregate_function_set_name(
+    aggregate_function: duckdb_aggregate_function,
+    name: *const c_char,
+) {
+    // SAFETY: test mock; `name` is NUL-terminated and the function is a live mock.
+    unsafe {
+        mock_agg(aggregate_function).name = CStr::from_ptr(name).to_string_lossy().into_owned()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_aggregate_function_add_parameter(
+    aggregate_function: duckdb_aggregate_function,
+    type_: duckdb_logical_type,
+) {
+    // SAFETY: test mock; `type_` is a live `MockLogicalType`.
+    unsafe {
+        let ty = (*(type_ as *const MockLogicalType)).ty;
+        mock_agg(aggregate_function).params.push(ty);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_aggregate_function_set_return_type(
+    aggregate_function: duckdb_aggregate_function,
+    type_: duckdb_logical_type,
+) {
+    // SAFETY: test mock; `type_` is a live `MockLogicalType`.
+    unsafe { mock_agg(aggregate_function).ret = Some((*(type_ as *const MockLogicalType)).ty) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_aggregate_function_set_functions(
+    aggregate_function: duckdb_aggregate_function,
+    _state_size: duckdb_aggregate_state_size,
+    _state_init: duckdb_aggregate_init_t,
+    _update: duckdb_aggregate_update_t,
+    _combine: duckdb_aggregate_combine_t,
+    _finalize: duckdb_aggregate_finalize_t,
+) {
+    // SAFETY: test mock; the function is a live mock.
+    unsafe { mock_agg(aggregate_function).has_functions = true }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_aggregate_function_set_destructor(
+    aggregate_function: duckdb_aggregate_function,
+    _destroy: duckdb_aggregate_destroy_t,
+) {
+    // SAFETY: test mock; the function is a live mock.
+    unsafe { mock_agg(aggregate_function).has_destructor = true }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn duckdb_register_aggregate_function(
+    con: duckdb_connection,
+    aggregate_function: duckdb_aggregate_function,
+) -> DuckDBState {
+    // SAFETY: test mock; `con` is a live `MockConnection` and the function a live mock.
+    unsafe {
+        let c = &mut *(con as *mut MockConnection);
+        let f = mock_agg(aggregate_function);
+        c.aggregate_functions.push(RegisteredAggregateFn {
+            name: f.name.clone(),
+            params: f.params.clone(),
+            ret: f.ret.unwrap_or(DuckDBType::Invalid),
+            has_functions: f.has_functions,
+            has_destructor: f.has_destructor,
+        });
+        DuckDBState::Success
+    }
 }
 
 #[no_mangle]
@@ -1223,6 +1353,15 @@ fn install_mock_api() {
         duckdb_connect,
         duckdb_create_list_type,
         duckdb_create_logical_type,
+        duckdb_create_struct_type,
+        duckdb_create_aggregate_function,
+        duckdb_destroy_aggregate_function,
+        duckdb_aggregate_function_set_name,
+        duckdb_aggregate_function_add_parameter,
+        duckdb_aggregate_function_set_return_type,
+        duckdb_aggregate_function_set_functions,
+        duckdb_aggregate_function_set_destructor,
+        duckdb_register_aggregate_function,
         duckdb_add_scalar_function_to_set,
         duckdb_create_scalar_function,
         duckdb_create_scalar_function_set,
@@ -1337,6 +1476,40 @@ fn test_extension_init_and_registration_completeness() {
         register_scalar_functions(con_ptr).unwrap();
         raster_h3_duckdb::functions::register_pmtiles_table_function(con_ptr).unwrap();
         raster_h3_duckdb::functions::register_parquet_table_function(con_ptr).unwrap();
+        raster_h3_duckdb::functions::register_plan_partitions_function(con_ptr).unwrap();
+        raster_h3_duckdb::functions::register_merge_functions(con_ptr).unwrap();
+    }
+
+    // Partitioned scans: the planner, the `partition` parameter and the merge aggregates.
+    assert!(con
+        .table_functions
+        .iter()
+        .any(|f| f.name == "h3_raster_plan_partitions"
+            && f.named_params.get("target_chunks") == Some(&DuckDBType::BigInt)));
+    for name in [
+        "h3_raster_continuous_aggregate",
+        "h3_raster_categorical_aggregate",
+    ] {
+        let tf = con.table_functions.iter().find(|f| f.name == name).unwrap();
+        assert_eq!(
+            tf.named_params.get("partition"),
+            Some(&DuckDBType::Varchar),
+            "{name}"
+        );
+    }
+    let merges: Vec<&str> = con
+        .aggregate_functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(
+        merges,
+        ["h3_merge_partials", "h3_merge_categorical_partials"]
+    );
+    for f in &con.aggregate_functions {
+        assert_eq!(f.params, [DuckDBType::Blob]);
+        assert_eq!(f.ret, DuckDBType::Struct);
+        assert!(f.has_functions && f.has_destructor, "{}", f.name);
     }
 
     // The mock reports DuckDB v1.2.0, so h3_polygon_to_cells registers only its BLOB overloads.

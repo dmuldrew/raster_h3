@@ -390,3 +390,168 @@ fn test_dedicated_pool_under_shared_mutex_does_not_deadlock() -> Result<()> {
     assert_eq!(counts.iter().sum::<f64>(), 2.0 * 256.0 * 256.0);
     Ok(())
 }
+
+/// The workers precompute the eviction key of every cell the serial merge
+/// inserts, so the merge never computes one itself, and the output still
+/// matches a single-worker run cell for cell.
+#[test]
+fn test_workers_precompute_every_eviction_key() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("eviction_keys.tif");
+    helpers::create_temp_geotiff(&path, 512, 512, CompressionMethod::None)?;
+    let mut config = MultiResolutionConfig::new(vec![6, 8, 10]);
+    config.aggregation_workers = Some(1);
+    let mut streamer = MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path)?, &config)?;
+    let mut reference = HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(128)? {
+            reference.insert(record.h3_index, record.accumulator);
+        }
+    }
+    assert_eq!(streamer.metrics().eviction_key_fallbacks, 0);
+
+    config.aggregation_workers = Some(4);
+    let mut streamer = MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path)?, &config)?;
+    let mut map = HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(128)? {
+            assert!(map.insert(record.h3_index, record.accumulator).is_none());
+        }
+    }
+    assert_eq!(streamer.metrics().eviction_key_fallbacks, 0);
+    assert!(streamer.metrics().jobs > 1);
+    assert_eq!(map.len(), reference.len());
+    for (k, v) in &reference {
+        let o = &map[k];
+        assert_eq!(v.count, o.count);
+        assert!((v.sum - o.sum).abs() <= 1e-9 * v.sum.abs().max(1.0));
+        assert_eq!((v.min, v.max), (o.min, o.max));
+    }
+    Ok(())
+}
+
+/// Drain a stream, returning (cells, peak horizon-map bytes, spill runs, waves).
+fn drain_stats(
+    mut streamer: MultiScanHorizonStreamer,
+) -> (HashMap<u64, H3Accumulator>, usize, u64, u64) {
+    let mut map = HashMap::new();
+    while !streamer.is_finished() {
+        for record in streamer.fetch_next_batch(512).unwrap() {
+            assert!(map.insert(record.h3_index, record.accumulator).is_none());
+        }
+    }
+    (
+        map,
+        streamer.peak_active_bytes(),
+        streamer.spill_run_count(),
+        streamer.metrics().waves,
+    )
+}
+
+fn stream_paths(
+    paths: &[std::path::PathBuf],
+    config: &MultiResolutionConfig,
+) -> MultiScanHorizonStreamer {
+    use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
+    let mosaic = MosaicReader::open(paths, None, None, OverlapRule::Cutline).unwrap();
+    MultiScanHorizonStreamer::new_mosaic(std::sync::Arc::new(mosaic), config).unwrap()
+}
+
+/// Horizon maps hold a whole batch of cells, so a batch must not grow by
+/// whole chunks with the worker count: with strips larger than a batch's
+/// pixel target, 1 and 4 workers hold the same cells and neither spills.
+#[test]
+fn test_batch_cells_do_not_grow_with_workers() {
+    use crate::helpers::{write_geotiff, Crs, Layout};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("strips.tif");
+    let crs = Crs::Geographic {
+        lon: -100.0,
+        lat: 40.0,
+        pixel_deg: 0.0005,
+    };
+    // 64 strips of 16 x 256 = 4096 pixels.
+    write_geotiff(
+        &path,
+        (256, 1024),
+        Layout::Strips(16),
+        crs,
+        "-9999",
+        |c, r| ((c * 31 + r * 17) % 97) as f32,
+    );
+    let mut config = MultiResolutionConfig::new(vec![7, 9, 11]);
+    // RGSS over three resolutions makes the per-pixel worker allowance large,
+    // so windows are small and one strip already exceeds a batch's pixel target.
+    config.sampling = raster_h3_core::aggregator::sampling::SamplingPattern::rgss();
+    let paths = [path];
+
+    config.aggregation_workers = Some(1);
+    let (one, peak_one, spills_one, _) = drain_stats(stream_paths(&paths, &config));
+    config.aggregation_workers = Some(4);
+    let (four, peak_four, spills_four, _) = drain_stats(stream_paths(&paths, &config));
+
+    assert_eq!(
+        (spills_one, spills_four),
+        (0, 0),
+        "no spill under the default budget"
+    );
+    assert!(
+        peak_four * 2 <= peak_one * 3,
+        "peak horizon bytes grew with workers: {peak_one} at 1, {peak_four} at 4"
+    );
+    assert_eq!(one.len(), four.len());
+    for (k, v) in &one {
+        let o = &four[k];
+        assert_eq!((v.count, v.min, v.max), (o.count, o.min, o.max));
+    }
+}
+
+/// Batch length follows the sizes of the chunks being drained, so a large
+/// chunk elsewhere in a mosaic does not shrink batches of narrow strips. A
+/// batch takes whichever chunks are already decoded, so the exact wave count
+/// depends on timing; sizing batches by the mosaic's largest chunk instead
+/// ran about 4x the waves of the two files streamed separately.
+#[test]
+fn test_mixed_mosaic_batches_follow_their_own_chunks() {
+    use crate::helpers::{write_geotiff, Crs, Layout};
+    let dir = tempdir().unwrap();
+    let pixel_deg = 0.0005;
+    let value = |c: u32, r: u32| ((c * 7 + r * 3) % 50) as f32;
+    // A: one 256 x 256 strip; B: 512 one-row strips directly south of it.
+    let a = dir.path().join("a.tif");
+    write_geotiff(
+        &a,
+        (256, 256),
+        Layout::Strips(256),
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg,
+        },
+        "-9999",
+        value,
+    );
+    let b = dir.path().join("b.tif");
+    write_geotiff(
+        &b,
+        (256, 512),
+        Layout::Strips(1),
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0 - 256.0 * pixel_deg,
+            pixel_deg,
+        },
+        "-9999",
+        value,
+    );
+    let mut config = MultiResolutionConfig::new(vec![9]);
+    config.aggregation_workers = Some(4);
+
+    let (_, _, _, waves_a) = drain_stats(stream_paths(std::slice::from_ref(&a), &config));
+    let (_, _, _, waves_b) = drain_stats(stream_paths(std::slice::from_ref(&b), &config));
+    let (_, _, _, waves_mosaic) = drain_stats(stream_paths(&[a, b], &config));
+    assert!(
+        waves_mosaic <= 2 * (waves_a + waves_b),
+        "mosaic ran {waves_mosaic} waves, its files {waves_a} + {waves_b} separately"
+    );
+}

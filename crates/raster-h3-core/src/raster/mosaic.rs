@@ -250,6 +250,9 @@ pub struct TileDescriptor {
     /// Unit vector of `centroid_wgs84`, cached so `Cutline` ownership does no
     /// trigonometry per tile.
     centroid_unit: UnitVector,
+    /// The CRS input `crs_transformer` was built from (the override, or the file's EPSG
+    /// code / PROJ string), identifying the effective CRS for partition fingerprints.
+    crs_identity: String,
 }
 
 impl TileDescriptor {
@@ -293,6 +296,13 @@ impl TileDescriptor {
         ));
 
         let lon_period = source_longitude_period(&crs_transformer, centroid_wgs84);
+        let crs_identity = match custom_crs {
+            Some(custom) => format!("override:{}", custom.trim()),
+            None => format!(
+                "file:epsg={:?};proj={:?}",
+                reader.metadata.epsg, reader.metadata.proj_string
+            ),
+        };
 
         Ok(Self {
             tile_idx,
@@ -303,7 +313,14 @@ impl TileDescriptor {
             crs_transformer,
             lon_period,
             centroid_unit: unit_vector(centroid_wgs84),
+            crs_identity,
         })
+    }
+
+    /// The CRS input this tile's transformer was built from: the CRS override when one was
+    /// given, otherwise the file's EPSG code and PROJ string.
+    pub fn crs_identity(&self) -> &str {
+        &self.crs_identity
     }
 
     /// Whether WGS84 `(lon, lat)` lies inside this raster's pixel grid,
@@ -402,7 +419,15 @@ pub struct MosaicReader {
     pub chunk_refs: Vec<MosaicChunkRef>,
     /// Maximum number of samples (bands) per pixel across all tiles in the mosaic.
     pub max_samples_per_pixel: u16,
+    /// The WGS 84 bounding box the mosaic was opened with (it pruned `chunk_refs`, and scans
+    /// clip samples to it), recorded for partition fingerprints.
+    pub bbox: Option<[f64; 4]>,
 }
+
+/// The [`RasterH3Error::InvalidParameter`] message [`MosaicReader::open`] returns when
+/// the configured bbox misses every tile. Callers for which the bbox only narrows a scan
+/// (filter pushdown) match it to return an empty result instead.
+pub const NO_TILES_IN_BBOX: &str = "No mosaic tiles intersect the requested bounding box";
 
 impl MosaicReader {
     /// Create a 1-tile MosaicReader from an existing single GeoTiffStreamReader
@@ -465,6 +490,7 @@ impl MosaicReader {
             overlap_rule: OverlapRule::Cutline,
             chunk_refs,
             max_samples_per_pixel: max_spp,
+            bbox,
         })
     }
 
@@ -474,6 +500,18 @@ impl MosaicReader {
         bbox: Option<[f64; 4]>,
         custom_crs: Option<&str>,
         overlap_rule: OverlapRule,
+    ) -> Result<Self> {
+        Self::open_with_remote_source_factory(paths, bbox, custom_crs, overlap_rule, None)
+    }
+
+    /// Open a mosaic, resolving tile byte sources through
+    /// remote_source_factory when set.
+    pub fn open_with_remote_source_factory(
+        paths: &[PathBuf],
+        bbox: Option<[f64; 4]>,
+        custom_crs: Option<&str>,
+        overlap_rule: OverlapRule,
+        remote_source_factory: Option<&crate::raster::http_range::RemoteSourceFactory>,
     ) -> Result<Self> {
         if paths.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
@@ -489,7 +527,8 @@ impl MosaicReader {
         let mut max_spp = 1u16;
 
         for (idx, p) in paths.iter().enumerate() {
-            let reader = GeoTiffStreamReader::open(p)?;
+            let reader =
+                GeoTiffStreamReader::open_with_remote_source_factory(p, remote_source_factory)?;
             max_spp = max_spp.max(reader.metadata.samples_per_pixel);
             let desc = TileDescriptor::new(idx, reader, custom_crs)?;
 
@@ -511,7 +550,7 @@ impl MosaicReader {
 
         if tiles.is_empty() {
             return Err(RasterH3Error::InvalidParameter(
-                "No mosaic tiles intersect the requested bounding box".to_string(),
+                NO_TILES_IN_BBOX.to_string(),
             ));
         }
 
@@ -589,6 +628,7 @@ impl MosaicReader {
             overlap_rule,
             chunk_refs,
             max_samples_per_pixel: max_spp,
+            bbox,
         })
     }
 

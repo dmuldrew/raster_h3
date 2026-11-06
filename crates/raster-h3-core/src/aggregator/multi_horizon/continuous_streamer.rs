@@ -43,6 +43,20 @@ impl ContinuousKernel {
     }
 }
 
+impl ContinuousKernel {
+    /// The kernel a stream built from `config` uses (filters, band and options).
+    pub fn from_config(config: &MultiResolutionConfig) -> Self {
+        ContinuousKernel {
+            band: config.band,
+            spectral_formula: config.spectral_formula,
+            min_count: config.min_count,
+            min_mean: config.min_mean,
+            max_mean: config.max_mean,
+            track_quantiles: config.track_quantiles(),
+        }
+    }
+}
+
 impl HorizonStreamKernel for ContinuousKernel {
     type Accumulator = H3Accumulator;
     type Record = MultiContinuousRecord;
@@ -134,14 +148,7 @@ impl MultiScanHorizonStreamer {
 
     /// Initialize a new MultiScanHorizonStreamer from a single GeoTIFF reader
     pub fn new(reader: GeoTiffStreamReader, config: &MultiResolutionConfig) -> Result<Self> {
-        let kernel = ContinuousKernel {
-            band: config.band,
-            spectral_formula: config.spectral_formula,
-            min_count: config.min_count,
-            min_mean: config.min_mean,
-            max_mean: config.max_mean,
-            track_quantiles: config.track_quantiles(),
-        };
+        let kernel = ContinuousKernel::from_config(config);
         let track_quantiles = kernel.track_quantiles;
         let inner = MultiHorizonStreamer::new(reader, config, kernel)?;
         Ok(Self {
@@ -152,14 +159,7 @@ impl MultiScanHorizonStreamer {
 
     /// Initialize a new MultiScanHorizonStreamer from a multi-file MosaicReader
     pub fn new_mosaic(mosaic: Arc<MosaicReader>, config: &MultiResolutionConfig) -> Result<Self> {
-        let kernel = ContinuousKernel {
-            band: config.band,
-            spectral_formula: config.spectral_formula,
-            min_count: config.min_count,
-            min_mean: config.min_mean,
-            max_mean: config.max_mean,
-            track_quantiles: config.track_quantiles(),
-        };
+        let kernel = ContinuousKernel::from_config(config);
         let track_quantiles = kernel.track_quantiles;
         let inner = MultiHorizonStreamer::new_mosaic(mosaic, config, kernel)?;
         Ok(Self {
@@ -172,6 +172,37 @@ impl MultiScanHorizonStreamer {
     #[inline(always)]
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<MultiContinuousRecord>> {
         self.inner.fetch_next_batch(max_rows)
+    }
+
+    /// Drain a partitioned scan (`config.partition`): completed records into `on_record`
+    /// and partial cells into `on_partial`, up to `max_rows` in total. 0 means end of
+    /// stream. See [`super::partition`].
+    #[inline(always)]
+    pub fn drain_partitioned_into<F, G>(
+        &mut self,
+        max_rows: usize,
+        on_record: F,
+        on_partial: G,
+    ) -> Result<usize>
+    where
+        F: FnMut(usize, MultiContinuousRecord),
+        G: FnMut(super::partition::PartialCell<H3Accumulator>),
+    {
+        self.inner
+            .drain_partitioned_into(max_rows, on_record, on_partial)
+    }
+
+    /// For a partitioned scan, `(interior, boundary)` cells classified so far.
+    pub fn partition_cell_counts(&self) -> Option<(u64, u64)> {
+        self.inner.partition_cell_counts()
+    }
+
+    /// A merger turning all partitions' partial cells into final records with the
+    /// filters of `config`.
+    pub fn partial_merger(
+        config: &MultiResolutionConfig,
+    ) -> super::partial::PartialMerger<ContinuousKernel> {
+        super::partial::PartialMerger::new(ContinuousKernel::from_config(config))
     }
 
     /// Drain up to `max_rows` completed records directly into a closure with zero heap allocation

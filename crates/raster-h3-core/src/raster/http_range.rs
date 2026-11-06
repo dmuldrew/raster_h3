@@ -99,10 +99,31 @@ pub fn validate_range_response_headers(
     Ok(total)
 }
 
-/// Check if a path or string is a remote URL (http, https, or s3)
+/// Check if a path or string is a remote URI: `http(s)://`, `s3://`, or any
+/// other `scheme://` cloud URI (gs, gcs, azure, abfs, r2, oss, hf, ftp, ...).
+/// Non-http(s) schemes need a remote source factory that understands them
+/// (e.g. the DuckDB file system); the built-in HTTP transport only supports
+/// http/https and s3 (which it normalizes to https).
 pub fn is_remote_url(path: &str) -> bool {
     let p = path.trim().to_lowercase();
-    p.starts_with("http://") || p.starts_with("https://") || p.starts_with("s3://")
+    let Some(pos) = p.find("://") else {
+        return false;
+    };
+    let scheme = &p[..pos];
+    // `file://` URIs name local paths and take the local (mmap) path.
+    if scheme == "file" {
+        return false;
+    }
+    // A URI scheme is [A-Za-z][A-Za-z0-9+._-]*; require length >= 2 so
+    // single-letter Windows drive paths like "c://x" are not remote.
+    scheme.len() >= 2
+        && scheme
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'_' | b'-'))
 }
 
 /// Normalize input URL, resolving `s3://bucket/key` into an HTTPS URL with region and endpoint support
@@ -229,6 +250,22 @@ pub enum ProbeResult {
     Partial { data: Vec<u8>, total_size: u64 },
 }
 
+/// Byte-range backend for a RemoteHttpSource: the built-in HTTP range
+/// client or a host-provided file-system adapter (e.g. DuckDB's
+/// duckdb_file_system). Implementations must be safe to call concurrently
+/// from prefetch and decode worker threads.
+pub trait RemoteTransport: Send + Sync {
+    /// Fetch the inclusive byte range [start, end] and return exactly the
+    /// requested bytes. Returning fewer bytes is treated as an error by the
+    /// caller.
+    fn fetch_range(&self, start: u64, end: u64, expected_total: Option<u64>) -> Result<Vec<u8>>;
+
+    /// Discover the source's total size and prefetch its first bytes.
+    /// Transports that already know the file size after opening should
+    /// override this and may report Complete for small files.
+    fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult>;
+}
+
 /// Remote HTTP transport handling connections, retries, headers, and range requests.
 #[derive(Clone)]
 pub struct HttpTransport {
@@ -239,6 +276,16 @@ pub struct HttpTransport {
 }
 
 #[allow(clippy::result_large_err)]
+impl RemoteTransport for HttpTransport {
+    fn fetch_range(&self, start: u64, end: u64, expected_total: Option<u64>) -> Result<Vec<u8>> {
+        HttpTransport::fetch_range(self, start, end, expected_total)
+    }
+
+    fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult> {
+        HttpTransport::probe(self, initial_fetch_len)
+    }
+}
+
 impl HttpTransport {
     /// Create a new transport client with configured connection pooling and timeouts
     pub fn new(url: &str) -> Result<Self> {
@@ -303,6 +350,7 @@ impl HttpTransport {
     }
 
     /// Probe remote server to determine byte-range capability and initial header data.
+    #[allow(clippy::result_large_err)]
     pub fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult> {
         let range_header = format!("bytes=0-{}", initial_fetch_len.saturating_sub(1));
         let resp = self.execute_request(|| {
@@ -390,6 +438,7 @@ impl HttpTransport {
     }
 
     /// Fetch an arbitrary byte range directly from the remote server with retry and verification
+    #[allow(clippy::result_large_err)]
     pub fn fetch_range(
         &self,
         start: u64,
@@ -538,8 +587,38 @@ impl ByteCache {
 pub struct RemoteHttpSource {
     pub url: String,
     pub total_size: u64,
-    transport: HttpTransport,
+    transport: Box<dyn RemoteTransport>,
     cache: ByteCache,
+}
+
+/// Factory opening a [`RemoteHttpSource`] for a path. Engine adapters (e.g.
+/// the DuckDB file-system layer) supply one to route raster reads through
+/// their own credentials and remote file handling; the built-in HTTP/S3
+/// client is used when no factory is supplied.
+type RemoteSourceOpener = dyn Fn(&str) -> Result<Arc<RemoteHttpSource>> + Send + Sync;
+
+#[derive(Clone)]
+pub struct RemoteSourceFactory(Arc<RemoteSourceOpener>);
+
+impl RemoteSourceFactory {
+    /// Wrap a source-opening closure.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str) -> Result<Arc<RemoteHttpSource>> + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    /// Open a remote byte source for path.
+    pub fn open(&self, path: &str) -> Result<Arc<RemoteHttpSource>> {
+        (self.0)(path)
+    }
+}
+
+impl std::fmt::Debug for RemoteSourceFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RemoteSourceFactory")
+    }
 }
 
 impl RemoteHttpSource {
@@ -547,6 +626,12 @@ impl RemoteHttpSource {
     pub fn open(raw_url: &str) -> Result<Self> {
         let url = normalize_url(raw_url)?;
         let transport = HttpTransport::new(&url)?;
+        Self::from_transport(url, Box::new(transport))
+    }
+
+    /// Open a source over a caller-provided transport, probing its size and
+    /// fetching the initial header block.
+    pub fn from_transport(url: String, transport: Box<dyn RemoteTransport>) -> Result<Self> {
         let probe = transport.probe(DEFAULT_BLOCK_SIZE)?;
 
         let (cache, total_size) = match probe {
@@ -579,6 +664,7 @@ impl RemoteHttpSource {
     }
 
     /// Fetch an arbitrary byte range directly from the remote server with retry
+    #[allow(clippy::result_large_err)]
     pub fn fetch_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
         // Servers that ignore Range headers hand us the complete file at probe
         // time; serve ranged requests from that cache — the server could not
@@ -586,7 +672,14 @@ impl RemoteHttpSource {
         if self.cache.is_complete() && start <= end && end < self.total_size {
             let mut buf = vec![0u8; (end - start + 1) as usize];
             if let Some(n) = self.cache.copy_from_complete(start, &mut buf)? {
-                buf.truncate(n);
+                // A custom transport may report a total_size beyond the body it
+                // delivered; never hand back a silently short range.
+                if n != buf.len() {
+                    return Err(RasterH3Error::InvalidParameter(format!(
+                        "Cached remote file holds {n} of {} requested bytes at offset {start}",
+                        buf.len()
+                    )));
+                }
                 return Ok(buf);
             }
         }
@@ -846,7 +939,7 @@ mod tests {
         let source = RemoteHttpSource {
             url: "http://example.com/test.tif".to_string(),
             total_size: 5,
-            transport,
+            transport: Box::new(transport),
             cache,
         };
 
@@ -872,7 +965,7 @@ mod tests {
         let source = RemoteHttpSource {
             url: "http://example.com/test.tif".to_string(),
             total_size: data.len() as u64,
-            transport,
+            transport: Box::new(transport),
             cache,
         };
 
@@ -887,5 +980,22 @@ mod tests {
         // validation before any request.
         assert!(source.fetch_range(99, 100).is_err());
         assert!(source.fetch_range(50, 40).is_err());
+    }
+
+    #[test]
+    fn fetch_range_rejects_short_complete_cache() {
+        // total_size claims more bytes than the cached body holds.
+        let cache = ByteCache::new_with_complete((0..50).collect(), 16);
+        let source = RemoteHttpSource {
+            url: "http://example.com/test.tif".to_string(),
+            total_size: 100,
+            transport: Box::new(HttpTransport::new("http://example.com/test.tif").unwrap()),
+            cache,
+        };
+        assert_eq!(
+            source.fetch_range(0, 9).unwrap(),
+            (0..10).collect::<Vec<u8>>()
+        );
+        assert!(source.fetch_range(40, 59).is_err());
     }
 }

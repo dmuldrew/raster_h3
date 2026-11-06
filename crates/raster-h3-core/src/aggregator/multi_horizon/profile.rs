@@ -2,7 +2,7 @@
 //! timers; normal builds compile hot-path measurement out entirely. The
 //! transform-failure diagnostic is always counted: it only runs when a sample
 //! is dropped.
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution};
 use serde::Serialize;
 use std::cell::Cell;
 
@@ -86,6 +86,31 @@ pub fn index(ll: LatLng, res: Resolution) -> CellIndex {
     });
     result
 }
+/// Index one point at every resolution, sharing h3o's projection work and
+/// reusing the indexer's last cell where the point's grid cell is unchanged.
+#[inline(always)]
+pub fn index_all(
+    indexer: &mut LatLngIndexer,
+    ll: LatLng,
+    resolutions: &[Resolution],
+    cells: &mut [u64],
+) {
+    #[cfg(feature = "stream-profile")]
+    let start = std::time::Instant::now();
+    for (cell, index) in cells
+        .iter_mut()
+        .zip(indexer.to_cells(ll, resolutions.iter().copied()))
+    {
+        *cell = u64::from(index);
+    }
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.h3_calls += resolutions.len() as u64;
+        p.h3_ns += start.elapsed().as_nanos() as u64;
+        v.set(p);
+    });
+}
 #[inline(always)]
 pub fn transform(
     crs: &crate::crs::transformer::CrsTransformer,
@@ -142,6 +167,9 @@ pub struct StreamProfile {
     /// Waves run serially on the calling thread: the caller was already a
     /// worker of the dedicated pool, or a Rayon worker with no dedicated pool.
     pub serial_waves: u64,
+    /// New horizon-map cells whose eviction key the merge computed itself
+    /// because the parallel workers had not precomputed it (normally 0).
+    pub eviction_key_fallbacks: u64,
     pub worker_map_sets: u64,
     pub peak_worker_bytes: usize,
     pub decoded_bytes: u64,

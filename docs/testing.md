@@ -138,7 +138,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/multiband_and_query_pushdown.rs`](../crates/raster-h3-core/tests/it/multiband_and_query_pushdown.rs) (12), [`duckdb/cell_bbox_pushdown.rs`](../crates/raster-h3-duckdb/tests/it/cell_bbox_pushdown.rs) (2) | Band selection and samples-per-pixel; NDVI, NDWI, NBR and EVI on the fly; zero-denominator and NoData resilience; out-of-range band clamping; borrowed interleaved windows match across job sizes; `min_count`/`min_mean`/`min_majority_fraction` pushdown; `h3_cell`/`h3_hex` bbox pushdown at high latitude and across the antimeridian without dropping raster samples. |
+| [`core/multiband_and_query_pushdown.rs`](../crates/raster-h3-core/tests/it/multiband_and_query_pushdown.rs) (13), [`duckdb/cell_bbox_pushdown.rs`](../crates/raster-h3-duckdb/tests/it/cell_bbox_pushdown.rs) (2) | Band selection and samples-per-pixel; NDVI, NDWI, NBR and EVI on the fly; zero-denominator and NoData resilience; out-of-range bands (and spectral formula bands) refused when the stream opens; borrowed interleaved windows match across job sizes; `min_count`/`min_mean`/`min_majority_fraction` pushdown; `h3_cell`/`h3_hex` bbox pushdown at high latitude and across the antimeridian without dropping raster samples. |
 | Unit: `multi_horizon/spectral.rs` (5) | Formula evaluation and singularity guards. |
 
 ## 9. Threading & concurrency
@@ -160,6 +160,7 @@ Results must not depend on thread count, scheduling or pool nesting.
 | [`core/memory_budgets.rs`](../crates/raster-h3-core/tests/it/memory_budgets.rs) (2) | The decoded-chunk budget bounds held chunks without changing results; the compaction limit decomposes groups without losing or duplicating samples. |
 | [`core/sparse_chunks_and_spilling.rs`](../crates/raster-h3-core/tests/it/sparse_chunks_and_spilling.rs) (4) | Sparse COG chunks are filled with a non-zero NoData and skipped; a low aggregation budget creates spill runs (`spill_run_count() > 0`) and the external merge matches an in-memory reference; with resolutions 6 and 8, compaction and four aggregation workers, a budget that spills only resolution 8 (resolution 6 stays in memory, checked per resolution) reproduces the in-memory continuous (count, sum, min, max, p50) and categorical (heap class maps) output exactly. |
 | Unit: `multi_horizon/spill.rs` (5) | Spill file writing and merging. |
+| Unit: `pmtiles/external_export.rs` (5) | The external-sort PMTiles exporter: with a 4 KiB budget (several spilled runs) and eviction every 8 features, the archive is byte-identical to an unspilled export and has the same tile count as single-pass accumulation; run records round-trip every `MvtValue` kind; an empty export is a valid archive; the spill directory is created only when a run is written. |
 | [`memory`](../crates/raster-h3-core/tests/memory/scenarios.rs) (7 scenarios, 38 checks) | Measured, not estimated, memory. A counting allocator records peak live heap and allocations; each scenario variant runs in its own process. `spill_sorted_run`: the sorted vector built for a spill run is the only new heap while the map's shards drain (accumulators move, nothing is cloned), it fits within the map's accounted bytes, and the map is freed afterwards (plain, quantile and categorical maps). `spill_stream_quantiles`, `categorical_high_cardinality`: p50/p90 sketches and ~46-class heap histograms forced to spill reproduce the in-memory output bit for bit per cell, stay within the budget and lower peak heap. `slow_http_consumer`: with a slow consumer, held response bytes stay within `max_buffered_bytes`, peak heap within twice it and under half of the chunk-count bound alone, with one request per coalesced range. `slow_parquet_writer`: a writer that sleeps per row group adds at most three row-group buffers. `many_tiny_chunks`: 512 one-row strips cost at most 16 allocations each and coalesce into one HTTP range. `concurrent_streams`: four streams use at most 5× the heap of one. |
 
 See [Engineering Architecture](engineering.md) for what the budgets cover.
@@ -222,7 +223,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (32) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
+| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (32) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; remote-path detection (cloud schemes, case, `file://`, Windows drive letters, malformed schemes); header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
 | Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
 
 ## 14. Mosaics & overlap rules
@@ -267,10 +268,11 @@ See [PMTiles & Multi-Resolution](pmtiles.md).
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (6) | Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, quantile sketches built only when a quantile column is projected (`geom` and `wkb` excluded) with reordered/repeated quantile columns matching a full scan, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
-| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (4, ignored) | Real SQL through DuckDB v1.2.0, v1.5.6, and v2.0.0: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 and v2.0.0 to serialize native geometry as WKB. |
+| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (6) | Default (v1.2.0) build only; the harness emulates the 357-entry v1.2.0 function table, so the DuckDB 2.0 build relies on `real_sql_v156_features` below. Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, quantile sketches built only when a quantile column is projected (`geom` and `wkb` excluded) with reordered/repeated quantile columns matching a full scan, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
+| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (5, ignored) | Real SQL through DuckDB v1.2.0, v1.5.6, and v2.0.0: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 and v2.0.0 to serialize native geometry as WKB. `real_sql_v156_features` runs only against the DuckDB 2.0 build (`DUCKDB_VERSION=v1.5.6`): `SET` options round-trip through `current_setting`; a raster export reads through DuckDB's file system; `COPY ... (FORMAT pmtiles)` overwrites a larger existing file (archive length matches its header) and writes tiles for valid cells; non-H3 values, unknown options and `memory_budget_mb 0` are rejected; a 1 MiB-budget COPY of ~23k cells is byte-identical to an unspilled one and creates `temp_directory` only when spilling; invalid constant `h3_polygon_to_cells` arguments fail at plan time; `typeof(h3_cell_to_geometry(...))` is `GEOMETRY`. |
+| [`root/duckdb_trusted_repository.rs`](../tests/it/duckdb_trusted_repository.rs) (1, ignored) | DuckDB 2.0+ trusted repository end to end, with signature checking on (no `-unsigned`) and an isolated `HOME`: a repository with a signed extension and `.well-known/duckdb-extension-repo.json` is created from a local prefix, the pinned fingerprint matches the key, `INSTALL`/`LOAD ... FROM` run the extension, a later session reloads it without opting in, and extensions that are unsigned or signed with an unpinned key are rejected. No-op against DuckDB < 2.0. |
 | [`test/sql/raster_h3.test`](../test/sql/raster_h3.test) (sqllogictest) | Packaged `build/release/raster_h3.duckdb_extension` from `make release` loads through DuckDB's Python sqllogictest runner (the community-extensions test path); `h3_to_string` is absent before `require raster_h3` and returns the expected cell after. |
-| [`root/package_extension.rs`](../tests/it/package_extension.rs) (4) | Extension footer layout: custom section headers, ABI fields, version and platform strings (including `v2.0.0`), zeroed signature, gzip output, 1 MiB chunked SHA-256 RSA-2048 signing and verification, tamper rejection, inline PEM env-var signing, and DuckDB 2.0 `.well-known/duckdb-extension-repo.json` manifest generation. |
+| [`root/package_extension.rs`](../tests/it/package_extension.rs) (6) | Extension footer layout: custom section headers, ABI fields, version and platform strings (including `v2.0.0`) and `--print-platform` parity, zeroed signature, gzip output, 1 MiB chunked SHA-256 RSA-2048 signing and verification, tamper and mismatched-key rejection, inline PEM env-var signing, and DuckDB 2.0 `.well-known/duckdb-extension-repo.json` manifest generation. |
 | Unit: `raster-h3-duckdb` (28) | `ffi/duckdb_c.rs` (9: `duckdb_string_t` layout), `ffi/mod.rs` (3), `bind_utils/parsing.rs` (6), `bind_helper.rs` (2), `chunk_writer.rs` (3), `record_queue.rs` (1), `scalar.rs` (4). |
 
 See [DuckDB](engines/duckdb.md).
@@ -378,7 +380,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 
 | Test | Gate | How to run |
 | :--- | :--- | :--- |
-| `duckdb_sql_smoke` (4 root tests) | `#[ignore]`; needs the DuckDB CLI and a built library; v1.5.6 needs network access to install DuckDB Spatial | `cargo build --release --lib && DUCKDB_BIN=/path/to/duckdb cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` (`DUCKDB_VERSION`, `DUCKDB_BIN`, and `RASTER_H3_LIBRARY` select the footer version, CLI, and library) |
+| `duckdb_sql_smoke` (5 root tests) | `#[ignore]`; needs the DuckDB CLI and a built library; v1.5.6 needs network access to install DuckDB Spatial; `real_sql_v156_features` needs a DuckDB 2.0 CLI, a library built with `--features duckdb-api-v1_5_6` (`RASTER_H3_LIBRARY`) and `DUCKDB_VERSION=v1.5.6`, and is skipped otherwise | `cargo build --release --lib && DUCKDB_BIN=/path/to/duckdb cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` (`DUCKDB_VERSION`, `DUCKDB_BIN`, and `RASTER_H3_LIBRARY` select the footer version, CLI, and library) |
 | `pg_extension_e2e::pg_extension_in_real_server` (root) | `#[ignore]`; needs Docker | `cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture` (`RASTER_H3_PG_VERSIONS=14,16,18`, `RASTER_H3_PG_E2E_KEEP=1`) |
 | 4 × `codecs` LZW Hawaii parity, 2 × `horizon_streaming` Hawaii aggregation (core) | `#[ignore]`; need `data/CFL_HI.tif` / `data/LF2024_FBFM40_HI.tif` | Download the datasets into the workspace-root `data/`, then `-- --ignored`. They fail explicitly if the files are missing. |
 | `super_sampling::benchmark_supersampling` (core) | `#[ignore]` | `cargo test --release -p raster-h3-core --test it benchmark_supersampling -- --ignored --nocapture` |
@@ -392,13 +394,15 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | Workflow | Command | Covers |
 | :--- | :--- | :--- |
 | [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded), and the core `memory` benchmark checks |
-| `ci.yml` | `cargo build --release --lib` then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0, v1.5.6 and v2.0.0 CLIs | Real-SQL coverage on all three DuckDB versions, packaging with each CLI's `PRAGMA platform` tag |
+| `ci.yml` | `cargo build --release --lib`, plus `cargo build --features duckdb-api-v1_5_6` into `target-v156/` (packaged with `--duckdb-version v1.5.6` under `dist/v2.0.0/`), then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs with the default build and and `duckdb_trusted_repository` against v2.0.0, both with the v1.5.6-API build | Real-SQL coverage on all three DuckDB versions and both extension builds, packaging with each CLI's `PRAGMA platform` tag; signed install through `CREATE EXTENSION REPOSITORY` |
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
 | `ci.yml` (`test-crates`, Linux) | `cargo test --release -p raster-h3-core -p raster-h3-duckdb -p raster-h3-datafusion -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
 | [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets and scoped Arrow Miri tests | Malformed input, sanitizer smoke checks, and FFI ownership; longer fuzz runs weekly |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
 | `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example profile_hotspots` | Hotspot harness ownership-sampling correctness; profiling experiments are excluded |
+| `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example worker_scaling` | Worker-scaling benchmark: every workload produces identical output at 1 and 3 aggregation workers; timings are not run |
+| [`profile.yml`](../.github/workflows/profile.yml) (optional, manual-only) | `cargo run --release -p raster-h3-core --example worker_scaling -- --json worker-scaling.json` | Informational: wall time, kernel and serial-merge time per workload at 1/2/4/8 aggregation workers; see [Worker Scaling](worker-scaling.md). Hosted runners have few cores, so high worker counts oversubscribe them |
 | [`profile.yml`](../.github/workflows/profile.yml) (optional, manual-only) | `cargo run --release -p raster-h3-core --example profile_hotspots -- --json profile.json` | Informational: mosaic planning/ownership scaling with tile count, end-to-end cost per overlap rule, and nested-Rayon wave dispatch (waves, helper-thread hand-offs, allocations). Prefer [local profiling](engines/core.md#profiling-and-wave-dispatch) for comparisons. Optional hosted results appear in the job summary, `::notice` annotations and a JSON artifact |
 | `ci.yml` | `duckdb -unsigned -c "LOAD …; SELECT h3_to_string(…)"` | Packaged extension loads |
 | [`wheels.yml`](../.github/workflows/wheels.yml) | `cibuildwheel` + `wheel_smoke.py` | Each built wheel installs and works |
@@ -421,3 +425,57 @@ name any branch, even one without the file.
 - The real PostgreSQL test and the Hawaii-dataset tests never run in CI.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - EPSG:6933 and EPSG:7856 have no coverage tests.
+
+
+## Accuracy and weighting contracts
+
+Projection accuracy and datum accuracy are separate. The 0.01 m golden-point
+checks in `geodetic_reference.rs` isolate projection mathematics by using the
+source ellipsoid. They do not promise centimetre-level WGS84 positioning.
+`datum_shifts.rs` checks the supported Helmert operations against PROJ with
+identical parameters, then separately compares with PROJ's preferred operation
+using the selected operation's published accuracy. These finite fixtures are
+regression checks, not proof of accuracy everywhere in an operation's area of use.
+
+The raster-to-cell datum test places a GeoTIFF pixel center at each stored PROJ
+reference coordinate and checks the emitted H3 cell, count and sum at resolutions
+5, 9 and 12. Expected geographic coordinates come directly from the PROJ fixture;
+they are never generated using `CrsTransformer`. H3 indexing still uses h3o on
+both sides, so this tests the raster/CRS integration rather than independently
+validating the H3 implementation. See the fixture comments for operation IDs,
+reference provenance and accuracy tolerances.
+
+EPSG:4269 (NAD83) is treated as WGS84 without a datum shift. NAD83 Albers fast
+paths likewise invert the projection without a grid-based datum correction.
+ETRS89/WGS84 equivalence is also approximate and epoch dependent. Metre-scale
+position errors can change H3 assignment near a boundary at any resolution;
+finer cells increase the practical sensitivity. Unsupported grid shifts are
+rejected. Reproject externally using an appropriate operation, grids and epoch
+when that accuracy is needed.
+
+Counts and category fractions measure pixel contributions. With built-in
+supersampling presets, a valid pixel contributes total weight one before spatial
+filtering; sum is the sum of values times their sample weights, and mean divides
+that sum by retained weight. These weights are not square metres. Equal angular
+pixels have different ground areas at different latitudes, and fixed-point
+supersampling is not exact pixel/hexagon intersection. The geographic weighting
+regression contrasts pixel means at the equator and 60 degrees north with an
+independent spherical rectangle-area calculation. There is no ground-area
+weighting mode implied by these statistics. Variance for fractional weights is
+an outstanding issue and is not validated by the weighting regression.
+
+Calibration is applied after stored-value nodata checks. Non-finite calibrated
+samples are omitted from continuous statistics and quantiles. Spectral indices
+also omit pixels with non-finite calibrated input bands, non-finite numerator or
+denominator, an effectively zero denominator, or a non-finite quotient. This
+policy applies to direct pixels, interleaved bands and spans. Finite statistics
+can still exceed floating-point range when accumulating extreme finite data;
+these tests do not establish arbitrary-precision aggregation.
+
+Run the added regressions with:
+
+```sh
+cargo test -p raster-h3-core calibrated_overflow_agrees_between_samples_and_spans
+cargo test -p raster-h3-core --test it band_calibration
+cargo test -p raster-h3-core --test it datum_shifts
+```

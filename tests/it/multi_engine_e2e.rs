@@ -18,11 +18,12 @@
 
 use crate::helpers;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use h3o::{CellIndex, LatLng};
 use helpers::TestGeoTiffBuilder;
@@ -270,6 +271,19 @@ fn python_exe() -> String {
 }
 
 fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
+    // Build each cdylib at most once per test process. Tests in this binary run in parallel, and
+    // a second `cargo build` can replace the copied library in `target/<profile>/` while another
+    // test's subprocess is `dlopen`-ing it (seen on macOS as a spurious "no such file"). The lock
+    // is held across the build so concurrent callers wait for the first build and reuse its path.
+    static BUILT: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let mut built = BUILT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(path) = built.get(pkg) {
+        return path.clone();
+    }
+
     let dir = target_profile_dir();
     let lib_path = dir.join(format!(
         "{}{}{}",
@@ -301,6 +315,7 @@ fn ensure_cdylib_built(pkg: &str, lib_stem: &str) -> PathBuf {
         "Expected shared library at {}",
         lib_path.display()
     );
+    built.insert(pkg.to_string(), lib_path.clone());
     lib_path
 }
 

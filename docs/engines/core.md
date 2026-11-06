@@ -62,6 +62,11 @@ resolutions, so a fine resolution can spill while a coarse one stays in memory. 
 resolution has spilled, the eviction horizon stops advancing: cells of in-memory
 resolutions south of it are held until EOF and then emitted from memory, never from runs.
 
+A horizon map holds at least one batch of cells, and a batch is never smaller than one
+chunk, so fine resolutions over wide strips or large tiles can need more than the
+64 MiB default. See [budget sizing](../engineering.md#1-southernmost-scan-line-horizon-eviction)
+for an estimate.
+
 ### Transform-failure diagnostics
 
 `transform_failures()` on both streamers and both batch readers counts valid sample points
@@ -125,6 +130,7 @@ collected even without `stream-profile`:
 | `waves` | Non-empty kernel dispatches, each containing up to `worker_tasks` window jobs (`jobs` counts the individual jobs). |
 | `bridged_waves` | Waves sent to a dedicated aggregation pool via a newly spawned helper OS thread because the caller is a worker of another Rayon pool. |
 | `serial_waves` | Waves executed serially on the caller: it is already a worker of the dedicated pool, or is a Rayon worker with no dedicated pool. |
+| `eviction_key_fallbacks` | New horizon-map cells whose eviction key the serial merge computed itself because the workers had not precomputed it. Normally 0. |
 
 Direct non-Rayon callers dispatch in parallel using the dedicated pool when
 configured, otherwise the ambient global pool; neither subtype counter increases.
@@ -153,6 +159,26 @@ for mosaic opening include file opening **and** planning. Allocator peaks are
 approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
 wall-time comparisons include decoding and scheduling; they do not isolate bridge
 cost. The bare spawn/join measurement is only an isolated baseline.
+
+### Worker scaling
+
+The `worker_scaling` example measures how wall time splits between the parallel
+kernel waves and the serial horizon merge as `aggregation_workers` grows:
+
+```bash
+cargo run --locked --release -p raster-h3-core --example worker_scaling -- --workers 1,2,4,8 --json scaling.json
+```
+
+It streams synthetic rasters through six workloads: resolution 9, coarse (7), fine
+(11), three resolutions, quantiles and categorical. For each worker count it reports
+wall time, throughput, `kernel_wall_ns`, `merge_ns` and the merge's share of wall
+time, plus parallel-stage efficiency, decode wait and spill time. `--quick` uses
+1024² rasters and one run; `--side` and `--reps` override the size and repetitions.
+Every worker count must produce the same cells and exact per-cell statistics
+(count, sum, min, max, class counts; not quantiles), or the run aborts. These stage timers are always on, so a normal release build suffices.
+Worker counts above the machine's cores oversubscribe it; the report prints the
+available parallelism. Results and the resulting decision are recorded in
+[Worker Scaling](../worker-scaling.md).
 
 ### Remote COG prefetching
 
@@ -201,6 +227,25 @@ range that needs the same budget. Handles remain valid after the queue is droppe
 All engine adapters use this core prefetcher; `RemotePrefetchConfig` is a Rust
 queue-level API, not an additional SQL, Python or CLI option.
 
+### Custom byte sources
+
+By default local paths are memory-mapped and remote URLs use the built-in HTTP/S3
+client (`http(s)://` and `s3://`; any other `scheme://` path counts as remote but is
+rejected by that client). An engine can supply its own byte source instead:
+
+- Implement `raster::http_range::RemoteTransport` (`fetch_range(start, end, expected_total)`
+  returning exactly those bytes, and `probe(initial_len)` reporting the total size). It must
+  be safe to call from several threads, because prefetch and decode workers share it.
+- Wrap a closure that opens one in `RemoteSourceFactory::new(|path| ...)`, building the
+  source with `RemoteHttpSource::from_transport(path, Box::new(transport))`.
+- Set `MultiResolutionConfig::remote_source_factory`, or call
+  `GeoTiffStreamReader::open_with_remote_source_factory` /
+  `MosaicReader::open_with_remote_source_factory`.
+
+When a factory is set it opens **every** path, local ones included, and the prefetcher,
+cache and coalescing work on top of it unchanged. The DuckDB 2.0 build uses this to read
+through DuckDB's file system (`SET raster_h3_use_duckdb_fs = true`).
+
 ### Mosaic decoder cache
 
 `PrefetchedMosaicReader` keeps at most `MAX_OPEN_DECODERS_PER_WORKER` (16) TIFF
@@ -244,6 +289,57 @@ on that pool without risking deadlock (see `aggregation_workers`):
 So when calling from inside a Rayon pool, set `aggregation_workers` and keep the
 aggregation budget at its default or larger. Calls from ordinary threads,
 including DuckDB's scan threads, are unaffected.
+
+### Partitioned scans
+
+A mosaic can be split across independent workers (for example Spark tasks) that each
+read a disjoint set of chunks, with results identical to a single scan up to
+floating-point summation order:
+
+1. **Plan** (driver, metadata only): `plan_partitions(&mosaic, target_chunks)` cuts each
+   tile's chunk grid into rectangles of about `target_chunks` chunks, packing small tiles
+   together. Each `ScanPartition` serializes with `to_json` / `from_json` and carries a
+   fingerprint of the mosaic layout (dimensions, chunk layouts, geotransforms, overlap
+   rule and the bbox-pruned chunk list, but not file paths).
+2. **Scan** (each worker): reopen the mosaic with the same sources, bbox, CRS override and
+   overlap rule (a different mosaic is refused), set `MultiResolutionConfig::partition`
+   and drain with `drain_partitioned_into(max, on_record, on_partial)`. Only the
+   partition's chunks are decoded; the rest of the pipeline is the single-node one.
+3. **Merge**: a finalized cell that no chunk outside the partition can reach is
+   *interior* and is emitted as a normal record. Any other cell is *boundary* and is
+   emitted as an unfiltered `PartialCell`. Ship partials with `encode_partial_state` (the
+   lossless spill format with a versioned `RH3P` header), merge them with
+   `PartialMerger::push_encoded` (built by the streamer's `partial_merger(&config)`), and
+   `finish()` applies the filters to the merged states.
+
+Classification is conservative: a cell is interior only when its padded lat/lon box misses
+the certified bounds of every outside chunk (`rejection_bounds`). Uncertified CRS bounds
+and cells near a pole or across the antimeridian count as boundary, which is always
+correct and only adds merge work. The test runs once per finalized cell, and an
+ancestor-level cache settles most interior cells without computing their boundary.
+Boundary cells are a perimeter effect and shrink as partitions grow. `partition_cell_counts()`
+reports the split.
+
+Partitioning adds no measurable CPU. The `partition_overhead` example scans a 6144 x 6144 px
+f32 raster (576 tiles of 256 px) once, then as all partitions plus the merge, and compares
+total process CPU time (median of 5 interleaved runs, 4 vCPUs):
+
+| resolutions | 4 partitions (144 tiles each) | 16 partitions (36 tiles each) |
+| :--- | :--- | :--- |
+| 8 | 0.99x CPU, 4.6% boundary cells | 0.98x, 13.2% |
+| 10 | 0.99x, 0.6% | 1.01x, 1.9% |
+| 7, 8, 9 | 0.97x, 2.3% | 1.02x, 6.8% |
+
+Ratios within a few percent of 1.0 are run-to-run noise on that machine. The merge takes
+milliseconds (under 3 ms for about 35,000 boundary cells at resolution 10).
+
+```bash
+cargo run --release -p raster-h3-core --example partition_overhead -- [--quick] [--json out.json]
+```
+
+Child compaction cannot be combined with a partition (sibling groups may span
+partitions), and record-only reads (`drain_completed_into`, `fetch_next_batch`) are
+refused so partials cannot be dropped silently.
 
 ## Columnar Model
 
@@ -403,6 +499,9 @@ floats become `null`; binary columns (`wkb`) are lowercase hex strings.
 | `H3ParquetWriter::write_continuous_streamer_to_parquet(streamer, path, ParquetExportConfig)` / `write_categorical_streamer_to_parquet` | Parquet or OGC GeoParquet 1.1 (`config.geoparquet`); the file is published only after the stream completes successfully. |
 | `H3PmtilesTiler::process_raster_source_to_pmtiles(source, path, config)` / `process_categorical_source_to_pmtiles` | PMTiles v3 archive with one zoom range per requested resolution. See [PMTiles & Multi-Resolution](../pmtiles.md). |
 | `transcode::process_parquet_to_pmtiles` | Pre-aggregated H3 Parquet → PMTiles. An explicit `h3_column_name` that isn't in the schema returns `Err` listing available columns; `None` auto-detects. |
+| `H3PmtilesTiler::export_h3_features(features, path)` | PMTiles v3 from `H3Feature`s in any order, with bounded memory (external sort by latitude, 256 MiB buffer). Invalid H3 indexes are counted in `PmtilesExportSummary::invalid_features_dropped`. |
+| `pmtiles::ExternalFeatureExport::new(budget_bytes, spill_dir)` → `push(feature)` → `finish(path)` / `finish_into(writer)` | The exporter behind `export_h3_features`, with a custom buffer budget, spill directory (created only when a run is spilled) and output; `finish_into` streams the archive to any `std::io::Write`, such as a database file system. |
+| `PmtilesWriter::new_in(..., spill_dir)` / `finish_into(writer)` | Low-level archive writer: tile spill file in a chosen directory, and the finished archive streamed to any writer (`finish(path)` writes atomically via a temporary file next to `path`). |
 
 ## Errors
 

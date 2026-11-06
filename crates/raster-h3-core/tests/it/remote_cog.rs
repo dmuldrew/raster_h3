@@ -1065,6 +1065,26 @@ fn test_remote_url_normalization_and_detection() {
     assert!(!is_remote_url("/local/path/to/raster.tif"));
     assert!(!is_remote_url("data/CFL_HI.tif"));
     assert!(!is_remote_url("file:///path/to/file.tif"));
+    // Other cloud schemes count as remote (the DuckDB file system serves
+    // them); scheme matching ignores case and surrounding whitespace.
+    assert!(is_remote_url("gs://bucket/raster.tif"));
+    assert!(is_remote_url("az://container/raster.tif"));
+    assert!(is_remote_url(
+        "abfss://fs@account.dfs.core.windows.net/raster.tif"
+    ));
+    assert!(is_remote_url("hf://datasets/org/repo/raster.tif"));
+    assert!(is_remote_url("HTTPS://example.com/raster.tif"));
+    assert!(is_remote_url("  s3://bucket/raster.tif"));
+    assert!(!is_remote_url("FILE:///path/to/file.tif"));
+    // Single-letter schemes are Windows drive letters, not URIs.
+    assert!(!is_remote_url("c://data/raster.tif"));
+    assert!(!is_remote_url("C:\\data\\raster.tif"));
+    // Malformed schemes are not URIs.
+    assert!(!is_remote_url("://bucket/raster.tif"));
+    assert!(!is_remote_url("1s3://bucket/raster.tif"));
+    assert!(!is_remote_url("my bucket://raster.tif"));
+    // The built-in transport still rejects schemes it cannot serve.
+    assert!(normalize_url("gs://bucket/raster.tif").is_err());
 
     // 2. Normalization
     let url_http = normalize_url("http://localhost:8080/data.tif").unwrap();

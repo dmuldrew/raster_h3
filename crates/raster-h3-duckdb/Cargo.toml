@@ -19,6 +19,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+duckdb-api-v1_5_6 = []
 stream-profile = ["raster-h3-core/stream-profile"]
 
 [dependencies]

@@ -11,6 +11,7 @@
 //! optionally limited (`compaction_budget_bytes`). Metadata is not budgeted.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
+use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use super::compaction::HierarchicalCompactor;
 use super::config::MultiResolutionConfig;
 use super::coordinates::eviction_north_bound;
 use super::lifecycle::{OutputBuffer, StreamLifecycle};
+use super::partition::{restrict_mosaic, BoundaryClassifier, PartialCell};
 use super::sharded_map::{AccumulatorMerge, ShardedResolutionMap};
 use super::spill::{RunReader, SpillAccumulator, SpillRuns};
 use super::walker::WalkContext;
@@ -43,6 +45,32 @@ type WindowJob<'a> = (
 );
 /// One worker's per-resolution cell maps.
 type CellMaps<A> = Vec<HashMap<u64, A, H3BuildHasher>>;
+/// Per resolution, `(cell, compute_cell_south_lat(cell))` in map order.
+type SouthKeys = Vec<Vec<(u64, f64)>>;
+
+/// Refuse a `band` (or spectral formula band) that some mosaic tile does not have. The
+/// sample kernels index pixels by band without a bounds check that fails the scan, so an
+/// out-of-range band would otherwise read another band's values.
+fn check_bands_exist(mosaic: &MosaicReader, config: &MultiResolutionConfig) -> Result<()> {
+    let bands = match &config.spectral_formula {
+        Some(formula) => formula.bands(),
+        None => vec![config.band],
+    };
+    for tile in &mosaic.tiles {
+        let available = usize::from(tile.reader.metadata.samples_per_pixel.max(1));
+        if let Some(&band) = bands.iter().find(|&&b| b == 0 || b > available) {
+            let what = if config.spectral_formula.is_some() {
+                "spectral formula band"
+            } else {
+                "band"
+            };
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "{what} {band} does not exist: the raster has {available} band(s), numbered from 1"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Dedicated aggregation pool of `threads` workers, shared by all live
 /// streams requesting the same size so concurrent queries do not each spawn
@@ -187,11 +215,25 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     /// Dedicated kernel pool (`aggregation_workers`); None uses the ambient pool.
     pool: Option<Arc<rayon::ThreadPool>>,
     worker_budget: usize,
+    /// Most chunks per batch.
     batch_size: usize,
+    /// Pixels after which a batch stops, about two waves of worker windows.
+    batch_pixels: usize,
     output_byte_limit: usize,
     peak_active_bytes: usize,
     worker_maps: Vec<CellMaps<K::Accumulator>>,
+    /// Per worker map set and resolution: eviction keys the worker computed
+    /// for cells new to the horizon map. Reused across waves.
+    worker_south_keys: Vec<SouthKeys>,
     metrics: super::profile::StreamProfile,
+    /// Set for partitioned scans (`MultiResolutionConfig::partition`).
+    partition: Option<PartitionOutput<K::Accumulator>>,
+}
+
+/// Interior/boundary classification and buffered partial cells of a partitioned scan.
+struct PartitionOutput<A> {
+    classifier: BoundaryClassifier,
+    partials: OutputBuffer<PartialCell<A>>,
 }
 
 impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
@@ -216,28 +258,21 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         kernel: K,
     ) -> Result<Self> {
         config.validate()?;
-        // Band references are 1-indexed into each tile's interleaved samples.
-        // An index beyond the raster's sample count used to clamp silently to
-        // the last band and produce plausible-but-wrong statistics.
-        let samples_per_pixel = mosaic
-            .tiles
-            .iter()
-            .map(|tile| tile.reader.metadata.samples_per_pixel as usize)
-            .min()
-            .unwrap_or(1);
-        for band in config
-            .spectral_formula
-            .iter()
-            .flat_map(|f| f.band_indices())
-            .chain(std::iter::once(config.band))
-        {
-            if band > samples_per_pixel {
-                return Err(RasterH3Error::InvalidParameter(format!(
-                    "band {band} exceeds the raster's {samples_per_pixel} samples per pixel"
-                )));
-            }
-        }
+        check_bands_exist(&mosaic, config)?;
         let should_compact = config.should_compact_h3_children();
+        // A partition streams only its own chunks; cells that chunks outside it may also
+        // reach are classified against the full mosaic's chunk list.
+        let (mosaic, partition) = match &config.partition {
+            Some(spec) => {
+                let restricted = Arc::new(restrict_mosaic(&mosaic, spec)?);
+                let output = PartitionOutput {
+                    classifier: BoundaryClassifier::new(&mosaic, spec),
+                    partials: OutputBuffer::with_capacity(16),
+                };
+                (restricted, Some(output))
+            }
+            None => (mosaic, None),
+        };
 
         let mut resolutions = Vec::with_capacity(config.resolutions.len());
         let mut resolution_u8s = Vec::with_capacity(config.resolutions.len());
@@ -320,6 +355,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         .min(worker_budget / per_pixel);
         let batch_size = (worker_tasks * 2).min((n_chunks / 4).max(1));
         let worker_pixels = (worker_budget / worker_tasks / per_pixel).clamp(1, 16384);
+        // Horizon maps hold every cell of a batch until it is merged, so a
+        // batch also stops at about two waves of windows (see `next_batch_len`).
+        let batch_pixels = 2 * worker_tasks * worker_pixels;
         let output_byte_limit = config.aggregation_budget_bytes / 4;
 
         Ok(Self {
@@ -355,6 +393,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             pool,
             worker_budget,
             batch_size,
+            batch_pixels,
             output_byte_limit,
             peak_active_bytes: 0,
             worker_maps: (0..worker_tasks)
@@ -364,10 +403,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         .collect()
                 })
                 .collect(),
+            worker_south_keys: Vec::new(),
             metrics: super::profile::StreamProfile {
                 worker_map_sets: worker_tasks as u64,
                 ..Default::default()
             },
+            partition,
         })
     }
 
@@ -425,6 +466,22 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// Emit one final cell. In sorted EOF order siblings are contiguous, so a
     /// parent's group is decomposed as soon as the stream moves past it.
     fn emit_final(&mut self, res_idx: usize, key: u64, acc: K::Accumulator) {
+        if let Some(partition) = &mut self.partition {
+            if !partition.classifier.is_interior(key) {
+                // Other partitions may hold samples of this cell: hand its state on
+                // unfiltered, since only the merged state can be filtered.
+                let bytes = size_of::<PartialCell<K::Accumulator>>() + acc.heap_bytes();
+                partition.partials.push_sized(
+                    PartialCell {
+                        resolution: self.resolution_u8s[res_idx],
+                        h3_index: key,
+                        accumulator: acc,
+                    },
+                    bytes,
+                );
+                return;
+            }
+        }
         if self.compactor.is_enabled() && self.finishing {
             let parent = CellIndex::try_from(key)
                 .ok()
@@ -458,16 +515,41 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         Ok(())
     }
 
+    /// Merge one job's worker maps into the horizon maps. `south_keys[i]`
+    /// holds the eviction keys the worker precomputed for resolution `i`'s
+    /// cells that were new to the horizon map, in the map's iteration order;
+    /// a cell missing from it gets its key computed here.
     fn merge_window(
         &mut self,
         maps: &mut [HashMap<u64, K::Accumulator, H3BuildHasher>],
+        south_keys: &[Vec<(u64, f64)>],
     ) -> Result<()> {
         for (i, map) in maps.iter_mut().enumerate() {
+            let precomputed = south_keys.get(i).map_or(&[][..], Vec::as_slice);
+            let mut cursor = 0;
             for (key, acc) in map.drain() {
                 if acc.memory_bytes() > self.accumulator_limit {
                     return Err(RasterH3Error::InvalidParameter("single accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
                 }
-                if self.resolution_shards[i].merge_owned(key, acc) > self.accumulator_limit {
+                // `drain` visits keys in the order the worker listed them, so
+                // a matching entry is always next. The key may already be in
+                // the horizon map (another worker merged it first); then the
+                // entry is skipped unused.
+                let south = match precomputed.get(cursor) {
+                    Some(&(k, south)) if k == key => {
+                        cursor += 1;
+                        Some(south)
+                    }
+                    _ => None,
+                };
+                let fallbacks = &mut self.metrics.eviction_key_fallbacks;
+                let merged = self.resolution_shards[i].merge_owned_with(key, acc, || {
+                    south.unwrap_or_else(|| {
+                        *fallbacks += 1;
+                        compute_cell_south_lat(key)
+                    })
+                });
+                if merged > self.accumulator_limit {
                     return Err(RasterH3Error::InvalidParameter("merged accumulator exceeds aggregation budget; increase aggregation_budget_bytes".into()));
                 }
                 self.peak_active_bytes = self.peak_active_bytes.max(
@@ -494,6 +576,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     ) -> Result<()> {
         use super::borrowed::BorrowedSamples;
         let mut maps = std::mem::take(&mut self.worker_maps);
+        let mut south_keys = std::mem::take(&mut self.worker_south_keys);
+        south_keys.resize_with(maps.len(), Vec::new);
         let result = (|| {
             let mut index = 0;
             let (mut row, mut col) = (0usize, 0usize);
@@ -558,7 +642,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 }
                 let t = std::time::Instant::now();
                 let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
-                let process = |(job, maps): (&WindowJob<'_>, &mut CellMaps<K::Accumulator>)| {
+                let process = |((job, maps), keys): (
+                    (&WindowJob<'_>, &mut CellMaps<K::Accumulator>),
+                    &mut SouthKeys,
+                )| {
                     peak.fetch_max(
                         active.fetch_add(1, Ordering::Relaxed) + 1,
                         Ordering::Relaxed,
@@ -590,13 +677,34 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         self.nodata.or(tile.reader.metadata.nodata),
                         maps,
                     );
+                    // Eviction keys cost a cell-boundary computation each, so
+                    // compute them here, in parallel, for the cells the serial
+                    // merge will insert. The horizon maps are read-only here.
+                    keys.resize_with(maps.len(), Vec::new);
+                    for ((map, shard), out) in maps
+                        .iter()
+                        .zip(&self.resolution_shards)
+                        .zip(keys.iter_mut())
+                    {
+                        out.clear();
+                        if shard.tracks_eviction() {
+                            out.extend(
+                                map.keys()
+                                    .filter(|&&key| !shard.contains(key))
+                                    .map(|&key| (key, compute_cell_south_lat(key))),
+                            );
+                        }
+                    }
                     active.fetch_sub(1, Ordering::Relaxed);
                     (scope.snapshot(), start.elapsed().as_nanos() as u64)
                 };
                 results.clear();
-                let parallel = |maps: &mut [CellMaps<K::Accumulator>], results: &mut Vec<_>| {
+                let parallel = |maps: &mut [CellMaps<K::Accumulator>],
+                                keys: &mut [SouthKeys],
+                                results: &mut Vec<_>| {
                     jobs.par_iter()
                         .zip(maps.par_iter_mut())
+                        .zip(keys.par_iter_mut())
                         .map(&process)
                         .collect_into_vec(results)
                 };
@@ -611,22 +719,36 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 match &self.pool {
                     Some(pool) if pool.current_thread_index().is_some() => {
                         self.metrics.serial_waves += 1;
-                        results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
+                        results.extend(
+                            jobs.iter()
+                                .zip(maps.iter_mut())
+                                .zip(south_keys.iter_mut())
+                                .map(&process),
+                        )
                     }
                     Some(pool) if rayon::current_thread_index().is_some() => {
                         self.metrics.bridged_waves += 1;
                         std::thread::scope(|s| {
-                            s.spawn(|| pool.install(|| parallel(&mut maps, &mut results)))
-                                .join()
-                                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                            s.spawn(|| {
+                                pool.install(|| parallel(&mut maps, &mut south_keys, &mut results))
+                            })
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
                         })
                     }
-                    Some(pool) => pool.install(|| parallel(&mut maps, &mut results)),
+                    Some(pool) => {
+                        pool.install(|| parallel(&mut maps, &mut south_keys, &mut results))
+                    }
                     None if rayon::current_thread_index().is_some() => {
                         self.metrics.serial_waves += 1;
-                        results.extend(jobs.iter().zip(maps.iter_mut()).map(&process))
+                        results.extend(
+                            jobs.iter()
+                                .zip(maps.iter_mut())
+                                .zip(south_keys.iter_mut())
+                                .map(&process),
+                        )
                     }
-                    None => parallel(&mut maps, &mut results),
+                    None => parallel(&mut maps, &mut south_keys, &mut results),
                 }
                 self.metrics.peak_concurrent_jobs = self
                     .metrics
@@ -647,6 +769,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 if self.strict_transforms && failures > 0 {
                     return Err(RasterH3Error::TransformFailures(failures));
                 }
+                let key_bytes: usize = south_keys
+                    .iter()
+                    .flatten()
+                    .map(|k| k.capacity() * size_of::<(u64, f64)>())
+                    .sum();
                 let bytes: usize = maps
                     .iter()
                     .flatten()
@@ -654,11 +781,14 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                         super::spill::table_bytes::<u64, K::Accumulator>(m.capacity())
                             + m.values().map(|a| a.heap_bytes()).sum::<usize>()
                     })
-                    .sum();
+                    .sum::<usize>()
+                    + key_bytes;
                 self.metrics.peak_worker_bytes = self.metrics.peak_worker_bytes.max(bytes);
                 let t = std::time::Instant::now();
-                for m in &mut maps {
-                    self.merge_window(m)?;
+                // Map sets past this wave's jobs are empty; their key lists may
+                // be stale, so pair only the sets that ran.
+                for (m, keys) in maps.iter_mut().zip(&south_keys).take(jobs.len()) {
+                    self.merge_window(m, keys)?;
                 }
                 let ns = t.elapsed().as_nanos() as u64;
                 self.metrics.merge_ns += ns;
@@ -667,11 +797,16 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     for map in maps.iter_mut().flatten() {
                         map.shrink_to_fit();
                     }
+                    for keys in south_keys.iter_mut().flatten() {
+                        keys.clear();
+                        keys.shrink_to_fit();
+                    }
                 }
             }
             Ok(())
         })();
         self.worker_maps = maps;
+        self.worker_south_keys = south_keys;
         result
     }
 
@@ -697,11 +832,23 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         }
     }
 
+    /// Records plus (in a partitioned scan) partial cells awaiting the consumer.
+    fn buffered_len(&self) -> usize {
+        self.output_buffer.len() + self.partition.as_ref().map_or(0, |p| p.partials.len())
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.output_buffer.estimated_bytes()
+            + self
+                .partition
+                .as_ref()
+                .map_or(0, |p| p.partials.estimated_bytes())
+    }
+
     fn advance_inner(&mut self, min_rows: usize) -> Result<()> {
-        while self.output_buffer.len() < min_rows
+        while self.buffered_len() < min_rows
             && !self.lifecycle.is_finished()
-            && (self.output_buffer.is_empty()
-                || self.output_buffer.estimated_bytes() < self.output_byte_limit)
+            && (self.buffered_len() == 0 || self.buffered_bytes() < self.output_byte_limit)
         {
             if self.finishing {
                 if let Some(reader) = &mut self.final_reader {
@@ -782,7 +929,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     continue;
                 }
             }
-            if self.output_buffer.is_empty() && !self.spill_runs.iter().any(|r| r.has_spilled()) {
+            if self.buffered_len() == 0 && !self.spill_runs.iter().any(|r| r.has_spilled()) {
                 // Held sibling groups may still emit records north of the horizon.
                 self.current_lat_horizon = self
                     .eviction_horizon
@@ -790,9 +937,10 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
 
             let t0 = std::time::Instant::now();
-            let mut items = Vec::with_capacity(self.batch_size);
+            let batch_len = self.next_batch_len();
+            let mut items = Vec::with_capacity(batch_len);
             if let Some(prefetcher) = &self.prefetcher {
-                prefetcher.drain_chunk_batch_into(&mut items, 1, self.batch_size);
+                prefetcher.drain_chunk_batch_into(&mut items, 1, batch_len);
             }
             let elapsed = t0.elapsed().as_nanos() as u64;
             self.metrics.prefetch_wait_ns += elapsed;
@@ -831,13 +979,43 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         Ok(())
     }
 
+    /// Chunks to take for the next batch. Horizon maps hold every cell of a
+    /// batch until it is merged, so a batch stops once its chunks reach
+    /// `batch_pixels` (about two waves of worker windows, enough to keep every
+    /// worker busy), or at `batch_size` chunks. Counting only chunks let
+    /// batches of large strips or tiles grow with the worker count, and fine
+    /// resolutions then spilled. Chunks arrive in `chunk_refs` order, so the
+    /// upcoming chunks' sizes are known here, even in mixed mosaics.
+    fn next_batch_len(&self) -> usize {
+        let upcoming = self
+            .mosaic
+            .chunk_refs
+            .get(self.processed_chunk_count..)
+            .unwrap_or_default();
+        let mut pixels = 0usize;
+        let mut len = 0;
+        for chunk in upcoming.iter().take(self.batch_size) {
+            let layout = &self.mosaic.tiles[chunk.tile_idx].reader.chunk_layout;
+            pixels += layout.chunk_width as usize * layout.chunk_height as usize;
+            len += 1;
+            if pixels >= self.batch_pixels {
+                break;
+            }
+        }
+        len.max(1)
+    }
+
     /// Latch failures so subsequent reads cannot mistake a failed stream for EOF.
     fn fail(&mut self, reason: String) -> RasterH3Error {
         self.prefetcher.take();
         self.output_buffer.clear();
+        if let Some(partition) = &mut self.partition {
+            partition.partials.clear();
+        }
         self.compactor.clear();
         self.resolution_shards.clear();
         self.worker_maps.clear();
+        self.worker_south_keys.clear();
         self.spill_runs.clear();
         self.final_reader = None;
         self.lifecycle.latch_failure(reason)
@@ -845,6 +1023,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     /// Pull up to `max_rows` completed multi-resolution records using multi-core chunk-row parallelism
     pub fn fetch_next_batch(&mut self, max_rows: usize) -> Result<Vec<K::Record>> {
+        self.reject_partitioned()?;
         self.advance_until_completed(max_rows)?;
         Ok(self.output_buffer.take_batch(max_rows))
     }
@@ -854,8 +1033,53 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     where
         F: FnMut(usize, K::Record),
     {
+        self.reject_partitioned()?;
         self.advance_until_completed(max_rows)?;
         Ok(self.output_buffer.drain_into(max_rows, consumer))
+    }
+
+    /// Record-only reads would silently lose a partitioned scan's partial cells.
+    fn reject_partitioned(&self) -> Result<()> {
+        if self.partition.is_some() {
+            return Err(RasterH3Error::InvalidParameter(
+                "partitioned scans emit partial cells; drain them with drain_partitioned_into"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drain a partitioned scan: up to `max_rows` completed (interior) records into
+    /// `on_record` and partial (boundary) cells into `on_partial`, in total. Returns the
+    /// number drained; with `max_rows >= 1`, 0 means end of stream. Like
+    /// [`Self::drain_completed_into`], `max_rows == 0` drains nothing and also returns 0, so
+    /// pass at least 1 (or check [`Self::is_finished`]). Also works for unpartitioned
+    /// scans, which produce no partial cells.
+    pub fn drain_partitioned_into<F, G>(
+        &mut self,
+        max_rows: usize,
+        on_record: F,
+        mut on_partial: G,
+    ) -> Result<usize>
+    where
+        F: FnMut(usize, K::Record),
+        G: FnMut(PartialCell<K::Accumulator>),
+    {
+        self.advance_until_completed(max_rows)?;
+        let records = self.output_buffer.drain_into(max_rows, on_record);
+        let partials = match &mut self.partition {
+            Some(p) => p
+                .partials
+                .drain_into(max_rows - records, |_, cell| on_partial(cell)),
+            None => 0,
+        };
+        Ok(records + partials)
+    }
+
+    /// For a partitioned scan, the number of finalized cells classified so far as
+    /// `(interior, boundary)`.
+    pub fn partition_cell_counts(&self) -> Option<(u64, u64)> {
+        self.partition.as_ref().map(|p| p.classifier.counts())
     }
 
     /// Bytes written to spill files, including intermediate merge outputs.
@@ -899,7 +1123,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
 
     /// Check if stream is fully drained and finished
     pub fn is_finished(&self) -> bool {
-        self.lifecycle.is_finished() && self.output_buffer.is_empty()
+        self.lifecycle.is_finished() && self.buffered_len() == 0
     }
 }
 

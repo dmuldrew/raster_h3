@@ -14,7 +14,9 @@ use tiff::tags::{CompressionMethod, PhotometricInterpretation, Predictor, Sample
 
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotransform::GeoTransform;
-use crate::raster::http_range::{is_remote_url, HttpRangeReader, RemoteHttpSource};
+use crate::raster::http_range::{
+    is_remote_url, HttpRangeReader, RemoteHttpSource, RemoteSourceFactory,
+};
 use crate::raster::metadata::{
     extract_alpha_sample, extract_band_scaling, extract_crs, extract_geotransform, extract_nodata,
     BandScaling,
@@ -1037,8 +1039,34 @@ impl GeoTiffStreamReader {
 
     /// Open and decode metadata for a local file (via mmap) or a remote URL (via HTTP Range)
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_remote_source_factory(path, None)
+    }
+
+    /// Open a raster source, using remote_source_factory to obtain the byte
+    /// source when set (e.g. a host file system); otherwise remote URLs use
+    /// the built-in HTTP range client and local paths use mmap.
+    pub fn open_with_remote_source_factory<P: AsRef<Path>>(
+        path: P,
+        remote_source_factory: Option<&RemoteSourceFactory>,
+    ) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let path_str = path_buf.to_string_lossy();
+
+        if let Some(factory) = remote_source_factory {
+            let remote = factory.open(&path_str)?;
+            let reader = HttpRangeReader::new(Arc::clone(&remote));
+            let mut decoder = Decoder::new(reader)?;
+            let (metadata, chunk_layout, chunk_info) =
+                Self::parse_metadata_and_layout(&mut decoder)?;
+
+            return Ok(Self {
+                file_path: path_buf,
+                source: RasterSource::Remote(remote),
+                metadata,
+                chunk_layout,
+                chunk_info,
+            });
+        }
 
         if is_remote_url(&path_str) {
             let remote = Arc::new(RemoteHttpSource::open(&path_str)?);

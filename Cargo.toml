@@ -9,7 +9,7 @@ members = [
     "crates/raster-h3-python",
     "crates/raster-h3-pg",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "crates/raster-h3-sedona"]
 
 [workspace.package]
 version = "0.5.0"
@@ -37,7 +37,7 @@ undocumented_unsafe_blocks = "warn"
 broken_intra_doc_links = "warn"
 
 [workspace.dependencies]
-h3o = "0.11"
+h3o = "0.11.1"
 rayon = "1.10"
 tiff = "0.11"
 proj4rs = { version = "0.1", features = ["esri"] }
@@ -84,6 +84,7 @@ path = "crates/raster-h3-cli/src/bin/raster_h3.rs"
 
 [features]
 default = []
+duckdb-api-v1_5_6 = ["raster-h3-duckdb/duckdb-api-v1_5_6"]
 stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
 
 [dependencies]

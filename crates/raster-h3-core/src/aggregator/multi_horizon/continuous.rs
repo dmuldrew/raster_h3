@@ -79,13 +79,26 @@ struct ContinuousEngine<T> {
 
 impl<T: SimdSpanAccumulate> ContinuousEngine<T> {
     /// Accumulate a span of stored values as calibrated values. The SIMD
-    /// kernel sums stored values; an affine map of those statistics equals
-    /// accumulating the calibrated values.
+    /// kernel sums stored values; use its affine image when representable.
+    /// Otherwise calibrate individually so overflow cannot poison valid pixels.
     #[inline(always)]
     fn span_accumulator(&self, slice: &[T]) -> H3Accumulator {
         let mut span_acc = T::accumulate_span(slice, self.native_nodata);
         if !self.scaling.is_identity() {
             span_acc.apply_affine(self.scaling.scale, self.scaling.offset);
+            if span_acc.count > 0.0
+                && !(span_acc.sum.is_finite()
+                    && span_acc.min.is_finite()
+                    && span_acc.max.is_finite()
+                    && span_acc.m2.is_finite())
+            {
+                span_acc = H3Accumulator::default();
+                for &v in slice {
+                    if let Some(value) = self.get_sample(v) {
+                        span_acc.update(value);
+                    }
+                }
+            }
         }
         span_acc
     }
@@ -130,8 +143,8 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
             if self.track_quantiles {
                 if let Some(ref mut q) = acc.quantiles {
                     for &v in slice {
-                        if v.is_valid(self.native_nodata) {
-                            q.update(self.scaling.apply(v.to_f64_val()), 1.0);
+                        if let Some(value) = self.get_sample(v) {
+                            q.update(value, 1.0);
                         }
                     }
                 }
@@ -148,8 +161,7 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
             }
             if self.track_quantiles {
                 for &v in slice {
-                    if v.is_valid(self.native_nodata) {
-                        let fv = self.scaling.apply(v.to_f64_val());
+                    if let Some(fv) = self.get_sample(v) {
                         for q in run_accs.iter_mut().filter_map(|a| a.quantiles.as_mut()) {
                             q.update(fv, 1.0);
                         }
@@ -162,7 +174,8 @@ impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngin
     #[inline(always)]
     fn get_sample(&self, pixel: T) -> Option<f64> {
         if pixel.is_valid(self.native_nodata) {
-            Some(self.scaling.apply(pixel.to_f64_val()))
+            let value = self.scaling.apply(pixel.to_f64_val());
+            value.is_finite().then_some(value)
         } else {
             None
         }
@@ -198,8 +211,13 @@ fn pixel_value<T: SimdSpanAccumulate + Default>(
         let v = px[b];
         v.is_valid(nodata)
             .then(|| ctx.scaling(b + 1).apply(v.to_f64_val()))
+            .filter(|value| value.is_finite())
     };
-    let ratio = |num: f64, den: f64| (den.abs() > 1e-12).then(|| num / den);
+    let ratio = |num: f64, den: f64| {
+        (num.is_finite() && den.is_finite() && den.abs() > 1e-12)
+            .then(|| num / den)
+            .filter(|value| value.is_finite())
+    };
     match formula {
         Some(SpectralFormula::Ndvi { nir_band, red_band }) => {
             let (nir, red) = (get(nir_band)?, get(red_band)?);
@@ -267,4 +285,54 @@ pub fn process_continuous_borrowed_into(
         process_continuous_slice_into_maps(window, slice, nd, options, chunk_maps);
     });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibrated_overflow_agrees_between_samples_and_spans() {
+        for (scaling, values, expected) in [
+            (
+                BandScaling {
+                    scale: 1e308,
+                    offset: 0.0,
+                },
+                [1e-308, 2.0, -2.0],
+                1.0,
+            ),
+            (
+                BandScaling {
+                    scale: 1.0,
+                    offset: 1e308,
+                },
+                [-1e308, 1e308, 1e308],
+                0.0,
+            ),
+        ] {
+            let engine = ContinuousEngine::<f64> {
+                native_nodata: None,
+                track_quantiles: true,
+                scaling,
+            };
+            let mut scalar = engine.new_acc();
+            for value in values {
+                if let Some(value) = engine.get_sample(value) {
+                    engine.update_sample(&mut scalar, value, 1.0);
+                }
+            }
+            let mut span = engine.new_acc();
+            engine.accumulate_span(&mut span, &values);
+            let mut multi = vec![engine.new_acc(), engine.new_acc()];
+            engine.accumulate_span_multi(&mut multi, &values);
+            for acc in [scalar, span].iter().chain(multi.iter()) {
+                assert_eq!(acc.count, 1.0);
+                assert!((acc.mean() - expected).abs() < 1e-12);
+                assert_eq!(acc.m2, 0.0);
+                assert!((acc.quantile(0.5) - expected).abs() < 1e-12);
+            }
+            assert_eq!(engine.span_accumulator(&[values[1], values[2]]).count, 0.0);
+        }
+    }
 }

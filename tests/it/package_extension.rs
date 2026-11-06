@@ -371,3 +371,79 @@ fn test_default_platform_follows_duckdb_version_on_linux_x86_64() {
     assert_eq!(default_platform_tag("v1.3.0"), "linux_amd64");
     assert_eq!(default_platform_tag("v2.0.0"), "linux_amd64");
 }
+
+#[test]
+fn test_print_platform_matches_packaged_footer() {
+    let print = |args: &[&str]| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_package_extension"))
+            .arg("--print-platform")
+            .args(args)
+            .output()
+            .expect("Failed to execute package_extension");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+
+    // An explicit platform is echoed back unchanged.
+    assert_eq!(print(&["-p", "osx_arm64"]), "osx_arm64");
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    for version in ["v1.2.0", "v1.3.0", "v2.0.0"] {
+        assert_eq!(print(&["-d", version]), default_platform_tag(version));
+    }
+}
+
+#[test]
+fn test_verify_rejects_mismatched_public_key() {
+    let dir = tempdir().unwrap();
+    let signing_key = dir.path().join("signing_key.pem");
+    let other_key = dir.path().join("other_key.pem");
+    let other_pub = dir.path().join("other_key.pub");
+    for key in [&signing_key, &other_key] {
+        let out = Command::new("openssl")
+            .args(["genrsa", "-out"])
+            .arg(key)
+            .arg("2048")
+            .output()
+            .expect("openssl genrsa must be available");
+        assert!(out.status.success());
+    }
+    let out = Command::new("openssl")
+        .args(["pkey", "-in"])
+        .arg(&other_key)
+        .args(["-pubout", "-out"])
+        .arg(&other_pub)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let so_path = dir.path().join("dummy.so");
+    let ext_path = dir.path().join("dummy.duckdb_extension");
+    fs::write(&so_path, vec![0x3Cu8; 4096]).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_package_extension"))
+        .env_remove("DUCKDB_EXTENSION_SIGNING_KEY")
+        .env_remove("DUCKDB_EXTENSION_PUBLIC_KEY")
+        .arg("-i")
+        .arg(&so_path)
+        .arg("-o")
+        .arg(&ext_path)
+        .arg("-k")
+        .arg(&signing_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // A public key that does not belong to the signing key must fail verification,
+    // even when the matching signing key is also configured.
+    let verify = Command::new(env!("CARGO_BIN_EXE_package_extension"))
+        .env_remove("DUCKDB_EXTENSION_PUBLIC_KEY")
+        .env("DUCKDB_EXTENSION_SIGNING_KEY", &signing_key)
+        .arg("-K")
+        .arg(&other_pub)
+        .arg("--verify")
+        .arg(&ext_path)
+        .output()
+        .unwrap();
+    assert!(!verify.status.success());
+}

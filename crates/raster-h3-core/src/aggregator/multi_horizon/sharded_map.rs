@@ -120,6 +120,16 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
         self.shards[get_shard(cell)].get(&cell)
     }
 
+    /// Whether `cell` is active in this map.
+    pub fn contains(&self, cell: u64) -> bool {
+        self.shards[get_shard(cell)].contains_key(&cell)
+    }
+
+    /// Whether newly inserted cells get an eviction key (false once spilled).
+    pub fn tracks_eviction(&self) -> bool {
+        self.track_eviction
+    }
+
     /// Per shard: (active cells, pending eviction entries)
     pub fn shard_occupancy(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.shards
@@ -143,6 +153,14 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
     /// Owned merge avoids cloning a large quantile or categorical state.
     /// Returns the merged accumulator's memory footprint.
     pub fn merge_owned(&mut self, key: u64, acc: A) -> usize {
+        self.merge_owned_with(key, acc, || compute_cell_south_lat(key))
+    }
+
+    /// [`Self::merge_owned`] taking the cell's eviction key from `south_lat`,
+    /// which must return [`compute_cell_south_lat`] of `key`. It is called
+    /// only when the cell is new and eviction is tracked, so callers can
+    /// compute the key ahead of time, off the merging thread.
+    pub fn merge_owned_with(&mut self, key: u64, acc: A, south_lat: impl FnOnce() -> f64) -> usize {
         let s = get_shard(key);
         let before = self.shard_bytes(s);
         let merged_bytes = match self.shards[s].entry(key) {
@@ -160,7 +178,7 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
                 if self.track_eviction {
                     self.eviction[s].push(HexEvictionEntry {
                         cell_u64: key,
-                        south_lat: compute_cell_south_lat(key),
+                        south_lat: south_lat(),
                     });
                 }
                 bytes

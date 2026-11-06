@@ -4,6 +4,7 @@
 mod helpers;
 
 mod duckdb_sql_smoke;
+mod duckdb_trusted_repository;
 mod multi_engine_e2e;
 mod package_extension;
 mod pg_extension_e2e;
