@@ -86,12 +86,16 @@ pub struct ChunkLayout {
 
 impl ChunkLayout {
     /// Create layout for tiled TIFFs
+    ///
+    /// Panics on zero tile dimensions or a chunk grid exceeding `u32::MAX`
+    /// chunks; untrusted TIFF input is validated before reaching this API.
     pub fn new_tiled(
         image_width: u32,
         image_height: u32,
         tile_width: u32,
         tile_height: u32,
     ) -> Self {
+        assert!(tile_width > 0 && tile_height > 0);
         let chunks_across = image_width.div_ceil(tile_width);
         let chunks_down = image_height.div_ceil(tile_height);
         Self {
@@ -99,12 +103,18 @@ impl ChunkLayout {
             chunk_height: tile_height,
             chunks_across,
             chunks_down,
-            total_chunks: chunks_across * chunks_down,
+            total_chunks: chunks_across
+                .checked_mul(chunks_down)
+                .expect("chunk grid exceeds u32 chunk count"),
         }
     }
 
     /// Create layout for striped TIFFs
+    ///
+    /// Panics on `rows_per_strip == 0`; untrusted TIFF input is validated
+    /// before reaching this API.
     pub fn new_striped(image_width: u32, image_height: u32, rows_per_strip: u32) -> Self {
+        assert!(rows_per_strip > 0);
         let chunks_down = image_height.div_ceil(rows_per_strip);
         Self {
             chunk_width: image_width,
@@ -397,9 +407,18 @@ impl<'a> ChunkDecoder<'a> {
             bytes.is_empty()
         } else if let Some(ref info) = self.chunk_info {
             let idx = chunk_index as usize;
-            let offset = info.chunk_offsets.get(idx).copied().unwrap_or(0);
-            let byte_count = info.chunk_bytes.get(idx).copied().unwrap_or(0);
-            offset == 0 || byte_count == 0
+            // An index past the offset/byte-count arrays means the arrays are
+            // shorter than the declared chunk grid — malformed metadata, not a
+            // legitimately absent chunk (which is recorded as offset/bytes 0).
+            match (info.chunk_offsets.get(idx), info.chunk_bytes.get(idx)) {
+                (Some(&offset), Some(&byte_count)) => offset == 0 || byte_count == 0,
+                _ => {
+                    return Err(RasterH3Error::InvalidMetadata(format!(
+                        "chunk {chunk_index} is outside the {} entries in the TIFF offset/byte-count arrays",
+                        info.chunk_offsets.len().min(info.chunk_bytes.len())
+                    )));
+                }
+            }
         } else {
             false
         };
@@ -926,9 +945,18 @@ impl GeoTiffStreamReader {
         let alpha_sample = extract_alpha_sample(decoder, samples_per_pixel);
 
         let (chunk_w, chunk_h) = decoder.chunk_dimensions();
+        if chunk_w == 0 || chunk_h == 0 {
+            return Err(RasterH3Error::InvalidMetadata(format!(
+                "TIFF declares a zero-sized chunk ({chunk_w}x{chunk_h})"
+            )));
+        }
         let chunks_across = width.div_ceil(chunk_w);
         let chunks_down = height.div_ceil(chunk_h);
-        let total_chunks = chunks_across * chunks_down;
+        let total_chunks = chunks_across.checked_mul(chunks_down).ok_or_else(|| {
+            RasterH3Error::InvalidMetadata(format!(
+                "TIFF chunk grid {chunks_across}x{chunks_down} exceeds u32 chunk count"
+            ))
+        })?;
 
         let chunk_layout = ChunkLayout {
             chunk_width: chunk_w,
@@ -957,7 +985,11 @@ impl GeoTiffStreamReader {
         };
 
         let predictor = match decoder.get_tag_u32(Tag::Predictor) {
-            Ok(v) => Predictor::from_u16(v as u16).unwrap_or(Predictor::None),
+            // An unrecognised predictor means the decoder would silently
+            // interpret delta-encoded samples as literal values.
+            Ok(v) => Predictor::from_u16(v as u16).ok_or_else(|| {
+                RasterH3Error::InvalidMetadata(format!("unrecognised Predictor tag value {v}"))
+            })?,
             Err(_) => Predictor::None,
         };
 
@@ -977,13 +1009,21 @@ impl GeoTiffStreamReader {
                 .get_tag_u16_vec(Tag::SampleFormat)
                 .map(|v| v.first().copied().unwrap_or(1) as u32)
         }) {
-            Ok(v) => SampleFormat::from_u16(v as u16).unwrap_or(SampleFormat::Uint),
+            Ok(v) => SampleFormat::from_u16(v as u16).ok_or_else(|| {
+                RasterH3Error::InvalidMetadata(format!("unrecognised SampleFormat tag value {v}"))
+            })?,
             Err(_) => SampleFormat::Uint,
         };
 
         let photometric = match decoder.get_tag_u32(Tag::PhotometricInterpretation) {
-            Ok(v) => PhotometricInterpretation::from_u16(v as u16)
-                .unwrap_or(PhotometricInterpretation::BlackIsZero),
+            // Coercing an unrecognised photometric to BlackIsZero inverts the
+            // WhiteIsZero/BlackIsZero decision and reads colour-modelled data
+            // (YCbCr, palette indices) as literal samples.
+            Ok(v) => PhotometricInterpretation::from_u16(v as u16).ok_or_else(|| {
+                RasterH3Error::InvalidMetadata(format!(
+                    "unrecognised PhotometricInterpretation tag value {v}"
+                ))
+            })?,
             Err(_) => PhotometricInterpretation::BlackIsZero,
         };
 
@@ -1019,18 +1059,29 @@ impl GeoTiffStreamReader {
         };
 
         let chunk_info = match (offsets, bytes) {
-            (Some(offs), Some(bts)) if offs.len() == bts.len() => Some(Arc::new(TiffChunkInfo {
-                compression,
-                predictor,
-                chunk_type,
-                chunk_offsets: offs.into(),
-                chunk_bytes: bts.into(),
-                chunk_dimensions: (chunk_w, chunk_h),
-                bits_per_sample,
-                sample_format,
-                byte_order,
-                photometric,
-            })),
+            (Some(offs), Some(bts)) if offs.len() == bts.len() => {
+                // A short array would make every chunk past its end silently
+                // read as sparse (nodata fill) instead of surfacing the
+                // malformation.
+                if offs.len() < total_chunks as usize {
+                    return Err(RasterH3Error::InvalidMetadata(format!(
+                        "TIFF offset/byte-count arrays hold {} entries but the image grid declares {total_chunks} chunks",
+                        offs.len()
+                    )));
+                }
+                Some(Arc::new(TiffChunkInfo {
+                    compression,
+                    predictor,
+                    chunk_type,
+                    chunk_offsets: offs.into(),
+                    chunk_bytes: bts.into(),
+                    chunk_dimensions: (chunk_w, chunk_h),
+                    bits_per_sample,
+                    sample_format,
+                    byte_order,
+                    photometric,
+                }))
+            }
             _ => None,
         };
 
@@ -1219,5 +1270,144 @@ mod tests {
         )
         .expect("exact-fill deflate chunk decodes");
         assert_eq!(out, payload);
+    }
+
+    /// Encode a minimal single-band GeoTIFF, applying `overrides` to the IFD
+    /// tags between the encoder defaults and `write_data`.
+    fn encode_gray_geotiff(
+        width: u32,
+        height: u32,
+        compression: tiff::encoder::Compression,
+        overrides: &[(Tag, u16)],
+    ) -> tempfile::NamedTempFile {
+        use tiff::encoder::{colortype::Gray8, TiffEncoder};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let file = File::create(tmp.path()).unwrap();
+        let mut encoder = TiffEncoder::new(std::io::BufWriter::new(file))
+            .unwrap()
+            .with_compression(compression);
+        let mut image = encoder.new_image::<Gray8>(width, height).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[100.0f64, 100.0, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[0.0, 0.0, 0.0, -122.45, 37.80, 0.0][..],
+            )
+            .unwrap();
+        for &(tag, value) in overrides {
+            image.encoder().write_tag(tag, value).unwrap();
+        }
+        image
+            .write_data(&vec![7u8; (width * height) as usize])
+            .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn short_offset_arrays_error_instead_of_sparse_fill() {
+        // Packbits forces rows_per_strip = 1, giving one strip per row.
+        let tmp = encode_gray_geotiff(32, 32, tiff::encoder::Compression::Packbits, &[]);
+        let reader = GeoTiffStreamReader::open(tmp.path()).unwrap();
+        let mut decoder = reader.open_decoder().unwrap();
+        let info = decoder.chunk_info.clone().unwrap();
+        assert!(info.chunk_offsets.len() > 1);
+
+        // A TiffChunkInfo whose arrays are shorter than the declared grid must
+        // not treat the tail chunks as sparse nodata fills.
+        let mut bad = (*info).clone();
+        bad.chunk_offsets = Arc::from(&bad.chunk_offsets[..1]);
+        bad.chunk_bytes = Arc::from(&bad.chunk_bytes[..1]);
+        decoder.chunk_info = Some(Arc::new(bad));
+        let err = match decoder.read_chunk_with_payload(1, None, None) {
+            Ok(_) => panic!("truncated offset arrays must error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, RasterH3Error::InvalidMetadata(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Rewrite a single SHORT-count-1 IFD entry in place. Used to inject tag
+    /// values the encoder would never emit itself.
+    fn patch_ifd_short(path: &Path, tag: u16, new_value: u16) {
+        let mut bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0..2], b"II");
+        let ifd_off = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(bytes[ifd_off..ifd_off + 2].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let e = ifd_off + 2 + i * 12;
+            let t = u16::from_le_bytes(bytes[e..e + 2].try_into().unwrap());
+            let ty = u16::from_le_bytes(bytes[e + 2..e + 4].try_into().unwrap());
+            let cnt = u32::from_le_bytes(bytes[e + 4..e + 8].try_into().unwrap());
+            if t == tag && ty == 3 && cnt == 1 {
+                bytes[e + 8..e + 10].copy_from_slice(&new_value.to_le_bytes());
+                std::fs::write(path, &bytes).unwrap();
+                return;
+            }
+        }
+        panic!("tag {tag} not found in IFD");
+    }
+
+    #[test]
+    fn unrecognised_sample_format_is_rejected() {
+        // The tiff crate keeps unknown SampleFormat values exhaustively, so a
+        // file that passes its init must not coerce to Uint in our parse. The
+        // encoder emits SampleFormat at finish() time, so patch the IFD entry
+        // (tag 339) after the file is written.
+        let tmp = encode_gray_geotiff(16, 16, tiff::encoder::Compression::Uncompressed, &[]);
+        patch_ifd_short(tmp.path(), 339, 99);
+        let err = match GeoTiffStreamReader::open(tmp.path()) {
+            Ok(_) => panic!("unknown SampleFormat must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("SampleFormat"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unrecognised_predictor_and_photometric_are_rejected() {
+        // Both are rejected by the tiff crate's own image init; asserting here
+        // pins the end-to-end contract that neither ever reaches a decode path.
+        for (tag, value) in [
+            (Tag::Predictor, 99u16),
+            (Tag::PhotometricInterpretation, 99u16),
+        ] {
+            let tmp = encode_gray_geotiff(
+                16,
+                16,
+                tiff::encoder::Compression::Uncompressed,
+                &[(tag, value)],
+            );
+            assert!(
+                GeoTiffStreamReader::open(tmp.path()).is_err(),
+                "{tag:?}={value} must not open"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "tile_width > 0")]
+    fn chunk_layout_tiled_rejects_zero_dimensions() {
+        ChunkLayout::new_tiled(100, 100, 0, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "rows_per_strip > 0")]
+    fn chunk_layout_striped_rejects_zero_rows() {
+        ChunkLayout::new_striped(100, 100, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds u32")]
+    fn chunk_layout_tiled_rejects_grid_overflow() {
+        ChunkLayout::new_tiled(u32::MAX, u32::MAX, 1, 1);
     }
 }

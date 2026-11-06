@@ -42,7 +42,10 @@ pub struct RasterChunk {
 
 impl RasterChunk {
     /// Generate a list of non-overlapping chunks covering width x height
+    ///
+    /// Panics on `chunk_size == 0`, which would otherwise loop forever.
     pub fn partition_grid(width: u32, height: u32, chunk_size: u32) -> Vec<Self> {
+        assert!(chunk_size > 0, "chunk_size must be non-zero");
         let mut chunks = Vec::new();
         let mut row = 0;
         while row < height {
@@ -61,5 +64,27 @@ impl RasterChunk {
             row += chunk_size;
         }
         chunks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_grid_covers_area_without_overlap() {
+        let chunks = RasterChunk::partition_grid(10, 7, 4);
+        let covered: u64 = chunks
+            .iter()
+            .map(|c| c.width as u64 * c.height as u64)
+            .sum();
+        assert_eq!(covered, 70);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_size must be non-zero")]
+    fn partition_grid_rejects_zero_chunk_size() {
+        // chunk_size 0 used to spin forever in the row loop.
+        RasterChunk::partition_grid(10, 10, 0);
     }
 }
