@@ -194,12 +194,23 @@ let config = RemotePrefetchConfig {
     ..Default::default()
 };
 // reader is an open remote GeoTiffStreamReader; chunk_indices selects its strips/tiles.
-let queue = RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)).unwrap();
-if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
-    let compressed_bytes: &[u8] = &payload;
-    // Decode compressed_bytes here, then drop payload before requesting more chunks.
+match RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)) {
+    Some(queue) => {
+        if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
+            let compressed_bytes: &[u8] = &payload;
+            // Decode compressed_bytes here, then drop payload before requesting more chunks.
+        }
+    }
+    // Nothing to prefetch: read chunks from `reader` directly.
+    None => {}
 }
 ```
+
+`spawn_single` returns `None` for a local reader, a reader without chunk offsets,
+or a remote file whose server ignored `Range` and returned the whole body when the
+reader opened: that file is already in memory, and range requests to such a server
+would fail. `spawn_mosaic` likewise returns `None` when every tile is local or
+already in memory, and skips in-memory tiles in a mixed mosaic.
 
 `max_buffered_bytes` reserves each coalesced response's full byte length **before**
 the HTTP request and counts requests in flight as well as retained responses.

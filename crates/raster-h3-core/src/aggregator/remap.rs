@@ -423,45 +423,4 @@ mod tests {
             assert_eq!(res, fallback_res, "mismatch at val {}", val);
         }
     }
-
-    // Regression: empty source tokens and multi-byte first characters
-    // previously panicked on `trimmed[1..]` byte indexing.
-    #[test]
-    fn test_parse_malformed_inputs_error_not_panic() {
-        for spec in [
-            ": 5",
-            "=>5",
-            "->5",
-            "λ: 1",
-            "→: 1",
-            "[1, 2]: 3, : 4",
-            "[]: 1",
-            "5-: 1",
-        ] {
-            assert!(
-                CategoryRemapper::parse(spec).is_err(),
-                "spec {:?} should return Err, not panic",
-                spec
-            );
-        }
-    }
-
-    // Regression: nested single-element bracket wrappers are collapsed
-    // iteratively so deep nesting cannot exhaust the call stack.
-    #[test]
-    fn test_parse_deeply_nested_brackets() {
-        let mut deep = "[".repeat(10_000);
-        deep.push('1');
-        deep.push_str(&"]".repeat(10_000));
-        deep.push_str(": 7");
-        let remapper = CategoryRemapper::parse(&deep).expect("nested wrapper spec");
-        assert_eq!(remapper.remap(1), Some(7));
-    }
-
-    #[test]
-    fn test_parse_hyphen_and_negative_ranges_still_work() {
-        let remapper = CategoryRemapper::parse("5-9: 1, -9--5: 2").expect("valid spec");
-        assert_eq!(remapper.remap(7), Some(1));
-        assert_eq!(remapper.remap(-7), Some(2));
-    }
 }

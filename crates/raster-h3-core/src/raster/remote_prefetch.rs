@@ -288,7 +288,12 @@ pub struct RemoteChunkPrefetchQueue {
 }
 
 impl RemoteChunkPrefetchQueue {
-    /// Spawn background prefetch queue for a single remote GeoTIFF reader
+    /// Spawn background prefetch queue for a single remote GeoTIFF reader.
+    ///
+    /// Returns `None` when there is nothing to prefetch: a local reader, one without
+    /// chunk offsets, or a remote file whose server ignored `Range` and sent the whole
+    /// body at open time (its reads are already served from memory). Read chunks from
+    /// `reader` directly in that case.
     pub fn spawn_single(
         reader: &GeoTiffStreamReader,
         chunk_indices: &[u32],
@@ -331,7 +336,10 @@ impl RemoteChunkPrefetchQueue {
         Some(Self::spawn_internal(sources, coalesced, cfg))
     }
 
-    /// Spawn background prefetch queue for a mosaic containing remote tiles
+    /// Spawn background prefetch queue for a mosaic containing remote tiles.
+    ///
+    /// Returns `None` when no tile needs prefetching: every tile is local or a remote
+    /// file already held in memory (see [`Self::spawn_single`]).
     pub fn spawn_mosaic(
         mosaic: &MosaicReader,
         config: Option<RemotePrefetchConfig>,

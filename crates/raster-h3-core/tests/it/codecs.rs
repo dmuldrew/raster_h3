@@ -697,6 +697,66 @@ fn test_deflate_corrupted_byte_stream_hardening() {
     }
 }
 
+// Regression: a well-formed zlib stream that decompresses to fewer bytes than its
+// tile used to be accepted, leaving the recycled buffer's previous contents in the
+// tail to be decoded as pixels. It must now fail the fast path, and a full read
+// must fall back to the on-disk tile rather than return stale samples.
+#[test]
+fn test_deflate_short_fill_rejected_through_streaming_reader() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let (width, height, tile) = (64u32, 64u32, 32u32);
+    let ground_truth: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(
+        temp_file.path(),
+        width,
+        height,
+        tile,
+        tile,
+        1,
+        &ground_truth,
+    );
+
+    let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+
+    // Tile 0's first half, compressed as a complete zlib stream.
+    let half: Vec<u8> = (0..tile * tile / 2)
+        .flat_map(|i| ground_truth[((i / tile) * width + i % tile) as usize].to_le_bytes())
+        .collect();
+    let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+    let mut short = vec![0u8; compressor.zlib_compress_bound(half.len())];
+    let n = compressor.zlib_compress(&half, &mut short).unwrap();
+    short.truncate(n);
+
+    // Recycle a buffer that holds another tile's samples, as the streaming path does.
+    let (_, mut recycled) = decoder.read_chunk_with_payload(3, None, None).unwrap();
+    let stale = match &recycled {
+        DecodingResult::F32(v) => v.clone(),
+        other => panic!("expected F32 samples, got {other:?}"),
+    };
+    assert!(
+        decoder
+            .decompress_chunk_fast_bytes(0, &short, Some(&mut recycled))
+            .is_err(),
+        "a short deflate tile must not be accepted into a recycled buffer"
+    );
+    assert!(decoder
+        .decompress_chunk_fast_bytes(0, &short, None)
+        .is_err());
+
+    // The full read falls back to the file and returns tile 0, not tile 3's tail.
+    let (_, data) = decoder
+        .read_chunk_with_payload(0, Some(&short), Some(DecodingResult::F32(stale)))
+        .unwrap();
+    let DecodingResult::F32(samples) = data else {
+        panic!("expected F32 samples");
+    };
+    for (i, &v) in samples.iter().enumerate() {
+        let (r, c) = (i as u32 / tile, i as u32 % tile);
+        assert_eq!(v, ground_truth[(r * width + c) as usize], "sample {i}");
+    }
+}
+
 #[test]
 fn test_deflate_buffer_auto_resizing_hardening() {
     let temp_file = NamedTempFile::new().unwrap();

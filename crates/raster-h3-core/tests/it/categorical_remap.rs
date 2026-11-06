@@ -81,6 +81,47 @@ fn test_remapper_invalid_syntax() {
     assert!(CategoryRemapper::parse("10: abc").is_err());
 }
 
+// Regression: empty source tokens and multi-byte first characters
+// previously panicked on `trimmed[1..]` byte indexing.
+#[test]
+fn test_parse_malformed_inputs_error_not_panic() {
+    for spec in [
+        ": 5",
+        "=>5",
+        "->5",
+        "λ: 1",
+        "→: 1",
+        "[1, 2]: 3, : 4",
+        "[]: 1",
+        "5-: 1",
+    ] {
+        assert!(
+            CategoryRemapper::parse(spec).is_err(),
+            "spec {:?} should return Err, not panic",
+            spec
+        );
+    }
+}
+
+// Regression: nested single-element bracket wrappers are collapsed
+// iteratively so deep nesting cannot exhaust the call stack.
+#[test]
+fn test_parse_deeply_nested_brackets() {
+    let mut deep = "[".repeat(10_000);
+    deep.push('1');
+    deep.push_str(&"]".repeat(10_000));
+    deep.push_str(": 7");
+    let remapper = CategoryRemapper::parse(&deep).expect("nested wrapper spec");
+    assert_eq!(remapper.remap(1), Some(7));
+}
+
+#[test]
+fn test_parse_hyphen_and_negative_ranges_still_work() {
+    let remapper = CategoryRemapper::parse("5-9: 1, -9--5: 2").expect("valid spec");
+    assert_eq!(remapper.remap(7), Some(1));
+    assert_eq!(remapper.remap(-7), Some(2));
+}
+
 fn create_categorical_test_raster(width: usize, height: usize) -> NamedTempFile {
     let (temp_file, _path) = helpers::TestGeoTiffBuilder::new(width as u32, height as u32)
         .origin(-122.45, 37.85)
@@ -200,4 +241,43 @@ fn test_multi_categorical_horizon_streamer_with_remapping() {
         assert_eq!(classes.get(&2).copied().unwrap_or(0.0), 1250.0);
         assert_eq!(classes.len(), 2);
     }
+}
+
+/// Remap a categorical raster through the streaming pipeline and total each output class.
+fn stream_class_counts(spec: &str) -> (f64, HashMap<i64, f64>) {
+    let raster_file = create_categorical_test_raster(50, 100);
+    let reader = GeoTiffStreamReader::open(raster_file.path()).unwrap();
+    let mut config = MultiResolutionConfig::single(8);
+    config.remapper = Some(Arc::new(CategoryRemapper::parse(spec).unwrap()));
+
+    let mut streamer = MultiCategoricalHorizonStreamer::new(reader, &config).unwrap();
+    let mut total = 0.0;
+    let mut classes = HashMap::new();
+    loop {
+        let batch = streamer.fetch_next_batch(64).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            total += rec.accumulator.total_count;
+            rec.accumulator.for_each_class(|cat, cnt| {
+                *classes.entry(cat).or_insert(0.0) += cnt;
+            });
+        }
+    }
+    (total, classes)
+}
+
+// Nested single-element brackets and hyphen ranges — the inputs the parser fixes
+// touched — remap streamed records exactly like their plain equivalents.
+#[test]
+fn test_nested_bracket_and_hyphen_specs_stream_like_plain_specs() {
+    let plain = stream_class_counts("101..103: 1, 121..122: 2, 99: null");
+    let nested =
+        stream_class_counts("[[[101]]]: 1, [[102]]: 1, 103-103: 1, [121, 122]: 2, 99: null");
+    assert_eq!(nested, plain);
+    assert_eq!(plain.0, 3750.0);
+    assert_eq!(plain.1.get(&1), Some(&1250.0));
+    assert_eq!(plain.1.get(&2), Some(&1250.0));
+    assert_eq!(plain.1.get(&42), Some(&1250.0));
 }
