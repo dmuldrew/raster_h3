@@ -216,6 +216,27 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         kernel: K,
     ) -> Result<Self> {
         config.validate()?;
+        // Band references are 1-indexed into each tile's interleaved samples.
+        // An index beyond the raster's sample count used to clamp silently to
+        // the last band and produce plausible-but-wrong statistics.
+        let samples_per_pixel = mosaic
+            .tiles
+            .iter()
+            .map(|tile| tile.reader.metadata.samples_per_pixel as usize)
+            .min()
+            .unwrap_or(1);
+        for band in config
+            .spectral_formula
+            .iter()
+            .flat_map(|f| f.band_indices())
+            .chain(std::iter::once(config.band))
+        {
+            if band > samples_per_pixel {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "band {band} exceeds the raster's {samples_per_pixel} samples per pixel"
+                )));
+            }
+        }
         let should_compact = config.should_compact_h3_children();
 
         let mut resolutions = Vec::with_capacity(config.resolutions.len());

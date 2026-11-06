@@ -567,8 +567,9 @@ fn test_spectral_formula_zero_denominator_and_nodata_resilience() {
 }
 
 #[test]
-fn test_spectral_formula_out_of_bounds_band_clamping() {
-    // Request Band 99 on a 4-band raster. Clamped safely to spp-1 (Band 4)
+fn test_spectral_formula_out_of_bounds_band_rejected() {
+    // Request Band 99 on a 4-band raster — previously this clamped silently to
+    // Band 4 and produced plausible-but-wrong NDVI. Now it must be an error.
     let temp_raster = create_test_rgba_geotiff(64, 64, 50, 100, 150, 200);
     let raster_path = temp_raster.path();
 
@@ -583,13 +584,32 @@ fn test_spectral_formula_out_of_bounds_band_clamping() {
         ..Default::default()
     };
 
-    let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
-    let records = streamer.fetch_next_batch(1000).unwrap();
-    assert!(!records.is_empty());
-    // Band 99 is clamped to Band 4 (NIR=200), Red is Band 1 (Red=50) -> NDVI = 0.60
-    for rec in &records {
-        assert!((rec.accumulator.mean() - 0.60).abs() < 1e-6);
-    }
+    let err = match MultiScanHorizonStreamer::new(reader, &config) {
+        Ok(_) => panic!("out-of-range spectral band must be rejected"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("band"), "unexpected error: {msg}");
+    assert!(msg.contains("99"), "error should name the bad band: {msg}");
+}
+
+#[test]
+fn test_config_band_out_of_bounds_rejected() {
+    // config.band = 5 on a 4-band raster must also error, not clamp.
+    let temp_raster = create_test_rgba_geotiff(64, 64, 50, 100, 150, 200);
+    let reader = GeoTiffStreamReader::open(temp_raster.path()).unwrap();
+
+    let config = MultiResolutionConfig {
+        resolutions: vec![8],
+        band: 5,
+        ..Default::default()
+    };
+
+    let err = match MultiScanHorizonStreamer::new(reader, &config) {
+        Ok(_) => panic!("out-of-range band must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("band"), "unexpected error: {err}");
 }
 
 #[test]
