@@ -11,6 +11,9 @@ pub struct H3Accumulator {
     pub min: f64,
     pub max: f64,
     pub m2: f64, // Sum of squared deviations from mean (Welford's algorithm)
+    /// Sum of squared observation weights, `sum(w_i^2)`. Equals `count` when every
+    /// observation has weight one. Used for the reliability-weighted sample variance.
+    pub sum_w2: f64,
     #[serde(skip)]
     pub quantiles: Option<Box<QuantileSketch>>,
 }
@@ -24,6 +27,7 @@ impl Default for H3Accumulator {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             m2: 0.0,
+            sum_w2: 0.0,
             quantiles: None,
         }
     }
@@ -39,6 +43,7 @@ impl H3Accumulator {
             min: val,
             max: val,
             m2: 0.0,
+            sum_w2: 1.0,
             quantiles: None,
         }
     }
@@ -52,19 +57,35 @@ impl H3Accumulator {
             min: val,
             max: val,
             m2: 0.0,
+            sum_w2: weight * weight,
             quantiles: None,
         }
     }
 
-    /// Initialize with raw stats without quantiles
+    /// Initialize with raw stats of `count` unit-weight observations, without quantiles
     #[inline(always)]
     pub fn from_stats(sum: f64, count: f64, min: f64, max: f64, m2: f64) -> Self {
+        Self::from_weighted_stats(sum, count, count, min, max, m2)
+    }
+
+    /// Initialize with raw stats of weighted observations (`sum_w2` is `sum(w_i^2)`),
+    /// without quantiles
+    #[inline(always)]
+    pub fn from_weighted_stats(
+        sum: f64,
+        count: f64,
+        sum_w2: f64,
+        min: f64,
+        max: f64,
+        m2: f64,
+    ) -> Self {
         Self {
             sum,
             count,
             min,
             max,
             m2,
+            sum_w2,
             quantiles: None,
         }
     }
@@ -78,6 +99,7 @@ impl H3Accumulator {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             m2: 0.0,
+            sum_w2: 0.0,
             quantiles: Some(Box::new(QuantileSketch::new())),
         }
     }
@@ -105,6 +127,7 @@ impl H3Accumulator {
         self.min = f64::INFINITY;
         self.max = f64::NEG_INFINITY;
         self.m2 = 0.0;
+        self.sum_w2 = 0.0;
         if let Some(ref mut q) = self.quantiles {
             q.clear();
         }
@@ -123,12 +146,14 @@ impl H3Accumulator {
             self.min = val;
             self.max = val;
             self.m2 = 0.0;
+            self.sum_w2 = 1.0;
             return;
         }
 
         let delta = val - (self.sum / self.count);
         self.sum += val;
         self.count += 1.0;
+        self.sum_w2 += 1.0;
         let delta2 = val - (self.sum / self.count);
         self.m2 += delta * delta2;
         self.min = self.min.min(val);
@@ -151,12 +176,14 @@ impl H3Accumulator {
             self.min = val;
             self.max = val;
             self.m2 = 0.0;
+            self.sum_w2 = weight * weight;
             return;
         }
 
         let old_mean = self.sum / self.count;
         self.sum += val * weight;
         self.count += weight;
+        self.sum_w2 += weight * weight;
         let new_mean = self.sum / self.count;
         self.m2 += weight * (val - old_mean) * (val - new_mean);
         self.min = self.min.min(val);
@@ -199,14 +226,7 @@ impl H3Accumulator {
                 m2 += d * d;
             }
         }
-        let chunk_acc = Self {
-            sum,
-            count,
-            min,
-            max,
-            m2,
-            quantiles: None,
-        };
+        let chunk_acc = Self::from_stats(sum, count, min, max, m2);
         self.merge(&chunk_acc);
     }
 
@@ -222,6 +242,7 @@ impl H3Accumulator {
             self.min = other.min;
             self.max = other.max;
             self.m2 = other.m2;
+            self.sum_w2 = other.sum_w2;
             if let Some(ref q_other) = other.quantiles {
                 if let Some(ref mut q_self) = self.quantiles {
                     q_self.merge(q_other);
@@ -240,6 +261,7 @@ impl H3Accumulator {
 
         self.sum += other.sum;
         self.count += other.count;
+        self.sum_w2 += other.sum_w2;
         self.m2 += other.m2 + delta * delta * (n1 * n2 / (n1 + n2));
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
@@ -261,15 +283,23 @@ impl H3Accumulator {
         }
     }
 
-    /// Calculate sample variance
+    /// Reliability-weighted sample variance, `M2 / (W - sum(w_i^2) / W)` with
+    /// `W = sum(w_i)`. With unit weights this is the usual `M2 / (n - 1)`. The
+    /// estimator is invariant to rescaling all weights, so fractional weights from
+    /// sub-pixel sampling still measure the spread of distinct pixel values.
+    /// Returns `0.0` for a single observation (or when every observation carries
+    /// the same value) and `NaN` when empty.
     #[inline(always)]
     pub fn variance(&self) -> f64 {
-        if self.count > 1.0 {
-            self.m2 / (self.count - 1.0)
-        } else if self.count > 0.0 {
-            0.0
+        if self.count <= 0.0 {
+            return f64::NAN;
+        }
+        let denom = self.count - self.sum_w2 / self.count;
+        // denom is 0 for a single observation; guard rounding near that limit.
+        if denom > self.count * 1e-12 && self.m2 > 0.0 {
+            self.m2 / denom
         } else {
-            f64::NAN
+            0.0
         }
     }
 
@@ -340,12 +370,14 @@ impl FastRunAccumulator {
         } else {
             0.0
         };
+        // Each run element is one unit-weight pixel.
         H3Accumulator {
             sum: self.sum,
             count: self.count,
             min: self.min,
             max: self.max,
             m2: m2.max(0.0),
+            sum_w2: self.count,
             quantiles: None,
         }
     }

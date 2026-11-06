@@ -32,6 +32,13 @@ pattern, pixel size relative to cell size, and the CRS; no universal bound is
 claimed. Workflows that need area-weighted means or conserved extensive totals
 should supply equal-area inputs or apply their own area weights.
 
+`stddev` treats each pixel as **one observation** per cell, weighted by the sum of
+its sample weights in that cell (`w_i`). The reliability-weighted sample variance
+`M2 / (W - sum(w_i^2) / W)`, with `W = sum(w_i)`, is unchanged when every weight is
+rescaled, so a cell's `stddev` reflects the spread of its distinct pixel values and not
+the pattern's point count. A pixel wholly inside one cell has weight one, which gives
+the usual `M2 / (n - 1)`; boundary pixels add only their fractional share.
+
 ## Performance & Precision Trade-Off Guide
 
 | Sampling Mode | Samples / Pixel | Relative Runtime | Boundary Precision | Recommended Use Case |
@@ -59,12 +66,13 @@ Because **no two points share the same horizontal ($X$) or vertical ($Y$) coordi
 
 For ordinary non-overlap scans, each valid pixel's sample locations are transformed
 once, then indexed once per requested H3 resolution. Small reusable buffers retain
-these assignments. If every retained sample belongs to the same cell, continuous
-and categorical engines combine their weights into one update. Otherwise, stored
-assignments are replayed without repeating projection or indexing. Bounding-box
+these assignments. Continuous and categorical engines combine the weights of a pixel's samples that
+share a cell into one update per cell (in the order of each cell's first sample),
+so a pixel wholly inside one cell is a single update, and the stored assignments are
+replayed without repeating projection or indexing. Bounding-box
 clipping preserves only the included sample weights, including partial pixels.
 
-Quantile-enabled continuous aggregation retains individual sample updates. The
+Quantile sketches receive the same combined weight. The
 mosaic overlap path keeps its ownership-aware sample walker. Center sampling
 continues to use sequential span accumulation. No geometric containment shortcut
 skips sample indexing, and performance depends on the CRS and sampling pattern.

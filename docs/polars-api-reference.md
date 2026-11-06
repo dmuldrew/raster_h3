@@ -254,7 +254,7 @@ H3-indexed frames and with DuckDB `UBIGINT`.
 | `h3_index` | `UInt64` | | 64-bit H3 cell index. |
 | `h3_hex` | `String` | | 15-character lowercase hex form, e.g. `"8828308281fffff"`. |
 | `mean` | `Float64` | | Weighted mean of pixel values in the cell. |
-| `stddev` | `Float64` | ✓ | Single-pass Welford sample standard deviation; `0.0` for one sample, null if it cannot be computed. |
+| `stddev` | `Float64` | ✓ | Single-pass Welford reliability-weighted sample standard deviation, sqrt(M2 / (W - sum(w²) / W)); equals the usual sample standard deviation for unit pixel weights. `0.0` for one pixel, null if it cannot be computed. |
 | `count` | `Float64` | | Weighted number of pixels contributing to the cell. |
 | `min` | `Float64` | | Minimum pixel value in the cell. |
 | `max` | `Float64` | | Maximum pixel value in the cell. |

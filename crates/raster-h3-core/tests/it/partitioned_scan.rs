@@ -16,6 +16,7 @@ use raster_h3_core::aggregator::multi_horizon::{
     decode_partial_state, encode_partial_state, plan_partitions, MultiCategoricalHorizonStreamer,
     MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget, ScanPartition,
 };
+use raster_h3_core::aggregator::sampling::SamplingPattern;
 use raster_h3_core::raster::mosaic::{MosaicReader, OverlapRule};
 
 use crate::helpers::{write_geotiff, write_tiled, Crs, Layout};
@@ -282,6 +283,7 @@ fn assert_same_continuous(
         close(a.min, b.min, "min", *key);
         close(a.max, b.max, "max", *key);
         close(a.mean(), b.mean(), "mean", *key);
+        close(a.sum_w2, b.sum_w2, "sum_w2", *key);
         close(a.variance(), b.variance(), "variance", *key);
         assert_eq!(
             a.quantiles.is_some(),
@@ -521,6 +523,40 @@ fn spilling_partitions_match_single_scan() {
     assert!(s.spill_run_count() > 0, "partition did not spill");
 }
 
+#[test]
+fn fractional_sampling_variance_survives_spills_and_partitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sf.tif");
+    write_tiled(&path, (300, 220), (32, 32), SF, "-9999", surface);
+    let spill = tempfile::tempdir().unwrap();
+    let paths = vec![path];
+    let mut config = MultiResolutionConfig::new(vec![9, 10]);
+    config.sampling = SamplingPattern::rgss();
+    config.aggregation_budget_bytes = 2 * 64 * 1024;
+    config.spill_directory = Some(spill.path().to_path_buf());
+    let single = single_continuous(&paths, OverlapRule::Cutline, &config);
+    let run = partitioned_continuous(&paths, OverlapRule::Cutline, &config, 12);
+    assert!(run.partitions > 1);
+    assert_same_continuous(&single, &run, &[]);
+
+    // Interior pixels contribute one unit observation, boundary pixels a fraction
+    // of one, so sum(w^2) <= count with equality only for wholly interior cells.
+    let mut unspilled = config.clone();
+    unspilled.aggregation_budget_bytes = 1 << 30;
+    unspilled.spill_directory = None;
+    let reference = single_continuous(&paths, OverlapRule::Cutline, &unspilled);
+    assert_eq!(reference.len(), single.len());
+    let mut boundary = 0;
+    for (key, a) in &reference {
+        let b = &single[key];
+        close(a.sum_w2, b.sum_w2, "spilled sum_w2", *key);
+        close(a.variance(), b.variance(), "spilled variance", *key);
+        assert!(a.sum_w2 <= a.count * (1.0 + 1e-12), "{key:?}");
+        boundary += usize::from(a.sum_w2 < a.count);
+    }
+    assert!(boundary > 0, "some pixels straddle cells");
+}
+
 // -----------------------------------------------------------------------------------------
 // Plans, encoding and misuse
 // -----------------------------------------------------------------------------------------
@@ -578,6 +614,19 @@ fn partial_states_round_trip_and_reject_corruption() {
         (acc.count, acc.sum, acc.min, acc.max)
     );
     assert_eq!(back.quantile(0.5), acc.quantile(0.5));
+
+    // Fractional weights keep their sum of squares, and so the weighted variance.
+    let mut weighted = H3Accumulator::new_weighted(100.0, 0.4);
+    weighted.update_weighted(200.0, 0.6);
+    let back: H3Accumulator =
+        decode_partial_state(&encode_partial_state(&weighted), STATE_LIMIT).unwrap();
+    assert_eq!(back, weighted);
+    assert!((back.variance() - 5000.0).abs() < 1e-8);
+
+    // Version 1 states lack sum(w^2) and are refused rather than misread.
+    let mut v1 = bytes.clone();
+    v1[4] = 1;
+    assert!(decode_partial_state::<H3Accumulator>(&v1, STATE_LIMIT).is_err());
 
     assert!(decode_partial_state::<H3Accumulator>(&bytes[..bytes.len() - 1], STATE_LIMIT).is_err());
     assert!(decode_partial_state::<H3Accumulator>(b"nope", STATE_LIMIT).is_err());

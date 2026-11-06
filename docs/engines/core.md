@@ -308,7 +308,7 @@ floating-point summation order:
 3. **Merge**: a finalized cell that no chunk outside the partition can reach is
    *interior* and is emitted as a normal record. Any other cell is *boundary* and is
    emitted as an unfiltered `PartialCell`. Ship partials with `encode_partial_state` (the
-   lossless spill format with a versioned `RH3P` header), merge them with
+   lossless spill format with a versioned `RH3P` header; version 2 adds the continuous sum of squared weights, and states from older releases are rejected, so every worker must run the same release), merge them with
    `PartialMerger::push_encoded` (built by the streamer's `partial_merger(&config)`), and
    `finish()` applies the filters to the merged states.
 
