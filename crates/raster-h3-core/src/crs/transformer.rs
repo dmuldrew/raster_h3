@@ -65,6 +65,130 @@ pub(crate) struct AlbersInverse<'a> {
     n_over_a_sq: f64,
     inv_qp: f64,
     apa: [f64; 4],
+    /// Series coefficients: phi = beta + sum(p[k-1] * sin(2*k*beta)).
+    p: [f64; 4],
+}
+
+/// Bounds describing how the unit vector of a row's locations moves per
+/// column, for `h3o::RowPath`: speed |dP/di| (rad/column), acceleration
+/// |d²P/di²| (rad/column²) and the floating-point jitter of the computed
+/// coordinates around the smooth path (rad).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowPathBounds {
+    pub speed: f64,
+    pub accel: f64,
+    pub noise: f64,
+}
+
+/// Bounds for a path whose latitude phi stays in `[phi_lo, phi_hi]`
+/// (radians) and whose longitude is linear in the column, advancing by
+/// `lam1` rad/column, given bounds `phi1 ≥ |phi'|` and `phi2 ≥ |phi''|`.
+///
+/// With P = (cos phi cos lambda, cos phi sin lambda, sin phi) and lambda'' =
+/// 0: |P_phi| = |P_phiphi| = 1, |P_lambda| = |P_lambdalambda| = cos phi and
+/// |P_philambda| = |sin phi|, so
+///
+/// - |P'| ≤ |phi'| + cos phi |lambda'|;
+/// - |P''| ≤ |phi''| + phi'² + 2 |phi' lambda'| |sin phi| + lambda'² cos phi.
+fn latlng_path_bounds(
+    (phi_lo, phi_hi): (f64, f64),
+    phi1: impl Fn(f64) -> f64,
+    phi2: impl Fn(f64, f64) -> f64,
+    lam1: f64,
+    noise: f64,
+) -> Option<RowPathBounds> {
+    let (near, far) = if phi_lo <= 0.0 && phi_hi >= 0.0 {
+        (0.0, phi_lo.abs().max(phi_hi.abs()))
+    } else {
+        (
+            phi_lo.abs().min(phi_hi.abs()),
+            phi_lo.abs().max(phi_hi.abs()),
+        )
+    };
+    // Largest cos phi and |sin phi| over the range, padded for rounding.
+    let cos_max = (near.cos() + 1e-12).min(1.0);
+    let sin_max = (far.sin() + 1e-12).min(1.0);
+    let phi1 = phi1(cos_max);
+    let speed = phi1 + lam1 * cos_max;
+    let accel =
+        phi2(cos_max, sin_max) + phi1 * phi1 + 2.0 * phi1 * lam1 * sin_max + lam1 * lam1 * cos_max;
+    let inflate = 1.0 + 1e-9;
+    let bounds = RowPathBounds {
+        speed: speed * inflate + 1e-300,
+        accel: accel * inflate + 1e-300,
+        noise: noise * inflate,
+    };
+    [phi_lo, phi_hi, bounds.speed, bounds.accel, bounds.noise]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some(bounds)
+}
+
+/// Bounds for WGS84 locations (degrees) along a straight line of
+/// coordinates (a rotated or sheared raster row) from `start` to `end`
+/// (each `(lon, lat)`), advancing by `step` = (dlon, dlat) degrees per
+/// column. Latitude and longitude are both linear in the column, so phi'' =
+/// 0. `coord_mag` bounds the magnitude of the terms summed into each
+/// coordinate (it sizes their rounding). `None` if a latitude leaves
+/// [-90, 90].
+pub(crate) fn wgs84_line_bounds(
+    start: (f64, f64),
+    end: (f64, f64),
+    step: (f64, f64),
+    coord_mag: f64,
+) -> Option<RowPathBounds> {
+    let range = -90.0..=90.0;
+    if !range.contains(&start.1) || !range.contains(&end.1) {
+        return None;
+    }
+    let (lat_lo, lat_hi) = (start.1.min(end.1), start.1.max(end.1));
+    let phi1 = step.1.abs().to_radians();
+    let lam1 = step.0.abs().to_radians();
+    // A few ulps of `coord_mag` on each coordinate.
+    let noise = 2.0 * (8.0 * f64::EPSILON * coord_mag).to_radians();
+    latlng_path_bounds(
+        (lat_lo.to_radians(), lat_hi.to_radians()),
+        |_| phi1,
+        |_, _| 0.0,
+        lam1,
+        noise,
+    )
+}
+
+/// Bounds for Web Mercator locations along a straight line of projected
+/// coordinates from `start` to `end` (metres), advancing by `step` = (dx,
+/// dy) metres per column. `coord_mag` bounds the magnitude of the terms
+/// summed into each coordinate.
+///
+/// lambda = x / R is linear; phi = gd(psi) with psi = y / R linear, so
+/// phi' = cos phi psi' and phi'' = -sin phi cos phi psi'². `None` beyond
+/// ±89° (no Web Mercator data goes there), which also keeps the per-pixel
+/// latitude filter from ever rejecting a location in the line.
+pub(crate) fn mercator_line_bounds(
+    start: (f64, f64),
+    end: (f64, f64),
+    step: (f64, f64),
+    coord_mag: f64,
+) -> Option<RowPathBounds> {
+    let (lat0, lat1) = (web_mercator_lat(start.1), web_mercator_lat(end.1));
+    if !(lat0.abs() <= 89.0 && lat1.abs() <= 89.0) {
+        return None;
+    }
+    let psi1 = step.1.abs() / WGS84_A;
+    let lam1 = step.0.abs() / WGS84_A;
+    let psi_max = start.1.abs().max(end.1.abs()) / WGS84_A;
+    // x and y round by a few ulps of `coord_mag`; then psi = y / R, exp,
+    // atan, the subtraction of pi/2 and the degree conversions.
+    let noise = 2.0 * 8.0 * f64::EPSILON * coord_mag / WGS84_A
+        + 4.0 * f64::EPSILON * (psi_max + 1.0)
+        + 16.0 * f64::EPSILON * std::f64::consts::PI;
+    latlng_path_bounds(
+        (lat0.min(lat1).to_radians(), lat0.max(lat1).to_radians()),
+        |cos_max| cos_max * psi1,
+        |cos_max, sin_max| sin_max * cos_max * psi1 * psi1,
+        lam1,
+        noise,
+    )
 }
 
 /// Tokenize a PROJ string into key-value pairs.
@@ -389,11 +513,189 @@ impl AlbersConicFast {
             n_over_a_sq: n_over_a * n_over_a,
             inv_qp: 1.0 / self.qp,
             apa: [p1 - p3, 2.0 * p2 - 4.0 * p4, 4.0 * p3, 8.0 * p4],
+            p: [p1, p2, p3, p4],
         }
     }
 }
 
 impl AlbersInverse<'_> {
+    /// Bounds for a north-up row evaluated with [`Self::transform_with_yp`]
+    /// at constant `y_p`, for projected x in `[x_lo, x_hi]` advancing by
+    /// `step` metres per column. See [`Self::line_path_bounds`].
+    pub(crate) fn row_path_bounds(
+        &self,
+        x_lo: f64,
+        x_hi: f64,
+        y_p: f64,
+        step: f64,
+    ) -> Option<RowPathBounds> {
+        if x_lo > x_hi {
+            return None;
+        }
+        let x_0 = self.albers.x_0;
+        // `y_p` is hoisted, so only x rounds per location.
+        let coord_mag = x_lo.abs().max(x_hi.abs()) + x_0.abs();
+        self.line_path_bounds_p((x_lo - x_0, y_p), (x_hi - x_0, y_p), (step, 0.0), coord_mag)
+    }
+
+    /// Bounds for locations evaluated with [`Self::transform_point`] along a
+    /// straight line of projected coordinates (a rotated or sheared raster
+    /// row) from `start` to `end`, advancing by `step` = (dx, dy) metres per
+    /// column. `coord_mag` bounds the magnitude of the terms summed into each
+    /// location's x and y (it sizes their rounding).
+    pub(crate) fn line_path_bounds(
+        &self,
+        start: (f64, f64),
+        end: (f64, f64),
+        step: (f64, f64),
+        coord_mag: f64,
+    ) -> Option<RowPathBounds> {
+        let albers = self.albers;
+        let to_p = |(x, y): (f64, f64)| (x - albers.x_0, albers.rho0 - (y - albers.y_0));
+        let coord_mag = coord_mag + albers.x_0.abs() + albers.y_0.abs() + albers.rho0.abs();
+        self.line_path_bounds_p(to_p(start), to_p(end), (step.0, -step.1), coord_mag)
+    }
+
+    /// [`Self::line_path_bounds`] in cone coordinates x_p = x - x_0 and
+    /// y_p = rho0 - (y - y_0), from `p0` to `p1` advancing by `v` per column.
+    ///
+    /// With rho² = x_p² + y_p², |v|² = v_x² + v_y² and theta = atan2(x_p, y_p):
+    ///
+    /// - lambda = lambda_0 + theta / n. theta' = (v_x y_p - v_y x_p) / rho²,
+    ///   so |theta'| ≤ min((|v_x| |y_p| + |v_y| |x_p|) / rho², |v| / rho).
+    ///   For straight-line motion at distance h from the apex and s along the
+    ///   line, theta'' = -2 |v|² h s / rho⁴ and 2 |h s| ≤ rho², so
+    ///   |theta''| ≤ |v|² / rho²;
+    /// - q = (C - rho² n²/a²) / n is linear in rho², with (rho²)' = 2 (x_p
+    ///   v_x + y_p v_y) and (rho²)'' = 2 |v|²: |q'| ≤ 2 |n| (|x_p v_x| + |y_p
+    ///   v_y|) / a², |q''| = 2 |n| |v|² / a². rho² is convex along the line,
+    ///   so its extremes (and q's) are at the point closest to the apex and
+    ///   at an end;
+    /// - beta = asin(q / qp): beta' = q' / (qp cos beta) and beta'' = q'' /
+    ///   (qp cos beta) + sin beta q'² / (qp² cos³ beta);
+    /// - phi = beta + sum(p_k sin(2k beta)): |dphi/dbeta| ≤ 1 + sum(2k |p_k|)
+    ///   and |d²phi/dbeta²| ≤ sum(4k² |p_k|);
+    /// - on the unit sphere, |P'| ≤ |phi'| + |lambda'| and |P''| ≤ |phi''| +
+    ///   |lambda''| + (|phi'| + |lambda'|)².
+    ///
+    /// For a north-up row (v_y = 0, constant y_p) these are the bounds of
+    /// the constant-y derivation: |lambda'| = step |y_p| / (|n| rho²) and
+    /// |lambda''| ≤ step² / (|n| rho²).
+    ///
+    /// The noise term bounds the rounding of that formula chain, dominated by
+    /// `asin` near the poles (error / cos beta), plus the rounding of x_p and
+    /// y_p themselves. Returns `None` when the line may reach the cone apex,
+    /// the atan2 branch cut, or the `sin beta` clamp (poles), where the
+    /// inverse isn't smooth.
+    fn line_path_bounds_p(
+        &self,
+        p0: (f64, f64),
+        p1: (f64, f64),
+        v: (f64, f64),
+        coord_mag: f64,
+    ) -> Option<RowPathBounds> {
+        let albers = self.albers;
+        let n = albers.n;
+        let a = albers.a;
+        if ![p0.0, p0.1, p1.0, p1.1, v.0, v.1, coord_mag, n, a, albers.qp]
+            .iter()
+            .all(|v| v.is_finite())
+            || n == 0.0
+        {
+            return None;
+        }
+        // Conservatively reject a segment whose rounded bounding box touches
+        // atan2's cut: x_p = 0 on the far side of the apex for this sign of n.
+        let delta = 8.0 * f64::EPSILON * coord_mag;
+        if p0.0.min(p1.0) <= delta
+            && p0.0.max(p1.0) >= -delta
+            && (if n > 0.0 {
+                p0.1.min(p1.1) <= delta
+            } else {
+                p0.1.max(p1.1) >= -delta
+            })
+        {
+            return None;
+        }
+        let (vx, vy) = (v.0.abs(), v.1.abs());
+        let v_sq = vx * vx + vy * vy;
+        let xp_max = p0.0.abs().max(p1.0.abs());
+        let yp_max = p0.1.abs().max(p1.1.abs());
+        // Closest point of the segment to the apex, deflated for the rounding
+        // of its computation (absolute, ~ε of the coordinates).
+        let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+        let len_sq = dx * dx + dy * dy;
+        let t = if len_sq > 0.0 {
+            (-(p0.0 * dx + p0.1 * dy) / len_sq).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let rho_min = (p0.0 + t * dx).hypot(p0.1 + t * dy) - 1e-12 * (xp_max + yp_max);
+        if rho_min.is_nan() || rho_min <= 0.0 {
+            return None;
+        }
+        let rho_sq_min = rho_min * rho_min;
+        let rho_sq_max = (p0.0 * p0.0 + p0.1 * p0.1).max(p1.0 * p1.0 + p1.1 * p1.1) * (1.0 + 1e-12);
+
+        let inv_n_abs = 1.0 / n.abs();
+        let theta1 = ((vx * yp_max + vy * xp_max) / rho_sq_min).min(v_sq.sqrt() / rho_min);
+        let theta2 = v_sq / rho_sq_min;
+        let lam1 = theta1 * inv_n_abs;
+        let lam2 = theta2 * inv_n_abs;
+
+        let q_of = |rho_sq: f64| (albers.c - rho_sq * self.n_over_a_sq) * self.inv_n;
+        let s_max = q_of(rho_sq_min).abs().max(q_of(rho_sq_max).abs()) * self.inv_qp.abs();
+        if s_max.is_nan() || s_max >= 1.0 - 1e-9 {
+            return None;
+        }
+        let cos_min = (1.0 - s_max * s_max).sqrt();
+        let qp = albers.qp.abs();
+        let q1 = 2.0 * n.abs() * (vx * xp_max + vy * yp_max) / (a * a);
+        let q2 = 2.0 * n.abs() * v_sq / (a * a);
+        let beta1 = q1 / (qp * cos_min);
+        let beta2 = q2 / (qp * cos_min) + s_max * q1 * q1 / (qp * qp * cos_min.powi(3));
+
+        let (mut d1, mut d2) = (1.0, 0.0);
+        for (k, p) in self.p.iter().enumerate() {
+            let k = (k + 1) as f64;
+            d1 += 2.0 * k * p.abs();
+            d2 += 4.0 * k * k * p.abs();
+        }
+        let phi1 = d1 * beta1;
+        let phi2 = d2 * beta1 * beta1 + d1 * beta2;
+
+        let speed = phi1 + lam1;
+        let accel = phi2 + lam2 + speed * speed;
+
+        // Rounding: x and rho² (relative), q, sin beta amplified by asin
+        // (1/cos beta), the series, theta/n, and the degree conversions
+        // round trip. 64 ulps per term is deliberately generous.
+        let q_scale =
+            (albers.c.abs() + rho_sq_max * self.n_over_a_sq) * self.inv_n.abs() * self.inv_qp.abs();
+        let theta_max = std::f64::consts::PI;
+        let formula = 64.0
+            * f64::EPSILON
+            * ((q_scale + 1.0) / cos_min
+                + (theta_max + 1.0) * self.inv_n.abs()
+                + 4.0 * std::f64::consts::PI);
+        // Absolute rounding of x_p and y_p (a few ulps of `coord_mag` each),
+        // through theta (1 / rho) and through rho² (2 rho) into q.
+        let coords = delta * inv_n_abs / rho_min
+            + d1 * 2.0 * rho_sq_max.sqrt() * delta * self.n_over_a_sq * inv_n_abs / (qp * cos_min);
+        let noise = formula + coords;
+
+        let inflate = 1.0 + 1e-9;
+        let bounds = RowPathBounds {
+            speed: speed * inflate + 1e-300,
+            accel: accel * inflate + 1e-300,
+            noise: noise * inflate,
+        };
+        [bounds.speed, bounds.accel, bounds.noise]
+            .iter()
+            .all(|v| v.is_finite())
+            .then_some(bounds)
+    }
+
     #[inline(always)]
     pub(crate) fn row_yp(&self, y: f64) -> (f64, f64) {
         self.albers.row_yp(y)
@@ -2534,5 +2836,550 @@ mod tests {
                 assert!((actual.1 - lat).abs() < 1e-8, "{actual:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod albers_row_tests {
+    use super::{AlbersConicFast, AlbersInverse, RowPathBounds};
+    use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution, RowPath};
+
+    /// Deterministic PRNG in [0, 1).
+    fn rng(mut state: u64) -> impl FnMut() -> f64 {
+        move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    fn projections() -> Vec<(&'static str, AlbersConicFast)> {
+        vec![
+            ("EPSG:5070 CONUS", AlbersConicFast::epsg_5070()),
+            (
+                "Alaska (EPSG:3338 parameters)",
+                AlbersConicFast::new(55.0, 65.0, 50.0, -154.0),
+            ),
+            (
+                "Australia (EPSG:3577 parameters, n < 0)",
+                AlbersConicFast::new(-18.0, -36.0, 0.0, 132.0),
+            ),
+            (
+                "near-equatorial cone (small n)",
+                AlbersConicFast::new(2.0, 8.0, 0.0, 20.0),
+            ),
+        ]
+    }
+
+    #[test]
+    fn albers_bounds_reject_branch_cut_for_both_cone_signs() {
+        for (_, albers) in projections() {
+            let inverse = albers.prepare_inverse();
+            let y_p = -albers.rho0;
+            assert!(inverse
+                .row_path_bounds(-100_000.0, 100_000.0, y_p, 100.0)
+                .is_none());
+            for (x0, x1) in [(-100_000.0, 100_000.0), (0.0, 100_000.0), (-100_000.0, 0.0)] {
+                let coord = |x, y_p| (x + albers.x_0, albers.rho0 - y_p + albers.y_0);
+                for (start, end) in [
+                    (coord(x0, y_p), coord(x1, y_p + 100_000.0)),
+                    (coord(x1, y_p + 100_000.0), coord(x0, y_p)),
+                ] {
+                    let step = ((end.0 - start.0) / 2000.0, (end.1 - start.1) / 2000.0);
+                    assert!(inverse.line_path_bounds(start, end, step, 1e8).is_none());
+                }
+            }
+            // The same crossing on the near side of the apex is smooth.
+            assert!(inverse
+                .row_path_bounds(-100_000.0, 100_000.0, -y_p, 100.0)
+                .is_some());
+        }
+    }
+
+    /// A north-up row: x(i) = x_start + i * step at constant y.
+    struct AlbersRow<'a> {
+        inverse: AlbersInverse<'a>,
+        x_start: f64,
+        step: f64,
+        y_p: f64,
+        y_p_sq: f64,
+        bounds: RowPathBounds,
+    }
+
+    impl<'a> AlbersRow<'a> {
+        fn new(
+            albers: &'a AlbersConicFast,
+            x_start: f64,
+            y: f64,
+            step: f64,
+            width: usize,
+        ) -> Option<Self> {
+            let inverse = albers.prepare_inverse();
+            let (y_p, y_p_sq) = inverse.row_yp(y);
+            let x_end = x_start + width as f64 * step;
+            let bounds =
+                inverse.row_path_bounds(x_start.min(x_end), x_start.max(x_end), y_p, step)?;
+            Some(Self {
+                inverse,
+                x_start,
+                step,
+                y_p,
+                y_p_sq,
+                bounds,
+            })
+        }
+
+        fn lon_lat(&self, i: usize) -> (f64, f64) {
+            self.inverse.transform_with_yp(
+                self.x_start + i as f64 * self.step,
+                self.y_p,
+                self.y_p_sq,
+            )
+        }
+    }
+
+    impl RowPath for AlbersRow<'_> {
+        fn point(&mut self, i: usize) -> LatLng {
+            let (lon, lat) = self.lon_lat(i);
+            LatLng::new(lat, lon).expect("finite")
+        }
+        fn speed_bound(&self) -> f64 {
+            self.bounds.speed
+        }
+        fn accel_bound(&self) -> f64 {
+            self.bounds.accel
+        }
+        fn noise_bound(&self) -> f64 {
+            self.bounds.noise
+        }
+    }
+
+    fn unit(lon_deg: f64, lat_deg: f64) -> [f64; 3] {
+        let (lat, lon) = (lat_deg.to_radians(), lon_deg.to_radians());
+        [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+    }
+
+    /// Random rows: a random point of the projection's region, projected
+    /// forward to pick the row's y and starting x.
+    fn rows(seed: u64, count: usize) -> Vec<(usize, f64, f64, f64)> {
+        let mut next = rng(seed);
+        (0..count)
+            .map(|k| {
+                let p = k % 4;
+                let (lat0, lon0) = match p {
+                    0 => (25.0 + 24.0 * next(), -124.0 + 57.0 * next()),
+                    1 => (52.0 + 18.0 * next(), -170.0 + 40.0 * next()),
+                    2 => (-43.0 + 32.0 * next(), 113.0 + 40.0 * next()),
+                    _ => (-10.0 + 20.0 * next(), 0.0 + 40.0 * next()),
+                };
+                let step = 10_f64.powf(1.0 + 1.7 * next()); // 10 m .. 500 m
+                (p, lat0, lon0, step)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn albers_row_bounds_dominate_finite_differences() {
+        let projections = projections();
+        let width = 2000;
+        let mut checked = 0;
+        for (p, lat0, lon0, step) in rows(3, 200) {
+            let (name, albers) = &projections[p];
+            let (x, y) = albers.project_point(lon0, lat0);
+            let Some(row) = AlbersRow::new(albers, x - 0.5 * width as f64 * step, y, step, width)
+            else {
+                continue;
+            };
+            checked += 1;
+            let pts: Vec<[f64; 3]> = (0..=width)
+                .map(|i| {
+                    let (lon, lat) = row.lon_lat(i);
+                    unit(lon, lat)
+                })
+                .collect();
+            let tol = 1e-12 + 4.0 * row.bounds.noise;
+            for i in 1..width {
+                let d1 = (0..3)
+                    .map(|k| (pts[i + 1][k] - pts[i][k]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let d2 = (0..3)
+                    .map(|k| (pts[i + 1][k] - 2.0 * pts[i][k] + pts[i - 1][k]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    d1 <= row.bounds.speed * (1.0 + 1e-6) + tol,
+                    "{name}: speed {d1} > {}",
+                    row.bounds.speed
+                );
+                assert!(
+                    d2 <= row.bounds.accel * (1.0 + 1e-6) + tol,
+                    "{name}: accel {d2} > {}",
+                    row.bounds.accel
+                );
+            }
+        }
+        assert!(checked > 150, "only {checked} rows had bounds");
+    }
+
+    #[test]
+    fn albers_rows_match_to_cell_with_index_row() {
+        let projections = projections();
+        let resolutions = [
+            Resolution::Six,
+            Resolution::Nine,
+            Resolution::Ten,
+            Resolution::Twelve,
+        ];
+        let width = 3000;
+        let (mut checked, mut decisions) = (0, 0);
+        for (p, lat0, lon0, step) in rows(17, 160) {
+            let (name, albers) = &projections[p];
+            let (x, y) = albers.project_point(lon0, lat0);
+            let Some(mut row) =
+                AlbersRow::new(albers, x - 0.5 * width as f64 * step, y, step, width)
+            else {
+                continue;
+            };
+            checked += 1;
+            let mut cells = vec![vec![None::<CellIndex>; width]; resolutions.len()];
+            let stats = LatLngIndexer::new().index_row(
+                &mut row,
+                0..width,
+                &resolutions,
+                |r, cols, cell| {
+                    for col in cols {
+                        cells[r][col] = Some(cell);
+                    }
+                },
+            );
+            decisions += stats.decisions;
+            for (col, ll) in (0..width).map(|col| (col, row.point(col))) {
+                for (r, &res) in resolutions.iter().enumerate() {
+                    assert_eq!(
+                        cells[r][col],
+                        Some(ll.to_cell(res)),
+                        "{name} step {step} col {col} {res:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 120, "only {checked} rows had bounds");
+        assert!(decisions > 0);
+    }
+
+    // Control: bounds understated 10x (speed, noise; acceleration 100x)
+    // produce wrong cells, so the derived bounds are within ~10x of what is
+    // needed and the test above would catch a bound that is too small.
+    #[test]
+    fn albers_rows_mismatch_with_understated_bounds() {
+        let projections = projections();
+        let resolutions = [
+            Resolution::Nine,
+            Resolution::Ten,
+            Resolution::Twelve,
+            Resolution::Thirteen,
+        ];
+        let width = 3000;
+        let mut mismatches = 0;
+        for (p, lat0, lon0, step) in rows(17, 160) {
+            let (_, albers) = &projections[p];
+            let (x, y) = albers.project_point(lon0, lat0);
+            let Some(mut row) =
+                AlbersRow::new(albers, x - 0.5 * width as f64 * step, y, step, width)
+            else {
+                continue;
+            };
+            row.bounds.speed *= 0.1;
+            row.bounds.accel *= 0.01;
+            row.bounds.noise *= 0.1;
+            let mut cells = vec![vec![None::<CellIndex>; width]; resolutions.len()];
+            LatLngIndexer::new().index_row(&mut row, 0..width, &resolutions, |r, cols, cell| {
+                for col in cols {
+                    cells[r][col] = Some(cell);
+                }
+            });
+            for col in 0..width {
+                let ll = row.point(col);
+                for (cells_r, &res) in cells.iter().zip(&resolutions) {
+                    mismatches += usize::from(cells_r[col] != Some(ll.to_cell(res)));
+                }
+            }
+        }
+        assert!(mismatches > 0, "understated bounds never changed a cell");
+    }
+}
+
+#[cfg(test)]
+mod line_row_tests {
+    use super::{
+        mercator_line_bounds, web_mercator_lat, web_mercator_lon, wgs84_line_bounds,
+        AlbersConicFast, AlbersInverse, RowPathBounds,
+    };
+    use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution, RowPath, SpanBounds};
+
+    /// Deterministic PRNG in [0, 1).
+    fn rng(mut state: u64) -> impl FnMut() -> f64 {
+        move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    enum Crs<'a> {
+        Wgs84,
+        Mercator,
+        Albers(AlbersInverse<'a>),
+    }
+
+    /// A rotated raster row: projected (x, y) = start + i * step.
+    struct LinePath<'a> {
+        crs: Crs<'a>,
+        start: (f64, f64),
+        step: (f64, f64),
+        width: usize,
+        /// Bounds scale, < 1 to understate them.
+        scale: (f64, f64, f64),
+    }
+
+    impl LinePath<'_> {
+        fn coord(&self, i: usize) -> (f64, f64) {
+            let i = i as f64;
+            (
+                self.start.0 + i * self.step.0,
+                self.start.1 + i * self.step.1,
+            )
+        }
+
+        fn lon_lat(&self, i: usize) -> (f64, f64) {
+            let (x, y) = self.coord(i);
+            match &self.crs {
+                Crs::Wgs84 => (x, y),
+                Crs::Mercator => (web_mercator_lon(x), web_mercator_lat(y)),
+                Crs::Albers(inverse) => inverse.transform_point(x, y),
+            }
+        }
+
+        fn bounds(&self, first: usize, last: usize) -> Option<RowPathBounds> {
+            let (start, end) = (self.coord(first), self.coord(last));
+            let n = last.max(first) as f64;
+            let mag = self.start.0.abs()
+                + (n * self.step.0).abs()
+                + self.start.1.abs()
+                + (n * self.step.1).abs();
+            let b = match &self.crs {
+                Crs::Wgs84 => wgs84_line_bounds(start, end, self.step, mag),
+                Crs::Mercator => mercator_line_bounds(start, end, self.step, mag),
+                Crs::Albers(inverse) => inverse.line_path_bounds(start, end, self.step, mag),
+            }?;
+            Some(RowPathBounds {
+                speed: b.speed * self.scale.0,
+                accel: b.accel * self.scale.1,
+                noise: b.noise * self.scale.2,
+            })
+        }
+
+        fn whole(&self) -> RowPathBounds {
+            self.bounds(0, self.width).expect("bounds")
+        }
+    }
+
+    impl RowPath for LinePath<'_> {
+        fn point(&mut self, i: usize) -> LatLng {
+            let (lon, lat) = self.lon_lat(i);
+            LatLng::new(lat, lon).expect("finite")
+        }
+        fn speed_bound(&self) -> f64 {
+            self.whole().speed
+        }
+        fn accel_bound(&self) -> f64 {
+            self.whole().accel
+        }
+        fn noise_bound(&self) -> f64 {
+            self.whole().noise
+        }
+        fn span_bounds(&mut self, first: usize, last: usize) -> Option<SpanBounds> {
+            let b = self.bounds(first, last)?;
+            Some(SpanBounds {
+                speed: b.speed,
+                accel: b.accel,
+                noise: b.noise,
+            })
+        }
+    }
+
+    /// Random rotated rows over the three CRSs: (crs, start, step).
+    fn rows<'a>(
+        albers: &'a [AlbersConicFast],
+        seed: u64,
+        count: usize,
+        width: usize,
+    ) -> Vec<LinePath<'a>> {
+        let mut next = rng(seed);
+        let mut out = Vec::new();
+        for k in 0..count {
+            let angle = std::f64::consts::TAU * next();
+            let (sin, cos) = angle.sin_cos();
+            let (crs, center, size) = match k % 4 {
+                0 => {
+                    // Up to 85°, so some rows approach the poles.
+                    let lat = -85.0 + 170.0 * next();
+                    let lon = -180.0 + 360.0 * next();
+                    (Crs::Wgs84, (lon, lat), 10_f64.powf(-4.5 + 1.7 * next()))
+                }
+                1 => {
+                    let y = (-1.9e7 + 3.8e7 * next()) * 0.95;
+                    let x = -2.0e7 + 4.0e7 * next();
+                    (Crs::Mercator, (x, y), 10_f64.powf(1.0 + 1.7 * next()))
+                }
+                p => {
+                    let albers = &albers[p - 2];
+                    let (lat, lon) = if p == 2 {
+                        (25.0 + 24.0 * next(), -124.0 + 57.0 * next())
+                    } else {
+                        (-43.0 + 32.0 * next(), 113.0 + 40.0 * next())
+                    };
+                    let center = albers.project_point(lon, lat);
+                    (
+                        Crs::Albers(albers.prepare_inverse()),
+                        center,
+                        10_f64.powf(1.0 + 1.7 * next()),
+                    )
+                }
+            };
+            let step = (size * cos, size * sin);
+            let half = 0.5 * width as f64;
+            out.push(LinePath {
+                crs,
+                start: (center.0 - half * step.0, center.1 - half * step.1),
+                step,
+                width,
+                scale: (1.0, 1.0, 1.0),
+            });
+        }
+        out
+    }
+
+    fn albers() -> [AlbersConicFast; 2] {
+        [
+            AlbersConicFast::epsg_5070(),
+            AlbersConicFast::new(-18.0, -36.0, 0.0, 132.0),
+        ]
+    }
+
+    fn unit(lon_deg: f64, lat_deg: f64) -> [f64; 3] {
+        let (lat, lon) = (lat_deg.to_radians(), lon_deg.to_radians());
+        [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+    }
+
+    fn norm(v: [f64; 3]) -> f64 {
+        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+    }
+
+    #[test]
+    fn line_bounds_dominate_finite_differences() {
+        let albers = albers();
+        let width = 2000;
+        let mut checked = 0;
+        let mut worst: [f64; 2] = [0.0; 2];
+        for row in rows(&albers, 5, 400, width) {
+            if row.bounds(0, width).is_none() {
+                continue;
+            }
+            checked += 1;
+            let pts: Vec<[f64; 3]> = (0..=width)
+                .map(|i| {
+                    let (lon, lat) = row.lon_lat(i);
+                    unit(lon, lat)
+                })
+                .collect();
+            // Check each 100-column window against its own (span) bounds.
+            for w in (0..width).step_by(100) {
+                let b = row.bounds(w, w + 100).expect("sub-span bounds");
+                let tol = 1e-12 + 4.0 * b.noise;
+                for i in (w + 1)..(w + 100) {
+                    let d1 = norm(std::array::from_fn(|k| pts[i + 1][k] - pts[i][k]));
+                    let d2 = norm(std::array::from_fn(|k| {
+                        pts[i + 1][k] - 2.0 * pts[i][k] + pts[i - 1][k]
+                    }));
+                    assert!(
+                        d1 <= b.speed * (1.0 + 1e-6) + tol,
+                        "speed {d1} > {}",
+                        b.speed
+                    );
+                    assert!(
+                        d2 <= b.accel * (1.0 + 1e-6) + tol,
+                        "accel {d2} > {}",
+                        b.accel
+                    );
+                    worst[0] = worst[0].max(d1 / b.speed);
+                    worst[1] = worst[1].max(d2 / b.accel);
+                }
+            }
+        }
+        assert!(checked > 350, "only {checked} rows had bounds");
+        // The speed bounds are tight; acceleration within a few x.
+        assert!(worst[0] > 0.5 && worst[1] > 0.05, "worst ratios {worst:?}");
+    }
+
+    fn mismatches(rows: &mut [LinePath<'_>], resolutions: &[Resolution]) -> (usize, usize) {
+        let (mut mismatches, mut decisions) = (0, 0);
+        for row in rows.iter_mut() {
+            if row.bounds(0, row.width).is_none() {
+                continue;
+            }
+            let width = row.width;
+            let mut cells = vec![vec![None::<CellIndex>; width]; resolutions.len()];
+            let stats =
+                LatLngIndexer::new().index_row(row, 0..width, resolutions, |r, cols, cell| {
+                    cells[r][cols].fill(Some(cell));
+                });
+            decisions += stats.decisions;
+            for col in 0..width {
+                let ll = row.point(col);
+                for (cells_r, &res) in cells.iter().zip(resolutions) {
+                    mismatches += usize::from(cells_r[col] != Some(ll.to_cell(res)));
+                }
+            }
+        }
+        (mismatches, decisions)
+    }
+
+    #[test]
+    fn line_rows_match_to_cell_with_index_row() {
+        let albers = albers();
+        let resolutions = [
+            Resolution::Six,
+            Resolution::Nine,
+            Resolution::Ten,
+            Resolution::Twelve,
+        ];
+        let mut rows = rows(&albers, 23, 240, 3000);
+        let (mismatches, decisions) = mismatches(&mut rows, &resolutions);
+        assert_eq!(mismatches, 0);
+        assert!(decisions > 100_000, "only {decisions} decisions");
+    }
+
+    // Control: bounds understated 10x (speed, noise; acceleration 100x)
+    // produce wrong cells, so the test above would catch a bound that is
+    // too small.
+    #[test]
+    fn line_rows_mismatch_with_understated_bounds() {
+        let albers = albers();
+        let resolutions = [
+            Resolution::Nine,
+            Resolution::Ten,
+            Resolution::Twelve,
+            Resolution::Thirteen,
+        ];
+        let mut rows = rows(&albers, 23, 240, 3000);
+        for row in &mut rows {
+            row.scale = (0.1, 0.01, 0.1);
+        }
+        let (mismatches, _) = mismatches(&mut rows, &resolutions);
+        assert!(mismatches > 0, "understated bounds never changed a cell");
     }
 }

@@ -12,6 +12,194 @@ use raster_h3_core::aggregator::sampling::SamplingPattern;
 use raster_h3_core::raster::GeoTiffStreamReader;
 
 #[test]
+fn row_windows_and_albers_branch_cuts_match_per_pixel_walk() {
+    use h3o::Resolution;
+    use raster_h3_core::aggregator::accumulator::H3Accumulator;
+    use raster_h3_core::aggregator::categorical::CategoricalAccumulator;
+    use raster_h3_core::aggregator::cell_hash::H3BuildHasher;
+    use raster_h3_core::aggregator::multi_horizon::{
+        categorical::process_categorical_chunk_payload_into,
+        continuous::{process_continuous_chunk_payload_into, ContinuousOptions},
+        WalkContext,
+    };
+    use raster_h3_core::crs::transformer::{AlbersConicFast, CrsTransformer};
+    use raster_h3_core::raster::{geotransform::GeoTransform, RasterChunk};
+    use std::collections::HashMap;
+    use tiff::decoder::DecodingResult;
+
+    let mut cases = Vec::new();
+    for crs in [
+        CrsTransformer::Wgs84Identity,
+        CrsTransformer::WebMercatorFast,
+        CrsTransformer::AlbersConic(AlbersConicFast::epsg_5070()),
+    ] {
+        let (x, y, size) = match crs {
+            CrsTransformer::Wgs84Identity => (-122.5, 37.85, 0.0001),
+            CrsTransformer::WebMercatorFast => (-11_700_000.0, 4_830_000.0, 10.0),
+            _ => (-300_000.0, 2_000_000.0, 10.0),
+        };
+        for rotation in [0.0, size * 0.3] {
+            cases.push((
+                crs.clone(),
+                GeoTransform {
+                    c0: x,
+                    f0: y,
+                    a: size,
+                    e: -size,
+                    b: rotation,
+                    d: rotation,
+                },
+                2057,
+            ));
+        }
+    }
+    for albers in [
+        AlbersConicFast::epsg_5070(),
+        AlbersConicFast::with_offsets(-18.0, -36.0, -25.0, 132.0, 12345.0, -9876.0),
+    ] {
+        for rotation in [0.0, 30.0] {
+            cases.push((
+                CrsTransformer::AlbersConic(albers),
+                GeoTransform {
+                    c0: albers.x_0 - 100_000.0,
+                    f0: albers.y_0 + 2.0 * albers.rho0,
+                    a: 200_000.0 / 257.0,
+                    e: -100.0,
+                    b: rotation,
+                    d: rotation,
+                },
+                257,
+            ));
+        }
+    }
+    let resolutions = [Resolution::Three, Resolution::Nine, Resolution::Fifteen];
+    for (crs, gt, width) in cases {
+        let chunk = RasterChunk {
+            col_offset: 3,
+            row_offset: 7,
+            width,
+            height: 2,
+        };
+        for sampling in [
+            SamplingPattern::center(),
+            SamplingPattern::rgss(),
+            SamplingPattern::sixteen_point(),
+        ] {
+            for spp in [1, 2] {
+                let decoded = DecodingResult::F32(
+                    (0..width * chunk.height)
+                        .flat_map(|i| {
+                            let value = if i % 31 == 0 || (1018..1030).contains(&i) {
+                                f32::NAN
+                            } else {
+                                (i % 17) as f32 - 8.0
+                            };
+                            std::iter::repeat_n(value, spp as usize)
+                        })
+                        .collect(),
+                );
+                let ctx = WalkContext {
+                    chunk: &chunk,
+                    resolutions: &resolutions,
+                    crs: &crs,
+                    gt: &gt,
+                    sampling: &sampling,
+                    bbox: None,
+                    stride: width,
+                    samples_per_pixel: spp,
+                    owner: None,
+                    band_scaling: &[],
+                    alpha_sample: None,
+                };
+                // A world bbox disables exact rows without process-global env changes.
+                let reference = WalkContext {
+                    bbox: Some([-180.0, -90.0, 180.0, 90.0]),
+                    ..ctx
+                };
+                for quantiles in [false, true] {
+                    let mut actual = vec![
+                        HashMap::<u64, H3Accumulator, H3BuildHasher>::default();
+                        resolutions.len()
+                    ];
+                    let mut expected = actual.clone();
+                    let options = ContinuousOptions {
+                        band: spp as usize,
+                        spectral_formula: None,
+                        track_quantiles: quantiles,
+                    };
+                    process_continuous_chunk_payload_into(
+                        &ctx,
+                        &decoded,
+                        None,
+                        options,
+                        &mut actual,
+                    );
+                    process_continuous_chunk_payload_into(
+                        &reference,
+                        &decoded,
+                        None,
+                        options,
+                        &mut expected,
+                    );
+                    for (got, want) in actual.iter().zip(&expected) {
+                        assert_eq!(got.len(), want.len());
+                        for (cell, oracle) in want {
+                            let acc = &got[cell];
+                            assert_eq!(acc.count, oracle.count);
+                            assert_eq!(acc.sum, oracle.sum);
+                            assert_eq!(acc.min, oracle.min);
+                            assert_eq!(acc.max, oracle.max);
+                            assert!((acc.m2 - oracle.m2).abs() < 1e-7);
+                            if quantiles {
+                                for q in [0.1, 0.5, 0.9] {
+                                    assert_eq!(acc.quantile(q), oracle.quantile(q));
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut actual = vec![
+                    HashMap::<u64, CategoricalAccumulator, H3BuildHasher>::default(
+                    );
+                    resolutions.len()
+                ];
+                let mut expected = actual.clone();
+                process_categorical_chunk_payload_into(
+                    &ctx,
+                    &decoded,
+                    None,
+                    spp as usize,
+                    None,
+                    &mut actual,
+                );
+                process_categorical_chunk_payload_into(
+                    &reference,
+                    &decoded,
+                    None,
+                    spp as usize,
+                    None,
+                    &mut expected,
+                );
+                for (got, want) in actual.iter().zip(&expected) {
+                    assert_eq!(got.len(), want.len());
+                    for (cell, oracle) in want {
+                        let mut classes = HashMap::new();
+                        got[cell].for_each_class(|class, count| {
+                            classes.insert(class, count);
+                        });
+                        let mut expected_classes = HashMap::new();
+                        oracle.for_each_class(|class, count| {
+                            expected_classes.insert(class, count);
+                        });
+                        assert_eq!(classes, expected_classes);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn web_mercator_samples_match_exact_projection() {
     use h3o::{LatLng, Resolution};
     use raster_h3_core::crs::transformer::CrsTransformer;
@@ -91,6 +279,88 @@ fn web_mercator_samples_match_exact_projection() {
                         assert!((output[cell] - count).abs() < 1e-8, "cell {cell}");
                     }
                 }
+            }
+        }
+    }
+}
+
+/// North-up rows take the exact row indexer one sample point at a time; every
+/// sample must still land in the cell `to_cell` gives its own coordinate.
+#[test]
+fn north_up_row_samples_match_exact_projection() {
+    use h3o::{LatLng, Resolution};
+    use raster_h3_core::crs::transformer::CrsTransformer;
+    use std::collections::HashMap;
+
+    let value = |col: u32, row: u32| {
+        if (col + row * 31).is_multiple_of(13) {
+            f32::NAN
+        } else {
+            (1 + (col + row) % 5) as f32
+        }
+    };
+    let cases = [
+        (4326, -122.5, 37.85, 0.0005),
+        (3857, -11_700_000.0, 4_830_000.0, 60.0),
+        (5070, -300_000.0, 2_000_000.0, 60.0),
+    ];
+    let patterns = [
+        SamplingPattern::rgss(),
+        SamplingPattern::gaussian_five_point(),
+        SamplingPattern::sixteen_point(),
+    ];
+    let resolutions = [8u8, 10, 12];
+    for (epsg, x, y, size) in cases {
+        let (_file, path) = TestGeoTiffBuilder::new(300, 40)
+            .origin(x, y)
+            .pixel_size(size)
+            .epsg(epsg)
+            .create_f32_tempfile(value);
+        let crs = CrsTransformer::from_crs_or_epsg(Some(epsg as u32), None).unwrap();
+        for pattern in &patterns {
+            let reader = GeoTiffStreamReader::open(&path).unwrap();
+            let gt = reader.metadata.geotransform;
+            let mut expected = HashMap::<(u8, u64), (f64, f64)>::new();
+            for row in 0..40 {
+                for col in 0..300 {
+                    let v = value(col, row) as f64;
+                    if v.is_nan() {
+                        continue;
+                    }
+                    for sample in &pattern.points {
+                        let (px, py) =
+                            gt.pixel_to_coord(col as f64 + sample.dx, row as f64 + sample.dy);
+                        let (lon, lat) = crs.transform_point(px, py).unwrap();
+                        let ll = LatLng::new(lat, lon).unwrap();
+                        for res in resolutions {
+                            let r = Resolution::try_from(res).unwrap();
+                            let e = expected.entry((res, ll.to_cell(r).into())).or_default();
+                            e.0 += sample.weight;
+                            e.1 += sample.weight * v;
+                        }
+                    }
+                }
+            }
+
+            let mut config = MultiResolutionConfig::new(resolutions.to_vec());
+            config.sampling = pattern.clone();
+            let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+            let mut actual = HashMap::new();
+            loop {
+                let batch = streamer.fetch_next_batch(1024).unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for r in batch {
+                    let a = r.accumulator;
+                    actual.insert((r.resolution, r.h3_index), (a.count, a.sum));
+                }
+            }
+            assert_eq!(actual.len(), expected.len(), "EPSG:{epsg}");
+            for (key, (count, sum)) in expected {
+                let (c, s) = actual[&key];
+                assert!((c - count).abs() < 1e-9, "EPSG:{epsg} {key:?}");
+                assert!((s - sum).abs() < 1e-9, "EPSG:{epsg} {key:?}");
             }
         }
     }
@@ -603,7 +873,7 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
         (32610, 500000.0, 4180000.0, 100.0, 30.0),
         (5070, -100000.0, 1500000.0, 100.0, 0.0),
     ] {
-        let crs = CrsTransformer::from_crs_or_epsg(Some(epsg), None).unwrap();
+        let crs = CrsTransformer::from_crs_or_epsg(Some(epsg as u32), None).unwrap();
         let gt = GeoTransform {
             c0: x,
             f0: y,
@@ -716,17 +986,32 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                     if cfg!(feature = "stream-profile") {
                         let unpruned = (values.iter().filter(|v| v.is_finite()).count()
                             * pattern.points.len()) as u64;
-                        if bbox.is_none() {
+                        let exact_row = bbox.is_none()
+                            && matches!(epsg, 4326 | 5070)
+                            && std::env::var("RASTER_H3_EXACT_ROWS").map_or(true, |v| v != "0");
+                        if exact_row {
+                            // Rows eagerly index NoData positions, but transform
+                            // only the exact samples requested by h3o.
+                            assert_eq!(
+                                metrics.h3_calls,
+                                (values.len() * pattern.points.len() * 2) as u64
+                            );
+                            assert!(metrics.transform_calls > 0);
+                            assert!(metrics.h3_ns > 0);
+                            assert!(metrics.transform_ns > 0);
+                        } else if bbox.is_none() {
                             assert_eq!(metrics.transform_calls, unpruned);
                         } else {
                             // Conservative row pruning may skip rejected samples before projection.
                             assert!((retained..=unpruned).contains(&metrics.transform_calls));
                         }
-                        assert_eq!(
-                            metrics.h3_calls,
-                            retained * 2,
-                            "Every retained sample is indexed exactly once per resolution"
-                        );
+                        if !exact_row {
+                            assert_eq!(
+                                metrics.h3_calls,
+                                retained * 2,
+                                "Every retained sample is indexed exactly once per resolution"
+                            );
+                        }
                     }
                     for i in 0..2 {
                         assert_eq!(actual[i].len(), expected[i].len());
