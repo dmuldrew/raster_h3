@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Built-in remote HTTP reads pin strong ETags and send `If-Match` on subsequent range requests. Same-size object replacements, changed/missing response validators, and HTTP 412 fail instead of mixing cached metadata with another version’s pixels. Clones and retries retain the validator; sources without strong ETags remain supported without a snapshot guarantee.
+
 - A `band` (or spectral formula band) the raster does not have is now an error when the stream opens, in every engine. The sample kernels clamped it to the last band, so `band := 5` on an RGBA raster silently aggregated the alpha band.
 - `h3_parquet_to_pmtiles` (and the new Python `parquet_to_pmtiles`) wrote an empty archive when the H3 column was nullable, the default for Parquet written by Polars, PyArrow and DuckDB: the row-group pre-scan read it without a definition-level buffer, and the resulting error was swallowed.
 - DataFusion: a pushed `FilterPredicate::Bbox` that misses every raster tile now scans empty instead of failing with "No mosaic tiles intersect the requested bounding box", so a spatial filter over an area without data returns no rows. A table-definition `with_bbox` that misses the raster still errors. Core exports the message as `raster::mosaic::NO_TILES_IN_BBOX`.

@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use raster_h3_core::error::RasterH3Error;
 use raster_h3_core::raster::geotiff::GeoTiffStreamReader;
-use raster_h3_core::raster::http_range::{is_remote_url, normalize_url, RemoteHttpSource};
+use raster_h3_core::raster::http_range::{
+    is_remote_url, normalize_url, HttpTransport, RemoteHttpSource,
+};
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader};
 use raster_h3_core::raster::remote_prefetch::{
     coalesce_chunk_ranges, ChunkLocation, RemoteChunkPrefetchQueue, RemotePrefetchConfig,
@@ -46,6 +48,124 @@ fn remote_chunk_payload_rejects_truncated_range() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("extends beyond file"));
+}
+
+fn versioned_source(mode: &str) -> (MockHttpServer, Arc<RemoteHttpSource>) {
+    let server = MockHttpServer::start(vec![7; 400_000]);
+    let source = Arc::new(RemoteHttpSource::open(&format!("{}/{mode}", server.url_base)).unwrap());
+    (server, source)
+}
+
+fn conditional_requests(server: &MockHttpServer) -> Vec<String> {
+    server
+        .recorded_headers()
+        .into_iter()
+        .filter(|h| h.to_ascii_lowercase().starts_with("if-match:"))
+        .collect()
+}
+
+#[test]
+fn strong_etag_pins_cached_direct_and_concurrent_ranges() {
+    let (server, source) = versioned_source("etag_stable");
+    assert_eq!(source.read_exact_range(0, 10).unwrap(), vec![7; 10]);
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+    let workers: Vec<_> = (0..4)
+        .map(|i| {
+            let source = Arc::clone(&source);
+            thread::spawn(move || {
+                source
+                    .fetch_range(150_000 + i * 100, 150_009 + i * 100)
+                    .unwrap()
+            })
+        })
+        .collect();
+    for worker in workers {
+        assert_eq!(worker.join().unwrap(), vec![7; 10]);
+    }
+    // Both the single-block cache fill and cross-block direct path are conditional.
+    assert_eq!(source.read_exact_range(140_000, 10).unwrap(), vec![7; 10]);
+    assert_eq!(source.read_exact_range(131_070, 10).unwrap(), vec![7; 10]);
+    let conditions = conditional_requests(&server);
+    assert_eq!(conditions.len(), 6);
+    assert!(conditions.iter().all(|h| h.trim() == "If-Match: \"v1\""));
+    assert_eq!(
+        server
+            .recorded_headers()
+            .iter()
+            .filter(|h| h.trim().eq_ignore_ascii_case("Accept-Encoding: identity"))
+            .count(),
+        7
+    );
+}
+
+#[test]
+fn same_size_replacement_fails_without_retrying_or_caching_new_bytes() {
+    let (server, source) = versioned_source("etag_changed");
+    for expected_requests in [2, 3] {
+        let err = source.read_exact_range(140_000, 10).unwrap_err();
+        assert!(err.to_string().contains("HTTP 412"), "{err}");
+        assert_eq!(
+            server.request_count.load(Ordering::SeqCst),
+            expected_requests
+        );
+    }
+    assert_eq!(source.read_exact_range(0, 10).unwrap(), vec![7; 10]);
+    assert_eq!(conditional_requests(&server).len(), 2);
+}
+
+#[test]
+fn changed_missing_or_weak_response_etag_is_rejected_even_if_server_ignores_condition() {
+    for mode in ["etag_ignored", "etag_missing", "etag_downgraded"] {
+        let (server, source) = versioned_source(mode);
+        let err = source.read_exact_range(140_000, 10).unwrap_err();
+        assert!(
+            err.to_string().contains("ETag changed or disappeared"),
+            "{mode}: {err}"
+        );
+        let err = source.fetch_range(150_000, 150_009).unwrap_err();
+        assert!(
+            err.to_string().contains("ETag changed or disappeared"),
+            "{mode}: {err}"
+        );
+        assert_eq!(server.request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(conditional_requests(&server).len(), 2);
+    }
+}
+
+#[test]
+fn absent_or_weak_initial_etags_do_not_send_invalid_preconditions() {
+    for mode in ["ranged", "etag_weak"] {
+        let (server, source) = versioned_source(mode);
+        assert_eq!(source.fetch_range(150_000, 150_009).unwrap(), vec![7; 10]);
+        assert!(conditional_requests(&server).is_empty());
+    }
+}
+
+#[test]
+fn transport_clones_and_transient_retries_keep_the_original_etag() {
+    let server = MockHttpServer::start(vec![7; 400_000]);
+    let transport = HttpTransport::new(&format!("{}/etag_stable", server.url_base)).unwrap();
+    let cloned = transport.clone(); // Clone before the probe pins the version.
+    transport.probe(131_072).unwrap();
+    server.transient_failures.store(1, Ordering::SeqCst);
+    assert_eq!(
+        cloned.fetch_range(150_000, 150_009, Some(400_000)).unwrap(),
+        vec![7; 10]
+    );
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 3);
+    let conditions = conditional_requests(&server);
+    assert_eq!(conditions.len(), 2);
+    assert!(conditions.iter().all(|h| h.trim() == "If-Match: \"v1\""));
+
+    let changing = MockHttpServer::start(vec![7; 400_000]);
+    let transport = HttpTransport::new(&format!("{}/etag_ignored", changing.url_base)).unwrap();
+    transport.probe(131_072).unwrap();
+    assert!(transport
+        .clone()
+        .probe(131_072)
+        .unwrap_err()
+        .to_string()
+        .contains("ETag changed"));
 }
 
 /// Lightweight mock HTTP server supporting HTTP Range requests (`bytes=start-end`)
@@ -229,6 +349,7 @@ impl MockHttpServer {
 
         // Read headers
         let mut range_header: Option<String> = None;
+        let mut if_match: Option<String> = None;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -236,6 +357,9 @@ impl MockHttpServer {
             }
             if let Ok(mut h) = recorded_headers.lock() {
                 h.push(line.clone());
+            }
+            if line.to_lowercase().starts_with("if-match:") {
+                if_match = Some(line["if-match:".len()..].trim().to_string());
             }
             if line.to_lowercase().starts_with("range:") {
                 let range_val = line["range:".len()..].trim().to_string();
@@ -256,7 +380,7 @@ impl MockHttpServer {
             return;
         }
 
-        request_count.fetch_add(1, Ordering::SeqCst);
+        let request_number = request_count.fetch_add(1, Ordering::SeqCst);
 
         // Check for simulated transient failure (HTTP 503 Slow Down)
         // `try_update` replaces this on Rust 1.95+, but rust-version is 1.94.
@@ -274,6 +398,48 @@ impl MockHttpServer {
             let _ = stream.write_all(resp.as_bytes());
             return;
         }
+
+        // Version fixtures replace bytes without changing length after the probe.
+        let replaced = request_number > 0
+            && [
+                "etag_changed",
+                "etag_ignored",
+                "etag_missing",
+                "etag_downgraded",
+            ]
+            .iter()
+            .any(|mode| path.contains(mode));
+        let etag = if path.contains("etag_weak") {
+            Some("W/\"v1\"")
+        } else if replaced && path.contains("etag_missing") {
+            None
+        } else if replaced && path.contains("etag_downgraded") {
+            Some("W/\"v1\"")
+        } else if replaced {
+            Some("\"v2\"")
+        } else if path.contains("etag_") {
+            Some("\"v1\"")
+        } else {
+            None
+        };
+        if path.contains("etag_changed") && if_match.as_deref().is_some_and(|tag| Some(tag) != etag)
+        {
+            let _ = stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        let version_header = etag
+            .map(|tag| format!("ETag: {tag}\r\n"))
+            .unwrap_or_default();
+        let replacement;
+        let file_bytes = if replaced {
+            replacement = file_bytes
+                .iter()
+                .map(|byte| byte ^ 0xff)
+                .collect::<Vec<_>>();
+            replacement.as_slice()
+        } else {
+            file_bytes
+        };
 
         let total_size = file_bytes.len();
 
@@ -318,7 +484,7 @@ impl MockHttpServer {
 
                 let header = format!(
                     "HTTP/1.1 206 Partial Content\r\n\
-                    Accept-Ranges: bytes\r\n\
+                    {version_header}Accept-Ranges: bytes\r\n\
                     Content-Type: image/tiff\r\n\
                     Content-Range: bytes {}-{}/{}\r\n\
                     Content-Length: {}\r\n\
