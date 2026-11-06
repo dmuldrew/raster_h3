@@ -2,13 +2,17 @@
 //! timers; normal builds compile hot-path measurement out entirely. The
 //! transform-failure diagnostic is always counted: it only runs when a sample
 //! is dropped.
-use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution};
+use h3o::{CellIndex, LatLng, LatLngIndexer, Resolution, RowPath};
 use serde::Serialize;
 use std::cell::Cell;
+use std::ops::Range;
 
 #[derive(Clone, Copy, Default, Debug, Serialize)]
 pub struct WorkerProfile {
+    /// Logical point-resolution assignments, including NoData pixels eagerly
+    /// indexed by the row path. Not the number of exact `to_cell` evaluations.
     pub h3_calls: u64,
+    /// H3 indexing time; row indexing includes its sampled CRS transforms.
     pub h3_ns: u64,
     pub transform_calls: u64,
     pub transform_ns: u64,
@@ -107,6 +111,29 @@ pub fn index_all(
     PROFILE.with(|v| {
         let mut p = v.get();
         p.h3_calls += resolutions.len() as u64;
+        p.h3_ns += start.elapsed().as_nanos() as u64;
+        v.set(p);
+    });
+}
+/// Measure row indexing using the same logical-assignment units as `index_all`.
+#[inline(always)]
+pub fn index_row(
+    indexer: &mut LatLngIndexer,
+    path: &mut impl RowPath,
+    cols: Range<usize>,
+    resolutions: &[Resolution],
+    emit: impl FnMut(usize, Range<usize>, CellIndex),
+) {
+    #[cfg(feature = "stream-profile")]
+    let (start, calls) = (
+        std::time::Instant::now(),
+        cols.len() as u64 * resolutions.len() as u64,
+    );
+    indexer.index_row(path, cols, resolutions, emit);
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.h3_calls += calls;
         p.h3_ns += start.elapsed().as_nanos() as u64;
         v.set(p);
     });

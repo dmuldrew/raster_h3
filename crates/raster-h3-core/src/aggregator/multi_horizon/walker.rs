@@ -259,18 +259,20 @@ fn walk<T, Acc, E, N, R>(
 
         if !batch && ctx.owner.is_none() && ctx.bbox.is_none() {
             let col_offset = chunk.col_offset as usize;
-            if row_indexer.index_samples(&projector, ctx, row_idx, col_offset, &cols) {
-                row_indexer.replay_samples(
-                    cols.clone(),
-                    row,
-                    spp,
-                    &read,
-                    ctx,
-                    (combine, total_weight),
-                    &mut runs,
-                    engine,
-                    maps,
-                );
+            if row_indexer.walk_samples(
+                &projector,
+                row_idx,
+                col_offset,
+                cols.clone(),
+                row,
+                spp,
+                &read,
+                ctx,
+                (combine, total_weight),
+                &mut runs,
+                engine,
+                maps,
+            ) {
                 continue;
             }
         }
@@ -670,7 +672,7 @@ impl RowPath for GridRow<'_> {
     #[inline]
     fn point(&mut self, c: usize) -> LatLng {
         let (x, y) = self.coord(c);
-        let (lon, lat) = match self.kind {
+        let (lon, lat) = super::profile::measure_transform(|| match self.kind {
             RowKind::Geographic { lat, mercator } => {
                 (if mercator { web_mercator_lon(x) } else { x }, lat)
             }
@@ -682,7 +684,7 @@ impl RowPath for GridRow<'_> {
             RowKind::Wgs84Line => (x, y),
             RowKind::MercatorLine => (web_mercator_lon(x), web_mercator_lat(y)),
             RowKind::AlbersLine(inverse) => inverse.transform_point(x, y),
-        };
+        });
         LatLng::new(lat, lon).expect("finite coordinate")
     }
 
@@ -716,12 +718,15 @@ impl RowPath for GridRow<'_> {
     }
 }
 
-/// Indexes whole rows with `LatLngIndexer::index_row` and replays the cell
+/// Maximum columns whose cell transitions are buffered at once.
+const ROW_INDEX_WINDOW: usize = 1024;
+
+/// Indexes bounded windows with `LatLngIndexer::index_row` and replays the cell
 /// changes through `Runs` exactly as the per-pixel loops would.
 #[derive(Default)]
 struct RowIndexer {
     indexer: LatLngIndexer,
-    /// (first column, cell) of each run of the current row, per resolution
+    /// (first column, cell) of each run of the current window, per resolution
     /// and sample point: `row_runs[i * num_samples + k]`.
     row_runs: Vec<Vec<(usize, u64)>>,
     cursor: Vec<usize>,
@@ -757,35 +762,67 @@ impl RowIndexer {
 
     /// Index every sample point of a row. False keeps the per-pixel path, for
     /// rows where some sample point has no `GridRow`.
-    fn index_samples(
+    #[allow(clippy::too_many_arguments)]
+    fn walk_samples<T, Acc, E, R>(
         &mut self,
         projector: &SampleProjector<'_>,
-        ctx: &WalkContext<'_>,
         row_idx: usize,
         col_offset: usize,
-        cols: &Range<usize>,
-    ) -> bool {
+        cols: Range<usize>,
+        row: &[T],
+        spp: usize,
+        read: &R,
+        ctx: &WalkContext<'_>,
+        weights: (bool, f64),
+        runs: &mut Runs<Acc>,
+        engine: &E,
+        maps: &mut [CellMap<Acc>],
+    ) -> bool
+    where
+        T: Copy,
+        Acc: Clone,
+        E: ScanlineEngine<T, Acc>,
+        R: Fn(&[T]) -> Option<E::Sample>,
+    {
         if cols.is_empty() {
             return true;
         }
-        for runs in &mut self.row_runs {
-            runs.clear();
-        }
+        // Validate every path before any accumulator updates: fallback must
+        // not replay a prefix twice if a later sample crosses a singularity.
+        let Some(mut paths) = ctx
+            .sampling
+            .points
+            .iter()
+            .enumerate()
+            .map(|(k, &sp)| projector.grid_row(row_idx, col_offset, k, sp, &cols))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
         let num_samples = self.num_samples;
-        for (k, &sp) in ctx.sampling.points.iter().enumerate() {
-            let Some(mut path) = projector.grid_row(row_idx, col_offset, k, sp, cols) else {
-                return false;
-            };
-            let row_runs = &mut self.row_runs;
-            self.indexer
-                .index_row(&mut path, cols.clone(), ctx.resolutions, |i, span, cell| {
-                    row_runs[i * num_samples + k].push((span.start, u64::from(cell)));
-                });
+        for start in (cols.start..cols.end).step_by(ROW_INDEX_WINDOW) {
+            let window = start..start.saturating_add(ROW_INDEX_WINDOW).min(cols.end);
+            for transitions in &mut self.row_runs {
+                transitions.clear();
+            }
+            for (k, path) in paths.iter_mut().enumerate() {
+                let row_runs = &mut self.row_runs;
+                super::profile::index_row(
+                    &mut self.indexer,
+                    path,
+                    window.clone(),
+                    ctx.resolutions,
+                    |i, span, cell| {
+                        row_runs[i * num_samples + k].push((span.start, u64::from(cell)));
+                    },
+                );
+            }
+            self.replay_samples(window, row, spp, read, ctx, weights, runs, engine, maps);
         }
         true
     }
 
-    /// Feed the row indexed by `index_samples` through `Runs`, with the same
+    /// Feed the indexed window through `Runs`, with the same
     /// updates in the same order as the per-pixel weighted loop. Between two
     /// cell changes every valid pixel has the same assignments, so only `read`
     /// and `Runs::update` remain per pixel.
@@ -871,42 +908,51 @@ impl RowIndexer {
         if cols.is_empty() {
             return;
         }
-        for runs in &mut self.row_runs {
-            runs.clear();
-        }
-        let row_runs = &mut self.row_runs;
-        self.indexer
-            .index_row(path, cols.clone(), resolutions, |i, span, cell| {
-                row_runs[i].push((span.start, u64::from(cell)));
-            });
-        self.cursor.fill(0);
-
         // Segments where no resolution changes cell. In each, the first valid
         // pixel is where the per-pixel loop would notice a change; the other
         // valid pixels would leave `Runs` untouched.
         let mut span_start: Option<usize> = None;
-        let mut start = cols.start;
-        loop {
-            let mut end = cols.end;
-            for (i, runs_i) in self.row_runs.iter().enumerate() {
-                let k = self.cursor[i];
-                runs.next_cells[i] = runs_i[k].1;
-                if let Some(&(next, _)) = runs_i.get(k + 1) {
-                    end = end.min(next);
+        for window_start in (cols.start..cols.end).step_by(ROW_INDEX_WINDOW) {
+            let window_end = window_start.saturating_add(ROW_INDEX_WINDOW).min(cols.end);
+            for transitions in &mut self.row_runs {
+                transitions.clear();
+            }
+            let row_runs = &mut self.row_runs;
+            super::profile::index_row(
+                &mut self.indexer,
+                path,
+                window_start..window_end,
+                resolutions,
+                |i, span, cell| {
+                    row_runs[i].push((span.start, u64::from(cell)));
+                },
+            );
+            self.cursor.fill(0);
+            let mut start = window_start;
+            loop {
+                let mut end = window_end;
+                for (i, runs_i) in self.row_runs.iter().enumerate() {
+                    let k = self.cursor[i];
+                    runs.next_cells[i] = runs_i[k].1;
+                    if let Some(&(next, _)) = runs_i.get(k + 1) {
+                        end = end.min(next);
+                    }
                 }
-            }
-            if let Some(c) = (start..end).find(|&c| read(&row[c * spp..(c + 1) * spp]).is_some()) {
-                runs.apply_next_cells(&row[..c], &mut span_start, engine, maps);
-            }
-            if end >= cols.end {
-                break;
-            }
-            for (i, runs_i) in self.row_runs.iter().enumerate() {
-                if runs_i.get(self.cursor[i] + 1).map(|r| r.0) == Some(end) {
-                    self.cursor[i] += 1;
+                if let Some(c) =
+                    (start..end).find(|&c| read(&row[c * spp..(c + 1) * spp]).is_some())
+                {
+                    runs.apply_next_cells(&row[..c], &mut span_start, engine, maps);
                 }
+                if end >= window_end {
+                    break;
+                }
+                for (i, runs_i) in self.row_runs.iter().enumerate() {
+                    if runs_i.get(self.cursor[i] + 1).map(|r| r.0) == Some(end) {
+                        self.cursor[i] += 1;
+                    }
+                }
+                start = end;
             }
-            start = end;
         }
         if let Some(s) = span_start {
             runs.add_span(&row[s..cols.end], engine);
@@ -1128,6 +1174,92 @@ impl RowPruner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_row_scratch_is_bounded_and_reused_after_wide_walks() {
+        use super::super::continuous::{process_continuous_chunk_payload_into, ContinuousOptions};
+        use crate::aggregator::accumulator::H3Accumulator;
+        use tiff::decoder::DecodingResult;
+
+        if !exact_rows_enabled() {
+            return;
+        }
+        let resolutions = [
+            Resolution::Twelve,
+            Resolution::Fourteen,
+            Resolution::Fifteen,
+        ];
+        let crs = CrsTransformer::Wgs84Identity;
+        let gt = GeoTransform {
+            c0: -122.5,
+            f0: 37.85,
+            a: 0.001,
+            e: -0.001,
+            b: 0.0,
+            d: 0.0,
+        };
+        for sampling in [SamplingPattern::center(), SamplingPattern::sixteen_point()] {
+            for spp in [1, 2] {
+                for width in [ROW_INDEX_WINDOW * 4 + 7, 17] {
+                    let chunk = RasterChunk {
+                        col_offset: 7,
+                        row_offset: 3,
+                        width: width as u32,
+                        height: 1,
+                    };
+                    let ctx = WalkContext {
+                        chunk: &chunk,
+                        resolutions: &resolutions,
+                        crs: &crs,
+                        gt: &gt,
+                        sampling: &sampling,
+                        bbox: None,
+                        stride: width as u32,
+                        samples_per_pixel: spp,
+                        owner: None,
+                        band_scaling: &[],
+                        alpha_sample: None,
+                    };
+                    let mut maps = vec![CellMap::<H3Accumulator>::default(); resolutions.len()];
+                    let scope = super::super::profile::WorkerScope::new();
+                    process_continuous_chunk_payload_into(
+                        &ctx,
+                        &DecodingResult::F32(vec![1.0; width * spp as usize]),
+                        None,
+                        ContinuousOptions {
+                            band: 1,
+                            spectral_formula: None,
+                            track_quantiles: false,
+                        },
+                        &mut maps,
+                    );
+                    #[cfg(feature = "stream-profile")]
+                    {
+                        let metrics = scope.snapshot();
+                        assert_eq!(
+                            metrics.h3_calls,
+                            (width * sampling.points.len() * resolutions.len()) as u64
+                        );
+                        assert!(metrics.h3_ns > 0);
+                        assert!(metrics.transform_calls > 0);
+                        assert!(metrics.transform_ns > 0);
+                    }
+                    drop(scope);
+                    ROW_INDEXER.with(|cell| {
+                        let indexer = cell.borrow();
+                        assert_eq!(
+                            indexer.row_runs.len(),
+                            resolutions.len() * sampling.points.len()
+                        );
+                        for transitions in &indexer.row_runs {
+                            assert!(!transitions.is_empty());
+                            assert!(transitions.capacity() <= ROW_INDEX_WINDOW);
+                        }
+                    });
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_is_point_in_bbox() {

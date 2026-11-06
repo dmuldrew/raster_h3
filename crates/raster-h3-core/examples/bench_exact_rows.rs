@@ -12,7 +12,7 @@
 //! diff off.txt on.txt
 //! ```
 //!
-//! `REPS` sets the repetitions per case (default 3) and `CASES` keeps only
+//! `REPS` sets the positive repetitions per case (default 3) and `CASES` keeps only
 //! the cases whose label (e.g. `albers5070 30m rotated res [8]`) contains it.
 //! `PROFILE=1` prints where each continuous run's wall time went.
 
@@ -116,14 +116,22 @@ fn categorical(path: &Path, res: &[u8], rotated: bool, out: &mut String) -> f64 
     elapsed
 }
 
-fn main() {
+fn parse_repetitions(value: &str) -> Result<usize, String> {
+    value
+        .parse::<std::num::NonZeroUsize>()
+        .map(std::num::NonZeroUsize::get)
+        .map_err(|_| format!("REPS must be a positive integer, got {value:?}"))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "fingerprint.txt".into());
-    let reps: usize = std::env::var("REPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+    let reps = match std::env::var("REPS") {
+        Ok(value) => parse_repetitions(&value)?,
+        Err(std::env::VarError::NotPresent) => 3,
+        Err(error) => return Err(error.into()),
+    };
     // Only run cases whose label ("name res [..]") contains this.
     let filter = std::env::var("CASES").unwrap_or_default();
     let mode = std::env::var("RASTER_H3_EXACT_ROWS").unwrap_or_else(|_| "1".into());
@@ -221,4 +229,17 @@ fn main() {
         fingerprint.push_str(&out);
     }
     std::fs::write(&out_path, fingerprint).unwrap();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn repetitions_must_be_positive() {
+        for value in ["0", "-1", "", "invalid"] {
+            assert!(super::parse_repetitions(value).is_err());
+        }
+        assert_eq!(super::parse_repetitions("1").unwrap(), 1);
+        assert_eq!(super::parse_repetitions("3").unwrap(), 3);
+    }
 }

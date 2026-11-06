@@ -584,8 +584,9 @@ impl AlbersInverse<'_> {
     ///
     /// The noise term bounds the rounding of that formula chain, dominated by
     /// `asin` near the poles (error / cos beta), plus the rounding of x_p and
-    /// y_p themselves. Returns `None` when the line may reach the cone apex
-    /// or the `sin beta` clamp (poles), where the inverse isn't smooth.
+    /// y_p themselves. Returns `None` when the line may reach the cone apex,
+    /// the atan2 branch cut, or the `sin beta` clamp (poles), where the
+    /// inverse isn't smooth.
     fn line_path_bounds_p(
         &self,
         p0: (f64, f64),
@@ -600,6 +601,19 @@ impl AlbersInverse<'_> {
             .iter()
             .all(|v| v.is_finite())
             || n == 0.0
+        {
+            return None;
+        }
+        // Conservatively reject a segment whose rounded bounding box touches
+        // atan2's cut: x_p = 0 on the far side of the apex for this sign of n.
+        let delta = 8.0 * f64::EPSILON * coord_mag;
+        if p0.0.min(p1.0) <= delta
+            && p0.0.max(p1.0) >= -delta
+            && (if n > 0.0 {
+                p0.1.min(p1.1) <= delta
+            } else {
+                p0.1.max(p1.1) >= -delta
+            })
         {
             return None;
         }
@@ -666,7 +680,6 @@ impl AlbersInverse<'_> {
                 + 4.0 * std::f64::consts::PI);
         // Absolute rounding of x_p and y_p (a few ulps of `coord_mag` each),
         // through theta (1 / rho) and through rho² (2 rho) into q.
-        let delta = 8.0 * f64::EPSILON * coord_mag;
         let coords = delta * inv_n_abs / rho_min
             + d1 * 2.0 * rho_sq_max.sqrt() * delta * self.n_over_a_sq * inv_n_abs / (qp * cos_min);
         let noise = formula + coords;
@@ -2857,6 +2870,31 @@ mod albers_row_tests {
                 AlbersConicFast::new(2.0, 8.0, 0.0, 20.0),
             ),
         ]
+    }
+
+    #[test]
+    fn albers_bounds_reject_branch_cut_for_both_cone_signs() {
+        for (_, albers) in projections() {
+            let inverse = albers.prepare_inverse();
+            let y_p = -albers.rho0;
+            assert!(inverse
+                .row_path_bounds(-100_000.0, 100_000.0, y_p, 100.0)
+                .is_none());
+            for (x0, x1) in [(-100_000.0, 100_000.0), (0.0, 100_000.0), (-100_000.0, 0.0)] {
+                let coord = |x, y_p| (x + albers.x_0, albers.rho0 - y_p + albers.y_0);
+                for (start, end) in [
+                    (coord(x0, y_p), coord(x1, y_p + 100_000.0)),
+                    (coord(x1, y_p + 100_000.0), coord(x0, y_p)),
+                ] {
+                    let step = ((end.0 - start.0) / 2000.0, (end.1 - start.1) / 2000.0);
+                    assert!(inverse.line_path_bounds(start, end, step, 1e8).is_none());
+                }
+            }
+            // The same crossing on the near side of the apex is smooth.
+            assert!(inverse
+                .row_path_bounds(-100_000.0, 100_000.0, -y_p, 100.0)
+                .is_some());
+        }
     }
 
     /// A north-up row: x(i) = x_start + i * step at constant y.
