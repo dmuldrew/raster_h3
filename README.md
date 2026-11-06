@@ -396,6 +396,11 @@ let plan = provider.scan(Some(&[0, 2]), &[FilterPredicate::MinCount(10.0)], Some
 for batch in plan.execute()? { /* RecordBatch with h3_index, mean */ }
 ```
 
+Call `supports_filters_pushdown` to learn which predicates you still have to apply to the
+scan's rows. With compaction on, it reports every predicate `Unsupported` and the scan returns
+the full compacted table; `RasterH3Table` (below) then leaves those `WHERE` clauses to
+DataFusion. See [filter pushdown](docs/engines/datafusion.md).
+
 **Apache DataFusion / SedonaDB**
 
 ```rust

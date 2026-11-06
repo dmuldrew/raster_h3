@@ -116,9 +116,18 @@ part of the table definition and clips individual pixels, so cells straddling it
 aggregated from only their pixels inside the box. `supports_filters_pushdown(&filters)` returns the
 classification above so a planner knows which predicates it still has to evaluate.
 
+When compaction is enabled (`with_compact` or `compact_h3_children`), that classification does not
+apply: `supports_filters_pushdown` reports every predicate as `Unsupported`, and `scan` leaves all
+of them to the caller as residual filters. Compaction changes both row identity and aggregate
+values, so a `Resolution` or value filter applied inside the scan would drop compacted parent rows
+the residual predicate is meant to see, or keep statistics computed from the filtered children.
+The scan emits the full compacted table instead.
+
 - **Projection**: `Some(&[indices])` projects the schema; only those columns are built.
 - **Limit**: passed to the batch reader, which stops draining once the limit is reached.
-  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out.
+  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out,
+  and on compacted scans whenever predicates are present, since the caller re-applies them after
+  the limit would have been spent.
 - **Statistics**: `statistics()` returns `TableStatistics { num_rows, is_exact: false }`
   from `estimate_raster_cardinality`.
 
@@ -301,7 +310,7 @@ ctx.sql(
 
 | Piece | What it does |
 | :--- | :--- |
-| `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) and `LIMIT` are pushed down. |
+| `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) and `LIMIT` are pushed down. A `WHERE` filter is pushed only as far as the wrapped provider's `supports_filters_pushdown` allows, so on compacted tables (and for non-`resolution` filters on partitioned ones) DataFusion evaluates it on the completed rows. |
 | Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
 | Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals`, and `ST_DWithin(..., d)` with a non-negative numeric literal `d`, between a cell's geometry (`wkb`, or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)` under any alias) and a constant geometry push an `Inexact` `FilterPredicate::Bbox`. The constant is a `geoarrow.wkb` literal in `OGC:CRS84` / `EPSG:4326` with planar edges (what `ST_SetSRID(ST_GeomFromWKT(...), 4326)` folds to) or `h3_to_wkb(<cell literal>)`. The box is the constant's envelope, grown by `d` degrees for `ST_DWithin` (planar distance in CRS units) and clamped to lon/lat range. `raster-h3-datafusion` then widens it past the largest cell before clipping samples (see `Bbox(b)` above), so every cell the predicate can match keeps its full aggregate; DataFusion re-applies the predicate to drop the extra cells. Compacted tables accept the filter but do not prune. |
 | Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
