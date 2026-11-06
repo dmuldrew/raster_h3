@@ -121,7 +121,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 | Suite | What it checks |
 | :--- | :--- |
 | [`core/categorical_long_streaming.rs`](../crates/raster-h3-core/tests/it/categorical_long_streaming.rs) (3) | Long-format output on a 300-class raster: batch sizes 1/7/32/4096 equal rows built from the streamer, batches are full except the last, cells split across batches stay contiguous and sorted, limits stop mid-cell, and projecting without entropy keeps values. |
-| [`core/categorical_remap.rs`](../crates/raster-h3-core/tests/it/categorical_remap.rs) (5) | Exact, range, list and wildcard remap syntax; sparse and negative categories; invalid syntax; remapping inside single- and multi-resolution categorical streamers. |
+| [`core/categorical_remap.rs`](../crates/raster-h3-core/tests/it/categorical_remap.rs) (9) | Exact, range, list and wildcard remap syntax; sparse and negative categories; invalid syntax; malformed specs (empty tokens, multibyte first characters) error instead of panicking; 10 000-deep nested brackets; nested-bracket and hyphen specs stream like their plain equivalents; remapping inside single- and multi-resolution categorical streamers. |
 | [`core/accumulators.rs`](../crates/raster-h3-core/tests/it/accumulators.rs) | Accumulator operations and merges, tied majorities, homogeneous rasters, RLE with interspersed NoData, high-cardinality Shannon entropy, the 16-slot inline array spilling to a heap map, SIMD uniformity across types (`test_categorical_*`). |
 | Unit: `aggregator/categorical.rs` (4), `aggregator/remap.rs` (4) | Histogram and remapper internals. |
 
@@ -214,9 +214,11 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/codecs.rs`](../crates/raster-h3-core/tests/it/codecs.rs) (10) | `libdeflater` output is bit-identical to the `tiff` decoder for striped u8/f32, tiled f32 with padding, floating-point and horizontal predictors; buffer recycling and auto-resizing; corrupted streams; cropped edge tiles in both streaming paths. |
+| [`core/codecs.rs`](../crates/raster-h3-core/tests/it/codecs.rs) (11) | `libdeflater` output is bit-identical to the `tiff` decoder for striped u8/f32, tiled f32 with padding, floating-point and horizontal predictors; buffer recycling and auto-resizing; corrupted streams; a short-filling deflate tile is rejected and falls back to the file instead of keeping stale samples; cropped edge tiles in both streaming paths. |
 | [`core/codecs.rs`](../crates/raster-h3-core/tests/it/codecs.rs) (9) | Fast LZW parity with the `tiff` decoder on synthetic tiled data with predictors and edge padding; corrupted and truncated streams; buffer resizing. Four parity/recycling tests use the Hawaii datasets and are ignored by default. |
 | [`core/conus_pipeline.rs`](../crates/raster-h3-core/tests/it/conus_pipeline.rs) | `test_tiff_magic_validation_edge_cases`. |
+| [`core/codecs.rs`](../crates/raster-h3-core/tests/it/codecs.rs) (3) | Opening rejects unknown SampleFormat, Predictor and PhotometricInterpretation tags and offset/byte-count arrays shorter than the tile grid. |
+| [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | Grid partitioning covers every pixel exactly once, rejects a zero chunk size, and layout constructors reject zero dimensions and overflowing tile counts. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs), [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_u16_raster_streaming`, `test_f64_raster_streaming`, `test_tiled_chunk_layout_calculation`, `test_tiled_uneven_chunk_layout_and_bounds`. |
 | Unit: `raster/predictor.rs` (9) | Predictor 2 (including NEON), predictor 3 unpacking, and rejection of truncated buffers and invalid/overflowing layouts. |
 
@@ -260,7 +262,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/pmtiles.rs`](../crates/raster-h3-core/tests/it/pmtiles.rs) (24) | MVT protobuf encoding; PMTiles v3 header and archive validation; Hilbert tile IDs (ordering and bijective round trip); resolution ↔ zoom monotonicity; cell → tile mapping; coarse-zoom parent aggregation over all children; property filtering; GeoTIFF and Parquet (custom column, hex strings, multi row-group eviction) to PMTiles; all-NoData rasters; Class III 10-vertex pentagons; antimeridian-straddling cells and world tiles. |
+| [`core/pmtiles.rs`](../crates/raster-h3-core/tests/it/pmtiles.rs) (25) | MVT protobuf encoding; PMTiles v3 header and archive validation; Hilbert tile IDs (ordering and bijective round trip); resolution ↔ zoom monotonicity; cell → tile mapping; coarse-zoom parent aggregation over all children; property filtering; GeoTIFF and Parquet (custom column, hex strings, multi row-group eviction) to PMTiles; all-NoData rasters; Class III 10-vertex pentagons; antimeridian-straddling cells and world tiles. | The exporter's `h3_hex` property holds the full hex index.
 | Unit: `pmtiles/pyramid.rs` (3), `pmtiles/overview.rs` (2) | Tile math and overview levels. |
 
 See [PMTiles & Multi-Resolution](pmtiles.md).

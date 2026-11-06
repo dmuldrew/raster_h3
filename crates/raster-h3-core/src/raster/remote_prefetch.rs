@@ -288,13 +288,24 @@ pub struct RemoteChunkPrefetchQueue {
 }
 
 impl RemoteChunkPrefetchQueue {
-    /// Spawn background prefetch queue for a single remote GeoTIFF reader
+    /// Spawn background prefetch queue for a single remote GeoTIFF reader.
+    ///
+    /// Returns `None` when there is nothing to prefetch: a local reader, one without
+    /// chunk offsets, or a remote file whose server ignored `Range` and sent the whole
+    /// body at open time (its reads are already served from memory). Read chunks from
+    /// `reader` directly in that case.
     pub fn spawn_single(
         reader: &GeoTiffStreamReader,
         chunk_indices: &[u32],
         config: Option<RemotePrefetchConfig>,
     ) -> Option<Self> {
         let remote_source = reader.remote_source()?;
+        // Servers that ignore Range headers hand us the whole file at probe
+        // time; reads are served from memory, so prefetch buys nothing and
+        // its range requests would fail.
+        if remote_source.is_complete_file() {
+            return None;
+        }
         let info = reader.chunk_info.as_ref()?;
         let cfg = config.unwrap_or_default();
 
@@ -325,7 +336,10 @@ impl RemoteChunkPrefetchQueue {
         Some(Self::spawn_internal(sources, coalesced, cfg))
     }
 
-    /// Spawn background prefetch queue for a mosaic containing remote tiles
+    /// Spawn background prefetch queue for a mosaic containing remote tiles.
+    ///
+    /// Returns `None` when no tile needs prefetching: every tile is local or a remote
+    /// file already held in memory (see [`Self::spawn_single`]).
     pub fn spawn_mosaic(
         mosaic: &MosaicReader,
         config: Option<RemotePrefetchConfig>,
@@ -334,11 +348,15 @@ impl RemoteChunkPrefetchQueue {
         let mut sources = Vec::with_capacity(mosaic.tiles.len());
 
         for tile in &mosaic.tiles {
-            if let Some(src) = tile.reader.remote_source() {
-                has_remote = true;
-                sources.push(Some(Arc::clone(src)));
-            } else {
-                sources.push(None);
+            match tile.reader.remote_source() {
+                // Whole file is already in memory; reads serve from the cache,
+                // so skip it like a local tile.
+                Some(src) if src.is_complete_file() => sources.push(None),
+                Some(src) => {
+                    has_remote = true;
+                    sources.push(Some(Arc::clone(src)));
+                }
+                None => sources.push(None),
             }
         }
 

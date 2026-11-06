@@ -136,6 +136,11 @@ impl H3Accumulator {
     /// Update running statistics with a full pixel (weight = 1.0)
     #[inline(always)]
     pub fn update(&mut self, val: f64) {
+        // Non-finite samples never enter the accumulator, matching
+        // update_slice and the SIMD span kernels.
+        if !val.is_finite() {
+            return;
+        }
         if let Some(ref mut q) = self.quantiles {
             q.update(val, 1.0);
         }
@@ -163,7 +168,9 @@ impl H3Accumulator {
     /// Branchless update of running statistics with single-pass Welford online variance
     #[inline(always)]
     pub fn update_weighted(&mut self, val: f64, weight: f64) {
-        if weight <= 0.0 {
+        // NaN slips past `weight <= 0.0`; require a positive finite weight and
+        // a finite value so neither can poison the running statistics.
+        if !(weight.is_finite() && weight > 0.0) || !val.is_finite() {
             return;
         }
         if let Some(ref mut q) = self.quantiles {
@@ -268,9 +275,11 @@ impl H3Accumulator {
 
         if let (Some(ref mut q_self), Some(ref q_other)) = (&mut self.quantiles, &other.quantiles) {
             q_self.merge(q_other);
-        } else if self.quantiles.is_none() && other.quantiles.is_some() {
-            self.quantiles = other.quantiles.clone();
         }
+        // A sketch-less `self` must not adopt `other`'s sketch: it would
+        // describe only the `other` samples while `count` covers both sides.
+        // The reverse direction (sketch on self, none on other) is kept —
+        // span kernels feed `self.quantiles` separately from the stats merge.
     }
 
     /// Calculate arithmetic mean
@@ -380,5 +389,78 @@ impl FastRunAccumulator {
             sum_w2: self.count,
             quantiles: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_rejects_non_finite_values() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut acc = H3Accumulator::default();
+            acc.update(bad);
+            assert_eq!(acc.count, 0.0, "update({bad}) must not count a sample");
+        }
+        // A NaN after valid samples must not poison them either.
+        let mut acc = H3Accumulator::default();
+        acc.update(1.0);
+        acc.update(f64::NAN);
+        acc.update(f64::INFINITY);
+        assert_eq!((acc.count, acc.sum, acc.mean()), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn update_weighted_rejects_bad_weights_and_values() {
+        // NaN slips past `weight <= 0.0`, infinity inflates count forever.
+        for bad_w in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let mut acc = H3Accumulator::default();
+            acc.update_weighted(5.0, bad_w);
+            assert_eq!(acc.count, 0.0, "weight {bad_w} must be rejected");
+        }
+        let mut acc = H3Accumulator::default();
+        acc.update_weighted(f64::NAN, 1.0);
+        acc.update_weighted(f64::INFINITY, 1.0);
+        assert_eq!(acc.count, 0.0);
+    }
+
+    #[test]
+    fn merge_does_not_adopt_partial_sketch() {
+        // Self has unsketched samples; other's sketch covers only its own
+        // samples. Adopting it would report quantiles for a subset.
+        let mut a = H3Accumulator::default();
+        a.update(1.0);
+        a.update(2.0);
+        let mut b = H3Accumulator::with_quantiles();
+        b.update(3.0);
+        b.update(4.0);
+        a.merge(&b);
+        assert_eq!(a.count, 4.0);
+        assert!(a.quantiles.is_none());
+        assert!(a.quantile(0.5).is_nan());
+    }
+
+    #[test]
+    fn merge_keeps_self_sketch_for_stats_only_other() {
+        // Span kernels feed self.quantiles separately from the stats merge,
+        // so a stats-only merge must leave an existing sketch intact.
+        let mut a = H3Accumulator::with_quantiles();
+        a.update(1.0);
+        let mut b = H3Accumulator::default();
+        b.update(2.0);
+        a.merge(&b);
+        assert!(a.quantiles.is_some());
+        assert!(a.quantile(0.5).is_finite());
+    }
+
+    #[test]
+    fn merge_adopts_sketch_when_self_was_empty() {
+        let mut a = H3Accumulator::with_quantiles();
+        let mut b = H3Accumulator::with_quantiles();
+        b.update(3.0);
+        a.merge(&b);
+        assert!(a.quantiles.is_some());
+        assert_eq!(a.quantile(0.5), 3.0);
     }
 }
