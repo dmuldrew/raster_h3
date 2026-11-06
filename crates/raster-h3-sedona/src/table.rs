@@ -39,8 +39,9 @@ pub enum TableKind {
 /// `count` / `total_count`, `mean`, `majority_fraction` and `resolution`, and spatial
 /// predicates (`ST_Intersects`-style and `ST_DWithin`) between `wkb` or
 /// `h3_to_wkb(h3_index)` and a constant lon/lat geometry (see the `filters` and `spatial`
-/// modules). Aggregation runs on DataFusion's blocking thread pool and streams batches back
-/// through the Arrow C Stream Interface without copying.
+/// modules). `LIMIT` is deferred whenever a filter still needs caller-side evaluation.
+/// Aggregation runs on DataFusion's blocking thread pool and streams batches back through
+/// the Arrow C Stream Interface without copying.
 pub struct RasterH3Table {
     inner: Arc<dyn raster_h3_datafusion::TableProvider>,
     kind: TableKind,
@@ -156,9 +157,16 @@ impl TableProvider for RasterH3Table {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let predicates: Vec<FilterPredicate> = filters
-            .iter()
-            .filter_map(|f| self.translate(f))
+        let translated: Vec<_> = filters.iter().map(|f| self.translate(f)).collect();
+        let limit = limit.filter(|_| {
+            translated.iter().all(|t| {
+                t.as_ref()
+                    .is_some_and(|t| t.pushdown == TableProviderFilterPushDown::Exact)
+            })
+        });
+        let predicates: Vec<FilterPredicate> = translated
+            .into_iter()
+            .flatten()
             .flat_map(|t| t.predicates)
             .collect();
 
