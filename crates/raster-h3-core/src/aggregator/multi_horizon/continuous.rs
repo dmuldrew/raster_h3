@@ -94,8 +94,12 @@ impl<T: SimdSpanAccumulate> ContinuousEngine<T> {
 impl<T: SimdSpanAccumulate> ScanlineEngine<T, H3Accumulator> for ContinuousEngine<T> {
     type Sample = f64;
 
+    /// A pixel is one observation of its cell: its samples in the same cell
+    /// merge into one weight, so `sum(w_i^2)` (and the weighted variance) does
+    /// not depend on the sampling pattern's point count. The quantile sketch
+    /// receives the same total weight per pixel either way.
     fn combine_sample_weights(&self) -> bool {
-        !self.track_quantiles
+        true
     }
 
     #[inline(always)]

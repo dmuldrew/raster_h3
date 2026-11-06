@@ -1045,10 +1045,13 @@ fn test_pmtiles_coarse_zoom_parent_aggregates_all_children() {
         .enumerate()
         .map(|(i, &c)| {
             let val = ((i + 1) * 10) as f64;
+            // Two unit-weight pixels per child, so the sample variance has 13 degrees of freedom.
+            let mut accumulator = H3Accumulator::new(val);
+            accumulator.update(val);
             MultiContinuousRecord {
                 resolution: 6,
                 h3_index: c.into(),
-                accumulator: H3Accumulator::new_weighted(val, 2.0),
+                accumulator,
             }
         })
         .collect();

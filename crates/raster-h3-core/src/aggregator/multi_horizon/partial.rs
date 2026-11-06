@@ -17,8 +17,10 @@ use super::spill::SpillAccumulator;
 
 /// Magic prefix of an encoded partial state.
 const MAGIC: &[u8; 4] = b"RH3P";
-/// Encoding version, bumped on any change to the state layout.
-const VERSION: u8 = 1;
+/// Encoding version, bumped on any change to the state layout. Version 2 added the
+/// continuous state's sum of squared weights; version 1 states are rejected because
+/// their weighted variance cannot be recovered.
+const VERSION: u8 = 2;
 
 /// Accumulator types whose partial states can be exchanged between workers.
 pub trait PartialState: SpillAccumulator + Default {
