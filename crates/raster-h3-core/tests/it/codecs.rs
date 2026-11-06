@@ -14,6 +14,81 @@ use tiff::tags::{CompressionMethod, Predictor, Tag};
 use weezl::encode::Encoder as LZWEncoder;
 use weezl::BitOrder;
 
+fn ifd_entry(bytes: &mut [u8], tag: u16) -> &mut [u8] {
+    assert_eq!(&bytes[..2], b"II");
+    let offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+    bytes[offset + 2..offset + 2 + count * 12]
+        .as_chunks_mut::<12>()
+        .0
+        .iter_mut()
+        .find(|entry| u16::from_le_bytes(entry[..2].try_into().unwrap()) == tag)
+        .unwrap_or_else(|| panic!("tag {tag} not found in IFD"))
+}
+
+#[test]
+fn test_unrecognised_sample_format_is_rejected() {
+    let tmp = NamedTempFile::new().unwrap();
+    write_tiled_deflate_geotiff(tmp.path(), 32, 32, 16, 16, 1, &[7.0; 1024]);
+    GeoTiffStreamReader::open(tmp.path()).unwrap();
+
+    let mut bytes = std::fs::read(tmp.path()).unwrap();
+    // SampleFormat is a single inline SHORT; patch after encoding so the
+    // encoder cannot replace the invalid value with its own default.
+    let entry = ifd_entry(&mut bytes, 339);
+    assert_eq!(u16::from_le_bytes(entry[2..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 1);
+    entry[8..10].copy_from_slice(&99u16.to_le_bytes());
+    std::fs::write(tmp.path(), bytes).unwrap();
+
+    let err = match GeoTiffStreamReader::open(tmp.path()) {
+        Ok(_) => panic!("unknown SampleFormat must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("SampleFormat"), "{err}");
+}
+
+#[test]
+fn test_unrecognised_predictor_and_photometric_are_rejected() {
+    for tag in [317, 262] {
+        let tmp = NamedTempFile::new().unwrap();
+        write_tiled_deflate_geotiff(tmp.path(), 32, 32, 16, 16, 1, &[7.0; 1024]);
+        GeoTiffStreamReader::open(tmp.path()).unwrap();
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        ifd_entry(&mut bytes, tag)[8..10].copy_from_slice(&99u16.to_le_bytes());
+        std::fs::write(tmp.path(), bytes).unwrap();
+        assert!(
+            GeoTiffStreamReader::open(tmp.path()).is_err(),
+            "tag {tag}=99 must not open"
+        );
+    }
+}
+
+#[test]
+fn test_short_chunk_arrays_are_rejected_at_open() {
+    let tmp = NamedTempFile::new().unwrap();
+    write_tiled_deflate_geotiff(tmp.path(), 32, 32, 16, 16, 1, &[7.0; 1024]);
+    assert_eq!(
+        GeoTiffStreamReader::open(tmp.path())
+            .unwrap()
+            .chunk_layout
+            .total_chunks,
+        4
+    );
+
+    let mut bytes = std::fs::read(tmp.path()).unwrap();
+    for tag in [324, 325] {
+        // Leave both arrays out-of-line and equally sized, but too short for
+        // the four-tile grid. This must not become sparse nodata chunks.
+        let entry = ifd_entry(&mut bytes, tag);
+        assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 4);
+        entry[4..8].copy_from_slice(&2u32.to_le_bytes());
+    }
+    std::fs::write(tmp.path(), bytes).unwrap();
+    assert!(GeoTiffStreamReader::open(tmp.path()).is_err());
+}
+
 /// Helper to write a custom tiled GeoTIFF with Deflate compression and optional predictor.
 fn write_tiled_deflate_geotiff(
     path: &Path,
