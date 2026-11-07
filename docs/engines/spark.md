@@ -83,7 +83,10 @@ cells = raster_h3.spark.read(spark, "dem.tif", resolutions=[8, 9], quantiles="p5
 ```sql
 CREATE TEMPORARY VIEW dem_parts USING raster_h3
 OPTIONS (path 'dem.tif', resolutions '8,9', target_chunks '256');
--- then, in Python: raster_h3.spark.merge_partials(spark.table("dem_parts"))
+
+-- Final cells in SQL alone: raster_h3_merge is registered by raster_h3.spark.register
+SELECT * FROM raster_h3_merge(TABLE(dem_parts));
+SELECT * FROM raster_h3_merge(TABLE(dem_parts), 'quantiles=p50, min_count=20');
 ```
 
 - **One Spark partition per raster partition.** The driver plans with `plan_partitions`
@@ -91,18 +94,32 @@ OPTIONS (path 'dem.tif', resolutions '8,9', target_chunks '256');
   number of planned partitions.
 - **Schema.** The scan's columns with Spark's signed types (`h3_index` `bigint`,
   `resolution` `smallint`) plus `partial_state` (`binary`).
-- **`merge_partials(df, ...)`** keeps rows with a null `partial_state`, shuffles the others
-  by `h3_index` and merges them with `raster_h3.merge_partials`. Pass the scan's
-  `categorical`, `columns`, `quantiles` and filters; `read` does this for you. Merge each
-  raster's DataFrame on its own.
+- **`merge_partials(df, ...)`** shuffles the rows by `h3_index` once, passes final rows
+  through and merges the partial ones with `raster_h3.merge_partials`; the raster is scanned
+  once. Pass the scan's `categorical`, `columns`, `quantiles` and filters; `read` does this
+  for you. Merge each raster's DataFrame on its own.
+- **`raster_h3_merge(TABLE(t) [, 'name=value, ...'])`** is the same merge as a SQL table
+  function (a Python UDTF). It hashes rows into `buckets` groups by `h3_index` (default 64)
+  and merges each group in one call. Options: `quantiles`, `min_count`, `min_mean`,
+  `max_mean`, `min_majority_fraction`, `categorical` (recognised from the columns when
+  omitted) and `buckets`; the output columns are the input's without `partial_state`.
 - **Options** have the names and meanings of `RasterH3ArrowStream`: `resolutions`,
   `target_chunks` (default 256), `categorical`, `columns`, `crs`, `nodata`, `bbox`, `band`,
   `sampling`, `overlap_rule`, `spectral_formula` and its `*_band` options, `quantiles`,
   `remap`, `min_count`, `min_mean`, `max_mean`, `min_majority_fraction`,
   `strict_transforms`. Unknown names and malformed values raise when the DataFrame is
   defined.
-- **No pushdown from Spark yet.** Spark applies `WHERE`, `LIMIT` and column selection
-  after the scan; narrow the scan with the options (`columns`, `bbox`, `min_count`, ...).
+- **Filter pushdown (Spark 4.1+).** `register(spark, pushdown=True)` (or setting
+  `spark.sql.python.filterPushdown.enabled` before `register`) pushes `resolution`
+  comparisons (`=`, `IN`, `<`, `<=`, `>`, `>=`) and `partial_state IS [NOT] NULL` into the
+  scan: only matching resolutions are indexed, and only final or only partial rows are
+  produced. Both are exact for every row, so Spark drops them from its plan. Spark 4.1
+  refuses a reader that implements pushdown while that setting is false, so it is opt-in.
+- **What is not pushed.** Filters on statistics (`count`, `mean`, `majority_fraction`, ...)
+  stay in Spark: before the merge they would see one partition's share of an edge cell, and
+  Spark cannot push a filter written after the merge through it. Filter after the merge, and
+  narrow the scan with the options (`min_count`, `min_mean`, ...) to do the work in the
+  scan. `LIMIT` and column selection also apply after the scan; use `columns` to project.
   The long categorical format is not available with partitions.
 
 The path is one `raster_h3` source: a file, URL, VRT or glob mosaic (a mosaic is planned
@@ -223,10 +240,12 @@ from the machine's cores. With several tasks per executor, give each task more c
 
 ## Testing
 
-[`examples/sedona_spark/tests/`](../../examples/sedona_spark/tests) runs the data source
-and the demo's `mapInArrow` pipeline on local Spark with Sedona and checks every result
-against one unpartitioned scan; the `sedona-spark` CI job builds the `sedona` image and runs
-it there. To run it
+[`examples/sedona_spark/tests/`](../../examples/sedona_spark/tests) runs the data source,
+the `raster_h3_merge` table function and the demo's `mapInArrow` pipeline on local Spark 4.0
+with Sedona, and [`crates/raster-h3-python/tests/spark/`](../../crates/raster-h3-python/tests/spark)
+checks filter pushdown on Spark 4.1. Every result is compared with an unpartitioned scan.
+The `sedona-spark` CI job builds the `sedona` image and runs both suites in it (the second
+with PySpark 4.1 installed beside the image's Spark 4.0). To run it
 locally:
 
 ```bash

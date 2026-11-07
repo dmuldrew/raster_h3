@@ -58,6 +58,8 @@ def test_load_and_merge_match_a_single_scan(sedona, terrain):
     assert df.where("partial_state IS NOT NULL").count() > 0
     cells = spark_ds.merge_partials(df)
     assert "partial_state" not in cells.columns
+    # One scan of the raster feeds both the final rows and the merge.
+    assert cells._jdf.queryExecution().optimizedPlan().toString().count("raster_h3") == 1
     assert assert_matches_single_scan(cells, path, resolutions=[8, 9]) > 0
 
 
@@ -130,3 +132,55 @@ def test_scan_errors_reach_spark(sedona, terrain):
     path = terrain()
     with pytest.raises(Exception, match="(?i)resolution"):
         sedona.read.format("raster_h3").option("resolutions", "16").load(path).count()
+
+
+def _parts_view(sedona, name, path, **options):
+    opts = ", ".join(f"{k} '{v}'" for k, v in {"path": path, "target_chunks": 8, **options}.items())
+    sedona.sql(f"CREATE OR REPLACE TEMPORARY VIEW {name} USING raster_h3 OPTIONS ({opts})")
+
+
+def test_sql_merge_table_function(sedona, terrain):
+    """`raster_h3_merge(TABLE(t))` merges a raster_h3 scan in SQL alone."""
+    path = terrain()
+    _parts_view(sedona, "sql_parts", path, resolutions="8,9")
+    assert sedona.table("sql_parts").where("partial_state IS NOT NULL").count() > 0
+    cells = sedona.sql("SELECT * FROM raster_h3_merge(TABLE(sql_parts))")
+    assert "partial_state" not in cells.columns
+    assert assert_matches_single_scan(cells, path, resolutions=[8, 9]) > 0
+
+
+def test_sql_merge_options(sedona, terrain):
+    """Quantiles and filters given to both the scan and the merge; one hash bucket."""
+    path = terrain()
+    _parts_view(
+        sedona, "sql_parts_q", path,
+        resolutions="9", columns="h3_index,resolution,count,mean,p90", quantiles="p90", min_count="20",
+    )
+    cells = sedona.sql(
+        "SELECT * FROM raster_h3_merge(TABLE(sql_parts_q), 'quantiles=p90, min_count=20, buckets=1')"
+    )
+    assert assert_matches_single_scan(
+        cells, path, resolutions=[9], columns=["h3_index", "resolution", "count", "mean", "p90"],
+        quantiles="p90", min_count=20,
+    ) > 0
+
+
+def test_sql_merge_recognises_categorical_input(sedona, terrain):
+    path = terrain("classes.tif", categorical=True)
+    _parts_view(sedona, "sql_parts_c", path, resolutions="9", categorical="true")
+    cells = sedona.sql("SELECT * FROM raster_h3_merge(TABLE(sql_parts_c))")
+    assert assert_matches_single_scan(cells, path, resolutions=[9], categorical=True) > 0
+
+
+@pytest.mark.parametrize(
+    "query, message",
+    [
+        ("SELECT * FROM raster_h3_merge(TABLE(SELECT 1 AS h3_index))", "missing column"),
+        ("SELECT * FROM raster_h3_merge(TABLE(sql_parts_bad), 'colour=red')", "unknown raster_h3_merge option"),
+        ("SELECT * FROM raster_h3_merge(TABLE(sql_parts_bad), 'min_count')", "not name=value"),
+    ],
+)
+def test_sql_merge_rejects_bad_input(sedona, terrain, query, message):
+    _parts_view(sedona, "sql_parts_bad", terrain(), resolutions="9")
+    with pytest.raises(Exception, match=message):
+        sedona.sql(query).collect()

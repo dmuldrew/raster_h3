@@ -537,6 +537,17 @@ jobs:
             "pip3 install --no-cache-dir --break-system-packages pytest \
              && python3 -m pytest -v -p no:cacheprovider /opt/raster_h3/examples/tests"
 
+      # Filter pushdown in raster_h3.spark needs Spark 4.1+, newer than the image's Spark 4.0:
+      # install PySpark 4.1 (with its own Spark jars) beside it for these tests only.
+      - name: Run the Spark 4.1 filter-pushdown tests
+        run: |
+          docker run --rm -e SPARK_MASTER=local[2] -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD:/repo:ro" raster_h3-sedona:ci sh -c \
+            "pip3 install --no-cache-dir --break-system-packages pytest \
+             && pip3 install --no-cache-dir --break-system-packages --target /tmp/ps41 'pyspark==4.1.*' \
+             && env -u SPARK_HOME PYTHONPATH=/tmp/ps41 \
+                python3 -m pytest -v -p no:cacheprovider /repo/crates/raster-h3-python/tests/spark"
+
   # All supply-chain checks are blocking; exceptions belong in deny.toml with a reason.
   deny:
     name: cargo-deny (${{ matrix.checks }})
