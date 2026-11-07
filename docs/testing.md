@@ -8,16 +8,18 @@ explains how to run each group and what CI runs. The counts below are the number
 
 | Location | Suites | Tests |
 | :--- | ---: | ---: |
-| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 34 modules, 1 binary | 310 |
+| [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 40 modules, 1 binary | 398 |
 | [`crates/raster-h3-core/tests/memory/`](../crates/raster-h3-core/tests/memory) (`memory`, one child process per scenario variant) | 7 scenarios, 1 binary | 38 checks |
-| [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 21 |
-| [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 5 modules, 1 binary | 17 |
-| [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 1 module, 1 binary | 7 |
-| [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 4 modules, 1 binary | 12 |
-| [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 11 (7 need `pg-extension`) |
-| [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 4 modules, 1 binary | 11 |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 207 |
-| [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 2 modules | 24 (35 cases) |
+| [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 25 |
+| [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 8 modules (plus shared `rows.rs`), 1 binary | 28 |
+| [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 2 modules, 1 binary | 14 |
+| [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 6 modules, 1 binary | 21 |
+| [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 12 (8 need `pg-extension`) |
+| [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 5 modules, 1 binary | 18 |
+| [`crates/raster-h3-sedona/tests/`](../crates/raster-h3-sedona/tests) (`sedona/…`, standalone workspace; one binary per module) | 6 modules | 34 (5 need `sedona-e2e`) |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 256 |
+| [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 7 modules | 84 |
+| [`crates/raster-h3-sedona/python/tests/`](../crates/raster-h3-sedona/python/tests) (`sedona-pytest/…`, needs the `sedonadb` 0.5.0 wheel) | 1 module | 14 |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -48,8 +50,14 @@ its own raster, so the suites need no downloaded data. The few exceptions are li
 16. [GeoParquet export](#16-geoparquet-export)
 17. [PMTiles & MVT export](#17-pmtiles--mvt-export)
 18. [DuckDB extension](#18-duckdb-extension)
-19. [Other engines & cross-engine parity](#19-other-engines--cross-engine-parity)
-20. [Performance guards & benchmarks](#20-performance-guards--benchmarks)
+19. [DataFusion](#19-datafusion)
+20. [SedonaDB](#20-sedonadb)
+21. [Python & Polars](#21-python--polars)
+22. [PostgreSQL](#22-postgresql)
+23. [CLI](#23-cli)
+24. [Cross-engine parity](#24-cross-engine-parity)
+25. [Performance guards & benchmarks](#25-performance-guards--benchmarks)
+26. [Partitioned scans](#26-partitioned-scans)
 
 The former catch-all `tests/test_raster_h3.rs` (58 tests) was split by topic; rows that
 list individual test names come from it or from a suite that mostly covers another category.
@@ -64,11 +72,11 @@ Coordinates must land where PROJ puts them, for every transform tier.
 | :--- | :--- |
 | [`core/geodetic_reference.rs`](../crates/raster-h3-core/tests/it/geodetic_reference.rs) (25) | Golden forward and inverse points from PROJ 9.5.1 for fast paths and fallbacks, each within **0.01 m**: Web Mercator, Albers CONUS/Alaska and southern parallels with false offsets (including non-polar latitudes through ±89.9999°), UTM north/south, polar stereographic north/south, EASE-Grid 2.0 and Lambert conformal; EPSG aliases are bit-identical. Affine round trips `coord_to_pixel(pixel_to_coord(p)) == p` on rotated/sheared grids. Coverage/duplicate properties include antimeridian-crossing Albers Alaska, EPSG:32756, pole-containing and supersampled EPSG:3413/3031 rasters, plus prior horizon, longitude-wrapping and mosaic cases. |
 | [`core/certified_bounds.rs`](../crates/raster-h3-core/tests/it/certified_bounds.rs) (13, plus 1 generated) | Rejection bounds enclose the true image: certified UTM/BNG bounds checked against dense samples and used to prune distant bboxes; generated rotated/sheared chunks for WGS84, Web Mercator, northern and southern Albers (including across the antimeridian, around the cone apex and past the cut opposite the central meridian) and a US-foot transverse Mercator have rect bounds and an eviction bound enclosing every sample; extreme `tmerc` scale factors stay enclosing and certificates use proj4rs's effective scale (`k0`, then `k`; `k_0` ignored); chunks ending at or one ulp below 180° keep non-reversed bounds; pole-containing UTM chunks get full longitude; huge `+towgs84` shifts and other projections fail open; partly unprojectable rectangles get whole-globe bounds; fine (1e-8°) affines invert; singular and non-finite affines are rejected on open; duplicate, quoted, non-lowercase or spaced TM parameters fail open; polar radial/angular bounds enclose dense rotated/sheared grids and preserve per-cell sums/counts across bbox and mosaic ownership modes. |
-| [`core/datum_shifts.rs`](../crates/raster-h3-core/tests/it/datum_shifts.rs) (7) | Helmert transforms match PROJ with identical parameters and stay within published accuracy of PROJ defaults; inverse round trips; explicit `+towgs84`; prime-meridian and axis-order composition; nonzero shifts avoid fast paths; grid-shift datums are rejected clearly. |
-| [`core/geotiff_crs.rs`](../crates/raster-h3-core/tests/it/geotiff_crs.rs) (10) | CRS detection from ESRI PE-string citations and GeoTIFF GeoKeys, EPSG/WKT handling, projected transformations and invalid/unspecified CRS paths. |
+| [`core/datum_shifts.rs`](../crates/raster-h3-core/tests/it/datum_shifts.rs) (9) | Helmert transforms match PROJ with identical parameters and stay within published accuracy of PROJ defaults; inverse round trips; explicit `+towgs84`; prime-meridian and axis-order composition; nonzero shifts avoid fast paths; grid-shift datums are rejected clearly. A nonzero shift never takes a fast path; grid-shift datums are rejected with a clear error; raster cells are assigned from independent PROJ datum references; geographic pixel weights are shown not to be ground-area weights. |
+| [`core/geotiff_crs.rs`](../crates/raster-h3-core/tests/it/geotiff_crs.rs) (11) | CRS detection from ESRI PE-string citations and GeoTIFF GeoKeys, EPSG/WKT handling, projected transformations and invalid/unspecified CRS paths. An ESRI PE citation with a nonzero `TOWGS84` shift is not detected (an all-zero shift is). |
 | [`core/geotiff_crs.rs`](../crates/raster-h3-core/tests/it/geotiff_crs.rs), [`core/antimeridian_bbox.rs`](../crates/raster-h3-core/tests/it/antimeridian_bbox.rs) | `test_crs_web_mercator_to_wgs84`, `test_crs_utm_to_wgs84`, `test_crs_southern_hemisphere_utm`, `test_crs_custom_albers_proj_string`, `test_crs_invalid_proj_string_error_handling`, `test_crs_unspecified_fallback_and_invalid_proj_error`, `test_plain_tiff_without_geokeys`, `test_geotransform_accuracy`, `test_geotransform_inverse_precision`, `test_extreme_polar_latitudes_clamping`. |
 | Unit: `crs/transformer.rs` (40) | Tier selection (identity, analytical, Proj4), authalic-series inverse Albers, public source-field mutation and struct-literal compatibility, parameter parsing, error paths, certified and fail-open rectangle bounds. |
-| Unit: `raster/metadata.rs` (11), `raster/geotransform.rs` (3) | GeoKey directory parsing, tiepoint/pixel-scale/model-transformation tags, EPSG and WKT extraction; scale-independent affine inversion. |
+| Unit: `raster/metadata.rs` (16), `raster/geotransform.rs` (3) | GeoKey directory parsing, tiepoint/pixel-scale/model-transformation tags, EPSG and WKT extraction; scale-independent affine inversion. |
 
 ## 2. Exact cell assignment & coordinates
 
@@ -138,7 +146,8 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/multiband_and_query_pushdown.rs`](../crates/raster-h3-core/tests/it/multiband_and_query_pushdown.rs) (13), [`duckdb/cell_bbox_pushdown.rs`](../crates/raster-h3-duckdb/tests/it/cell_bbox_pushdown.rs) (2) | Band selection and samples-per-pixel; NDVI, NDWI, NBR and EVI on the fly; zero-denominator and NoData resilience; out-of-range bands (and spectral formula bands) refused when the stream opens; borrowed interleaved windows match across job sizes; `min_count`/`min_mean`/`min_majority_fraction` pushdown; `h3_cell`/`h3_hex` bbox pushdown at high latitude and across the antimeridian without dropping raster samples. |
+| [`core/multiband_and_query_pushdown.rs`](../crates/raster-h3-core/tests/it/multiband_and_query_pushdown.rs) (14), [`duckdb/cell_bbox_pushdown.rs`](../crates/raster-h3-duckdb/tests/it/cell_bbox_pushdown.rs) (2) | Band selection and samples-per-pixel; NDVI, NDWI, NBR and EVI on the fly; zero-denominator and NoData resilience; out-of-range bands (and spectral formula bands) refused when the stream opens; borrowed interleaved windows match across job sizes; `min_count`/`min_mean`/`min_majority_fraction` pushdown; `h3_cell`/`h3_hex` bbox pushdown at high latitude and across the antimeridian without dropping raster samples. A band or spectral formula band the raster does not have is refused when the stream opens; multi-band planar TIFFs are rejected. |
+| [`core/band_calibration.rs`](../crates/raster-h3-core/tests/it/band_calibration.rs) (12) | GDAL `SCALE`/`OFFSET` calibrate continuous statistics (a negative scale swaps min and max) and spectral indices per band; categorical classes are not scaled; mosaic tiles use their own calibration; malformed calibration metadata is rejected in every mode; overflow drops only non-finite physical values, on interleaved and spectral paths too. Zero-alpha pixels contribute no observation, unspecified `ExtraSamples` are data, and unknown compression is never read as raw samples. |
 | Unit: `multi_horizon/spectral.rs` (5) | Formula evaluation and singularity guards. |
 
 ## 9. Threading & concurrency
@@ -147,7 +156,7 @@ Results must not depend on thread count, scheduling or pool nesting.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/threading.rs`](../crates/raster-h3-core/tests/it/threading.rs) (6) | Identical output across Rayon thread counts; pool scaling; a high-contention stress run; multithreaded prefetched chunk reading; aggregation workers run concurrently inside `ThreadPool::install`; a dedicated pool behind a shared mutex does not deadlock. |
+| [`core/threading.rs`](../crates/raster-h3-core/tests/it/threading.rs) (10) | Identical output across Rayon thread counts; pool scaling; a high-contention stress run; multithreaded prefetched chunk reading; aggregation workers run concurrently inside `ThreadPool::install`; a dedicated pool behind a shared mutex does not deadlock. A dedicated pool under a shared streamer mutex does not deadlock; workers precompute every eviction key the merge needs (no fallbacks) with output identical to one worker; batch cells do not grow with the worker count; mixed-mosaic batches follow their own chunk sizes. |
 | [`core/sharding.rs`](../crates/raster-h3-core/tests/it/sharding.rs) (5) | Shard balance for H3 indices at resolutions 0–15 and in local neighbourhoods; sharded merge + eviction preserves continuous statistics and categorical histograms; worker results merge before the watermark advances. |
 | [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_prefetched_chunk_reader`, `test_prefetched_chunk_reader_multi_worker_ordering`, `test_prefetched_chunk_reader_early_drop`. |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) | Multi-worker ordering and early drop; a 17-tile, ten-strip-row mosaic checks eviction/reopening, Deflate and fallback PackBits pixel values, edge strips, recycling and byte budgets with one/four workers. With `test-hooks`, it also bounds decoder opens to prevent round-robin thrashing. |
@@ -160,8 +169,7 @@ Results must not depend on thread count, scheduling or pool nesting.
 | [`core/memory_budgets.rs`](../crates/raster-h3-core/tests/it/memory_budgets.rs) (2) | The decoded-chunk budget bounds held chunks without changing results; the compaction limit decomposes groups without losing or duplicating samples. |
 | [`core/sparse_chunks_and_spilling.rs`](../crates/raster-h3-core/tests/it/sparse_chunks_and_spilling.rs) (4) | Sparse COG chunks are filled with a non-zero NoData and skipped; a low aggregation budget creates spill runs (`spill_run_count() > 0`) and the external merge matches an in-memory reference; with resolutions 6 and 8, compaction and four aggregation workers, a budget that spills only resolution 8 (resolution 6 stays in memory, checked per resolution) reproduces the in-memory continuous (count, sum, min, max, p50) and categorical (heap class maps) output exactly. |
 | Unit: `multi_horizon/spill.rs` (5) | Spill file writing and merging. |
-| [`core/partitioned_scan.rs`](../crates/raster-h3-core/tests/it/partitioned_scan.rs) | Partitioned scans (tiled, striped, mosaics, categorical, spilling) merged through encoded partial states match a single scan, including `sum_w2` and variance; `fractional_sampling_variance_survives_spills_and_partitions` repeats this with RGSS sampling, a spilling budget and two resolutions; partial states round-trip fractional weights and version 1 states are rejected. |
-| Unit: `pmtiles/external_export.rs` (5) | The external-sort PMTiles exporter: with a 4 KiB budget (several spilled runs) and eviction every 8 features, the archive is byte-identical to an unspilled export and has the same tile count as single-pass accumulation; run records round-trip every `MvtValue` kind; an empty export is a valid archive; the spill directory is created only when a run is written. |
+| Unit: `pmtiles/external_export.rs` (6) | The external-sort PMTiles exporter: with a 4 KiB budget (several spilled runs) and eviction every 8 features, the archive is byte-identical to an unspilled export and has the same tile count as single-pass accumulation; run records round-trip every `MvtValue` kind; an empty export is a valid archive; the spill directory is created only when a run is written. |
 | [`memory`](../crates/raster-h3-core/tests/memory/scenarios.rs) (7 scenarios, 38 checks) | Measured, not estimated, memory. A counting allocator records peak live heap and allocations; each scenario variant runs in its own process. `spill_sorted_run`: the sorted vector built for a spill run is the only new heap while the map's shards drain (accumulators move, nothing is cloned), it fits within the map's accounted bytes, and the map is freed afterwards (plain, quantile and categorical maps). `spill_stream_quantiles`, `categorical_high_cardinality`: p50/p90 sketches and ~46-class heap histograms forced to spill reproduce the in-memory output bit for bit per cell, stay within the budget and lower peak heap. `slow_http_consumer`: with a slow consumer, held response bytes stay within `max_buffered_bytes`, peak heap within twice it and under half of the chunk-count bound alone, with one request per coalesced range. `slow_parquet_writer`: a writer that sleeps per row group adds at most three row-group buffers. `many_tiny_chunks`: 512 one-row strips cost at most 16 allocations each and coalesce into one HTTP range. `concurrent_streams`: four streams use at most 5× the heap of one. |
 
 See [Engineering Architecture](engineering.md) for what the budgets cover.
@@ -206,6 +214,8 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | Suite | What it checks |
 | :--- | :--- |
 | [`core/streaming_failures.rs`](../crates/raster-h3-core/tests/it/streaming_failures.rs) (6), [`duckdb/record_queue.rs`](../crates/raster-h3-duckdb/tests/it/record_queue.rs) (1) | Corrupt-chunk errors latch in both streamers; a missing or non-directory spill directory fails both streamers with a latched error and no records after it, and spill runs leave no files in a usable one (on Unix, not even mid-stream); the DuckDB record queue propagates failure instead of EOF; failed exports leave existing outputs untouched; a Parquet file is not published after a late failure; premature prefetch termination is an error. |
+| [`core/transform_failures.rs`](../crates/raster-h3-core/tests/it/transform_failures.rs) (7) | Samples beyond the pole and failed inverse projections are counted; valid rasters and bbox exclusions report none; batch readers and exporters report through the shared counter; `strict_transforms` fails the stream instead of dropping samples and accepts rasters without failures. |
+| [`datafusion/transform_failures.rs`](../crates/raster-h3-datafusion/tests/it/transform_failures.rs) (1), [`python/transform_failures.rs`](../crates/raster-h3-python/tests/it/transform_failures.rs) (3), [`pytest/test_transform_failures.py`](../crates/raster-h3-python/tests/pytest/test_transform_failures.py) (4) | DataFusion providers, the Python batch reader and `raster_h3_py_scan_json` count failures in lenient mode and fail in strict mode; a strict Arrow stream fails while reading; lenient Python scans warn once with the count (and free the result even when warnings are errors), and valid rasters do not warn. |
 | [`duckdb/prefetch_resilience.rs`](../crates/raster-h3-duckdb/tests/it/prefetch_resilience.rs) (3) | Mixed local/remote mosaics finish without deadlock; a decode-worker panic latches into the queue; a corrupt chunk unblocks readers instead of hanging. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs) | `test_nonexistent_file_path_error`, `test_corrupted_and_empty_tiff_error_handling`. |
 | [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs), [`python/batch_reader.rs`](../crates/raster-h3-python/tests/it/batch_reader.rs), [`python/exports.rs`](../crates/raster-h3-python/tests/it/exports.rs), [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) | A strip that fails to decode part-way is a non-zero CLI exit, an `out_err` from `raster_h3_py_batch_reader_next` / `scan_json` / the exporters, and `-1` from `pg_srf_continuous_next`, never a short successful result; failed Python and CLI Parquet exports leave no file. |
@@ -226,14 +236,14 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (32) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; remote-path detection (cloud schemes, case, `file://`, Windows drive letters, malformed schemes); header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
-| Unit: `raster/http_range.rs` (5), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
+| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (34) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; remote-path detection (cloud schemes, case, `file://`, Windows drive letters, malformed schemes); header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. Servers that ignore `Range` and send the whole file serve later reads and `fetch_range` from the cached body. |
+| Unit: `raster/http_range.rs` (7), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
 
 ## 14. Mosaics & overlap rules
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (10) | Glob matching, comma lists, VRT XML resolution; adjacent-tile conservation; `cutline` vs `first` vs `average`; categorical overlaps; mixed VRT paths and export pipelines. |
+| [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (11) | Glob matching, comma lists, VRT XML resolution; adjacent-tile conservation; `cutline` vs `first` vs `average`; categorical overlaps; mixed VRT paths and export pipelines. |
 | [`core/cutline_ownership.rs`](../crates/raster-h3-core/tests/it/cutline_ownership.rs) (3) | `Cutline` ownership with cached centre vectors matches the original per-call computation for every tile at thousands of points: an overlapping 4×4 grid, three identical footprints (exact distance ties go to the lower index), tiles on different longitude branches across the antimeridian, and near-polar tiles. |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (4) | Mosaic opening keeps antimeridian tiles; overlap rules test real tile footprints, not WGS84 rectangles, including rotated footprints and mixed longitude branches. |
 | [`core/conus_pipeline.rs`](../crates/raster-h3-core/tests/it/conus_pipeline.rs) | `test_conus_batch_and_evict_pipeline_simulation`: multi-tile ingestion, batch eviction, Parquet progress and PMTiles from partitioned input. |
@@ -248,13 +258,13 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | [`core/polygon_to_cells.rs`](../crates/raster-h3-core/tests/it/polygon_to_cells.rs) (1) | POLYGON/MULTIPOLYGON WKB polyfill against direct `h3o` output, including holes, overlapping members, four containment modes and two resolutions. |
 | [`duckdb/spatial_geometry.rs`](../crates/raster-h3-duckdb/tests/it/spatial_geometry.rs) | `test_wkb_ogc_compliance`, `test_fast_hex_formatting`. |
 | [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) | `h3_to_wkb_returns_core_wkb_including_pentagons`: the `bytea` from `pg_h3_to_wkb` equals the core WKB, including 10-vertex pentagons. |
-| Unit: `encoding/wkb.rs` (8), `encoding/fast_hex.rs` (2) | Ring construction, antimeridian splitting and polar caps (every cell at resolutions 0–2 checked for range, closure, orientation, simplicity and area), hex formatting/parsing. |
+| Unit: `encoding/wkb.rs` (9), `encoding/fast_hex.rs` (2) | Ring construction, antimeridian splitting and polar caps (every cell at resolutions 0–2 checked for range, closure, orientation, simplicity and area), hex formatting/parsing. |
 
 ## 16. GeoParquet export
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/geoparquet.rs`](../crates/raster-h3-core/tests/it/geoparquet.rs) (8) | Continuous and categorical metadata and WKB; compact and full schemas; GeoParquet off by default; raster → GeoParquet end to end; deep validation against OGC GeoParquet 1.1 (PROJJSON, edges, bbox); column projection. |
+| [`core/geoparquet.rs`](../crates/raster-h3-core/tests/it/geoparquet.rs) (11) | Continuous and categorical metadata and WKB; compact and full schemas; GeoParquet off by default; raster → GeoParquet end to end; deep validation against OGC GeoParquet 1.1 (PROJJSON, edges, bbox); column projection. The `geo` bbox covers every cell geometry, including split antimeridian cells; every leaf carries the type-defined column order, so Polars' native reader opens the file. |
 | [`core/multi_resolution.rs`](../crates/raster-h3-core/tests/it/multi_resolution.rs) | Sorted streaming Parquet exports. |
 | Unit: `parquet/geoparquet_metadata.rs` (1) | Metadata JSON. |
 
@@ -262,7 +272,9 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/pmtiles.rs`](../crates/raster-h3-core/tests/it/pmtiles.rs) (25) | MVT protobuf encoding; PMTiles v3 header and archive validation; Hilbert tile IDs (ordering and bijective round trip); resolution ↔ zoom monotonicity; cell → tile mapping; coarse-zoom parent aggregation over all children; property filtering; GeoTIFF and Parquet (custom column, hex strings, multi row-group eviction) to PMTiles; all-NoData rasters; Class III 10-vertex pentagons; antimeridian-straddling cells and world tiles. | The exporter's `h3_hex` property holds the full hex index.
+| [`core/pmtiles.rs`](../crates/raster-h3-core/tests/it/pmtiles.rs) (26) | MVT protobuf encoding; PMTiles v3 header and archive validation; Hilbert tile IDs (ordering and bijective round trip); resolution ↔ zoom monotonicity; cell → tile mapping; coarse-zoom parent aggregation over all children; property filtering; GeoTIFF and Parquet (custom column, hex strings, multi row-group eviction) to PMTiles; all-NoData rasters; Class III 10-vertex pentagons; antimeridian-straddling cells and world tiles; the exporter's `h3_hex` property holds the full hex index; `parquet_to_pmtiles` reads nullable H3 columns. |
+| [`core/mvt_geometry.rs`](../crates/raster-h3-core/tests/it/mvt_geometry.rs) (3) | Every feature ring has positive area; cells at the poles become caps that reach the map edge, and `add_hexagon` builds the same cap. |
+| [`sedona/pmtiles.rs`](../crates/raster-h3-sedona/tests/pmtiles.rs) (6) | `COPY (query) TO '*.pmtiles'` in a plain DataFusion `SessionContext`: every cell is written with its columns as properties; `STORED AS PMTILES` options and zoom range; NULL cells skipped; signed and hex H3 columns; the `write_pmtiles` DataFrame API; an empty query writes a valid archive; bad copies fail with a message. |
 | Unit: `pmtiles/pyramid.rs` (3), `pmtiles/overview.rs` (2) | Tile math and overview levels. |
 
 See [PMTiles & Multi-Resolution](pmtiles.md).
@@ -271,45 +283,110 @@ See [PMTiles & Multi-Resolution](pmtiles.md).
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (6) | Default (v1.2.0) build only; the harness emulates the 357-entry v1.2.0 function table, so the DuckDB 2.0 build relies on `real_sql_v156_features` below. Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, quantile sketches built only when a quantile column is projected (`geom` and `wkb` excluded) with reordered/repeated quantile columns matching a full scan, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. |
-| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (5, ignored) | Real SQL through DuckDB v1.2.0, v1.5.6, and v2.0.0: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 and v2.0.0 to serialize native geometry as WKB. `real_sql_v156_features` runs only against the DuckDB 2.0 build (`DUCKDB_VERSION=v1.5.6`): `SET` options round-trip through `current_setting`; a raster export reads through DuckDB's file system; `COPY ... (FORMAT pmtiles)` overwrites a larger existing file (archive length matches its header) and writes tiles for valid cells; non-H3 values, unknown options and `memory_budget_mb 0` are rejected; a 1 MiB-budget COPY of ~23k cells is byte-identical to an unspilled one and creates `temp_directory` only when spilling; invalid constant `h3_polygon_to_cells` arguments fail at plan time; `typeof(h3_cell_to_geometry(...))` is `GEOMETRY`. |
+| [`duckdb/ffi_sql.rs`](../crates/raster-h3-duckdb/tests/it/ffi_sql.rs) (9) | Default (v1.2.0) build only; the harness emulates the 357-entry v1.2.0 function table, so the DuckDB 2.0 build relies on `real_sql_v156_features` below. Mock C-API callbacks: init and registration completeness, scalar NULL propagation, `h3_polygon_to_cells` BLOB overload registration, both `h3_cell_to_geometry` overloads and output parity, continuous scans with projection pushdown, quantile sketches built only when a quantile column is projected (`geom` and `wkb` excluded) with reordered/repeated quantile columns matching a full scan, categorical wide and long, and export table functions with CRS overrides. No SQL is executed. Transform-failure counts in export summaries; `strict_transforms` fails row scans, and fails exports with the count. |
+| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) (6, ignored) | Real SQL through DuckDB v1.2.0, v1.5.6, and v2.0.0: continuous/categorical scan names and aliases, pixel totals and constant means, projected CRS locations, scan/Parquet bidirectional `EXCEPT` parity, Parquet-to-PMTiles positional/named arguments, status/count/magic checks, `h3_cell_to_geometry` overloads and WKB bytes, and polygon modes/aliases/invalid-WKB NULL behavior. DuckDB Spatial is installed for v1.5.6 and v2.0.0 to serialize native geometry as WKB. `real_sql_v156_features` runs only against the DuckDB 2.0 build (`DUCKDB_VERSION=v1.5.6`): `SET` options round-trip through `current_setting`; a raster export reads through DuckDB's file system; `COPY ... (FORMAT pmtiles)` overwrites a larger existing file (archive length matches its header) and writes tiles for valid cells; non-H3 values, unknown options and `memory_budget_mb 0` are rejected; a 1 MiB-budget COPY of ~23k cells is byte-identical to an unspilled one and creates `temp_directory` only when spilling; invalid constant `h3_polygon_to_cells` arguments fail at plan time; `typeof(h3_cell_to_geometry(...))` is `GEOMETRY`. Partitioned scans merged with `h3_merge_partials` equal the single scan. |
 | [`root/duckdb_trusted_repository.rs`](../tests/it/duckdb_trusted_repository.rs) (1, ignored) | DuckDB 2.0+ trusted repository end to end, with signature checking on (no `-unsigned`) and an isolated `HOME`: a repository with a signed extension and `.well-known/duckdb-extension-repo.json` is created from a local prefix, the pinned fingerprint matches the key, `INSTALL`/`LOAD ... FROM` run the extension, a later session reloads it without opting in, and extensions that are unsigned or signed with an unpinned key are rejected. No-op against DuckDB < 2.0. |
 | [`test/sql/raster_h3.test`](../test/sql/raster_h3.test) (sqllogictest) | Packaged `build/release/raster_h3.duckdb_extension` from `make release` loads through DuckDB's Python sqllogictest runner (the community-extensions test path); `h3_to_string` is absent before `require raster_h3` and returns the expected cell after. |
 | [`root/package_extension.rs`](../tests/it/package_extension.rs) (6) | Extension footer layout: custom section headers, ABI fields, version and platform strings (including `v2.0.0`) and `--print-platform` parity, zeroed signature, gzip output, 1 MiB chunked SHA-256 RSA-2048 signing and verification, tamper and mismatched-key rejection, inline PEM env-var signing, and DuckDB 2.0 `.well-known/duckdb-extension-repo.json` manifest generation. |
 | Unit: `raster-h3-duckdb` (28) | `ffi/duckdb_c.rs` (9: `duckdb_string_t` layout), `ffi/mod.rs` (3), `bind_utils/parsing.rs` (6), `bind_helper.rs` (2), `chunk_writer.rs` (3), `record_queue.rs` (1), `scalar.rs` (4). |
 
+Also covered elsewhere: bbox pushdown in [§8](#8-bands-spectral-indices--pushdown); record queue and prefetch resilience in [§11](#11-failure-propagation--resilience); WKB and `GEOMETRY` output in [§15](#15-geometry-encoding-wkb); partitioned scans in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
 See [DuckDB](engines/duckdb.md).
 
-## 19. Other engines & cross-engine parity
+## 19. DataFusion
+
+The `raster-h3-datafusion` table providers must return what a core batch reader returns for the same configuration, with every pushed filter either exact or left to DataFusion.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
-| [`root/pg_extension_e2e.rs`](../tests/it/pg_extension_e2e.rs) (1, ignored) | Builds the PostgreSQL module in Docker, loads it into `postgres:<major>` for each `RASTER_H3_PG_VERSIONS`, compares `psql` output with in-process SRFs and checks that bad `bbox`/`h3_res` raise SQL errors without breaking the session. |
-| Unit: `raster-h3-core` columnar (6), `scalar_ops.rs` (6) | Arrow C stream round trip, release callback null-safety/idempotence, cross-thread owned export release, `RH3IPC01` round trip, scalar helpers. |
 | [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) (8) | Each `ContinuousRasterTableProvider` builder option equals a core `ContinuousBatchReader` run with the same config and changes the output: `with_nodata` (drops exactly the matching pixels), `with_sampling`, `with_band` (0 clamps to 1), `with_spectral_formula`, `with_quantiles` (extra columns, projectable), `with_min_count`/`with_min_mean`/`with_max_mean` intersected with pushed `MinCount`/`MinMean`/`MaxMean` (the stricter bound wins), `with_compact` (mass conserved; adjacent resolutions rejected), `with_overlap_rule` on a two-file source. |
 | [`datafusion/categorical_options.rs`](../crates/raster-h3-datafusion/tests/it/categorical_options.rs) (3) | `CategoricalRasterTableProvider` `with_nodata`, `with_remapper` (wide and long) and `with_min_majority_fraction` / `with_min_count` intersected with pushed filters, against `CategoricalBatchReader`. |
 | [`datafusion/statistics.rs`](../crates/raster-h3-datafusion/tests/it/statistics.rs) (3) | `statistics()` returns the inexact core cardinality estimate for both providers, grows with resolution, resolution count and mosaic files, stays within 4× of the real row count, and falls back to 10 000 per resolution for unreadable rasters. |
 | [`datafusion/scalar_udfs.rs`](../crates/raster-h3-datafusion/tests/it/scalar_udfs.rs) (3) | `string_to_h3`, `h3_to_lat`, `h3_to_lng` against `h3o` and the core scalars on cells near the poles, the antimeridian and a pentagon: validity pass-through, NaN for invalid cells, type errors, round trip back to the same cell. |
 | [`datafusion/compaction_pushdown.rs`](../crates/raster-h3-datafusion/tests/it/compaction_pushdown.rs) (2) | With `compact` or `compact_h3_children` set, every predicate reports `Unsupported` and `scan` emits the unfiltered compacted table: residual resolution and aggregate filters see completed parent rows, and `limit` is spent only after them — for both providers (categorical in wide and long formats). |
+| [`datafusion/bbox_pushdown.rs`](../crates/raster-h3-datafusion/tests/it/bbox_pushdown.rs) (5) | A pushed `Bbox` keeps edge cells whole (continuous and categorical statistics equal an unpruned scan); compacted scans ignore it; `LIMIT` is not spent on cells outside the box; a box off the raster scans empty. |
+| Unit: `raster-h3-datafusion` (6) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
+
+Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); overlap rules in [§14](#14-mosaics--overlap-rules); partitioned scans in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [DataFusion](engines/datafusion.md).
+
+## 20. SedonaDB
+
+`raster-h3-sedona` is a standalone workspace pinned to SedonaDB's DataFusion; its suites run in the `sedona-adapter` CI job. Apache Sedona on Spark does not use this adapter: it reads cells from the Python package, and its manual end-to-end check is listed under [Partitioned scans](#26-partitioned-scans).
+
+| Suite | What it checks |
+| :--- | :--- |
 | [`sedona/sql.rs`](../crates/raster-h3-sedona/tests/sql.rs) (12) | Real DataFusion SQL over continuous/categorical tables, including compacted parent resolution/count filters with `LIMIT`. Direct scans with small batches cover both compaction flags, strict comparisons, partially translated `BETWEEN`, unsupported and mixed predicates: reader and execution-plan limits are deferred for residual filters, while unfiltered/exact scans retain limit pushdown. |
-| [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs) (7) | The built `raster-h3-cli` binary against core readers and exporters: `--bbox`, `--nodata` and `--limit` change the output exactly as the core config does; stdout (no `-o`, `-o -`) equals file output; projected JSONL and categorical long format; categorical Parquet rows and a categorical PMTiles archive byte-identical to the core tiler; unknown subcommands, bad options and missing, non-TIFF or corrupt inputs exit non-zero with a stderr message. |
+| [`sedona/pushdown_correctness.rs`](../crates/raster-h3-sedona/tests/pushdown_correctness.rs) (6) | Many random query geometries through envelope-only `st_intersects` / `st_dwithin` stand-ins: every column of every matching row equals the same filter over a materialised table, on lon/lat, UTM, Web Mercator and high-latitude rasters, multiple resolutions and categorical data. |
+| [`sedona/extension_abi.rs`](../crates/raster-h3-sedona/tests/extension_abi.rs) (2) | `RasterH3Table` exported through SedonaDB's C extension ABI and imported back scans like the original, and spatial pushdown survives the round trip. |
+| [`sedona/sedona.rs`](../crates/raster-h3-sedona/tests/sedona.rs) (5, `sedona-e2e` only) | Inside a real `SedonaContext`: cells read as lon/lat geometry, Sedona's `ST_*` predicates on raster cells, bbox pushdown keeps edge cells whole, `ST_DWithin` and `h3_to_wkb` predicates match an unpruned scan, and a spatial query copies to PMTiles. |
+| Unit: `raster-h3-sedona` (12) | `spatial.rs` (5): WKB envelopes of points, lines and collections, malformed and empty WKB, clamping a grown envelope to the lon/lat range, predicate-to-envelope translation and CRS metadata; `filters.rs` (2): continuous and categorical comparison pushdown; `pmtiles.rs` (5): property names and native types, H3 column types and selection, zoom filtering, invalid cells and schemas, `COPY` options. |
+| [`sedona-pytest/test_sedonadb.py`](../crates/raster-h3-sedona/python/tests/test_sedonadb.py) (14) | `raster_h3_sedona.RasterH3Table` scanned by the `sedonadb` wheel through its table-provider capsule: projection, limit and count; cells as Sedona geometry; spatial filters equal an unpruned scan, prune it across the extension ABI, and return nothing off the raster; scalar UDF registration; `h3_polygon_to_cells` joins and rejects projected geometry; categorical tables; invalid arguments; `write_pmtiles` from SedonaDB queries and Arrow sources, and its errors. |
+
+Also covered elsewhere: PMTiles `COPY` in [§17](#17-pmtiles--mvt-export); partitioned scans in [§26](#26-partitioned-scans).
+
+See [DataFusion](engines/datafusion.md) for the SedonaDB adapter.
+
+## 21. Python & Polars
+
+The `raster-h3-python` C ABI is tested from Rust; the `raster_h3` package is tested with pytest against the locally built library.
+
+| Suite | What it checks |
+| :--- | :--- |
 | [`python/batch_reader.rs`](../crates/raster-h3-python/tests/it/batch_reader.rs) (3) | `raster_h3_py_open_batch_reader` / `_batch_reader_next` / `_free_batch_reader`: one bounded batch per stream, rows equal to core, projection, limit, categorical long, NULL-reader and open errors, early free. |
 | [`python/c_abi.rs`](../crates/raster-h3-python/tests/it/c_abi.rs) (5) | `raster_h3_py_scan_json` columns equal core output with NoData, bbox, CRS, projection, limit, categorical wide/long; errors set `out_err`, including malformed bbox, resolutions and format, which are rejected rather than ignored or defaulted. |
-| [`python/exports.rs`](../crates/raster-h3-python/tests/it/exports.rs) (2) | `raster_h3_py_export_parquet` / `_pmtiles` error paths return `-1` with a message and no output; successful exports return core row counts and PMTiles bytes identical to the core tiler. |
+| [`python/exports.rs`](../crates/raster-h3-python/tests/it/exports.rs) (3) | `raster_h3_py_export_parquet` / `_pmtiles` error paths return `-1` with a message and no output; successful exports return core row counts and PMTiles bytes identical to the core tiler. Exports report transform failures. |
 | [`python/scalars.rs`](../crates/raster-h3-python/tests/it/scalars.rs) (2) | `raster_h3_py_h3_is_valid_str` and `raster_h3_py_h3_cell_to_parent_str` against `h3o` and their `u64` variants. |
-| [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) (4) | `PgCategoricalSrf` with resolution, CRS, NoData and bbox options against `CategoricalBatchReader`; the `pg_srf_continuous_*` C-ABI lifecycle with options, WKB (including the full 189-byte boundary of an odd-resolution pentagon) and hex columns, NULL handles and errors. |
-| [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) (7, `pg-extension` only) | The V1 `fmgr` entry points in process, against server stand-ins in [`pg/fmgr/server.rs`](../crates/raster-h3-pg/tests/it/fmgr/server.rs) (`palloc`, `funcapi` multi-call helpers, reset callbacks): `pg_h3_to_string`, `pg_string_to_h3` (1- and 4-byte varlena headers), `pg_h3_is_valid_text`, `pg_h3_to_wkb`, the finfo records and magic block, and the categorical and continuous value-per-call SRFs against core output, including state release on early termination. Error reporting (`ereport` longjmps) is left to `root/pg_extension_e2e.rs`. |
-| Unit: `raster-h3-datafusion` (3) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
-| Unit: `raster-h3-cli` (2) | Argument validation, IPC and JSONL output. |
-| Unit: `raster-h3-python` (3), `raster-h3-pg` (4 + 3 in `fmgr.rs`) | C-ABI helpers and SRF iterators. The `fmgr.rs` tests only compile with `--features pg-extension`. |
+| Unit: `raster-h3-python` (4) | C-ABI helpers. |
 | [`pytest/test_arrow_stream.py`](../crates/raster-h3-python/tests/pytest/test_arrow_stream.py) (12) | The in-tree `raster_h3` package with the locally built cdylib, read by real PyArrow and Polars: continuous `h3_index`/`count`/`sum`/`min`/`max`/`mean` equal an independent reference that indexes every pixel centre with the `h3` package; `pl.from_arrow`, `to_polars()`, `read_raster_h3` and `iter_batches` equal `pyarrow.table` on `RasterH3ArrowStream` (`__arrow_c_stream__`), and `pyarrow.schema` (`__arrow_c_schema__`) equals the stream schema; `columns` and `limit`; categorical long counts/fractions and wide majority class/count/fraction against the `h3` reference; missing files, non-TIFF input, unknown columns and a non-intersecting bbox raise `RuntimeError`. |
 | [`pytest/test_polars_scan.py`](../crates/raster-h3-python/tests/pytest/test_polars_scan.py) (12) | `scan_raster_h3` as a Polars IO source (`register_io_source`, Polars ≥ 1.4): projection pushdown opens the native scan with only the selected columns; predicate pushdown (numeric, combined, string, `is_in` on `h3_index`) and `head(n)` (pushed as the scan limit), `head` after `filter`, and the `limit`/`columns` arguments give the same rows as the eager full scan filtered in Polars; empty results keep the schema; categorical wide/long pushdown; scan errors and unknown columns raise. |
+| [`pytest/test_scan_options.py`](../crates/raster-h3-python/tests/pytest/test_scan_options.py) (23) | The `_v2` scan options against values computed independently from pixels and the `h3` package: `band` (default, beyond the raster, below one, non-int), spectral formulas and their bands, `sampling`, `overlap_rule` (including in `plan_partitions`), `min_majority_fraction`; every option reaches every scan path; `parquet_to_pmtiles` with default, named and missing hex columns. |
+| [`pytest/test_scan_filters.py`](../crates/raster-h3-python/tests/pytest/test_scan_filters.py) (21) | Quantile columns (specs, projection, exact single-pixel quantiles, Arrow schema, errors), `remap` (merging, dropping, pass-through, errors), the `min_count` / `min_mean` / `max_mean` filters, and Polars predicate pushdown into them: rows equal a full scan filtered in Polars, and the opened scan carries the pushed options. Resolution predicates narrow the scan but keep invalid resolutions an error; older native libraries fall back to Polars-only filtering. |
+| [`pytest/test_parquet_export.py`](../crates/raster-h3-python/tests/pytest/test_parquet_export.py) (1) | `raster_to_parquet` output opens with Polars' native Parquet reader. |
 | [`wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | After `cibuildwheel` installs a wheel: the bundled library loads, Arrow/Polars paths work, `raster-h3-cli` is on `PATH`, and `h3_polygon_to_cells` handles a cell boundary and invalid resolution. |
+
+Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); partitioned scans, including the Apache Sedona (Spark) demo, in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [Python & Polars](engines/python-polars.md).
+
+## 22. PostgreSQL
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) (4) | `PgCategoricalSrf` with resolution, CRS, NoData and bbox options against `CategoricalBatchReader`; the `pg_srf_continuous_*` C-ABI lifecycle with options, WKB (including the full 189-byte boundary of an odd-resolution pentagon) and hex columns, NULL handles and errors. |
+| [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) (8, `pg-extension` only) | The V1 `fmgr` entry points in process, against server stand-ins in [`pg/fmgr/server.rs`](../crates/raster-h3-pg/tests/it/fmgr/server.rs) (`palloc`, `funcapi` multi-call helpers, reset callbacks): `pg_h3_to_string`, `pg_string_to_h3` (1- and 4-byte varlena headers), `pg_h3_is_valid_text`, `pg_h3_to_wkb`, the finfo records and magic block, and the categorical and continuous value-per-call SRFs against core output, including state release on early termination. Error reporting (`ereport` longjmps) is left to `root/pg_extension_e2e.rs`. The SRFs raise a `WARNING` when failed transforms drop samples. |
+| Unit: `raster-h3-pg` (4 + 3 in `fmgr.rs`) | SRF iterators. The `fmgr.rs` tests only compile with `--features pg-extension`. |
+| [`root/pg_extension_e2e.rs`](../tests/it/pg_extension_e2e.rs) (1, ignored) | Builds the PostgreSQL module in Docker, loads it into `postgres:<major>` for each `RASTER_H3_PG_VERSIONS`, compares `psql` output with in-process SRFs and checks that bad `bbox`/`h3_res` raise SQL errors without breaking the session. |
+
+Also covered elsewhere: cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [PostgreSQL](engines/postgresql.md).
+
+## 23. CLI
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs) (10) | The built `raster-h3-cli` binary against core readers and exporters: `--bbox`, `--nodata` and `--limit` change the output exactly as the core config does; stdout (no `-o`, `-o -`) equals file output; projected JSONL and categorical long format; categorical Parquet rows and a categorical PMTiles archive byte-identical to the core tiler; unknown subcommands, bad options and missing, non-TIFF or corrupt inputs exit non-zero with a stderr message. `parquet-to-pmtiles` round trips the CLI Parquet export, reads a nullable hex column under a custom name and reports skipped null/invalid rows on stderr, and rejects bad invocations. |
+| Unit: `raster-h3-cli` (2) | Argument validation, IPC and JSONL output. |
+
+Also covered elsewhere: partitioned fan-outs in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [CLI](engines/cli.md).
+
+## 24. Cross-engine parity
+
+One raster, every engine: per-cell results must agree.
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
+| Unit: `raster-h3-core` columnar (6), `scalar_ops.rs` (6) | Arrow C stream round trip, release callback null-safety/idempotence, cross-thread owned export release, `RH3IPC01` round trip, scalar helpers. |
 
 See the [engine deep dives](engines/README.md).
 
-## 20. Performance guards & benchmarks
+## 25. Performance guards & benchmarks
 
 | Suite | What it checks |
 | :--- | :--- |
@@ -359,6 +436,24 @@ report security-sensitive findings privately per [SECURITY.md](../SECURITY.md).
 
 ---
 
+## 26. Partitioned scans
+
+A partitioned scan merged from its parts must equal one unpartitioned scan, cell for cell,
+in every engine.
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`core/partitioned_scan.rs`](../crates/raster-h3-core/tests/it/partitioned_scan.rs) (13) | Partitioned scans (tiled, striped, mosaics, categorical, spilling) merged through encoded partial states match a single scan, including `sum_w2` and variance; `fractional_sampling_variance_survives_spills_and_partitions` repeats this with RGSS sampling, a spilling budget and two resolutions; partial states round-trip fractional weights and version 1 states are rejected. |
+| [`datafusion/partitions.rs`](../crates/raster-h3-datafusion/tests/it/partitions.rs) (3) | Continuous and categorical `with_partition` providers merge to the unpartitioned provider; pushed filters keep partial rows mergeable. |
+| [`sedona/partitions.rs`](../crates/raster-h3-sedona/tests/partitions.rs) (3) | SQL `h3_raster_plan_partitions`, a partition spec argument and the `h3_merge_partials` aggregates equal an unpartitioned query, also with filters and limits. |
+| [`cli/partitions.rs`](../crates/raster-h3-cli/tests/it/partitions.rs) (4) | `plan` / `ipc --partition` / `merge` fan-outs equal a single scan for continuous, categorical and projected rasters; a spec on the command line and the plan on stdout; misuse is rejected. |
+| [`python/partitions.rs`](../crates/raster-h3-python/tests/it/partitions.rs) (5) | Through the C ABI: continuous and categorical partitions merge to a single scan; unsupported options are rejected; the merge accepts the scan's projection including `partial_state`, and rejects rows without a state. |
+| [`pytest/test_partitions.py`](../crates/raster-h3-python/tests/pytest/test_partitions.py) (11) | `plan_partitions`, `RasterH3ArrowStream(partition=...)` and `merge_partials` from Python: continuous and categorical parity, projection through the merge, Spark-style types (signed `h3_index`, `int16` resolution), batch and dict output, a warning for dropped samples, scan options and filters surviving the merge, and misuse errors. |
+| [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) | `real_sql_partitioned_scans_merge_to_the_single_scan` (ignored): the same through real DuckDB SQL. |
+| [`sedona_spark/raster_h3_spark_demo.py`](../examples/sedona_spark/raster_h3_spark_demo.py) `--verify` (manual) | On Apache Sedona (Spark) in the `sedona` Docker service: the driver plans partitions, each Spark task scans one through `mapInArrow`, edge cells are shuffled by `h3_index` and merged with `merge_partials`, and `--verify` compares the union with one unpartitioned scan of each raster: the same cells, each exactly once, statistics within 1e-9 relative (summation order) and identical WKB. Then queries the cells with Sedona's `ST_GeomFromWKB` / `ST_H3CellIDs`. Uses a generated tiled raster unless paths are given. |
+
+See [Raster H3 Core](engines/core.md) for the protocol and its measured overhead.
+
 ## Running the Tests
 
 ```bash
@@ -379,17 +474,36 @@ python -m pip install pytest polars pyarrow h3
 python -m pytest crates/raster-h3-python/tests/pytest   # RASTER_H3_PYTHON_LIB picks a specific library
 ```
 
+The SedonaDB adapter is a standalone workspace, so `--workspace` does not include it:
+
+```bash
+cd crates/raster-h3-sedona
+cargo test --locked                        # sedona/… suites except sedona.rs
+cargo test --locked --features sedona-e2e  # adds sedona.rs; compiles SedonaDB from git
+```
+
+Its Python bindings are tested with a built wheel, as CI does:
+
+```bash
+cd crates/raster-h3-sedona/python
+maturin build --release
+python -m pip install target/wheels/*.whl pytest pandas geoarrow-pyarrow "sedonadb==0.5.0"
+python -m pytest
+```
+
 Use `--release` for anything that streams real data; debug builds are much slower.
 
 ### Gated tests
 
 | Test | Gate | How to run |
 | :--- | :--- | :--- |
-| `duckdb_sql_smoke` (5 root tests) | `#[ignore]`; needs the DuckDB CLI and a built library; v1.5.6 needs network access to install DuckDB Spatial; `real_sql_v156_features` needs a DuckDB 2.0 CLI, a library built with `--features duckdb-api-v1_5_6` (`RASTER_H3_LIBRARY`) and `DUCKDB_VERSION=v1.5.6`, and is skipped otherwise | `cargo build --release --lib && DUCKDB_BIN=/path/to/duckdb cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` (`DUCKDB_VERSION`, `DUCKDB_BIN`, and `RASTER_H3_LIBRARY` select the footer version, CLI, and library) |
+| `duckdb_sql_smoke` (6 root tests) | `#[ignore]`; needs the DuckDB CLI and a built library; v1.5.6 needs network access to install DuckDB Spatial; `real_sql_v156_features` needs a DuckDB 2.0 CLI, a library built with `--features duckdb-api-v1_5_6` (`RASTER_H3_LIBRARY`) and `DUCKDB_VERSION=v1.5.6`, and is skipped otherwise | `cargo build --release --lib && DUCKDB_BIN=/path/to/duckdb cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored` (`DUCKDB_VERSION`, `DUCKDB_BIN`, and `RASTER_H3_LIBRARY` select the footer version, CLI, and library) |
 | `pg_extension_e2e::pg_extension_in_real_server` (root) | `#[ignore]`; needs Docker | `cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture` (`RASTER_H3_PG_VERSIONS=14,16,18`, `RASTER_H3_PG_E2E_KEEP=1`) |
 | 4 × `codecs` LZW Hawaii parity, 2 × `horizon_streaming` Hawaii aggregation (core) | `#[ignore]`; need `data/CFL_HI.tif` / `data/LF2024_FBFM40_HI.tif` | Download the datasets into the workspace-root `data/`, then `-- --ignored`. They fail explicitly if the files are missing. |
 | `super_sampling::benchmark_supersampling` (core) | `#[ignore]` | `cargo test --release -p raster-h3-core --test it benchmark_supersampling -- --ignored --nocapture` |
-| `pg/fmgr.rs` (7) and the `fmgr.rs` unit tests | `--features pg-extension`; needs `RASTER_H3_PG_MAJOR` or `pg_config` on `PATH` | `RASTER_H3_PG_MAJOR=16 cargo test -p raster-h3-pg --features pg-extension` |
+| `pg/fmgr.rs` (8) and the `fmgr.rs` unit tests | `--features pg-extension`; needs `RASTER_H3_PG_MAJOR` or `pg_config` on `PATH` | `RASTER_H3_PG_MAJOR=16 cargo test -p raster-h3-pg --features pg-extension` |
+| `sedona/sedona.rs` (5) | `--features sedona-e2e`; compiles SedonaDB from git | `cargo test --features sedona-e2e` in `crates/raster-h3-sedona` |
+| Apache Sedona (Spark) demo `--verify` | Manual; needs Docker and the `sedona` compose profile (Apache Sedona 1.9.1 image with the locally built wheel) | `docker compose up --build sedona`, then `docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py --verify` |
 | DuckDB part of `multi_engine_e2e` | Skipped when `duckdb --version` fails | Put the DuckDB CLI on `PATH` |
 | `crates/raster-h3-python/tests/pytest` | Each module skips when `polars` or `pyarrow` is missing; `test_polars_scan.py` also skips without `polars.io.plugins` (Polars < 1.4), the `h3` reference checks skip without `h3`, the `pl.from_arrow(stream)` check skips on Polars without PyCapsule support, and the string-predicate case skips on Polars < 1.22 (it drops such predicates on IO sources) | `pip install pytest polars pyarrow h3` and build the cdylib |
 | Python part of `multi_engine_e2e` | Runs `/usr/bin/python3`; the test fails if that path is absent | Run on a system with `/usr/bin/python3` |
@@ -402,6 +516,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` | `cargo build --release --lib`, plus `cargo build --features duckdb-api-v1_5_6` into `target-v156/` (packaged with `--duckdb-version v1.5.6` under `dist/v2.0.0/`), then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs with the default build and and `duckdb_trusted_repository` against v2.0.0, both with the v1.5.6-API build | Real-SQL coverage on all three DuckDB versions and both extension builds, packaging with each CLI's `PRAGMA platform` tag; signed install through `CREATE EXTENSION REPOSITORY` |
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
 | `ci.yml` (`test-crates`, Linux) | `cargo test --release -p raster-h3-core -p raster-h3-duckdb -p raster-h3-datafusion -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
+| `ci.yml` (`sedona-adapter`, Linux) | `cargo test --locked --no-fail-fast` in `crates/raster-h3-sedona`, Clippy on the Python bindings, then a built wheel tested with `pytest` against `sedonadb==0.5.0` | The standalone SedonaDB adapter workspace (without `sedona-e2e`) and its Python bindings |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
 | [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets and scoped Arrow Miri tests | Malformed input, sanitizer smoke checks, and FFI ownership; longer fuzz runs weekly |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
@@ -427,7 +542,9 @@ name any branch, even one without the file.
 
 - CLI, DataFusion, Python and PostgreSQL unit/integration suites run on Linux in CI;
   their cross-platform coverage is through the root parity tests or the manual workflow.
-- The real PostgreSQL test and the Hawaii-dataset tests never run in CI.
+- The real PostgreSQL test, the Hawaii-dataset tests and the `sedona-e2e` suite never run in CI.
+- Partitioned scans on real Spark are checked only by the manual Apache Sedona demo; CI covers
+  Spark's signed `h3_index` / `int16` resolution types through `pytest/test_partitions.py`, without Spark.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - EPSG:6933 and EPSG:7856 have no coverage tests.
 
@@ -466,8 +583,9 @@ pixels have different ground areas at different latitudes, and fixed-point
 supersampling is not exact pixel/hexagon intersection. The geographic weighting
 regression contrasts pixel means at the equator and 60 degrees north with an
 independent spherical rectangle-area calculation. There is no ground-area
-weighting mode implied by these statistics. Variance for fractional weights is
-an outstanding issue and is not validated by the weighting regression.
+weighting mode implied by these statistics. Fractional weights use the
+reliability-weighted sample variance `M2 / (W - sum(w_i^2) / W)`; the super-sampling
+reference test checks `sum_w2` and the variance it implies.
 
 Calibration is applied after stored-value nodata checks. Non-finite calibrated
 samples are omitted from continuous statistics and quantiles. Spectral indices
