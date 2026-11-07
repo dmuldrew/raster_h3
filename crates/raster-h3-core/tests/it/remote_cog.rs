@@ -168,6 +168,110 @@ fn transport_clones_and_transient_retries_keep_the_original_etag() {
         .contains("ETag changed"));
 }
 
+#[test]
+fn retargeted_transport_uses_url_scoped_etags_for_probes_and_ranges() {
+    for probe_first in [false, true] {
+        let server = MockHttpServer::start(vec![7; 400_000]);
+        let original_url = format!("{}/etag_stable", server.url_base);
+        let mut transport = HttpTransport::new(&original_url).unwrap();
+        transport.probe(131_072).unwrap();
+        let original = transport.clone();
+
+        transport.url = format!("{}/etag_other", server.url_base);
+        if probe_first {
+            transport.probe(131_072).unwrap();
+        } else {
+            assert_eq!(
+                transport
+                    .fetch_range(150_000, 150_009, Some(400_000))
+                    .unwrap(),
+                vec![7; 10]
+            );
+        }
+        transport
+            .fetch_range(150_000, 150_009, Some(400_000))
+            .unwrap();
+        original
+            .fetch_range(150_000, 150_009, Some(400_000))
+            .unwrap();
+        transport.url = original_url;
+        transport.probe(131_072).unwrap();
+
+        let conditions = conditional_requests(&server);
+        let conditions: Vec<_> = conditions.iter().map(|h| h.trim()).collect();
+        assert_eq!(
+            conditions,
+            [
+                "If-Match: \"other\"",
+                "If-Match: \"v1\"",
+                "If-Match: \"v1\""
+            ]
+        );
+    }
+}
+
+#[test]
+fn retargeted_clones_pin_different_urls_concurrently() {
+    let server = MockHttpServer::start(vec![7; 400_000]);
+    let original_url = format!("{}/etag_stable", server.url_base);
+    let other_url = format!("{}/etag_other", server.url_base);
+    let transport = HttpTransport::new(&original_url).unwrap();
+    let mut other = transport.clone();
+    other.url = other_url.clone();
+    let workers: Vec<_> = [transport.clone(), other]
+        .into_iter()
+        .map(|transport| {
+            thread::spawn(move || {
+                transport.probe(131_072).unwrap();
+                transport
+                    .fetch_range(150_000, 150_009, Some(400_000))
+                    .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let mut retargeted = transport.clone();
+    retargeted.url = other_url;
+    retargeted.probe(131_072).unwrap();
+    transport.probe(131_072).unwrap();
+
+    let conditions = conditional_requests(&server);
+    assert_eq!(conditions.len(), 4);
+    for tag in ["v1", "other"] {
+        assert_eq!(
+            conditions
+                .iter()
+                .filter(|h| h.trim() == format!("If-Match: \"{tag}\""))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn retargeting_after_an_unversioned_probe_can_pin_a_strong_etag() {
+    for mode in ["ranged", "etag_weak"] {
+        let server = MockHttpServer::start(vec![7; 400_000]);
+        let mut transport = HttpTransport::new(&format!("{}/{mode}", server.url_base)).unwrap();
+        transport.probe(131_072).unwrap();
+        transport.url = format!("{}/etag_stable", server.url_base);
+        transport.probe(131_072).unwrap();
+        assert_eq!(
+            transport
+                .fetch_range(150_000, 150_009, Some(400_000))
+                .unwrap(),
+            vec![7; 10]
+        );
+        transport.url = format!("{}/{mode}", server.url_base);
+        transport.probe(131_072).unwrap();
+        let conditions = conditional_requests(&server);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].trim(), "If-Match: \"v1\"");
+    }
+}
+
 /// Lightweight mock HTTP server supporting HTTP Range requests (`bytes=start-end`)
 struct MockHttpServer {
     #[allow(dead_code)]
@@ -417,6 +521,8 @@ impl MockHttpServer {
             Some("W/\"v1\"")
         } else if replaced {
             Some("\"v2\"")
+        } else if path.contains("etag_other") {
+            Some("\"other\"")
         } else if path.contains("etag_") {
             Some("\"v1\"")
         } else {

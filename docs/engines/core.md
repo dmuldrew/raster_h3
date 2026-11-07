@@ -227,13 +227,15 @@ range that needs the same budget. Handles remain valid after the queue is droppe
 All engine adapters use this core prefetcher; `RemotePrefetchConfig` is a Rust
 queue-level API, not an additional SQL, Python or CLI option.
 
-The built-in HTTP transport pins the first successful response's **strong ETag**.
+The built-in HTTP transport pins the first successful response's **strong ETag** per URL.
 Subsequent range requests send `If-Match` and request `Accept-Encoding: identity`.
 HTTP 412 is a terminal read error, not a transient retry. A successful range response
 with a changed, missing, or downgraded-to-weak ETag also fails before its bytes enter
 caches or decoders, including when a same-size replacement slips past range validation.
 Transport clones, parallel reads, and retries share the original validator; they never
 silently adopt a new version. Previously cached bytes remain from the original response.
+Changing `HttpTransport.url` selects that URL's independent validator; returning to
+a previously read URL retains its original pin, including across clones.
 
 Servers supplying only weak ETags or no ETag remain supported with the existing size
 and range checks, but those checks **cannot guarantee snapshot consistency**. Use an
