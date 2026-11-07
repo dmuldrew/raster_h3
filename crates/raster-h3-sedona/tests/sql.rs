@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
-use datafusion::prelude::SessionContext;
+use datafusion::catalog::TableProvider;
+use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::prelude::{col, lit, SessionContext};
 use raster_h3_datafusion::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
 use raster_h3_sedona::{register_all, RasterH3Table, GEOARROW_WKB_EXTENSION};
 
@@ -252,6 +254,81 @@ async fn compacted_tables_filter_completed_rows() {
                 expected.contains(&limited[0]),
                 "{count}: WHERE {filter} LIMIT 1"
             );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_defers_limits_until_residual_filters_are_applied() {
+    use TableProviderFilterPushDown::{Exact, Inexact, Unsupported};
+
+    let tif = gradient_tif(128, 128);
+    let src = source(&tif);
+    let ctx = context();
+    for compaction in 0..=2 {
+        let mut continuous = ContinuousRasterTableProvider::try_new(&src, vec![8]).unwrap();
+        let mut categorical = CategoricalRasterTableProvider::try_new(&src, vec![8]).unwrap();
+        for config in [&mut continuous.config, &mut categorical.config] {
+            config.compact = compaction == 1;
+            config.compact_h3_children = compaction == 2;
+        }
+        continuous.batch_size = 2;
+        categorical.batch_size = 2;
+        for (count, table) in [
+            ("count", RasterH3Table::continuous(continuous)),
+            ("total_count", RasterH3Table::categorical(categorical)),
+        ] {
+            for (filters, mut expected_statuses) in [
+                (vec![], vec![]),
+                (vec![col(count).gt_eq(lit(0.0))], vec![Exact]),
+                (vec![col(count).gt(lit(0.0))], vec![Inexact]),
+                (vec![col(count).lt(lit(100.0))], vec![Unsupported]),
+                (
+                    vec![col(count).between(lit(0.0), lit(100.0))],
+                    vec![Inexact],
+                ),
+                (
+                    vec![col(count).gt_eq(lit(0.0)), col(count).lt(lit(100.0))],
+                    vec![Exact, Unsupported],
+                ),
+                (
+                    vec![col(count).gt_eq(lit(0.0)), col(count).gt(lit(1.0))],
+                    vec![Exact, Inexact],
+                ),
+            ] {
+                let statuses = table
+                    .supports_filters_pushdown(&filters.iter().collect::<Vec<_>>())
+                    .unwrap();
+                if compaction > 0 {
+                    expected_statuses.fill(Unsupported);
+                }
+                assert_eq!(statuses, expected_statuses);
+                let unbounded = table
+                    .scan(&ctx.state(), None, &filters, None)
+                    .await
+                    .unwrap();
+                let unbounded = datafusion::physical_plan::collect(unbounded, ctx.task_ctx())
+                    .await
+                    .unwrap();
+                assert!(rows(&unbounded) > 1);
+                let limited = table
+                    .scan(&ctx.state(), None, &filters, Some(1))
+                    .await
+                    .unwrap();
+                let limited = datafusion::physical_plan::collect(limited, ctx.task_ctx())
+                    .await
+                    .unwrap();
+                let expected = if statuses.iter().all(|s| *s == Exact) {
+                    1
+                } else {
+                    rows(&unbounded)
+                };
+                assert_eq!(
+                    rows(&limited),
+                    expected,
+                    "{count}, compaction={compaction}, filters={filters:?}"
+                );
+            }
         }
     }
 }
