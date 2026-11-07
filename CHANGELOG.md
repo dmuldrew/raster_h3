@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DataFusion-style providers leave predicates to the caller when compaction is enabled, and defer limits until after those predicates. Resolution and aggregate filters no longer discard compacted parents or change their statistics by filtering children. Applies to both compaction flags and continuous/categorical scans. The SedonaDB/DataFusion `RasterH3Table` now caps each filter's pushdown at the wrapped provider's status, so compacted SQL queries keep their `WHERE` clauses as DataFusion filters instead of returning unfiltered rows.
 - DataFusion `FilterPredicate::Bbox` pushdown no longer changes the aggregates of cells straddling the box edge. The pushed box is widened by more than the largest cell diameter at the coarsest resolution, so every cell intersecting the box keeps the values of an unfiltered scan and the pushdown is a true `Inexact` superset. It is not pushed when compaction is on. `with_bbox` keeps its pixel-clipping semantics.
 
+- Built-in remote HTTP reads pin strong ETags per URL and send `If-Match` on subsequent range requests. Same-size object replacements, changed/missing response validators, and HTTP 412 fail instead of mixing cached metadata with another version’s pixels. Clones and retries retain each URL's validator, even when transports are retargeted; sources without strong ETags remain supported without a snapshot guarantee.
+
 ## [0.5.0] - 2026-10-28
 
 ### Added
