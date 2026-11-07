@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `raster_h3.spark`: a Spark 4.0+ data source (Python Data Source API). `raster_h3.spark.register(spark)` then `spark.read.format("raster_h3").option("resolutions", "8,9").load(path)` (or `CREATE TEMPORARY VIEW ... USING raster_h3 OPTIONS (...)`) scans each partition planned by `plan_partitions` in its own Spark task, with the scan options of `RasterH3ArrowStream` as Spark options and Spark's signed types. `raster_h3.spark.merge_partials(df, ...)` merges the edge cells into final cells, equal to one unpartitioned scan; `raster_h3.spark.read(spark, path, **options)` does both. PySpark is imported only by this module. Tested on Apache Sedona 1.9.1 (Spark 4.0.1) in the `sedona-spark` CI job, together with the Apache Sedona demo's `mapInArrow` pipeline (`examples/sedona_spark/tests`). New guide: `docs/engines/spark.md`.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added

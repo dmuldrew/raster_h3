@@ -44,9 +44,9 @@ def sedona():
 def terrain(tmp_path):
     """Write the demo's synthetic tiled terrain; returns a factory of paths."""
 
-    def write(name: str = "terrain.tif", side: int = 512, tile: int = 64) -> str:
+    def write(name: str = "terrain.tif", side: int = 512, tile: int = 64, categorical: bool = False) -> str:
         path = str(tmp_path / name)
-        demo.write_sample(path, side=side, tile=tile)
+        demo.write_sample(path, side=side, tile=tile, categorical=categorical)
         return path
 
     return write

@@ -329,7 +329,7 @@ returns the same cells and statistics for the same input.
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
 | **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version); SedonaDB Python: `maturin build` in `crates/raster-h3-sedona/python` | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
-| **Apache Spark / Apache Sedona** | `raster-h3-python` (on every executor) | The `raster-h3` wheel; or `docker compose up --build sedona` (Apache Sedona 1.9.1 image) | [Spark & Apache Sedona](docs/engines/spark.md) |
+| **Apache Spark / Apache Sedona** | `raster-h3-python` (on every executor) | The `raster-h3` wheel (`raster_h3.spark` data source on Spark 4.0+); or `docker compose up --build sedona` (Apache Sedona 1.9.1, Spark 4.0) | [Spark & Apache Sedona](docs/engines/spark.md) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
 | **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 

@@ -4,7 +4,9 @@
 
 `raster_h3` runs on Apache Spark through its Python package. There is no Spark plugin or JVM
 code: each Spark task opens the raster with the `raster_h3` native library and hands Arrow
-batches to Spark (`mapInArrow`). A raster is split into **partitions** of TIFF tiles or
+batches to Spark. On Spark 4.0+, `raster_h3.spark` registers a `raster_h3` data source
+(`spark.read.format("raster_h3")`); on any Spark version the same steps can be written with
+`mapInArrow`. A raster is split into **partitions** of TIFF tiles or
 strips, so many executors read one raster in parallel without reading any pixel twice, and
 the result is identical to a single scan (up to floating-point summation order).
 
@@ -59,9 +61,57 @@ docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.
 `crates/raster-h3-python` on every node, as [`Dockerfile.sedona`](../../Dockerfile.sedona)
 does.
 
-## A partitioned scan
+## The `raster_h3` data source (Spark 4.0+)
 
-The complete pipeline is
+`raster_h3.spark` implements Spark's Python Data Source API, so a raster loads like any
+other source, from Python or SQL:
+
+```python
+import raster_h3.spark
+
+raster_h3.spark.register(spark)
+df = (spark.read.format("raster_h3")
+      .option("resolutions", "8,9")
+      .option("target_chunks", 256)
+      .load("s3://bucket/dem.tif"))
+cells = raster_h3.spark.merge_partials(df)          # final cells, no partial_state
+
+# Or both steps at once, with the options as Python values:
+cells = raster_h3.spark.read(spark, "dem.tif", resolutions=[8, 9], quantiles="p50")
+```
+
+```sql
+CREATE TEMPORARY VIEW dem_parts USING raster_h3
+OPTIONS (path 'dem.tif', resolutions '8,9', target_chunks '256');
+-- then, in Python: raster_h3.spark.merge_partials(spark.table("dem_parts"))
+```
+
+- **One Spark partition per raster partition.** The driver plans with `plan_partitions`
+  (metadata only); each Spark task scans one spec, so `df.rdd.getNumPartitions()` is the
+  number of planned partitions.
+- **Schema.** The scan's columns with Spark's signed types (`h3_index` `bigint`,
+  `resolution` `smallint`) plus `partial_state` (`binary`).
+- **`merge_partials(df, ...)`** keeps rows with a null `partial_state`, shuffles the others
+  by `h3_index` and merges them with `raster_h3.merge_partials`. Pass the scan's
+  `categorical`, `columns`, `quantiles` and filters; `read` does this for you. Merge each
+  raster's DataFrame on its own.
+- **Options** have the names and meanings of `RasterH3ArrowStream`: `resolutions`,
+  `target_chunks` (default 256), `categorical`, `columns`, `crs`, `nodata`, `bbox`, `band`,
+  `sampling`, `overlap_rule`, `spectral_formula` and its `*_band` options, `quantiles`,
+  `remap`, `min_count`, `min_mean`, `max_mean`, `min_majority_fraction`,
+  `strict_transforms`. Unknown names and malformed values raise when the DataFrame is
+  defined.
+- **No pushdown from Spark yet.** Spark applies `WHERE`, `LIMIT` and column selection
+  after the scan; narrow the scan with the options (`columns`, `bbox`, `min_count`, ...).
+  The long categorical format is not available with partitions.
+
+The path is one `raster_h3` source: a file, URL, VRT or glob mosaic (a mosaic is planned
+and merged as one raster).
+
+## A partitioned scan with `mapInArrow`
+
+On Spark 3, or to control each step, write the pipeline with `mapInArrow`. The complete
+pipeline is
 [`examples/sedona_spark/raster_h3_spark_demo.py`](../../examples/sedona_spark/raster_h3_spark_demo.py).
 Its steps are importable (`plan`, `distributed_cells`, `register_cells`, `verify`); the
 core of it is:
@@ -173,9 +223,10 @@ from the machine's cores. With several tasks per executor, give each task more c
 
 ## Testing
 
-[`examples/sedona_spark/tests/`](../../examples/sedona_spark/tests) runs the demo's
-pipeline on local Spark with Sedona and checks every result against one unpartitioned
-scan; the `sedona-spark` CI job builds the `sedona` image and runs it there. To run it
+[`examples/sedona_spark/tests/`](../../examples/sedona_spark/tests) runs the data source
+and the demo's `mapInArrow` pipeline on local Spark with Sedona and checks every result
+against one unpartitioned scan; the `sedona-spark` CI job builds the `sedona` image and runs
+it there. To run it
 locally:
 
 ```bash

@@ -108,13 +108,15 @@ def merge_boundary_cells(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.Recor
             yield to_spark(merged, path)
 
 
-def write_sample(path: str, side: int = 2048, tile: int = 256) -> None:
-    """A tiled float32 GeoTIFF (EPSG:4326) of synthetic terrain near San Francisco."""
+def write_sample(path: str, side: int = 2048, tile: int = 256, categorical: bool = False) -> None:
+    """A tiled GeoTIFF (EPSG:4326) of synthetic terrain near San Francisco: float32
+    elevations, or with `categorical` uint8 classes 1-8 (elevation bands)."""
     import numpy as np
 
     y, x = np.mgrid[0:side, 0:side].astype(np.float32)
     z = 300 + 120 * np.sin(x / 97) * np.cos(y / 131) + 40 * np.sin((x + y) / 23)
-    z = z.astype("<f4")
+    z = (1 + (z - 140) // 40).clip(1, 8).astype("u1") if categorical else z.astype("<f4")
+    bits, sample_format = (8, 1) if categorical else (32, 3)
     across = side // tile
     tiles = [
         z[r * tile : (r + 1) * tile, c * tile : (c + 1) * tile].tobytes()
@@ -130,9 +132,9 @@ def write_sample(path: str, side: int = 2048, tile: int = 256) -> None:
         b"\0" * 4 * len(tiles),  # tile offsets, filled in below
     ]
     entries = [  # (tag, type, count, value or blob index); SHORT=3, LONG=4, DOUBLE=12
-        (256, 4, 1, side), (257, 4, 1, side), (258, 3, 1, 32), (259, 3, 1, 1), (262, 3, 1, 1),
+        (256, 4, 1, side), (257, 4, 1, side), (258, 3, 1, bits), (259, 3, 1, 1), (262, 3, 1, 1),
         (277, 3, 1, 1), (284, 3, 1, 1), (322, 4, 1, tile), (323, 4, 1, tile),
-        (324, 4, len(tiles), 4), (325, 4, len(tiles), 3), (339, 3, 1, 3),
+        (324, 4, len(tiles), 4), (325, 4, len(tiles), 3), (339, 3, 1, sample_format),
         (33550, 12, 3, 0), (33922, 12, 6, 1), (34735, 3, 12, 2),
     ]  # fmt: skip
     offset = 8 + 2 + 12 * len(entries) + 4
