@@ -287,6 +287,12 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 | **Cloud-Native Streaming** | HTTP/S3 COG range prefetching — no local copies needed |
 | **Sub-Pixel Super-Sampling** | RGSS, Hex, Gaussian, 8-Rooks boundary anti-aliasing |
 
+Built-in HTTP/S3 reads pin strong ETags per URL and use `If-Match`, failing if the
+object changes during a scan. Rust `HttpTransport` clones share each URL's pin:
+changing `url` selects an independent validator, and returning to a previous URL
+retains its original pin. Servers with weak or missing ETags have no snapshot
+guarantee; use immutable/versioned URLs. See [remote COG streaming](docs/engines/core.md#cloud-optimized-geotiff-cog-streaming).
+
 ---
 
 ## How It Works
