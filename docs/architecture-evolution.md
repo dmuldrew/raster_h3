@@ -293,28 +293,64 @@ A compacted scan filters input cells, but a user's `WHERE resolution = 7` or `co
 
 ---
 
-## Future Performance Roadmap (Post-`v0.4.0` Opportunities)
+## Performance Roadmap (Post-`v0.7.0`)
 
-> **Status (November 2026):** `P0` and `P2` shipped in `v0.5.0` (PR #47); `P1` was withdrawn. `P3`–`P5` remain open. The `v0.7.0` merge-scaling work (Lessons 21–22) came from the `worker_scaling` measurements rather than this list.
+The original post-`v0.4.0` roadmap was ranked from the CONUS Resolution 9 telemetry (`518s–596s` on WGS84, `908s–1,067s` on Albers) and an instruction-level reading of the `v0.4.0` hot paths. `v0.5.0` shipped its two inner-loop items, and `v0.7.0` measurements with the `worker_scaling` benchmark ([`docs/worker-scaling.md`](worker-scaling.md)) found costs that the list did not have. This section records what happened to each item, then ranks the open work.
 
-Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and `908s–1,067s` on Albers) and instruction-level inspection of the `v0.4.0` hot paths, the following optimizations represent the highest-leverage next steps, ranked by **Return on Investment (Impact vs. Complexity)**.
+### Status of the Post-`v0.4.0` Items
 
-### Priority Matrix
+| Item | Optimization | Status | Result |
+| :---: | :--- | :--- | :--- |
+| **P0** | Snyder authalic series + `rho_sq` + row-hoisted `y_p` in `AlbersConicFast` | **Shipped** in `v0.5.0` (PR #47) | **1.19×–1.26×** on Albers (Hawaii); −20.3% user CPU on CONUS |
+| **P1** | Endpoint-only stride probing | **Withdrawn** | Misassigns pixels on short cell re-entries (Lesson 12) |
+| **P2** | Row-latitude hoisting for `Wgs84Identity` + single-point loop | **Shipped** in `v0.5.0` (PR #47) | **1.01×–1.03×** on WGS84 |
+| **P3** | Parallel column encoding + `BYTE_STREAM_SPLIT` in CLI Parquet | Open | — |
+| **P4** | Row-shared trigonometry in H3 indexing | Open; now needs an `h3o` API change | — |
+| **P5** | Projected SoA eviction slabs (skip AoS `OutputBuffer`) | Open | — |
+| — | Eviction keys computed in the parallel workers | **Shipped** in `v0.7.0` (PR #82) | Resolution 11 merge 12.1 s → 2.0 s; **1.7×** wall at 4 workers |
+| — | Horizon batches sized by pixels | **Shipped** in `v0.7.0` (PR #85) | **1.5×** (multi-resolution, 2 GiB) and **2.1×** (quantiles, 64 MiB) at 4 workers |
+| — | Partitioned scans | **Shipped** in `v0.7.0` (PRs #78, #80, #84) | No measurable CPU overhead (0.97×–1.02× total CPU) |
 
-| Priority | Optimization | Target Workload | Expected / Measured Speedup | Effort |
+### Open Work, Ranked
+
+| Rank | Item | Target Workload | Evidence / Expected Gain | Effort |
 | :---: | :--- | :--- | :--- | :---: |
-| **P0** | **Snyder Authalic Series + `rho_sq` + Row-Hoisted `y_p` in `AlbersConicFast`** | Projected rasters (`EPSG:5070`) | **1.19×–1.26×** (-20.3% User CPU / -879s CPU on CONUS; -41.1% Albers cycle overhead) | Low (~50 LOC) |
-| **P1 (withdrawn)** | **Endpoint-Only Stride Probing** | Not safe without a geometric certificate | Not applicable | Requires a correctness proof |
-| **P2** | **Row-Latitude Hoisting for `Wgs84Identity` + Specialized Single-Point Loop** | Native `EPSG:4326` / `EPSG:3857` | **1.01×–1.03×** (-0.7% cycles / -3.6 cyc/px on CONUS WGS84) | Low (~80 LOC) |
-| **P3** | **Parallel Column Encoding + `BYTE_STREAM_SPLIT` in CLI Parquet** | CLI Parquet export | **+10–15% speed, 6× smaller files** | Medium (~150 LOC) |
-| **P4** | **Row-Shared Trigonometric Precomputation in H3 Indexing** | North-up `EPSG:4326` / `EPSG:3857` | **+8–12%** on H3 indexing math | Medium (~150 LOC) |
-| **P5** | **Projected SoA Eviction Slabs (Skip AoS `OutputBuffer`)** | DuckDB / Polars / DataFusion | **+5% speed, -25% Peak RSS (~1.2 GB)** | Medium (~200 LOC) |
+| **R1** | **Re-run the CONUS benchmark at `v0.7.0` on 8+ cores** | All engines | The continental numbers above predate `v0.5.0`; every later gain was measured on Hawaii or the 4-vCPU `worker_scaling` fixture | Low |
+| **R2** | **Per-resolution budget shares weighted by expected cell count** | Fine (res ≥ 10) and multi-resolution scans | Under the 64 MiB default, resolution 11 spends **12.5 s of 16.9 s** spilling, and `res 7, 9, 11` spends 14.2 s of 20.2 s. Equal shares give coarse resolutions memory they cannot use | Medium |
+| **P3** | **Parallel column encoding + `BYTE_STREAM_SPLIT` in CLI Parquet** | CLI Parquet export | CLI was 65–100 s slower than Polars/DuckDB on CONUS; **+10–15%** expected, smaller files with the compact schema | Medium (~150 LOC) |
+| **P5** | **Projected SoA eviction slabs** | DuckDB / Polars / DataFusion | ~6 GB of AoS → SoA copies on CONUS; **+5%** speed, **−25%** peak RSS expected | Medium (~200 LOC) |
+| **R3** | **Parallel merge, sharded by cell hash** | Fine resolutions at 8+ workers | Remaining merge is ~110–130 ns per new cell, **18.5%** of wall time at resolution 11 with 4 workers. Do it only if R1 shows it above 20% | Medium–High |
+| **P4** | **Row-shared trigonometry in H3 indexing** | North-up `EPSG:4326` / `EPSG:3857` | **+8–12%** on indexing math, but the projection now runs inside `h3o::LatLngIndexer` | Medium + upstream |
+
+#### R1. Refresh the Continental Baseline
+* **Why first:** Every decision below depends on where time goes at full scale, on a machine with more cores than the 4-vCPU runs. The CONUS tables above were measured at `v0.4.0` (and the P0 + P2 branch); since then indexing, eviction, batching and spill behaviour have all changed.
+* **What to record:** wall, user/sys CPU and peak RSS for CLI, Polars and DuckDB on both `BP_CONUS` rasters at resolution 9; plus `StreamProfile` merge, spill and `eviction_key_fallbacks`, and `worker_scaling` at 1/2/4/8/16 workers on the same machine. Add a partitioned run (`raster-h3-cli plan` / `ipc --partition` / `merge`) to confirm partitioning stays free at continental scale.
+
+#### R2. Weight Budget Shares by Expected Cell Count
+* **Where:** `map_budget = aggregation_budget_bytes / num_res / 4` in [`crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs) and the horizon maps that enforce it.
+* **The bottleneck:** Each resolution's horizon map gets a quarter of the aggregation budget divided by the number of resolutions ([`engineering.md`](engineering.md)). A batch of resolution-11 cells on a 4096-pixel-wide, 64-row-strip raster needs ~53 MiB, but gets 16 MiB alone or ~5 MiB in a three-resolution run, while resolution 7 in the same run holds a few thousand cells. The fine resolution spills on every batch.
+* **The fix:** Size each resolution's share from its expected cells per batch (batch pixels divided by pixels per cell, capped at batch pixels), so coarse resolutions give up memory they cannot use. Keep the total budget unchanged, and keep spilling as the fallback so the result is always correct.
+* **Validate with:** the `worker_scaling` `res 11` and `res 7, 9, 11` workloads at 64 MiB, and the memory benchmark suite, which must show peak memory still within the budget.
+
+#### R3. Parallelise the Merge Only If It Still Dominates
+* **Where:** the serial horizon merge in [`crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs).
+* **Status:** After PR #82 the merge is a hash insert and an eviction-heap push per new cell. The horizon map already has 32 shards, so a sharded merge is possible, but merge order also feeds the eviction heap and spill runs, both of which must stay deterministic.
+* **Gate:** the `worker_scaling` decision rule: proceed only if the merge exceeds 20% of wall time on a common workload in R1's 8+ core runs.
+
+#### Notes on P3–P5
+* **P3** is unchanged in substance: the CLI writer still permutes and compresses columns on one writer thread, and only `h3_index` sets a non-default encoding (`DELTA_BINARY_PACKED`). Much of the 6.2 GB vs 960 MB gap is the geometry and extra columns of the full GeoParquet schema, so compare against the compact schema when measuring.
+* **P4:** since `v0.6.0` the lat/lng → face projection happens inside `h3o::LatLngIndexer` (PR #48), which also shares it across resolutions. Reusing a row's `sin(lat)`/`cos(lat)` therefore needs `h3o` to accept precomputed values, which is an upstream change like the one that added `LatLngIndexer`.
+* **P5** is unchanged. Partitioned scans add a second record type (`PartialCell`) to `OutputBuffer`, so a columnar eviction path must cover partial rows too.
 
 ---
 
+### Original Post-`v0.4.0` Analysis
+
+The sections below are the original analysis of `P0`–`P5`, kept for reference. `P0` and `P2` describe what shipped in `v0.5.0`.
+
 ### Tier 1: High-Impact Inner-Loop Optimizations
 
-#### 1. Replace Newton-Raphson + `.ln()` in `AlbersConicFast` with Snyder's Authalic Series & Eliminate Redundant `sqrt()` (`P0`)
+#### 1. Replace Newton-Raphson + `.ln()` in `AlbersConicFast` with Snyder's Authalic Series & Eliminate Redundant `sqrt()` (`P0`, shipped in `v0.5.0`)
 * **Where:** [`crates/raster-h3-core/src/crs/transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs) (`AlbersConicFast::transform_point`)
 * **The Bottleneck:** On CONUS Albers (`EPSG:5070`), coordinate reprojection accounts for the entire ~400–550 second gap versus native WGS84. Currently, `AlbersConicFast::transform_point` executes:
   1. `let rho = (x_p * x_p + y_p * y_p).sqrt();` followed immediately by `rho * rho` (`rho` is never used unsquared).
@@ -330,7 +366,7 @@ Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and 
 * **Boundary finding:** Bisecting a three-column probe also cannot infer an unchecked pixel's cell from the midpoint and endpoint. For `A, A, A, A, A, B, A, C, C`, the midpoint is `A` and the next probe agrees with the `C` endpoint, but skipping the unchecked `B` still misassigns it to `A`.
 * **Current implementation:** Index every valid sample at every requested resolution, then batch only verified same-cell spans. Keep the Albers authalic series, row-invariant projection hoisting, and single-point loop specialization. Any future skipping requires a conservative geometric certificate, not endpoint equality.
 
-#### 3. Extend Row-Invariant Latitude Hoisting to `Wgs84Identity` & Specialize the Single-Point `walk` Loop (`P2`)
+#### 3. Extend Row-Invariant Latitude Hoisting to `Wgs84Identity` & Specialize the Single-Point `walk` Loop (`P2`, shipped in `v0.5.0`)
 * **Where:** [`crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/walker.rs) (`SampleProjector` and `walk`)
 * **The Bottleneck:**
   1. Before these changes, `SampleProjector` hoisted row-constant latitudes **only** for `WebMercatorFast`, leaving `Wgs84Identity` (`EPSG:4326`) to recompute them per pixel.
