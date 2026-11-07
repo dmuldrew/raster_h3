@@ -309,7 +309,8 @@ scans' `categorical`, `columns`, `quantiles` and filters (`min_count`, `min_mean
 same filters; options that act on pixels (`remap`, `band`, `sampling`, ...) are already
 applied to the partial states. With Spark,
 scan one spec per task (`mapInArrow`), then `repartition("h3_index")` the partial rows and
-merge each group with `mapInArrow` as well. The Apache Sedona demo,
+merge each group with `mapInArrow` as well; see [Spark & Apache Sedona](spark.md) for the
+full pipeline and Sedona SQL. The Apache Sedona demo,
 [`examples/sedona_spark/raster_h3_spark_demo.py`](../../examples/sedona_spark/raster_h3_spark_demo.py),
 is a complete pipeline; its tests in `examples/sedona_spark/tests/` run it on real Spark in
 the `sedona` image (CI job `sedona-spark`):
