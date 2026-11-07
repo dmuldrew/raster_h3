@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: dmuldrew/raster_h3
-  ref: 36a9f9f8ac68777777ca79beaddd7e06ae2eaf72
+  ref: 25ec308af4db4bdbf29050c00eae79c2b1685d84
 
 docs:
   hello_world: |
