@@ -2,13 +2,13 @@
 
 [← Back to README](../README.md) · [Core Engineering](engineering.md) · [Architecture Comparison](architecture-comparison.md) · [Optimal Raster Format](optimal-raster-format.md)
 
-This document traces the chronological evolution of `raster_h3` from an initial single-threaded DuckDB prototype (`v0.1.0`) to a multi-engine geospatial workspace (`v0.4.0`) capable of aggregating 18+ billion pixels across the Continental United States (CONUS) into 74.4 million H3 hexagons in under 9 minutes on a single workstation.
+This document traces the chronological evolution of `raster_h3` from an initial single-threaded DuckDB prototype (`v0.1.0`) to a multi-engine geospatial workspace (`v0.4.0`) capable of aggregating 18+ billion pixels across the Continental United States (CONUS) into 74.4 million H3 hexagons in under 9 minutes on a single workstation. It then follows the hardening of that workspace for production (`v0.5.0`), its expansion to DuckDB 2.0 and SedonaDB (`v0.6.0`), and its move to scans partitioned across independent workers (`v0.7.0`).
 
 More importantly, it documents the **engineering hypotheses that failed**, the **subtle geodetic and concurrency bugs uncovered under continental-scale stress testing**, and the **systems lessons learned** along the way.
 
 ---
 
-## Executive Timeline: The Five Architectural Eras
+## Executive Timeline: The Eight Architectural Eras
 
 ```mermaid
 flowchart LR
@@ -16,6 +16,9 @@ flowchart LR
     P2 --> P3["Phase 3 (v0.3.0)<br/>Option 25 Lock-Free Pools,<br/>SIMD & Multi-Res Fusion"]
     P3 --> P4["Phase 4 (Oct 2026 Audit)<br/>Exact Indexing, Certified<br/>Eviction & Spill Budgets"]
     P4 --> P5["Phase 5 (v0.4.0)<br/>Multi-Engine Workspace &<br/>Zero-Copy Arrow Streams"]
+    P5 --> P6["Phase 6 (v0.5.0)<br/>Correctness Contracts &<br/>Release Gates"]
+    P6 --> P7["Phase 7 (v0.6.0)<br/>DuckDB 2.0 &<br/>SedonaDB Adapter"]
+    P7 --> P8["Phase 8 (v0.7.0)<br/>Partitioned Scans &<br/>Merge Scaling"]
 ```
 
 | Era | Key Architectural Milestone | Primary Bottleneck Solved | Key Pivot / Lesson Learned |
@@ -25,6 +28,9 @@ flowchart LR
 | **Phase 3 (`v0.3.0`)** | `DecodingBufferPool`, `OrderedPrefetchQueue`, SIMD predictors, 32-way sharding | OS `mmap`/`brk` allocator storms across 100k+ chunks & DuckDB lock contention | At 15B+ pixels, memory allocator churn and mutex contention eclipse raw trigonometric math. |
 | **Phase 4 (`Oct 2026`)** | Stripped out lookahead for exact indexing; certified latitude bounds; external disk spilling | Geodetic boundary misassignment, rotated/conic eviction bugs, and unbounded RAM | Branchless sequential SIMD + exact indexing is **7–12% faster** than binary search lookahead and 100% mathematically sound. |
 | **Phase 5 (`v0.4.0`)** | 6-crate workspace (`core`, `duckdb`, `python`, `cli`, `datafusion`, `pg`) + Arrow PyCapsule | Engine lock-in, Python ABI coupling, and WKB geometry serialization overhead | Pure C-ABI (`ctypes`) Arrow streams allow Polars & DuckDB to saturate hardware with zero intermediate copies. |
+| **Phase 6 (`v0.5.0`)** | Snyder/Chebyshev Albers series, strict transform mode, GDAL scale/offset, release quality gates | Silent sample loss on failed transforms, uncalibrated values, and unverified releases | A dropped sample must be counted or fail the scan; a speedup that changes cell assignment is a bug, not an optimization. |
+| **Phase 7 (`v0.6.0`)** | v1.5.6-API DuckDB build with signing, DataFusion 54 / SedonaDB adapter, cached multi-resolution H3 indexing | One DuckDB ABI for every release, no SedonaDB path, and per-resolution H3 projection cost | Pushdown is only allowed when it is a true superset: a pushed bbox must never change a straddling cell's statistics. |
+| **Phase 8 (`v0.7.0`)** | Partitioned scans across every engine, parallel eviction keys, pixel-sized horizon batches, version-pinned remote reads | Single-process scan limits and a serial merge that dominated fine-resolution runs | Measure before parallelising: the serial merge was slow because of one ~584 ns key per cell, not because it was serial. |
 
 ---
 
@@ -186,6 +192,93 @@ All three engines produced bit-identical cell counts and identical floating-poin
 
 ---
 
+## Phase 6: Correctness Contracts & Release Gates (`v0.5.0`, October 28, 2026)
+
+`v0.5.0` shipped the corrected roadmap work from the post-`v0.4.0` plan below and turned several silent behaviours into explicit contracts.
+
+### Lesson 12: A Faster Kernel That Moves Pixels Is Not an Optimization
+The first `P0` + `P1` branch (`4a48ba6`) measured up to **2.5× faster** on Hawaii, but its endpoint stride probing assumed that a run with equal endpoints is one cell. Short scanlines can re-enter a cell (`A, A, B, A, A`), so the probing was removed in `c8aa1de`. The shipped version (`1daa33e`, PR #47) keeps the Snyder/Chebyshev authalic series and row-invariant hoisting, indexes every valid sample at every resolution, and still runs **1.19×–1.26× faster** on Albers. An independent reference test (`core/exact_cell_assignment.rs`) now indexes every sample directly with `h3o` and must match the engine cell for cell. The measurements are in *Measured Results* under the roadmap below.
+
+### Lesson 13: Every Dropped Sample Must Be Counted
+Before `v0.5.0`, a sample whose coordinate transform failed, or produced a latitude/longitude outside the valid range, was silently skipped. The streamers now count these (`transform_failures()`), every engine reports the count (a DuckDB summary column, a PostgreSQL `WARNING`, a Python `RuntimeWarning`, a CLI stderr line), and `strict_transforms` fails the scan on the first one (PRs #58, #61, #65).
+
+### Lesson 14: Raster Metadata Is Part of the Value
+GDAL band `SCALE`/`OFFSET` calibration (PR #55) now applies `stored * scale + offset` before statistics, quantiles and spectral indices, while NoData still matches stored values. Pixels with a zero `ExtraSamples` alpha are excluded. Both were previously ignored, so calibrated products such as reflectance or temperature were aggregated in raw counts.
+
+### Lesson 15: Release Gates Belong in CI, Not in a Checklist
+PRs #42 and #70 added CI gates for lint (strict Clippy and rustdoc), MSRV `1.94`, cargo-deny, package and version consistency (`scripts/check_versions.py`), wheel smoke tests, fuzzing (WKB/EWKB, GeoTIFF metadata, chunk predictors) and scoped Miri checks. Releases also ship SHA-256 checksums and build attestations. A tag can no longer produce a release that has not passed them.
+
+---
+
+## Phase 7: DuckDB 2.0 & the SedonaDB Adapter (`v0.6.0`, cut at `f922c78`, November 3, 2026)
+
+**Release boundary:** `v0.6.0` is everything merged to `main` up to and including PR #72 (`f922c78`). From there, `main` moved to partitioned scans; every PR after that point belongs to `v0.7.0`.
+
+| PR | Change |
+| :--- | :--- |
+| #73 | DataFusion `Bbox` pushdown made result-preserving |
+| #71 | Memory benchmark suite (7 scenarios, each in its own process) |
+| #75 | DuckDB 2.0 extension signing and custom repository manifests |
+| #77 | Second DuckDB build on the stable v1.5.6 C extension API |
+| #48 | Multi-resolution indexing through `h3o::LatLngIndexer` |
+| #72 | `raster-h3-sedona`: DataFusion 54 / SedonaDB adapter |
+
+### Lesson 16: Ship Two ABIs Instead of Choosing One
+The v1.2.0 C extension API still covers DuckDB 1.2 through 1.5, but features like native `GEOMETRY`, `COPY ... TO (FORMAT pmtiles)`, session settings (`raster_h3_fetch_workers`, `raster_h3_decode_budget_mb`, `raster_h3_workers`) and reads through DuckDB's own file system (`raster_h3_use_duckdb_fs`, so `CREATE SECRET` credentials work for `s3://`, `gs://`, `azure://`) need the v1.5.6 API. Release bundles now carry both trees (`v1.2.0/<platform>` and `v2.0.0/<platform>`). Signing (`package_extension --signing-key`) and a generated `.well-known/duckdb-extension-repo.json` let users install a signed build through `CREATE EXTENSION REPOSITORY` with signature checks on, and CI verifies that unsigned and wrong-key builds are rejected.
+
+### Lesson 17: Pushdown Must Be a Superset, Never a Clip
+DataFusion `Bbox` pushdown originally clipped pixels to the box, so a cell straddling the edge lost the pixels outside it and its `mean` changed depending on the query's `WHERE` clause (PR #73). The pushed box is now widened by more than the largest cell diameter at the coarsest resolution, so the scan returns an `Inexact` superset with unchanged statistics, and a box that misses every tile scans empty instead of failing. The same rule governs the SedonaDB adapter's `ST_Intersects` / `ST_DWithin` pushdown.
+
+### Lesson 18: Match the Host's Dependency Pins Exactly
+`raster-h3-sedona` pins DataFusion `=54.1.0` and arrow `58` to match SedonaDB, so its `TableProvider`, table functions and UDFs register into a plain `SessionContext` or SedonaDB's `SedonaContext::ctx`. It is a separate workspace, so these pins add nothing to the root `Cargo.lock`. Geometry columns are `geoarrow.wkb` in `OGC:CRS84`, so Sedona's `ST_*` functions accept them without conversion. Python bindings implement SedonaDB's `__sedonadb_table_provider__` protocol and export the scalar UDFs as `sedonadb_scalar_kernel` capsules.
+
+### Lesson 19: Share Work Across Resolutions Upstream
+Multi-resolution scans indexed each sample once per resolution, repeating H3's resolution-independent face projection. PR #48 added `LatLngIndexer` to `h3o` upstream (released in `h3o 0.11.1`) and reuses the last cell per resolution while consecutive samples stay in the same face `IJK` cell. Cells are identical. The project temporarily depended on a git fork, then on upstream `master`, and dropped the patch once the release shipped, so `cargo package -p raster-h3-core` verifies against crates.io again.
+
+---
+
+## Phase 8: Partitioned Scans & Merge Scaling (`v0.7.0`, November 3–6, 2026)
+
+| PR | Change |
+| :--- | :--- |
+| #78 | Core and Python partitioned scans (`plan_partitions`, `PartialCell`, `PartialMerger`) |
+| #79 | Spark demo with SedonaDB partitioned scans |
+| #66 | `worker_scaling` benchmark and the decision not to parallelise the merge |
+| #80 | Partitioned scans in DuckDB, DataFusion and SedonaDB SQL |
+| #81 | E2E tests build each cdylib at most once per test process |
+| #82 | Horizon eviction keys computed in the parallel workers |
+| #84 | CLI `plan` / `ipc --partition` / `merge` |
+| #85 | Horizon batches sized by pixels |
+| #87 | Python scan options, quantiles, remap, filters and Polars predicate pushdown; SedonaDB `COPY ... TO '*.pmtiles'`; CLI and Python `parquet_to_pmtiles` |
+| #89, #90 | WKT/GeoKey datum shifts rejected; calibration overflow filtered consistently |
+| #91 | Reliability-weighted sample variance for fractional weights |
+| #92 | Five audit fixes: MVT `h3_hex`, `remap` panics, deflate short fills, non-`Range` servers, planar TIFFs |
+| #93, #95 | Compacted scans and residual filters no longer receive pushed predicates or premature limits |
+| #94 (merge before tagging) | Remote HTTP reads pinned to a strong ETag (`If-Match`) |
+
+### Lesson 20: Split Work at the Chunk Grid; Merge Only the Edges
+A partition is a rectangle of the chunk grid plus a fingerprint of the mosaic (including CRS and bbox), built from metadata alone, so no chunk is read twice. Cells entirely inside a partition are final when it ends. Cells that another partition may also reach are emitted as unfiltered `PartialCell`s in the lossless spill format, and `PartialMerger` combines them and then applies the filters. Results match a single scan for tiled and striped rasters, geographic and projected CRSs, every mosaic overlap rule, quantiles, categorical data and spilling. The same protocol is exposed everywhere: Python (`plan_partitions`, `partition=`, `merge_partials`, including Spark-typed rows), DuckDB (`h3_raster_plan_partitions`, `partition :=`, `h3_merge_partials`), DataFusion/SedonaDB, and the CLI, whose `RH3PART1` headers let `merge` refuse an incomplete, repeated or mismatched set of partition files before writing anything.
+
+### Lesson 21: The Serial Merge Was Slow Because of One Function
+The `worker_scaling` benchmark (PR #66, [`docs/worker-scaling.md`](worker-scaling.md)) showed that at resolution 11 the serial merge took **72% of wall time** at 4 workers. Instead of parallelising the merge, profiling found its main cost was computing each new cell's eviction latitude (`compute_cell_south_lat`, ~584 ns per cell). Moving that computation into the parallel workers (PR #82) cut the merge from **12.1 s to 2.0 s** and the stream from **18.0 s to 10.6 s**, with identical keys and output.
+
+### Lesson 22: Size Batches by Pixels, Not Chunks
+Horizon batches were `aggregation_workers × 2` chunks. With large strips or tiles, each extra worker added whole chunks of cells to the horizon map, so a three-resolution run spilled even with a 2 GiB budget, and adding workers increased peak memory. Sizing batches by pixels (about two waves of worker windows, at least one chunk; PR #85) removed that spill (**1.5× faster** at 4 workers) and kept resolution 9 with quantiles in memory under the 64 MiB default (**2.1× faster** at 4 workers). Peak horizon-map memory no longer grows with the worker count.
+
+### Lesson 23: Distributed Reads Need a Snapshot
+Long scans, and partitioned workers that read the same remote object over minutes, are exposed to object replacement: a same-size replacement of that object could mix cached metadata with another version's pixels. With PR #94, built-in HTTP reads pin the first strong ETag per URL and send `If-Match` on every later range request; a changed or missing validator, or HTTP 412, fails the read. Sources without strong ETags still work, without a snapshot guarantee.
+
+### Lesson 24: Reject Metadata You Cannot Honour
+Two more silent fallbacks became errors. A `band` the raster does not have was clamped to the last band, so `band := 5` on RGBA aggregated alpha; it now fails when the stream opens. A WKT `TOWGS84[...]` or GeoKey `2062` datum shift that the CRS parser could not carry was dropped; a nonzero shift now yields no CRS (all-zero shifts are still accepted). Calibrated or spectral values that overflow to non-finite numbers are excluded identically by the per-sample, span and quantile paths. A code audit (PR #92) found the same pattern in the decoders: a deflate chunk that decompressed short kept stale bytes from a recycled buffer, and planar multi-band TIFFs were decoded as interleaved. Both now fail when detected.
+
+### Lesson 25: Fractional Weights Need a Weighted Estimator
+Super-sampling and bbox clipping give samples fractional weights, but `stddev` divided `M2` by `W - 1`. Two pixels of 100 and 200 weighted 0.4 and 0.6 have `W = 1`, so the reported spread was 0. PR #91 switched to the reliability-weighted estimate `M2 / (W - sum(w_i^2) / W)`, which equals the old result when every weight is 1, and counts each pixel once per cell, so a pixel's influence no longer depends on how many sample points it has. The extra `sum_w2` state travels through spills and partial states (the `RH3P` encoding is now version 2), so partitioned scans stay exact.
+
+### Lesson 26: Compaction Changes Which Rows a Filter Sees
+A compacted scan filters input cells, but a user's `WHERE resolution = 7` or `count >= 150` refers to the compacted parents. Treating those predicates as exact returned no rows where filtering the output returned 27. Compacted scans now leave predicates to the engine (PR #93), and no provider pushes a `LIMIT` below a filter it cannot evaluate exactly (PR #95), since the limit could stop the scan before enough rows pass the filter.
+
+---
+
 ## Summary of Golden Engineering Rules
 
 1. **Favor Branchless Sequential Loops Over Heuristic Skipping:** On modern superscalar CPUs, exact coordinate evaluation with register-level span accumulation beats branch-heavy binary search lookahead in both speed and geodetic correctness.
@@ -194,10 +287,15 @@ All three engines produced bit-identical cell counts and identical floating-poin
 4. **Certify Eviction Envelopes Mathematically:** Never assume pixel row order equals latitude order on projected or rotated grids; evict early only when certified by rigorous analytical bounds, and spill to disk when uncertified horizons exceed memory budgets.
 5. **Push Column Projections All the Way to the Scan Kernel:** Skipping WKB polygon generation when only scalar statistics (`h3_index`, `min`, `max`, `mean`) are needed reduces output Parquet file sizes by **84% (6.2 GB → 960 MB)** and cuts total runtime by **~10–15%**.
 6. **Physical Raster Layout Multiplies Throughput by 2×:** Converting striped projected GeoTIFFs into $512 \times 512$ tiled WGS84 COGs doubles end-to-end throughput (from ~17 Mpix/s to ~35 Mpix/s) by keeping active hexagon accumulators resident in L1/L2 cache and eliminating transcendental projection math.
+7. **Count or Fail, Never Drop Silently:** Failed transforms, out-of-range bands and unsupported datum shifts must surface as a count, a warning or an error. A plausible-looking wrong answer is worse than a failed scan.
+8. **Pushdown and Partitioning Must Not Change Answers:** Every pushed filter is a superset of the rows it replaces, and every partitioned scan merges to exactly the single-scan result. Test both against an unpruned, unpartitioned reference.
+9. **Profile the Serial Section Before Parallelising It:** A serial stage that dominates wall time often has one expensive call inside it. Moving that call to the workers can be simpler, and just as effective, as parallelising the stage.
 
 ---
 
 ## Future Performance Roadmap (Post-`v0.4.0` Opportunities)
+
+> **Status (November 2026):** `P0` and `P2` shipped in `v0.5.0` (PR #47); `P1` was withdrawn. `P3`–`P5` remain open. The `v0.7.0` merge-scaling work (Lessons 21–22) came from the `worker_scaling` measurements rather than this list.
 
 Based on the CONUS Resolution 9 benchmark telemetry (`518s–596s` on WGS84 and `908s–1,067s` on Albers) and instruction-level inspection of the `v0.4.0` hot paths, the following optimizations represent the highest-leverage next steps, ranked by **Return on Investment (Impact vs. Complexity)**.
 
