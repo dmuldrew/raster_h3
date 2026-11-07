@@ -22,6 +22,8 @@ services:
   # profile so `docker compose up` doesn't build it; naming the service enables it:
   #   docker compose up --build sedona     # JupyterLab on http://localhost:8888
   #   docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py --verify
+  #   docker compose exec sedona sh -c "pip3 install --break-system-packages pytest \
+  #     && python3 -m pytest -v /opt/raster_h3/examples/tests"   # the Spark tests
   sedona:
     profiles: ["sedona"]
     build:

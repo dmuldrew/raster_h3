@@ -33,7 +33,6 @@ from typing import Iterator, List
 
 import pyarrow as pa
 import pyarrow.compute as pc
-from sedona.spark import SedonaContext
 
 # Spark has no unsigned integer types, so the Arrow output is narrowed to signed ones.
 # H3 cell indexes never set the top bit, so UInt64 -> Int64 keeps every value.
@@ -197,6 +196,50 @@ def verify(cells, paths: List[str], resolutions: List[int]) -> None:
         print(f"verified {path}: {len(a)} cells identical to a single scan (max differences: {detail})")
 
 
+def sedona_session(master: str, shuffle_partitions: int):
+    """A Spark session with Sedona's SQL functions registered."""
+    from sedona.spark import SedonaContext
+
+    config = (
+        SedonaContext.builder()
+        .master(master)
+        .appName("raster_h3 partitioned scan on Sedona")
+        .config("spark.sql.shuffle.partitions", str(max(1, shuffle_partitions)))
+        .getOrCreate()
+    )
+    return SedonaContext.create(config)
+
+
+def plan(paths: List[str], target_chunks: int) -> List[tuple]:
+    """Plan on the driver, from metadata only: one (path, spec) task per partition."""
+    import raster_h3
+
+    return [(p, spec) for p in paths for spec in raster_h3.plan_partitions(p, target_chunks=target_chunks)]
+
+
+def distributed_cells(spark, tasks: List[tuple], resolutions: List[int]):
+    """Scan every partition in its own Spark task and merge the edge cells.
+
+    Returns `(cells, final, partial)`: the merged cells without `partial_state`, the rows
+    that came out final from their partition, and the partial rows that were merged.
+    """
+    # Scan: one task per partition.
+    specs = spark.createDataFrame(tasks, "path string, spec string").repartition(max(1, len(tasks)))
+    scanned = specs.mapInArrow(scan_partitions(resolutions), SPARK_SCHEMA).cache()
+
+    # Merge: final cells pass through; boundary cells are shuffled by cell and merged.
+    final = scanned.where("partial_state IS NULL")
+    partial = scanned.where("partial_state IS NOT NULL")
+    merged = partial.repartition("path", "h3_index").mapInArrow(merge_boundary_cells, SPARK_SCHEMA)
+    cells = final.unionByName(merged).drop("partial_state").cache()
+    return cells, final, partial
+
+
+def register_cells(spark, cells, view: str = "cells") -> None:
+    """Expose the cells to Sedona SQL with a `geom` column built from raster_h3's WKB."""
+    cells.selectExpr("*", "ST_GeomFromWKB(wkb) AS geom").drop("wkb").createOrReplaceTempView(view)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("paths", nargs="*", help="GeoTIFF paths or glob patterns (visible to every executor)")
@@ -206,8 +249,6 @@ def main() -> None:
     args = parser.parse_args()
     resolutions = [int(r) for r in args.resolutions.split(",")]
 
-    import raster_h3
-
     paths = sorted({p for pattern in args.paths for p in (glob.glob(pattern) or [pattern])})
     if not paths:
         sample = os.path.join(tempfile.gettempdir(), "raster_h3_demo_terrain.tif")
@@ -216,27 +257,13 @@ def main() -> None:
         paths = [sample]
 
     # 1. Plan on the driver: metadata only.
-    tasks = [(p, spec) for p in paths for spec in raster_h3.plan_partitions(p, target_chunks=args.target_chunks)]
+    tasks = plan(paths, args.target_chunks)
     print(f"{len(paths)} raster(s) planned into {len(tasks)} partitions of ~{args.target_chunks} chunks")
 
-    config = (
-        SedonaContext.builder()
-        .master(os.environ.get("SPARK_MASTER", "local[*]"))
-        .appName("raster_h3 partitioned scan on Sedona")
-        .config("spark.sql.shuffle.partitions", str(max(1, len(tasks))))
-        .getOrCreate()
-    )
-    sedona = SedonaContext.create(config)
+    sedona = sedona_session(os.environ.get("SPARK_MASTER", "local[*]"), len(tasks))
 
-    # 2. Scan: one task per partition.
-    specs = sedona.createDataFrame(tasks, "path string, spec string").repartition(len(tasks))
-    scanned = specs.mapInArrow(scan_partitions(resolutions), SPARK_SCHEMA).cache()
-
-    # 3. Merge: final cells pass through; boundary cells are shuffled by cell and merged.
-    final = scanned.where("partial_state IS NULL")
-    partial = scanned.where("partial_state IS NOT NULL")
-    merged = partial.repartition("path", "h3_index").mapInArrow(merge_boundary_cells, SPARK_SCHEMA)
-    cells = final.unionByName(merged).drop("partial_state").cache()
+    # 2-3. Scan each partition in its own task, then merge the boundary cells.
+    cells, final, partial = distributed_cells(sedona, tasks, resolutions)
 
     n_final, n_partial, n_cells = final.count(), partial.count(), cells.count()
     print(
@@ -247,7 +274,7 @@ def main() -> None:
         verify(cells, paths, resolutions)
 
     # 4. Query with Sedona.
-    cells.selectExpr("*", "ST_GeomFromWKB(wkb) AS geom").drop("wkb").createOrReplaceTempView("cells")
+    register_cells(sedona, cells)
     sedona.sql(
         "SELECT path, resolution, count(*) AS cells, round(avg(mean), 2) AS avg_mean, "
         "round(min(min), 2) AS min, round(max(max), 2) AS max "
