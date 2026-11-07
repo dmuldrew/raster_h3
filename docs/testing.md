@@ -20,6 +20,8 @@ explains how to run each group and what CI runs. The counts below are the number
 | Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 256 |
 | [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 7 modules | 84 |
 | [`crates/raster-h3-sedona/python/tests/`](../crates/raster-h3-sedona/python/tests) (`sedona-pytest/…`, needs the `sedonadb` 0.5.0 wheel) | 1 module | 14 |
+| [`examples/sedona_spark/tests/`](../examples/sedona_spark/tests) (`spark/…`, needs PySpark, Apache Sedona and `raster_h3`, as in the `sedona` image) | 2 modules | 17 (23 cases) |
+| [`crates/raster-h3-python/tests/spark/`](../crates/raster-h3-python/tests/spark) (`spark41/…`, needs PySpark 4.1+ and `raster_h3`) | 1 module | 4 (12 cases) |
 | [`crates/raster-h3-python/tests/wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | 1 script | — |
 
 Each crate links one integration test binary, `tests/it/main.rs`, with one module per
@@ -314,7 +316,7 @@ See [DataFusion](engines/datafusion.md).
 
 ## 20. SedonaDB
 
-`raster-h3-sedona` is a standalone workspace pinned to SedonaDB's DataFusion; its suites run in the `sedona-adapter` CI job. Apache Sedona on Spark does not use this adapter: it reads cells from the Python package, and its manual end-to-end check is listed under [Partitioned scans](#26-partitioned-scans).
+`raster-h3-sedona` is a standalone workspace pinned to SedonaDB's DataFusion; its suites run in the `sedona-adapter` CI job. Apache Sedona on Spark does not use this adapter: it reads cells from the Python package, and its tests, which run in the `sedona-spark` CI job, are listed under [Partitioned scans](#26-partitioned-scans).
 
 | Suite | What it checks |
 | :--- | :--- |
@@ -347,7 +349,7 @@ The `raster-h3-python` C ABI is tested from Rust; the `raster_h3` package is tes
 | [`pytest/test_parquet_export.py`](../crates/raster-h3-python/tests/pytest/test_parquet_export.py) (1) | `raster_to_parquet` output opens with Polars' native Parquet reader. |
 | [`wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | After `cibuildwheel` installs a wheel: the bundled library loads, Arrow/Polars paths work, `raster-h3-cli` is on `PATH`, and `h3_polygon_to_cells` handles a cell boundary and invalid resolution. |
 
-Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); partitioned scans, including the Apache Sedona (Spark) demo, in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); partitioned scans, including Apache Sedona (Spark), in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
 
 See [Python & Polars](engines/python-polars.md).
 
@@ -450,9 +452,12 @@ in every engine.
 | [`python/partitions.rs`](../crates/raster-h3-python/tests/it/partitions.rs) (5) | Through the C ABI: continuous and categorical partitions merge to a single scan; unsupported options are rejected; the merge accepts the scan's projection including `partial_state`, and rejects rows without a state. |
 | [`pytest/test_partitions.py`](../crates/raster-h3-python/tests/pytest/test_partitions.py) (11) | `plan_partitions`, `RasterH3ArrowStream(partition=...)` and `merge_partials` from Python: continuous and categorical parity, projection through the merge, Spark-style types (signed `h3_index`, `int16` resolution), batch and dict output, a warning for dropped samples, scan options and filters surviving the merge, and misuse errors. |
 | [`root/duckdb_sql_smoke.rs`](../tests/it/duckdb_sql_smoke.rs) | `real_sql_partitioned_scans_merge_to_the_single_scan` (ignored): the same through real DuckDB SQL. |
-| [`sedona_spark/raster_h3_spark_demo.py`](../examples/sedona_spark/raster_h3_spark_demo.py) `--verify` (manual) | On Apache Sedona (Spark) in the `sedona` Docker service: the driver plans partitions, each Spark task scans one through `mapInArrow`, edge cells are shuffled by `h3_index` and merged with `merge_partials`, and `--verify` compares the union with one unpartitioned scan of each raster: the same cells, each exactly once, statistics within 1e-9 relative (summation order) and identical WKB. Then queries the cells with Sedona's `ST_GeomFromWKB` / `ST_H3CellIDs`. Uses a generated tiled raster unless paths are given. |
+| [`spark/test_datasource.py`](../examples/sedona_spark/tests/test_datasource.py) (11, 16 cases) | The Spark 4 `raster_h3` data source (`raster_h3.spark`) against one unpartitioned scan with the same options: one Spark partition per planned partition, signed types, and `merge_partials` (scanning the raster once) equal to a single scan at two resolutions; the `raster_h3_merge` SQL table function on continuous data, with quantiles, filters and one hash bucket, and on categorical data it recognises, and its errors (a table without `partial_state`, unknown or malformed options); the `read` helper carrying quantiles, a projection and cell filters into the merge; categorical wide data with `min_majority_fraction`; a single partition with no partial rows; `CREATE TEMPORARY VIEW ... USING raster_h3` from SQL with Sedona reading the WKB and agreeing on cell ids; unknown or malformed options and scan errors (an invalid resolution) reach the caller. |
+| [`spark41/test_pushdown.py`](../crates/raster-h3-python/tests/spark/test_pushdown.py) (4, 12 cases) | Spark 4.1 filter pushdown: `resolution` comparisons (`=`, `IN`, ranges) and `partial_state IS [NOT] NULL` leave Spark's plan and give the same rows as Spark evaluating them (values within 1e-9 relative: fewer resolutions change summation order); statistic filters and `OR`s stay in the plan; a pushed scan merges like a narrower scan, also through a SQL view; filters that exclude everything scan nothing; `register` follows `spark.sql.python.filterPushdown.enabled`. |
+| [`spark/test_spark_partitions.py`](../examples/sedona_spark/tests/test_spark_partitions.py) (6, 7 cases) | On local Spark (`local[2]`) with Apache Sedona, through the [demo](../examples/sedona_spark/raster_h3_spark_demo.py)'s own pipeline: the driver plans partitions, each Spark task scans one through `mapInArrow`, edge cells are shuffled by `h3_index` and merged with `merge_partials`. The demo's `verify` compares the union with one unpartitioned scan of each raster (the same cells, each exactly once, statistics within 1e-9 relative, identical WKB) for one tiled raster in 9 partitions at resolution 9 and at 7–9 (asserting that edge cells were merged), two overlapping rasters that share cell ids (merged separately per file), and a raster in one partition (nothing to merge); `verify` fails when the merged cells are dropped. Sedona reads raster_h3's WKB as valid geometry, and its H3 functions agree on every cell: `ST_H3CellIDs` of each centroid is that cell and `ST_H3ToGeom` centroids differ by under 1e-9°. The command-line demo runs end to end with `--verify` and its Sedona SQL. |
 
-See [Raster H3 Core](engines/core.md) for the protocol and its measured overhead.
+See [Raster H3 Core](engines/core.md) for the protocol and its measured overhead, and
+[Spark & Apache Sedona](engines/spark.md) for the Spark pipeline.
 
 ## Running the Tests
 
@@ -491,6 +496,17 @@ python -m pip install target/wheels/*.whl pytest pandas geoarrow-pyarrow "sedona
 python -m pytest
 ```
 
+The Apache Sedona (Spark) tests run inside the `sedona` image, as CI does (about 30 s once
+the image is built). To run them on a multi-container standalone cluster instead (driver
+and executors in separate containers), see
+[Spark & Apache Sedona](engines/spark.md#a-local-multi-node-cluster).
+
+```bash
+docker build -f Dockerfile.sedona -t raster_h3-sedona .
+docker run --rm -v "$PWD/examples/sedona_spark:/opt/raster_h3/examples" raster_h3-sedona sh -c \
+  "pip3 install --break-system-packages pytest && python3 -m pytest -v /opt/raster_h3/examples/tests"
+```
+
 Use `--release` for anything that streams real data; debug builds are much slower.
 
 ### Gated tests
@@ -503,7 +519,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `super_sampling::benchmark_supersampling` (core) | `#[ignore]` | `cargo test --release -p raster-h3-core --test it benchmark_supersampling -- --ignored --nocapture` |
 | `pg/fmgr.rs` (8) and the `fmgr.rs` unit tests | `--features pg-extension`; needs `RASTER_H3_PG_MAJOR` or `pg_config` on `PATH` | `RASTER_H3_PG_MAJOR=16 cargo test -p raster-h3-pg --features pg-extension` |
 | `sedona/sedona.rs` (5) | `--features sedona-e2e`; compiles SedonaDB from git | `cargo test --features sedona-e2e` in `crates/raster-h3-sedona` |
-| Apache Sedona (Spark) demo `--verify` | Manual; needs Docker and the `sedona` compose profile (Apache Sedona 1.9.1 image with the locally built wheel) | `docker compose up --build sedona`, then `docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py --verify` |
+| `examples/sedona_spark/tests` | Skipped unless PySpark, Apache Sedona (Python package and jars), `raster_h3` and NumPy are importable, so they run only in the `sedona` image | See [Running the Tests](#running-the-tests); the demo alone: `docker compose up --build sedona`, then `docker compose exec sedona python3 /opt/raster_h3/examples/raster_h3_spark_demo.py --verify` |
 | DuckDB part of `multi_engine_e2e` | Skipped when `duckdb --version` fails | Put the DuckDB CLI on `PATH` |
 | `crates/raster-h3-python/tests/pytest` | Each module skips when `polars` or `pyarrow` is missing; `test_polars_scan.py` also skips without `polars.io.plugins` (Polars < 1.4), the `h3` reference checks skip without `h3`, the `pl.from_arrow(stream)` check skips on Polars without PyCapsule support, and the string-predicate case skips on Polars < 1.22 (it drops such predicates on IO sources) | `pip install pytest polars pyarrow h3` and build the cdylib |
 | Python part of `multi_engine_e2e` | Runs `/usr/bin/python3`; the test fails if that path is absent | Run on a system with `/usr/bin/python3` |
@@ -517,6 +533,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
 | `ci.yml` (`test-crates`, Linux) | `cargo test --release -p raster-h3-core -p raster-h3-duckdb -p raster-h3-datafusion -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
 | `ci.yml` (`sedona-adapter`, Linux) | `cargo test --locked --no-fail-fast` in `crates/raster-h3-sedona`, Clippy on the Python bindings, then a built wheel tested with `pytest` against `sedonadb==0.5.0` | The standalone SedonaDB adapter workspace (without `sedona-e2e`) and its Python bindings |
+| `ci.yml` (`sedona-spark`, Linux) | `docker build -f Dockerfile.sedona`, then `pytest /opt/raster_h3/examples/tests` in the image with `SPARK_MASTER=local[2]`, and `pytest crates/raster-h3-python/tests/spark` with PySpark 4.1 installed beside the image's Spark 4.0 | Partitioned scans on real Spark with Apache Sedona, the Sedona SQL interop and the demo; also that the `sedona` image builds |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
 | [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets and scoped Arrow Miri tests | Malformed input, sanitizer smoke checks, and FFI ownership; longer fuzz runs weekly |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
@@ -543,8 +560,9 @@ name any branch, even one without the file.
 - CLI, DataFusion, Python and PostgreSQL unit/integration suites run on Linux in CI;
   their cross-platform coverage is through the root parity tests or the manual workflow.
 - The real PostgreSQL test, the Hawaii-dataset tests and the `sedona-e2e` suite never run in CI.
-- Partitioned scans on real Spark are checked only by the manual Apache Sedona demo; CI covers
-  Spark's signed `h3_index` / `int16` resolution types through `pytest/test_partitions.py`, without Spark.
+- CI runs the Spark tests in local mode (`local[2]`). They also pass (23/23) on the local
+  multi-container standalone cluster of the `spark-cluster` Compose profile, with executors
+  in separate containers, but that is run by hand, and no test runs on separate machines.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - EPSG:6933 and EPSG:7856 have no coverage tests.
 
