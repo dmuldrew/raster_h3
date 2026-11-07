@@ -291,7 +291,7 @@ Built-in HTTP/S3 reads pin strong ETags per URL and use `If-Match`, failing if t
 object changes during a scan. Rust `HttpTransport` clones share each URL's pin:
 changing `url` selects an independent validator, and returning to a previous URL
 retains its original pin. Servers with weak or missing ETags have no snapshot
-guarantee; use immutable/versioned URLs. See [remote COG streaming](docs/engines/core.md#cloud-optimized-geotiff-cog-streaming).
+guarantee; use immutable/versioned URLs. See [remote COG streaming](docs/engines/core.md#remote-cog-prefetching).
 
 ---
 
