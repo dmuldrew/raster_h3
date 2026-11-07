@@ -50,9 +50,14 @@ its own raster, so the suites need no downloaded data. The few exceptions are li
 16. [GeoParquet export](#16-geoparquet-export)
 17. [PMTiles & MVT export](#17-pmtiles--mvt-export)
 18. [DuckDB extension](#18-duckdb-extension)
-19. [Other engines & cross-engine parity](#19-other-engines--cross-engine-parity)
-20. [Performance guards & benchmarks](#20-performance-guards--benchmarks)
-21. [Partitioned scans](#21-partitioned-scans)
+19. [DataFusion](#19-datafusion)
+20. [SedonaDB](#20-sedonadb)
+21. [Python & Polars](#21-python--polars)
+22. [PostgreSQL](#22-postgresql)
+23. [CLI](#23-cli)
+24. [Cross-engine parity](#24-cross-engine-parity)
+25. [Performance guards & benchmarks](#25-performance-guards--benchmarks)
+26. [Partitioned scans](#26-partitioned-scans)
 
 The former catch-all `tests/test_raster_h3.rs` (58 tests) was split by topic; rows that
 list individual test names come from it or from a suite that mostly covers another category.
@@ -285,46 +290,103 @@ See [PMTiles & Multi-Resolution](pmtiles.md).
 | [`root/package_extension.rs`](../tests/it/package_extension.rs) (6) | Extension footer layout: custom section headers, ABI fields, version and platform strings (including `v2.0.0`) and `--print-platform` parity, zeroed signature, gzip output, 1 MiB chunked SHA-256 RSA-2048 signing and verification, tamper and mismatched-key rejection, inline PEM env-var signing, and DuckDB 2.0 `.well-known/duckdb-extension-repo.json` manifest generation. |
 | Unit: `raster-h3-duckdb` (28) | `ffi/duckdb_c.rs` (9: `duckdb_string_t` layout), `ffi/mod.rs` (3), `bind_utils/parsing.rs` (6), `bind_helper.rs` (2), `chunk_writer.rs` (3), `record_queue.rs` (1), `scalar.rs` (4). |
 
+Also covered elsewhere: bbox pushdown in [§8](#8-bands-spectral-indices--pushdown); record queue and prefetch resilience in [§11](#11-failure-propagation--resilience); WKB and `GEOMETRY` output in [§15](#15-geometry-encoding-wkb); partitioned scans in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
 See [DuckDB](engines/duckdb.md).
 
-## 19. Other engines & cross-engine parity
+## 19. DataFusion
+
+The `raster-h3-datafusion` table providers must return what a core batch reader returns for the same configuration, with every pushed filter either exact or left to DataFusion.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
-| [`root/pg_extension_e2e.rs`](../tests/it/pg_extension_e2e.rs) (1, ignored) | Builds the PostgreSQL module in Docker, loads it into `postgres:<major>` for each `RASTER_H3_PG_VERSIONS`, compares `psql` output with in-process SRFs and checks that bad `bbox`/`h3_res` raise SQL errors without breaking the session. |
-| Unit: `raster-h3-core` columnar (6), `scalar_ops.rs` (6) | Arrow C stream round trip, release callback null-safety/idempotence, cross-thread owned export release, `RH3IPC01` round trip, scalar helpers. |
 | [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) (8) | Each `ContinuousRasterTableProvider` builder option equals a core `ContinuousBatchReader` run with the same config and changes the output: `with_nodata` (drops exactly the matching pixels), `with_sampling`, `with_band` (0 clamps to 1), `with_spectral_formula`, `with_quantiles` (extra columns, projectable), `with_min_count`/`with_min_mean`/`with_max_mean` intersected with pushed `MinCount`/`MinMean`/`MaxMean` (the stricter bound wins), `with_compact` (mass conserved; adjacent resolutions rejected), `with_overlap_rule` on a two-file source. |
 | [`datafusion/categorical_options.rs`](../crates/raster-h3-datafusion/tests/it/categorical_options.rs) (3) | `CategoricalRasterTableProvider` `with_nodata`, `with_remapper` (wide and long) and `with_min_majority_fraction` / `with_min_count` intersected with pushed filters, against `CategoricalBatchReader`. |
 | [`datafusion/statistics.rs`](../crates/raster-h3-datafusion/tests/it/statistics.rs) (3) | `statistics()` returns the inexact core cardinality estimate for both providers, grows with resolution, resolution count and mosaic files, stays within 4× of the real row count, and falls back to 10 000 per resolution for unreadable rasters. |
 | [`datafusion/scalar_udfs.rs`](../crates/raster-h3-datafusion/tests/it/scalar_udfs.rs) (3) | `string_to_h3`, `h3_to_lat`, `h3_to_lng` against `h3o` and the core scalars on cells near the poles, the antimeridian and a pentagon: validity pass-through, NaN for invalid cells, type errors, round trip back to the same cell. |
 | [`datafusion/compaction_pushdown.rs`](../crates/raster-h3-datafusion/tests/it/compaction_pushdown.rs) (2) | With `compact` or `compact_h3_children` set, every predicate reports `Unsupported` and `scan` emits the unfiltered compacted table: residual resolution and aggregate filters see completed parent rows, and `limit` is spent only after them — for both providers (categorical in wide and long formats). |
 | [`datafusion/bbox_pushdown.rs`](../crates/raster-h3-datafusion/tests/it/bbox_pushdown.rs) (5) | A pushed `Bbox` keeps edge cells whole (continuous and categorical statistics equal an unpruned scan); compacted scans ignore it; `LIMIT` is not spent on cells outside the box; a box off the raster scans empty. |
+| Unit: `raster-h3-datafusion` (6) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
+
+Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); overlap rules in [§14](#14-mosaics--overlap-rules); partitioned scans in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [DataFusion](engines/datafusion.md).
+
+## 20. SedonaDB
+
+`raster-h3-sedona` is a standalone workspace pinned to SedonaDB's DataFusion; its suites run in the `sedona-adapter` CI job.
+
+| Suite | What it checks |
+| :--- | :--- |
 | [`sedona/sql.rs`](../crates/raster-h3-sedona/tests/sql.rs) (12) | Real DataFusion SQL over continuous/categorical tables, including compacted parent resolution/count filters with `LIMIT`. Direct scans with small batches cover both compaction flags, strict comparisons, partially translated `BETWEEN`, unsupported and mixed predicates: reader and execution-plan limits are deferred for residual filters, while unfiltered/exact scans retain limit pushdown. |
 | [`sedona/pushdown_correctness.rs`](../crates/raster-h3-sedona/tests/pushdown_correctness.rs) (6) | Many random query geometries through envelope-only `st_intersects` / `st_dwithin` stand-ins: every column of every matching row equals the same filter over a materialised table, on lon/lat, UTM, Web Mercator and high-latitude rasters, multiple resolutions and categorical data. |
 | [`sedona/extension_abi.rs`](../crates/raster-h3-sedona/tests/extension_abi.rs) (2) | `RasterH3Table` exported through SedonaDB's C extension ABI and imported back scans like the original, and spatial pushdown survives the round trip. |
 | [`sedona/sedona.rs`](../crates/raster-h3-sedona/tests/sedona.rs) (5, `sedona-e2e` only) | Inside a real `SedonaContext`: cells read as lon/lat geometry, Sedona's `ST_*` predicates on raster cells, bbox pushdown keeps edge cells whole, `ST_DWithin` and `h3_to_wkb` predicates match an unpruned scan, and a spatial query copies to PMTiles. |
-| [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs) (10) | The built `raster-h3-cli` binary against core readers and exporters: `--bbox`, `--nodata` and `--limit` change the output exactly as the core config does; stdout (no `-o`, `-o -`) equals file output; projected JSONL and categorical long format; categorical Parquet rows and a categorical PMTiles archive byte-identical to the core tiler; unknown subcommands, bad options and missing, non-TIFF or corrupt inputs exit non-zero with a stderr message. `parquet-to-pmtiles` round trips the CLI Parquet export, reads a nullable hex column under a custom name and reports skipped null/invalid rows on stderr, and rejects bad invocations. |
+| Unit: `raster-h3-sedona` (12) | `spatial.rs` (5): WKB envelopes of points, lines and collections, malformed and empty WKB, clamping a grown envelope to the lon/lat range, predicate-to-envelope translation and CRS metadata; `filters.rs` (2): continuous and categorical comparison pushdown; `pmtiles.rs` (5): property names and native types, H3 column types and selection, zoom filtering, invalid cells and schemas, `COPY` options. |
+| [`sedona-pytest/test_sedonadb.py`](../crates/raster-h3-sedona/python/tests/test_sedonadb.py) (14) | `raster_h3_sedona.RasterH3Table` scanned by the `sedonadb` wheel through its table-provider capsule: projection, limit and count; cells as Sedona geometry; spatial filters equal an unpruned scan, prune it across the extension ABI, and return nothing off the raster; scalar UDF registration; `h3_polygon_to_cells` joins and rejects projected geometry; categorical tables; invalid arguments; `write_pmtiles` from SedonaDB queries and Arrow sources, and its errors. |
+
+Also covered elsewhere: PMTiles `COPY` in [§17](#17-pmtiles--mvt-export); partitioned scans in [§26](#26-partitioned-scans).
+
+See [DataFusion](engines/datafusion.md) for the SedonaDB adapter.
+
+## 21. Python & Polars
+
+The `raster-h3-python` C ABI is tested from Rust; the `raster_h3` package is tested with pytest against the locally built library.
+
+| Suite | What it checks |
+| :--- | :--- |
 | [`python/batch_reader.rs`](../crates/raster-h3-python/tests/it/batch_reader.rs) (3) | `raster_h3_py_open_batch_reader` / `_batch_reader_next` / `_free_batch_reader`: one bounded batch per stream, rows equal to core, projection, limit, categorical long, NULL-reader and open errors, early free. |
 | [`python/c_abi.rs`](../crates/raster-h3-python/tests/it/c_abi.rs) (5) | `raster_h3_py_scan_json` columns equal core output with NoData, bbox, CRS, projection, limit, categorical wide/long; errors set `out_err`, including malformed bbox, resolutions and format, which are rejected rather than ignored or defaulted. |
 | [`python/exports.rs`](../crates/raster-h3-python/tests/it/exports.rs) (3) | `raster_h3_py_export_parquet` / `_pmtiles` error paths return `-1` with a message and no output; successful exports return core row counts and PMTiles bytes identical to the core tiler. Exports report transform failures. |
 | [`python/scalars.rs`](../crates/raster-h3-python/tests/it/scalars.rs) (2) | `raster_h3_py_h3_is_valid_str` and `raster_h3_py_h3_cell_to_parent_str` against `h3o` and their `u64` variants. |
-| [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) (4) | `PgCategoricalSrf` with resolution, CRS, NoData and bbox options against `CategoricalBatchReader`; the `pg_srf_continuous_*` C-ABI lifecycle with options, WKB (including the full 189-byte boundary of an odd-resolution pentagon) and hex columns, NULL handles and errors. |
-| [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) (8, `pg-extension` only) | The V1 `fmgr` entry points in process, against server stand-ins in [`pg/fmgr/server.rs`](../crates/raster-h3-pg/tests/it/fmgr/server.rs) (`palloc`, `funcapi` multi-call helpers, reset callbacks): `pg_h3_to_string`, `pg_string_to_h3` (1- and 4-byte varlena headers), `pg_h3_is_valid_text`, `pg_h3_to_wkb`, the finfo records and magic block, and the categorical and continuous value-per-call SRFs against core output, including state release on early termination. Error reporting (`ereport` longjmps) is left to `root/pg_extension_e2e.rs`. The SRFs raise a `WARNING` when failed transforms drop samples. |
-| Unit: `raster-h3-datafusion` (6) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
-| Unit: `raster-h3-cli` (2) | Argument validation, IPC and JSONL output. |
-| Unit: `raster-h3-python` (4), `raster-h3-pg` (4 + 3 in `fmgr.rs`) | C-ABI helpers and SRF iterators. The `fmgr.rs` tests only compile with `--features pg-extension`. |
+| Unit: `raster-h3-python` (4) | C-ABI helpers. |
 | [`pytest/test_arrow_stream.py`](../crates/raster-h3-python/tests/pytest/test_arrow_stream.py) (12) | The in-tree `raster_h3` package with the locally built cdylib, read by real PyArrow and Polars: continuous `h3_index`/`count`/`sum`/`min`/`max`/`mean` equal an independent reference that indexes every pixel centre with the `h3` package; `pl.from_arrow`, `to_polars()`, `read_raster_h3` and `iter_batches` equal `pyarrow.table` on `RasterH3ArrowStream` (`__arrow_c_stream__`), and `pyarrow.schema` (`__arrow_c_schema__`) equals the stream schema; `columns` and `limit`; categorical long counts/fractions and wide majority class/count/fraction against the `h3` reference; missing files, non-TIFF input, unknown columns and a non-intersecting bbox raise `RuntimeError`. |
 | [`pytest/test_polars_scan.py`](../crates/raster-h3-python/tests/pytest/test_polars_scan.py) (12) | `scan_raster_h3` as a Polars IO source (`register_io_source`, Polars ≥ 1.4): projection pushdown opens the native scan with only the selected columns; predicate pushdown (numeric, combined, string, `is_in` on `h3_index`) and `head(n)` (pushed as the scan limit), `head` after `filter`, and the `limit`/`columns` arguments give the same rows as the eager full scan filtered in Polars; empty results keep the schema; categorical wide/long pushdown; scan errors and unknown columns raise. |
 | [`pytest/test_scan_options.py`](../crates/raster-h3-python/tests/pytest/test_scan_options.py) (23) | The `_v2` scan options against values computed independently from pixels and the `h3` package: `band` (default, beyond the raster, below one, non-int), spectral formulas and their bands, `sampling`, `overlap_rule` (including in `plan_partitions`), `min_majority_fraction`; every option reaches every scan path; `parquet_to_pmtiles` with default, named and missing hex columns. |
 | [`pytest/test_scan_filters.py`](../crates/raster-h3-python/tests/pytest/test_scan_filters.py) (21) | Quantile columns (specs, projection, exact single-pixel quantiles, Arrow schema, errors), `remap` (merging, dropping, pass-through, errors), the `min_count` / `min_mean` / `max_mean` filters, and Polars predicate pushdown into them: rows equal a full scan filtered in Polars, and the opened scan carries the pushed options. Resolution predicates narrow the scan but keep invalid resolutions an error; older native libraries fall back to Polars-only filtering. |
 | [`pytest/test_parquet_export.py`](../crates/raster-h3-python/tests/pytest/test_parquet_export.py) (1) | `raster_to_parquet` output opens with Polars' native Parquet reader. |
-| [`sedona-pytest/test_sedonadb.py`](../crates/raster-h3-sedona/python/tests/test_sedonadb.py) (14) | `raster_h3_sedona.RasterH3Table` scanned by the `sedonadb` wheel through its table-provider capsule: projection, limit and count; cells as Sedona geometry; spatial filters equal an unpruned scan, prune it across the extension ABI, and return nothing off the raster; scalar UDF registration; `h3_polygon_to_cells` joins and rejects projected geometry; categorical tables; invalid arguments; `write_pmtiles` from SedonaDB queries and Arrow sources, and its errors. |
 | [`wheel_smoke.py`](../crates/raster-h3-python/tests/wheel_smoke.py) | After `cibuildwheel` installs a wheel: the bundled library loads, Arrow/Polars paths work, `raster-h3-cli` is on `PATH`, and `h3_polygon_to_cells` handles a cell boundary and invalid resolution. |
+
+Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); partitioned scans in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [Python & Polars](engines/python-polars.md).
+
+## 22. PostgreSQL
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) (4) | `PgCategoricalSrf` with resolution, CRS, NoData and bbox options against `CategoricalBatchReader`; the `pg_srf_continuous_*` C-ABI lifecycle with options, WKB (including the full 189-byte boundary of an odd-resolution pentagon) and hex columns, NULL handles and errors. |
+| [`pg/fmgr.rs`](../crates/raster-h3-pg/tests/it/fmgr.rs) (8, `pg-extension` only) | The V1 `fmgr` entry points in process, against server stand-ins in [`pg/fmgr/server.rs`](../crates/raster-h3-pg/tests/it/fmgr/server.rs) (`palloc`, `funcapi` multi-call helpers, reset callbacks): `pg_h3_to_string`, `pg_string_to_h3` (1- and 4-byte varlena headers), `pg_h3_is_valid_text`, `pg_h3_to_wkb`, the finfo records and magic block, and the categorical and continuous value-per-call SRFs against core output, including state release on early termination. Error reporting (`ereport` longjmps) is left to `root/pg_extension_e2e.rs`. The SRFs raise a `WARNING` when failed transforms drop samples. |
+| Unit: `raster-h3-pg` (4 + 3 in `fmgr.rs`) | SRF iterators. The `fmgr.rs` tests only compile with `--features pg-extension`. |
+| [`root/pg_extension_e2e.rs`](../tests/it/pg_extension_e2e.rs) (1, ignored) | Builds the PostgreSQL module in Docker, loads it into `postgres:<major>` for each `RASTER_H3_PG_VERSIONS`, compares `psql` output with in-process SRFs and checks that bad `bbox`/`h3_res` raise SQL errors without breaking the session. |
+
+Also covered elsewhere: cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [PostgreSQL](engines/postgresql.md).
+
+## 23. CLI
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs) (10) | The built `raster-h3-cli` binary against core readers and exporters: `--bbox`, `--nodata` and `--limit` change the output exactly as the core config does; stdout (no `-o`, `-o -`) equals file output; projected JSONL and categorical long format; categorical Parquet rows and a categorical PMTiles archive byte-identical to the core tiler; unknown subcommands, bad options and missing, non-TIFF or corrupt inputs exit non-zero with a stderr message. `parquet-to-pmtiles` round trips the CLI Parquet export, reads a nullable hex column under a custom name and reports skipped null/invalid rows on stderr, and rejects bad invocations. |
+| Unit: `raster-h3-cli` (2) | Argument validation, IPC and JSONL output. |
+
+Also covered elsewhere: partitioned fan-outs in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
+
+See [CLI](engines/cli.md).
+
+## 24. Cross-engine parity
+
+One raster, every engine: per-cell results must agree.
+
+| Suite | What it checks |
+| :--- | :--- |
+| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
+| Unit: `raster-h3-core` columnar (6), `scalar_ops.rs` (6) | Arrow C stream round trip, release callback null-safety/idempotence, cross-thread owned export release, `RH3IPC01` round trip, scalar helpers. |
 
 See the [engine deep dives](engines/README.md).
 
-## 20. Performance guards & benchmarks
+## 25. Performance guards & benchmarks
 
 | Suite | What it checks |
 | :--- | :--- |
@@ -374,7 +436,7 @@ report security-sensitive findings privately per [SECURITY.md](../SECURITY.md).
 
 ---
 
-## 21. Partitioned scans
+## 26. Partitioned scans
 
 A partitioned scan merged from its parts must equal one unpartitioned scan, cell for cell,
 in every engine.
