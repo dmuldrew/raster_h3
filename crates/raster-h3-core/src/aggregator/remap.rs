@@ -262,8 +262,20 @@ fn parse_target(s: &str) -> Result<Option<i64>> {
 }
 
 fn parse_source_rules(src: &str, target: Option<i64>, rules: &mut Vec<RemapRule>) -> Result<()> {
-    // 1. Check for list in brackets: [101, 102, 103]
-    let trimmed = src.trim();
+    // 1. Check for list in brackets: [101, 102, 103]. Nested single-element
+    //    wrappers are collapsed iteratively so a pathological input like
+    //    '[[[[…]]]]' cannot exhaust the call stack.
+    let mut trimmed = src.trim();
+    while trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if !(inner.starts_with('[')
+            && inner.ends_with(']')
+            && !inner[1..inner.len() - 1].contains(','))
+        {
+            break;
+        }
+        trimmed = inner;
+    }
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         let inner = &trimmed[1..trimmed.len() - 1];
         for part in inner.split(',') {
@@ -295,8 +307,9 @@ fn parse_source_rules(src: &str, target: Option<i64>, rules: &mut Vec<RemapRule>
         return Ok(());
     }
 
-    // Check hyphen range: e.g. "101-109" (ensure hyphen is not leading negative sign)
-    if let Some(dash_pos) = trimmed[1..].find('-') {
+    // Check hyphen range: e.g. "101-109" (ensure hyphen is not leading negative sign).
+    // `get(1..)` returns None for an empty token or a multi-byte first char.
+    if let Some(dash_pos) = trimmed.get(1..).and_then(|rest| rest.find('-')) {
         let actual_pos = dash_pos + 1;
         let left = trimmed[..actual_pos].trim();
         let right = trimmed[actual_pos + 1..].trim();

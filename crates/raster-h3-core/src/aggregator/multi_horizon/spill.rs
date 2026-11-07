@@ -53,7 +53,14 @@ fn count(input: &mut impl Read, limit: usize) -> io::Result<usize> {
 
 impl SpillAccumulator for H3Accumulator {
     fn write_state(&self, out: &mut impl Write) -> io::Result<()> {
-        for v in [self.sum, self.count, self.min, self.max, self.m2] {
+        for v in [
+            self.sum,
+            self.count,
+            self.sum_w2,
+            self.min,
+            self.max,
+            self.m2,
+        ] {
             write_f64(out, v)?;
         }
         write_u64(out, u64::from(self.quantiles.is_some()))?;
@@ -71,7 +78,8 @@ impl SpillAccumulator for H3Accumulator {
         Ok(())
     }
     fn read_state(input: &mut impl Read, limit: usize) -> io::Result<Self> {
-        let mut acc = Self::from_stats(
+        let mut acc = Self::from_weighted_stats(
+            read_f64(input)?,
             read_f64(input)?,
             read_f64(input)?,
             read_f64(input)?,

@@ -194,12 +194,23 @@ let config = RemotePrefetchConfig {
     ..Default::default()
 };
 // reader is an open remote GeoTiffStreamReader; chunk_indices selects its strips/tiles.
-let queue = RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)).unwrap();
-if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
-    let compressed_bytes: &[u8] = &payload;
-    // Decode compressed_bytes here, then drop payload before requesting more chunks.
+match RemoteChunkPrefetchQueue::spawn_single(&reader, &chunk_indices, Some(config)) {
+    Some(queue) => {
+        if let Some(payload) = queue.get_chunk_payload(0, chunk_indices[0])? {
+            let compressed_bytes: &[u8] = &payload;
+            // Decode compressed_bytes here, then drop payload before requesting more chunks.
+        }
+    }
+    // Nothing to prefetch: read chunks from `reader` directly.
+    None => {}
 }
 ```
+
+`spawn_single` returns `None` for a local reader, a reader without chunk offsets,
+or a remote file whose server ignored `Range` and returned the whole body when the
+reader opened: that file is already in memory, and range requests to such a server
+would fail. `spawn_mosaic` likewise returns `None` when every tile is local or
+already in memory, and skips in-memory tiles in a mixed mosaic.
 
 `max_buffered_bytes` reserves each coalesced response's full byte length **before**
 the HTTP request and counts requests in flight as well as retained responses.
@@ -323,7 +334,7 @@ floating-point summation order:
 3. **Merge**: a finalized cell that no chunk outside the partition can reach is
    *interior* and is emitted as a normal record. Any other cell is *boundary* and is
    emitted as an unfiltered `PartialCell`. Ship partials with `encode_partial_state` (the
-   lossless spill format with a versioned `RH3P` header), merge them with
+   lossless spill format with a versioned `RH3P` header; version 2 adds the continuous sum of squared weights, and states from older releases are rejected, so every worker must run the same release), merge them with
    `PartialMerger::push_encoded` (built by the streamer's `partial_merger(&config)`), and
    `finish()` applies the filters to the merged states.
 

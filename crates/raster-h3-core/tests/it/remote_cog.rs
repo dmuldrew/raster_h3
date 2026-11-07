@@ -1232,6 +1232,51 @@ fn initial_full_body_response_serves_later_blocks_from_cache() {
 }
 
 #[test]
+fn full_body_response_serves_fetch_range_from_cache() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let source = RemoteHttpSource::open(&format!("{}/full_body", server.url_base)).unwrap();
+
+    // The probe was the only request: a non-Range server answers every
+    // subsequent request with HTTP 200, which fetch_range would reject.
+    assert_eq!(source.fetch_range(100, 199).unwrap(), data[100..200]);
+    assert_eq!(
+        source.fetch_range(199_990, 199_999).unwrap(),
+        data[199_990..]
+    );
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn full_body_reader_skips_remote_prefetch() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let (file, _path) = helpers::TestGeoTiffBuilder::new(64, 64).create_f32_tempfile(|_, _| 1.0);
+    let bytes = std::fs::read(file.path()).unwrap();
+    let server = MockHttpServer::start(bytes);
+    let reader = GeoTiffStreamReader::open(format!("{}/full_body", server.url_base)).unwrap();
+    let info = reader.chunk_info.as_ref().unwrap();
+    let indices: Vec<u32> = (0..info.chunk_offsets.len() as u32).collect();
+    assert!(
+        RemoteChunkPrefetchQueue::spawn_single(&reader, &indices, None).is_none(),
+        "complete-file sources must not spawn remote prefetch workers"
+    );
+    // Chunk reads still succeed through the cache-backed path.
+    let source = reader.remote_source().unwrap();
+    let payload = source
+        .read_exact_range(info.chunk_offsets[0], info.chunk_bytes[0] as usize)
+        .unwrap();
+    assert_eq!(payload.len(), info.chunk_bytes[0] as usize);
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn remote_read_crossing_cache_blocks_returns_all_bytes() {
     if !MockHttpServer::is_networking_supported() {
         eprintln!("Skipping test: localhost networking not permitted in test environment");

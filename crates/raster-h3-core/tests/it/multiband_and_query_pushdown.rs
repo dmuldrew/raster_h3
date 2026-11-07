@@ -633,6 +633,20 @@ fn borrowed_interleaved_windows_match_across_job_sizes() {
     }
 }
 
+#[test]
+fn test_planar_configuration_rejected() {
+    let temp_file = NamedTempFile::new().unwrap();
+    crate::codecs::write_planar_geotiff(temp_file.path(), 32, 32, 4);
+    let err = match GeoTiffStreamReader::open(temp_file.path()) {
+        Ok(_) => panic!("planar TIFF must be rejected at open"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("PlanarConfiguration"),
+        "unexpected error: {err}"
+    );
+}
+
 /// A band (or spectral formula band) the raster does not have is refused when the stream
 /// opens, for continuous and categorical streams alike; the kernels used to clamp it to the
 /// last band and silently aggregate that band instead.

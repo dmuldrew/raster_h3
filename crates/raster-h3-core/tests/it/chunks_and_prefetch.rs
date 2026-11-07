@@ -5,9 +5,50 @@ use raster_h3_core::aggregator::multi_horizon::{MultiResolutionConfig, MultiScan
 use raster_h3_core::aggregator::{chunk_intersects_bbox, is_chunk_all_nodata};
 use raster_h3_core::crs::CrsTransformer;
 use raster_h3_core::raster::{
-    ChunkLayout, GeoTiffStreamReader, GeoTransform, PrefetchedChunkReader,
+    ChunkLayout, GeoTiffStreamReader, GeoTransform, PrefetchedChunkReader, RasterChunk,
 };
 use tempfile::NamedTempFile;
+
+#[test]
+fn test_partition_grid_covers_area_without_overlap() {
+    let mut coverage = [0; 70];
+    for chunk in RasterChunk::partition_grid(10, 7, 4) {
+        assert!(chunk.width > 0 && chunk.width <= 4);
+        assert!(chunk.height > 0 && chunk.height <= 4);
+        assert!(chunk.col_offset + chunk.width <= 10);
+        assert!(chunk.row_offset + chunk.height <= 7);
+        for row in chunk.row_offset..chunk.row_offset + chunk.height {
+            for col in chunk.col_offset..chunk.col_offset + chunk.width {
+                coverage[(row * 10 + col) as usize] += 1;
+            }
+        }
+    }
+    assert_eq!(coverage, [1; 70]);
+}
+
+#[test]
+#[should_panic(expected = "chunk_size must be non-zero")]
+fn test_partition_grid_rejects_zero_chunk_size() {
+    RasterChunk::partition_grid(10, 10, 0);
+}
+
+#[test]
+#[should_panic(expected = "tile_width > 0")]
+fn test_chunk_layout_tiled_rejects_zero_dimensions() {
+    ChunkLayout::new_tiled(100, 100, 0, 16);
+}
+
+#[test]
+#[should_panic(expected = "rows_per_strip > 0")]
+fn test_chunk_layout_striped_rejects_zero_rows() {
+    ChunkLayout::new_striped(100, 100, 0);
+}
+
+#[test]
+#[should_panic(expected = "exceeds u32")]
+fn test_chunk_layout_tiled_rejects_grid_overflow() {
+    ChunkLayout::new_tiled(u32::MAX, u32::MAX, 1, 1);
+}
 
 #[test]
 fn test_is_chunk_all_nodata() {

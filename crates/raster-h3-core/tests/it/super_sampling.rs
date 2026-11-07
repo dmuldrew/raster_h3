@@ -650,6 +650,8 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                     if !value.is_finite() {
                         continue;
                     }
+                    // One observation per pixel and cell, weighted by its samples there.
+                    let mut pixel_weights = vec![Vec::<(u64, f64)>::new(); 2];
                     for sp in &pattern.points {
                         let (x, y) = gt.pixel_to_coord(
                             (chunk.col_offset as usize + idx % 24) as f64 + sp.dx,
@@ -664,11 +666,19 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                         retained += 1;
                         for (i, &res) in resolutions.iter().enumerate() {
                             let cell = u64::from(LatLng::new(lat, lon).unwrap().to_cell(res));
+                            match pixel_weights[i].iter_mut().find(|(c, _)| *c == cell) {
+                                Some((_, w)) => *w += sp.weight,
+                                None => pixel_weights[i].push((cell, sp.weight)),
+                            }
+                            *classes[i].entry((cell, value as i64)).or_default() += sp.weight;
+                        }
+                    }
+                    for (i, weights) in pixel_weights.into_iter().enumerate() {
+                        for (cell, weight) in weights {
                             expected[i]
                                 .entry(cell)
                                 .or_insert_with(H3Accumulator::with_quantiles)
-                                .update_weighted(value as f64, sp.weight);
-                            *classes[i].entry((cell, value as i64)).or_default() += sp.weight;
+                                .update_weighted(value as f64, weight);
                         }
                     }
                 }
@@ -726,13 +736,18 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                                 (got.count, oracle.count),
                                 (got.sum, oracle.sum),
                                 (got.m2, oracle.m2),
+                                (got.sum_w2, oracle.sum_w2),
+                                (got.variance(), oracle.variance()),
                             ] {
                                 assert!((a - b).abs() < 1e-8, "{a} != {b}");
                             }
                             assert_eq!(got.min, oracle.min);
                             assert_eq!(got.max, oracle.max);
                             if quantiles {
-                                for q in [0.1, 0.5, 0.9] {
+                                // Weights are multiples of 0.1, so ranks such as 0.5 * 9.6 can sit
+                                // exactly on a bin boundary, where a 1-ULP difference in summation
+                                // order picks the neighbouring bin. Probe off that grid.
+                                for q in [0.1234567, 0.5123457, 0.8765432] {
                                     // Sketch merging can change the last few floating-point bits.
                                     let expected = oracle.quantile(q);
                                     assert!(

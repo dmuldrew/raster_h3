@@ -83,6 +83,12 @@ pub trait TableProvider: Send + Sync {
     ) -> Result<Box<dyn ExecutionPlan>>;
 }
 
+/// Compaction changes both row identity and aggregate values. Scan predicates must
+/// remain residual predicates over the completed table, not filter its children.
+fn compacts(config: &MultiResolutionConfig) -> bool {
+    config.compact || config.compact_h3_children
+}
+
 /// Apply a filter common to both providers (`MinCount`, `Bbox`, `Resolution`) by narrowing
 /// `config`. Returns `false` when the filter excludes every row. Filters only ever narrow the
 /// table: a `Resolution` outside the configured set or a `Bbox` disjoint from the configured
@@ -215,10 +221,17 @@ fn intersect_bbox(current: [f64; 4], other: [f64; 4]) -> Option<[f64; 4]> {
 /// The row limit a scan may hand its batch reader. A pushed `Bbox` is `Inexact`: the scan
 /// also emits cells near the widened edge that the caller's re-applied predicate drops, so
 /// a reader-level limit could be spent on them before every matching cell is produced.
-fn reader_limit(filters: &[FilterPredicate], limit: Option<usize>) -> Option<usize> {
-    if filters
-        .iter()
-        .any(|f| matches!(f, FilterPredicate::Bbox(_)))
+/// Compacted scans likewise defer every predicate to the caller, so their limits must
+/// remain above those residual filters.
+fn reader_limit(
+    config: &MultiResolutionConfig,
+    filters: &[FilterPredicate],
+    limit: Option<usize>,
+) -> Option<usize> {
+    if (compacts(config) && !filters.is_empty())
+        || filters
+            .iter()
+            .any(|f| matches!(f, FilterPredicate::Bbox(_)))
     {
         None
     } else {
@@ -642,6 +655,9 @@ impl TableProvider for ContinuousRasterTableProvider {
     }
 
     fn supports_filters_pushdown(&self, filters: &[FilterPredicate]) -> Vec<FilterPushdownStatus> {
+        if compacts(&self.config) {
+            return vec![FilterPushdownStatus::Unsupported; filters.len()];
+        }
         if self.config.partition.is_some() {
             return filters.iter().map(partitioned_pushdown).collect();
         }
@@ -679,7 +695,9 @@ impl TableProvider for ContinuousRasterTableProvider {
         }
         let mut config = self.config.clone();
         let mut empty = false;
-        for f in filters {
+        // Unsupported predicates must not alter child aggregation or resolution selection.
+        let pushed_filters = if compacts(&config) { &[][..] } else { filters };
+        for f in pushed_filters {
             match *f {
                 FilterPredicate::MinMean(v) => {
                     config.min_mean = Some(config.min_mean.map_or(v, |c| c.max(v)));
@@ -704,7 +722,7 @@ impl TableProvider for ContinuousRasterTableProvider {
             projection: projection.map(|p| p.to_vec()),
             schema,
             batch_size: self.batch_size,
-            limit: reader_limit(filters, limit),
+            limit: reader_limit(&self.config, filters, limit),
             empty,
             bbox_pushed,
         }))
@@ -865,6 +883,9 @@ impl TableProvider for CategoricalRasterTableProvider {
     }
 
     fn supports_filters_pushdown(&self, filters: &[FilterPredicate]) -> Vec<FilterPushdownStatus> {
+        if compacts(&self.config) {
+            return vec![FilterPushdownStatus::Unsupported; filters.len()];
+        }
         if self.config.partition.is_some() {
             return filters.iter().map(partitioned_pushdown).collect();
         }
@@ -905,7 +926,9 @@ impl TableProvider for CategoricalRasterTableProvider {
         }
         let mut config = self.config.clone();
         let mut empty = false;
-        for f in filters {
+        // Unsupported predicates must not alter child aggregation or resolution selection.
+        let pushed_filters = if compacts(&config) { &[][..] } else { filters };
+        for f in pushed_filters {
             match *f {
                 FilterPredicate::MinMajorityFraction(v) => {
                     config.min_majority_fraction =
@@ -929,7 +952,7 @@ impl TableProvider for CategoricalRasterTableProvider {
             projection: projection.map(|p| p.to_vec()),
             schema,
             batch_size: self.batch_size,
-            limit: reader_limit(filters, limit),
+            limit: reader_limit(&self.config, filters, limit),
             empty,
             bbox_pushed,
         }))

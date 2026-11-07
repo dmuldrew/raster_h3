@@ -5,6 +5,7 @@ mod helpers;
 
 mod bbox_pushdown;
 mod categorical_options;
+mod compaction_pushdown;
 mod continuous_options;
 mod partitions;
 mod rows;
