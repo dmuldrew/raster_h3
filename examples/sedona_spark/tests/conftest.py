@@ -33,16 +33,26 @@ import raster_h3_spark_demo as demo  # noqa: E402
 
 @pytest.fixture(scope="session")
 def sedona():
-    """One local Spark session with Sedona's functions, shared by every test."""
+    """One Spark session with Sedona's functions, shared by every test: local mode, or the
+    cluster named by SPARK_MASTER (see docker-compose.yml's spark-cluster profile)."""
     spark = demo.sedona_session(os.environ.get("SPARK_MASTER", "local[2]"), shuffle_partitions=4)
     spark.sparkContext.setLogLevel("ERROR")
+    # Executors in other containers or machines import the demo's mapInArrow functions.
+    spark.sparkContext.addPyFile(str(DEMO_DIR / "raster_h3_spark_demo.py"))
     yield spark
     spark.stop()
 
 
 @pytest.fixture
 def terrain(tmp_path):
-    """Write the demo's synthetic tiled terrain; returns a factory of paths."""
+    """Write the demo's synthetic tiled terrain; returns a factory of paths.
+
+    On a cluster, executors must read the rasters too: set RASTER_H3_SHARED_DIR to a
+    directory every node mounts at the same path, and they are written there."""
+    shared = os.environ.get("RASTER_H3_SHARED_DIR")
+    if shared:
+        tmp_path = Path(shared) / "tests" / tmp_path.name
+        tmp_path.mkdir(parents=True, exist_ok=True)
 
     def write(name: str = "terrain.tif", side: int = 512, tile: int = 64, categorical: bool = False) -> str:
         path = str(tmp_path / name)

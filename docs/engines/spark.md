@@ -229,14 +229,76 @@ returns that cell, and `ST_H3ToGeom` gives a polygon whose centroid is within 1e
 
 ## Performance
 
-Partitioning adds no measurable CPU over a single scan (0.97×–1.02× total CPU in the
-`partition_overhead` benchmark, see [Partitioned scans](core.md#partitioned-scans)), so
-throughput scales with the number of executors until storage bandwidth or the shuffle of
-edge cells dominates. Each task also runs `raster_h3`'s own parallel decode and
-aggregation: aggregation uses Rayon's thread count, capped at 8, and decoding sizes itself
-from the machine's cores. With several tasks per executor, give each task more cores
-(`spark.task.cpus`) or cap Rayon on the executors
-(`spark.executorEnv.RAYON_NUM_THREADS`) so tasks do not oversubscribe the CPU.
+Partitioning adds no measurable CPU inside `raster_h3` (0.97×–1.02× total CPU in the
+`partition_overhead` benchmark, see [Partitioned scans](core.md#partitioned-scans)). What
+Spark adds is per-job and per-task overhead: scheduling, a Python worker per task, Arrow
+transfer to the JVM and the shuffle of the merge.
+
+### Measured on a local multi-container cluster
+
+The `spark-cluster` Compose profile (below) runs a standalone master, N workers with 2 CPUs
+each and a driver container on one machine (Apple Silicon, Docker with 10 CPUs and 8 GB).
+[`cluster/benchmark.py`](../../examples/sedona_spark/cluster/benchmark.py) timed
+`raster_h3.spark.read(...).count()` on a 6144 × 6144 float32 raster (37.7 M pixels, 576
+tiles of 256 px, resolution 9, 135,293 cells, identical in every run); median of 3 after a
+warm-up (November 2026):
+
+| Setup | Partitions | Wall time | Speedup |
+| :--- | ---: | ---: | ---: |
+| `raster_h3` alone, one process, 2 CPUs | — | 4.78 s | — |
+| `raster_h3` alone, one process, 10 CPUs | — | 2.15 s | — |
+| Spark, 1 worker (2 cores) | 2 | 5.61 s | 1.00× |
+| Spark, 2 workers (4 cores) | 4 | 3.39 s | 1.65× |
+| Spark, 3 workers (6 cores) | 7 | 2.81 s | 2.00× |
+| Spark, 4 workers (8 cores) | 9 | 2.63 s | 2.13× |
+| Spark, 1 worker, 36 partitions of 16 tiles | 36 | 8.29 s | — |
+| Spark, 4 workers, 36 partitions of 16 tiles | 36 | 3.19 s | — |
+
+What this shows, and what it does not:
+
+- **Partition size matters most.** On one worker, 36 small partitions (about 1 M pixels,
+  ~0.1 s of work each) took 8.29 s; 2 partitions took 5.61 s. Each extra task costs on the
+  order of 0.1 s, so give every partition several seconds of work: tens of millions of
+  pixels, or a few hundred 256–512 px tiles (`target_chunks`).
+- **Spark's fixed cost is about 0.8 s here** (1 worker with large partitions: 5.61 s against
+  4.78 s for one process on the same 2 CPUs). On large rasters it is negligible.
+- **Scaling is good from 1 to 2 workers (1.65×) and flattens by 4.** The fit
+  `1.2 s + 4.4 s / workers` matches 1 and 2 workers; at 3 and 4 the planner's grid gave
+  one more partition than slots (a second wave), and 8 worker CPUs plus the driver nearly
+  fill Docker's 10.
+- **On one machine, Spark does not beat `raster_h3` alone** (2.63 s on 8 cores against
+  2.15 s for one process on 10): all workers share one machine's CPUs, memory bandwidth and
+  disk. The gain comes from more machines, each with its own CPUs and storage path; this
+  cluster cannot measure that.
+- `spark.task.cpus=2` (one task per worker, so each task's thread pools have the worker to
+  themselves) made no difference at this size.
+
+### Tuning
+
+Each task also runs `raster_h3`'s own parallel decode and aggregation: aggregation uses
+Rayon's thread count, capped at 8, and decoding sizes itself from the cores the container
+or machine allows. With several tasks per executor on large machines, give each task more
+cores (`spark.task.cpus`) or cap Rayon on the executors
+(`spark.executorEnv.RAYON_NUM_THREADS`) if tasks oversubscribe the CPU. On x86-64 clusters,
+a wheel built with `.cargo/fma.toml` (CPUs with FMA3) makes H3 indexing about 25–45%
+faster; release wheels target the baseline CPU.
+
+### A local multi-node cluster
+
+```bash
+docker compose build sedona
+docker compose --profile spark-cluster up -d --no-build \
+  spark-master spark-worker spark-client --scale spark-worker=3
+docker compose exec spark-client sh /opt/raster_h3/examples/cluster/run_tests.sh   # tests on the cluster
+sh examples/sedona_spark/cluster/scaling.sh 4 --target-chunks 72                  # time 1..4 workers
+docker compose --profile spark-cluster rm -sf spark-master spark-worker spark-client
+```
+
+Executors run in other containers than the driver, so rasters must be on the shared
+`/shared` volume (the tests use `RASTER_H3_SHARED_DIR`), on `/data`, or at a URL. The
+cluster UI is at http://localhost:8091. A standalone application takes every core by
+default; `run_tests.sh` caps the test session so the end-to-end test's second application
+can start.
 
 ## Testing
 

@@ -43,3 +43,69 @@ services:
       - "8888:8888"   # JupyterLab
       - "8090:8080"   # Spark master UI (8080 is the viewer's)
       - "4040:4040"   # Spark application UI
+
+  # A multi-node Spark standalone cluster from the same image: one master, N workers
+  # (2 CPUs each) and a client container that runs the driver. Executors run in other
+  # containers than the driver, so rasters must be on the shared /shared volume (or /data,
+  # or a URL). All containers share this machine's CPUs and disk: this checks distributed
+  # behaviour and gives a rough scaling curve, not cluster performance. Name the services:
+  # a bare `up` would also start the default services above.
+  #   docker compose build sedona                       # the image all three use
+  #   docker compose --profile spark-cluster up -d --no-build \
+  #     spark-master spark-worker spark-client --scale spark-worker=3
+  #   docker compose exec spark-client sh /opt/raster_h3/examples/cluster/run_tests.sh
+  #   sh examples/sedona_spark/cluster/scaling.sh 4       # on the host: time 1..4 workers
+  #   docker compose --profile spark-cluster rm -sf spark-master spark-worker spark-client
+  spark-master:
+    profiles: ["spark-cluster"]
+    image: raster_h3-sedona:latest
+    hostname: spark-master
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - exec /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+        --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "8091:8080"   # cluster UI: workers, applications, executors
+
+  spark-worker:
+    profiles: ["spark-cluster"]
+    init: true   # reap the Python workers and JVMs that finished drivers leave
+    image: raster_h3-sedona:latest
+    depends_on: [spark-master]
+    cpus: 2
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "1g"
+    entrypoint: ["/bin/sh", "-c"]
+    # Replicas get random hostnames, so each worker advertises its IP.
+    command:
+      - export SPARK_LOCAL_IP=$$(hostname -i);
+        exec /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+        --host $$SPARK_LOCAL_IP spark://spark-master:7077
+    volumes:
+      - spark-shared:/shared
+      - ./data:/data:ro
+      - ./examples/sedona_spark:/opt/raster_h3/examples:ro
+
+  spark-client:
+    profiles: ["spark-cluster"]
+    init: true   # reap the Python workers and JVMs that finished drivers leave
+    image: raster_h3-sedona:latest
+    hostname: spark-client
+    depends_on: [spark-master]
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      RASTER_H3_SHARED_DIR: /shared
+      PYSPARK_DRIVER_PYTHON: python3
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - pip3 install -q --no-cache-dir --break-system-packages pytest; exec sleep infinity
+    volumes:
+      - spark-shared:/shared
+      - ./data:/data:ro
+      - ./examples/sedona_spark:/opt/raster_h3/examples
+    ports:
+      - "4041:4040"   # application UI of the running driver
+
+volumes:
+  spark-shared:

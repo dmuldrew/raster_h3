@@ -497,7 +497,9 @@ python -m pytest
 ```
 
 The Apache Sedona (Spark) tests run inside the `sedona` image, as CI does (about 30 s once
-the image is built):
+the image is built). To run them on a multi-container standalone cluster instead (driver
+and executors in separate containers), see
+[Spark & Apache Sedona](engines/spark.md#a-local-multi-node-cluster).
 
 ```bash
 docker build -f Dockerfile.sedona -t raster_h3-sedona .
@@ -558,10 +560,9 @@ name any branch, even one without the file.
 - CLI, DataFusion, Python and PostgreSQL unit/integration suites run on Linux in CI;
   their cross-platform coverage is through the root parity tests or the manual workflow.
 - The real PostgreSQL test, the Hawaii-dataset tests and the `sedona-e2e` suite never run in CI.
-- The Spark tests use local mode (`local[2]`) on continuous rasters only. A standalone or
-  multi-node cluster (`SPARK_MASTER=spark://…`) and categorical merges on Spark are not
-  tested; categorical partitioned merges are covered without Spark by
-  `pytest/test_partitions.py`.
+- CI runs the Spark tests in local mode (`local[2]`). They also pass (23/23) on the local
+  multi-container standalone cluster of the `spark-cluster` Compose profile, with executors
+  in separate containers, but that is run by hand, and no test runs on separate machines.
 - The `fmgr.rs` unit tests and `pg/fmgr.rs` only build with `--features pg-extension`.
 - EPSG:6933 and EPSG:7856 have no coverage tests.
 
