@@ -1,7 +1,7 @@
 [package]
 name = "raster-h3-sedona-python"
 publish = false
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.94"
 authors = ["raster_h3 contributors"]
@@ -14,8 +14,8 @@ name = "raster_h3_sedona_python"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-raster-h3-sedona = { version = "0.5.0", path = ".." }
-raster-h3-datafusion = { version = "0.5.0", path = "../../raster-h3-datafusion" }
+raster-h3-sedona = { version = "0.6.0", path = ".." }
+raster-h3-datafusion = { version = "0.6.0", path = "../../raster-h3-datafusion" }
 datafusion = { version = "=54.1.0", default-features = false }
 # SedonaDB's C extension ABI. Same revision as the `sedona` dev dependency of raster-h3-sedona;
 # the table-provider ABI there matches the `sedonadb` 0.5.0 wheel.

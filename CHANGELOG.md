@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
 ### Added
 
 - `raster-h3-sedona`: a real Apache DataFusion adapter (DataFusion `=54.1.0`, arrow `58`, matching SedonaDB) that registers into a plain `SessionContext` or SedonaDB's `SedonaContext::ctx`. It provides `RasterH3Table` (a `TableProvider` with projection, `LIMIT` and `Expr` filter pushdown, streamed zero-copy over the Arrow C Stream), the `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate` table functions (with an optional CRS argument), and the H3 scalar UDFs. `wkb` and `h3_to_wkb` output are `geoarrow.wkb` fields in `OGC:CRS84`, so Sedona's `ST_*` functions accept them directly. It is a standalone workspace, so it adds nothing to the root `Cargo.lock`. A `sedona-e2e` feature runs the tests inside a real `SedonaContext`.
@@ -277,7 +279,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docker container** with multi-stage build, bundled DuckDB CLI, and demo script
 - **Query planner integration**: cardinality estimation and parallel `init_local` distribution
 
-[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dmuldrew/raster_h3/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/dmuldrew/raster_h3/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dmuldrew/raster_h3/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dmuldrew/raster_h3/compare/c63dd46...v0.4.0
 [0.3.0]: https://github.com/dmuldrew/raster_h3/tree/c63dd46

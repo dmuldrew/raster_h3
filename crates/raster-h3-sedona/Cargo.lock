@@ -1872,9 +1872,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "h3o"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fb2db7abbf5a95268cfb53ee6c2d4c02894323e1d3e1d7b300595eee61c482c"
+checksum = "e09e90732a210d62fb37ce0452cac2b999aeff4ebd1998b53cf45290175b39b5"
 dependencies = [
  "ahash",
  "either",
@@ -3111,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crossbeam-deque",
  "flate2",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-datafusion"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "h3o",
  "raster-h3-core",
@@ -3144,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-sedona"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-sedona-python"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "datafusion",
  "pyo3",

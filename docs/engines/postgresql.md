@@ -44,10 +44,10 @@ the suffix your server expects). Then:
 CREATE EXTENSION raster_h3;
 ```
 
-A database with 0.4.0 installed upgrades in place with `ALTER EXTENSION raster_h3 UPDATE;`
-(`raster_h3--0.4.0--0.5.0.sql`; the SQL definitions are unchanged).
+A database with 0.4.0 or later installed upgrades in place with `ALTER EXTENSION raster_h3 UPDATE;`
+through the `raster_h3--<old>--<new>.sql` scripts; the SQL definitions are unchanged since 0.4.0.
 
-[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.5.0`,
+[`raster_h3.control`](../../crates/raster-h3-pg/raster_h3.control) declares version `0.6.0`,
 `module_pathname = '$libdir/raster_h3_pg'`, `relocatable = true` and `superuser = true`.
 
 The raster aggregation functions read files with the server's OS privileges, so `EXECUTE` on
@@ -63,7 +63,7 @@ other targets fail to compile.
 
 ## SQL API
 
-All definitions are in [`sql/raster_h3--0.5.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.5.0.sql).
+All definitions are in [`sql/raster_h3--0.6.0.sql`](../../crates/raster-h3-pg/sql/raster_h3--0.6.0.sql).
 
 ### Raster aggregation
 
