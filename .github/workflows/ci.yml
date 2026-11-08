@@ -514,6 +514,40 @@ jobs:
           .venv/bin/pip install dist/*.whl pytest pandas geoarrow-pyarrow "sedonadb==0.5.0"
           .venv/bin/pytest -v
 
+  # Apache Sedona (Spark): build the `sedona` image users run (Dockerfile.sedona) and run the
+  # demo's partitioned-scan pipeline under pytest in it, on real Spark with Sedona's SQL
+  # functions. The tests compare every distributed result with an unpartitioned scan.
+  sedona-spark:
+    name: Apache Sedona (Spark) partitioned scans
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the sedona image
+        run: docker build -f Dockerfile.sedona -t raster_h3-sedona:ci .
+
+      - name: Run the Spark tests
+        run: |
+          docker run --rm -e SPARK_MASTER=local[2] raster_h3-sedona:ci sh -c \
+            "pip3 install --no-cache-dir --break-system-packages pytest \
+             && python3 -m pytest -v -p no:cacheprovider /opt/raster_h3/examples/tests"
+
+      # Filter pushdown in raster_h3.spark needs Spark 4.1+, newer than the image's Spark 4.0:
+      # install PySpark 4.1 (with its own Spark jars) beside it for these tests only.
+      - name: Run the Spark 4.1 filter-pushdown tests
+        run: |
+          docker run --rm -e SPARK_MASTER=local[2] -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD:/repo:ro" raster_h3-sedona:ci sh -c \
+            "pip3 install --no-cache-dir --break-system-packages pytest \
+             && pip3 install --no-cache-dir --break-system-packages --target /tmp/ps41 'pyspark==4.1.*' \
+             && env -u SPARK_HOME PYTHONPATH=/tmp/ps41 \
+                python3 -m pytest -v -p no:cacheprovider /repo/crates/raster-h3-python/tests/spark"
+
   # All supply-chain checks are blocking; exceptions belong in deny.toml with a reason.
   deny:
     name: cargo-deny (${{ matrix.checks }})
@@ -577,7 +611,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, lint, msrv, community-build, test-crates, sedona-adapter, deny, metadata, package-check, wheel-validation, safety]
+    needs: [build, lint, msrv, community-build, test-crates, sedona-adapter, sedona-spark, deny, metadata, package-check, wheel-validation, safety]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

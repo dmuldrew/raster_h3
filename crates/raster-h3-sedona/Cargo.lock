@@ -3111,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-core"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-deque",
  "flate2",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-datafusion"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "h3o",
  "raster-h3-core",
@@ -3144,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-sedona"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-sedona-python"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "datafusion",
  "pyo3",

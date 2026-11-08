@@ -23,13 +23,13 @@ duckdb-api-v1_5_6 = []
 stream-profile = ["raster-h3-core/stream-profile"]
 
 [dependencies]
-raster-h3-core = { version = "0.5.0", path = "../raster-h3-core" }
+raster-h3-core = { version = "0.7.0", path = "../raster-h3-core" }
 h3o.workspace = true
 libc.workspace = true
 parquet.workspace = true
 crossbeam-deque.workspace = true
 
 [dev-dependencies]
-raster-h3-core = { version = "0.5.0", path = "../raster-h3-core", features = ["test-hooks"] }
+raster-h3-core = { version = "0.7.0", path = "../raster-h3-core", features = ["test-hooks"] }
 tempfile.workspace = true
 tiff.workspace = true

@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-cli"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "flate2",
  "h3o",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-core"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "criterion",
  "crossbeam-deque",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-datafusion"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "h3o",
  "raster-h3-core",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-duckdb"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-deque",
  "h3o",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-pg"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "h3o",
  "libc",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "raster-h3-python"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "h3o",
  "libc",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "raster_h3"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-deque",
  "flate2",
