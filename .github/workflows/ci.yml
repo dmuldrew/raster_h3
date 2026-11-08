@@ -184,7 +184,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/duckdb_lib
-          curl -fsSLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
+          curl --retry 5 --retry-max-time 600 --connect-timeout 30 --max-time 180 -fsSLO https://github.com/duckdb/duckdb/releases/download/v1.2.0/libduckdb-windows-amd64.zip
           scripts/verify_sha256.sh libduckdb-windows-amd64.zip "$LIBDUCKDB_WINDOWS_SHA256"
           unzip -o -q libduckdb-windows-amd64.zip -d target/duckdb_lib
           WIN_LIB_DIR=$(cygpath -w "$(pwd)/target/duckdb_lib")
@@ -294,7 +294,7 @@ jobs:
         run: |
           CLI_URL="https://github.com/duckdb/duckdb/releases/download/v1.2.0/duckdb_cli-${{ matrix.cli_arch }}.zip"
           echo "Downloading DuckDB CLI from $CLI_URL..."
-          curl -fsSLO "$CLI_URL"
+          curl --retry 5 --retry-max-time 600 --connect-timeout 30 --max-time 180 -fsSLO "$CLI_URL"
           scripts/verify_sha256.sh "duckdb_cli-${{ matrix.cli_arch }}.zip" "${{ matrix.cli_sha256 }}"
           unzip -o -q "duckdb_cli-${{ matrix.cli_arch }}.zip"
           
@@ -339,7 +339,7 @@ jobs:
           fi
           CLI_URL="https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-${CLI_ARCH}.zip"
           echo "Downloading DuckDB CLI from $CLI_URL..."
-          curl -fsSL "$CLI_URL" -o "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip"
+          curl --retry 5 --retry-max-time 600 --connect-timeout 30 --max-time 180 -fsSL "$CLI_URL" -o "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip"
           scripts/verify_sha256.sh "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip" "${{ matrix.cli_v156_sha256 }}"
           unzip -o -q "duckdb-1.5/duckdb_cli-${CLI_ARCH}.zip" -d duckdb-1.5
 
@@ -363,7 +363,7 @@ jobs:
           fi
           CLI_URL="https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-${CLI_ARCH}.tar.gz"
           echo "Downloading DuckDB CLI from $CLI_URL..."
-          curl -fsSL "$CLI_URL" -o "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz"
+          curl --retry 5 --retry-max-time 600 --connect-timeout 30 --max-time 180 -fsSL "$CLI_URL" -o "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz"
           scripts/verify_sha256.sh "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz" "${{ matrix.cli_v200_sha256 }}"
           tar -xzf "duckdb-2.0/duckdb-cli-${CLI_ARCH}.tar.gz" -C duckdb-2.0
 
