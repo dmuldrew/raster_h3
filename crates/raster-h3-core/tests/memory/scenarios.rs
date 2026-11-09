@@ -809,7 +809,9 @@ fn check_many_tiny_chunks(r: &Results) -> Vec<Check> {
     checks
 }
 
-/// About 9 measured; a per-chunk regression (one extra buffer per strip) shows.
+/// About 14 measured (9 before batches were pipelined: the pipeline adds its
+/// channels and task spawns once per batch, here four strips); a per-chunk
+/// regression (one extra buffer per strip) shows.
 const LOCAL_ALLOCS_PER_CHUNK: f64 = 16.0;
 
 // ---------------------------------------------------------------------------
