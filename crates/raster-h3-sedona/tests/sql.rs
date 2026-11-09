@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
-use datafusion::prelude::SessionContext;
-use raster_h3_datafusion::ContinuousRasterTableProvider;
+use datafusion::catalog::TableProvider;
+use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::prelude::{col, lit, SessionContext};
+use raster_h3_datafusion::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
 use raster_h3_sedona::{register_all, RasterH3Table, GEOARROW_WKB_EXTENSION};
 
 use common::{collect, gradient_tif, rows, source, write_tif};
@@ -180,6 +182,155 @@ async fn configured_provider_registers_as_table() {
 
     let batches = collect(&ctx, "SELECT MIN(mean) FROM dem").await;
     assert!(batches[0].column(0).as_primitive::<Float64Type>().value(0) >= 20.0);
+}
+
+/// `(h3_index, resolution, count)` rows of `sql`, sorted.
+async fn cell_counts(ctx: &SessionContext, sql: &str) -> Vec<(i64, i64, f64)> {
+    let mut out: Vec<_> = collect(ctx, sql)
+        .await
+        .iter()
+        .flat_map(|b| {
+            let h = b.column(0).as_primitive::<Int64Type>().clone();
+            let r = b.column(1).as_primitive::<Int64Type>().clone();
+            let c = b.column(2).as_primitive::<Float64Type>().clone();
+            (0..b.num_rows()).map(move |i| (h.value(i), r.value(i), c.value(i)))
+        })
+        .collect();
+    out.sort_by_key(|c| c.0);
+    out
+}
+
+/// Compacted tables refuse pushdown, so DataFusion must keep every predicate as a residual
+/// filter over completed rows and apply `LIMIT` after it. Advertising them `Exact` would
+/// return the unfiltered compacted table.
+#[tokio::test(flavor = "multi_thread")]
+async fn compacted_tables_filter_completed_rows() {
+    let tif = gradient_tif(128, 128);
+    let src = source(&tif);
+    let continuous = ContinuousRasterTableProvider::try_new(&src, vec![8])
+        .unwrap()
+        .with_compact(true);
+    let mut categorical = CategoricalRasterTableProvider::try_new(&src, vec![8]).unwrap();
+    categorical.config.compact_h3_children = true;
+    let tables = [
+        ("count", RasterH3Table::continuous(continuous)),
+        ("total_count", RasterH3Table::categorical(categorical)),
+    ];
+    for (count, table) in tables {
+        let ctx = context();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        let select = format!(
+            "SELECT CAST(h3_index AS BIGINT), CAST(resolution AS BIGINT), \
+             CAST({count} AS DOUBLE) FROM t"
+        );
+        let full = cell_counts(&ctx, &select).await;
+        let parents: Vec<_> = full.iter().filter(|c| c.1 == 7).cloned().collect();
+        assert!(!parents.is_empty(), "{count}: no compacted parents");
+        assert!(full.iter().any(|c| c.1 == 8), "{count}: no children left");
+        let threshold = parents.iter().map(|c| c.2).fold(f64::INFINITY, f64::min);
+
+        for (filter, keep) in [
+            (
+                "resolution = 7".to_string(),
+                Box::new(|c: &(i64, i64, f64)| c.1 == 7) as Box<dyn Fn(&_) -> bool>,
+            ),
+            (
+                format!("{count} >= {threshold}"),
+                Box::new(move |c: &(i64, i64, f64)| c.2 >= threshold),
+            ),
+            (
+                format!("resolution = 8 AND {count} >= 1"),
+                Box::new(|c: &(i64, i64, f64)| c.1 == 8 && c.2 >= 1.0),
+            ),
+        ] {
+            let expected: Vec<_> = full.iter().filter(|c| keep(c)).cloned().collect();
+            assert!(!expected.is_empty(), "{count}: {filter} matches nothing");
+            assert!(expected.len() < full.len(), "{count}: {filter} matches all");
+            let filtered = cell_counts(&ctx, &format!("{select} WHERE {filter}")).await;
+            assert_eq!(filtered, expected, "{count}: WHERE {filter}");
+            let limited = cell_counts(&ctx, &format!("{select} WHERE {filter} LIMIT 1")).await;
+            assert_eq!(limited.len(), 1, "{count}: WHERE {filter} LIMIT 1");
+            assert!(
+                expected.contains(&limited[0]),
+                "{count}: WHERE {filter} LIMIT 1"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_defers_limits_until_residual_filters_are_applied() {
+    use TableProviderFilterPushDown::{Exact, Inexact, Unsupported};
+
+    let tif = gradient_tif(128, 128);
+    let src = source(&tif);
+    let ctx = context();
+    for compaction in 0..=2 {
+        let mut continuous = ContinuousRasterTableProvider::try_new(&src, vec![8]).unwrap();
+        let mut categorical = CategoricalRasterTableProvider::try_new(&src, vec![8]).unwrap();
+        for config in [&mut continuous.config, &mut categorical.config] {
+            config.compact = compaction == 1;
+            config.compact_h3_children = compaction == 2;
+        }
+        continuous.batch_size = 2;
+        categorical.batch_size = 2;
+        for (count, table) in [
+            ("count", RasterH3Table::continuous(continuous)),
+            ("total_count", RasterH3Table::categorical(categorical)),
+        ] {
+            for (filters, mut expected_statuses) in [
+                (vec![], vec![]),
+                (vec![col(count).gt_eq(lit(0.0))], vec![Exact]),
+                (vec![col(count).gt(lit(0.0))], vec![Inexact]),
+                (vec![col(count).lt(lit(100.0))], vec![Unsupported]),
+                (
+                    vec![col(count).between(lit(0.0), lit(100.0))],
+                    vec![Inexact],
+                ),
+                (
+                    vec![col(count).gt_eq(lit(0.0)), col(count).lt(lit(100.0))],
+                    vec![Exact, Unsupported],
+                ),
+                (
+                    vec![col(count).gt_eq(lit(0.0)), col(count).gt(lit(1.0))],
+                    vec![Exact, Inexact],
+                ),
+            ] {
+                let statuses = table
+                    .supports_filters_pushdown(&filters.iter().collect::<Vec<_>>())
+                    .unwrap();
+                if compaction > 0 {
+                    expected_statuses.fill(Unsupported);
+                }
+                assert_eq!(statuses, expected_statuses);
+                let unbounded = table
+                    .scan(&ctx.state(), None, &filters, None)
+                    .await
+                    .unwrap();
+                let unbounded = datafusion::physical_plan::collect(unbounded, ctx.task_ctx())
+                    .await
+                    .unwrap();
+                assert!(rows(&unbounded) > 1);
+                let limited = table
+                    .scan(&ctx.state(), None, &filters, Some(1))
+                    .await
+                    .unwrap();
+                let limited = datafusion::physical_plan::collect(limited, ctx.task_ctx())
+                    .await
+                    .unwrap();
+                let expected = if statuses.iter().all(|s| *s == Exact) {
+                    1
+                } else {
+                    rows(&unbounded)
+                };
+                assert_eq!(
+                    rows(&limited),
+                    expected,
+                    "{count}, compaction={compaction}, filters={filters:?}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

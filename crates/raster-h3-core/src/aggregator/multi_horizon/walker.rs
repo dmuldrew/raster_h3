@@ -387,19 +387,12 @@ fn walk<T, Acc, E, N, R>(
                         .zip(position_cells.chunks_exact(num_res))
                         .map(|(&(_, w), cells)| (cells[i], w)),
                 );
-                let first = assignments[0].0;
-                // A pixel wholly inside one cell contributes its retained
-                // weight once; custom patterns need not sum to one.
-                if assignments.len() == 1
-                    || (combine && assignments.iter().all(|&(cell, _)| cell == first))
-                {
-                    let weight = assignments.iter().map(|a| a.1).sum::<f64>();
-                    if weight.is_finite() {
-                        runs.update(i, first, sample, weight, engine, &mut maps[i]);
-                        continue;
-                    }
+                // A pixel contributes its retained weight in each cell once;
+                // custom patterns need not sum to one. Cells keep the order
+                // of their first sample.
+                if combine && assignments.len() > 1 {
+                    combine_by_cell(&mut assignments);
                 }
-                // Preserve sample order for boundary pixels and quantile sketches.
                 for &(cell, weight) in &assignments {
                     runs.update(i, cell, sample, weight, engine, &mut maps[i]);
                 }
@@ -411,6 +404,32 @@ fn walk<T, Acc, E, N, R>(
     }
     runs.finish(engine, maps);
     row_indexer.release();
+}
+
+/// Merge the weights of samples that share a cell, keeping each cell at the
+/// position of its first sample. Left unchanged if a merged weight could
+/// overflow, so no observation gets an infinite weight.
+fn combine_by_cell(assignments: &mut Vec<(u64, f64)>) {
+    if !assignments
+        .iter()
+        .map(|a| a.1.abs())
+        .sum::<f64>()
+        .is_finite()
+    {
+        return;
+    }
+    let mut len = 0;
+    for k in 0..assignments.len() {
+        let (cell, weight) = assignments[k];
+        match assignments[..len].iter_mut().find(|a| a.0 == cell) {
+            Some(prev) => prev.1 += weight,
+            None => {
+                assignments[len] = (cell, weight);
+                len += 1;
+            }
+        }
+    }
+    assignments.truncate(len);
 }
 
 /// Row-dependent projection terms. Horizontal shear is allowed: only d affects y.

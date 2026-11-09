@@ -14,6 +14,81 @@ use tiff::tags::{CompressionMethod, Predictor, Tag};
 use weezl::encode::Encoder as LZWEncoder;
 use weezl::BitOrder;
 
+fn ifd_entry(bytes: &mut [u8], tag: u16) -> &mut [u8] {
+    assert_eq!(&bytes[..2], b"II");
+    let offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+    bytes[offset + 2..offset + 2 + count * 12]
+        .as_chunks_mut::<12>()
+        .0
+        .iter_mut()
+        .find(|entry| u16::from_le_bytes(entry[..2].try_into().unwrap()) == tag)
+        .unwrap_or_else(|| panic!("tag {tag} not found in IFD"))
+}
+
+#[test]
+fn test_unrecognised_sample_format_is_rejected() {
+    let tmp = NamedTempFile::new().unwrap();
+    write_tiled_deflate_geotiff(tmp.path(), 32, 32, 16, 16, 1, &[7.0; 1024]);
+    GeoTiffStreamReader::open(tmp.path()).unwrap();
+
+    let mut bytes = std::fs::read(tmp.path()).unwrap();
+    // SampleFormat is a single inline SHORT; patch after encoding so the
+    // encoder cannot replace the invalid value with its own default.
+    let entry = ifd_entry(&mut bytes, 339);
+    assert_eq!(u16::from_le_bytes(entry[2..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 1);
+    entry[8..10].copy_from_slice(&99u16.to_le_bytes());
+    std::fs::write(tmp.path(), bytes).unwrap();
+
+    let err = match GeoTiffStreamReader::open(tmp.path()) {
+        Ok(_) => panic!("unknown SampleFormat must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("SampleFormat"), "{err}");
+}
+
+#[test]
+fn test_unrecognised_predictor_and_photometric_are_rejected() {
+    for tag in [317, 262] {
+        let tmp = NamedTempFile::new().unwrap();
+        write_tiled_deflate_geotiff(tmp.path(), 32, 32, 16, 16, 1, &[7.0; 1024]);
+        GeoTiffStreamReader::open(tmp.path()).unwrap();
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        ifd_entry(&mut bytes, tag)[8..10].copy_from_slice(&99u16.to_le_bytes());
+        std::fs::write(tmp.path(), bytes).unwrap();
+        assert!(
+            GeoTiffStreamReader::open(tmp.path()).is_err(),
+            "tag {tag}=99 must not open"
+        );
+    }
+}
+
+#[test]
+fn test_short_chunk_arrays_are_rejected_at_open() {
+    let tmp = NamedTempFile::new().unwrap();
+    write_tiled_deflate_geotiff(tmp.path(), 32, 32, 16, 16, 1, &[7.0; 1024]);
+    assert_eq!(
+        GeoTiffStreamReader::open(tmp.path())
+            .unwrap()
+            .chunk_layout
+            .total_chunks,
+        4
+    );
+
+    let mut bytes = std::fs::read(tmp.path()).unwrap();
+    for tag in [324, 325] {
+        // Leave both arrays out-of-line and equally sized, but too short for
+        // the four-tile grid. This must not become sparse nodata chunks.
+        let entry = ifd_entry(&mut bytes, tag);
+        assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 4);
+        entry[4..8].copy_from_slice(&2u32.to_le_bytes());
+    }
+    std::fs::write(tmp.path(), bytes).unwrap();
+    assert!(GeoTiffStreamReader::open(tmp.path()).is_err());
+}
+
 /// Helper to write a custom tiled GeoTIFF with Deflate compression and optional predictor.
 fn write_tiled_deflate_geotiff(
     path: &Path,
@@ -697,6 +772,66 @@ fn test_deflate_corrupted_byte_stream_hardening() {
     }
 }
 
+// Regression: a well-formed zlib stream that decompresses to fewer bytes than its
+// tile used to be accepted, leaving the recycled buffer's previous contents in the
+// tail to be decoded as pixels. It must now fail the fast path, and a full read
+// must fall back to the on-disk tile rather than return stale samples.
+#[test]
+fn test_deflate_short_fill_rejected_through_streaming_reader() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let (width, height, tile) = (64u32, 64u32, 32u32);
+    let ground_truth: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(
+        temp_file.path(),
+        width,
+        height,
+        tile,
+        tile,
+        1,
+        &ground_truth,
+    );
+
+    let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+
+    // Tile 0's first half, compressed as a complete zlib stream.
+    let half: Vec<u8> = (0..tile * tile / 2)
+        .flat_map(|i| ground_truth[((i / tile) * width + i % tile) as usize].to_le_bytes())
+        .collect();
+    let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+    let mut short = vec![0u8; compressor.zlib_compress_bound(half.len())];
+    let n = compressor.zlib_compress(&half, &mut short).unwrap();
+    short.truncate(n);
+
+    // Recycle a buffer that holds another tile's samples, as the streaming path does.
+    let (_, mut recycled) = decoder.read_chunk_with_payload(3, None, None).unwrap();
+    let stale = match &recycled {
+        DecodingResult::F32(v) => v.clone(),
+        other => panic!("expected F32 samples, got {other:?}"),
+    };
+    assert!(
+        decoder
+            .decompress_chunk_fast_bytes(0, &short, Some(&mut recycled))
+            .is_err(),
+        "a short deflate tile must not be accepted into a recycled buffer"
+    );
+    assert!(decoder
+        .decompress_chunk_fast_bytes(0, &short, None)
+        .is_err());
+
+    // The full read falls back to the file and returns tile 0, not tile 3's tail.
+    let (_, data) = decoder
+        .read_chunk_with_payload(0, Some(&short), Some(DecodingResult::F32(stale)))
+        .unwrap();
+    let DecodingResult::F32(samples) = data else {
+        panic!("expected F32 samples");
+    };
+    for (i, &v) in samples.iter().enumerate() {
+        let (r, c) = (i as u32 / tile, i as u32 % tile);
+        assert_eq!(v, ground_truth[(r * width + c) as usize], "sample {i}");
+    }
+}
+
 #[test]
 fn test_deflate_buffer_auto_resizing_hardening() {
     let temp_file = NamedTempFile::new().unwrap();
@@ -1280,4 +1415,80 @@ fn test_lzw_buffer_auto_resizing_hardening() {
         }
         _ => panic!("Expected U16 results"),
     }
+}
+
+/// Write a well-formed `PlanarConfiguration=Planar` GeoTIFF: `bands` planes of
+/// `width × height` u8 samples, one strip per plane. The chunk layout itself is
+/// valid, so opening must fail at the explicit planar rejection, not earlier.
+pub fn write_planar_geotiff(path: &Path, width: u32, height: u32, bands: u32) {
+    let mut file = BufWriter::new(File::create(path).unwrap());
+    file.write_all(b"II\x2a\x00\x08\x00\x00\x00").unwrap();
+
+    // One strip of `width*height` bytes per band plane, starting at 4096.
+    let strip_bytes = (width * height) as usize;
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    let mut strip_offsets = Vec::with_capacity(bands as usize);
+    for band in 0..bands {
+        strip_offsets.push(file.stream_position().unwrap());
+        file.write_all(&vec![(band * 40 + 10) as u8; strip_bytes])
+            .unwrap();
+    }
+
+    // Metadata arrays right after the header (offset 8).
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let tiepoint_offset = file.stream_position().unwrap();
+    for v in [0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0] {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+    let scale_offset = file.stream_position().unwrap();
+    for v in [0.001f64, 0.001, 0.0] {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+    let bits_offset = file.stream_position().unwrap();
+    for _ in 0..bands {
+        file.write_all(&8u16.to_le_bytes()).unwrap();
+    }
+    let geokeys_offset = file.stream_position().unwrap();
+    for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+    let offsets_pos = file.stream_position().unwrap();
+    for off in &strip_offsets {
+        file.write_all(&(*off as u32).to_le_bytes()).unwrap();
+    }
+    let counts_pos = file.stream_position().unwrap();
+    for _ in 0..bands {
+        file.write_all(&(strip_bytes as u32).to_le_bytes()).unwrap();
+    }
+
+    let ifd_offset = file.stream_position().unwrap() as u32;
+    file.seek(SeekFrom::Start(4)).unwrap();
+    file.write_all(&ifd_offset.to_le_bytes()).unwrap();
+    file.seek(SeekFrom::Start(ifd_offset as u64)).unwrap();
+
+    let write_tag = |f: &mut BufWriter<File>, tag: u16, typ: u16, count: u32, val_or_off: u32| {
+        f.write_all(&tag.to_le_bytes()).unwrap();
+        f.write_all(&typ.to_le_bytes()).unwrap();
+        f.write_all(&count.to_le_bytes()).unwrap();
+        f.write_all(&val_or_off.to_le_bytes()).unwrap();
+    };
+
+    // Tags in ascending order; SHORT count=1 values sit inline (low bytes).
+    file.write_all(&13u16.to_le_bytes()).unwrap();
+    write_tag(&mut file, 256, 4, 1, width); // ImageWidth LONG
+    write_tag(&mut file, 257, 4, 1, height); // ImageLength LONG
+    write_tag(&mut file, 258, 3, bands, bits_offset as u32); // BitsPerSample SHORT[]
+    write_tag(&mut file, 259, 3, 1, 1); // Compression SHORT = none
+    write_tag(&mut file, 262, 3, 1, 2); // PhotometricInterpretation SHORT = RGB
+    write_tag(&mut file, 273, 4, bands, offsets_pos as u32); // StripOffsets LONG[]
+    write_tag(&mut file, 277, 3, 1, bands); // SamplesPerPixel SHORT
+    write_tag(&mut file, 278, 4, 1, height); // RowsPerStrip LONG
+    write_tag(&mut file, 279, 4, bands, counts_pos as u32); // StripByteCounts LONG[]
+    write_tag(&mut file, 284, 3, 1, 2); // PlanarConfiguration SHORT = Planar
+    write_tag(&mut file, 33550, 12, 3, scale_offset as u32); // ModelPixelScaleTag DOUBLE[3]
+    write_tag(&mut file, 33922, 12, 6, tiepoint_offset as u32); // ModelTiepointTag DOUBLE[6]
+    write_tag(&mut file, 34735, 3, 12, geokeys_offset as u32); // GeoKeyDirectoryTag SHORT[12]
+
+    file.write_all(&0u32.to_le_bytes()).unwrap(); // next IFD offset
+    file.flush().unwrap();
 }

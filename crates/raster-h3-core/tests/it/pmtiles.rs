@@ -1045,10 +1045,13 @@ fn test_pmtiles_coarse_zoom_parent_aggregates_all_children() {
         .enumerate()
         .map(|(i, &c)| {
             let val = ((i + 1) * 10) as f64;
+            // Two unit-weight pixels per child, so the sample variance has 13 degrees of freedom.
+            let mut accumulator = H3Accumulator::new(val);
+            accumulator.update(val);
             MultiContinuousRecord {
                 resolution: 6,
                 h3_index: c.into(),
-                accumulator: H3Accumulator::new_weighted(val, 2.0),
+                accumulator,
             }
         })
         .collect();
@@ -1305,5 +1308,117 @@ fn wrapped_writer_bounds_preserve_center_after_metadata_update() {
         assert_eq!(coord(114), -15.0);
         assert_eq!(coord(119), if update_metadata { 179.0 } else { 176.0 });
         assert_eq!(coord(123), -20.0);
+    }
+}
+
+/// Polars, PyArrow and DuckDB write nullable (OPTIONAL) columns by default. The row-group
+/// pre-scan used to read them without a definition-level buffer, which fails; the error
+/// was swallowed and an empty archive written.
+#[test]
+fn test_parquet_to_pmtiles_nullable_h3_column() {
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parquet_path = dir.path().join("nullable.parquet");
+    let message_type = "
+        message schema {
+            OPTIONAL INT64 h3_index;
+            OPTIONAL DOUBLE value;
+        }
+    ";
+    let schema = Arc::new(parse_message_type(message_type).unwrap());
+    let props = Arc::new(WriterProperties::builder().build());
+    let file = File::create(&parquet_path).unwrap();
+    let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+    let mut row_group = writer.next_row_group().unwrap();
+
+    // Three rows: two cells and a null H3 index.
+    let def_levels = [1i16, 0, 1];
+    let mut col_writer = row_group.next_column().unwrap().unwrap();
+    col_writer
+        .typed::<parquet::data_type::Int64Type>()
+        .write_batch(
+            &[0x8828308281fffff, 0x8828308283fffff],
+            Some(&def_levels),
+            None,
+        )
+        .unwrap();
+    col_writer.close().unwrap();
+    let mut col_writer = row_group.next_column().unwrap().unwrap();
+    col_writer
+        .typed::<parquet::data_type::DoubleType>()
+        .write_batch(&[1.5, 2.5, 3.5], Some(&[1, 1, 1]), None)
+        .unwrap();
+    col_writer.close().unwrap();
+    row_group.close().unwrap();
+    writer.close().unwrap();
+
+    let pmtiles_path = dir.path().join("nullable.pmtiles");
+    let summary =
+        H3PmtilesTiler::process_parquet_to_pmtiles(&parquet_path, &pmtiles_path, None).unwrap();
+    assert_eq!(summary.total_features, 3);
+    assert_eq!(summary.valid_features, 2);
+    assert_eq!(summary.invalid_features_dropped, 1);
+    assert!(summary.total_tiles > 0);
+}
+
+/// Every feature in every tile of an archive. PMTiles tile data is a run of gzip
+/// members, and concatenated MVT tiles decode as one tile holding all their layers.
+fn archive_features(archive: &[u8]) -> Vec<mvt_decode::Feature> {
+    let offset = u64::from_le_bytes(archive[56..64].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(archive[64..72].try_into().unwrap()) as usize;
+    let mut tiles = Vec::new();
+    flate2::read::MultiGzDecoder::new(&archive[offset..offset + len])
+        .read_to_end(&mut tiles)
+        .unwrap();
+    mvt_decode::decode(&tiles)
+}
+
+// Regression: the exporter's default `h3_hex` property was written with a leading
+// NUL and its last digit dropped, because the hex digits sat right-aligned in a
+// buffer that is read from the front.
+#[test]
+fn test_export_writes_full_h3_hex_property() {
+    use raster_h3_core::pmtiles::{ExternalFeatureExport, H3Feature};
+
+    let cells: Vec<u64> = [(37.7749, -122.4194), (-33.86, 151.21)]
+        .into_iter()
+        .flat_map(|(lat, lng)| {
+            let ll = h3o::LatLng::new(lat, lng).unwrap();
+            [h3o::Resolution::Two, h3o::Resolution::Eight].map(|r| u64::from(ll.to_cell(r)))
+        })
+        .collect();
+
+    let mut exporter = ExternalFeatureExport::new(1 << 20, None);
+    for &cell in &cells {
+        exporter
+            .push(H3Feature::new(cell, vec![("mean", MvtValue::Double(1.0))]))
+            .unwrap();
+    }
+    let mut archive = Vec::new();
+    exporter.finish_into(&mut archive).unwrap();
+
+    let features = archive_features(&archive);
+    for &cell in &cells {
+        let expected = format!("{cell:x}");
+        let hexes: Vec<_> = features
+            .iter()
+            .filter(|f| f.properties.get("h3_index") == Some(&MvtValue::UInt(cell)))
+            .map(|f| f.properties.get("h3_hex").cloned())
+            .collect();
+        assert!(
+            !hexes.is_empty(),
+            "cell {expected} missing from the archive"
+        );
+        for hex in hexes {
+            assert_eq!(
+                hex,
+                Some(MvtValue::String(expected.clone())),
+                "cell {expected}"
+            );
+        }
     }
 }

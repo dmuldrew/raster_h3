@@ -5,22 +5,32 @@
 //! - Newline-delimited JSON (`JSONEachRow` / NDJSON) streaming to `stdout` for ClickHouse
 //!   executable table functions and shell pipelines
 //! - Native Parquet / GeoParquet and PMTiles v3 exports
+//! - Transcoding any H3-indexed Parquet file to PMTiles v3 ([`transcode_parquet_to_pmtiles`])
+//! - Partitioned scans for shell fan-outs: [`plan_raster_partitions`], a partition per
+//!   [`CliStreamOptions::partition`] scan, and [`merge_partition_files`]
 
-use std::io::Write;
-use std::path::Path;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
-    MultiCategoricalHorizonStreamer, MultiResolutionConfig, MultiScanHorizonStreamer,
+    plan_partitions, ChunkBlock, MultiCategoricalHorizonStreamer, MultiResolutionConfig,
+    MultiScanHorizonStreamer, ScanPartition,
 };
-use raster_h3_core::columnar::ipc::{write_ipc_stream, write_jsonl_stream};
+use raster_h3_core::columnar::ipc::{write_ipc_stream, write_jsonl_stream, IpcStreamReader};
+use raster_h3_core::columnar::partitioned::{
+    merge_partial_batches, PartitionedBatchReader, PARTIAL_STATE_COLUMN,
+};
 use raster_h3_core::columnar::{
-    CategoricalBatchReader, CategoricalFormat, ColumnSchema, ContinuousBatchReader,
+    CategoricalBatchReader, CategoricalFormat, ColumnArray, ColumnSchema, ContinuousBatchReader,
+    RecordBatch,
 };
 use raster_h3_core::error::{RasterH3Error, Result};
 use raster_h3_core::parquet::{H3ParquetWriter, ParquetExportConfig};
-use raster_h3_core::pmtiles::H3PmtilesTiler;
+use raster_h3_core::pmtiles::{H3PmtilesTiler, PmtilesExportSummary};
 use raster_h3_core::raster::mosaic::{resolve_raster_sources, MosaicReader, OverlapRule};
 use raster_h3_core::scalar_ops::{parse_bbox_str, try_parse_resolutions_str};
 
@@ -49,6 +59,9 @@ pub struct CliStreamOptions {
     pub batch_size: usize,
     pub limit: Option<usize>,
     pub output_format: StreamOutputFormat,
+    /// Scan only this partition (from [`plan_raster_partitions`]). The output gains a
+    /// nullable `partial_state` column; combine the partitions with [`merge_partition_files`].
+    pub partition: Option<ScanPartition>,
 }
 
 impl Default for CliStreamOptions {
@@ -66,6 +79,7 @@ impl Default for CliStreamOptions {
             batch_size: 2048,
             limit: None,
             output_format: StreamOutputFormat::Ipc,
+            partition: None,
         }
     }
 }
@@ -115,6 +129,11 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
     config.bbox = opts.bbox;
     config.overlap_rule = OverlapRule::Cutline;
 
+    if let Some(partition) = &opts.partition {
+        config.partition = Some(partition.clone());
+        return stream_partition(opts, &paths, &config, writer);
+    }
+
     if !opts.categorical {
         let full_schema = ColumnSchema::continuous(&config.quantiles);
         let projection = resolve_projection_indices(&full_schema, &opts.columns)?;
@@ -149,6 +168,544 @@ pub fn stream_raster_to_writer<W: Write>(opts: &CliStreamOptions, writer: &mut W
         warn_transform_failures(reader.transform_failures());
         Ok(rows)
     }
+}
+
+/// Scan one partition (`config.partition`) to `writer`: the projected columns plus
+/// `partial_state`. Only IPC output is mergeable, so other formats are refused.
+fn stream_partition<W: Write>(
+    opts: &CliStreamOptions,
+    paths: &[PathBuf],
+    config: &MultiResolutionConfig,
+    writer: &mut W,
+) -> Result<usize> {
+    let refuse = |why: &str| {
+        Err(RasterH3Error::InvalidParameter(format!(
+            "--partition {why}"
+        )))
+    };
+    if opts.output_format != StreamOutputFormat::Ipc {
+        return refuse("needs `ipc` output: `merge` reads the partitions' IPC files");
+    }
+    if opts.limit.is_some() {
+        return refuse("cannot be combined with --limit (a partition holds parts of cells)");
+    }
+    if opts.categorical && opts.categorical_format == CategoricalFormat::Long {
+        return refuse("needs the wide categorical format");
+    }
+    // `partial_state` may be listed in --columns; it is always appended.
+    let columns = opts.columns.as_ref().map(|cols| {
+        cols.iter()
+            .filter(|c| !c.eq_ignore_ascii_case(PARTIAL_STATE_COLUMN))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let mut reader = if opts.categorical {
+        let projection = resolve_projection_indices(&ColumnSchema::categorical_wide(), &columns)?;
+        PartitionedBatchReader::open_categorical(paths, config, projection, opts.batch_size)?
+    } else {
+        let full = ColumnSchema::continuous(&config.quantiles);
+        let projection = resolve_projection_indices(&full, &columns)?;
+        PartitionedBatchReader::open_continuous(paths, config, projection, opts.batch_size)?
+    };
+    let header = PartitionHeader {
+        partition: config
+            .partition
+            .clone()
+            .expect("a partitioned scan has a partition"),
+        scan: scan_identity(opts),
+    };
+    write_partition_header(writer, &header)?;
+    let schema = reader.schema();
+    let rows = write_ipc_stream(writer, &schema, &mut reader)?;
+    warn_transform_failures(reader.transform_failures());
+    Ok(rows)
+}
+
+/// Magic prefix of a partition file: the header below, then an `RH3IPC01` stream.
+const PARTITION_MAGIC: &[u8; 8] = b"RH3PART1";
+
+/// What a partition file was scanned from, so `merge` can check that its inputs are the
+/// complete set of partitions of one scan.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PartitionHeader {
+    partition: ScanPartition,
+    /// The scan's input and the options that change its values (columns are checked
+    /// through the stream schema).
+    scan: serde_json::Value,
+}
+
+fn scan_identity(opts: &CliStreamOptions) -> serde_json::Value {
+    serde_json::json!({
+        "input": opts.input_path,
+        "resolutions": opts.resolutions,
+        "categorical": opts.categorical,
+        "crs": opts.source_crs,
+        "nodata": opts.nodata,
+        "apply_scale_offset": opts.apply_scale_offset,
+        "bbox": opts.bbox,
+    })
+}
+
+fn write_partition_header<W: Write>(writer: &mut W, header: &PartitionHeader) -> Result<()> {
+    let json =
+        serde_json::to_vec(header).map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+    writer.write_all(PARTITION_MAGIC)?;
+    writer.write_all(&(json.len() as u32).to_le_bytes())?;
+    writer.write_all(&json)?;
+    Ok(())
+}
+
+/// Largest header accepted, guarding against reading a huge length from a corrupt file.
+const MAX_PARTITION_HEADER: usize = 64 << 20;
+
+fn read_partition_header<R: Read>(reader: &mut R) -> Result<PartitionHeader> {
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != PARTITION_MAGIC {
+        return Err(RasterH3Error::InvalidParameter(
+            "not a partition file (missing RH3PART1 header)".into(),
+        ));
+    }
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_PARTITION_HEADER {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "partition header of {len} bytes is too large"
+        )));
+    }
+    let mut json = vec![0u8; len];
+    reader.read_exact(&mut json)?;
+    serde_json::from_slice(&json)
+        .map_err(|e| RasterH3Error::InvalidParameter(format!("invalid partition header: {e}")))
+}
+
+/// Split a raster or mosaic scan into partitions of about `target_chunks` TIFF tiles or
+/// strips each, reading only metadata. `source_crs` and `bbox` must be the ones the
+/// partitions will be scanned with (a scan with another layout refuses the partition).
+pub fn plan_raster_partitions(
+    input_path: &str,
+    target_chunks: usize,
+    source_crs: Option<&str>,
+    bbox: Option<[f64; 4]>,
+) -> Result<Vec<ScanPartition>> {
+    if target_chunks == 0 {
+        return Err(RasterH3Error::InvalidParameter(
+            "--target-chunks must be at least 1".into(),
+        ));
+    }
+    let paths = resolve_raster_sources(input_path)?;
+    // Open the mosaic exactly as the scans do, so the fingerprints match.
+    let mosaic = MosaicReader::open(&paths, bbox, source_crs, OverlapRule::Cutline)?;
+    plan_partitions(&mosaic, target_chunks)
+}
+
+/// Write a plan as JSON Lines, one partition spec per line (line `k` is partition `k`).
+pub fn write_plan<W: Write>(plan: &[ScanPartition], writer: &mut W) -> Result<()> {
+    for partition in plan {
+        writeln!(writer, "{}", partition.to_json())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Read a partition spec: a JSON object, or `@FILE` holding one spec or a plan written by
+/// [`write_plan`], from which `index` picks a line (required when it has several).
+pub fn read_partition_spec(spec: &str, index: Option<usize>) -> Result<ScanPartition> {
+    let Some(path) = spec.strip_prefix('@') else {
+        if index.is_some() {
+            return Err(RasterH3Error::InvalidParameter(
+                "--partition-index needs --partition @PLAN_FILE".into(),
+            ));
+        }
+        return ScanPartition::from_json(spec);
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        RasterH3Error::InvalidParameter(format!("cannot read partition file '{path}': {e}"))
+    })?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let line = match (index, lines.as_slice()) {
+        (None, [only]) => *only,
+        (None, _) => {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "'{path}' holds {} partition specs: pick one with --partition-index",
+                lines.len()
+            )))
+        }
+        (Some(i), _) => *lines.get(i).ok_or_else(|| {
+            RasterH3Error::InvalidParameter(format!(
+                "--partition-index {i} is out of range: '{path}' holds {} partition specs",
+                lines.len()
+            ))
+        })?,
+    };
+    ScanPartition::from_json(line)
+}
+
+/// Options for [`merge_partition_files`].
+#[derive(Debug, Clone)]
+pub struct CliMergeOptions {
+    /// Partition files written by `ipc --partition`: every partition of one plan, once,
+    /// scanned from the same input with the same options and columns.
+    pub inputs: Vec<PathBuf>,
+    /// Categorical partitions (also inferred from categorical-only columns).
+    pub categorical: bool,
+    pub output_format: StreamOutputFormat,
+    pub batch_size: usize,
+}
+
+/// Combine the partition files of a scan into its final rows: every file's final rows are
+/// passed through (without `partial_state`), then the partial rows of all files are merged
+/// per cell. The result equals an unpartitioned scan's rows, in another order.
+///
+/// Before writing anything, the files' headers are checked to be every partition of one
+/// plan exactly once, scanned from the same input with the same options. Files are then
+/// streamed one batch at a time; only partial rows are held in memory. Returns the number
+/// of rows written.
+pub fn merge_partition_files<W: Write>(opts: &CliMergeOptions, writer: &mut W) -> Result<usize> {
+    if opts.inputs.is_empty() {
+        return Err(RasterH3Error::InvalidParameter(
+            "merge needs at least one partition file".into(),
+        ));
+    }
+    let mut headers = Vec::with_capacity(opts.inputs.len());
+    let mut schema: Option<Arc<ColumnSchema>> = None;
+    for path in &opts.inputs {
+        let (header, stream) = open_partition_file(path)?;
+        match &schema {
+            None => schema = Some(stream.schema()),
+            Some(first) if **first != *stream.schema() => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "'{}' has other columns than '{}'; merge the partitions of one scan",
+                    path.display(),
+                    opts.inputs[0].display()
+                )))
+            }
+            Some(_) => {}
+        }
+        headers.push(header);
+    }
+    check_partition_set(&opts.inputs, &headers)?;
+
+    let mut files: VecDeque<PathBuf> = opts.inputs.iter().cloned().collect();
+    let first_path = files.pop_front().expect("inputs are not empty");
+    let (_, first) = open_partition_file(&first_path)?;
+    let input_schema = first.schema();
+    let state_idx = input_schema.index_of(PARTIAL_STATE_COLUMN).ok_or_else(|| {
+        RasterH3Error::InvalidParameter(format!(
+            "'{}' has no {PARTIAL_STATE_COLUMN} column",
+            first_path.display()
+        ))
+    })?;
+    let keep: Vec<usize> = (0..input_schema.fields.len())
+        .filter(|&i| i != state_idx)
+        .collect();
+    let names: Vec<&str> = keep
+        .iter()
+        .map(|&i| input_schema.fields[i].name.as_str())
+        .collect();
+
+    let continuous = ColumnSchema::continuous(&[]);
+    let wide = ColumnSchema::categorical_wide();
+    let categorical_only = names.iter().any(|n| continuous.index_of(n).is_none());
+    let categorical = opts.categorical || categorical_only;
+    let base = if categorical { &wide } else { &continuous };
+    let projection = names
+        .iter()
+        .map(|n| {
+            base.index_of(n).ok_or_else(|| {
+                RasterH3Error::InvalidParameter(format!(
+                    "column '{n}' is not a {} scan column",
+                    if categorical {
+                        "categorical"
+                    } else {
+                        "continuous"
+                    }
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let output_schema = Arc::new(input_schema.project(&keep)?);
+
+    let mut merger = PartitionMerge {
+        files,
+        input_schema: Arc::clone(&input_schema),
+        state_idx,
+        keep,
+        current: Some(first),
+        partials: Vec::new(),
+        merged: VecDeque::new(),
+        merge: Some(MergeSpec {
+            categorical,
+            projection,
+            batch_size: opts.batch_size,
+        }),
+    };
+    let rows = match opts.output_format {
+        StreamOutputFormat::Ipc => write_ipc_stream(writer, &output_schema, &mut merger),
+        StreamOutputFormat::Jsonl => write_jsonl_stream(writer, &mut merger),
+    }?;
+    Ok(rows)
+}
+
+type PartitionStream = IpcStreamReader<BufReader<File>>;
+
+/// Open a partition file: its header, and a reader positioned at its first batch.
+fn open_partition_file(path: &Path) -> Result<(PartitionHeader, PartitionStream)> {
+    let context = |e: RasterH3Error| {
+        RasterH3Error::InvalidParameter(format!(
+            "'{}' is not a partition file written by `ipc --partition`: {e}",
+            path.display()
+        ))
+    };
+    let file = File::open(path).map_err(|e| {
+        RasterH3Error::InvalidParameter(format!("cannot open '{}': {e}", path.display()))
+    })?;
+    let mut reader = BufReader::new(file);
+    let header = read_partition_header(&mut reader).map_err(context)?;
+    let stream = IpcStreamReader::new(reader).map_err(context)?;
+    Ok((header, stream))
+}
+
+/// Check that `headers` are every partition of one plan exactly once, from one scan.
+fn check_partition_set(paths: &[PathBuf], headers: &[PartitionHeader]) -> Result<()> {
+    let invalid = |msg: String| Err(RasterH3Error::InvalidParameter(msg));
+    let first = &headers[0];
+    let name = |i: usize| paths[i].display().to_string();
+    for (i, h) in headers.iter().enumerate().skip(1) {
+        if h.scan != first.scan {
+            return invalid(format!(
+                "'{}' was scanned with other options than '{}' ({} vs {}); merge the partitions of one scan",
+                name(i),
+                name(0),
+                h.scan,
+                first.scan
+            ));
+        }
+        if h.partition.count != first.partition.count
+            || h.partition.mosaic_fingerprint != first.partition.mosaic_fingerprint
+        {
+            return invalid(format!(
+                "'{}' belongs to another plan than '{}'",
+                name(i),
+                name(0)
+            ));
+        }
+    }
+    let count = first.partition.count as usize;
+    let mut seen: Vec<Option<usize>> = vec![None; count];
+    for (i, h) in headers.iter().enumerate() {
+        let index = h.partition.index as usize;
+        match seen.get_mut(index) {
+            None => {
+                return invalid(format!(
+                    "'{}' has partition index {index} of {count}",
+                    name(i)
+                ))
+            }
+            Some(Some(j)) => {
+                return invalid(format!(
+                    "partition {index} is given twice ('{}' and '{}')",
+                    name(*j),
+                    name(i)
+                ))
+            }
+            Some(slot) => *slot = Some(i),
+        }
+    }
+    let missing: Vec<String> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .map(|(k, _)| k.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return invalid(format!(
+            "missing partition(s) {} of {count}: merge needs every partition of the plan",
+            missing.join(", ")
+        ));
+    }
+    // Plans with the same partition count for one layout could still differ; their
+    // partitions would then overlap.
+    let blocks: Vec<(usize, &ChunkBlock)> = headers
+        .iter()
+        .enumerate()
+        .flat_map(|(i, h)| h.partition.blocks.iter().map(move |b| (i, b)))
+        .collect();
+    for (a, (i, x)) in blocks.iter().enumerate() {
+        for (j, y) in &blocks[a + 1..] {
+            let overlap = x.tile_idx == y.tile_idx
+                && x.col_start < y.col_end
+                && y.col_start < x.col_end
+                && x.row_start < y.row_end
+                && y.row_start < x.row_end;
+            if overlap {
+                return invalid(format!(
+                    "'{}' and '{}' cover the same chunks: they come from different plans",
+                    name(*i),
+                    name(*j)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct MergeSpec {
+    categorical: bool,
+    projection: Vec<usize>,
+    batch_size: usize,
+}
+
+/// Yields every file's final rows, streaming the files one batch at a time and keeping
+/// their partial rows, then the merged partial rows.
+struct PartitionMerge {
+    files: VecDeque<PathBuf>,
+    input_schema: Arc<ColumnSchema>,
+    state_idx: usize,
+    keep: Vec<usize>,
+    /// The file being read.
+    current: Option<PartitionStream>,
+    partials: Vec<RecordBatch>,
+    /// Merged output batches.
+    merged: VecDeque<RecordBatch>,
+    /// Taken when the merged rows are queued.
+    merge: Option<MergeSpec>,
+}
+
+impl PartitionMerge {
+    /// The next output batch; `Ok(None)` when done.
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.merged.pop_front() {
+                return Ok(Some(batch));
+            }
+            if let Some(stream) = &mut self.current {
+                match stream.next().transpose()? {
+                    Some(batch) => {
+                        if let Some(finals) = self.split(batch)? {
+                            return Ok(Some(finals));
+                        }
+                    }
+                    None => self.current = None,
+                }
+                continue;
+            }
+            if let Some(path) = self.files.pop_front() {
+                let (_, stream) = open_partition_file(&path)?;
+                if *stream.schema() != *self.input_schema {
+                    return Err(RasterH3Error::InvalidParameter(format!(
+                        "'{}' changed while merging",
+                        path.display()
+                    )));
+                }
+                self.current = Some(stream);
+                continue;
+            }
+            let Some(spec) = self.merge.take() else {
+                return Ok(None);
+            };
+            // The CLI's scans have no value filters or quantiles, so the default merge
+            // settings match them; the resolutions come from the partial rows.
+            let config = MultiResolutionConfig::new(vec![8]);
+            let (_, merged) = merge_partial_batches(
+                &std::mem::take(&mut self.partials),
+                spec.categorical,
+                &config,
+                Some(&spec.projection),
+                spec.batch_size,
+            )?;
+            self.merged = merged.into();
+        }
+    }
+
+    /// Keep the partial rows of an input batch; return its final rows without
+    /// `partial_state` (`None` when it has none). Rows are split into contiguous runs.
+    fn split(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
+        let is_partial: Vec<bool> = match &batch.columns[self.state_idx] {
+            ColumnArray::Binary { validity, .. } => match validity {
+                Some(v) => v.clone(),
+                None => vec![true; batch.num_rows],
+            },
+            _ => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "{PARTIAL_STATE_COLUMN} must be a Binary column"
+                )))
+            }
+        };
+        let mut finals: Vec<RecordBatch> = Vec::new();
+        let mut start = 0;
+        while start < batch.num_rows {
+            let partial = is_partial[start];
+            let len = is_partial[start..]
+                .iter()
+                .take_while(|&&p| p == partial)
+                .count();
+            let run = batch.slice(start, len);
+            if partial {
+                self.partials.push(run);
+            } else {
+                finals.push(run.project(&self.keep)?);
+            }
+            start += len;
+        }
+        Ok(match finals.len() {
+            0 => None,
+            1 => finals.pop(),
+            _ => Some(concat_batches(finals)?),
+        })
+    }
+}
+
+impl Iterator for PartitionMerge {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch().transpose()
+    }
+}
+
+/// Concatenate batches of one schema.
+fn concat_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let schema = Arc::clone(&batches[0].schema);
+    let columns = (0..schema.fields.len())
+        .map(|c| {
+            let mut parts = batches.iter().map(|b| b.columns[c].clone());
+            let mut acc = parts.next().expect("at least one batch");
+            for part in parts {
+                append_column(&mut acc, part);
+            }
+            acc
+        })
+        .collect();
+    RecordBatch::try_new(schema, columns)
+}
+
+fn append_column(acc: &mut ColumnArray, part: ColumnArray) {
+    let (acc_len, part_len) = (acc.len(), part.len());
+    fn join(a: &mut Option<Vec<bool>>, b: Option<Vec<bool>>, a_len: usize, b_len: usize) {
+        if a.is_none() && b.is_none() {
+            return;
+        }
+        let mut v = a.take().unwrap_or_else(|| vec![true; a_len]);
+        v.extend(b.unwrap_or_else(|| vec![true; b_len]));
+        *a = Some(v);
+    }
+    macro_rules! extend {
+        ($($variant:ident),*) => {
+            match (acc, part) {
+                $((
+                    ColumnArray::$variant { values, validity },
+                    ColumnArray::$variant { values: more, validity: more_validity },
+                ) => {
+                    values.extend(more);
+                    join(validity, more_validity, acc_len, part_len);
+                })*
+                _ => unreachable!("batches of one schema have equal column types"),
+            }
+        };
+    }
+    extend!(UInt64, Int64, UInt8, Float64, Boolean, Utf8, Binary);
 }
 
 /// Export a raster directly to a Parquet / GeoParquet file.
@@ -228,6 +785,88 @@ pub fn export_raster_to_pmtiles(
     Ok(tiles)
 }
 
+/// Transcode an H3-indexed Parquet file (from `raster-h3-cli parquet`, DuckDB, Spark, Polars,
+/// ...) into a PMTiles v3 archive: one hexagon feature per row, the other columns as
+/// properties. `h3_column` names the H3 column (integer or hex string, matched
+/// case-insensitively); `None` picks the first of `h3_index`, `h3_hex`, `h3`, `cell`, `hex`.
+/// Rows whose H3 value is null or not a valid cell are skipped and counted in
+/// [`PmtilesExportSummary::invalid_features_dropped`].
+pub fn transcode_parquet_to_pmtiles(
+    input_path: &Path,
+    output_path: &Path,
+    h3_column: Option<&str>,
+) -> Result<PmtilesExportSummary> {
+    if !input_path.is_file() {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "Input Parquet file does not exist: {}",
+            input_path.display()
+        )));
+    }
+    H3PmtilesTiler::process_parquet_to_pmtiles(input_path, output_path, h3_column)
+        .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))
+}
+
+/// Arguments of the `parquet-to-pmtiles` subcommand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CliTranscodeArgs {
+    pub input_path: String,
+    pub output_path: String,
+    pub h3_column: Option<String>,
+}
+
+/// Parse `parquet-to-pmtiles <input.parquet> -o <out.pmtiles> [--h3-column NAME]`. The
+/// archive needs a seekable file, so `-o` is required and cannot be stdout.
+pub fn parse_parquet_to_pmtiles_args(args: &[String]) -> Result<CliTranscodeArgs> {
+    let mut input_path: Option<String> = None;
+    let mut output_path: Option<String> = None;
+    let mut h3_column: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let flag = arg.as_str();
+        let mut value = || {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| RasterH3Error::InvalidParameter(format!("Missing value for {flag}")))
+        };
+        match flag {
+            "-i" | "--input" => input_path = Some(value()?),
+            "-o" | "--output" => {
+                let v = value()?;
+                if v == "-" {
+                    return Err(RasterH3Error::InvalidParameter(
+                        "parquet-to-pmtiles cannot write to stdout: pass a file with -o".into(),
+                    ));
+                }
+                output_path = Some(v);
+            }
+            "--h3-column" | "--h3-col" => h3_column = Some(value()?),
+            _ if flag.starts_with('-') && flag != "-" => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unknown option '{flag}' for parquet-to-pmtiles"
+                )));
+            }
+            _ if input_path.is_none() => input_path = Some(flag.to_string()),
+            _ => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unexpected argument '{flag}' (input path already set to '{}')",
+                    input_path.unwrap_or_default()
+                )));
+            }
+        }
+    }
+    let input_path = input_path.ok_or_else(|| {
+        RasterH3Error::InvalidParameter("Missing required input Parquet path".into())
+    })?;
+    let output_path = output_path.ok_or_else(|| {
+        RasterH3Error::InvalidParameter("Missing -o / --output path for parquet-to-pmtiles".into())
+    })?;
+    Ok(CliTranscodeArgs {
+        input_path,
+        output_path,
+        h3_column,
+    })
+}
+
 /// Parse CLI arguments into [`CliStreamOptions`] and an optional output file path (`None` = stdout).
 ///
 /// Unknown flags, missing flag values, malformed numbers/lists and extra positional
@@ -241,6 +880,8 @@ pub fn parse_stream_args(
         ..Default::default()
     };
     let mut output_file: Option<String> = None;
+    let mut partition_spec: Option<String> = None;
+    let mut partition_index: Option<usize> = None;
 
     let invalid = |flag: &str, value: &str, expected: &str| {
         RasterH3Error::InvalidParameter(format!(
@@ -310,6 +951,14 @@ pub fn parse_stream_args(
                         .map_err(|_| invalid(flag, v, "a non-negative integer"))?,
                 );
             }
+            "--partition" => partition_spec = Some(value()?.to_string()),
+            "--partition-index" => {
+                let v = value()?;
+                partition_index = Some(
+                    v.parse()
+                        .map_err(|_| invalid(flag, v, "a non-negative integer"))?,
+                );
+            }
             _ if flag.starts_with('-') && flag != "-" => {
                 return Err(RasterH3Error::InvalidParameter(format!(
                     "Unknown option '{flag}'"
@@ -330,8 +979,131 @@ pub fn parse_stream_args(
             "Missing required input raster path".into(),
         ));
     }
+    match (partition_spec, partition_index) {
+        (Some(spec), index) => opts.partition = Some(read_partition_spec(&spec, index)?),
+        (None, Some(_)) => {
+            return Err(RasterH3Error::InvalidParameter(
+                "--partition-index needs --partition @PLAN_FILE".into(),
+            ))
+        }
+        (None, None) => {}
+    }
 
     Ok((opts, output_file))
+}
+
+/// Arguments of the `plan` subcommand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CliPlanArgs {
+    pub input_path: String,
+    pub target_chunks: usize,
+    pub source_crs: Option<String>,
+    pub bbox: Option<[f64; 4]>,
+    /// `None` = stdout.
+    pub output: Option<String>,
+}
+
+/// Parse `plan <input> [--target-chunks N] [--crs CRS] [--bbox ...] [-o FILE]`.
+pub fn parse_plan_args(args: &[String]) -> Result<CliPlanArgs> {
+    let mut out = CliPlanArgs {
+        input_path: String::new(),
+        target_chunks: 256,
+        source_crs: None,
+        bbox: None,
+        output: None,
+    };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let flag = arg.as_str();
+        let mut value = || {
+            iter.next()
+                .map(String::as_str)
+                .ok_or_else(|| RasterH3Error::InvalidParameter(format!("Missing value for {flag}")))
+        };
+        let invalid = |v: &str, expected: &str| {
+            RasterH3Error::InvalidParameter(format!(
+                "Invalid value '{v}' for {flag}: expected {expected}"
+            ))
+        };
+        match flag {
+            "-i" | "--input" => out.input_path = value()?.to_string(),
+            "-o" | "--output" => {
+                let v = value()?;
+                out.output = (v != "-").then(|| v.to_string());
+            }
+            "--target-chunks" => {
+                let v = value()?;
+                out.target_chunks = v
+                    .parse()
+                    .ok()
+                    .filter(|&n: &usize| n > 0)
+                    .ok_or_else(|| invalid(v, "a positive integer"))?;
+            }
+            "--crs" | "--source-crs" => out.source_crs = Some(value()?.to_string()),
+            "--bbox" => {
+                let v = value()?;
+                out.bbox = Some(
+                    parse_bbox_str(v)
+                        .ok_or_else(|| invalid(v, "min_lon,min_lat,max_lon,max_lat"))?,
+                );
+            }
+            _ if flag.starts_with('-') && flag != "-" => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unknown option '{flag}' for plan"
+                )));
+            }
+            _ if out.input_path.is_empty() => out.input_path = flag.to_string(),
+            _ => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unexpected argument '{flag}' (input path already set to '{}')",
+                    out.input_path
+                )));
+            }
+        }
+    }
+    if out.input_path.is_empty() {
+        return Err(RasterH3Error::InvalidParameter(
+            "Missing required input raster path".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse `merge <part>... [-c] [--jsonl] [-o FILE]` into options and an output path
+/// (`None` = stdout).
+pub fn parse_merge_args(args: &[String]) -> Result<(CliMergeOptions, Option<String>)> {
+    let mut opts = CliMergeOptions {
+        inputs: Vec::new(),
+        categorical: false,
+        output_format: StreamOutputFormat::Ipc,
+        batch_size: 2048,
+    };
+    let mut output = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-o" | "--output" => {
+                let v = iter.next().ok_or_else(|| {
+                    RasterH3Error::InvalidParameter(format!("Missing value for {arg}"))
+                })?;
+                output = (v != "-").then(|| v.clone());
+            }
+            "-c" | "--categorical" => opts.categorical = true,
+            "--jsonl" => opts.output_format = StreamOutputFormat::Jsonl,
+            flag if flag.starts_with('-') => {
+                return Err(RasterH3Error::InvalidParameter(format!(
+                    "Unknown option '{flag}' for merge"
+                )));
+            }
+            path => opts.inputs.push(PathBuf::from(path)),
+        }
+    }
+    if opts.inputs.is_empty() {
+        return Err(RasterH3Error::InvalidParameter(
+            "merge needs at least one partition file".into(),
+        ));
+    }
+    Ok((opts, output))
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use raster_h3_core::columnar::ArrowArrayStream;
 use raster_h3_datafusion::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
-    PARTIAL_STATE_COLUMN,
+    FilterPushdownStatus,
 };
 
 use crate::convert::{to_arrow_schema, to_df_error};
@@ -39,16 +39,14 @@ pub enum TableKind {
 /// `count` / `total_count`, `mean`, `majority_fraction` and `resolution`, and spatial
 /// predicates (`ST_Intersects`-style and `ST_DWithin`) between `wkb` or
 /// `h3_to_wkb(h3_index)` and a constant lon/lat geometry (see the `filters` and `spatial`
-/// modules). Aggregation runs on DataFusion's blocking thread pool and streams batches back
-/// through the Arrow C Stream Interface without copying.
+/// modules). `LIMIT` is deferred whenever a filter still needs caller-side evaluation.
+/// Aggregation runs on DataFusion's blocking thread pool and streams batches back through
+/// the Arrow C Stream Interface without copying.
 pub struct RasterH3Table {
     inner: Arc<dyn raster_h3_datafusion::TableProvider>,
     kind: TableKind,
     schema: arrow::datatypes::SchemaRef,
     untagged: Untagged,
-    /// A partitioned scan: only `resolution` filters may be pushed (see
-    /// `raster_h3_datafusion::ContinuousRasterTableProvider::with_partition`).
-    partitioned: bool,
 }
 
 impl RasterH3Table {
@@ -64,14 +62,12 @@ impl RasterH3Table {
 
     fn new(inner: Arc<dyn raster_h3_datafusion::TableProvider>, kind: TableKind) -> Self {
         let core_schema = inner.schema();
-        let partitioned = core_schema.index_of(PARTIAL_STATE_COLUMN).is_some();
         let schema = to_arrow_schema(&core_schema);
         Self {
             inner,
             kind,
             schema,
             untagged: Untagged::Reject,
-            partitioned,
         }
     }
 
@@ -93,17 +89,21 @@ impl RasterH3Table {
 }
 
 impl RasterH3Table {
-    /// Translate a filter for pushdown. A partitioned scan keeps partial rows whole, so
-    /// only filters that reduce to `resolution` predicates are pushed there.
+    /// Translate a filter for pushdown, capped by what the wrapped provider accepts.
+    ///
+    /// The provider may refuse predicates its scan would ignore or misapply: a partitioned
+    /// scan keeps partial rows whole and pushes only `resolution`, and a compacted scan
+    /// pushes nothing (its rows and aggregates depend on unfiltered children). Advertising
+    /// such a filter as `Exact` would drop it from DataFusion's plan while the scan ignores
+    /// it, so the filter is not pushed and DataFusion evaluates it on the completed rows.
     fn translate(&self, filter: &Expr) -> Option<crate::filters::Translated> {
-        let translated = translate(filter, self.kind, self.untagged)?;
-        if self.partitioned
-            && !translated
-                .predicates
-                .iter()
-                .all(|p| matches!(p, FilterPredicate::Resolution(_)))
-        {
+        let mut translated = translate(filter, self.kind, self.untagged)?;
+        let inner = self.inner.supports_filters_pushdown(&translated.predicates);
+        if inner.contains(&FilterPushdownStatus::Unsupported) {
             return None;
+        }
+        if inner.contains(&FilterPushdownStatus::Inexact) {
+            translated.pushdown = TableProviderFilterPushDown::Inexact;
         }
         Some(translated)
     }
@@ -157,9 +157,16 @@ impl TableProvider for RasterH3Table {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let predicates: Vec<FilterPredicate> = filters
-            .iter()
-            .filter_map(|f| self.translate(f))
+        let translated: Vec<_> = filters.iter().map(|f| self.translate(f)).collect();
+        let limit = limit.filter(|_| {
+            translated.iter().all(|t| {
+                t.as_ref()
+                    .is_some_and(|t| t.pushdown == TableProviderFilterPushDown::Exact)
+            })
+        });
+        let predicates: Vec<FilterPredicate> = translated
+            .into_iter()
+            .flatten()
             .flat_map(|t| t.predicates)
             .collect();
 

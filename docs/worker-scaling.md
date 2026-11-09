@@ -128,3 +128,40 @@ build, run back to back on an otherwise idle machine:
   `merge_ns` includes that spill time. Why more workers make it spill is a separate
   question for decision 2.
 
+## Follow-up: batches sized by pixels
+
+The spilling under decision 2 came from batch sizing. Cells are evicted between
+batches, so a horizon map holds every cell of the current batch, and a batch was
+`worker_tasks × 2` chunks. The fixture's chunks are 64-row strips of 4096 pixels, so
+each extra worker added two whole strips of cells: about 460,000 resolution-11 cells
+(107 MiB) at 1 worker and 915,000 (215–230 MiB) at 2. A three-resolution run's share of
+a 2 GiB budget is 2 GiB / 3 / 4 ≈ 170 MiB, so it spilled.
+
+Batches are now about two waves of worker windows (`2 × worker_tasks × worker_pixels`
+pixels, at least one chunk, at most the old `worker_tasks × 2` chunks). A 64-row strip
+is already 16 windows of 16,384 pixels, so one strip per batch keeps 4 workers busy;
+the number of kernel waves did not change. Peak horizon-map size is now ~230,000 cells
+(~53 MiB) at any worker count.
+
+Before (previous `main`) and after, on the same setup:
+
+| Workload | Budget | Workers | Wall before (s) | Wall after (s) | Spill before (s) | Spill after (s) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| res 7, 9, 11 | 2 GiB | 2 | 16.3 | 16.4 | 7.3 | 0 |
+| res 7, 9, 11 | 2 GiB | 4 | 16.5 | 11.2 | 10.7 | 0 |
+| res 11 | 2 GiB | 4 | 10.8 | 9.4 | 0 | 0 |
+| res 9 + quantiles | 64 MiB | 1 | 10.7 | 7.0 | 3.7 | 0 |
+| res 9 + quantiles | 64 MiB | 4 | 6.7 | 3.1 | 3.5 | 0 |
+| res 11 | 64 MiB | 4 | 17.1 | 16.9 | 12.6 | 12.5 |
+| res 7, 9, 11 | 64 MiB | 4 | 22.3 | 20.2 | 16.0 | 14.2 |
+
+- **2 GiB, multi-resolution:** no longer spills at any worker count.
+  - At 4 workers it is 1.5× faster.
+  - At 2 workers the wall time is unchanged. Spilling had switched off eviction-key
+    tracking, so the run that no longer spills now computes those keys in the workers.
+- **64 MiB default, quantiles:** no longer spills, and is 2.1× faster at 4 workers.
+- **64 MiB default, fine resolutions:** still spill. One batch of resolution-11 cells
+  (~53 MiB) exceeds a resolution's 16 MiB share, as designed. The aggregation-budget
+  docs in `engineering.md` now give a sizing estimate (decision 2).
+- **Unchanged:** resolutions 7 and 9 and categorical were unchanged within noise.
+

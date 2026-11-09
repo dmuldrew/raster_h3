@@ -170,35 +170,65 @@ where
 }
 
 /// Read a binary columnar IPC stream from `reader` into `(Arc<ColumnSchema>, Vec<RecordBatch>)`.
+/// [`IpcStreamReader`] reads it one batch at a time instead.
 pub fn read_ipc_stream<R: Read>(reader: &mut R) -> Result<(Arc<ColumnSchema>, Vec<RecordBatch>)> {
-    let mut magic = [0u8; 8];
-    reader.read_exact(&mut magic)?;
-    if &magic != IPC_MAGIC {
-        return Err(RasterH3Error::InvalidParameter(
-            "Invalid IPC stream magic header".into(),
-        ));
+    let stream = IpcStreamReader::new(reader)?;
+    let schema = stream.schema();
+    let batches = stream.collect::<Result<Vec<_>>>()?;
+    Ok((schema, batches))
+}
+
+/// Incremental reader of a binary columnar IPC stream: the header is parsed by
+/// [`Self::new`], then each [`Iterator::next`] decodes one batch, so memory is bounded by
+/// the largest batch rather than the stream.
+pub struct IpcStreamReader<R: Read> {
+    reader: R,
+    schema: Arc<ColumnSchema>,
+    done: bool,
+}
+
+impl<R: Read> IpcStreamReader<R> {
+    /// Read and validate the stream header (magic and schema).
+    pub fn new(mut reader: R) -> Result<Self> {
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != IPC_MAGIC {
+            return Err(RasterH3Error::InvalidParameter(
+                "Invalid IPC stream magic header".into(),
+            ));
+        }
+
+        let num_fields = read_u32(&mut reader)? as usize;
+        let mut fields = Vec::with_capacity(num_fields.min(1024));
+        for _ in 0..num_fields {
+            let name_len = read_u32(&mut reader)? as usize;
+            let mut name_bytes = vec![0u8; name_len];
+            reader.read_exact(&mut name_bytes)?;
+            let name = String::from_utf8(name_bytes).map_err(|e| {
+                RasterH3Error::InvalidParameter(format!("Invalid UTF-8 field name in IPC: {e}"))
+            })?;
+            let dt = decode_dtype(read_u8(&mut reader)?)?;
+            let nullable = read_u8(&mut reader)? != 0;
+            fields.push(ColumnField::new(name, dt, nullable));
+        }
+        Ok(Self {
+            reader,
+            schema: Arc::new(ColumnSchema::new(fields)),
+            done: false,
+        })
     }
 
-    let num_fields = read_u32(reader)? as usize;
-    let mut fields = Vec::with_capacity(num_fields);
-    for _ in 0..num_fields {
-        let name_len = read_u32(reader)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        reader.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes).map_err(|e| {
-            RasterH3Error::InvalidParameter(format!("Invalid UTF-8 field name in IPC: {e}"))
-        })?;
-        let dt = decode_dtype(read_u8(reader)?)?;
-        let nullable = read_u8(reader)? != 0;
-        fields.push(ColumnField::new(name, dt, nullable));
+    /// The stream's schema.
+    pub fn schema(&self) -> Arc<ColumnSchema> {
+        Arc::clone(&self.schema)
     }
-    let schema = Arc::new(ColumnSchema::new(fields));
 
-    let mut batches = Vec::new();
-    loop {
+    fn read_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let reader = &mut self.reader;
+        let schema = &self.schema;
         let marker = read_u8(reader)?;
         if marker == 0 {
-            break;
+            return Ok(None);
         }
         if marker != 1 {
             return Err(RasterH3Error::InvalidParameter(format!(
@@ -271,10 +301,23 @@ pub fn read_ipc_stream<R: Read>(reader: &mut R) -> Result<(Arc<ColumnSchema>, Ve
             };
             columns.push(col);
         }
-        batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
+        Ok(Some(RecordBatch::try_new(Arc::clone(schema), columns)?))
     }
+}
 
-    Ok((schema, batches))
+impl<R: Read> Iterator for IpcStreamReader<R> {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let batch = self.read_batch();
+        if !matches!(batch, Ok(Some(_))) {
+            self.done = true;
+        }
+        batch.transpose()
+    }
 }
 
 /// Write a stream of [`RecordBatch`]es as newline-delimited JSON (`JSONEachRow` / NDJSON),
@@ -385,5 +428,42 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"8828308281fffff\""));
         assert!(lines[0].contains("\"stddev\":null"));
+    }
+
+    #[test]
+    fn test_ipc_stream_reader_yields_batches_one_at_a_time() {
+        let schema = Arc::new(ColumnSchema::new(vec![ColumnField::new(
+            "h3_index",
+            ArrowDataType::UInt64,
+            false,
+        )]));
+        let batch = |v: Vec<u64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![ColumnArray::UInt64 {
+                    values: v,
+                    validity: None,
+                }],
+            )
+            .unwrap()
+        };
+        let batches = vec![batch(vec![1, 2]), batch(vec![3])];
+        let mut buf = Vec::new();
+        write_ipc_stream(&mut buf, &schema, batches.clone().into_iter().map(Ok)).unwrap();
+
+        let mut reader = IpcStreamReader::new(buf.as_slice()).unwrap();
+        assert_eq!(*reader.schema(), *schema);
+        assert_eq!(reader.next().unwrap().unwrap(), batches[0]);
+        assert_eq!(reader.next().unwrap().unwrap(), batches[1]);
+        assert!(reader.next().is_none());
+        assert!(reader.next().is_none());
+
+        // A truncated stream yields its complete batches, then one error.
+        let truncated = &buf[..buf.len() - 3];
+        let mut reader = IpcStreamReader::new(truncated).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), batches[0]);
+        assert!(reader.next().unwrap().is_err());
+        assert!(reader.next().is_none());
+        assert!(IpcStreamReader::new(&b"RH3IPC00"[..]).is_err());
     }
 }

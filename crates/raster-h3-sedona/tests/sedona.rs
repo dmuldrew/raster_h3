@@ -205,3 +205,34 @@ async fn dwithin_and_h3_to_wkb_predicates_match_an_unpruned_scan() {
         );
     }
 }
+
+/// `COPY ... TO '*.pmtiles'` from a query that uses Sedona's spatial functions.
+#[tokio::test(flavor = "multi_thread")]
+async fn sedona_copies_a_spatial_query_to_pmtiles() {
+    let tif = gradient_tif(64, 64);
+    let ctx = sedona().await;
+    let src = source(&tif);
+    let aoi = "ST_SetSRID(ST_GeomFromWKT('POLYGON((-122.45 37.76, -122.41 37.76, -122.41 37.80, -122.45 37.80, -122.45 37.76))'), 4326)";
+    let query = format!(
+        "SELECT h3_index, mean FROM h3_raster_continuous_aggregate('{src}', 8) \
+         WHERE ST_Intersects(wkb, {aoi})"
+    );
+    let expected = rows(&query_batches(&ctx, &query).await) as u64;
+    assert!(expected > 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("aoi.pmtiles");
+    let result = query_batches(&ctx, &format!("COPY ({query}) TO '{}'", out.display())).await;
+    assert_eq!(
+        result[0]
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::UInt64Type>()
+            .value(0),
+        expected
+    );
+    assert_eq!(&std::fs::read(&out).unwrap()[..7], b"PMTiles");
+}
+
+async fn query_batches(ctx: &SedonaContext, sql: &str) -> Vec<RecordBatch> {
+    query(ctx, sql).await
+}

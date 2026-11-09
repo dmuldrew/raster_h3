@@ -59,7 +59,7 @@ On the DuckDB 2.0 build, `workers`, `fetch_workers` and `decode_budget_mb` can a
 | `h3_index` | `UBIGINT` | Native 64-bit unsigned integer H3 cell index (fast for joins). |
 | `h3_hex` | `VARCHAR` | 15/16-character lowercase hexadecimal representation (e.g. `'8828308281fffff'`). |
 | `mean` | `DOUBLE` | Weighted arithmetic mean of pixel values in the cell. |
-| `stddev` | `DOUBLE` | Single-pass Welford sample standard deviation of pixel values. |
+| `stddev` | `DOUBLE` | Single-pass Welford reliability-weighted sample standard deviation of pixel values (see [definitions](#aggregation-statistics-mathematical-definitions--geospatial-use-cases)). |
 | `count` | `DOUBLE` | Weighted count of pixels contributing to the cell. |
 | `min` | `DOUBLE` | Minimum pixel value observed within the cell. |
 | `max` | `DOUBLE` | Maximum pixel value observed within the cell. |
@@ -75,7 +75,7 @@ On the DuckDB 2.0 build, `workers`, `fetch_workers` and `decode_budget_mb` can a
 | Statistic | Mathematical Formula | Geospatial Analytics Use Case | Why & When to Use |
 | :--- | :--- | :--- | :--- |
 | **`mean`** | sum(w_i * x_i) / sum(w_i) | **Continuous Surfaces**: Average elevation, mean surface temperature, average NDVI / vegetation health. | Primary metric for summarizing continuous physical phenomena across a geographic area. |
-| **`stddev`** | sqrt(M2 / (sum(w_i) - 1)) | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep terrain; low `stddev` indicates flat plains. |
+| **`stddev`** | sqrt(M2 / (W - sum(w_i²) / W)), W = sum(w_i), M2 = sum(w_i (x_i - mean)²) | **Spatial Heterogeneity & Terrain Ruggedness**: Terrain roughness (TRI), micro-climate variability, canopy height variation. | Quantifies internal cell diversity. High `stddev` in a DEM indicates steep terrain; low `stddev` indicates flat plains. With unit pixel weights this is the usual sample standard deviation, sqrt(M2 / (n - 1)); with fractional super-sampling weights it treats each pixel as one observation weighted by its share in the cell, and does not change if all weights are rescaled. `0.0` for a single pixel. |
 | **`count`** | sum(w_i) | **Coverage Completeness & QC**: Area weighting verification, boundary completeness, filtering out clipped edge cells. | In single-point sampling, returns integer count of pixels in cell. In super-sampling, returns fractional area coverage. |
 | **`min`** | min(x_i) | **Extreme Lows**: Valley floor elevation, minimum winter temperature, lowest water table level. | Use to detect extremes that a mean hides, such as a single deep sink or a localized cold pocket. |
 | **`max`** | max(x_i) | **Extreme Peaks**: Mountain ridge summits, peak heatwave index, maximum building height. | Use to detect isolated peaks that a mean smooths away, such as a lone tower or a hot spot. |

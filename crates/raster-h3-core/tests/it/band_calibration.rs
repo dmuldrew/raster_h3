@@ -517,3 +517,107 @@ fn malformed_calibration_metadata_is_rejected_in_all_modes() {
         }
     }
 }
+
+#[test]
+fn calibration_overflow_drops_only_nonfinite_physical_values() {
+    use raster_h3_core::aggregator::sampling::SamplingPattern;
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, scale, offset, values, expected) in [
+        ("multiply", 1e308, 0.0, [1e-308, 2.0], 1.0),
+        ("add", 1.0, 1e308, [-1e308, 1e308], 0.0),
+    ] {
+        let path = dir.path().join(format!("overflow_{name}.tif"));
+        let xml = gdal_metadata(&[("scale", 0, scale), ("offset", 0, offset)]);
+        let tags = Tags {
+            gdal_metadata: Some(&xml),
+            ..Default::default()
+        };
+        let data: Vec<f64> = (0..128).map(|i| values[i % 2]).collect();
+        write_tiff!(
+            colortype::Gray64Float,
+            &path,
+            128,
+            1,
+            (-122.45, 37.80),
+            &data[..],
+            &tags
+        );
+        for sampling in [SamplingPattern::center(), SamplingPattern::rgss()] {
+            for quantiles in [false, true] {
+                let mut cfg = config(true);
+                cfg.resolutions = vec![0, 9];
+                cfg.sampling = sampling.clone();
+                if !quantiles {
+                    cfg.quantiles.clear();
+                }
+                let cells = run(&path, &cfg);
+                for resolution in [0, 9] {
+                    let count: f64 = cells
+                        .iter()
+                        .filter(|(k, _)| k.0 == resolution)
+                        .map(|(_, acc)| acc.count)
+                        .sum();
+                    assert_eq!(count, 64.0, "{name}, res {resolution}");
+                }
+                for acc in cells.values() {
+                    assert!((acc.mean() - expected).abs() < 1e-12);
+                    assert!(acc.min.is_finite() && acc.max.is_finite());
+                    assert!(acc.m2.is_finite());
+                    if quantiles {
+                        assert!((acc.quantile(0.5) - expected).abs() < 1e-12);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn interleaved_calibration_and_spectral_overflow_are_filtered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spectral_overflow.tif");
+    let xml = gdal_metadata(&[("scale", 0, 1e308), ("scale", 1, 1e308)]);
+    let tags = Tags {
+        gdal_metadata: Some(&xml),
+        extra_samples: Some(&[0]),
+        ..Default::default()
+    };
+    // Valid ratio, calibration overflow, denominator overflow, numerator overflow.
+    let data: Vec<f64> = (0..32)
+        .flat_map(|_| [0.75, 0.25, 2.0, 0.25, 1.0, 1.0, -1.0, 1.0])
+        .collect();
+    write_tiff!(
+        colortype::Gray64Float,
+        &path,
+        128,
+        1,
+        (-122.45, 37.80),
+        &data[..],
+        &tags
+    );
+    let mut cfg = config(true);
+    cfg.resolutions = vec![9];
+    for formula in [
+        SpectralFormula::Ndvi {
+            nir_band: 1,
+            red_band: 2,
+        },
+        SpectralFormula::Ndwi {
+            green_band: 1,
+            nir_band: 2,
+        },
+        SpectralFormula::Nbr {
+            nir_band: 1,
+            swir_band: 2,
+        },
+    ] {
+        cfg.spectral_formula = Some(formula);
+        let cells = run(&path, &cfg);
+        assert_eq!(cells.values().map(|a| a.count).sum::<f64>(), 32.0);
+        for acc in cells.values() {
+            assert!((acc.mean() - 0.5).abs() < 1e-12);
+            assert!((acc.quantile(0.5) - 0.5).abs() < 1e-12);
+        }
+    }
+}

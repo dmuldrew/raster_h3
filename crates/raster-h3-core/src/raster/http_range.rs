@@ -20,13 +20,18 @@
 //! - **Transport short reads are ERRORS**: If the remote server returns fewer bytes than requested
 //!   for an in-bounds byte range, [`HttpTransport`] returns an `Err(RasterH3Error::InvalidParameter)`
 //!   rather than returning a silent partial payload that would corrupt decoder state.
+//! - **Object consistency**: The built-in HTTP transport pins the first successful
+//!   response's strong ETag per URL and sends `If-Match` on subsequent requests. Changed or
+//!   missing response ETags and HTTP 412 fail before bytes reach caches or decoders.
+//!   Servers without a strong ETag retain size/range validation only; use immutable
+//!   versioned URLs when reading such sources. Host transports own their consistency policy.
 //! - **Exact range reads**: [`RemoteHttpSource::read_exact_range`] enforces that the entire requested
 //!   byte count is satisfied. If the requested range extends past `total_size` or if fewer bytes are
 //!   returned, an explicit error is returned.
 
 use rustc_hash::FxHashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use ureq::Agent;
 use url::Url;
 
@@ -266,13 +271,18 @@ pub trait RemoteTransport: Send + Sync {
     fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult>;
 }
 
+type PinnedEtag = Arc<OnceLock<Option<String>>>;
+
 /// Remote HTTP transport handling connections, retries, headers, and range requests.
 #[derive(Clone)]
 pub struct HttpTransport {
+    /// Request URL. Clones share a pinned validator only for the same URL.
     pub url: String,
     agent: Agent,
     headers: Vec<(String, String)>,
     max_retries: usize,
+    // Clones share validators per URL, including URLs with no usable strong ETag.
+    etags: Arc<RwLock<FxHashMap<String, PinnedEtag>>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -302,7 +312,61 @@ impl HttpTransport {
             agent,
             headers,
             max_retries: 4,
+            etags: Arc::new(RwLock::new(FxHashMap::default())),
         })
+    }
+
+    fn pinned_etag(&self) -> Result<PinnedEtag> {
+        let mut etags = self.etags.write().map_err(|_| {
+            RasterH3Error::InvalidParameter("Remote HTTP validator lock poisoned".into())
+        })?;
+        Ok(Arc::clone(
+            etags
+                .entry(self.url.clone())
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        ))
+    }
+
+    fn range_request(&self, range: &str, etag: &OnceLock<Option<String>>) -> ureq::Request {
+        let mut req = self
+            .agent
+            .get(&self.url)
+            .set("Range", range)
+            .set("Accept-Encoding", "identity");
+        for (k, v) in &self.headers {
+            req = req.set(k, v);
+        }
+        if let Some(Some(etag)) = etag.get() {
+            req = req.set("If-Match", etag);
+        }
+        req
+    }
+
+    /// Pin only a strong ETag: weak tags do not guarantee byte-for-byte identity.
+    /// Even if a server ignores If-Match, never return bytes with a different validator.
+    /// Initialization is atomic so concurrent first reads cannot pin different versions.
+    fn validate_etag(etag: &OnceLock<Option<String>>, response_etag: Option<&str>) -> Result<()> {
+        let pinned = etag.get_or_init(|| {
+            response_etag
+                .filter(|tag| {
+                    let bytes = tag.as_bytes();
+                    bytes.len() >= 2
+                        && bytes[0] == b'"'
+                        && bytes[bytes.len() - 1] == b'"'
+                        && bytes[1..bytes.len() - 1]
+                            .iter()
+                            .all(|&b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80)
+                })
+                .map(str::to_owned)
+        });
+        if let Some(expected) = pinned {
+            if response_etag != Some(expected.as_str()) {
+                return Err(RasterH3Error::InvalidParameter(
+                    "Remote raster changed during scan: ETag changed or disappeared".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Execute a request with automatic exponential backoff retry on transient errors
@@ -319,6 +383,10 @@ impl HttpTransport {
                 Err(e) => {
                     if attempt >= self.max_retries || !is_transient_error(&e) {
                         return match e {
+                            ureq::Error::Status(412, _) => Err(RasterH3Error::InvalidParameter(
+                                "Remote raster changed during scan (HTTP 412 Precondition Failed)"
+                                    .into(),
+                            )),
                             ureq::Error::Status(404, _) => Err(RasterH3Error::InvalidParameter(
                                 format!("Remote raster not found (HTTP 404): {}", self.url),
                             )),
@@ -352,14 +420,10 @@ impl HttpTransport {
     /// Probe remote server to determine byte-range capability and initial header data.
     #[allow(clippy::result_large_err)]
     pub fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult> {
+        let etag = self.pinned_etag()?;
         let range_header = format!("bytes=0-{}", initial_fetch_len.saturating_sub(1));
-        let resp = self.execute_request(|| {
-            let mut req = self.agent.get(&self.url).set("Range", &range_header);
-            for (k, v) in &self.headers {
-                req = req.set(k, v);
-            }
-            req.call()
-        })?;
+        let resp = self.execute_request(|| self.range_request(&range_header, &etag).call())?;
+        let response_etag = resp.header("ETag").map(str::to_owned);
 
         let status = resp.status();
         if status == 206 {
@@ -399,6 +463,7 @@ impl HttpTransport {
                 None,
                 buf.len(),
             )?;
+            Self::validate_etag(&etag, response_etag.as_deref())?;
             Ok(ProbeResult::Partial {
                 data: buf,
                 total_size,
@@ -425,6 +490,7 @@ impl HttpTransport {
                 )));
             }
             let total_size = buf.len() as u64;
+            Self::validate_etag(&etag, response_etag.as_deref())?;
             Ok(ProbeResult::Complete {
                 data: buf,
                 total_size,
@@ -454,14 +520,10 @@ impl HttpTransport {
                 start, end, total_msg
             )));
         }
+        let etag = self.pinned_etag()?;
         let range_header = format!("bytes={}-{}", start, end);
-        let resp = self.execute_request(|| {
-            let mut req = self.agent.get(&self.url).set("Range", &range_header);
-            for (k, v) in &self.headers {
-                req = req.set(k, v);
-            }
-            req.call()
-        })?;
+        let resp = self.execute_request(|| self.range_request(&range_header, &etag).call())?;
+        let response_etag = resp.header("ETag").map(str::to_owned);
 
         let status = resp.status();
         let content_range = resp.header("Content-Range").map(str::to_owned);
@@ -496,6 +558,7 @@ impl HttpTransport {
             buf.len(),
         )?;
 
+        Self::validate_etag(&etag, response_etag.as_deref())?;
         Ok(buf)
     }
 }
@@ -666,6 +729,23 @@ impl RemoteHttpSource {
     /// Fetch an arbitrary byte range directly from the remote server with retry
     #[allow(clippy::result_large_err)]
     pub fn fetch_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        // Servers that ignore Range headers hand us the complete file at probe
+        // time; serve ranged requests from that cache — the server could not
+        // answer them over HTTP anyway.
+        if self.cache.is_complete() && start <= end && end < self.total_size {
+            let mut buf = vec![0u8; (end - start + 1) as usize];
+            if let Some(n) = self.cache.copy_from_complete(start, &mut buf)? {
+                // A custom transport may report a total_size beyond the body it
+                // delivered; never hand back a silently short range.
+                if n != buf.len() {
+                    return Err(RasterH3Error::InvalidParameter(format!(
+                        "Cached remote file holds {n} of {} requested bytes at offset {start}",
+                        buf.len()
+                    )));
+                }
+                return Ok(buf);
+            }
+        }
         self.transport
             .fetch_range(start, end, Some(self.total_size))
     }
@@ -938,5 +1018,47 @@ mod tests {
         assert!(source.read_exact_range(1, usize::MAX).is_err());
         assert!(source.read_exact_range(u64::MAX, 2).is_err());
         assert_eq!(source.read_exact_range(5, 0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn fetch_range_serves_complete_file_from_cache() {
+        let data: Vec<u8> = (0..100).collect();
+        let cache = ByteCache::new_with_complete(data.clone(), 16);
+        let transport = HttpTransport::new("http://example.com/test.tif").unwrap();
+        let source = RemoteHttpSource {
+            url: "http://example.com/test.tif".to_string(),
+            total_size: data.len() as u64,
+            transport: Box::new(transport),
+            cache,
+        };
+
+        // Servers that ignore Range headers hand us the complete file at probe
+        // time; fetch_range must serve from that cache rather than issuing an
+        // HTTP request the server cannot honor anyway.
+        assert_eq!(source.fetch_range(0, 9).unwrap(), data[..10]);
+        assert_eq!(source.fetch_range(90, 99).unwrap(), data[90..]);
+        assert_eq!(source.fetch_range(0, 99).unwrap(), data);
+
+        // Out-of-bounds and inverted ranges are still rejected by transport
+        // validation before any request.
+        assert!(source.fetch_range(99, 100).is_err());
+        assert!(source.fetch_range(50, 40).is_err());
+    }
+
+    #[test]
+    fn fetch_range_rejects_short_complete_cache() {
+        // total_size claims more bytes than the cached body holds.
+        let cache = ByteCache::new_with_complete((0..50).collect(), 16);
+        let source = RemoteHttpSource {
+            url: "http://example.com/test.tif".to_string(),
+            total_size: 100,
+            transport: Box::new(HttpTransport::new("http://example.com/test.tif").unwrap()),
+            cache,
+        };
+        assert_eq!(
+            source.fetch_range(0, 9).unwrap(),
+            (0..10).collect::<Vec<u8>>()
+        );
+        assert!(source.fetch_range(40, 59).is_err());
     }
 }

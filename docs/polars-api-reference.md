@@ -27,11 +27,12 @@ Polars and PyArrow are optional dependencies. Without Polars, the scan functions
 
 | Function | Returns | Purpose |
 | :--- | :--- | :--- |
-| [`scan_raster_h3(path, resolutions=8, **opts)`](#scan_raster_h3) | `pl.LazyFrame` | Lazy scan with projection and row-limit pushdown |
+| [`scan_raster_h3(path, resolutions=8, **opts)`](#scan_raster_h3) | `pl.LazyFrame` | Lazy scan with projection, predicate and row-limit pushdown |
 | [`read_raster_h3(path, resolutions=8, **opts)`](#read_raster_h3) | `pl.DataFrame` | Eager scan |
 | [`RasterH3ArrowStream(path, resolutions=8, **opts)`](#rasterh3arrowstream) | stream object | Arrow PyCapsule producer, batch iterator, PyArrow / dict conversion |
 | [`raster_to_parquet(input_path, output_path, resolutions=8, ...)`](#raster_to_parquet) | `int` | Stream a raster straight to Parquet / GeoParquet 1.1 |
 | [`raster_to_pmtiles(input_path, output_path, resolutions=8, ...)`](#raster_to_pmtiles) | `int` | Stream a raster straight to a PMTiles v3 vector archive |
+| [`parquet_to_pmtiles(parquet_path, output_path, h3_column=None)`](#parquet_to_pmtiles) | `int` | Transcode any H3-indexed Parquet file to a PMTiles v3 vector archive |
 | [H3 helpers](#h3-helper-functions) | scalars | `h3_to_string`, `string_to_h3`, `h3_to_lat`, `h3_to_lng`, `h3_get_resolution`, `h3_is_valid`, `h3_to_wkb`, `h3_cell_to_parent`, `h3_polygon_to_cells` |
 
 ---
@@ -59,6 +60,19 @@ Polars and PyArrow are optional dependencies. Without Polars, the scan functions
 | `bbox` | `str \| Sequence[float] \| None` | `None` | Region of interest as `(min_lon, min_lat, max_lon, max_lat)` or `"min_lon,min_lat,max_lon,max_lat"`. Exactly four numbers. Chunks outside the box are not read. |
 | `columns` | `Sequence[str] \| None` | `None` (all) | Output columns, in this order. Projection is pushed into the engine, so unrequested columns (for example `wkb`, `h3_hex`) are never built. Names must come from the [output schema](#output-schemas) for the chosen mode. |
 | `limit` | `int \| None` | `None` | Maximum rows to produce. |
+| `band` | `int \| None` | `None` (band 1) | 1-indexed band to aggregate. A band the raster does not have raises an error. |
+| `sampling` | `str \| None` | `None` (`"center"`) | Sub-pixel sampling pattern: `"center"`, `"5point"`, `"gaussian"`, `"rgss"`, `"hex"`, `"8rooks"`, `"9point"` or `"16point"` (the [SQL aliases](super-sampling.md) are accepted too). Each pixel's weight is split across its samples, so a pixel straddling a cell edge contributes to both cells. |
+| `overlap_rule` | `str \| None` | `None` (`"cutline"`) | How overlapping mosaic tiles are resolved: `"cutline"` (each ground point from one tile), `"first"` (earlier files win) or `"average"` (every tile's samples are kept). Pass the same value to [`plan_partitions`](engines/python-polars.md#partitioned-scans-spark-and-other-distributed-engines) for partitioned scans. |
+| `spectral_formula` | `str \| None` | `None` | Continuous only: aggregate `"ndvi"`, `"ndwi"`, `"nbr"` or `"evi"`, computed per pixel from the bands named by `nir_band` (default 4), `red_band` (3), `green_band` (2), `blue_band` (1) and `swir_band` (6). |
+| `quantiles` | `str \| Sequence[str \| float] \| None` | `None` | Continuous only: streaming quantile columns, in DuckDB's [`quantiles`](sql-api-reference.md) syntax: `"p50,p90"`, `["median", "iqr"]`, `[0.05, 0.95]`, or a preset (`"default"`, `"box"`, `"tails"`, `"deciles"`). Each distinct target adds a nullable `Float64` column named after it (`0.05` becomes `p05`) after `wkb`. Sketches are built only when a quantile column is selected. |
+| `remap` | `str \| Mapping \| None` | `None` | Categorical only: class remapping applied to every pixel before aggregation. Either DuckDB's [`remap`](sql-api-reference.md) string (`"11..19: 1, 21: 2, else: null"`) or a mapping whose keys are class codes, `range`s of codes (step 1) or `"else"`, and whose values are the new code or `None` to drop the class: `{range(11, 20): 1, 21: 2, "else": None}`. Unmatched classes pass through unless `"else"` is given. |
+| `min_count` | `float \| None` | `None` | Drop cells with fewer samples than this (`count`, or `total_count` for categorical scans). Inclusive: a cell with exactly `min_count` samples is kept. |
+| `min_mean` / `max_mean` | `float \| None` | `None` | Continuous only: drop cells whose `mean` is below / above this value (inclusive). |
+| `min_majority_fraction` | `float \| None` | `None` | Categorical only: drop cells whose majority class covers less than this fraction (0 to 1) of their samples. |
+
+The filters (`min_count`, `min_mean`, `max_mean`, `min_majority_fraction`) run inside the
+engine, so dropped cells never reach Python. A Polars `filter` on the same columns is pushed
+into them automatically; see [Query optimisation](#query-optimisation).
 
 ### Fixed behaviour
 
@@ -67,14 +81,7 @@ example through the `duckdb` Python package) or the Rust APIs when you need to c
 
 | Setting | Python behaviour | SQL equivalent |
 | :--- | :--- | :--- |
-| Band | Band 1 | `band` |
-| Sub-pixel sampling | `'center'` (one sample per pixel) | `sampling` |
-| Mosaic overlaps | `'cutline'` | `overlap_rule` |
 | Scale / offset | GDAL `SCALE`/`OFFSET` always applied to continuous values | `scale_offset` |
-| Spectral indices | Not available | `formula`, `nir_band`, `red_band`, ... |
-| Quantiles | Not available | `quantiles` / `percentiles` |
-| Category remapping | Not available | `remap` |
-| Output filters | Use Polars `filter` instead | `min_count`, `min_mean`, `max_mean`, `min_majority_fraction` |
 | Single-cell pushdown | Use `bbox` or a Polars filter instead | `h3_cell`, `h3_hex` |
 | Compaction | Not available | `compact` |
 | Geometry column | `wkb` (`Binary`) only | `geom := true` (`GEOMETRY`) |
@@ -83,7 +90,9 @@ example through the `duckdb` Python package) or the Rust APIs when you need to c
 ### Validation
 
 Invalid options raise `RuntimeError` with the engine's message; they are never silently
-ignored. The one empty value that falls back to a default is `format=""`, which means `"wide"`.
+ignored. A wrongly typed option raises `TypeError`, and a non-finite filter bound, an
+out-of-range `min_majority_fraction` or a malformed `remap` mapping raises `ValueError`,
+when the scan object is created. The one empty value that falls back to a default is `format=""`, which means `"wide"`.
 
 | Input | Message (prefixed `Invalid parameter:`) |
 | :--- | :--- |
@@ -91,6 +100,9 @@ ignored. The one empty value that falls back to a default is `format=""`, which 
 | `format` other than `wide` / `long` | `Invalid format 'tall': expected 'wide' or 'long'` |
 | `bbox` without exactly four numbers | `Invalid bbox '1,2,3': expected four numbers min_lon,min_lat,max_lon,max_lat` |
 | Unknown name in `columns` | `Column 'nope' not found in raster_h3 schema` |
+| Unknown `sampling`, `overlap_rule` or `spectral_formula` name, invalid `quantiles` or `remap` | `Invalid sampling 'bilinear': expected one of center, 5point, ...` |
+| `band` (or a spectral formula band) the raster does not have | `band 3 does not exist: the raster has 2 band(s), numbered from 1` |
+| An option on the wrong kind of scan (`min_majority_fraction` or `remap` on a continuous scan; `spectral_formula`, `quantiles`, `min_mean` or `max_mean` on a categorical one) | `min_majority_fraction applies to categorical scans only` |
 | Missing file | `Input file path does not exist: nope.tif` |
 
 `read_raster_h3` and the `RasterH3ArrowStream` methods raise these directly.
@@ -124,8 +136,25 @@ If Polars is not installed, or is too old to provide `register_io_source`, it re
 | Projection (`select`, column pruning) | Pushed into the engine as `columns`; only the selected columns are built. |
 | Slice (`head`, `limit`, `n_rows`) with no filter | Pushed into the engine as `limit` (combined with your own `limit` by taking the smaller). |
 | Slice after a filter | Applied after the filter, so it caps the rows that survive the filter. |
-| Predicate (`filter`) | Evaluated by Polars on each batch inside the source as it streams. It does not prune raster reads; use `bbox` for that. |
+| Predicate (`filter`) | Comparisons with a literal, joined by `&`, are pushed into the engine (below). Polars then applies the full predicate to each batch, so the result is exactly that of filtering a full scan. It does not prune raster reads; use `bbox` for that. |
 | Batch size | Passed to [`iter_batches`](#methods). |
+
+Pushed predicates:
+
+| Predicate on | Pushed as | Scans |
+| :--- | :--- | :--- |
+| `count` `>`, `>=`, `==` | `min_count` | Continuous |
+| `total_count` `>`, `>=`, `==` | `min_count` | Categorical (both layouts) |
+| `mean` `>`, `>=`, `==` / `<`, `<=`, `==`; `is_between` | `min_mean` / `max_mean` | Continuous |
+| `majority_fraction` `>`, `>=`, `==` | `min_majority_fraction` (capped at 1) | Categorical, wide |
+| `resolution` (any comparison, `is_between`) | Resolutions the predicate rejects are not aggregated at all | All |
+
+Strict comparisons are pushed as the inclusive bound (`count > 10` as `min_count=10`),
+and pushed bounds only tighten your own `min_count` / `min_mean` / ... arguments. Anything
+else (`|`, `~`, casts, other columns, `is_in`) is simply evaluated by Polars. Narrowing the
+resolutions can change `stddev` in the last bits (summation order); values are otherwise
+identical. Pushdown reads the predicate through `Expr.meta.serialize`, so Polars versions
+without it fall back to filtering in Polars.
 
 ### Example
 
@@ -225,13 +254,14 @@ H3-indexed frames and with DuckDB `UBIGINT`.
 | `h3_index` | `UInt64` | | 64-bit H3 cell index. |
 | `h3_hex` | `String` | | 15-character lowercase hex form, e.g. `"8828308281fffff"`. |
 | `mean` | `Float64` | | Weighted mean of pixel values in the cell. |
-| `stddev` | `Float64` | ✓ | Single-pass Welford sample standard deviation; `0.0` for one sample, null if it cannot be computed. |
+| `stddev` | `Float64` | ✓ | Single-pass Welford reliability-weighted sample standard deviation, sqrt(M2 / (W - sum(w²) / W)); equals the usual sample standard deviation for unit pixel weights. `0.0` for one pixel, null if it cannot be computed. |
 | `count` | `Float64` | | Weighted number of pixels contributing to the cell. |
 | `min` | `Float64` | | Minimum pixel value in the cell. |
 | `max` | `Float64` | | Maximum pixel value in the cell. |
 | `sum` | `Float64` | | Sum of weighted pixel values. |
 | `resolution` | `UInt8` | | H3 resolution (0 to 15) of the cell. |
 | `wkb` | `Binary` | | OGC 2D WKB cell geometry in WGS84; see [cell geometry](sql-api-reference.md#cell-geometry). |
+| `p50`, `iqr`, ... | `Float64` | ✓ | One column per [`quantiles`](#keyword-parameters) target, in the order given. |
 
 See [Aggregation statistics](sql-api-reference.md#aggregation-statistics-mathematical-definitions--geospatial-use-cases)
 for the formulas and when to use each statistic.
@@ -353,6 +383,35 @@ all resolutions.
 | `resolutions` | `int \| str \| Sequence[int]` | `8` | H3 resolutions to include, e.g. `[5, 6, 7, 8]`. |
 | `categorical` | `bool` | `False` | Encode categorical instead of continuous properties. |
 | `crs` | `str \| None` | `None` (auto) | Source CRS override. |
+
+---
+
+## `parquet_to_pmtiles`
+
+```python
+parquet_to_pmtiles(parquet_path, output_path, *, h3_column=None) -> int
+```
+
+Transcodes an H3-indexed Parquet file (for example the output of
+[`raster_to_parquet`](#raster_to_parquet) or Polars' `write_parquet`) into a PMTiles v3
+archive with one hexagon feature per row and the other columns as properties, as DuckDB's
+[`h3_parquet_to_pmtiles`](sql-api-reference.md#parquet-pmtiles-v3-export-h3_parquet_to_pmtilesparquet_path-output_pmtiles-)
+does. Returns the number of hexagon features written; rows whose H3 value is null or not a
+valid cell are skipped.
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `parquet_path` | `str \| Path` | — | Input Parquet file. |
+| `output_path` | `str \| Path` | — | Destination `.pmtiles` file. |
+| `h3_column` | `str \| None` | `None` (auto) | H3 column, integer or hex string, matched case-insensitively. By default the first of `h3_index`, `h3_hex`, `h3`, `cell` or `hex`. A named column that does not exist raises `RuntimeError` listing the available columns. |
+
+```python
+(raster_h3.scan_raster_h3("landcover.tif", 9, categorical=True)
+    .filter(pl.col("majority_fraction") > 0.6)
+    .select("h3_index", "majority_class")
+    .sink_parquet("landcover.parquet"))
+raster_h3.parquet_to_pmtiles("landcover.parquet", "landcover.pmtiles")
+```
 
 ### Exporter errors and warnings
 

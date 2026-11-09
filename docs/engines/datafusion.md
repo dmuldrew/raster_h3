@@ -116,9 +116,18 @@ part of the table definition and clips individual pixels, so cells straddling it
 aggregated from only their pixels inside the box. `supports_filters_pushdown(&filters)` returns the
 classification above so a planner knows which predicates it still has to evaluate.
 
+When compaction is enabled (`with_compact` or `compact_h3_children`), that classification does not
+apply: `supports_filters_pushdown` reports every predicate as `Unsupported`, and `scan` leaves all
+of them to the caller as residual filters. Compaction changes both row identity and aggregate
+values, so a `Resolution` or value filter applied inside the scan would drop compacted parent rows
+the residual predicate is meant to see, or keep statistics computed from the filtered children.
+The scan emits the full compacted table instead.
+
 - **Projection**: `Some(&[indices])` projects the schema; only those columns are built.
 - **Limit**: passed to the batch reader, which stops draining once the limit is reached.
-  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out.
+  It is dropped when a `Bbox` is pushed, since that scan also emits cells the caller filters out,
+  and on compacted scans whenever predicates are present, since the caller re-applies them after
+  the limit would have been spent.
 - **Statistics**: `statistics()` returns `TableStatistics { num_rows, is_exact: false }`
   from `estimate_raster_cardinality`.
 
@@ -275,9 +284,11 @@ let plan = dem.scan(None, &[], None)?;
 
 ### Exports
 
-The DataFusion crate has no file writers. For Parquet/GeoParquet or PMTiles, use the core
-exporters (`H3ParquetWriter`, `H3PmtilesTiler`, see [Core](core.md#file-exporters)) with the
-same `MultiResolutionConfig`, or write the Arrow stream with any Arrow-based writer.
+The `raster-h3-datafusion` crate has no file writers. For Parquet/GeoParquet or PMTiles, use
+the core exporters (`H3ParquetWriter`, `H3PmtilesTiler`, see [Core](core.md#file-exporters))
+with the same `MultiResolutionConfig`, or write the Arrow stream with any Arrow-based writer.
+In real DataFusion and SedonaDB, `raster-h3-sedona` adds `COPY ... TO '*.pmtiles'`; see
+[PMTiles output](#pmtiles-output-copy--to-pmtiles).
 
 ## Using with Apache DataFusion and SedonaDB
 
@@ -299,15 +310,58 @@ ctx.sql(
 
 | Piece | What it does |
 | :--- | :--- |
-| `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) and `LIMIT` are pushed down. |
+| `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) is pushed down; `LIMIT` is pushed to the reader and `StreamingTableExec` only when every supplied filter is `Exact` (or there are none). Otherwise the caller applies the limit after residual filtering. A `WHERE` filter is pushed only as far as the wrapped provider's `supports_filters_pushdown` allows, so on compacted tables (and for non-`resolution` filters on partitioned ones) DataFusion evaluates it on the completed rows. |
 | Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
 | Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals`, and `ST_DWithin(..., d)` with a non-negative numeric literal `d`, between a cell's geometry (`wkb`, or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)` under any alias) and a constant geometry push an `Inexact` `FilterPredicate::Bbox`. The constant is a `geoarrow.wkb` literal in `OGC:CRS84` / `EPSG:4326` with planar edges (what `ST_SetSRID(ST_GeomFromWKT(...), 4326)` folds to) or `h3_to_wkb(<cell literal>)`. The box is the constant's envelope, grown by `d` degrees for `ST_DWithin` (planar distance in CRS units) and clamped to lon/lat range. `raster-h3-datafusion` then widens it past the largest cell before clipping samples (see `Bbox(b)` above), so every cell the predicate can match keeps its full aggregate; DataFusion re-applies the predicate to drop the extra cells. Compacted tables accept the filter but do not prune. |
 | Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
 | Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types, plus `h3_polygon_to_cells(geometry, resolution [, containment])` → `List<UInt64>`, with DuckDB's containment modes and NULL handling (see the [SQL reference](../sql-api-reference.md#h3_polygon_to_cells)). The geometry is WKB in lon/lat; a `geoarrow.wkb` argument tagged with another CRS is a planning error. The rows of each batch are polyfilled in parallel. |
 | Geometry | The `wkb` column and `h3_to_wkb` results are `geoarrow.wkb` fields with CRS `OGC:CRS84` (planar edges, as in the GeoParquet export), so Sedona's `ST_*` functions accept them directly. |
+| PMTiles output | `register_all` registers a `pmtiles` file format, so `COPY (query) TO 'cells.pmtiles'` writes any query's rows as H3 hexagon features. See [PMTiles output](#pmtiles-output-copy--to-pmtiles). |
 
 The crate is a standalone Cargo workspace (listed in the root `exclude`), so DataFusion
 never enters the root `Cargo.lock` or the `--workspace` CI jobs.
+
+### PMTiles output: `COPY ... TO '*.pmtiles'`
+
+`register_all` (or `register_pmtiles_format` alone) registers a write-only `pmtiles` file
+format, the DataFusion counterpart of DuckDB's `COPY ... (FORMAT pmtiles)`. The rows of any
+query become one hexagon feature each, so cells can be filtered, joined with other tables or
+aggregated before tiling:
+
+```sql
+COPY (
+    SELECT d.h3_index, d.mean, t.name AS tract
+    FROM h3_raster_continuous_aggregate('dem.tif', 7, 8) AS d
+    JOIN tract_cells AS t USING (h3_index)
+    WHERE d.count >= 4
+) TO 'dem.pmtiles' OPTIONS (min_zoom 5, max_zoom 11);
+```
+
+The `.pmtiles` extension selects the format; with another file name add
+`STORED AS PMTILES`.
+
+| Input | Handling |
+| :--- | :--- |
+| H3 column | The `h3_column` option, else the first of `h3_index`, `h3_hex`, `h3`, `cell`, `hex` (case-insensitive), else the first column. `UInt64`, `Int64` (the same 64 bits, as Spark and PostgreSQL store cells) or a hex string, plain or dictionary-encoded. NULL rows are skipped; any other value that is not a valid H3 cell fails the `COPY` with the value in the message. |
+| Other columns | One feature property each, under the column's name and listed in the archive's `vector_layers` metadata. Integers, floats, booleans and strings are native MVT values; binary columns (`wkb` and other geometry) are left out, since the feature is the cell polygon; other types (dates, decimals, timestamps) are written as their string form. NULL values are omitted from that feature. `h3_index`, `h3_hex` and `resolution` are added unless the query supplies them. |
+
+| Option | Default | Meaning |
+| :--- | :--- | :--- |
+| `h3_column` | auto | The H3 column (see above). |
+| `min_zoom`, `max_zoom` | all | Keep only cells whose PMTiles zoom, derived from their H3 resolution (see [PMTiles](../pmtiles.md)), is in this range. |
+| `memory_budget_mb` | `256` | Rows buffered in memory before sorted runs spill to temporary files. |
+
+Rows go through core's `ExternalFeatureExport`: buffered up to the budget, then
+external-sorted by latitude, so any number of rows in any order is written with bounded
+memory, and the archive bytes do not depend on the budget or the input order. The archive is
+built on a blocking thread and then uploaded through the session's object store, so a
+registered `s3://` (or other) store works as a destination. `COPY` returns the number of
+features written. `PARTITIONED BY`, a directory destination and file compression are
+refused, unknown options are errors, and PMTiles cannot be read back as a table.
+
+From Rust, `raster_h3_sedona::write_pmtiles(df, "cells.pmtiles", PmtilesWriteOptions::default())`
+writes a `DataFrame` through the same sink, and `write_record_batches` writes any iterator
+of `RecordBatch`es to a local file.
 
 ### Partitioned scans
 
@@ -354,7 +408,13 @@ options. `raster_h3_sedona.scalar_functions()` exports the scalar UDFs above, un
 name and alias, as `sedonadb_scalar_kernel` capsules; `sd.register(...)` installs them all
 (`__sedonadb_extension__`), or register single entries by iterating. Geometry arguments
 must be planar lon/lat or have no CRS, and `h3_to_wkb` returns `OGC:CRS84` geometry, so
-it composes with Sedona's `ST_*` functions and with spatial pushdown:
+it composes with Sedona's `ST_*` functions and with spatial pushdown.
+
+A join `ON ST_Intersects(d.wkb, t.wkb_geometry)` runs as SedonaDB's `SpatialJoinExec`. To join
+on hex ids instead, as the DuckDB and Polars versions do, polyfill the polygons with
+`unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index`; joining
+`ON d.h3_index = t.h3_index` is then a plain hash join on a 64-bit integer, which is cheaper
+when the polyfilled polygons are reused across queries:
 
 ```python
 sd.register(raster_h3_sedona.scalar_functions())
@@ -366,7 +426,22 @@ sd.sql("""
     JOIN dem AS d ON d.h3_index = t.h3_index
     GROUP BY t.name
 """).show()
-``` The capsule ABI follows the pinned SedonaDB revision, which matches the
+```
+
+SedonaDB's extension ABI registers table providers and functions but not file formats, so
+in Python `COPY ... TO '*.pmtiles'` is replaced by `raster_h3_sedona.write_pmtiles(data,
+path, *, h3_column=None, min_zoom=None, max_zoom=None, memory_budget_mb=None)`. It takes
+anything exposing `__arrow_c_stream__` (a SedonaDB DataFrame, a PyArrow table, a Polars
+DataFrame), applies the same rules and options as the SQL format, writes the archive
+atomically and returns the number of features:
+
+```python
+cells = sd.sql("SELECT h3_index, mean FROM dem WHERE count >= 4")
+raster_h3_sedona.write_pmtiles(cells, "dem.pmtiles", min_zoom=5)
+```
+
+Invalid H3 values and bad options raise `ValueError`, and a file-system error raises
+`OSError`. The capsule ABI follows the pinned SedonaDB revision, which matches the
 `sedonadb` 0.5.0 wheel.
 
 ## Testing

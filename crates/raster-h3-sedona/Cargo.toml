@@ -1,7 +1,7 @@
 [package]
 name = "raster-h3-sedona"
 publish = false
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.94"
 authors = ["raster_h3 contributors"]
@@ -19,15 +19,17 @@ members = [".", "python"]
 name = "raster_h3_sedona"
 
 [dependencies]
-raster-h3-core = { version = "0.5.0", path = "../raster-h3-core" }
-raster-h3-datafusion = { version = "0.5.0", path = "../raster-h3-datafusion" }
+raster-h3-core = { version = "0.7.0", path = "../raster-h3-core" }
+raster-h3-datafusion = { version = "0.7.0", path = "../raster-h3-datafusion" }
 # Must match the DataFusion / arrow versions pinned by apache/sedona-db.
 datafusion = { version = "=54.1.0", default-features = false, features = ["sql"] }
 arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }
 futures = "0.3"
 # Parallel polyfill in `h3_polygon_to_cells` (already used by raster-h3-core).
 rayon = "1.10"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+# Temporary file holding a PMTiles archive before it is uploaded to the object store.
+tempfile = "3.10"
 async-trait = "0.1"
 serde_json = "1.0"
 # Only for the `sedona-e2e` tests; pinned to the SedonaDB revision this adapter was checked against.
@@ -38,6 +40,8 @@ sedona = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc0
 sedona-e2e = ["dep:sedona"]
 
 [dev-dependencies]
+# Reads the gzipped JSON metadata of PMTiles archives in the `pmtiles` tests.
+flate2 = "1"
 h3o = "0.11"
 # SedonaDB's extension ABI, for the `extension_abi` round-trip tests (same revision as `sedona`).
 sedona-extension = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc06fae0ff5662e99608d7e8b1" }

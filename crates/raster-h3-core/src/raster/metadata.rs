@@ -252,6 +252,8 @@ const KEY_GEODETIC_DATUM: u16 = 2050;
 const KEY_PRIME_MERIDIAN: u16 = 2051;
 const KEY_GEOG_ANGULAR_UNITS: u16 = 2054;
 const KEY_ELLIPSOID: u16 = 2056;
+/// libgeotiff/GDAL extension: Helmert datum shift to WGS84 (3 or 7 doubles).
+const KEY_GEOG_TOWGS84: u16 = 2062;
 const KEY_PROJECTED_CRS: u16 = 3072;
 const KEY_PROJ_METHOD: u16 = 3075;
 const KEY_PROJ_LINEAR_UNITS: u16 = 3076;
@@ -353,6 +355,7 @@ pub fn extract_crs<R: Read + Seek>(decoder: &mut Decoder<R>) -> (Option<u32>, Op
 
     let mut short_keys: HashMap<u16, u16> = HashMap::new();
     let mut double_param_keys = HashMap::new();
+    let mut towgs84_count = 0usize;
 
     if let Ok(keys) = keys_res {
         if keys.len() >= 4 {
@@ -369,6 +372,9 @@ pub fn extract_crs<R: Read + Seek>(decoder: &mut Decoder<R>) -> (Option<u32>, Op
                     } else if tiff_tag_loc == 34736 {
                         // Index into GeoDoubleParamsTag
                         double_param_keys.insert(key_id, val_or_offset as usize);
+                        if key_id == KEY_GEOG_TOWGS84 {
+                            towgs84_count = keys[offset + 2] as usize;
+                        }
                     }
                 }
             }
@@ -398,6 +404,16 @@ pub fn extract_crs<R: Read + Seek>(decoder: &mut Decoder<R>) -> (Option<u32>, Op
                 .get(&key)
                 .and_then(|&idx| doubles.get(idx).copied())
         };
+        // `+datum=` implies a zero shift; a nonzero GeoKey shift cannot be
+        // represented, and the WKT fallback below must not drop it either.
+        if towgs84_count > 0 {
+            let shift = double_param_keys
+                .get(&KEY_GEOG_TOWGS84)
+                .and_then(|&idx| doubles.get(idx..idx + towgs84_count));
+            if !shift.is_some_and(|v| v.iter().all(|&x| x == 0.0)) {
+                return (None, None);
+            }
+        }
         if let Some(p) = user_defined_geokeys_to_proj(&short_keys, get_double) {
             return (None, Some(p));
         }
@@ -512,6 +528,10 @@ fn user_defined_geokeys_to_proj(
 pub fn parse_wkt_or_ascii_to_proj(s: &str) -> Option<String> {
     let upper = extract_projcs(&s.to_uppercase())?;
 
+    if has_datum_shift(&upper) {
+        return None;
+    }
+
     // Datum by name only; ellipsoid names (e.g. GRS 1980) are shared by
     // several datums and do not identify one.
     let datum_name = section_name(&upper, "DATUM[")?;
@@ -602,6 +622,37 @@ fn extract_projcs(upper: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether the WKT carries a `TOWGS84[...]` datum shift that `+datum=WGS84`
+/// or `+datum=NAD83` cannot represent: any value other than all zeros (which
+/// GDAL commonly writes and those datums already imply), or one that does
+/// not parse. Quoted names are ignored, so a CRS named "... TOWGS84[...]"
+/// is not mistaken for a shift.
+fn has_datum_shift(upper: &str) -> bool {
+    const TAG: &str = "TOWGS84";
+    // Drop quoted text so only WKT elements can match.
+    let mut quoted = false;
+    let unquoted: String = upper
+        .chars()
+        .filter(|&c| {
+            if c == '"' {
+                quoted = !quoted;
+            }
+            !quoted && c != '"'
+        })
+        .collect();
+    unquoted.match_indices(TAG).any(|(i, _)| {
+        let Some(rest) = unquoted[i + TAG.len()..].trim_start().strip_prefix('[') else {
+            return false;
+        };
+        let Some(end) = rest.find(']') else {
+            return true;
+        };
+        !rest[..end]
+            .split(',')
+            .all(|v| v.trim().parse::<f64>() == Ok(0.0))
+    })
 }
 
 /// The quoted name of the first `tag` section, e.g. `DATUM["WGS_1984",...`.
@@ -836,9 +887,6 @@ mod tests {
         shorts: &[(u16, u16)],
         doubles: &[(u16, f64)],
     ) -> Decoder<std::io::Cursor<Vec<u8>>> {
-        use std::io::Cursor;
-        use tiff::encoder::{colortype, TiffEncoder};
-
         let mut dir: Vec<u16> = vec![1, 1, 0, (shorts.len() + doubles.len()) as u16];
         for &(k, v) in shorts {
             dir.extend([k, 0, 1, v]);
@@ -847,19 +895,23 @@ mod tests {
             dir.extend([k, 34736, 1, i as u16]);
         }
         let values: Vec<f64> = doubles.iter().map(|d| d.1).collect();
+        decoder_with_geokey_dir(&dir, &values)
+    }
+
+    /// Encode a 1x1 GeoTIFF with a raw GeoKeyDirectoryTag and GeoDoubleParamsTag.
+    fn decoder_with_geokey_dir(dir: &[u16], values: &[f64]) -> Decoder<std::io::Cursor<Vec<u8>>> {
+        use std::io::Cursor;
+        use tiff::encoder::{colortype, TiffEncoder};
 
         let mut buffer = Vec::new();
         {
             let mut encoder = TiffEncoder::new(Cursor::new(&mut buffer)).unwrap();
             let mut image = encoder.new_image::<colortype::Gray32Float>(1, 1).unwrap();
-            image
-                .encoder()
-                .write_tag(Tag::Unknown(34735), &dir[..])
-                .unwrap();
+            image.encoder().write_tag(Tag::Unknown(34735), dir).unwrap();
             if !values.is_empty() {
                 image
                     .encoder()
-                    .write_tag(Tag::Unknown(34736), &values[..])
+                    .write_tag(Tag::Unknown(34736), values)
                     .unwrap();
             }
             image.write_data(&[0.0f32]).unwrap();
@@ -947,6 +999,63 @@ mod tests {
         assert_eq!(parse_wkt_or_ascii_to_proj(&paris), None);
         let no_scale = wkt.replace(r#"PARAMETER["scale_factor",0.9999],"#, "");
         assert_eq!(parse_wkt_or_ascii_to_proj(&no_scale), None);
+    }
+
+    #[test]
+    fn test_parse_wkt_datum_shift_is_rejected_unless_zero() {
+        let wkt = r#"PROJCS["NAD83 / custom ft",GEOGCS["NAD83",DATUM["North_American_Datum_1983",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",31],PARAMETER["central_meridian",-110.1666666666667],PARAMETER["scale_factor",0.9999],PARAMETER["false_easting",700000],PARAMETER["false_northing",0],UNIT["US survey foot",0.3048006096012192]]"#;
+        let spheroid = r#"SPHEROID["GRS 1980",6378137,298.257222101]"#;
+        let with = |towgs84: &str| wkt.replace(spheroid, &format!("{spheroid},{towgs84}"));
+        let expected = parse_wkt_or_ascii_to_proj(wkt).unwrap();
+
+        // GDAL writes an explicit zero shift for NAD83/WGS84; +datum implies it.
+        for zero in [
+            "TOWGS84[0,0,0,0,0,0,0]",
+            "TOWGS84[0,0,0]",
+            "TOWGS84 [0, 0, 0]",
+        ] {
+            assert_eq!(
+                parse_wkt_or_ascii_to_proj(&with(zero)),
+                Some(expected.clone())
+            );
+        }
+        for shift in [
+            "TOWGS84[1,2,3]",
+            "TOWGS84[0,0,0,0,0,0,1]",
+            "TOWGS84 [1,2,3]",
+            "TOWGS84[0,0,X]",
+        ] {
+            assert_eq!(parse_wkt_or_ascii_to_proj(&with(shift)), None, "{shift}");
+        }
+
+        // The text inside a quoted name is not a WKT element.
+        let named = wkt.replace("NAD83 / custom ft", "NAD83 TOWGS84[1,2,3]");
+        assert_eq!(parse_wkt_or_ascii_to_proj(&named), Some(expected));
+    }
+
+    #[test]
+    fn test_user_defined_geokey_datum_shift_is_rejected_unless_zero() {
+        // NAD83 datum, user-defined Transverse Mercator; the doubles are
+        // 3080, 3081, 3092 followed by GeogTOWGS84GeoKey's 3 values.
+        let with_shift = |shift: [f64; 3]| {
+            let dir: Vec<u16> = vec![
+                1, 1, 0, 7, //
+                2050, 0, 1, 6269, //
+                2062, 34736, 3, 3, //
+                3072, 0, 1, 32767, //
+                3075, 0, 1, 1, //
+                3080, 34736, 1, 0, //
+                3081, 34736, 1, 1, //
+                3092, 34736, 1, 2,
+            ];
+            let mut values = vec![-120.0, 0.0, 0.9996];
+            values.extend(shift);
+            extract_crs(&mut decoder_with_geokey_dir(&dir, &values))
+        };
+        let (epsg, proj) = with_shift([0.0; 3]);
+        assert_eq!(epsg, None);
+        assert!(proj.unwrap().contains("+datum=NAD83"));
+        assert_eq!(with_shift([1.0, 2.0, 3.0]), (None, None));
     }
 
     #[test]

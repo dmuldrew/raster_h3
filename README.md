@@ -10,6 +10,8 @@ A pure-Rust engine that aggregates multi-gigabyte geospatial rasters (GeoTIFF, C
 
 Supports **continuous** surfaces (elevation, temperature, NDVI, precipitation) and **categorical** classifications (land cover, zoning, soil types) with dedicated streaming engines.
 
+Statistics use pixel contributions, not ground-area weights. CRS projection tolerances do not imply the same absolute WGS84 datum accuracy; NAD83 and ETRS89 paths include documented approximations. See [accuracy and weighting contracts](docs/testing.md#accuracy-and-weighting-contracts) for interpretation and regression coverage.
+
 | Output | Use Case | Available In |
 | :--- | :--- | :--- |
 | **H3 table / Arrow stream** | SQL analytics, JOINs, DataFrames | DuckDB, Python/Polars, PostgreSQL, DataFusion, CLI (NDJSON / `RH3IPC01`) |
@@ -111,6 +113,12 @@ WHERE t.majority_class = 41          -- Deciduous forest (NLCD code)
 ORDER BY t.canopy_purity ASC;
 ```
 
+DuckDB's advantage is reach: the same SQL runs from the DuckDB CLI or from Python, Node.js and
+R, and one session joins the raster with vector files, Parquet and S3 data through DuckDB's
+other extensions. It also exposes every engine option, including compaction and memory budgets.
+Unlike SedonaDB, `WHERE` filters apply after aggregation, so narrow the scan with parameters
+such as `bbox := '...'`.
+
 #### Python & Polars
 
 ```python
@@ -154,10 +162,12 @@ result = (
 )
 ```
 
-Python scans reject malformed `resolutions`, `format` and `bbox` with `RuntimeError`
-instead of silently ignoring them or using defaults. Parquet and PMTiles exports
-also reject invalid resolutions; every resolution must be between 0 and 15. See the
-[Python scan parameters](docs/engines/python-polars.md#scan-parameters) for details.
+In Polars, the raster is a `LazyFrame`, read only when `.collect()` runs, and it combines freely
+with other Polars and GeoPandas data. `columns=` and `.filter()` comparisons on `count`, `mean`,
+`majority_fraction` or `resolution` are pushed into the scan, but spatial conditions are
+not; pass `bbox=tracts.total_bounds` to read less of the raster. `h3_polygon_to_cells`
+takes one geometry at a time, hence the list comprehension, and the `UInt64` cast matches the
+scan's `h3_index`. See the [Python scan parameters](docs/engines/python-polars.md#scan-parameters).
 
 #### SedonaDB (Python)
 
@@ -211,15 +221,14 @@ result = sd.sql("""
 """).to_pandas()
 ```
 
-The join runs as SedonaDB's `SpatialJoinExec`. To join on hex ids instead, as in the DuckDB
-and Polars versions, register the raster_h3 SQL functions with
-`sd.register(raster_h3_sedona.scalar_functions())` and polyfill the tracts with
-`unnest(h3_polygon_to_cells(wkb_geometry, 8, 'covers')) AS h3_index`; joining
-`ON c.h3_index = t.h3_index` is then a plain hash join on a 64-bit integer, which is cheaper when
-the polyfilled tracts are reused. A filter against a constant geometry, such as
-`ST_Intersects(wkb, ST_GeomFromWKT(...))`, is pushed into the raster scan instead, so only the
-hexagons near it are aggregated. See
-[DataFusion & SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
+In SedonaDB, the tracts don't need converting to hexagons; the join matches hexagon shapes to
+tract shapes directly. It is also the only one of the three that skips raster from a spatial
+condition: a condition against a fixed shape, such as `ST_Intersects(wkb,
+ST_GeomFromWKT(...))`, limits the scan to the tiles near it, and `majority_fraction >= 0.5`
+drops hexagons inside the scan rather than after it. The tract join and the filters in this
+example don't narrow the scan; the whole raster is still aggregated. To join on hex ids
+instead, as DuckDB and Polars do, see [DataFusion &
+SedonaDB](docs/engines/datafusion.md#from-sedonadbs-python-api).
 
 > No GDAL. No intermediate files. The raster *becomes* a queryable table source — a SQL table function in DuckDB, a `LazyFrame` in Polars, a table provider in SedonaDB.
 
@@ -278,6 +287,12 @@ A web map needs tiles at every zoom level — from hemispheric overview down to 
 | **Cloud-Native Streaming** | HTTP/S3 COG range prefetching — no local copies needed |
 | **Sub-Pixel Super-Sampling** | RGSS, Hex, Gaussian, 8-Rooks boundary anti-aliasing |
 
+Built-in HTTP/S3 reads pin strong ETags per URL and use `If-Match`, failing if the
+object changes during a scan. Rust `HttpTransport` clones share each URL's pin:
+changing `url` selects an independent validator, and returning to a previous URL
+retains its original pin. Servers with weak or missing ETags have no snapshot
+guarantee; use immutable/versioned URLs. See [remote COG streaming](docs/engines/core.md#remote-cog-prefetching).
+
 ---
 
 ## How It Works
@@ -320,13 +335,15 @@ returns the same cells and statistics for the same input.
 | **PostgreSQL 13–18** | `raster-h3-pg` | `cargo build -p raster-h3-pg --features pg-extension` | [PostgreSQL](docs/engines/postgresql.md) |
 | **DataFusion-style Rust API** | `raster-h3-datafusion` | Cargo dependency | [DataFusion](docs/engines/datafusion.md) |
 | **Apache DataFusion / SedonaDB** | `raster-h3-sedona` | Cargo dependency (DataFusion pinned to SedonaDB's version); SedonaDB Python: `maturin build` in `crates/raster-h3-sedona/python` | [DataFusion & SedonaDB](docs/engines/datafusion.md#using-with-apache-datafusion-and-sedonadb) |
+| **Apache Spark / Apache Sedona** | `raster-h3-python` (on every executor) | The `raster-h3` wheel (`raster_h3.spark` data source on Spark 4.0+); or `docker compose up --build sedona` (Apache Sedona 1.9.1, Spark 4.0) | [Spark & Apache Sedona](docs/engines/spark.md) |
 | **CLI** | `raster-h3-cli` | `cargo build --release -p raster-h3-cli` (also in the Python wheel) | [CLI](docs/engines/cli.md) |
 | **Rust library** | `raster-h3-core` | Cargo dependency | [Core Engine](docs/engines/core.md) |
 
 Feature coverage differs per engine: DuckDB exposes every parameter (sampling, bands,
 spectral formulas, quantiles, remapping, budgets), DataFusion exposes most of them through
-builders, and PostgreSQL, Python and the CLI expose the common subset (resolutions, CRS,
-NoData, bbox, categorical layout). The [Engines Overview](docs/engines/README.md) has the
+builders, Python exposes all but compaction, single-cell pushdown and resource budgets
+(and pushes Polars filters into the engine), and PostgreSQL and the CLI expose the common subset (resolutions, CRS, NoData, bbox,
+categorical layout). The [Engines Overview](docs/engines/README.md) has the
 full capability matrix, shared output schemas, a side-by-side cheat sheet and the
 cross-engine parity tests. Each engine deep dive covers install, recipes (basic and
 advanced scans, scalar helpers, joins, exports, remote COGs, mosaics, categorical queries),
@@ -385,6 +402,12 @@ let provider = ctx.h3_raster_continuous_aggregate("dem.tif", vec![8])?;
 let plan = provider.scan(Some(&[0, 2]), &[FilterPredicate::MinCount(10.0)], Some(1000))?;
 for batch in plan.execute()? { /* RecordBatch with h3_index, mean */ }
 ```
+
+Call `supports_filters_pushdown` to learn which predicates you still have to apply to the
+scan's rows. With compaction on, it reports every predicate `Unsupported` and the scan returns
+the full compacted table; `RasterH3Table` (below) then leaves those `WHERE` clauses to
+DataFusion. The adapter defers `LIMIT` until after all residual filters, including inexact
+pushdowns. See [filter pushdown](docs/engines/datafusion.md).
 
 **Apache DataFusion / SedonaDB**
 
@@ -445,10 +468,14 @@ SELECT h3_index, resolution, h3_merge_partials(partial_state) AS cell
 FROM partial_rows GROUP BY h3_index, resolution;   -- cell.mean, cell.count, ...
 ```
 
+From a shell, `raster-h3-cli plan` / `ipc --partition` / `merge` fan out with `xargs -P`
+or batch jobs ([CLI guide](docs/engines/cli.md#partitioned-scans)).
+
 In Rust the same steps are `plan_partitions`, `MultiResolutionConfig::partition` and
 `PartialMerger` (DataFusion providers: `plan_partitions` / `with_partition`). See
 [Partitioned scans](docs/engines/core.md#partitioned-scans) and the
 [Python](docs/engines/python-polars.md#partitioned-scans-spark-and-other-distributed-engines),
+[Spark & Apache Sedona](docs/engines/spark.md),
 [DuckDB](docs/engines/duckdb.md#partitioned-scans) and
 [DataFusion / SedonaDB](docs/engines/datafusion.md#partitioned-scans) guides.
 

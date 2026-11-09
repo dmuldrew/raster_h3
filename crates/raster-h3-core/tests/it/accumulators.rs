@@ -517,3 +517,66 @@ fn apply_affine_matches_accumulating_transformed_values() {
     empty.apply_affine(-3.0, 1.0);
     assert_eq!(empty, H3Accumulator::default());
 }
+
+#[test]
+fn weighted_sample_variance_handles_fractional_weights_and_merges() {
+    // Weighted sample variance uses M2 / (W - sum(w_i^2) / W).
+    // For 100 and 200 with weights 0.4 and 0.6, M2 is 2400 and
+    // the denominator is 0.48, giving 5000.
+    for factor in [0.5, 1.0, 2.0, 10.0] {
+        let mut direct = H3Accumulator::new_weighted(100.0, 0.4 * factor);
+        direct.update_weighted(200.0, 0.6 * factor);
+        assert!((direct.variance() - 5000.0).abs() < 1e-8);
+        assert!((direct.stddev() - 5000.0_f64.sqrt()).abs() < 1e-8);
+
+        let mut merged = H3Accumulator::new_weighted(100.0, 0.4 * factor);
+        merged.merge(&H3Accumulator::new_weighted(200.0, 0.6 * factor));
+        assert!((merged.variance() - direct.variance()).abs() < 1e-8);
+    }
+}
+
+#[test]
+fn weighted_sample_variance_edge_cases() {
+    // Unit weights keep the unweighted sample variance, whichever path builds them.
+    let values = [3.0, 7.0, 7.0, 19.0];
+    let mut unit = H3Accumulator::default();
+    let mut weighted = H3Accumulator::default();
+    for v in values {
+        unit.update(v);
+        weighted.update_weighted(v, 1.0);
+    }
+    let mut sliced = H3Accumulator::default();
+    sliced.update_slice(&values);
+    let mean = values.iter().sum::<f64>() / 4.0;
+    let expected = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 3.0;
+    for acc in [&unit, &weighted, &sliced] {
+        assert_eq!(acc.sum_w2, 4.0);
+        assert!((acc.variance() - expected).abs() < 1e-12);
+    }
+
+    // A single observation has no spread, whatever its weight.
+    for w in [0.25, 1.0, 3.0] {
+        let acc = H3Accumulator::new_weighted(42.0, w);
+        assert_eq!(acc.variance(), 0.0);
+        assert_eq!(acc.stddev(), 0.0);
+    }
+    assert!(H3Accumulator::default().variance().is_nan());
+    assert!(H3Accumulator::default().stddev().is_nan());
+
+    // Merging with empty or self-equal states, and affine maps, keep sum(w^2).
+    let mut a = H3Accumulator::new_weighted(1.0, 0.3);
+    a.merge(&H3Accumulator::default());
+    assert!((a.sum_w2 - 0.09).abs() < 1e-15);
+    let mut empty = H3Accumulator::default();
+    empty.merge(&a);
+    assert_eq!(empty.sum_w2, a.sum_w2);
+    let mut b = H3Accumulator::new_weighted(10.0, 0.5);
+    b.update_weighted(20.0, 0.25);
+    let var = b.variance();
+    b.apply_affine(-2.0, 5.0);
+    assert!((b.variance() - 4.0 * var).abs() < 1e-9);
+
+    // Clearing resets it.
+    b.clear();
+    assert_eq!(b.sum_w2, 0.0);
+}
