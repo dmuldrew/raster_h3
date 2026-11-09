@@ -10,8 +10,8 @@
 //! (`decode_budget_bytes`); pending compaction groups are accounted and
 //! optionally limited (`compaction_budget_bytes`). Metadata is not budgeted.
 
+use super::eviction_space::{CellKeys, EvictionSpace};
 use crate::aggregator::cell_hash::H3BuildHasher;
-use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use h3o::{CellIndex, Resolution};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -45,8 +45,9 @@ type WindowJob<'a> = (
 );
 /// One worker's per-resolution cell maps.
 type CellMaps<A> = Vec<HashMap<u64, A, H3BuildHasher>>;
-/// Per resolution, `(cell, compute_cell_south_lat(cell))` in map order.
-type SouthKeys = Vec<Vec<(u64, f64)>>;
+/// Per resolution, `(cell, eviction keys)` in map order (see
+/// [`EvictionSpace::cell_keys`]).
+type SouthKeys = Vec<Vec<(u64, CellKeys)>>;
 
 /// Refuse a `band` (or spectral formula band) that some mosaic tile does not have. The
 /// sample kernels index pixels by band without a bounds check that fails the scan, so an
@@ -201,6 +202,14 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     current_lat_horizon: f64,
     can_evict_early: bool,
     suffix_max_north_lat: Vec<f64>,
+    /// How cells' eviction keys and chunks' bounds are measured.
+    eviction_space: EvictionSpace,
+    /// Suffix maxima of chunk bounds in `eviction_space` when it is not
+    /// latitude (then `suffix_max_north_lat` serves both).
+    suffix_eviction_bound: Option<Vec<f64>>,
+    /// Latitude bound of every chunk not yet processed. Equals
+    /// `eviction_horizon` when keys are latitudes.
+    lat_horizon: f64,
     processed_chunk_count: usize,
     spill_runs: Vec<SpillRuns<K::Accumulator>>,
     final_reader: Option<FinalCells<K::Accumulator>>,
@@ -320,9 +329,36 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             );
             suffix_max_north_lat[k] = suffix_max_north_lat[k + 1].max(north);
         }
-        let can_evict_early = suffix_max_north_lat.iter().any(|v| v.is_finite());
+        // Cells are evicted by `eviction_space`; latitude bounds still guard
+        // compaction and the horizon published to tilers.
+        let eviction_space = EvictionSpace::for_mosaic(&mosaic);
+        let suffix_eviction_bound = eviction_space.is_rows().then(|| {
+            let mut suffix = vec![f64::NEG_INFINITY; n_chunks + 1];
+            for k in (0..n_chunks).rev() {
+                let reference = mosaic.chunk_refs[k];
+                let tile = &mosaic.tiles[reference.tile_idx];
+                let chunk = tile.reader.chunk_layout.get_chunk_bounds(
+                    reference.chunk_idx,
+                    tile.reader.metadata.width,
+                    tile.reader.metadata.height,
+                );
+                let bound = eviction_space.chunk_bound(
+                    &chunk,
+                    &tile.reader.metadata.geotransform,
+                    &tile.crs_transformer,
+                );
+                suffix[k] = suffix[k + 1].max(bound);
+            }
+            suffix
+        });
+        let can_evict_early = suffix_eviction_bound
+            .as_ref()
+            .unwrap_or(&suffix_max_north_lat)
+            .iter()
+            .any(|v| v.is_finite());
         for map in &mut resolution_shards {
             map.set_eviction_enabled(can_evict_early);
+            map.set_lat_tracking(eviction_space.is_rows());
         }
         // Leave room for sorted-run construction, merge heads, and bounded output.
         let map_budget = config.aggregation_budget_bytes / num_res / 4;
@@ -379,6 +415,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             current_lat_horizon: f64::INFINITY,
             can_evict_early,
             suffix_max_north_lat,
+            eviction_space,
+            suffix_eviction_bound,
+            lat_horizon: f64::INFINITY,
             processed_chunk_count: 0,
             spill_runs,
             final_reader: None,
@@ -522,7 +561,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     fn merge_window(
         &mut self,
         maps: &mut [HashMap<u64, K::Accumulator, H3BuildHasher>],
-        south_keys: &[Vec<(u64, f64)>],
+        south_keys: &[Vec<(u64, CellKeys)>],
     ) -> Result<()> {
         for (i, map) in maps.iter_mut().enumerate() {
             let precomputed = south_keys.get(i).map_or(&[][..], Vec::as_slice);
@@ -536,17 +575,18 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 // the horizon map (another worker merged it first); then the
                 // entry is skipped unused.
                 let south = match precomputed.get(cursor) {
-                    Some(&(k, south)) if k == key => {
+                    Some(&(k, keys)) if k == key => {
                         cursor += 1;
-                        Some(south)
+                        Some(keys)
                     }
                     _ => None,
                 };
                 let fallbacks = &mut self.metrics.eviction_key_fallbacks;
+                let space = &self.eviction_space;
                 let merged = self.resolution_shards[i].merge_owned_with(key, acc, || {
                     south.unwrap_or_else(|| {
                         *fallbacks += 1;
-                        compute_cell_south_lat(key)
+                        space.cell_keys(key)
                     })
                 });
                 if merged > self.accumulator_limit {
@@ -691,7 +731,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                             out.extend(
                                 map.keys()
                                     .filter(|&&key| !shard.contains(key))
-                                    .map(|&key| (key, compute_cell_south_lat(key))),
+                                    .map(|&key| (key, self.eviction_space.cell_keys(key))),
                             );
                         }
                     }
@@ -772,7 +812,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 let key_bytes: usize = south_keys
                     .iter()
                     .flatten()
-                    .map(|k| k.capacity() * size_of::<(u64, f64)>())
+                    .map(|k| k.capacity() * size_of::<(u64, CellKeys)>())
                     .sum();
                 let bytes: usize = maps
                     .iter()
@@ -913,8 +953,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 // logical children all lie north of the horizon is final.
                 let buffered = self.output_buffer.len();
                 let (spill_runs, resolution_u8s) = (&self.spill_runs, &self.resolution_u8s);
+                let lat_guard = self.lat_guard();
                 self.compactor.flush_completed(
-                    self.eviction_horizon,
+                    lat_guard,
                     |res| {
                         resolution_u8s
                             .iter()
@@ -931,9 +972,8 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
             if self.buffered_len() == 0 && !self.spill_runs.iter().any(|r| r.has_spilled()) {
                 // Held sibling groups may still emit records north of the horizon.
-                self.current_lat_horizon = self
-                    .eviction_horizon
-                    .max(self.compactor.pending_emit_south());
+                self.current_lat_horizon =
+                    self.lat_guard().max(self.compactor.pending_emit_south());
             }
 
             let t0 = std::time::Instant::now();
@@ -973,10 +1013,33 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             // Spilling may defer older northern cells, so do not publish a new
             // horizon downstream after any resolution has spilled.
             if !self.spill_runs.iter().any(|r| r.has_spilled()) {
-                self.eviction_horizon = self.suffix_max_north_lat[self.processed_chunk_count];
+                let k = self.processed_chunk_count;
+                self.lat_horizon = self.suffix_max_north_lat[k];
+                self.eviction_horizon = self
+                    .suffix_eviction_bound
+                    .as_ref()
+                    .map_or(self.lat_horizon, |suffix| suffix[k]);
             }
         }
         Ok(())
+    }
+
+    /// At least the southern latitude of every cell that may still be
+    /// emitted: cells of chunks not yet processed and cells held in the
+    /// horizon maps. With latitude keys the eviction horizon is that bound,
+    /// because every cell south-keyed above it has been popped. With row keys
+    /// a held cell can lie north of the remaining chunks, so the held cells'
+    /// latitudes are included. Compaction and tilers rely on this bound.
+    fn lat_guard(&self) -> f64 {
+        if !self.eviction_space.is_rows() {
+            return self.eviction_horizon;
+        }
+        self.resolution_shards
+            .iter()
+            .zip(&self.spill_runs)
+            .filter(|(_, runs)| !runs.has_spilled())
+            .filter_map(|(shard, _)| shard.held_south_lat_bound())
+            .fold(self.lat_horizon, f64::max)
     }
 
     /// Chunks to take for the next batch. Horizon maps hold every cell of a

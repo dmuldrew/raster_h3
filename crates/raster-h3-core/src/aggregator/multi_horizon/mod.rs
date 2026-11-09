@@ -11,6 +11,7 @@ pub mod continuous;
 pub mod continuous_streamer;
 pub mod controller;
 pub mod coordinates;
+pub mod eviction_space;
 pub mod lifecycle;
 pub mod partial;
 pub mod partition;

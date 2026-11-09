@@ -1,10 +1,11 @@
 use crate::aggregator::cell_hash::{mix_h3, H3BuildHasher};
 use std::collections::{BinaryHeap, HashMap};
 
+use super::eviction_space::CellKeys;
 use super::spill::table_bytes;
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
-use crate::aggregator::horizon_streamer::{compute_cell_south_lat, HexEvictionEntry};
+use crate::aggregator::horizon_streamer::compute_cell_south_lat;
 use crate::aggregator::quantiles::QuantileSketch;
 
 /// Number of concurrent shards for parallel active map merging
@@ -61,6 +62,101 @@ impl AccumulatorMerge for CategoricalAccumulator {
     }
 }
 
+/// A pending eviction: the cell's key (see [`super::eviction_space`]) and the
+/// latitude-histogram bucket it was counted in.
+#[derive(Debug, Clone, Copy)]
+struct EvictionEntry {
+    key: f64,
+    cell_u64: u64,
+    lat_bucket: u32,
+}
+
+impl PartialEq for EvictionEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for EvictionEntry {}
+
+impl Ord for EvictionEntry {
+    /// Max-heap on the key: the earliest-completing cell is popped first.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.total_cmp(&other.key)
+    }
+}
+
+impl PartialOrd for EvictionEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Buckets per degree of [`LatHistogram`].
+const LAT_BUCKETS_PER_DEG: f64 = 100.0;
+const LAT_BUCKETS: usize = 180 * LAT_BUCKETS_PER_DEG as usize + 1;
+
+/// Counts of held cells by an upper bound of their southern latitude, rounded
+/// up to 0.01°, so the largest such bound among held cells is cheap to read.
+#[derive(Debug, Clone)]
+struct LatHistogram {
+    counts: Vec<u32>,
+    held: usize,
+    /// No bucket above this index is non-empty.
+    top: usize,
+}
+
+impl LatHistogram {
+    fn new() -> Self {
+        Self {
+            counts: vec![0; LAT_BUCKETS],
+            held: 0,
+            top: 0,
+        }
+    }
+
+    fn bucket(lat: f64) -> u32 {
+        let b = ((lat + 90.0) * LAT_BUCKETS_PER_DEG).ceil();
+        if b.is_nan() {
+            (LAT_BUCKETS - 1) as u32
+        } else {
+            b.clamp(0.0, (LAT_BUCKETS - 1) as f64) as u32
+        }
+    }
+
+    fn insert(&mut self, bucket: u32) {
+        let b = bucket as usize;
+        self.counts[b] += 1;
+        self.held += 1;
+        self.top = self.top.max(b);
+    }
+
+    fn remove(&mut self, bucket: u32) {
+        let b = bucket as usize;
+        self.counts[b] -= 1;
+        self.held -= 1;
+        while self.top > 0 && self.counts[self.top] == 0 {
+            self.top -= 1;
+        }
+    }
+
+    /// At least the southern latitude of every held cell; `-inf` when empty.
+    fn max_south_lat(&self) -> f64 {
+        if self.held == 0 {
+            f64::NEG_INFINITY
+        } else {
+            // Bucket b covers latitudes up to b / 100 - 90; round outwards.
+            (self.top as f64 / LAT_BUCKETS_PER_DEG - 90.0).next_up()
+        }
+    }
+
+    fn clear(&mut self) {
+        self.counts.iter_mut().for_each(|c| *c = 0);
+        self.held = 0;
+        self.top = 0;
+    }
+}
+
 /// A 32-way hash-partitioned active map and eviction heap for a single H3 resolution.
 ///
 /// The controller joins bounded worker waves, merges owned states with budget
@@ -68,7 +164,10 @@ impl AccumulatorMerge for CategoricalAccumulator {
 /// require exclusive access, so the phases cannot overlap in safe Rust.
 pub struct ShardedResolutionMap<A: AccumulatorMerge> {
     shards: Vec<HashMap<u64, A, H3BuildHasher>>,
-    eviction: Vec<BinaryHeap<HexEvictionEntry>>,
+    eviction: Vec<BinaryHeap<EvictionEntry>>,
+    /// Southern-latitude bounds of held cells, when eviction keys are not
+    /// latitudes (see [`Self::set_lat_tracking`]).
+    lat_histogram: Option<LatHistogram>,
     dynamic_bytes: usize,
     /// Table and heap allocation, maintained incrementally so budget checks
     /// stay O(1) per merged cell.
@@ -97,13 +196,14 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
             dynamic_bytes: 0,
             structure_bytes: 0,
             track_eviction: true,
+            lat_histogram: None,
         }
     }
 
     #[inline]
     fn shard_bytes(&self, s: usize) -> usize {
         table_bytes::<u64, A>(self.shards[s].capacity())
-            + self.eviction[s].capacity() * size_of::<HexEvictionEntry>()
+            + self.eviction[s].capacity() * size_of::<EvictionEntry>()
     }
 
     fn recount_structure(&mut self) {
@@ -130,6 +230,18 @@ impl<A: AccumulatorMerge> ShardedResolutionMap<A> {
         self.track_eviction
     }
 
+    /// Count held cells by southern latitude, so [`Self::held_south_lat_bound`]
+    /// works when eviction keys are not latitudes. Set before inserting.
+    pub fn set_lat_tracking(&mut self, enabled: bool) {
+        self.lat_histogram = enabled.then(LatHistogram::new);
+    }
+
+    /// At least the southern latitude of every cell still awaiting eviction,
+    /// `-inf` when none is; `None` without [`Self::set_lat_tracking`].
+    pub fn held_south_lat_bound(&self) -> Option<f64> {
+        self.lat_histogram.as_ref().map(LatHistogram::max_south_lat)
+    }
+
     /// Per shard: (active cells, pending eviction entries)
     pub fn shard_occupancy(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.shards
@@ -146,21 +258,32 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
             for heap in &mut self.eviction {
                 *heap = BinaryHeap::new();
             }
+            if let Some(h) = &mut self.lat_histogram {
+                h.clear();
+            }
             self.recount_structure();
         }
     }
 
     /// Owned merge avoids cloning a large quantile or categorical state.
     /// Returns the merged accumulator's memory footprint.
+    /// New cells are keyed by latitude ([`compute_cell_south_lat`]).
     pub fn merge_owned(&mut self, key: u64, acc: A) -> usize {
-        self.merge_owned_with(key, acc, || compute_cell_south_lat(key))
+        self.merge_owned_with(key, acc, || {
+            let south = compute_cell_south_lat(key);
+            CellKeys {
+                key: south,
+                south_lat_upper: south,
+            }
+        })
     }
 
-    /// [`Self::merge_owned`] taking the cell's eviction key from `south_lat`,
-    /// which must return [`compute_cell_south_lat`] of `key`. It is called
-    /// only when the cell is new and eviction is tracked, so callers can
-    /// compute the key ahead of time, off the merging thread.
-    pub fn merge_owned_with(&mut self, key: u64, acc: A, south_lat: impl FnOnce() -> f64) -> usize {
+    /// [`Self::merge_owned`] taking the cell's eviction keys from `keys`,
+    /// which must return the stream's [`super::eviction_space::EvictionSpace::cell_keys`]
+    /// of `key`. It is called only when the cell is new and eviction is
+    /// tracked, so callers can compute the keys ahead of time, off the
+    /// merging thread.
+    pub fn merge_owned_with(&mut self, key: u64, acc: A, keys: impl FnOnce() -> CellKeys) -> usize {
         let s = get_shard(key);
         let before = self.shard_bytes(s);
         let merged_bytes = match self.shards[s].entry(key) {
@@ -176,9 +299,15 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
                 self.dynamic_bytes += acc.heap_bytes();
                 entry.insert(acc);
                 if self.track_eviction {
-                    self.eviction[s].push(HexEvictionEntry {
+                    let keys = keys();
+                    let lat_bucket = LatHistogram::bucket(keys.south_lat_upper);
+                    if let Some(h) = &mut self.lat_histogram {
+                        h.insert(lat_bucket);
+                    }
+                    self.eviction[s].push(EvictionEntry {
+                        key: keys.key,
                         cell_u64: key,
-                        south_lat: south_lat(),
+                        lat_bucket,
                     });
                 }
                 bytes
@@ -195,13 +324,14 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
     /// Remove at most one completed cell, keeping output backpressure effective.
     pub fn pop_completed(&mut self, horizon: f64) -> Option<(u64, A)> {
         for s in 0..NUM_SHARDS {
-            while self.eviction[s]
-                .peek()
-                .is_some_and(|e| e.south_lat > horizon)
-            {
+            while self.eviction[s].peek().is_some_and(|e| e.key > horizon) {
                 // Removal can leave a tombstone that lowers reported capacity.
                 let before = self.shard_bytes(s);
-                let key = self.eviction[s].pop().unwrap().cell_u64;
+                let entry = self.eviction[s].pop().unwrap();
+                if let Some(h) = &mut self.lat_histogram {
+                    h.remove(entry.lat_bucket);
+                }
+                let key = entry.cell_u64;
                 let removed = self.shards[s].remove(&key);
                 if removed.is_some() && self.shards[s].is_empty() {
                     self.shards[s] = HashMap::with_hasher(H3BuildHasher);
@@ -225,6 +355,9 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
             let owned = std::mem::replace(map, HashMap::with_hasher(H3BuildHasher));
             records.extend(owned);
             *heap = BinaryHeap::new();
+        }
+        if let Some(h) = &mut self.lat_histogram {
+            h.clear();
         }
         self.dynamic_bytes = 0;
         self.structure_bytes = 0;
