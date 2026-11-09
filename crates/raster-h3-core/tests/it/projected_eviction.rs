@@ -498,3 +498,98 @@ fn albers_wide_rows_evict_by_row_soundly_and_promptly() {
         actual.len()
     );
 }
+
+/// A south-up CONUS Albers grid placed beyond the projection's longitude cut
+/// (directly above the cone apex, about 300 degrees east of the central
+/// meridian by the inverse). Its samples' cells project back onto the
+/// canonical branch, far below the apex, so row keys taken there would
+/// evict each cell before its later rows arrive and emit it twice. Such a
+/// raster must fall back to latitude keys and still match a direct
+/// per-pixel computation exactly.
+#[test]
+fn albers_raster_beyond_the_cut_aggregates_each_cell_once() {
+    use raster_h3_core::crs::transformer::AlbersConicFast;
+    let albers = AlbersConicFast::epsg_5070();
+    let (width, height) = (400u32, 120u32);
+    let (c0, f0) = (albers.x_0 - 6000.0, albers.y_0 + 2.0 * albers.rho0);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    {
+        let mut encoder = TiffEncoder::new(std::fs::File::create(file.path()).unwrap()).unwrap();
+        let mut image = encoder
+            .new_image::<colortype::Gray32Float>(width, height)
+            .unwrap();
+        image.rows_per_strip(1).unwrap();
+        // x = c0 + 30 col, y = f0 + 30 row: rows run north in projected y.
+        let matrix = [
+            30.0, 0.0, 0.0, c0, 0.0, 30.0, 0.0, f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        image
+            .encoder()
+            .write_tag(Tag::ModelTransformationTag, &matrix[..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(
+                Tag::GeoKeyDirectoryTag,
+                &[1u16, 1, 0, 2, 1024, 0, 1, 1, 3072, 0, 1, 5070][..],
+            )
+            .unwrap();
+        let data: Vec<f32> = (0..height)
+            .flat_map(|r| (0..width).map(move |c| ((c * 7 + r * 13) % 29) as f32 + 1.0))
+            .collect();
+        image.write_data(&data).unwrap();
+    }
+    let reader = GeoTiffStreamReader::open(file.path()).unwrap();
+    let gt = reader.metadata.geotransform;
+    let crs = CrsTransformer::from_crs_or_epsg(Some(5070), None).unwrap();
+    // The inverse really does leave the canonical branch here.
+    let (x, y) = gt.pixel_center_to_coord(200, 60);
+    let (lon, _) = crs.transform_point(x, y).unwrap();
+    assert!(
+        (lon - albers.lon_origin_rad.to_degrees()).abs() > 180.0,
+        "lon {lon}"
+    );
+
+    let kernel = ContinuousKernel {
+        band: 1,
+        spectral_formula: None,
+        min_count: None,
+        min_mean: None,
+        max_mean: None,
+        track_quantiles: false,
+    };
+    let config = MultiResolutionConfig::single(9);
+    let mut stream = MultiHorizonStreamer::new(reader, &config, kernel).unwrap();
+    let mut actual = HashMap::new();
+    loop {
+        let batch = stream.fetch_next_batch(64).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for rec in batch {
+            assert!(
+                actual.insert(rec.h3_index, rec.accumulator).is_none(),
+                "cell {:x} emitted twice",
+                rec.h3_index
+            );
+        }
+    }
+    assert!(stream.is_finished());
+
+    let mut expected = HashMap::<u64, H3Accumulator>::new();
+    for r in 0..height {
+        for c in 0..width {
+            let val = ((c * 7 + r * 13) % 29) as f64 + 1.0;
+            let (x, y) = gt.pixel_center_to_coord(c as usize, r as usize);
+            let (lon, lat) = crs.transform_point(x, y).unwrap();
+            let key = u64::from(LatLng::new(lat, lon).unwrap().to_cell(Resolution::Nine));
+            expected.entry(key).or_default().update(val);
+        }
+    }
+    assert_eq!(actual.len(), expected.len(), "cell sets differ");
+    for (key, exp) in &expected {
+        let act = &actual[key];
+        assert_eq!(act.count, exp.count, "count of {key:x}");
+        assert_eq!((act.min, act.max), (exp.min, exp.max), "min/max of {key:x}");
+    }
+}

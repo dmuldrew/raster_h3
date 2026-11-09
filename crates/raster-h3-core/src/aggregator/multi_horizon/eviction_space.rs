@@ -15,7 +15,8 @@
 //!
 //! [`EvictionSpace::Rows`] therefore uses the negated row coordinate of a
 //! reference grid for mosaics whose tiles all use the same Albers
-//! projection. A chunk's bound is minus its first row; a cell's key is minus
+//! projection and lie on its canonical branch (inside the wedge that maps
+//! to longitudes within 180 degrees of the central meridian). A chunk's bound is minus its first row; a cell's key is minus
 //! a certified upper bound of the rows its points project to.
 
 use h3o::{CellIndex, LatLng};
@@ -83,7 +84,8 @@ pub struct RowSpace {
 
 impl EvictionSpace {
     /// The space for a mosaic: [`Self::Rows`] when every tile uses the same
-    /// Albers projection and an invertible, finite geotransform, otherwise
+    /// Albers projection and an invertible, finite geotransform, and lies
+    /// entirely on the projection's canonical branch; otherwise
     /// [`Self::Latitude`].
     pub fn for_mosaic(mosaic: &MosaicReader) -> Self {
         let Some(first) = mosaic.tiles.first() else {
@@ -104,6 +106,14 @@ impl EvictionSpace {
             .iter()
             .any(|tile| !finite_invertible(&tile.reader.metadata.geotransform))
         {
+            return Self::Latitude;
+        }
+        // Row keys project each cell onto the canonical branch of the
+        // projection, so every sample must come from it too.
+        if !mosaic.tiles.iter().all(|tile| {
+            let meta = &tile.reader.metadata;
+            on_canonical_branch(albers, &meta.geotransform, meta.width, meta.height)
+        }) {
             return Self::Latitude;
         }
         RowSpace::new(*albers, &first.reader.metadata.geotransform)
@@ -158,6 +168,73 @@ fn same_albers(a: &AlbersConicFast, b: &AlbersConicFast) -> bool {
         .map(f64::to_bits)
     };
     fields(a) == fields(b)
+}
+
+/// Whether every point of a `width` x `height` pixel grid lies on the
+/// canonical branch of `albers`: its polar angle about the cone's apex,
+/// `theta = n (lon - lon_0)`, is within `(-|n| pi, |n| pi)`.
+///
+/// The inverse projection reads `theta` from the full `(-pi, pi]` and
+/// divides by `n`, so for `|n| < 1` points outside that wedge get
+/// longitudes more than 180 degrees from `lon_0`. The forward projection
+/// wraps such a longitude back by 360 degrees, onto a different place in
+/// the plane, so the cells of those samples would be keyed by rows far from
+/// the samples' own.
+///
+/// The grid is a parallelogram, hence convex. If it does not contain the
+/// apex, it subtends less than a half turn from it, and its angular range
+/// is spanned by its corners, read continuously around the angle of its
+/// centre.
+fn on_canonical_branch(
+    albers: &AlbersConicFast,
+    gt: &GeoTransform,
+    width: u32,
+    height: u32,
+) -> bool {
+    use std::f64::consts::PI;
+    // Polar angle about the apex, as `AlbersInverse::transform_with_yp`
+    // computes it.
+    let angle = |x: f64, y: f64| {
+        let x_p = x - albers.x_0;
+        let y_p = albers.rho0 - (y - albers.y_0);
+        if albers.n >= 0.0 {
+            x_p.atan2(y_p)
+        } else {
+            (-x_p).atan2(-y_p)
+        }
+    };
+    let (w, h) = (f64::from(width), f64::from(height));
+    let corners =
+        [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)].map(|(col, row)| gt.pixel_to_coord(col, row));
+    // The apex lies inside the parallelogram or on its boundary iff no two
+    // edges see it on opposite sides.
+    let (apex_x, apex_y) = (albers.x_0, albers.y_0 + albers.rho0);
+    let sides = (0..4).map(|i| {
+        let (ax, ay) = corners[i];
+        let (bx, by) = corners[(i + 1) % 4];
+        (bx - ax) * (apex_y - ay) - (by - ay) * (apex_x - ax)
+    });
+    let (mut neg, mut pos) = (false, false);
+    for side in sides {
+        if !side.is_finite() {
+            return false;
+        }
+        neg |= side < 0.0;
+        pos |= side > 0.0;
+    }
+    if !(neg && pos) {
+        return false;
+    }
+    let (cx, cy) = gt.pixel_to_coord(w / 2.0, h / 2.0);
+    let centre = angle(cx, cy);
+    let limit = albers.n.abs() * PI;
+    corners.iter().all(|&(x, y)| {
+        let delta = angle(x, y) - centre;
+        // Continuous around the centre's angle: |delta| < pi after wrapping.
+        let delta = delta - (2.0 * PI) * (delta / (2.0 * PI)).round();
+        let theta = centre + delta;
+        theta.is_finite() && theta.abs() < limit
+    }) && centre.abs() < limit
 }
 
 fn finite_invertible(gt: &GeoTransform) -> bool {
@@ -534,6 +611,58 @@ mod tests {
     }
 
     /// k equals 1 on the standard parallels of a two-parallel cone.
+    #[test]
+    fn canonical_branch_accepts_conus_and_rejects_grids_past_the_cut() {
+        let conus = AlbersConicFast::epsg_5070();
+        let grid =
+            |c0: f64, f0: f64, a: f64, b: f64, d: f64, e: f64| GeoTransform { c0, f0, a, b, d, e };
+        // BP_CONUS.tif: 156,335 x 101,538 pixels of 30 m.
+        let bp_conus = grid(-2_361_915.0, 3_177_435.0, 30.0, 0.0, 0.0, -30.0);
+        assert!(on_canonical_branch(&conus, &bp_conus, 156_335, 101_538));
+        // The same grid rotated by 30 degrees.
+        let (s, c) = 30f64.to_radians().sin_cos();
+        let rotated = grid(
+            -2_361_915.0,
+            3_177_435.0,
+            30.0 * c,
+            30.0 * s,
+            30.0 * s,
+            -30.0 * c,
+        );
+        assert!(on_canonical_branch(&conus, &rotated, 156_335, 101_538));
+
+        let apex_y = conus.y_0 + conus.rho0;
+        // Directly above the apex, where the inverse gives lon_0 + 300 degrees.
+        let above = grid(-6000.0, apex_y + conus.rho0, 30.0, 0.0, 0.0, 30.0);
+        assert!(!on_canonical_branch(&conus, &above, 400, 120));
+        // Containing the apex, or touching it with an edge or a corner.
+        let around = grid(-1000.0, apex_y + 1000.0, 10.0, 0.0, 0.0, -10.0);
+        assert!(!on_canonical_branch(&conus, &around, 200, 200));
+        let edge = grid(-1000.0, apex_y, 10.0, 0.0, 0.0, -10.0);
+        assert!(!on_canonical_branch(&conus, &edge, 200, 200));
+        let corner = grid(0.0, apex_y, 10.0, 0.0, 0.0, -10.0);
+        assert!(!on_canonical_branch(&conus, &corner, 200, 200));
+        // Beside the apex, polar angle 90 degrees: inside CONUS's 108 degree
+        // half-wedge (n ~ 0.6) ...
+        let beside = grid(1_000_000.0, apex_y + 500.0, 10.0, 0.0, 0.0, -10.0);
+        assert!(on_canonical_branch(&conus, &beside, 100, 100));
+        // ... but not for a flatter cone whose half-wedge is narrower.
+        let flat = AlbersConicFast::new(20.0, 30.0, 10.0, -96.0);
+        assert!(flat.n < 0.5);
+        let flat_apex = flat.y_0 + flat.rho0;
+        let beside_flat = grid(1_000_000.0, flat_apex + 500.0, 10.0, 0.0, 0.0, -10.0);
+        assert!(!on_canonical_branch(&flat, &beside_flat, 100, 100));
+
+        // A southern cone mirrors it: its apex is below the origin.
+        let south = AlbersConicFast::new(-45.5, -29.5, -23.0, 135.0);
+        assert!(south.n < 0.0);
+        let south_apex = south.y_0 + south.rho0;
+        let australia = grid(-2_000_000.0, -1_000_000.0, 30.0, 0.0, 0.0, -30.0);
+        assert!(on_canonical_branch(&south, &australia, 100_000, 60_000));
+        let below = grid(-6000.0, south_apex + south.rho0, 30.0, 0.0, 0.0, -30.0);
+        assert!(!on_canonical_branch(&south, &below, 400, 120));
+    }
+
     #[test]
     fn parallel_scale_is_one_on_standard_parallels() {
         let p = AlbersConicFast::epsg_5070();
