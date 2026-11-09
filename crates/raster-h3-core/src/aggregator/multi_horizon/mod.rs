@@ -31,7 +31,9 @@ pub use continuous::{
     process_continuous_chunk_payload_into, ContinuousOptions, MultiContinuousRecord,
 };
 pub use continuous_streamer::MultiScanHorizonStreamer;
-pub use controller::{HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer};
+pub use controller::{
+    inline_worker_bytes_per_sample, HorizonStreamKernel, MultiHorizonStreamer, RecordStreamer,
+};
 pub use coordinates::{is_point_in_bbox, CoordinateTransformer, RAD_TO_DEG, WGS84_A};
 pub use lifecycle::{OutputBuffer, StreamLifecycle, StreamState};
 pub use partial::{decode_partial_state, encode_partial_state, PartialMerger, PartialState};

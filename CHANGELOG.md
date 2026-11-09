@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HorizonStreamKernel::worker_bytes_per_sample`: the worst-case worker bytes one sample can add to one resolution's cell map (a new table entry, its owned accumulator state and its eviction key). Kernel worker windows are sized from it, so it must not understate. The default keeps the previous 1 KiB allowance, so custom kernels are unaffected. `inline_worker_bytes_per_sample::<A>()` gives the bound for accumulators that own no heap state.
+
+### Changed
+
+- Continuous streams without quantiles size kernel worker windows by `inline_worker_bytes_per_sample::<H3Accumulator>()` (292 B per sample and resolution) instead of 1 KiB, so windows are about 3.5× larger under the same `aggregation_budget_bytes` and worker maps still fit their allowance when every sample is a new cell. With 5-point sampling at r9 on `BP_CONUS.tif`, system CPU (Rayon workers sleeping and waking between tiny waves) drops by about 62% and wall time from 39.0 to 36.0 min. Per-cell `count` and `sum` can differ from earlier releases in the last bits, because windows group samples differently; cells, `min`, `max` and totals are unchanged. Categorical and quantile streams keep the 1 KiB allowance.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added

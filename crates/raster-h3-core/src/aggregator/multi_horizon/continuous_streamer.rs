@@ -70,6 +70,15 @@ impl HorizonStreamKernel for ContinuousKernel {
         }
     }
 
+    fn worker_bytes_per_sample(&self) -> usize {
+        // Without quantile sketches an `H3Accumulator` owns no heap state.
+        if self.track_quantiles {
+            1024usize.max(size_of::<H3Accumulator>().saturating_mul(8))
+        } else {
+            super::controller::inline_worker_bytes_per_sample::<H3Accumulator>()
+        }
+    }
+
     #[inline(always)]
     fn passes_filter(&self, acc: &Self::Accumulator) -> bool {
         if let Some(min_c) = self.min_count {
