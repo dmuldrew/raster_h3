@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Rasters (and mosaics) whose tiles all use the same Albers projection evict horizon-map cells by raster row instead of latitude. Albers rows curve across parallels, so under the latitude rule cells near the east and west edges of a CONUS raster stayed in memory for thousands of rows, overflowed the map budget and spilled, which also stopped eviction for the rest of the scan. A cell is now evicted once the scan passes a certified upper bound of the rows its points project to (`multi_horizon::eviction_space`). On `BP_CONUS.tif` (5-point, r9, default budget) nothing spills any more: wall time drops from 39.0 to 36.6 min, and peak horizon-map memory halves on a 10,000-row crop. The latitude horizon published to tilers and used by compaction still covers every cell not yet emitted. Per-cell `count` and `sum` can differ from earlier releases in the last bits, because cells no longer pass through spill runs; cells, `min`, `max` and totals are unchanged.
+- `ShardedResolutionMap::merge_owned_with` takes a closure returning `eviction_space::CellKeys` (eviction key and southern-latitude bound) instead of a latitude. `ShardedResolutionMap::set_lat_tracking` and `held_south_lat_bound` are new.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added
