@@ -160,6 +160,39 @@ approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
 wall-time comparisons include decoding and scheduling; they do not isolate bridge
 cost. The bare spawn/join measurement is only an isolated baseline.
 
+### Worker window sizing
+
+Each kernel wave splits decoded chunks into at most `worker_tasks` window jobs,
+each aggregating into its own cell maps. Windows are sized so those maps fit a
+quarter of `aggregation_budget_bytes` even in the worst case, where every sample
+of every pixel lands in a new cell at each resolution:
+
+```text
+worker_pixels = (budget / 4 / worker_tasks − fixed map slack)
+                / (worker_bytes_per_sample × resolutions × sample points)
+```
+
+clamped to 1–16,384 pixels. The per-sample cost comes from the kernel's
+`HorizonStreamKernel::worker_bytes_per_sample`:
+
+| Kernel | Bytes per sample and resolution |
+| :--- | :--- |
+| Continuous, no quantiles | `inline_worker_bytes_per_sample::<H3Accumulator>()` (308 B) |
+| Continuous with quantiles, categorical | 1 KiB (covers sketch and class-count state) |
+| Custom kernels (default) | `max(1 KiB, 8 × size_of::<Accumulator>())` |
+
+`inline_worker_bytes_per_sample::<A>()` is stated in the terms the budget check
+measures: one table entry charged at two buckets per unit of capacity, with
+reused map capacity under twice the entry count, plus an eviction key in a
+`Vec` that is likewise under twice full. A custom kernel whose accumulator owns
+no heap memory can return it; a kernel that owns heap state per cell must
+return at least that state's worst case on top, or worker maps can exceed the
+budget. Small windows are expensive with dense sampling: each wave wakes and
+parks the Rayon workers, so with 5-point sampling the old flat 1 KiB allowance
+(about 409-pixel windows at the default budget) spent roughly half of all CPU
+time in the kernel scheduler once the per-sample work was fast. When memory
+allows, raising `aggregation_budget_bytes` widens windows further.
+
 ### Worker scaling
 
 The `worker_scaling` example measures how wall time splits between the parallel

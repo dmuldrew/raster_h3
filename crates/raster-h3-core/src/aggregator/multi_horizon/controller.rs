@@ -97,6 +97,22 @@ fn shared_aggregation_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>> {
     Ok(pool)
 }
 
+/// Fixed bytes a worker map and its key list are charged for regardless of
+/// entries: the `+ 1` bucket and alignment slack of `spill::table_bytes`.
+fn worker_map_fixed_bytes<A>() -> usize {
+    2 * (size_of::<(u64, A)>() + 1) + 64
+}
+
+/// Worst-case worker bytes per sample for an accumulator that owns no heap
+/// state, in the same terms the budget check measures them: a sample adds at
+/// most one entry to a map whose reused capacity stays under twice its
+/// largest entry count, charged at `spill::table_bytes`'s two
+/// buckets per unit of capacity, plus an eviction key in a `Vec` that is
+/// likewise under twice full.
+pub fn inline_worker_bytes_per_sample<A>() -> usize {
+    4 * (size_of::<(u64, A)>() + 1) + 2 * size_of::<(u64, CellKeys)>()
+}
+
 /// Kernel trait parameterizing data type-specific chunk processing, aggregation, and filtering
 pub trait HorizonStreamKernel: Send + Sync + 'static {
     type Accumulator: SpillAccumulator + Default + 'static;
@@ -121,6 +137,16 @@ pub trait HorizonStreamKernel: Send + Sync + 'static {
     ) {
         let bytes = size_of::<Self::Record>() + acc.heap_bytes();
         output.push_sized(self.make_record(resolution, key, acc), bytes);
+    }
+
+    /// Worst-case worker bytes one sample can add to one resolution's map: a
+    /// new table entry, its owned accumulator state and its eviction key.
+    /// Window sizes are derived from it, so it must not understate. The
+    /// default of 1 KiB covers table slack plus quantile or category state;
+    /// kernels with inline-only accumulators can return
+    /// [`inline_worker_bytes_per_sample`] instead for larger windows.
+    fn worker_bytes_per_sample(&self) -> usize {
+        1024usize.max(size_of::<Self::Accumulator>().saturating_mul(8))
     }
 
     /// Aggregate one decoded window into thread-local cell maps, one per
@@ -366,10 +392,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let spill_runs = (0..num_res)
             .map(|_| SpillRuns::new(accumulator_limit, config.spill_directory.as_deref()))
             .collect();
-        // Reserve worker storage by sample cardinality, not TIFF chunk count.
-        // 1 KiB/sample covers standard table slack and quantile/category state.
-        // Custom heap-owning kernels must obey the same bound or use a larger allowance.
-        let per_sample = 1024usize.max(size_of::<K::Accumulator>().saturating_mul(8));
+        // Reserve worker storage by sample cardinality, not TIFF chunk count:
+        // each sample can add at most one cell per resolution.
+        let per_sample = kernel.worker_bytes_per_sample();
         let per_pixel = per_sample
             .saturating_mul(num_res)
             .saturating_mul(config.sampling.points.len());
@@ -390,7 +415,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         }
         .min(worker_budget / per_pixel);
         let batch_size = (worker_tasks * 2).min((n_chunks / 4).max(1));
-        let worker_pixels = (worker_budget / worker_tasks / per_pixel).clamp(1, 16384);
+        let map_fixed = worker_map_fixed_bytes::<K::Accumulator>().saturating_mul(num_res);
+        let worker_pixels =
+            ((worker_budget / worker_tasks).saturating_sub(map_fixed) / per_pixel).clamp(1, 16384);
         // Horizon maps hold every cell of a batch until it is merged, so a
         // batch also stops at about two waves of windows (see `next_batch_len`).
         let batch_pixels = 2 * worker_tasks * worker_pixels;
