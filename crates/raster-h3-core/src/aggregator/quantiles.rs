@@ -119,7 +119,7 @@ impl QuantileSketch {
     /// Update the sketch with a new value and weight
     #[inline]
     pub fn update(&mut self, val: f64, weight: f64) {
-        if weight <= 0.0 || !val.is_finite() {
+        if !(weight.is_finite() && weight > 0.0) || !val.is_finite() {
             return;
         }
 
@@ -347,5 +347,40 @@ impl QuantileSketch {
             results[idx] = max;
         }
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_weights_are_ignored() {
+        let mut sketch = QuantileSketch::new();
+        sketch.update(1.0, 1.0);
+        sketch.update(2.0, f64::NAN);
+        sketch.update(2.0, f64::INFINITY);
+        sketch.update(2.0, -1.0);
+        sketch.update(3.0, 1.0);
+        assert_eq!(sketch.count(), 2.0);
+        assert!(sketch.quantile(0.5, 1.0, 3.0).is_finite());
+    }
+
+    #[test]
+    fn merge_matches_single_stream() {
+        let mut single = QuantileSketch::new();
+        let mut odds = QuantileSketch::new();
+        let mut evens = QuantileSketch::new();
+        for i in 1..=100 {
+            let v = i as f64;
+            single.update(v, 1.0);
+            if i % 2 == 0 {
+                evens.update(v, 1.0);
+            } else {
+                odds.update(v, 1.0);
+            }
+        }
+        odds.merge(&evens);
+        assert_eq!(odds, single);
     }
 }
