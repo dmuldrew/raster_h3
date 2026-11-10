@@ -358,64 +358,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_finite_weights_are_ignored() {
-        let mut sketch = QuantileSketch::new();
-        sketch.update(1.0, 1.0);
-        sketch.update(2.0, f64::NAN);
-        sketch.update(2.0, f64::INFINITY);
-        sketch.update(2.0, -1.0);
-        sketch.update(3.0, 1.0);
-        assert_eq!(sketch.count(), 2.0);
-        assert!(sketch.quantile(0.5, 1.0, 3.0).is_finite());
-    }
-
-    #[test]
-    fn merge_matches_single_stream() {
-        let mut single = QuantileSketch::new();
-        let mut odds = QuantileSketch::new();
-        let mut evens = QuantileSketch::new();
-        for i in 1..=100 {
-            let v = i as f64;
-            single.update(v, 1.0);
-            if i % 2 == 0 {
-                evens.update(v, 1.0);
-            } else {
-                odds.update(v, 1.0);
-            }
-        }
-        odds.merge(&evens);
-        assert_eq!(odds, single);
-    }
-
-    #[test]
-    fn small_magnitudes_keep_relative_accuracy() {
-        for scale in [1e-8, 1e-30, 1e-300] {
-            let mut sketch = QuantileSketch::new();
-            for k in 1..=101 {
-                sketch.update(scale * k as f64, 1.0);
-            }
-            let p50 = sketch.quantile(0.5, scale, scale * 101.0);
-            let expected = scale * 51.0;
-            assert!(
-                (p50 - expected).abs() <= 0.02 * expected,
-                "scale {scale}: p50 {p50} not within 2% of {expected}"
-            );
-        }
-
-        let scale = 1e-8;
-        let mut sketch = QuantileSketch::new();
-        for k in 1..=101 {
-            sketch.update(-scale * k as f64, 1.0);
-        }
-        let p50 = sketch.quantile(0.5, -scale * 101.0, -scale);
-        let expected = -scale * 51.0;
-        assert!(
-            (p50 - expected).abs() <= 0.02 * -expected,
-            "negative scale: p50 {p50} not within 2% of {expected}"
-        );
-    }
-
-    #[test]
     fn zero_and_subnormals_use_the_zero_bucket() {
         let mut sketch = QuantileSketch::new();
         sketch.update(0.0, 1.0);

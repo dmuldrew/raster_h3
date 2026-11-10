@@ -507,7 +507,13 @@ impl MockHttpServer {
                 }
             });
         if fail_hit.is_ok() {
-            let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            // Paths containing `retry_after` ask the client to wait one second.
+            let retry_after = if path.contains("retry_after") {
+                "Retry-After: 1\r\n"
+            } else {
+                ""
+            };
+            let resp = format!("HTTP/1.1 503 Service Unavailable\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n");
             let _ = stream.write_all(resp.as_bytes());
             return;
         }
@@ -1341,6 +1347,28 @@ fn truncated_range_body_is_retried() {
     let fetched = source.fetch_range(200_000, 200_099).unwrap();
     assert_eq!(fetched, data[200_000..=200_099]);
     assert_eq!(server.request_count.load(Ordering::SeqCst), 3);
+}
+
+/// A numeric `Retry-After` longer than the backoff (at most 100 ms for the
+/// first retry) sets the wait.
+#[test]
+fn retry_after_seconds_delay_the_retry() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..400_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let source = RemoteHttpSource::open(&format!("{}/retry_after.tif", server.url_base)).unwrap();
+    server.transient_failures.store(1, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let fetched = source.fetch_range(200_000, 200_099).unwrap();
+    assert_eq!(fetched, data[200_000..=200_099]);
+    assert!(
+        started.elapsed() >= Duration::from_millis(950),
+        "retried after {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
