@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HorizonStreamKernel::worker_bytes_per_sample`: the worst-case worker bytes one sample can add to one resolution's cell map (a new table entry, its owned accumulator state and its eviction key). Kernel worker windows are sized from it, so it must not understate. The default keeps the previous 1 KiB allowance, so custom kernels are unaffected. `inline_worker_bytes_per_sample::<A>()` gives the bound for accumulators that own no heap state.
+
+### Changed
+
+- Continuous streams without quantiles size kernel worker windows by `inline_worker_bytes_per_sample::<H3Accumulator>()` (260 B per sample and resolution) instead of 1 KiB, so windows are larger under the same `aggregation_budget_bytes` and worker maps still fit their allowance when every sample is a new cell. With 5-point sampling at r9 on `BP_CONUS.tif`, system CPU (Rayon workers sleeping and waking between tiny waves) drops by about 62% and wall time from 39.0 to 36.0 min. Per-cell `count` and `sum` can differ from earlier releases in the last bits, because windows group samples differently; cells, `min`, `max` and totals are unchanged. Categorical and quantile streams keep the 1 KiB allowance.
+- Kernel windows run as a pipeline instead of waves. Each batch's windows go to long-lived workers that take a job as soon as they are free, and the calling thread merges finished map sets strictly in window order while later windows still run, so output is unchanged by timing (a run matches the serial run of the same windows bit for bit). Previously every wave of up to `worker_tasks` windows waited for its slowest window, and workers idled during the serial merge. Two map sets per worker share the worker allowance, so windows are half as large. New cells' eviction keys are computed by the workers as extra jobs instead of being filtered against the horizon maps, which the merging thread now writes concurrently; `eviction_key_fallbacks` stays 0. `waves`, `bridged_waves` and `serial_waves` now count batches. Windows are cut lazily as they are dispatched, and sets finished out of order wait in a ring of one slot per map set, so scheduling memory is bounded by the map-set count, not the number of windows in a tile.
+- Rasters (and mosaics) whose tiles all use the same Albers projection evict horizon-map cells by raster row instead of latitude. Albers rows curve across parallels, so under the latitude rule cells near the east and west edges of a CONUS raster stayed in memory for thousands of rows, overflowed the map budget and spilled, which also stopped eviction for the rest of the scan. A cell is now evicted once the scan passes a certified upper bound of the rows its points project to (`multi_horizon::eviction_space`). Grids reaching past the projection's longitude cut keep latitude keys. On `BP_CONUS.tif` (5-point, r9, default budget) nothing spills any more: wall time drops from 39.0 to 36.6 min, and peak horizon-map memory halves on a 10,000-row crop. The latitude horizon published to tilers and used by compaction still covers every cell not yet emitted. Per-cell `count` and `sum` can differ from earlier releases in the last bits, because cells no longer pass through spill runs; cells, `min`, `max` and totals are unchanged.
+- `ShardedResolutionMap::merge_owned_with` takes a closure returning `eviction_space::CellKeys` (eviction key and southern-latitude bound) instead of a latitude. `ShardedResolutionMap::set_lat_tracking` and `held_south_lat_bound` are new.
+- Remote files served by HTTP servers without `Range` support are now capped at 1 GiB (`DEFAULT_MAX_FULL_BODY_BYTES`), because a full-body probe response is held in memory. Larger files now fail at open unless the limit is raised through the `RASTER_H3_MAX_FULL_BODY_BYTES` environment variable or `HttpTransport::with_max_full_body_bytes`.
+
+### Fixed
+
+- `PmtilesWriter::finish_into` rejects duplicate tile IDs instead of writing both entries into the directory, where readers would see only one and silently lose the other's features.
+- `QuantileSketch::update` ignores NaN and infinite weights; they previously slipped through the `weight <= 0.0` guard and turned `total_count` into NaN or infinity.
+- Remote range reads retry a response body that fails mid-read or arrives shorter than announced (an io error while reading, or fewer bytes than the requested range or the stated `Content-Length`), using the same backoff as request-level retries instead of failing the whole scan.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added

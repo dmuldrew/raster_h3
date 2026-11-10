@@ -127,10 +127,10 @@ collected even without `stream-profile`:
 
 | Counter | Meaning |
 | :--- | :--- |
-| `waves` | Non-empty kernel dispatches, each containing up to `worker_tasks` window jobs (`jobs` counts the individual jobs). |
-| `bridged_waves` | Waves sent to a dedicated aggregation pool via a newly spawned helper OS thread because the caller is a worker of another Rayon pool. |
-| `serial_waves` | Waves executed serially on the caller: it is already a worker of the dedicated pool, or is a Rayon worker with no dedicated pool. |
-| `eviction_key_fallbacks` | New horizon-map cells whose eviction key the serial merge computed itself because the workers had not precomputed it. Normally 0. |
+| `waves` | Non-empty kernel dispatches, one per batch of chunks; each runs all of the batch's window jobs (`jobs` counts the individual jobs). |
+| `bridged_waves` | Dispatches sent to a dedicated aggregation pool via a newly spawned helper OS thread because the caller is a worker of another Rayon pool. |
+| `serial_waves` | Dispatches executed serially on the caller: it is already a worker of the dedicated pool, or is a Rayon worker with no dedicated pool. |
+| `eviction_key_fallbacks` | Kept for compatibility; always 0 now that new cells' eviction keys are computed as pipeline jobs. |
 
 Direct non-Rayon callers dispatch in parallel using the dedicated pool when
 configured, otherwise the ambient global pool; neither subtype counter increases.
@@ -159,6 +159,51 @@ for mosaic opening include file opening **and** planning. Allocator peaks are
 approximate extra live bytes, not RSS, and can vary with scheduling. Full-stream
 wall-time comparisons include decoding and scheduling; they do not isolate bridge
 cost. The bare spawn/join measurement is only an isolated baseline.
+
+### Batch pipeline
+
+Each batch of decoded chunks is cut lazily into window jobs using chunk, row and
+column cursors, and every job aggregates into its own map set. Pending jobs and
+the completion ring are bounded by the map-set count, not the number of windows
+in a tile, even when one tile exceeds the batch's pixel target.
+`worker_tasks` long-lived workers take jobs as they become
+free, so no worker waits for the slowest window of a group. The calling thread
+merges finished map sets into the horizon maps **strictly in window order** while
+later windows still run, and returns each set to a pool of `2 × worker_tasks`
+sets (`StreamProfile::worker_map_sets`) for the next job. Output is therefore
+independent of thread timing: a run matches the serial run of the same windows
+bit for bit, including per-cell sums and record order. Cells new to a horizon map
+need an eviction key (a cell-boundary computation); the merging thread collects
+them, and the workers compute their keys as extra jobs of 256 cells. The keys are
+queued in creation order at the end of the batch, before eviction can use them.
+
+### Worker window sizing
+
+Windows are sized so all map sets in flight fit a quarter of
+`aggregation_budget_bytes` even in the worst case, where every sample of every
+pixel lands in a new cell at each resolution:
+
+```text
+worker_pixels = (budget / 4 / map sets − fixed map slack)
+                / (worker_bytes_per_sample × resolutions × sample points)
+```
+
+clamped to 1–16,384 pixels. The per-sample cost comes from the kernel's
+`HorizonStreamKernel::worker_bytes_per_sample`:
+
+| Kernel | Bytes per sample and resolution |
+| :--- | :--- |
+| Continuous, no quantiles | `inline_worker_bytes_per_sample::<H3Accumulator>()` (260 B) |
+| Continuous with quantiles, categorical | 1 KiB (covers sketch and class-count state) |
+| Custom kernels (default) | `max(1 KiB, 8 × size_of::<Accumulator>())` |
+
+`inline_worker_bytes_per_sample::<A>()` is stated in the terms the budget check
+measures: one table entry charged at two buckets per unit of capacity, with
+reused map capacity under twice the entry count. A custom kernel whose accumulator owns
+no heap memory can return it; a kernel that owns heap state per cell must
+return at least that state's worst case on top, or worker maps can exceed the
+budget. When memory allows, raising `aggregation_budget_bytes` widens windows
+further.
 
 ### Worker scaling
 
@@ -253,6 +298,19 @@ and range checks, but those checks **cannot guarantee snapshot consistency**. Us
 immutable/versioned URL for those sources. Custom `RemoteTransport` implementations
 are responsible for their own snapshot guarantees. See [HTTP conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.1).
 
+A server that ignores `Range` returns the whole file, which is held in memory. The
+built-in transport accepts such a body only up to 1 GiB
+(`http_range::DEFAULT_MAX_FULL_BODY_BYTES`) and fails at open beyond that, before
+reading past the limit; a larger announced `Content-Length` fails without reading.
+Raise the limit with `RASTER_H3_MAX_FULL_BODY_BYTES` (bytes; invalid or zero values
+keep the default) or `HttpTransport::with_max_full_body_bytes`.
+
+Transient failures are retried with exponential backoff, up to four retries: request
+errors, and also a connection error while reading a response body or a body shorter
+than announced (`Content-Range` or `Content-Length`). Header, ETag and over-length
+failures are not retried. A truncated chunked response without `Content-Length`
+cannot be detected and is accepted.
+
 ### Custom byte sources
 
 By default local paths are memory-mapped and remote URLs use the built-in HTTP/S3
@@ -304,11 +362,11 @@ remain linear in tile count per overlapping sample; only chunks flagged
 A streamer driven from a worker of another Rayon pool cannot run kernel waves
 on that pool without risking deadlock (see `aggregation_workers`):
 
-- `aggregation_workers: None` runs every wave **serially** on the calling
+- `aggregation_workers: None` runs every batch **serially** on the calling
   thread, about 2.5× slower than a direct call with 4 workers in the
   `profile_hotspots` example, at every budget.
-- `aggregation_workers: Some(n)` hands each wave to the dedicated pool through
-  a short-lived helper thread, roughly one thread spawn (≈40 µs) per wave. That
+- `aggregation_workers: Some(n)` hands each batch to the dedicated pool through
+  a short-lived helper thread, roughly one thread spawn (≈40 µs) per batch. That
   is a few percent at budgets of 16 MiB and above, but grows as small
   `aggregation_budget_bytes` shrink windows (3.4× slower at 256 KiB).
 

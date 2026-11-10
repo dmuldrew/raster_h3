@@ -301,9 +301,22 @@ fn test_aggregation_workers_run_concurrently_inside_pool_install() -> Result<()>
 
 #[test]
 fn test_wave_dispatch_counters_for_each_caller_and_pool() -> Result<()> {
-    let (_file, path) = helpers::TestGeoTiffBuilder::new(64, 64)
-        .pixel_size(0.001)
-        .create_f32_tempfile(|_, _| 1.0);
+    use crate::helpers::{write_geotiff, Crs, Layout};
+    // Each dispatch covers one batch of chunks, so use several strips.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("strips.tif");
+    write_geotiff(
+        &path,
+        (64, 64),
+        Layout::Strips(4),
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg: 0.001,
+        },
+        "-9999",
+        |_, _| 1.0f32,
+    );
     let caller = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
         .build()
@@ -554,4 +567,203 @@ fn test_mixed_mosaic_batches_follow_their_own_chunks() {
         waves_mosaic <= 2 * (waves_a + waves_b),
         "mosaic ran {waves_mosaic} waves, its files {waves_a} + {waves_b} separately"
     );
+}
+
+/// Worker windows are sized from the kernel's per-sample worst case, so even
+/// when every sample lands in its own cell (coarse pixels, fine resolution,
+/// 5-point sampling) the worker maps stay within their share of the budget.
+#[test]
+fn test_worker_bytes_stay_within_budget_when_every_sample_is_a_new_cell() {
+    use crate::helpers::{write_geotiff, Crs, Layout};
+    use raster_h3_core::aggregator::sampling::SamplingPattern;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("coarse.tif");
+    // ~1 km pixels at r12 (~10 m cells): all five samples of a pixel are
+    // hundreds of metres apart, so each one adds a distinct cell.
+    write_geotiff(
+        &path,
+        (512, 256),
+        Layout::Strips(16),
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg: 0.01,
+        },
+        "-9999",
+        |c, r| ((c * 13 + r * 7) % 89) as f32,
+    );
+    for quantiles in [false, true] {
+        let mut config = MultiResolutionConfig::new(vec![12]);
+        config.sampling = SamplingPattern::five_point();
+        config.aggregation_budget_bytes = 8 * 1024 * 1024;
+        config.aggregation_workers = Some(4);
+        if quantiles {
+            config.quantiles = vec![
+                raster_h3_core::aggregator::multi_horizon::QuantileTarget::Percentile(
+                    0.5,
+                    "p50".into(),
+                ),
+            ];
+        }
+        let worker_budget = config.aggregation_budget_bytes / 4;
+        let mut streamer = stream_paths(std::slice::from_ref(&path), &config);
+        let mut cells = 0usize;
+        while !streamer.is_finished() {
+            cells += streamer.fetch_next_batch(4096).unwrap().len();
+        }
+        assert_eq!(cells, 512 * 256 * 5, "every sample should be its own cell");
+        let peak = streamer.metrics().peak_worker_bytes;
+        assert!(
+            peak <= worker_budget,
+            "quantiles={quantiles}: worker maps peaked at {peak} B over the {worker_budget} B allowance"
+        );
+        assert!(
+            peak * 4 >= worker_budget,
+            "quantiles={quantiles}: worker maps peaked at only {peak} B of {worker_budget} B; \
+             windows are sized far below the allowance"
+        );
+    }
+}
+
+/// Continuous streams without quantile sketches own no per-cell heap state,
+/// so they get larger worker windows (fewer jobs) than the 1 KiB/sample
+/// allowance quantile sketches need, with identical results.
+#[test]
+fn test_inline_continuous_kernel_uses_larger_windows() {
+    use crate::helpers::{write_geotiff, Crs, Layout};
+    use raster_h3_core::aggregator::sampling::SamplingPattern;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rows.tif");
+    write_geotiff(
+        &path,
+        (4096, 64),
+        Layout::Strips(1),
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg: 0.0003,
+        },
+        "-9999",
+        |c, r| ((c / 5 + r * 3) % 41) as f32,
+    );
+    let run = |quantiles: bool| {
+        let mut config = MultiResolutionConfig::new(vec![9]);
+        config.sampling = SamplingPattern::five_point();
+        config.aggregation_workers = Some(4);
+        if quantiles {
+            config.quantiles = vec![
+                raster_h3_core::aggregator::multi_horizon::QuantileTarget::Percentile(
+                    0.5,
+                    "p50".into(),
+                ),
+            ];
+        }
+        let mut streamer = stream_paths(std::slice::from_ref(&path), &config);
+        let mut map = HashMap::new();
+        while !streamer.is_finished() {
+            for record in streamer.fetch_next_batch(4096).unwrap() {
+                map.insert(record.h3_index, record.accumulator);
+            }
+        }
+        (map, streamer.metrics().jobs)
+    };
+    let (inline, inline_jobs) = run(false);
+    let (sketch, sketch_jobs) = run(true);
+    assert!(
+        inline_jobs * 3 <= sketch_jobs,
+        "expected far fewer jobs without quantiles: {inline_jobs} vs {sketch_jobs}"
+    );
+    assert_eq!(inline.len(), sketch.len());
+    for (k, v) in &inline {
+        let o = &sketch[k];
+        assert_eq!((v.min, v.max), (o.min, o.max));
+        assert!((v.count - o.count).abs() <= 1e-9 * v.count.abs());
+        assert!((v.sum - o.sum).abs() <= 1e-9 * v.sum.abs().max(1.0));
+    }
+}
+
+/// Pipelined batches merge windows in window order whatever order the
+/// workers finish them in, so a run on 8 workers matches the serial run of
+/// the same windows bit for bit: per-cell count, sum, min and max, and the
+/// order records come out. Values are non-integers sampled at five points,
+/// so any change in summation order would show in the sums.
+#[test]
+fn test_pipelined_batches_match_serial_bit_for_bit() {
+    assert_pipelined_matches_serial((2048, 48), helpers::Layout::Strips(1));
+}
+
+#[test]
+fn test_pipelined_tiles_match_serial_bit_for_bit() {
+    assert_pipelined_matches_serial((321, 257), helpers::Layout::Tiles(256, 256));
+}
+
+fn assert_pipelined_matches_serial(size: (u32, u32), layout: helpers::Layout) {
+    use crate::helpers::{write_geotiff, Crs};
+    use raster_h3_core::aggregator::sampling::SamplingPattern;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rows.tif");
+    write_geotiff(
+        &path,
+        size,
+        layout,
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg: 0.0003,
+        },
+        "-9999",
+        |c, r| ((c * 7 + r * 13) % 101) as f32 * 0.37 + 0.011 * (c % 3) as f32,
+    );
+    let mut config = MultiResolutionConfig::new(vec![8, 10]);
+    config.sampling = SamplingPattern::five_point();
+    // Small windows: dozens of jobs in flight per row.
+    config.aggregation_budget_bytes = 4 * 1024 * 1024;
+    let run = || {
+        let mut streamer =
+            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config)
+                .unwrap();
+        let mut records = Vec::new();
+        while !streamer.is_finished() {
+            for r in streamer.fetch_next_batch(1000).unwrap() {
+                let a = &r.accumulator;
+                records.push((
+                    r.resolution,
+                    r.h3_index,
+                    a.count.to_bits(),
+                    a.sum.to_bits(),
+                    a.min.to_bits(),
+                    a.max.to_bits(),
+                ));
+            }
+        }
+        let m = streamer.metrics();
+        (
+            records,
+            m.jobs,
+            m.waves,
+            m.serial_waves,
+            m.peak_concurrent_jobs,
+        )
+    };
+    // Same worker count both ways, so the windows are the same.
+    let caller = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon::current_num_threads())
+        .build()
+        .unwrap();
+    let (pipelined, jobs, waves, serial_waves, peak) = run();
+    let (again, ..) = run();
+    let (serial, serial_jobs, _, serial_count, _) = caller.install(run);
+    assert_eq!(serial_waves, 0);
+    assert!(serial_count > 0, "the nested run must be serial");
+    assert!(
+        jobs >= 10 * waves,
+        "too few jobs per batch: {jobs} in {waves}"
+    );
+    if rayon::current_num_threads() > 1 {
+        assert!(peak > 1, "windows never ran concurrently");
+    }
+    assert_eq!(jobs, serial_jobs);
+    assert!(!pipelined.is_empty());
+    assert_eq!(pipelined, again, "pipelined runs differ");
+    assert_eq!(pipelined, serial, "pipelined and serial runs differ");
 }

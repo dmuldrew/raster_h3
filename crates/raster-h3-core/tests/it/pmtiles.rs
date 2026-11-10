@@ -877,6 +877,39 @@ fn test_pmtiles_writer_finish_with_bare_filename() {
 }
 
 #[test]
+fn pmtiles_writer_rejects_duplicate_tile_ids() {
+    use raster_h3_core::pmtiles::writer::PmtilesWriter;
+
+    let mut writer =
+        PmtilesWriter::new(0, 5, [-180.0, -85.0, 180.0, 85.0], "{}".to_string()).unwrap();
+    writer.add_tile(5, 3, 3, b"first").unwrap();
+    writer.add_tile(5, 3, 3, b"second").unwrap();
+
+    let err = writer
+        .finish_into(&mut Vec::new())
+        .expect_err("duplicate tile ids must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("5/3/3"),
+        "error must name the duplicated tile: {err}"
+    );
+}
+
+#[test]
+fn pmtiles_writer_accepts_distinct_tile_ids() {
+    use raster_h3_core::pmtiles::writer::PmtilesWriter;
+
+    let mut writer =
+        PmtilesWriter::new(0, 5, [-180.0, -85.0, 180.0, 85.0], "{}".to_string()).unwrap();
+    writer.add_tile(5, 3, 3, b"first").unwrap();
+    writer.add_tile(5, 3, 4, b"second").unwrap();
+
+    writer
+        .finish_into(&mut Vec::new())
+        .expect("distinct tile ids must finish");
+}
+
+#[test]
 fn test_mvt_class_iii_pentagon_10_vertices_preserved() {
     use h3o::CellIndex;
     use raster_h3_core::pmtiles::pyramid::cell_boundary_mercator;
