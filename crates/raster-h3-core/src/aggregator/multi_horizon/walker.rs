@@ -752,6 +752,8 @@ struct RowIndexer {
     num_samples: usize,
     /// Each sample point's cell in the current segment, laid out like `row_runs`.
     segment_cells: Vec<u64>,
+    /// One pixel's `(cell, weight)` per sample point at one resolution.
+    assignments: Vec<(u64, f64)>,
 }
 
 thread_local! {
@@ -889,8 +891,22 @@ impl RowIndexer {
                         runs.update(i, first, sample, total_weight, engine, &mut maps[i]);
                         continue;
                     }
-                    for (&cell, sp) in cells.iter().zip(&ctx.sampling.points) {
-                        runs.update(i, cell, sample, sp.weight, engine, &mut maps[i]);
+                    // As in the per-pixel loop: a pixel's samples that share a
+                    // cell are one observation with their summed weight, which
+                    // keeps `sum_w2` (and so the variance) independent of how
+                    // the pattern splits across cells.
+                    self.assignments.clear();
+                    self.assignments.extend(
+                        cells
+                            .iter()
+                            .zip(&ctx.sampling.points)
+                            .map(|(&cell, sp)| (cell, sp.weight)),
+                    );
+                    if combine && self.assignments.len() > 1 {
+                        combine_by_cell(&mut self.assignments);
+                    }
+                    for &(cell, weight) in &self.assignments {
+                        runs.update(i, cell, sample, weight, engine, &mut maps[i]);
                     }
                 }
             }
