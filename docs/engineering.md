@@ -28,6 +28,26 @@ rotated grids and curved cell edges without assuming scanline order alone is
 sufficient. Unknown Proj4 bounds and Albers chunks that may contain the cone apex
 disable early eviction until the remaining suffix is certifiable or EOF.
 
+Latitude is the right order for rows that follow parallels (north-up WGS84 and Web
+Mercator), but Albers rows curve across them: a CONUS row in EPSG:5070 lies about 3°
+further south at its ends than at the central meridian, so under a latitude rule cells
+near the east and west edges waited ~10,000 rows, overflowed the map budget and spilled.
+When every tile of a mosaic uses the same Albers projection, and lies inside the
+projection's valid wedge (polar angle about the cone apex under |n| × 180°, beyond which
+the inverse returns longitudes more than 180° from the central meridian and the forward
+projection would put those cells elsewhere), cells are therefore keyed
+by **raster row** instead (`multi_horizon::eviction_space`): a chunk's bound is its
+first row in the first tile's grid, and a cell's key is a certified upper bound of the
+rows its points project to. That bound is the projected centre's row plus the cell's
+bounding-cap radius × the ellipsoid's largest radius of curvature × the projection's
+largest principal scale on the cap's latitudes (Albers is equal-area, so
+`max(k, 1/k)`) × the row gradient, plus a margin of one row and one metre. Cells within
+5° of a pole or near the projection's cut keep the never-evict-early behaviour. Tilers
+and compaction still need a latitude bound, so each horizon map also counts held cells
+by an upper bound of their southern latitude, and the published horizon covers both
+the remaining chunks and the held cells. Other CRSs and mixed-CRS mosaics keep the
+latitude rule.
+
 The aggregation budget defaults to 64 MiB. Disk spilling limits active
 accumulators. Pending compaction groups are accounted in bytes and can be
 limited with the opt-in `compaction_budget_bytes`: past it, the groups nearest
@@ -40,8 +60,8 @@ overhead also use RAM.
 
 Each resolution's horizon map may use a quarter of the aggregation budget divided by
 the number of resolutions before it spills. Cells are evicted between batches, so a
-map holds at least one batch of cells. A batch is about two waves of worker windows
-(`2 × workers × worker window pixels`), but never less than one chunk (a strip or
+map holds at least one batch of cells. A batch is about one worker window per map set
+(`map sets × worker window pixels`), but never less than one chunk (a strip or
 tile). At resolutions where cells are about as small as pixels, that is roughly one
 chunk's pixels times ~230 bytes for continuous statistics (more with quantiles or
 categories). For example, a 4096-pixel-wide raster stored in 64-row strips holds about
@@ -65,9 +85,9 @@ Queries specifying a spatial Region of Interest (ROI) bounding box (`min_lat`, `
 
 ## 4. Work-Stealing Parallelism
 Every engine (DuckDB, DataFusion, PostgreSQL, Python/Polars, CLI) drives the same multi-resolution controller, so aggregation parallelism is shared:
-- **Parallel Kernel Windows**: Decoded chunks are grouped into waves of worker windows. Rayon processes the windows of a wave in parallel (`par_iter`), each into its own cell maps, so pixel accumulation takes no shared lock. The worker count defaults to Rayon's thread count capped at 8, or `aggregation_workers` (1–64), and is further limited by the aggregation budget.
-- **Horizon Merge**: After each wave, the calling thread merges the worker maps into the per-resolution horizon maps, where eviction and spilling happen. Worker map bytes count against the aggregation budget. The merge is serial, but the eviction key of each new cell (its southern edge, a cell-boundary computation) is computed by the parallel workers beforehand; [Worker Scaling](worker-scaling.md) measures the merge's share of wall time.
-- **Deadlock-Safe Execution**: A wave started from inside a Rayon worker either runs on the dedicated pool through a helper OS thread, or runs serially, so a joining worker never steals a task that needs a lock its caller holds.
+- **Parallel Kernel Windows**: Each batch of decoded chunks is cut into worker windows. Long-lived tasks on a Rayon pool take windows as they become free, each into its own map set, so pixel accumulation takes no shared lock and no worker waits for a group's slowest window. The worker count defaults to Rayon's thread count capped at 8, or `aggregation_workers` (1–64), and is further limited by the aggregation budget.
+- **Horizon Merge**: While later windows run, the calling thread merges finished map sets into the per-resolution horizon maps strictly in window order, so output does not depend on thread timing; eviction happens between batches. Worker map bytes (all `2 × workers` map sets) count against the aggregation budget. The merge is serial, but each new cell's eviction key (a cell-boundary computation) is computed by the workers as extra jobs; [Worker Scaling](worker-scaling.md) measures the merge's share of wall time.
+- **Deadlock-Safe Execution**: A batch started from inside a Rayon worker either runs on the dedicated pool through a helper OS thread, or runs serially, so a joining worker never steals a task that needs a lock its caller holds.
 - **DuckDB `init_local`**: DuckDB additionally registers a per-thread local state for its scan callbacks. Its threads pull completed records from a shared record queue and write them to output vectors in parallel; aggregation itself runs in the kernel windows above.
 - **Cardinality Estimate**: `estimate_raster_cardinality()` gives DuckDB's optimizer an approximate output row count from the raster extent and H3 cell area at each requested resolution.
 
