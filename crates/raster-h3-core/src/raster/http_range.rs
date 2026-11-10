@@ -40,6 +40,18 @@ use crate::error::{RasterH3Error, Result};
 /// Default block cache size for header and tag reading (128 KB)
 pub const DEFAULT_BLOCK_SIZE: usize = 131072;
 
+/// Largest body (1 GiB) accepted when a server ignores Range and returns the
+/// whole file, since that body is held in memory; override with env
+/// `RASTER_H3_MAX_FULL_BODY_BYTES`.
+pub const DEFAULT_MAX_FULL_BODY_BYTES: u64 = 1 << 30;
+
+fn parse_max_full_body_bytes(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_FULL_BODY_BYTES)
+}
+
 /// Parse a standards-compliant `Content-Range` value of the form
 /// `bytes start-end/total`.
 pub fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
@@ -273,6 +285,20 @@ pub trait RemoteTransport: Send + Sync {
 
 type PinnedEtag = Arc<OnceLock<Option<String>>>;
 
+/// Outcome of a single response attempt: `Done` carries the validated result;
+/// `Retry` carries the error to return if retries are exhausted.
+enum BodyAttempt<T> {
+    Done(T),
+    Retry(RasterH3Error),
+}
+
+fn backoff(attempt: usize) -> std::time::Duration {
+    let base_delay_ms = 100u64;
+    let jitter = (attempt as u64 * 37) % 50;
+    let backoff_ms = (base_delay_ms * (1 << attempt) + jitter).min(2000);
+    std::time::Duration::from_millis(backoff_ms)
+}
+
 /// Remote HTTP transport handling connections, retries, headers, and range requests.
 #[derive(Clone)]
 pub struct HttpTransport {
@@ -281,6 +307,7 @@ pub struct HttpTransport {
     agent: Agent,
     headers: Vec<(String, String)>,
     max_retries: usize,
+    max_full_body_bytes: u64,
     // Clones share validators per URL, including URLs with no usable strong ETag.
     etags: Arc<RwLock<FxHashMap<String, PinnedEtag>>>,
 }
@@ -312,8 +339,46 @@ impl HttpTransport {
             agent,
             headers,
             max_retries: 4,
+            max_full_body_bytes: parse_max_full_body_bytes(
+                std::env::var("RASTER_H3_MAX_FULL_BODY_BYTES")
+                    .ok()
+                    .as_deref(),
+            ),
             etags: Arc::new(RwLock::new(FxHashMap::default())),
         })
+    }
+
+    /// Cap the body size accepted when a server ignores Range and returns the
+    /// whole file; see [`DEFAULT_MAX_FULL_BODY_BYTES`].
+    pub fn with_max_full_body_bytes(mut self, max: u64) -> Self {
+        self.max_full_body_bytes = max;
+        self
+    }
+
+    fn full_body_limit_error(&self) -> RasterH3Error {
+        RasterH3Error::InvalidParameter(format!(
+            "Remote server at '{}' ignored the Range request and the file exceeds the {}-byte full-download limit; raise RASTER_H3_MAX_FULL_BODY_BYTES to allow larger full downloads",
+            self.url, self.max_full_body_bytes
+        ))
+    }
+
+    /// Retry a response attempt whose body read failed transiently: an io
+    /// error mid-body or a body shorter than announced. `once` returns
+    /// `Err` for fatal failures and `Ok(Retry(e))` for retryable ones.
+    fn retry_body<T>(&self, mut once: impl FnMut() -> Result<BodyAttempt<T>>) -> Result<T> {
+        let mut attempt = 0;
+        loop {
+            match once()? {
+                BodyAttempt::Done(v) => return Ok(v),
+                BodyAttempt::Retry(e) => {
+                    if attempt >= self.max_retries {
+                        return Err(e);
+                    }
+                    std::thread::sleep(backoff(attempt));
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     fn pinned_etag(&self) -> Result<PinnedEtag> {
@@ -375,7 +440,6 @@ impl HttpTransport {
         F: FnMut() -> std::result::Result<ureq::Response, ureq::Error>,
     {
         let mut attempt = 0;
-        let base_delay_ms = 100u64;
 
         loop {
             match make_request() {
@@ -408,9 +472,7 @@ impl HttpTransport {
                     }
 
                     // Exponential backoff with small jitter
-                    let jitter = (attempt as u64 * 37) % 50;
-                    let backoff_ms = (base_delay_ms * (1 << attempt) + jitter).min(2000);
-                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    std::thread::sleep(backoff(attempt));
                     attempt += 1;
                 }
             }
@@ -421,8 +483,17 @@ impl HttpTransport {
     #[allow(clippy::result_large_err)]
     pub fn probe(&self, initial_fetch_len: usize) -> Result<ProbeResult> {
         let etag = self.pinned_etag()?;
+        self.retry_body(|| self.probe_once(initial_fetch_len, &etag))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn probe_once(
+        &self,
+        initial_fetch_len: usize,
+        etag: &OnceLock<Option<String>>,
+    ) -> Result<BodyAttempt<ProbeResult>> {
         let range_header = format!("bytes=0-{}", initial_fetch_len.saturating_sub(1));
-        let resp = self.execute_request(|| self.range_request(&range_header, &etag).call())?;
+        let resp = self.execute_request(|| self.range_request(&range_header, etag).call())?;
         let response_etag = resp.header("ETag").map(str::to_owned);
 
         let status = resp.status();
@@ -446,55 +517,75 @@ impl HttpTransport {
             )?;
             let reader = resp.into_reader();
             let mut buf = Vec::with_capacity(initial_fetch_len);
-            reader
+            if let Err(e) = reader
                 .take(initial_fetch_len as u64 + 1)
                 .read_to_end(&mut buf)
-                .map_err(|e| {
-                    RasterH3Error::InvalidParameter(format!(
+            {
+                return Ok(BodyAttempt::Retry(RasterH3Error::InvalidParameter(
+                    format!(
                         "Failed reading initial header bytes from '{}': {}",
                         self.url, e
-                    ))
-                })?;
-            let total_size = validate_range_response(
-                status,
-                content_range.as_deref(),
-                0,
-                expected_end,
-                None,
-                buf.len(),
-            )?;
-            Self::validate_etag(&etag, response_etag.as_deref())?;
-            Ok(ProbeResult::Partial {
+                    ),
+                )));
+            }
+            let expected_len = (expected_end + 1) as usize;
+            if buf.len() != expected_len {
+                let err = RasterH3Error::InvalidParameter(format!(
+                    "Remote range response for bytes {}-{} has {} bytes, expected {}",
+                    0,
+                    expected_end,
+                    buf.len(),
+                    expected_end + 1
+                ));
+                if buf.len() < expected_len {
+                    return Ok(BodyAttempt::Retry(err));
+                }
+                return Err(err);
+            }
+            Self::validate_etag(etag, response_etag.as_deref())?;
+            Ok(BodyAttempt::Done(ProbeResult::Partial {
                 data: buf,
-                total_size,
-            })
+                total_size: parsed_total,
+            }))
         } else if status == 200 {
             // Server returned entire body (or file is small / server ignores ranges)
             let cl = resp
                 .header("Content-Length")
                 .and_then(|h| h.parse::<u64>().ok())
                 .unwrap_or(0);
-            let mut reader = resp.into_reader();
+            if cl > self.max_full_body_bytes {
+                return Err(self.full_body_limit_error());
+            }
+            let reader = resp.into_reader();
             let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).map_err(|e| {
-                RasterH3Error::InvalidParameter(format!(
-                    "Failed reading response from '{}': {}",
-                    self.url, e
-                ))
-            })?;
+            if let Err(e) = reader
+                .take(self.max_full_body_bytes.saturating_add(1))
+                .read_to_end(&mut buf)
+            {
+                return Ok(BodyAttempt::Retry(RasterH3Error::InvalidParameter(
+                    format!("Failed reading response from '{}': {}", self.url, e),
+                )));
+            }
+            if buf.len() as u64 > self.max_full_body_bytes {
+                return Err(self.full_body_limit_error());
+            }
             if cl > 0 && cl != buf.len() as u64 {
-                return Err(RasterH3Error::InvalidParameter(format!(
+                let err = RasterH3Error::InvalidParameter(format!(
                     "Remote response has {} bytes but Content-Length says {}",
                     buf.len(),
                     cl
-                )));
+                ));
+                if (buf.len() as u64) < cl {
+                    return Ok(BodyAttempt::Retry(err));
+                }
+                return Err(err);
             }
             let total_size = buf.len() as u64;
-            Self::validate_etag(&etag, response_etag.as_deref())?;
-            Ok(ProbeResult::Complete {
+            Self::validate_etag(etag, response_etag.as_deref())?;
+            Ok(BodyAttempt::Done(ProbeResult::Complete {
                 data: buf,
                 total_size,
-            })
+            }))
         } else {
             Err(RasterH3Error::InvalidParameter(format!(
                 "Unexpected HTTP status {} from '{}'",
@@ -521,8 +612,19 @@ impl HttpTransport {
             )));
         }
         let etag = self.pinned_etag()?;
+        self.retry_body(|| self.fetch_range_once(start, end, expected_total, &etag))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn fetch_range_once(
+        &self,
+        start: u64,
+        end: u64,
+        expected_total: Option<u64>,
+        etag: &OnceLock<Option<String>>,
+    ) -> Result<BodyAttempt<Vec<u8>>> {
         let range_header = format!("bytes={}-{}", start, end);
-        let resp = self.execute_request(|| self.range_request(&range_header, &etag).call())?;
+        let resp = self.execute_request(|| self.range_request(&range_header, etag).call())?;
         let response_etag = resp.header("ETag").map(str::to_owned);
 
         let status = resp.status();
@@ -539,27 +641,31 @@ impl HttpTransport {
 
         let reader = resp.into_reader();
         let mut buf = Vec::with_capacity(expected_len);
-        reader
-            .take(expected_len as u64 + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| {
-                RasterH3Error::InvalidParameter(format!(
+        if let Err(e) = reader.take(expected_len as u64 + 1).read_to_end(&mut buf) {
+            return Ok(BodyAttempt::Retry(RasterH3Error::InvalidParameter(
+                format!(
                     "Failed reading range {} from '{}': {}",
                     range_header, self.url, e
-                ))
-            })?;
+                ),
+            )));
+        }
 
-        validate_range_response(
-            status,
-            content_range.as_deref(),
-            start,
-            end,
-            expected_total,
-            buf.len(),
-        )?;
+        if buf.len() != expected_len {
+            let err = RasterH3Error::InvalidParameter(format!(
+                "Remote range response for bytes {}-{} has {} bytes, expected {}",
+                start,
+                end,
+                buf.len(),
+                end - start + 1
+            ));
+            if buf.len() < expected_len {
+                return Ok(BodyAttempt::Retry(err));
+            }
+            return Err(err);
+        }
 
-        Self::validate_etag(&etag, response_etag.as_deref())?;
-        Ok(buf)
+        Self::validate_etag(etag, response_etag.as_deref())?;
+        Ok(BodyAttempt::Done(buf))
     }
 }
 
@@ -931,6 +1037,17 @@ impl Seek for HttpRangeReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_max_full_body_bytes_override() {
+        for value in [None, Some(""), Some("abc"), Some("0")] {
+            assert_eq!(
+                parse_max_full_body_bytes(value),
+                DEFAULT_MAX_FULL_BODY_BYTES
+            );
+        }
+        assert_eq!(parse_max_full_body_bytes(Some(" 4096 ")), 4096);
+    }
 
     #[test]
     fn parses_and_validates_exact_partial_content() {

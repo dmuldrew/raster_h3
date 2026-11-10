@@ -281,6 +281,7 @@ struct MockHttpServer {
     request_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     transient_failures: Arc<AtomicUsize>,
+    body_truncations: Arc<AtomicUsize>,
     recorded_headers: Arc<Mutex<Vec<String>>>,
     gate: Arc<RequestGate>,
     shutdown: Arc<AtomicBool>,
@@ -365,6 +366,7 @@ impl MockHttpServer {
         let bytes_served = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::new(AtomicUsize::new(0));
         let transient_failures = Arc::new(AtomicUsize::new(failure_count));
+        let body_truncations = Arc::new(AtomicUsize::new(0));
         let recorded_headers = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new(RequestGate::default());
         let gate_clone = Arc::clone(&gate);
@@ -373,6 +375,7 @@ impl MockHttpServer {
         let bytes_served_clone = Arc::clone(&bytes_served);
         let request_count_clone = Arc::clone(&request_count);
         let failures_clone = Arc::clone(&transient_failures);
+        let truncations_clone = Arc::clone(&body_truncations);
         let headers_clone = Arc::clone(&recorded_headers);
         let file_bytes_arc = Arc::new(file_bytes);
 
@@ -397,6 +400,7 @@ impl MockHttpServer {
                 let served = Arc::clone(&bytes_served_clone);
                 let reqs = Arc::clone(&request_count_clone);
                 let fails = Arc::clone(&failures_clone);
+                let truncs = Arc::clone(&truncations_clone);
                 let hdrs = Arc::clone(&headers_clone);
                 let gate = Arc::clone(&gate_clone);
 
@@ -407,7 +411,9 @@ impl MockHttpServer {
                         .expect("Failed to make accepted socket blocking");
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                    Self::handle_connection(stream, &file_data, served, reqs, fails, hdrs, gate);
+                    Self::handle_connection(
+                        stream, &file_data, served, reqs, fails, truncs, hdrs, gate,
+                    );
                 });
             }
         });
@@ -418,6 +424,7 @@ impl MockHttpServer {
             bytes_served,
             request_count,
             transient_failures,
+            body_truncations,
             recorded_headers,
             gate,
             shutdown,
@@ -429,12 +436,14 @@ impl MockHttpServer {
         self.recorded_headers.lock().unwrap().clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_connection(
         mut stream: TcpStream,
         file_bytes: &[u8],
         bytes_served: Arc<AtomicUsize>,
         request_count: Arc<AtomicUsize>,
         transient_failures: Arc<AtomicUsize>,
+        body_truncations: Arc<AtomicUsize>,
         recorded_headers: Arc<Mutex<Vec<String>>>,
         gate: Arc<RequestGate>,
     ) {
@@ -587,6 +596,36 @@ impl MockHttpServer {
                 let slice = &file_bytes[start..=end];
                 let content_len = slice.len();
                 bytes_served.fetch_add(content_len, Ordering::SeqCst);
+
+                // Simulate a mid-body connection reset: announce the full
+                // Content-Length but close after writing only half the body.
+                // `try_update` replaces this on Rust 1.95+, but rust-version is 1.94.
+                #[allow(deprecated)]
+                let truncate_hit = range_str != "bytes=0-131071"
+                    && body_truncations
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                            if count > 0 {
+                                Some(count - 1)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_ok();
+                if truncate_hit {
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                        {version_header}Accept-Ranges: bytes\r\n\
+                        Content-Type: image/tiff\r\n\
+                        Content-Range: bytes {}-{}/{}\r\n\
+                        Content-Length: {}\r\n\
+                        Connection: close\r\n\r\n",
+                        start, end, total_size, content_len
+                    );
+                    if stream.write_all(header.as_bytes()).is_ok() && method == "GET" {
+                        let _ = stream.write_all(&slice[..slice.len() / 2]);
+                    }
+                    return;
+                }
 
                 let header = format!(
                     "HTTP/1.1 206 Partial Content\r\n\
@@ -1249,6 +1288,73 @@ fn full_body_response_serves_fetch_range_from_cache() {
         data[199_990..]
     );
     assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn full_body_response_over_limit_is_rejected() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data);
+    let url = format!("{}/full_body", server.url_base);
+    let transport = HttpTransport::new(&url)
+        .unwrap()
+        .with_max_full_body_bytes(1024);
+    match RemoteHttpSource::from_transport(url, Box::new(transport)) {
+        Err(err) => assert!(
+            err.to_string().contains("RASTER_H3_MAX_FULL_BODY_BYTES"),
+            "unexpected error: {err}"
+        ),
+        Ok(_) => panic!("full body over the limit must be rejected"),
+    }
+}
+
+#[test]
+fn full_body_response_within_limit_is_accepted() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let url = format!("{}/full_body", server.url_base);
+    let transport = HttpTransport::new(&url)
+        .unwrap()
+        .with_max_full_body_bytes(data.len() as u64);
+    let source = RemoteHttpSource::from_transport(url, Box::new(transport))
+        .expect("full body within the limit must be accepted");
+    assert!(source.is_complete_file());
+}
+
+#[test]
+fn truncated_range_body_is_retried() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..400_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let source = RemoteHttpSource::open(&format!("{}/test.tif", server.url_base)).unwrap();
+    server.body_truncations.store(1, Ordering::SeqCst);
+    let fetched = source.fetch_range(200_000, 200_099).unwrap();
+    assert_eq!(fetched, data[200_000..=200_099]);
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn persistently_truncated_range_body_fails_after_retries() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..400_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data);
+    let source = RemoteHttpSource::open(&format!("{}/test.tif", server.url_base)).unwrap();
+    server.body_truncations.store(100, Ordering::SeqCst);
+    assert!(source.fetch_range(200_000, 200_099).is_err());
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 1 + 5);
 }
 
 #[test]

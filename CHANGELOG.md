@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Continuous streams without quantiles size kernel worker windows by `inline_worker_bytes_per_sample::<H3Accumulator>()` (292 B per sample and resolution) instead of 1 KiB, so windows are about 3.5× larger under the same `aggregation_budget_bytes` and worker maps still fit their allowance when every sample is a new cell. With 5-point sampling at r9 on `BP_CONUS.tif`, system CPU (Rayon workers sleeping and waking between tiny waves) drops by about 62% and wall time from 39.0 to 36.0 min. Per-cell `count` and `sum` can differ from earlier releases in the last bits, because windows group samples differently; cells, `min`, `max` and totals are unchanged. Categorical and quantile streams keep the 1 KiB allowance.
+- Remote files served by HTTP servers without `Range` support are now capped at 1 GiB (`DEFAULT_MAX_FULL_BODY_BYTES`), because a full-body probe response is held in memory. Larger files now fail at open unless the limit is raised through the `RASTER_H3_MAX_FULL_BODY_BYTES` environment variable or `HttpTransport::with_max_full_body_bytes`.
+
+### Fixed
+
+- `PmtilesWriter::finish_into` rejects duplicate tile IDs instead of writing both entries into the directory, where readers would see only one and silently lose the other's features.
+- `QuantileSketch::update` ignores NaN and infinite weights; they previously slipped through the `weight <= 0.0` guard and turned `total_count` into NaN or infinity.
+- Remote range reads retry a response body that fails mid-read or arrives shorter than announced (an io error while reading, or fewer bytes than the requested range or the stated `Content-Length`), using the same backoff as request-level retries instead of failing the whole scan.
 
 ## [0.7.0] - 2026-11-06
 
