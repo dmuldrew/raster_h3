@@ -1512,3 +1512,68 @@ fn test_pmtiles_impossible_root_limit_is_an_error() {
     let err = build_directories(&irregular_entries(5_000), 1).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
+
+/// Gzip-decoded JSON metadata of a PMTiles v3 archive.
+fn read_pmtiles_metadata(path: &str) -> serde_json::Value {
+    let mut bytes = Vec::new();
+    File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
+    let offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let mut json = String::new();
+    GzDecoder::new(&bytes[offset..offset + len])
+        .read_to_string(&mut json)
+        .unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+/// A pole cell spans every longitude, so at fine zooms it would be enumerated
+/// into every tile column. Tiling skips it there and reports each skipped
+/// `(cell, zoom)` pair, overview parents included, in the archive metadata.
+#[test]
+fn test_polar_cells_over_tile_cap_reported_in_metadata() {
+    let tiff_tmp = NamedTempFile::new().unwrap();
+    // Four rows within 0.00004° of the north pole: every pixel falls in the
+    // resolution-12 pole cell (edge about 0.00008°).
+    helpers::TestGeoTiffBuilder::new(4, 4)
+        .origin(-2.0, 90.0)
+        .pixel_size_xy(1.0, 0.00001)
+        .write_gray8_fn(tiff_tmp.path(), |_, _| 7)
+        .unwrap();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap();
+
+    let total = H3PmtilesTiler::process_geotiff_to_pmtiles(
+        tiff_tmp.path(),
+        pmtiles_path,
+        MultiResolutionConfig::new(vec![12]),
+    )
+    .unwrap();
+    assert_eq!(total, 1, "all pixels fall in the pole cell");
+
+    // The pole cell's tile range is one row of 2^z columns. Skipped: the
+    // resolution-12 cell at zooms 18 and 19, and its resolution-11 overview
+    // parent at zoom 17. The resolution-10 parent at zoom 16 covers exactly
+    // 65,536 tiles, which is within the cap.
+    let metadata = read_pmtiles_metadata(pmtiles_path);
+    assert_eq!(metadata["h3_cells_over_tile_cap"], 3, "{metadata}");
+}
+
+/// Archives without pole cells carry no skip count.
+#[test]
+fn test_tile_cap_metadata_absent_without_polar_cells() {
+    let tiff_tmp = NamedTempFile::new().unwrap();
+    create_temp_geotiff(tiff_tmp.path(), 32, 32, tiff::tags::CompressionMethod::None).unwrap();
+    let pmtiles_tmp = NamedTempFile::new().unwrap().into_temp_path();
+    let pmtiles_path = pmtiles_tmp.to_str().unwrap();
+    H3PmtilesTiler::process_geotiff_to_pmtiles(
+        tiff_tmp.path(),
+        pmtiles_path,
+        MultiResolutionConfig::new(vec![9]),
+    )
+    .unwrap();
+    let metadata = read_pmtiles_metadata(pmtiles_path);
+    assert!(
+        metadata.get("h3_cells_over_tile_cap").is_none(),
+        "{metadata}"
+    );
+}

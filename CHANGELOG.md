@@ -30,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Arrow C Data import (`ArrowArray::to_record_batch`) rejects Utf8/Binary columns whose offsets are negative or decreasing, or that reference data through a null data buffer, with `InvalidParameter`. Such input used to panic or slice the wrong bytes.
 - `IpcStreamReader` no longer allocates from declared lengths. A row count, string length, validity length or field-name length larger than the bytes that follow now fails as a truncated stream instead of requesting up to gigabytes first.
-- A panic inside an aggregation wave no longer leaves `MultiHorizonStreamer` without its worker maps. They are restored before the panic continues, so a caller that catches it cannot go on to drop every later sample silently.
-- PMTiles tiling skips a cell at any zoom where it would cover more than 65,536 tiles (`MAX_TILE_OPS_PER_CELL_ZOOM`), which only happens for cells containing a pole at fine zooms, where the old enumeration produced millions of features per cell. `for_each_cell_tile_mercator` now returns the number of tiles emitted, and the continuous and categorical tilers report skipped cells as `h3_cells_over_tile_cap` in the archive metadata.
+- A panic inside an aggregation wave no longer leaves `MultiHorizonStreamer` without its worker maps. They are restored before the panic continues, so a caller that catches it cannot go on to drop every later sample silently. The stream is also latched as failed: the batch in flight is lost, so later reads return an error instead of continuing without its samples.
+- PMTiles tiling skips a cell at any zoom where it would cover more than 65,536 tiles (`MAX_TILE_OPS_PER_CELL_ZOOM`), which only happens for cells containing a pole at fine zooms, where the old enumeration produced millions of features per cell. `for_each_cell_tile_mercator` now returns the number of tiles emitted, and the continuous and categorical tilers report each skipped `(cell, zoom)` pair, overview parents included, as `h3_cells_over_tile_cap` in the archive metadata.
 
 ## [0.7.0] - 2026-11-06
 

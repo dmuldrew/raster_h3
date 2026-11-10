@@ -409,7 +409,7 @@ impl H3PmtilesTiler {
             Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
-        coarse_parents.write(
+        let overview_capped = coarse_parents.write(
             &min_res_zooms,
             &property_filter,
             &mut writer,
@@ -425,6 +425,7 @@ impl H3PmtilesTiler {
                 max: acc.max,
             },
         )?;
+        capped_cells.fetch_add(overview_capped, Ordering::Relaxed);
 
         accumulator.flush_all(&mut writer)?;
 
@@ -752,7 +753,7 @@ impl H3PmtilesTiler {
             Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
-        coarse_parents.write(
+        let overview_capped = coarse_parents.write(
             &min_res_zooms,
             &property_filter,
             &mut writer,
@@ -774,6 +775,7 @@ impl H3PmtilesTiler {
                 }
             },
         )?;
+        capped_cells.fetch_add(overview_capped, Ordering::Relaxed);
 
         accumulator.flush_all(&mut writer)?;
 
