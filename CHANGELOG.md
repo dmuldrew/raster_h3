@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Test infrastructure: four new cargo-fuzz targets (IPC stream, Arrow array import, remap parser, `Content-Range` parsing), a wider Miri scope (columnar, categorical and predictor unsafe code), a ThreadSanitizer job over the prefetch and aggregation suites, a `cargo llvm-cov` coverage workflow uploading to Codecov, and new proptest invariants in `core/properties.rs`.
 - `HorizonStreamKernel::worker_bytes_per_sample`: the worst-case worker bytes one sample can add to one resolution's cell map (a new table entry, its owned accumulator state and its eviction key). Kernel worker windows are sized from it, so it must not understate. The default keeps the previous 1 KiB allowance, so custom kernels are unaffected. `inline_worker_bytes_per_sample::<A>()` gives the bound for accumulators that own no heap state.
 
 ### Changed
@@ -26,8 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `QuantileSketch` no longer counts every value below 1e-7 in magnitude as zero, so quantiles of small values keep their documented 1% relative error instead of collapsing to the minimum. Streams with many such values now keep more sketch buckets, so their quantile state is larger; only zero and subnormal magnitudes use the exact zero bucket.
 - `PmtilesWriter` leaf directories now grow (through `build_directories`) until the root directory fits the PMTiles v3 limit of 16,384 bytes minus the 127-byte header; the root was not checked once leaf directories were in use, so an archive with tens of millions of tiles could exceed it.
 - Remote retry delays now use random jitter between half and the full exponential backoff, so concurrent workers no longer retry in lockstep, and a numeric `Retry-After` response header (up to 30 s) is honoured when it is longer than the backoff.
-
-### Fixed
 
 - Arrow C Data import (`ArrowArray::to_record_batch`) rejects Utf8/Binary columns whose offsets are negative or decreasing, or that reference data through a null data buffer, with `InvalidParameter`. Such input used to panic or slice the wrong bytes.
 - `IpcStreamReader` no longer allocates from declared lengths. A row count, string length, validity length or field-name length larger than the bytes that follow now fails as a truncated stream instead of requesting up to gigabytes first.
