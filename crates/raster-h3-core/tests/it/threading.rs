@@ -301,9 +301,22 @@ fn test_aggregation_workers_run_concurrently_inside_pool_install() -> Result<()>
 
 #[test]
 fn test_wave_dispatch_counters_for_each_caller_and_pool() -> Result<()> {
-    let (_file, path) = helpers::TestGeoTiffBuilder::new(64, 64)
-        .pixel_size(0.001)
-        .create_f32_tempfile(|_, _| 1.0);
+    use crate::helpers::{write_geotiff, Crs, Layout};
+    // Each dispatch covers one batch of chunks, so use several strips.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("strips.tif");
+    write_geotiff(
+        &path,
+        (64, 64),
+        Layout::Strips(4),
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg: 0.001,
+        },
+        "-9999",
+        |_, _| 1.0f32,
+    );
     let caller = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
         .build()
@@ -667,4 +680,90 @@ fn test_inline_continuous_kernel_uses_larger_windows() {
         assert!((v.count - o.count).abs() <= 1e-9 * v.count.abs());
         assert!((v.sum - o.sum).abs() <= 1e-9 * v.sum.abs().max(1.0));
     }
+}
+
+/// Pipelined batches merge windows in window order whatever order the
+/// workers finish them in, so a run on 8 workers matches the serial run of
+/// the same windows bit for bit: per-cell count, sum, min and max, and the
+/// order records come out. Values are non-integers sampled at five points,
+/// so any change in summation order would show in the sums.
+#[test]
+fn test_pipelined_batches_match_serial_bit_for_bit() {
+    assert_pipelined_matches_serial((2048, 48), helpers::Layout::Strips(1));
+}
+
+#[test]
+fn test_pipelined_tiles_match_serial_bit_for_bit() {
+    assert_pipelined_matches_serial((321, 257), helpers::Layout::Tiles(256, 256));
+}
+
+fn assert_pipelined_matches_serial(size: (u32, u32), layout: helpers::Layout) {
+    use crate::helpers::{write_geotiff, Crs};
+    use raster_h3_core::aggregator::sampling::SamplingPattern;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rows.tif");
+    write_geotiff(
+        &path,
+        size,
+        layout,
+        Crs::Geographic {
+            lon: -100.0,
+            lat: 40.0,
+            pixel_deg: 0.0003,
+        },
+        "-9999",
+        |c, r| ((c * 7 + r * 13) % 101) as f32 * 0.37 + 0.011 * (c % 3) as f32,
+    );
+    let mut config = MultiResolutionConfig::new(vec![8, 10]);
+    config.sampling = SamplingPattern::five_point();
+    // Small windows: dozens of jobs in flight per row.
+    config.aggregation_budget_bytes = 4 * 1024 * 1024;
+    let run = || {
+        let mut streamer =
+            MultiScanHorizonStreamer::new(GeoTiffStreamReader::open(&path).unwrap(), &config)
+                .unwrap();
+        let mut records = Vec::new();
+        while !streamer.is_finished() {
+            for r in streamer.fetch_next_batch(1000).unwrap() {
+                let a = &r.accumulator;
+                records.push((
+                    r.resolution,
+                    r.h3_index,
+                    a.count.to_bits(),
+                    a.sum.to_bits(),
+                    a.min.to_bits(),
+                    a.max.to_bits(),
+                ));
+            }
+        }
+        let m = streamer.metrics();
+        (
+            records,
+            m.jobs,
+            m.waves,
+            m.serial_waves,
+            m.peak_concurrent_jobs,
+        )
+    };
+    // Same worker count both ways, so the windows are the same.
+    let caller = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon::current_num_threads())
+        .build()
+        .unwrap();
+    let (pipelined, jobs, waves, serial_waves, peak) = run();
+    let (again, ..) = run();
+    let (serial, serial_jobs, _, serial_count, _) = caller.install(run);
+    assert_eq!(serial_waves, 0);
+    assert!(serial_count > 0, "the nested run must be serial");
+    assert!(
+        jobs >= 10 * waves,
+        "too few jobs per batch: {jobs} in {waves}"
+    );
+    if rayon::current_num_threads() > 1 {
+        assert!(peak > 1, "windows never ran concurrently");
+    }
+    assert_eq!(jobs, serial_jobs);
+    assert!(!pipelined.is_empty());
+    assert_eq!(pipelined, again, "pipelined runs differ");
+    assert_eq!(pipelined, serial, "pipelined and serial runs differ");
 }

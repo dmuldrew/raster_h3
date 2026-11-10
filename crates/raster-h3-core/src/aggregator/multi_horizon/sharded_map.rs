@@ -317,6 +317,53 @@ impl<A: super::spill::SpillAccumulator> ShardedResolutionMap<A> {
         merged_bytes
     }
 
+    /// Merge without computing an eviction key. Returns the merged
+    /// accumulator's memory footprint and whether the cell is new to the map
+    /// while eviction is tracked; such a cell must get its keys from
+    /// [`Self::push_eviction`] before the next [`Self::pop_completed`].
+    pub fn merge_owned_deferred(&mut self, key: u64, acc: A) -> (usize, bool) {
+        let s = get_shard(key);
+        let before = self.shard_bytes(s);
+        let (merged_bytes, needs_keys) = match self.shards[s].entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                self.dynamic_bytes -= existing.heap_bytes();
+                existing.merge(&acc);
+                self.dynamic_bytes += existing.heap_bytes();
+                (existing.memory_bytes(), false)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let bytes = acc.memory_bytes();
+                self.dynamic_bytes += acc.heap_bytes();
+                entry.insert(acc);
+                (bytes, self.track_eviction)
+            }
+        };
+        self.structure_bytes = self.structure_bytes - before + self.shard_bytes(s);
+        (merged_bytes, needs_keys)
+    }
+
+    /// Queue `key` for eviction with `keys`, for a cell inserted by
+    /// [`Self::merge_owned_deferred`]. Ignored when eviction is no longer
+    /// tracked or the cell has left the map (a spill since its insertion).
+    pub fn push_eviction(&mut self, key: u64, keys: CellKeys) {
+        let s = get_shard(key);
+        if !self.track_eviction || !self.shards[s].contains_key(&key) {
+            return;
+        }
+        let before = self.shard_bytes(s);
+        let lat_bucket = LatHistogram::bucket(keys.south_lat_upper);
+        if let Some(h) = &mut self.lat_histogram {
+            h.insert(lat_bucket);
+        }
+        self.eviction[s].push(EvictionEntry {
+            key: keys.key,
+            cell_u64: key,
+            lat_bucket,
+        });
+        self.structure_bytes = self.structure_bytes - before + self.shard_bytes(s);
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         self.dynamic_bytes + self.structure_bytes
     }

@@ -35,8 +35,14 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.9.1 --locked
 
+      # The pg fmgr entry points and their tests/it suite build only with
+      # `pg-extension`, which the other crates do not take, so run it apart and
+      # merge both runs into one report.
       - name: Collect coverage
-        run: cargo llvm-cov --locked --lcov --output-path lcov.info -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg --lib --test it
+        run: |
+          cargo llvm-cov --locked --no-report -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python --lib --test it
+          cargo llvm-cov --locked --no-report -p raster-h3-pg --features pg-extension --lib --test it
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
