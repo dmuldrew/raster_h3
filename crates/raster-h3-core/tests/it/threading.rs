@@ -689,14 +689,23 @@ fn test_inline_continuous_kernel_uses_larger_windows() {
 /// so any change in summation order would show in the sums.
 #[test]
 fn test_pipelined_batches_match_serial_bit_for_bit() {
-    use crate::helpers::{write_geotiff, Crs, Layout};
+    assert_pipelined_matches_serial((2048, 48), helpers::Layout::Strips(1));
+}
+
+#[test]
+fn test_pipelined_tiles_match_serial_bit_for_bit() {
+    assert_pipelined_matches_serial((321, 257), helpers::Layout::Tiles(256, 256));
+}
+
+fn assert_pipelined_matches_serial(size: (u32, u32), layout: helpers::Layout) {
+    use crate::helpers::{write_geotiff, Crs};
     use raster_h3_core::aggregator::sampling::SamplingPattern;
     let dir = tempdir().unwrap();
     let path = dir.path().join("rows.tif");
     write_geotiff(
         &path,
-        (2048, 48),
-        Layout::Strips(1),
+        size,
+        layout,
         Crs::Geographic {
             lon: -100.0,
             lat: 40.0,

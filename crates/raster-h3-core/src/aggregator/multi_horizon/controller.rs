@@ -22,6 +22,7 @@ use crate::aggregator::sampling::SamplingPattern;
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::mosaic::MosaicReader;
+use crate::raster::prefetch::MosaicPrefetchItem;
 use crate::raster::prefetch::PrefetchedMosaicReader;
 use crate::raster::RasterChunk;
 
@@ -44,6 +45,126 @@ type WindowJob<'a> = (
 );
 /// One worker's per-resolution cell maps.
 type CellMaps<A> = Vec<HashMap<u64, A, H3BuildHasher>>;
+
+/// A batch's windows, generated on demand without storage per window.
+struct WindowJobs<'a> {
+    items: &'a [MosaicPrefetchItem],
+    mosaic: &'a MosaicReader,
+    worker_pixels: usize,
+    item: usize,
+    row: usize,
+    col: usize,
+    remaining: usize,
+}
+
+impl<'a> WindowJobs<'a> {
+    fn new(
+        items: &'a [MosaicPrefetchItem],
+        mosaic: &'a MosaicReader,
+        worker_pixels: usize,
+        decoded_bytes: &mut u64,
+    ) -> Result<Self> {
+        use super::borrowed::BorrowedSamples;
+        let mut remaining = 0;
+        for item in items {
+            let (tile, index, chunk, data, _) = item
+                .as_ref()
+                .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
+            if chunk.width == 0
+                || chunk.height == 0
+                || mosaic.tiles[*tile].reader.is_sparse_chunk(*index)
+            {
+                continue;
+            }
+            let width = chunk.width as usize;
+            let height = chunk.height as usize;
+            let spp = mosaic.tiles[*tile].reader.metadata.samples_per_pixel.max(1) as usize;
+            let samples = BorrowedSamples::from(data);
+            let len = width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(spp))
+                .ok_or_else(|| RasterH3Error::InvalidMetadata("sample window overflow".into()))?;
+            samples.window(0, len)?;
+            *decoded_bytes += samples.bytes() as u64;
+            remaining += if width <= worker_pixels {
+                height.div_ceil(worker_pixels / width)
+            } else {
+                width.div_ceil(worker_pixels) * height
+            };
+        }
+        Ok(Self {
+            items,
+            mosaic,
+            worker_pixels,
+            item: 0,
+            row: 0,
+            col: 0,
+            remaining,
+        })
+    }
+}
+
+impl<'a> Iterator for WindowJobs<'a> {
+    type Item = WindowJob<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use super::borrowed::BorrowedSamples;
+        while let Some(item) = self.items.get(self.item) {
+            let (tile, index, chunk, data, overlap) = item.as_ref().expect("validated batch");
+            let width = chunk.width as usize;
+            let height = chunk.height as usize;
+            // Sparse fills must not be interpreted as observed data.
+            if width == 0
+                || self.row == height
+                || self.mosaic.tiles[*tile].reader.is_sparse_chunk(*index)
+            {
+                self.item += 1;
+                self.row = 0;
+                self.col = 0;
+                continue;
+            }
+            let spp = self.mosaic.tiles[*tile]
+                .reader
+                .metadata
+                .samples_per_pixel
+                .max(1) as usize;
+            let (w, h) = if width <= self.worker_pixels {
+                (width, (self.worker_pixels / width).min(height - self.row))
+            } else {
+                (self.worker_pixels.min(width - self.col), 1)
+            };
+            let start = (self.row * width + self.col) * spp;
+            let len = ((h - 1) * width + w) * spp;
+            let samples = BorrowedSamples::from(data)
+                .window(start, len)
+                .expect("validated sample window");
+            let bounds = RasterChunk {
+                col_offset: chunk.col_offset + self.col as u32,
+                row_offset: chunk.row_offset + self.row as u32,
+                width: w as u32,
+                height: h as u32,
+            };
+            if w == width {
+                self.row += h;
+            } else {
+                self.col += w;
+                if self.col == width {
+                    self.col = 0;
+                    self.row += 1;
+                }
+            }
+            self.remaining -= 1;
+            return Some((*tile, bounds, samples, width as u32, *overlap));
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for WindowJobs<'_> {}
 
 /// Refuse a `band` (or spectral formula band) that some mosaic tile does not have. The
 /// sample kernels index pixels by band without a bounds check that fails the scan, so an
@@ -116,9 +237,13 @@ const KEY_CHUNK: usize = 256;
 type KeyChunk = (usize, Vec<(usize, u64)>, Vec<CellKeys>);
 
 /// Work handed to a pipeline worker.
-enum Work<A> {
+enum Work<A, J> {
     /// Aggregate window `index` into `maps`, an empty map set.
-    Window { index: usize, maps: CellMaps<A> },
+    Window {
+        index: usize,
+        job: J,
+        maps: CellMaps<A>,
+    },
     /// Compute eviction keys of `(resolution index, cell)` pairs.
     Keys {
         chunk: usize,
@@ -247,8 +372,8 @@ impl<A: SpillAccumulator> MergeTarget<'_, A> {
 
 /// Run a batch on the calling thread: windows in order, then the new cells'
 /// eviction keys.
-fn run_serial<A, W, C>(
-    jobs: usize,
+fn run_serial<A, J, W, C>(
+    jobs: impl Iterator<Item = J>,
     free: &mut Vec<CellMaps<A>>,
     run_window: &W,
     compute_keys: &C,
@@ -256,13 +381,13 @@ fn run_serial<A, W, C>(
 ) -> Result<()>
 where
     A: SpillAccumulator,
-    W: Fn(usize, &mut CellMaps<A>) -> (super::profile::WorkerProfile, u64),
+    W: Fn(J, &mut CellMaps<A>) -> (super::profile::WorkerProfile, u64),
     C: Fn(&[(usize, u64)]) -> Vec<CellKeys>,
 {
     let mut maps = free.pop().expect("at least one worker map set");
     let mut result = Ok(());
-    for index in 0..jobs {
-        let (profile, ns) = run_window(index, &mut maps);
+    for job in jobs {
+        let (profile, ns) = run_window(job, &mut maps);
         target.record(profile, ns);
         result = target.merge(&mut maps);
         if result.is_err() {
@@ -286,10 +411,10 @@ where
 /// merges finished windows in window order (see `process_batch`).
 /// `finished` holds sets that finished out of order; it is reused across batches.
 #[allow(clippy::too_many_arguments)]
-fn run_pipelined<'s, A, W, C>(
+fn run_pipelined<'s, A, J, W, C>(
     scope: &rayon::Scope<'s>,
     workers: usize,
-    jobs: usize,
+    mut jobs: impl ExactSizeIterator<Item = J>,
     free: &mut Vec<CellMaps<A>>,
     run_window: &'s W,
     compute_keys: &'s C,
@@ -298,12 +423,13 @@ fn run_pipelined<'s, A, W, C>(
 ) -> Result<()>
 where
     A: SpillAccumulator + Send + 's,
-    W: Fn(usize, &mut CellMaps<A>) -> (super::profile::WorkerProfile, u64) + Sync,
+    J: Send + 's,
+    W: Fn(J, &mut CellMaps<A>) -> (super::profile::WorkerProfile, u64) + Sync,
     C: Fn(&[(usize, u64)]) -> Vec<CellKeys> + Sync,
 {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::mpsc;
-    let (work_tx, work_rx) = mpsc::channel::<Work<A>>();
+    let (work_tx, work_rx) = mpsc::channel::<Work<A, J>>();
     let work_rx = Arc::new(Mutex::new(work_rx));
     let (done_tx, done_rx) = mpsc::channel::<Done<A>>();
     for _ in 0..workers.max(1) {
@@ -317,8 +443,12 @@ where
             };
             let Ok(work) = message else { break };
             let reply = catch_unwind(AssertUnwindSafe(|| match work {
-                Work::Window { index, mut maps } => {
-                    let (profile, ns) = run_window(index, &mut maps);
+                Work::Window {
+                    index,
+                    job,
+                    mut maps,
+                } => {
+                    let (profile, ns) = run_window(job, &mut maps);
                     Done::Window {
                         index,
                         maps,
@@ -340,14 +470,20 @@ where
     drop(done_tx);
 
     finished.clear();
-    finished.resize_with(jobs, || None);
-    let (mut next, mut expected, mut end) = (0, 0, jobs);
+    let slots = free.len();
+    finished.resize_with(slots, || None);
+    let count = jobs.len();
+    let (mut next, mut expected, mut end) = (0, 0, count);
     let (mut key_chunk, mut keys_out) = (0, 0);
     let mut result = Ok(());
     let mut panic = None;
     while next < end {
         let Some(maps) = free.pop() else { break };
-        let _ = work_tx.send(Work::Window { index: next, maps });
+        let _ = work_tx.send(Work::Window {
+            index: next,
+            job: jobs.next().expect("window count"),
+            maps,
+        });
         next += 1;
     }
     while expected < end || keys_out > 0 {
@@ -368,9 +504,10 @@ where
                 ns,
             } => {
                 target.record(profile, ns);
-                finished[index] = Some(maps);
+                // A slot is reused only after its previous set is merged.
+                finished[index % slots] = Some(maps);
                 while expected < end {
-                    let Some(mut maps) = finished[expected].take() else {
+                    let Some(mut maps) = finished[expected % slots].take() else {
                         break;
                     };
                     if result.is_ok() {
@@ -385,11 +522,15 @@ where
                     expected += 1;
                     if next < end {
                         let maps = free.pop().expect("a set was just returned");
-                        let _ = work_tx.send(Work::Window { index: next, maps });
+                        let _ = work_tx.send(Work::Window {
+                            index: next,
+                            job: jobs.next().expect("window count"),
+                            maps,
+                        });
                         next += 1;
                     }
                 }
-                let last = expected == jobs;
+                let last = expected == count;
                 if result.is_ok()
                     && (target.new_cells.len() >= KEY_CHUNK
                         || (last && !target.new_cells.is_empty()))
@@ -563,9 +704,7 @@ pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     /// Map sets for window jobs in flight (twice the workers, so a worker
     /// can start its next window while earlier ones wait to be merged).
     worker_maps: Vec<CellMaps<K::Accumulator>>,
-    /// Most window jobs seen in one batch, to reserve the next batch's list.
-    batch_jobs_hint: usize,
-    /// Map sets finished out of window order, reused across batches.
+    /// Ring of out-of-order sets, bounded by the map-set count and reused across batches.
     finished_sets: Vec<Option<CellMaps<K::Accumulator>>>,
     /// New-cell and computed-key lists of a batch, reused across batches.
     new_cell_buffer: Vec<(usize, u64)>,
@@ -776,7 +915,6 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             batch_pixels,
             output_byte_limit,
             peak_active_bytes: 0,
-            batch_jobs_hint: 0,
             finished_sets: Vec::new(),
             new_cell_buffer: Vec::new(),
             key_chunk_buffer: Vec::new(),
@@ -896,69 +1034,6 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         )
     }
 
-    /// Cut the batch's decoded chunks into bounded window jobs borrowing their
-    /// storage. When a full row fits, rows are combined into one job;
-    /// otherwise jobs are horizontal row segments.
-    fn batch_jobs<'a>(
-        &mut self,
-        items: &'a [crate::raster::prefetch::MosaicPrefetchItem],
-    ) -> Result<Vec<WindowJob<'a>>> {
-        use super::borrowed::BorrowedSamples;
-        let mut jobs = Vec::with_capacity(self.batch_jobs_hint.max(items.len()));
-        for item in items {
-            let (tile_idx, chunk_idx, chunk, data, overlap) = item
-                .as_ref()
-                .map_err(|e| RasterH3Error::StreamFailed(e.to_string()))?;
-            let width = chunk.width as usize;
-            let height = chunk.height as usize;
-            // Do not interpret a decoder's sparse fill as observed data:
-            // the effective nodata may differ from the file's sentinel.
-            if width == 0
-                || height == 0
-                || self.mosaic.tiles[*tile_idx]
-                    .reader
-                    .is_sparse_chunk(*chunk_idx)
-            {
-                continue;
-            }
-            let spp = self.mosaic.tiles[*tile_idx]
-                .reader
-                .metadata
-                .samples_per_pixel
-                .max(1) as usize;
-            self.metrics.decoded_bytes += BorrowedSamples::from(data).bytes() as u64;
-            let (mut row, mut col) = (0usize, 0usize);
-            while row < height {
-                let (w, h) = if width <= self.worker_pixels {
-                    (width, (self.worker_pixels / width).min(height - row))
-                } else {
-                    (self.worker_pixels.min(width - col), 1)
-                };
-                let start = (row * width + col) * spp;
-                let len = ((h - 1) * width + w) * spp;
-                let samples = BorrowedSamples::from(data).window(start, len)?;
-                let bounds = RasterChunk {
-                    col_offset: chunk.col_offset + col as u32,
-                    row_offset: chunk.row_offset + row as u32,
-                    width: w as u32,
-                    height: h as u32,
-                };
-                jobs.push((*tile_idx, bounds, samples, width as u32, *overlap));
-                if w == width {
-                    row += h;
-                } else {
-                    col += w;
-                    if col == width {
-                        col = 0;
-                        row += 1;
-                    }
-                }
-            }
-        }
-        self.batch_jobs_hint = self.batch_jobs_hint.max(jobs.len());
-        Ok(jobs)
-    }
-
     /// Aggregate a batch's windows into the horizon maps.
     ///
     /// Windows run on long-lived workers that take jobs as they become free,
@@ -970,12 +1045,16 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
     /// keys (a cell-boundary computation each) from the workers too, as extra
     /// jobs, and the keys are queued in creation order at the end of the
     /// batch, before any eviction can need them.
-    fn process_batch(
-        &mut self,
-        items: &mut [crate::raster::prefetch::MosaicPrefetchItem],
-    ) -> Result<()> {
-        let jobs = self.batch_jobs(items)?;
-        if jobs.is_empty() {
+    fn process_batch(&mut self, items: &mut [MosaicPrefetchItem]) -> Result<()> {
+        let mosaic = &*self.mosaic;
+        let jobs = WindowJobs::new(
+            items,
+            mosaic,
+            self.worker_pixels,
+            &mut self.metrics.decoded_bytes,
+        )?;
+        let job_count = jobs.len();
+        if job_count == 0 {
             return Ok(());
         }
         let mut free = std::mem::take(&mut self.worker_maps);
@@ -985,7 +1064,6 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let set_budget = self.worker_budget / map_sets.max(1);
         let Self {
             kernel,
-            mosaic,
             resolutions,
             sampling,
             bbox,
@@ -1007,18 +1085,18 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         } = self;
         let (kernel, mosaic, resolutions, sampling, eviction_space) = (
             &*kernel,
-            &*mosaic,
+            mosaic,
             &*resolutions,
             &*sampling,
             &*eviction_space,
         );
         let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let run_window = |index: usize, maps: &mut CellMaps<K::Accumulator>| {
+        let run_window = |job: WindowJob<'_>, maps: &mut CellMaps<K::Accumulator>| {
             peak.fetch_max(
                 active.fetch_add(1, Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
             );
-            let (tile_idx, chunk, samples, stride, overlap) = &jobs[index];
+            let (tile_idx, chunk, samples, stride, overlap) = &job;
             let tile = &mosaic.tiles[*tile_idx];
             let scope = super::profile::WorkerScope::new();
             let start = std::time::Instant::now();
@@ -1031,7 +1109,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 bbox: *bbox,
                 stride: *stride,
                 samples_per_pixel: tile.reader.metadata.samples_per_pixel,
-                owner: overlap.then_some((*tile_idx, &**mosaic)),
+                owner: overlap.then_some((*tile_idx, mosaic)),
                 band_scaling: if *apply_scale_offset {
                     &tile.reader.metadata.band_scaling
                 } else {
@@ -1078,26 +1156,16 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         // dedicated pool, run it serially.
         let t = std::time::Instant::now();
         target.metrics.waves += 1;
-        let workers = (*worker_tasks).min(jobs.len());
+        let workers = (*worker_tasks).min(job_count);
         let result = match &*pool {
             // One window (or one worker) gains nothing from the pipeline;
             // running it here saves the channels and task spawns.
-            _ if workers <= 1 => run_serial(
-                jobs.len(),
-                &mut free,
-                &run_window,
-                &compute_keys,
-                &mut target,
-            ),
+            _ if workers <= 1 => {
+                run_serial(jobs, &mut free, &run_window, &compute_keys, &mut target)
+            }
             Some(p) if p.current_thread_index().is_some() => {
                 target.metrics.serial_waves += 1;
-                run_serial(
-                    jobs.len(),
-                    &mut free,
-                    &run_window,
-                    &compute_keys,
-                    &mut target,
-                )
+                run_serial(jobs, &mut free, &run_window, &compute_keys, &mut target)
             }
             Some(p) if rayon::current_thread_index().is_some() => {
                 target.metrics.bridged_waves += 1;
@@ -1107,7 +1175,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                             run_pipelined(
                                 scope,
                                 workers,
-                                jobs.len(),
+                                jobs,
                                 &mut free,
                                 &run_window,
                                 &compute_keys,
@@ -1124,7 +1192,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 run_pipelined(
                     scope,
                     workers,
-                    jobs.len(),
+                    jobs,
                     &mut free,
                     &run_window,
                     &compute_keys,
@@ -1134,19 +1202,13 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }),
             None if rayon::current_thread_index().is_some() => {
                 target.metrics.serial_waves += 1;
-                run_serial(
-                    jobs.len(),
-                    &mut free,
-                    &run_window,
-                    &compute_keys,
-                    &mut target,
-                )
+                run_serial(jobs, &mut free, &run_window, &compute_keys, &mut target)
             }
             None => rayon::in_place_scope(|scope| {
                 run_pipelined(
                     scope,
                     workers,
-                    jobs.len(),
+                    jobs,
                     &mut free,
                     &run_window,
                     &compute_keys,
@@ -1588,6 +1650,239 @@ mod pipeline_tests {
     use super::*;
     use crate::aggregator::accumulator::H3Accumulator;
 
+    fn test_mosaic() -> (tempfile::NamedTempFile, MosaicReader) {
+        use tiff::encoder::{colortype::Gray8, TiffEncoder};
+        use tiff::tags::Tag;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut encoder = TiffEncoder::new(file.reopen().unwrap()).unwrap();
+            let mut image = encoder.new_image::<Gray8>(1, 1).unwrap();
+            image
+                .encoder()
+                .write_tag(Tag::ModelPixelScaleTag, &[0.01, 0.01, 0.0][..])
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(
+                    Tag::ModelTiepointTag,
+                    &[0.0, 0.0, 0.0, -100.0, 40.0, 0.0][..],
+                )
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(
+                    Tag::GeoKeyDirectoryTag,
+                    &[1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326][..],
+                )
+                .unwrap();
+            image.write_data(&[1]).unwrap();
+        }
+        let reader = GeoTiffStreamReader::open(file.path()).unwrap();
+        (
+            file,
+            MosaicReader::from_single_reader(reader, None, None).unwrap(),
+        )
+    }
+
+    #[test]
+    fn large_tile_windows_are_lazy_and_cover_each_pixel_once() {
+        let (_file, mosaic) = test_mosaic();
+        let items = vec![Ok((
+            0,
+            0,
+            RasterChunk {
+                col_offset: 7,
+                row_offset: 11,
+                width: 4096,
+                height: 4096,
+            },
+            DecodingResult::U8(vec![1; 4096 * 4096]),
+            true,
+        ))];
+        let mut decoded_bytes = 0;
+        let mut jobs = WindowJobs::new(&items, &mosaic, 33, &mut decoded_bytes).unwrap();
+        let count = 4096usize.div_ceil(33) * 4096;
+        assert_eq!(jobs.len(), count);
+        assert_eq!(decoded_bytes, 4096 * 4096);
+        let mut pixels = 0;
+        let mut windows = 0;
+        while let Some((tile, chunk, samples, stride, overlap)) = jobs.next() {
+            assert_eq!(tile, 0);
+            assert_eq!(chunk.col_offset as usize - 7, pixels % 4096);
+            assert_eq!(chunk.row_offset as usize - 11, pixels / 4096);
+            assert_eq!(chunk.height, 1);
+            assert!(chunk.width <= 33);
+            assert_eq!(samples.bytes(), chunk.width as usize);
+            assert_eq!(stride, 4096);
+            assert!(overlap);
+            pixels += chunk.width as usize;
+            windows += 1;
+            assert_eq!(jobs.len(), count - windows);
+        }
+        assert_eq!(windows, count);
+        assert_eq!(pixels, 4096 * 4096);
+        assert!(jobs.next().is_none());
+    }
+
+    #[test]
+    fn windows_combine_rows_and_preserve_interleaved_sample_offsets() {
+        let (_file, mut mosaic) = test_mosaic();
+        mosaic.tiles[0].reader.metadata.samples_per_pixel = 3;
+        let items = vec![
+            Ok((
+                0,
+                0,
+                RasterChunk {
+                    col_offset: 0,
+                    row_offset: 0,
+                    width: 0,
+                    height: 3,
+                },
+                DecodingResult::U8(Vec::new()),
+                false,
+            )),
+            Ok((
+                0,
+                0,
+                RasterChunk {
+                    col_offset: 4,
+                    row_offset: 6,
+                    width: 3,
+                    height: 5,
+                },
+                DecodingResult::U8((0..45).collect()),
+                false,
+            )),
+            Ok((
+                0,
+                0,
+                RasterChunk {
+                    col_offset: 8,
+                    row_offset: 9,
+                    width: 3,
+                    height: 1,
+                },
+                DecodingResult::U8((45..54).collect()),
+                false,
+            )),
+        ];
+        let mut decoded_bytes = 0;
+        let jobs = WindowJobs::new(&items, &mosaic, 7, &mut decoded_bytes).unwrap();
+        assert_eq!(jobs.len(), 4);
+        let windows: Vec<_> = jobs
+            .map(|(_, chunk, samples, stride, _)| {
+                let super::super::borrowed::BorrowedSamples::U8(samples) = samples else {
+                    panic!("wrong sample type")
+                };
+                assert_eq!(stride, 3);
+                (chunk.row_offset, chunk.height, samples.to_vec())
+            })
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                (6, 2, (0..18).collect()),
+                (8, 2, (18..36).collect()),
+                (10, 1, (36..45).collect()),
+                (9, 1, (45..54).collect()),
+            ]
+        );
+        assert_eq!(decoded_bytes, 54);
+    }
+
+    #[test]
+    fn malformed_chunks_fail_before_dispatch() {
+        let (_file, mosaic) = test_mosaic();
+        let chunk = RasterChunk {
+            col_offset: 0,
+            row_offset: 0,
+            width: 2,
+            height: 2,
+        };
+        let mut items = vec![
+            Ok((0, 0, chunk, DecodingResult::U8(vec![0; 4]), false)),
+            Ok((0, 0, chunk, DecodingResult::U8(vec![0; 3]), false)),
+        ];
+        let mut decoded_bytes = 0;
+        assert!(matches!(
+            WindowJobs::new(&items, &mosaic, 1, &mut decoded_bytes),
+            Err(RasterH3Error::InvalidMetadata(_))
+        ));
+        items[1] = Err(RasterH3Error::StreamFailed("decode failed".into()));
+        assert!(matches!(
+            WindowJobs::new(&items, &mosaic, 1, &mut decoded_bytes),
+            Err(RasterH3Error::StreamFailed(_))
+        ));
+    }
+
+    #[test]
+    fn scheduling_storage_is_bounded_for_half_a_million_windows() {
+        struct Job<'a>(&'a AtomicUsize);
+        impl Drop for Job<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let live = AtomicUsize::new(0);
+        let peak_live = AtomicUsize::new(0);
+        let jobs = (0..512_000).map(|_| {
+            peak_live.fetch_max(live.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            Job(&live)
+        });
+        let run_window = |_: Job<'_>, _: &mut CellMaps<H3Accumulator>| {
+            (super::super::profile::WorkerProfile::default(), 0)
+        };
+        let compute_keys = |_: &[(usize, u64)]| Vec::new();
+        let mut shards = vec![ShardedResolutionMap::new()];
+        let mut spill_runs = vec![SpillRuns::new(usize::MAX, None)];
+        let mut metrics = super::super::profile::StreamProfile::default();
+        let mut peak = 0;
+        let mut free = (0..8)
+            .map(|_| vec![HashMap::with_hasher(H3BuildHasher)])
+            .collect();
+        let mut finished = Vec::new();
+        let mut target = MergeTarget {
+            shards: &mut shards,
+            spill_runs: &mut spill_runs,
+            metrics: &mut metrics,
+            peak_active_bytes: &mut peak,
+            failure_counter: None,
+            compactor_bytes: 0,
+            accumulator_limit: usize::MAX,
+            map_budget: usize::MAX,
+            set_budget: usize::MAX,
+            map_sets: 8,
+            new_cells: Vec::new(),
+            key_chunks: Vec::new(),
+        };
+        pool.in_place_scope(|scope| {
+            run_pipelined(
+                scope,
+                4,
+                jobs,
+                &mut free,
+                &run_window,
+                &compute_keys,
+                &mut target,
+                &mut finished,
+            )
+        })
+        .unwrap();
+        assert_eq!(metrics.jobs, 512_000);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert!(peak_live.load(Ordering::Relaxed) <= 8);
+        assert_eq!(finished.len(), 8);
+        assert_eq!(finished.capacity(), 8);
+        assert!(finished.iter().all(Option::is_none));
+        assert_eq!(free.len(), 8);
+    }
+
     fn run(jobs: usize, panic_at: Option<usize>) -> std::thread::Result<Result<Vec<usize>>> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
@@ -1650,7 +1945,7 @@ mod pipeline_tests {
                 run_pipelined(
                     scope,
                     4,
-                    jobs,
+                    0..jobs,
                     &mut free,
                     &run_window,
                     &compute_keys,

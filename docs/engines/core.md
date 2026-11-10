@@ -162,8 +162,11 @@ cost. The bare spawn/join measurement is only an isolated baseline.
 
 ### Batch pipeline
 
-Each batch of decoded chunks is cut into window jobs, and every job aggregates
-into its own map set. `worker_tasks` long-lived workers take jobs as they become
+Each batch of decoded chunks is cut lazily into window jobs using chunk, row and
+column cursors, and every job aggregates into its own map set. Pending jobs and
+the completion ring are bounded by the map-set count, not the number of windows
+in a tile, even when one tile exceeds the batch's pixel target.
+`worker_tasks` long-lived workers take jobs as they become
 free, so no worker waits for the slowest window of a group. The calling thread
 merges finished map sets into the horizon maps **strictly in window order** while
 later windows still run, and returns each set to a pool of `2 × worker_tasks`
