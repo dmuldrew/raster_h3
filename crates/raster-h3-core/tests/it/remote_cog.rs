@@ -503,6 +503,12 @@ impl MockHttpServer {
             return;
         }
 
+        if path.contains("forbidden") {
+            let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+
         if path.contains("not_found") {
             let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes());
@@ -2167,11 +2173,13 @@ fn test_remote_request_headers_injection() {
 
     std::env::set_var("AWS_REQUEST_PAYER", "requester");
     std::env::set_var("RASTER_H3_AUTH_TOKEN", "test-secret-token-xyz");
+    std::env::set_var("RASTER_H3_AUTH_HOSTS", "127.0.0.1");
 
     let _reader = GeoTiffStreamReader::open(&remote_url).expect("Reader open with custom headers");
 
     std::env::remove_var("AWS_REQUEST_PAYER");
     std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
 
     let headers = server.recorded_headers();
     let found_payer = headers
@@ -2187,6 +2195,120 @@ fn test_remote_request_headers_injection() {
         "Expected x-amz-request-payer header in HTTP request"
     );
     assert!(found_auth, "Expected authorization header in HTTP request");
+}
+
+/// Lower-cased request header lines the mock server has seen.
+fn recorded_lowercase(server: &MockHttpServer) -> Vec<String> {
+    server
+        .recorded_headers()
+        .iter()
+        .map(|h| h.to_lowercase())
+        .collect()
+}
+
+// The bearer token belongs to the process, the URL often to a caller (a SQL
+// argument). It goes only to hosts the process owner listed, and a transport
+// pointed at another host does not take it along.
+#[test]
+fn auth_token_is_sent_only_to_listed_hosts() {
+    let _env_lock = ENV_MUTEX.lock().unwrap();
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let sent = |headers: &[String]| {
+        headers
+            .iter()
+            .any(|h| h.contains("authorization: bearer scoped-token"))
+    };
+
+    std::env::set_var("RASTER_H3_AUTH_TOKEN", "scoped-token");
+
+    // No host list: the token stays home, and public data still reads.
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
+    let server = MockHttpServer::start(data.clone());
+    let source = RemoteHttpSource::open(&format!("{}/test.tif", server.url_base)).unwrap();
+    assert_eq!(source.fetch_range(0, 9).unwrap(), data[..10]);
+    let unlisted = recorded_lowercase(&server);
+
+    // Another host is listed.
+    std::env::set_var("RASTER_H3_AUTH_HOSTS", "data.example.com, .example.org");
+    let server = MockHttpServer::start(data.clone());
+    RemoteHttpSource::open(&format!("{}/test.tif", server.url_base)).unwrap();
+    let other_host = recorded_lowercase(&server);
+
+    // This host is listed. The same server is then reached under a name that
+    // is not, through the transport that was created for the listed one.
+    std::env::set_var("RASTER_H3_AUTH_HOSTS", "data.example.com,127.0.0.1");
+    let server = MockHttpServer::start(data.clone());
+    let mut transport = HttpTransport::new(&format!("{}/test.tif", server.url_base)).unwrap();
+    assert_eq!(transport.fetch_range(0, 9, None).unwrap(), data[..10]);
+    let listed = recorded_lowercase(&server);
+    transport.url = transport.url.replace("127.0.0.1", "localhost");
+    let retargeted = match transport.fetch_range(0, 9, None) {
+        // `localhost` may not resolve to the IPv4 listener everywhere.
+        Ok(_) => Some(recorded_lowercase(&server)[listed.len()..].to_vec()),
+        Err(_) => None,
+    };
+
+    std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
+
+    assert!(!unlisted.is_empty() && !sent(&unlisted), "{unlisted:?}");
+    assert!(
+        !other_host.is_empty() && !sent(&other_host),
+        "{other_host:?}"
+    );
+    assert!(sent(&listed), "{listed:?}");
+    if let Some(retargeted) = retargeted {
+        assert!(
+            !retargeted.is_empty() && !sent(&retargeted),
+            "{retargeted:?}"
+        );
+    }
+}
+
+// A server that refuses the request is the only sign the caller gets that a
+// configured token was not sent, so the error says so.
+#[test]
+fn refused_request_reports_a_withheld_auth_token() {
+    let _env_lock = ENV_MUTEX.lock().unwrap();
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let server = MockHttpServer::start(vec![0u8; 1024]);
+    let url = format!("{}/forbidden.tif", server.url_base);
+    let open_error = || match RemoteHttpSource::open(&url) {
+        Ok(_) => panic!("a 403 response must fail the open"),
+        Err(err) => err.to_string(),
+    };
+
+    std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
+    let without_token = open_error();
+
+    std::env::set_var("RASTER_H3_AUTH_TOKEN", "scoped-token");
+    let withheld = open_error();
+
+    std::env::set_var("RASTER_H3_AUTH_HOSTS", "127.0.0.1");
+    let sent = open_error();
+
+    std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
+
+    assert!(without_token.contains("HTTP 403"), "{without_token}");
+    assert!(!without_token.contains("RASTER_H3_AUTH"), "{without_token}");
+    assert!(
+        withheld.contains("RASTER_H3_AUTH_TOKEN was not sent")
+            && withheld.contains("RASTER_H3_AUTH_HOSTS"),
+        "{withheld}"
+    );
+    assert!(!sent.contains("was not sent"), "{sent}");
+    for message in [&without_token, &withheld, &sent] {
+        assert!(!message.contains("scoped-token"), "{message}");
+    }
 }
 
 #[test]
