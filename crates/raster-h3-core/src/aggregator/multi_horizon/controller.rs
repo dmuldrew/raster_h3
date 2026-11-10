@@ -1157,7 +1157,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let t = std::time::Instant::now();
         target.metrics.waves += 1;
         let workers = (*worker_tasks).min(job_count);
-        let result = match &*pool {
+        // A panic unwinds past the restore at the end of this function, and the
+        // sets it held (in flight or being merged) are lost with it. Catch it,
+        // refill the pool and resume, so a caught panic does not leave the
+        // streamer with fewer map sets (or none) for later batches.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &*pool {
             // One window (or one worker) gains nothing from the pipeline;
             // running it here saves the channels and task spawns.
             _ if workers <= 1 => {
@@ -1216,6 +1220,19 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     finished_sets,
                 )
             }),
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(panic) => {
+                free.iter_mut().flatten().for_each(HashMap::clear);
+                free.resize_with(map_sets, || {
+                    (0..resolutions.len())
+                        .map(|_| HashMap::with_hasher(H3BuildHasher))
+                        .collect()
+                });
+                self.worker_maps = free;
+                std::panic::resume_unwind(panic);
+            }
         };
         let kernel_ns = t.elapsed().as_nanos() as u64;
         let MergeTarget {
@@ -1257,7 +1274,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         if let Some(reason) = self.lifecycle.failure_reason() {
             return Err(RasterH3Error::StreamFailed(reason.to_string()));
         }
-        let result = self.advance_inner(min_rows.min(2048));
+        let result = self.latch_panics(|s| s.advance_inner(min_rows.min(2048)));
         self.metrics.peak_compaction_bytes = self.compactor.peak_bytes();
         self.metrics.forced_compaction_flushes = self.compactor.forced_flushes();
         if let Some(prefetcher) = &self.prefetcher {
@@ -1470,6 +1487,20 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         len.max(1)
     }
 
+    /// Run `f`, latching the stream as failed if it panics, then resume the
+    /// unwind. A panic loses the batch in flight (its chunks are already
+    /// taken from the prefetcher), so a caller that catches it must not read
+    /// on past the missing samples.
+    fn latch_panics<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(value) => value,
+            Err(panic) => {
+                self.fail("aggregation panicked; the stream cannot continue".into());
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
     /// Latch failures so subsequent reads cannot mistake a failed stream for EOF.
     fn fail(&mut self, reason: String) -> RasterH3Error {
         self.prefetcher.take();
@@ -1642,6 +1673,97 @@ impl<A: SpillAccumulator> FinalCells<A> {
             Self::Memory(iter) => Ok(iter.next()),
             Self::Disk(reader) => reader.next_record(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregator::multi_horizon::continuous_streamer::MultiScanHorizonStreamer;
+    use crate::raster::prefetch::MosaicPrefetchItem;
+    use tiff::encoder::{colortype, TiffEncoder};
+    use tiff::tags::Tag;
+
+    /// Minimal georeferenced Gray8 GeoTIFF — enough for `GeoTiffStreamReader::open`.
+    fn write_gray_geotiff(path: &std::path::Path) {
+        const GEOKEYS: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+        let mut image = encoder.new_image::<colortype::Gray8>(8, 8).unwrap();
+        image
+            .encoder()
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[0.0, 0.0, 0.0, -122.0, 38.0, 0.0][..],
+            )
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001, 0.001, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &GEOKEYS[..])
+            .unwrap();
+        image.write_data(&[1u8; 64]).unwrap();
+    }
+
+    /// A panic inside a wave used to leave `worker_maps` empty; every following
+    /// wave then zipped jobs against zero maps and silently dropped all
+    /// samples. `process_batch` now restores its state before resuming the
+    /// unwind, so a caller that catches the panic finds the maps intact.
+    #[test]
+    fn worker_panic_preserves_worker_maps() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_gray_geotiff(tmp.path());
+        let reader = GeoTiffStreamReader::open(tmp.path()).unwrap();
+        let config = MultiResolutionConfig::single(5);
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        let maps_before = streamer.worker_maps.len();
+        assert!(maps_before > 0);
+
+        // Without horizon maps, merging the window's map set indexes a
+        // missing resolution and panics after the sets are taken from the pool.
+        streamer.resolution_shards.clear();
+        let mut items: Vec<MosaicPrefetchItem> = vec![Ok((
+            0,
+            0,
+            RasterChunk {
+                col_offset: 0,
+                row_offset: 0,
+                width: 4,
+                height: 4,
+            },
+            DecodingResult::U8(vec![1; 16]),
+            false,
+        ))];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = streamer.process_batch(&mut items);
+        }));
+        assert!(panic.is_err());
+        assert_eq!(streamer.worker_maps.len(), maps_before);
+    }
+
+    /// A panic while advancing loses the batch in flight, so the stream
+    /// latches a failure: later reads return an error instead of continuing
+    /// past the missing samples.
+    #[test]
+    fn panic_while_advancing_latches_failure() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_gray_geotiff(tmp.path());
+        let reader = GeoTiffStreamReader::open(tmp.path()).unwrap();
+        let config = MultiResolutionConfig::single(5);
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        // Without horizon maps, the first merge indexes a missing resolution
+        // and panics on the calling thread.
+        streamer.resolution_shards.clear();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = streamer.advance_until_completed(1);
+        }));
+        assert!(panic.is_err(), "the panic must still reach the caller");
+        let err = streamer.advance_until_completed(1).unwrap_err();
+        assert!(err.to_string().contains("panicked"), "{err}");
+        assert!(streamer.fetch_next_batch(16).is_err());
     }
 }
 

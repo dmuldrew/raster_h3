@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::categorical::CategoricalAccumulator;
@@ -128,6 +129,7 @@ pub fn evict_and_write_tiles(
         safety_margin: 0.0,
         layer_name: Cow::Borrowed("h3_hexagons"),
         property_filter: None,
+        capped_cells: 0,
     };
     let count = acc.evict_and_write_tiles(lat_horizon, writer)?;
     *tile_buckets = acc.tile_buckets;
@@ -147,6 +149,7 @@ pub fn flush_all_tiles(
         safety_margin: 0.0,
         layer_name: Cow::Borrowed("h3_hexagons"),
         property_filter: None,
+        capped_cells: 0,
     };
     acc.flush_all(writer)
 }
@@ -252,6 +255,9 @@ impl H3PmtilesTiler {
 
         let mut res_stats: HashMap<u8, ResolutionAccumulatorStats, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher);
+        // Cells whose per-zoom tile range exceeded the enumeration cap
+        // (polar-cap cells at fine zooms); surfaced in the archive metadata.
+        let capped_cells = AtomicUsize::new(0);
         let min_res_zooms = zooms_for_h3_res(min_res, min_res);
         let mut coarse_res_list: Vec<u8> = min_res_zooms
             .iter()
@@ -341,22 +347,30 @@ impl H3PmtilesTiler {
                             continue;
                         }
 
-                        for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
-                            let feature = MvtFeature::from_mercator(
-                                h3_index,
-                                vertices_merc,
-                                zoom,
-                                tx,
-                                ty,
-                                4096,
-                                properties.clone(),
-                            );
-                            ops.push(PreparedTileOp {
-                                tile_key: (zoom, tx, ty),
-                                feature,
-                                is_parent: false,
-                            });
-                        });
+                        if for_each_cell_tile_mercator(
+                            center_merc,
+                            vertices_merc,
+                            zoom,
+                            |tx, ty| {
+                                let feature = MvtFeature::from_mercator(
+                                    h3_index,
+                                    vertices_merc,
+                                    zoom,
+                                    tx,
+                                    ty,
+                                    4096,
+                                    properties.clone(),
+                                );
+                                ops.push(PreparedTileOp {
+                                    tile_key: (zoom, tx, ty),
+                                    feature,
+                                    is_parent: false,
+                                });
+                            },
+                        ) == 0
+                        {
+                            capped_cells.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
 
                     Some(PreparedContinuousHex {
@@ -395,7 +409,7 @@ impl H3PmtilesTiler {
             Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
-        coarse_parents.write(
+        let overview_capped = coarse_parents.write(
             &min_res_zooms,
             &property_filter,
             &mut writer,
@@ -411,6 +425,7 @@ impl H3PmtilesTiler {
                 max: acc.max,
             },
         )?;
+        capped_cells.fetch_add(overview_capped, Ordering::Relaxed);
 
         accumulator.flush_all(&mut writer)?;
 
@@ -487,6 +502,10 @@ impl H3PmtilesTiler {
             Some({
                 let mut extras = serde_json::Map::new();
                 extras.insert("h3_resolution_stats".to_string(), json!(res_stats_json));
+                let skipped = capped_cells.load(Ordering::Relaxed);
+                if skipped > 0 {
+                    extras.insert("h3_cells_over_tile_cap".to_string(), json!(skipped));
+                }
                 extras
             }),
         );
@@ -567,6 +586,9 @@ impl H3PmtilesTiler {
             HashMap::with_hasher(FxBuildHasher);
         let mut res_pixel_sums: HashMap<u8, f64, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher);
+        // Cells whose per-zoom tile range exceeded the enumeration cap
+        // (polar-cap cells at fine zooms); surfaced in the archive metadata.
+        let capped_cells = AtomicUsize::new(0);
         let min_res_zooms = zooms_for_h3_res(min_res, min_res);
         let mut coarse_res_list: Vec<u8> = min_res_zooms
             .iter()
@@ -656,22 +678,30 @@ impl H3PmtilesTiler {
                             continue;
                         }
 
-                        for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
-                            let feature = MvtFeature::from_mercator(
-                                h3_index,
-                                vertices_merc,
-                                zoom,
-                                tx,
-                                ty,
-                                4096,
-                                properties.clone(),
-                            );
-                            ops.push(PreparedTileOp {
-                                tile_key: (zoom, tx, ty),
-                                feature,
-                                is_parent: false,
-                            });
-                        });
+                        if for_each_cell_tile_mercator(
+                            center_merc,
+                            vertices_merc,
+                            zoom,
+                            |tx, ty| {
+                                let feature = MvtFeature::from_mercator(
+                                    h3_index,
+                                    vertices_merc,
+                                    zoom,
+                                    tx,
+                                    ty,
+                                    4096,
+                                    properties.clone(),
+                                );
+                                ops.push(PreparedTileOp {
+                                    tile_key: (zoom, tx, ty),
+                                    feature,
+                                    is_parent: false,
+                                });
+                            },
+                        ) == 0
+                        {
+                            capped_cells.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
 
                     Some(PreparedCategoricalHex {
@@ -723,7 +753,7 @@ impl H3PmtilesTiler {
             Err(e) => return Err(format!("Producer thread panicked: {:?}", e).into()),
         }
 
-        coarse_parents.write(
+        let overview_capped = coarse_parents.write(
             &min_res_zooms,
             &property_filter,
             &mut writer,
@@ -745,6 +775,7 @@ impl H3PmtilesTiler {
                 }
             },
         )?;
+        capped_cells.fetch_add(overview_capped, Ordering::Relaxed);
 
         accumulator.flush_all(&mut writer)?;
 
@@ -864,6 +895,10 @@ impl H3PmtilesTiler {
                 extras.insert("type".to_string(), json!("overlay"));
                 extras.insert("dataset_type".to_string(), json!("categorical"));
                 extras.insert("h3_resolution_stats".to_string(), json!(res_stats_json));
+                let skipped = capped_cells.load(Ordering::Relaxed);
+                if skipped > 0 {
+                    extras.insert("h3_cells_over_tile_cap".to_string(), json!(skipped));
+                }
                 extras
             }),
         );
