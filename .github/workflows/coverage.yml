@@ -1,0 +1,52 @@
+name: Coverage
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # The pg fmgr suites need a target major; they run against in-process stand-ins.
+      RASTER_H3_PG_MAJOR: '16'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          components: llvm-tools-preview
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+
+      # The pg fmgr entry points and their tests/it suite build only with
+      # `pg-extension`, which the other crates do not take, so run it apart and
+      # merge both runs into one report.
+      - name: Collect coverage
+        run: |
+          cargo llvm-cov --locked --no-report -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python --lib --test it
+          cargo llvm-cov --locked --no-report -p raster-h3-pg --features pg-extension --lib --test it
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

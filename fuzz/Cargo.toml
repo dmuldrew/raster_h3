@@ -37,6 +37,34 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ipc"
+path = "fuzz_targets/ipc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arrow_import"
+path = "fuzz_targets/arrow_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remap"
+path = "fuzz_targets/remap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_range"
+path = "fuzz_targets/content_range.rs"
+test = false
+doc = false
+bench = false
+
 # Keep in sync with the workspace `[patch.crates-io]`: this crate is its own
 # workspace, so the root patch does not apply here.
 [patch.crates-io]

@@ -238,7 +238,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (42) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; remote-path detection (cloud schemes, case, `file://`, Windows drive letters, malformed schemes); header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; strong ETag pinning across cached/direct/concurrent reads and transport clones; URL-scoped validators for retargeted transports, divergent concurrent clones, and unversioned sources; same-size replacement and HTTP 412 without retry; rejection of changed/missing/weak response validators despite ignored preconditions; compatibility without strong initial tags; conditional transient retries; range coalescing; rejection of truncated, ignored or wrong ranges; full-body responses served from cache; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
+| [`core/remote_cog.rs`](../crates/raster-h3-core/tests/it/remote_cog.rs) (48) | Against a local mock HTTP server: URL normalisation and S3 regional/custom endpoints; remote-path detection (cloud schemes, case, `file://`, Windows drive letters, malformed schemes); header read budget; numerical equality with local reads; ROI-selective streaming; 404 handling; transient retry and recovery; header injection; strong ETag pinning across cached/direct/concurrent reads and transport clones; URL-scoped validators for retargeted transports, divergent concurrent clones, and unversioned sources; same-size replacement and HTTP 412 without retry; rejection of changed/missing/weak response validators despite ignored preconditions; compatibility without strong initial tags; conditional transient retries; range coalescing; rejection of truncated, ignored or wrong ranges; retry of truncated range, probe and full-body responses; full-body responses served from cache and capped by `RASTER_H3_MAX_FULL_BODY_BYTES`; reads across cache blocks; in-flight prefetch completion, final fetch errors and cancellation waking all consumers; the prefetch byte budget bounding held bytes under a slow consumer with no duplicate requests, coalesced responses shared by their chunks and charged until the last slice drops, oversized ranges fetched one at a time, and cancellation waking workers blocked on the budget; out-of-order and concurrent demand, coalesced sibling refetch, full count capacity, caller-clone retention and payload validity after queue drop; remote mosaics and the multi-resolution streamer; remote COG → Parquet. |
 | Unit: `raster/http_range.rs` (7), `raster/remote_prefetch.rs` (7) | Range validation, caching, coalescing, backoff and the private terminal-update locking invariant. |
 
 ## 14. Mosaics & overlap rules
@@ -393,7 +393,7 @@ See the [engine deep dives](engines/README.md).
 | Suite | What it checks |
 | :--- | :--- |
 | [`core/performance.rs`](../crates/raster-h3-core/tests/it/performance.rs) (4) | Continuous, multi-resolution, categorical and supersampled streaming conserve pixel mass, with no wall-clock pass/fail thresholds. |
-| [`core/properties.rs`](../crates/raster-h3-core/tests/it/properties.rs) (5 generated tests) | Weighted merge equivalence, WKB validity/truncation, affine and Mercator round trips, and nodata/supersampled conservation plus cell uniqueness across the antimeridian. |
+| [`core/properties.rs`](../crates/raster-h3-core/tests/it/properties.rs) (11 generated tests) | Weighted merge equivalence, accumulator merge associativity/commutativity, sketch merge-vs-single-stream and bounded relative error, `quantiles_batch`/`quantile` agreement, IPC stream round trips, Hilbert tile-id round trips and level bounds, WKB validity/truncation, affine and Mercator round trips, and nodata/supersampled conservation plus cell uniqueness across the antimeridian. |
 | [`core/benches/streaming.rs`](../crates/raster-h3-core/benches/streaming.rs) | Criterion baselines for continuous, multi-resolution, categorical and supersampled streaming; `single_quantile` scalar/batch/plan p50/p90 queries on small positive and larger mixed-sign sketches; hash-sensitive quantile and 8-class inline / 64-class heap categorical accumulators; raw res-10 H3 map insertion/removal. Fixture/input creation is not timed. |
 | [`core/super_sampling.rs`](../crates/raster-h3-core/tests/it/super_sampling.rs) | `benchmark_supersampling` (ignored): manual release throughput comparison. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs) | `test_parallel_chunk_aggregation_hawaii_dataset`, `test_parallel_categorical_aggregation_hawaii_dataset` (ignored, need data). |
@@ -415,8 +415,10 @@ not the four-column Polars projection; timings from the two backends are not int
 
 The [safety workflow](../.github/workflows/safety.yml) runs a short coverage-guided,
 AddressSanitizer-enabled fuzz smoke test on code changes and tags, and longer weekly runs.
-Targets cover the core WKB/EWKB parser, GeoTIFF metadata reader, and integer/floating-point
-chunk unpacking and predictors. Dimensions and allocations in the predictor harness are bounded;
+Targets cover the core WKB/EWKB parser, GeoTIFF metadata reader, integer/floating-point
+chunk unpacking and predictors, the columnar IPC stream reader, Arrow `ArrowArray` import
+with forged variable-length offsets, the categorical remap parser, and `Content-Range`
+header parsing. Dimensions and allocations in the predictor harness are bounded;
 GeoTIFF metadata fuzzing deliberately does not decode attacker-controlled image dimensions.
 These are not exhaustive CRS or database ABI fuzzers.
 
@@ -426,13 +428,30 @@ cargo +nightly run --locked --manifest-path fuzz/Cargo.toml --example seed_corpu
 cargo +nightly fuzz run wkb -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run geotiff -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run predictor -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run ipc -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run arrow_import -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run remap -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run content_range -- -max_total_time=60 -max_len=65536
 rustup component add --toolchain nightly miri rust-src
-cargo +nightly miri test --locked -p raster-h3-core --lib columnar::arrow_c::tests
+cargo +nightly miri test --locked -p raster-h3-core --lib -- columnar:: aggregator::categorical:: raster::predictor::
 ```
 
-Miri checks Arrow schema/array/stream ownership, callbacks, round trips and slicing; it
-does not run the external DuckDB/PostgreSQL/Python hosts. Existing real-host smoke tests
-remain necessary. Fuzz crash artifacts are retained on CI failure. Minimize a reproducer
+Miri checks Arrow schema/array/stream ownership, callbacks, round trips and slicing, the
+categorical raw-slice casts, and the predictor byte-cast paths (NEON on aarch64 hosts); it
+does not run mmap or the external DuckDB/PostgreSQL/Python hosts. Existing real-host smoke
+tests remain necessary. The `tsan` job in the same workflow runs the prefetch,
+remote-prefetch and controller unit tests plus the `threading::`, `chunks_and_prefetch::`
+and `streaming_failures::` integration suites under ThreadSanitizer
+(`RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --locked -p raster-h3-core
+--test it -- threading:: chunks_and_prefetch:: streaming_failures::`, with `--target` for
+cross builds). The [coverage workflow](../.github/workflows/coverage.yml) measures
+`--lib --test it` across the core, cli, datafusion, python and pg crates with
+`cargo llvm-cov` and uploads `lcov.info` to Codecov (informational statuses); run it
+locally as `RASTER_H3_PG_MAJOR=16 cargo llvm-cov --locked --lcov --output-path lcov.info
+-p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python
+-p raster-h3-pg --lib --test it`.
+
+Fuzz crash artifacts are retained on CI failure. Minimize a reproducer
 with `cargo +nightly fuzz tmin <target> <artifact>` and add a deterministic regression test;
 report security-sensitive findings privately per [SECURITY.md](../SECURITY.md).
 
@@ -535,7 +554,8 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` (`sedona-adapter`, Linux) | `cargo test --locked --no-fail-fast` in `crates/raster-h3-sedona`, Clippy on the Python bindings, then a built wheel tested with `pytest` against `sedonadb==0.5.0` | The standalone SedonaDB adapter workspace (without `sedona-e2e`) and its Python bindings |
 | `ci.yml` (`sedona-spark`, Linux) | `docker build -f Dockerfile.sedona`, then `pytest /opt/raster_h3/examples/tests` in the image with `SPARK_MASTER=local[2]`, and `pytest crates/raster-h3-python/tests/spark` with PySpark 4.1 installed beside the image's Spark 4.0 | Partitioned scans on real Spark with Apache Sedona, the Sedona SQL interop and the demo; also that the `sedona` image builds |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
-| [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets and scoped Arrow Miri tests | Malformed input, sanitizer smoke checks, and FFI ownership; longer fuzz runs weekly |
+| [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets, scoped Miri tests over the columnar/categorical/predictor unsafe code, and a ThreadSanitizer run over prefetch and aggregation tests | Malformed input, sanitizer smoke checks, FFI ownership and data races; longer fuzz runs weekly |
+| [`coverage.yml`](../.github/workflows/coverage.yml) | `cargo llvm-cov --locked --lcov --output-path lcov.info -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg --lib --test it`, uploaded to Codecov | Line/region/function coverage on every push to main and PR; statuses informational |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
 | `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example profile_hotspots` | Hotspot harness ownership-sampling correctness; profiling experiments are excluded |
 | `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example worker_scaling` | Worker-scaling benchmark: every workload produces identical output at 1 and 3 aggregation workers; timings are not run |
