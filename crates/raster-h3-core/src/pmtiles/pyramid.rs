@@ -83,24 +83,41 @@ pub fn cell_tile_range_mercator(
     (min_tx, max_tx, min_ty, max_ty)
 }
 
+/// Tile-op cap for a single `(cell, zoom)` enumeration in
+/// [`for_each_cell_tile_mercator`]. A legitimate cell covers at most a few
+/// thousand tiles at its natural zoom, but a cell containing a pole has
+/// vertices spanning all longitudes: `2^z` columns at zoom `z` is millions of
+/// duplicated features. Past this bound the enumeration is skipped entirely
+/// (the cell is absent at that zoom rather than patchily present) and `0` is
+/// returned.
+pub const MAX_TILE_OPS_PER_CELL_ZOOM: u64 = 65_536;
+
 /// Invoke `f(tx, ty)` for every tile at zoom `z` intersected by an H3 cell.
 /// Properly wraps across the antimeridian (`tx = 2^z - 1` to `tx = 0`) without
 /// enumerating every intermediate tile across the globe.
+///
+/// Returns the number of tiles emitted, or `0` when the tile range exceeds
+/// [`MAX_TILE_OPS_PER_CELL_ZOOM`] (polar-cap cells at fine zooms).
 #[inline]
 pub fn for_each_cell_tile_mercator<F>(
     center: MercatorPoint,
     vertices: &[MercatorPoint],
     z: u8,
     mut f: F,
-) where
+) -> usize
+where
     F: FnMut(u32, u32),
 {
     let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center, vertices, z);
+    let ty_count = u64::from(max_ty - min_ty + 1);
     if min_tx == max_tx {
+        if ty_count > MAX_TILE_OPS_PER_CELL_ZOOM {
+            return 0;
+        }
         for ty in min_ty..=max_ty {
             f(min_tx, ty);
         }
-        return;
+        return ty_count as usize;
     }
 
     let mut min_raw_x = center.x;
@@ -142,22 +159,33 @@ pub fn for_each_cell_tile_mercator<F>(
             let t_min = (min_ux * n_f).floor() as i64;
             let t_max = (max_ux * n_f).floor() as i64;
             if t_max - t_min < n_i {
+                // The unwrapped range is the narrower of the two tile spans;
+                // if it exceeds the cap the full range would too.
+                let count = (t_max - t_min + 1) as u64 * ty_count;
+                if count > MAX_TILE_OPS_PER_CELL_ZOOM {
+                    return 0;
+                }
                 for t in t_min..=t_max {
                     let tx = t.rem_euclid(n_i) as u32;
                     for ty in min_ty..=max_ty {
                         f(tx, ty);
                     }
                 }
-                return;
+                return count as usize;
             }
         }
     }
 
+    let tx_count = u64::from(max_tx - min_tx + 1);
+    if tx_count * ty_count > MAX_TILE_OPS_PER_CELL_ZOOM {
+        return 0;
+    }
     for tx in min_tx..=max_tx {
         for ty in min_ty..=max_ty {
             f(tx, ty);
         }
     }
+    (tx_count * ty_count) as usize
 }
 
 /// Compute boundary vertices for an H3 cell directly into a stack-allocated array (zero heap allocations)
@@ -436,6 +464,64 @@ mod tests {
         for res in 0..=15 {
             let z = h3_res_to_zoom(res);
             assert!(z <= 24);
+        }
+    }
+
+    /// A cell containing the pole spans every longitude; at fine zooms the
+    /// naive tile range is millions of tiles. The enumeration must bail out
+    /// instead of emitting a partial result — the caller sees `0` and the
+    /// callback never runs.
+    #[test]
+    fn test_polar_cell_tile_enumeration_capped() {
+        use h3o::Resolution;
+        let pole = LatLng::new(90.0, 0.0)
+            .expect("valid")
+            .to_cell(Resolution::Fifteen);
+        let center: LatLng = pole.into();
+        let center_merc = MercatorPoint::from_lat_lng(center.lat(), center.lng());
+        let (v, len) = cell_boundary_mercator(pole);
+        let vertices = &v[..len];
+
+        let mut calls = 0usize;
+        let emitted = for_each_cell_tile_mercator(center_merc, vertices, 23, |_, _| {
+            calls += 1;
+        });
+        assert_eq!(emitted, 0);
+        assert_eq!(calls, 0);
+
+        // At zoom 0 the same polar cell fits in the single root tile.
+        let emitted = for_each_cell_tile_mercator(center_merc, vertices, 0, |tx, ty| {
+            calls += 1;
+            assert_eq!((tx, ty), (0, 0));
+        });
+        assert_eq!(emitted, 1);
+        assert_eq!(calls, 1);
+    }
+
+    /// Ordinary cells still enumerate their full tile range and report it.
+    #[test]
+    fn test_normal_cell_tile_enumeration_count() {
+        use h3o::Resolution;
+        let cell = LatLng::new(37.8, -122.4)
+            .expect("valid")
+            .to_cell(Resolution::Five);
+        let center: LatLng = cell.into();
+        let center_merc = MercatorPoint::from_lat_lng(center.lat(), center.lng());
+        let (v, len) = cell_boundary_mercator(cell);
+        let vertices = &v[..len];
+
+        let (min_tx, max_tx, min_ty, max_ty) = cell_tile_range_mercator(center_merc, vertices, 9);
+        let expected = ((max_tx - min_tx + 1) * (max_ty - min_ty + 1)) as usize;
+
+        let mut seen = Vec::new();
+        let emitted =
+            for_each_cell_tile_mercator(center_merc, vertices, 9, |tx, ty| seen.push((tx, ty)));
+        assert_eq!(emitted, expected);
+        assert_eq!(seen.len(), expected);
+        for tx in min_tx..=max_tx {
+            for ty in min_ty..=max_ty {
+                assert!(seen.contains(&(tx, ty)));
+            }
         }
     }
 }

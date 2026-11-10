@@ -150,6 +150,16 @@ on both sides). The two pole cells are polar caps closed along the map's top or 
 at fine resolutions they lie wholly beyond Web Mercator's ±85.05° limit and flatten onto that
 edge. See [cell geometry](sql-api-reference.md#cell-geometry).
 
+A pole cell's vertices span every longitude, so at fine zooms its tile range is the whole
+width of the map (millions of tiles per cell). Tiling skips a cell at any zoom where it would
+cover more than 65,536 tiles (`pyramid::MAX_TILE_OPS_PER_CELL_ZOOM`); it stays present at
+coarser zooms. `pyramid::for_each_cell_tile_mercator` returns the number of tiles it emitted,
+`0` for a skipped cell. The continuous and categorical tilers record the skipped
+`(cell, zoom)` pairs, overview parents included, as `h3_cells_over_tile_cap` in the archive
+metadata (omitted when nothing was skipped). The Parquet transcoder and
+`ExternalFeatureExport` count them in `TilePyramidAccumulator::capped_cells` but do not
+write the count to metadata.
+
 ## PMTiles v3 Leaf Directory Architecture
 
 For massive multi-resolution archives containing tens of thousands or millions of vector tiles, `raster_h3` automatically constructs **PMTiles v3 Leaf Directories**:

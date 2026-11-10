@@ -86,14 +86,33 @@ fn write_validity<W: Write>(w: &mut W, validity: &Option<Vec<bool>>) -> Result<(
     }
 }
 
+/// Read exactly `len` bytes, growing the buffer only as data actually arrives.
+/// Declared lengths in an untrusted stream may far exceed the real payload, so
+/// this must not pre-allocate `len` bytes the way `vec![0u8; len]` would.
+fn read_exact_vec<R: Read>(r: &mut R, len: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut take = r.take(len as u64);
+    take.read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "IPC stream truncated").into(),
+        );
+    }
+    Ok(buf)
+}
+
+/// Bound for `Vec::with_capacity` on declared row counts: the read loop grows
+/// the vec to the real number of rows anyway, so the pre-allocation is only a
+/// fast path and must stay small enough to be harmless on a hostile stream.
+const MAX_ROW_PREALLOC: usize = 1 << 16;
+
 fn read_validity<R: Read>(r: &mut R) -> Result<Option<Vec<bool>>> {
     let has = read_u8(r)?;
     if has == 0 {
         return Ok(None);
     }
     let len = read_u32(r)? as usize;
-    let mut bytes = vec![0u8; len];
-    r.read_exact(&mut bytes)?;
+    let bytes = read_exact_vec(r, len)?;
     Ok(Some(bytes.into_iter().map(|b| b != 0).collect()))
 }
 
@@ -202,8 +221,7 @@ impl<R: Read> IpcStreamReader<R> {
         let mut fields = Vec::with_capacity(num_fields.min(1024));
         for _ in 0..num_fields {
             let name_len = read_u32(&mut reader)? as usize;
-            let mut name_bytes = vec![0u8; name_len];
-            reader.read_exact(&mut name_bytes)?;
+            let name_bytes = read_exact_vec(&mut reader, name_len)?;
             let name = String::from_utf8(name_bytes).map_err(|e| {
                 RasterH3Error::InvalidParameter(format!("Invalid UTF-8 field name in IPC: {e}"))
             })?;
@@ -243,14 +261,14 @@ impl<R: Read> IpcStreamReader<R> {
             let validity = read_validity(reader)?;
             let col = match field.data_type {
                 ArrowDataType::UInt64 => {
-                    let mut values = Vec::with_capacity(num_rows);
+                    let mut values = Vec::with_capacity(num_rows.min(MAX_ROW_PREALLOC));
                     for _ in 0..num_rows {
                         values.push(read_u64(reader)?);
                     }
                     ColumnArray::UInt64 { values, validity }
                 }
                 ArrowDataType::Int64 => {
-                    let mut values = Vec::with_capacity(num_rows);
+                    let mut values = Vec::with_capacity(num_rows.min(MAX_ROW_PREALLOC));
                     for _ in 0..num_rows {
                         let mut b = [0u8; 8];
                         reader.read_exact(&mut b)?;
@@ -259,12 +277,11 @@ impl<R: Read> IpcStreamReader<R> {
                     ColumnArray::Int64 { values, validity }
                 }
                 ArrowDataType::UInt8 => {
-                    let mut values = vec![0u8; num_rows];
-                    reader.read_exact(&mut values)?;
+                    let values = read_exact_vec(reader, num_rows)?;
                     ColumnArray::UInt8 { values, validity }
                 }
                 ArrowDataType::Float64 => {
-                    let mut values = Vec::with_capacity(num_rows);
+                    let mut values = Vec::with_capacity(num_rows.min(MAX_ROW_PREALLOC));
                     for _ in 0..num_rows {
                         let mut b = [0u8; 8];
                         reader.read_exact(&mut b)?;
@@ -273,27 +290,24 @@ impl<R: Read> IpcStreamReader<R> {
                     ColumnArray::Float64 { values, validity }
                 }
                 ArrowDataType::Boolean => {
-                    let mut bytes = vec![0u8; num_rows];
-                    reader.read_exact(&mut bytes)?;
+                    let bytes = read_exact_vec(reader, num_rows)?;
                     let values = bytes.into_iter().map(|b| b != 0).collect();
                     ColumnArray::Boolean { values, validity }
                 }
                 ArrowDataType::Utf8 => {
-                    let mut values = Vec::with_capacity(num_rows);
+                    let mut values = Vec::with_capacity(num_rows.min(MAX_ROW_PREALLOC));
                     for _ in 0..num_rows {
                         let slen = read_u32(reader)? as usize;
-                        let mut sb = vec![0u8; slen];
-                        reader.read_exact(&mut sb)?;
+                        let sb = read_exact_vec(reader, slen)?;
                         values.push(String::from_utf8_lossy(&sb).into_owned());
                     }
                     ColumnArray::Utf8 { values, validity }
                 }
                 ArrowDataType::Binary => {
-                    let mut values = Vec::with_capacity(num_rows);
+                    let mut values = Vec::with_capacity(num_rows.min(MAX_ROW_PREALLOC));
                     for _ in 0..num_rows {
                         let blen = read_u32(reader)? as usize;
-                        let mut bb = vec![0u8; blen];
-                        reader.read_exact(&mut bb)?;
+                        let bb = read_exact_vec(reader, blen)?;
                         values.push(bb);
                     }
                     ColumnArray::Binary { values, validity }
@@ -465,5 +479,60 @@ mod tests {
         assert!(reader.next().unwrap().is_err());
         assert!(reader.next().is_none());
         assert!(IpcStreamReader::new(&b"RH3IPC00"[..]).is_err());
+    }
+
+    /// Header bytes for a one-field stream; `dtype`/`name` pick the column.
+    fn ipc_header(dtype: u8, name: &str) -> Vec<u8> {
+        let mut buf = IPC_MAGIC.to_vec();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_fields
+        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(dtype);
+        buf.push(0); // not nullable
+        buf
+    }
+
+    /// A declared string length of `u32::MAX` used to demand a 4 GiB
+    /// allocation before any data was read; the reader must instead fail on
+    /// the real (truncated) payload.
+    #[test]
+    fn test_ipc_inflated_string_length_fails_without_huge_alloc() {
+        let mut buf = ipc_header(6, "s"); // Utf8
+        buf.push(1); // batch marker
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_rows
+        buf.push(0); // no validity
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // slen
+        buf.extend_from_slice(b"tiny"); // far fewer than u32::MAX payload bytes
+
+        let mut reader = IpcStreamReader::new(buf.as_slice()).unwrap();
+        assert!(reader.next().unwrap().is_err());
+        assert!(reader.next().is_none());
+    }
+
+    /// A declared row count of `u32::MAX` used to pre-allocate a ~34 GiB value
+    /// vector; the reader must instead fail on the first missing row.
+    #[test]
+    fn test_ipc_inflated_row_count_fails_without_huge_alloc() {
+        let mut buf = ipc_header(1, "v"); // UInt64
+        buf.push(1); // batch marker
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // num_rows
+        buf.push(0); // no validity
+        buf.extend_from_slice(&42u64.to_le_bytes()); // one real row, not billions
+
+        let mut reader = IpcStreamReader::new(buf.as_slice()).unwrap();
+        assert!(reader.next().unwrap().is_err());
+        assert!(reader.next().is_none());
+    }
+
+    /// An inflated field-name length must fail on truncation, not allocate
+    /// gigabytes before noticing the stream ended.
+    #[test]
+    fn test_ipc_inflated_field_name_fails_without_huge_alloc() {
+        let mut buf = IPC_MAGIC.to_vec();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_fields
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // name_len
+        buf.extend_from_slice(b"s");
+
+        assert!(IpcStreamReader::new(buf.as_slice()).is_err());
     }
 }

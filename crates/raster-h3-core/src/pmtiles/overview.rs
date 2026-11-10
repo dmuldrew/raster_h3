@@ -131,6 +131,10 @@ impl<A: SpillAccumulator> Overview<A> {
         Ok(())
     }
 
+    /// Write the overview tiles. Returns the `(cell, zoom)` pairs skipped
+    /// because the cell's tile range exceeded
+    /// [`MAX_TILE_OPS_PER_CELL_ZOOM`](super::pyramid::MAX_TILE_OPS_PER_CELL_ZOOM),
+    /// counted like the tilers' direct-resolution skips.
     pub fn write(
         self,
         zooms: &[u8],
@@ -138,8 +142,9 @@ impl<A: SpillAccumulator> Overview<A> {
         writer: &mut PmtilesWriter,
         bounds: &mut Wgs84BoundsAccumulator,
         properties: impl Fn(u64, u8, &A) -> FeatureProperties,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
         let mut tiles = BufferedMerge::new(BUFFER_BYTES);
+        let mut capped = 0;
         self.parents.finish(|id, acc| {
             let cell = CellIndex::try_from(id).expect("validated parent");
             let center: LatLng = cell.into();
@@ -150,15 +155,18 @@ impl<A: SpillAccumulator> Overview<A> {
                 if h3_res_for_zoom(z) != u8::from(cell.resolution()) {
                     continue;
                 }
-                emitted = true;
                 let mut result = Ok(());
-                for_each_cell_tile_mercator(center, &vertices[..len], z, |x, y| {
+                let count = for_each_cell_tile_mercator(center, &vertices[..len], z, |x, y| {
                     if result.is_ok() {
                         result =
                             tiles.push(zxy_to_tile_id(z, x, y), TileCells(vec![(id, acc.clone())]));
                     }
                 });
                 result?;
+                if count == 0 {
+                    capped += 1;
+                }
+                emitted |= count > 0;
             }
             if emitted {
                 bounds.record_cell(cell);
@@ -181,7 +189,8 @@ impl<A: SpillAccumulator> Overview<A> {
                 );
             }
             writer.add_tile(z, x, y, &layer.encode())
-        })
+        })?;
+        Ok(capped)
     }
 }
 
