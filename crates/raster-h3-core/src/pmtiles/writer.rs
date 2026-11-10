@@ -328,6 +328,16 @@ impl PmtilesWriter {
         // Sort entries by canonical Hilbert Tile ID
         self.entries.sort_by_key(|e| e.tile_id);
 
+        for pair in self.entries.windows(2) {
+            if pair[0].tile_id == pair[1].tile_id {
+                let (z, x, y) = tile_id_to_zxy(pair[0].tile_id);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("tile {z}/{x}/{y} was written more than once"),
+                ));
+            }
+        }
+
         let mut directory_entries: Vec<Entry> = Vec::with_capacity(self.entries.len());
         let mut final_tile_offset = 0u64;
 
