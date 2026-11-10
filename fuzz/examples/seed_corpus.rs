@@ -6,7 +6,15 @@ use std::path::Path;
 
 fn main() -> std::io::Result<()> {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
-    for target in ["wkb", "geotiff", "predictor"] {
+    for target in [
+        "wkb",
+        "geotiff",
+        "predictor",
+        "ipc",
+        "arrow_import",
+        "remap",
+        "content_range",
+    ] {
         fs::create_dir_all(corpus.join(target))?;
     }
     // Little-endian Polygon with one closed ring; include big-endian and EWKB SRID variants.
@@ -45,5 +53,46 @@ fn main() -> std::io::Result<()> {
     helpers::TestGeoTiffBuilder::new(8, 8)
         .write_fn(corpus.join("geotiff/integer"), |c, r| (c + r) as u16)?;
     fs::write(corpus.join("predictor/basic"), [0u8; 69])?;
+
+    // A minimal valid IPC stream: one Utf8 column, two rows.
+    {
+        use raster_h3_core::columnar::ipc::write_ipc_stream;
+        use raster_h3_core::columnar::{
+            ArrowDataType, ColumnArray, ColumnField, ColumnSchema, RecordBatch,
+        };
+        use std::sync::Arc;
+        let schema = ColumnSchema::new(vec![ColumnField::new("s", ArrowDataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![ColumnArray::Utf8 {
+                values: vec!["a".into(), "bb".into()],
+                validity: None,
+            }],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        write_ipc_stream(&mut buf, &schema, vec![Ok(batch)]).unwrap();
+        fs::write(corpus.join("ipc/valid-stream"), buf)?;
+    }
+
+    // N=4: five little-endian i32 offsets [0,1,2,3,4] plus parent offset 0, length 4.
+    {
+        let mut buf = Vec::new();
+        for v in 0i32..=4 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&[0u8, 4]);
+        fs::write(corpus.join("arrow_import/monotonic-offsets"), buf)?;
+    }
+
+    for (name, spec) in [
+        ("pairs", "1: 10, 2: 20"),
+        ("ranges", "{101..105: 1, 121..=124: 2, 141-143: 3}"),
+        ("arrow", "[10, 20, 30] => 1; 40 -> 2"),
+    ] {
+        fs::write(corpus.join("remap").join(name), spec)?;
+    }
+
+    fs::write(corpus.join("content_range/basic"), "bytes 0-9/100")?;
     Ok(())
 }
