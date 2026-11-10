@@ -177,7 +177,7 @@ clamped to 1–16,384 pixels. The per-sample cost comes from the kernel's
 
 | Kernel | Bytes per sample and resolution |
 | :--- | :--- |
-| Continuous, no quantiles | `inline_worker_bytes_per_sample::<H3Accumulator>()` (292 B) |
+| Continuous, no quantiles | `inline_worker_bytes_per_sample::<H3Accumulator>()` (308 B) |
 | Continuous with quantiles, categorical | 1 KiB (covers sketch and class-count state) |
 | Custom kernels (default) | `max(1 KiB, 8 × size_of::<Accumulator>())` |
 

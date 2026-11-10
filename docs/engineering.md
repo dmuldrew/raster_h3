@@ -28,6 +28,26 @@ rotated grids and curved cell edges without assuming scanline order alone is
 sufficient. Unknown Proj4 bounds and Albers chunks that may contain the cone apex
 disable early eviction until the remaining suffix is certifiable or EOF.
 
+Latitude is the right order for rows that follow parallels (north-up WGS84 and Web
+Mercator), but Albers rows curve across them: a CONUS row in EPSG:5070 lies about 3°
+further south at its ends than at the central meridian, so under a latitude rule cells
+near the east and west edges waited ~10,000 rows, overflowed the map budget and spilled.
+When every tile of a mosaic uses the same Albers projection, and lies inside the
+projection's valid wedge (polar angle about the cone apex under |n| × 180°, beyond which
+the inverse returns longitudes more than 180° from the central meridian and the forward
+projection would put those cells elsewhere), cells are therefore keyed
+by **raster row** instead (`multi_horizon::eviction_space`): a chunk's bound is its
+first row in the first tile's grid, and a cell's key is a certified upper bound of the
+rows its points project to. That bound is the projected centre's row plus the cell's
+bounding-cap radius × the ellipsoid's largest radius of curvature × the projection's
+largest principal scale on the cap's latitudes (Albers is equal-area, so
+`max(k, 1/k)`) × the row gradient, plus a margin of one row and one metre. Cells within
+5° of a pole or near the projection's cut keep the never-evict-early behaviour. Tilers
+and compaction still need a latitude bound, so each horizon map also counts held cells
+by an upper bound of their southern latitude, and the published horizon covers both
+the remaining chunks and the held cells. Other CRSs and mixed-CRS mosaics keep the
+latitude rule.
+
 The aggregation budget defaults to 64 MiB. Disk spilling limits active
 accumulators. Pending compaction groups are accounted in bytes and can be
 limited with the opt-in `compaction_budget_bytes`: past it, the groups nearest
