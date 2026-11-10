@@ -165,6 +165,7 @@ write the count to metadata.
 For massive multi-resolution archives containing tens of thousands or millions of vector tiles, `raster_h3` automatically constructs **PMTiles v3 Leaf Directories**:
 * **16 KB Root Fetch Budget**: The PMTiles v3 specification specifies that web clients (e.g. `pmtiles.js`) fetch only the first 16 KB (bytes 0 to 16383) during initialization to retrieve the archive header and root directory index.
 * **4,096-Entry Leaf Chunks**: When tile counts exceed a single directory block, directory entries are partitioned into compressed leaf directory blocks (~4 to 8 KB each). The root directory retains lightweight pointer entries (`run_length = 0`, pointing to leaf byte offsets and lengths).
+* **Root Always Fits**: `pmtiles::writer::build_directories(entries, max_root_bytes)` chooses the layout. If the compressed root of leaf pointers would exceed 16,257 bytes (about 30 million tiles), the leaf size grows in 20% steps until it fits, as go-pmtiles does; an archive whose root cannot fit fails instead of writing an out-of-spec root.
 * **Instant Scalability**: Compressed root directories remain under 150 bytes regardless of dataset size (e.g., 60,000+ tiles compressed from 87 KB down to 122 bytes), ensuring instantaneous startup and sub-millisecond viewport tile lookups.
 
 ## Embedded Multi-Resolution Statistical Metadata (`h3_resolution_stats`)

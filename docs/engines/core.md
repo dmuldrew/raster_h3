@@ -305,11 +305,14 @@ reading past the limit; a larger announced `Content-Length` fails without readin
 Raise the limit with `RASTER_H3_MAX_FULL_BODY_BYTES` (bytes; invalid or zero values
 keep the default) or `HttpTransport::with_max_full_body_bytes`.
 
-Transient failures are retried with exponential backoff, up to four retries: request
-errors, and also a connection error while reading a response body or a body shorter
-than announced (`Content-Range` or `Content-Length`). Header, ETag and over-length
-failures are not retried. A truncated chunked response without `Content-Length`
-cannot be detected and is accepted.
+Transient failures are retried up to four times, each after a random delay between
+half and the full exponential backoff, so concurrent workers do not retry in
+lockstep; a numeric `Retry-After` header of up to 30 s lengthens the delay (the
+HTTP-date form is ignored). Retried failures include request errors, a connection
+error while reading a response body or a body shorter than announced
+(`Content-Range` or `Content-Length`). Header, ETag and over-length failures are not
+retried. A truncated chunked response without `Content-Length` cannot be detected
+and is accepted.
 
 ### Custom byte sources
 
@@ -502,6 +505,13 @@ The core and DuckDB long readers compute entropy only when `shannon_entropy` or
 one sorted sweep of a sketch's bins, returning exactly what `quantile(q, min, max)`
 returns for each target in input order. Targets may be unsorted or repeated; NaN
 targets yield NaN, `q <= 0` yields `min` and `q >= 1` yields `max`.
+
+Each nonzero normal value goes to a logarithmic bucket, which keeps the sketch's 1%
+relative error at any magnitude, including values far below 1. Only zero and
+subnormal magnitudes (below `quantiles::ZERO_THRESHOLD`, which is `f64::MIN_POSITIVE`)
+are counted in the exact zero bucket. Data spanning many orders of magnitude keeps
+about 115 buckets per decade per sign. When `min == max` exactly, every quantile is
+`min`. NaN, infinite and non-positive weights are ignored by `update`.
 
 `raster_h3_core::aggregator::multi_horizon::QuantilePlan` builds on it for
 `QuantileTarget` lists: `QuantilePlan::new(&targets)` deduplicates the probabilities
