@@ -1,7 +1,9 @@
 //! High-Performance Streaming Non-Parametric Quantile Sketch (DDSketch)
 //!
-//! Provides fast, mergeable, constant-memory estimation of arbitrary percentiles
+//! Provides fast, mergeable estimation of arbitrary percentiles
 //! (p01, p05, p10, p25, p50, p75, p90, p95, p99, IQR) with bounded relative error (alpha <= 0.01).
+//! Memory grows with the number of distinct logarithmic buckets observed
+//! (about 115 per decade of magnitude per sign).
 //!
 //! Fully commutative and associative across multi-core Rayon threads and multi-tile chunks.
 
@@ -10,8 +12,9 @@ use rustc_hash::FxHashMap;
 /// Bounded relative error alpha (1% relative error guarantee)
 pub const QUANTILE_ALPHA: f64 = 0.01;
 
-/// Threshold below which float values are counted in the exact zero bucket
-pub const ZERO_THRESHOLD: f64 = 1e-7;
+/// Magnitudes below this (zero and subnormals) are counted in the exact zero
+/// bucket; `key_for_positive` reads the IEEE exponent and needs a normal float.
+pub const ZERO_THRESHOLD: f64 = f64::MIN_POSITIVE;
 
 /// Logarithmic binning constant: gamma = (1 + alpha) / (1 - alpha)
 const GAMMA: f64 = (1.0 + QUANTILE_ALPHA) / (1.0 - QUANTILE_ALPHA);
@@ -125,7 +128,7 @@ impl QuantileSketch {
 
         self.total_count += weight;
 
-        if val.abs() <= ZERO_THRESHOLD {
+        if val.abs() < ZERO_THRESHOLD {
             self.zero_count += weight;
         } else if val > 0.0 {
             let key = Self::key_for_positive(val);
@@ -172,7 +175,7 @@ impl QuantileSketch {
         if q >= 1.0 {
             return max;
         }
-        if (min - max).abs() < 1e-12 {
+        if min == max {
             return min;
         }
 
@@ -243,7 +246,7 @@ impl QuantileSketch {
         if self.total_count <= 0.0 {
             return results;
         }
-        let degenerate = (min - max).abs() < 1e-12;
+        let degenerate = min == max;
 
         // Targets that need the bin sweep, as (rank, output index).
         let mut pending: Vec<(f64, usize)> = Vec::with_capacity(targets.len());
@@ -382,5 +385,67 @@ mod tests {
         }
         odds.merge(&evens);
         assert_eq!(odds, single);
+    }
+
+    #[test]
+    fn small_magnitudes_keep_relative_accuracy() {
+        for scale in [1e-8, 1e-30, 1e-300] {
+            let mut sketch = QuantileSketch::new();
+            for k in 1..=101 {
+                sketch.update(scale * k as f64, 1.0);
+            }
+            let p50 = sketch.quantile(0.5, scale, scale * 101.0);
+            let expected = scale * 51.0;
+            assert!(
+                (p50 - expected).abs() <= 0.02 * expected,
+                "scale {scale}: p50 {p50} not within 2% of {expected}"
+            );
+        }
+
+        let scale = 1e-8;
+        let mut sketch = QuantileSketch::new();
+        for k in 1..=101 {
+            sketch.update(-scale * k as f64, 1.0);
+        }
+        let p50 = sketch.quantile(0.5, -scale * 101.0, -scale);
+        let expected = -scale * 51.0;
+        assert!(
+            (p50 - expected).abs() <= 0.02 * -expected,
+            "negative scale: p50 {p50} not within 2% of {expected}"
+        );
+    }
+
+    #[test]
+    fn zero_and_subnormals_use_the_zero_bucket() {
+        let mut sketch = QuantileSketch::new();
+        sketch.update(0.0, 1.0);
+        sketch.update(-0.0, 1.0);
+        sketch.update(f64::MIN_POSITIVE / 2.0, 1.0);
+        assert_eq!(sketch.zero_count, 3.0);
+        assert!(sketch.pos_bins.is_empty());
+        assert!(sketch.neg_bins.is_empty());
+        sketch.update(f64::MIN_POSITIVE, 1.0);
+        assert_eq!(sketch.pos_bins.len(), 1);
+    }
+
+    #[test]
+    fn bucket_keys_match_ln_across_the_normal_range() {
+        for x in [
+            f64::MIN_POSITIVE,
+            1e-300,
+            1e-100,
+            1e-7,
+            1.0,
+            12345.678,
+            1e100,
+            1e300,
+        ] {
+            let reference = (x.ln() / GAMMA.ln()).floor() as i32;
+            let key = QuantileSketch::key_for_positive(x);
+            assert!(
+                (key - reference).abs() <= 1,
+                "key_for_positive({x}) = {key}, ln reference {reference}"
+            );
+        }
     }
 }
