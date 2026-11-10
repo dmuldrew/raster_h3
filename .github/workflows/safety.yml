@@ -63,7 +63,8 @@ jobs:
         with:
           key: miri
       - run: cargo miri setup
-      - run: cargo miri test --locked --target x86_64-unknown-linux-gnu -p raster-h3-core --lib -- columnar:: aggregator::categorical:: raster::predictor::
+      - run: |
+          cargo miri test --locked --target x86_64-unknown-linux-gnu -p raster-h3-core --lib -- columnar:: aggregator::categorical:: raster::predictor::
 
   tsan:
     name: ThreadSanitizer (prefetch and aggregation)
@@ -81,5 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: tsan
-      - run: cargo test -Zbuild-std --locked --target x86_64-unknown-linux-gnu -p raster-h3-core --lib -- raster::prefetch:: raster::remote_prefetch:: aggregator::multi_horizon::controller::
-      - run: cargo test -Zbuild-std --locked --target x86_64-unknown-linux-gnu -p raster-h3-core --test it -- threading:: chunks_and_prefetch:: streaming_failures::
+      - run: |
+          cargo test -Zbuild-std --locked --target x86_64-unknown-linux-gnu -p raster-h3-core --lib -- raster::prefetch:: raster::remote_prefetch:: aggregator::multi_horizon::controller::
+      - run: |
+          cargo test -Zbuild-std --locked --target x86_64-unknown-linux-gnu -p raster-h3-core --test it -- threading:: chunks_and_prefetch:: streaming_failures::
