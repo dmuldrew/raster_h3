@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PmtilesWriter::finish_into` rejects duplicate tile IDs instead of writing both entries into the directory, where readers would see only one and silently lose the other's features.
 - `QuantileSketch::update` ignores NaN and infinite weights; they previously slipped through the `weight <= 0.0` guard and turned `total_count` into NaN or infinity.
 - Remote range reads retry a response body that fails mid-read or arrives shorter than announced (an io error while reading, or fewer bytes than the requested range or the stated `Content-Length`), using the same backoff as request-level retries instead of failing the whole scan.
+- `QuantileSketch` no longer counts every value below 1e-7 in magnitude as zero, so quantiles of small values keep their documented 1% relative error instead of collapsing to the minimum. Streams with many such values now keep more sketch buckets, so their quantile state is larger; only zero and subnormal magnitudes use the exact zero bucket.
+- `PmtilesWriter` leaf directories now grow (through `build_directories`) until the root directory fits the PMTiles v3 limit of 16,384 bytes minus the 127-byte header; the root was not checked once leaf directories were in use, so an archive with tens of millions of tiles could exceed it.
+- Remote retry delays now use random jitter between half and the full exponential backoff, so concurrent workers no longer retry in lockstep, and a numeric `Retry-After` response header (up to 30 s) is honoured when it is longer than the backoff.
 
 ## [0.7.0] - 2026-11-06
 
