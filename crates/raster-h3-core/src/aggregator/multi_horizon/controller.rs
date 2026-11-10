@@ -645,7 +645,11 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let mut maps = std::mem::take(&mut self.worker_maps);
         let mut south_keys = std::mem::take(&mut self.worker_south_keys);
         south_keys.resize_with(maps.len(), Vec::new);
-        let result = (|| {
+        // A panic inside the wave unwinds past the restore assignments below,
+        // leaving worker_maps empty; every subsequent wave would then zip jobs
+        // against zero maps and silently drop every sample. Catch, restore,
+        // then resume the unwind so state survives a caught panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut index = 0;
             let (mut row, mut col) = (0usize, 0usize);
             let mut jobs = Vec::with_capacity(self.worker_tasks);
@@ -871,10 +875,13 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                 }
             }
             Ok(())
-        })();
+        }));
         self.worker_maps = maps;
         self.worker_south_keys = south_keys;
-        result
+        match result {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 
     /// Advance until a bounded batch of completed records is available.
@@ -1268,5 +1275,73 @@ impl<A: SpillAccumulator> FinalCells<A> {
             Self::Memory(iter) => Ok(iter.next()),
             Self::Disk(reader) => reader.next_record(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregator::multi_horizon::continuous_streamer::MultiScanHorizonStreamer;
+    use crate::raster::prefetch::MosaicPrefetchItem;
+    use tiff::encoder::{colortype, TiffEncoder};
+    use tiff::tags::Tag;
+
+    /// Minimal georeferenced Gray8 GeoTIFF — enough for `GeoTiffStreamReader::open`.
+    fn write_gray_geotiff(path: &std::path::Path) {
+        const GEOKEYS: [u16; 12] = [1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326];
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+        let mut image = encoder.new_image::<colortype::Gray8>(8, 8).unwrap();
+        image
+            .encoder()
+            .write_tag(
+                Tag::ModelTiepointTag,
+                &[0.0, 0.0, 0.0, -122.0, 38.0, 0.0][..],
+            )
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[0.001, 0.001, 0.0][..])
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(34735), &GEOKEYS[..])
+            .unwrap();
+        image.write_data(&[1u8; 64]).unwrap();
+    }
+
+    /// A panic inside a wave used to leave `worker_maps` empty; every following
+    /// wave then zipped jobs against zero maps and silently dropped all
+    /// samples. `process_batch` now restores its state before resuming the
+    /// unwind, so a caller that catches the panic finds the maps intact.
+    #[test]
+    fn worker_panic_preserves_worker_maps() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_gray_geotiff(tmp.path());
+        let reader = GeoTiffStreamReader::open(tmp.path()).unwrap();
+        let config = MultiResolutionConfig::single(5);
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        let maps_before = streamer.worker_maps.len();
+        assert!(maps_before > 0);
+
+        // A prefetch item whose tile index is out of range panics on
+        // `mosaic.tiles[tile_idx]` inside the wave.
+        let mut items: Vec<MosaicPrefetchItem> = vec![Ok((
+            usize::MAX,
+            0,
+            RasterChunk {
+                col_offset: 0,
+                row_offset: 0,
+                width: 4,
+                height: 4,
+            },
+            DecodingResult::U8(vec![1; 16]),
+            false,
+        ))];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = streamer.process_batch(&mut items);
+        }));
+        assert!(panic.is_err());
+        assert_eq!(streamer.worker_maps.len(), maps_before);
     }
 }

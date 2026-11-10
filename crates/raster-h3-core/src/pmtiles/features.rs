@@ -224,6 +224,9 @@ pub struct TilePyramidAccumulator {
     pub safety_margin: f64,
     pub layer_name: Cow<'static, str>,
     pub property_filter: Option<PropertyFilter>,
+    /// Features skipped because their per-zoom tile range exceeded
+    /// [`crate::pmtiles::pyramid::MAX_TILE_OPS_PER_CELL_ZOOM`].
+    pub capped_cells: usize,
 }
 
 impl TilePyramidAccumulator {
@@ -240,6 +243,7 @@ impl TilePyramidAccumulator {
             safety_margin,
             layer_name: layer_name.into(),
             property_filter: None,
+            capped_cells: 0,
         }
     }
 
@@ -295,12 +299,15 @@ impl TilePyramidAccumulator {
         // Delay one tile so the final insertion can take ownership of properties.
         // This keeps the common single-tile path allocation- and clone-free.
         let mut last_tile = None;
-        for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
+        if for_each_cell_tile_mercator(center_merc, vertices_merc, zoom, |tx, ty| {
             if let Some((px, py)) = last_tile.replace((tx, ty)) {
                 self.get_or_create_layer((zoom, px, py))
                     .add_hexagon_mercator(h3_u64, vertices_merc, zoom, px, py, properties.clone());
             }
-        });
+        }) == 0
+        {
+            self.capped_cells += 1;
+        }
         if let Some((tx, ty)) = last_tile {
             self.get_or_create_layer((zoom, tx, ty))
                 .add_hexagon_mercator(h3_u64, vertices_merc, zoom, tx, ty, properties);

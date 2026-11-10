@@ -150,14 +150,13 @@ impl<A: SpillAccumulator> Overview<A> {
                 if h3_res_for_zoom(z) != u8::from(cell.resolution()) {
                     continue;
                 }
-                emitted = true;
                 let mut result = Ok(());
-                for_each_cell_tile_mercator(center, &vertices[..len], z, |x, y| {
+                emitted |= for_each_cell_tile_mercator(center, &vertices[..len], z, |x, y| {
                     if result.is_ok() {
                         result =
                             tiles.push(zxy_to_tile_id(z, x, y), TileCells(vec![(id, acc.clone())]));
                     }
-                });
+                }) > 0;
                 result?;
             }
             if emitted {

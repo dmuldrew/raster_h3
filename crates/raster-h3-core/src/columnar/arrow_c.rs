@@ -394,24 +394,37 @@ unsafe fn read_var_len<'a>(
     data_ptr: *const u8,
     start: usize,
     len: usize,
-) -> Vec<&'a [u8]> {
+) -> Result<Vec<&'a [u8]>> {
     if len == 0 || off_ptr.is_null() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // SAFETY: per the caller contract the offsets buffer is aligned and holds at
     // least `start + len + 1` entries (Arrow stores `length + 1` offsets).
     let offsets = unsafe { std::slice::from_raw_parts(off_ptr.add(start), len + 1) };
-    let total_bytes = offsets[len].max(0) as usize;
-    let bytes = if total_bytes == 0 || data_ptr.is_null() {
+    // A foreign producer can hand us offsets that are negative or not
+    // monotonically non-decreasing; either would panic (or read out of order)
+    // in the per-row slices below, so validate instead of trusting the layout.
+    if offsets[0] < 0 || offsets[..len].iter().zip(&offsets[1..]).any(|(a, b)| a > b) {
+        return Err(RasterH3Error::InvalidParameter(
+            "ArrowArray variable-length offsets are not monotonically non-decreasing".into(),
+        ));
+    }
+    let total_bytes = offsets[len] as usize;
+    if total_bytes > 0 && data_ptr.is_null() {
+        return Err(RasterH3Error::InvalidParameter(
+            "ArrowArray variable-length column has data offsets but a null data buffer".into(),
+        ));
+    }
+    let bytes = if total_bytes == 0 {
         &[][..]
     } else {
         // SAFETY: `offsets[len]` is the end of the last visible value, which the
         // caller guarantees is within the data buffer; it lives for `'a`.
         unsafe { std::slice::from_raw_parts(data_ptr, total_bytes) }
     };
-    (0..len)
-        .map(|r| &bytes[offsets[r].max(0) as usize..offsets[r + 1].max(0) as usize])
-        .collect()
+    Ok((0..len)
+        .map(|r| &bytes[offsets[r] as usize..offsets[r + 1] as usize])
+        .collect())
 }
 
 impl ArrowArray {
@@ -667,7 +680,7 @@ impl ArrowArray {
                             *child.buffers.add(2) as *const u8,
                             start,
                             len,
-                        )
+                        )?
                         .into_iter()
                         .map(|b| std::str::from_utf8(b).unwrap_or_default().to_owned())
                         .collect();
@@ -679,7 +692,7 @@ impl ArrowArray {
                             *child.buffers.add(2) as *const u8,
                             start,
                             len,
-                        )
+                        )?
                         .into_iter()
                         .map(<[u8]>::to_vec)
                         .collect();
@@ -1110,5 +1123,67 @@ mod tests {
         // SAFETY: `arr` was built from `batch` with this `schema`.
         let got = unsafe { arr.to_record_batch(Arc::clone(&schema)).unwrap() };
         assert_eq!(got, batch);
+    }
+
+    /// Point child `i`'s buffer `slot` at test-owned storage, forging a
+    /// malformed foreign buffer.
+    ///
+    /// # Safety
+    /// `arr` must own at least `i + 1` children and child `i` must have at
+    /// least `slot + 1` buffer-pointer slots. The pointed-to data must stay
+    /// valid until `arr.to_record_batch` returns.
+    unsafe fn set_child_buffer(arr: &mut ArrowArray, i: usize, slot: usize, p: *const c_void) {
+        // SAFETY: the caller guarantees `arr` owns at least `i + 1` children.
+        let child = unsafe { &mut **arr.children.add(i) };
+        // SAFETY: the caller guarantees child `i` has at least `slot + 1`
+        // buffer-pointer slots.
+        unsafe { *child.buffers.add(slot) = p };
+    }
+
+    /// Non-monotonic Utf8 offsets used to panic on `bytes[hi..lo]`; they must
+    /// instead be rejected at the FFI boundary.
+    #[test]
+    fn test_import_rejects_non_monotonic_var_len_offsets() {
+        let (schema, batch) = sliceable_batch();
+        let mut arr = ArrowArray::from_record_batch(batch);
+        let bad_offsets = [0i32, 5, 2, 9];
+        // SAFETY: child 1 is the Utf8 column (3 buffer slots); `bad_offsets`
+        // provides the `length + 1` offsets the layout requires.
+        unsafe { set_child_buffer(&mut arr, 1, 1, bad_offsets.as_ptr().cast()) };
+        // SAFETY: `arr` matches `schema` apart from the deliberately forged
+        // offsets buffer under test.
+        let err = unsafe { arr.to_record_batch(Arc::clone(&schema)) }.unwrap_err();
+        assert!(matches!(err, RasterH3Error::InvalidParameter(_)));
+    }
+
+    /// A negative first offset used to be silently clamped to 0 by `.max(0)`,
+    /// mis-slicing foreign data; it must instead be rejected.
+    #[test]
+    fn test_import_rejects_negative_var_len_offsets() {
+        let (schema, batch) = sliceable_batch();
+        let mut arr = ArrowArray::from_record_batch(batch);
+        let bad_offsets = [-1i32, 0, 3, 6];
+        // SAFETY: child 1 is the Utf8 column (3 buffer slots); `bad_offsets`
+        // provides the `length + 1` offsets the layout requires.
+        unsafe { set_child_buffer(&mut arr, 1, 1, bad_offsets.as_ptr().cast()) };
+        // SAFETY: `arr` matches `schema` apart from the deliberately forged
+        // offsets buffer under test.
+        let err = unsafe { arr.to_record_batch(Arc::clone(&schema)) }.unwrap_err();
+        assert!(matches!(err, RasterH3Error::InvalidParameter(_)));
+    }
+
+    /// Offsets that reach into a null data buffer used to panic indexing an
+    /// empty slice; they must instead be rejected.
+    #[test]
+    fn test_import_rejects_var_len_data_past_null_buffer() {
+        let (schema, batch) = sliceable_batch();
+        let mut arr = ArrowArray::from_record_batch(batch);
+        // SAFETY: child 1 is the Utf8 column (3 buffer slots). The factory
+        // offsets still end at 6 data bytes, but the data buffer is now null.
+        unsafe { set_child_buffer(&mut arr, 1, 2, ptr::null()) };
+        // SAFETY: `arr` matches `schema` apart from the deliberately forged
+        // data buffer under test.
+        let err = unsafe { arr.to_record_batch(Arc::clone(&schema)) }.unwrap_err();
+        assert!(matches!(err, RasterH3Error::InvalidParameter(_)));
     }
 }

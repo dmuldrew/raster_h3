@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PmtilesWriter` leaf directories now grow (through `build_directories`) until the root directory fits the PMTiles v3 limit of 16,384 bytes minus the 127-byte header; the root was not checked once leaf directories were in use, so an archive with tens of millions of tiles could exceed it.
 - Remote retry delays now use random jitter between half and the full exponential backoff, so concurrent workers no longer retry in lockstep, and a numeric `Retry-After` response header (up to 30 s) is honoured when it is longer than the backoff.
 
+### Fixed
+
+- Arrow C Data import (`ArrowArray::to_record_batch`) rejects Utf8/Binary columns whose offsets are negative or decreasing, or that reference data through a null data buffer, with `InvalidParameter`. Such input used to panic or slice the wrong bytes.
+- `IpcStreamReader` no longer allocates from declared lengths. A row count, string length, validity length or field-name length larger than the bytes that follow now fails as a truncated stream instead of requesting up to gigabytes first.
+- A panic inside an aggregation wave no longer leaves `MultiHorizonStreamer` without its worker maps. They are restored before the panic continues, so a caller that catches it cannot go on to drop every later sample silently.
+- PMTiles tiling skips a cell at any zoom where it would cover more than 65,536 tiles (`MAX_TILE_OPS_PER_CELL_ZOOM`), which only happens for cells containing a pole at fine zooms, where the old enumeration produced millions of features per cell. `for_each_cell_tile_mercator` now returns the number of tiles emitted, and the continuous and categorical tilers report skipped cells as `h3_cells_over_tile_cap` in the archive metadata.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added
