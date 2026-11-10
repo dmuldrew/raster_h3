@@ -119,7 +119,7 @@ impl QuantileSketch {
     /// Update the sketch with a new value and weight
     #[inline]
     pub fn update(&mut self, val: f64, weight: f64) {
-        if weight <= 0.0 || !val.is_finite() {
+        if !(weight.is_finite() && weight > 0.0) || !val.is_finite() {
             return;
         }
 

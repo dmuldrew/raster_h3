@@ -298,6 +298,19 @@ and range checks, but those checks **cannot guarantee snapshot consistency**. Us
 immutable/versioned URL for those sources. Custom `RemoteTransport` implementations
 are responsible for their own snapshot guarantees. See [HTTP conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.1).
 
+A server that ignores `Range` returns the whole file, which is held in memory. The
+built-in transport accepts such a body only up to 1 GiB
+(`http_range::DEFAULT_MAX_FULL_BODY_BYTES`) and fails at open beyond that, before
+reading past the limit; a larger announced `Content-Length` fails without reading.
+Raise the limit with `RASTER_H3_MAX_FULL_BODY_BYTES` (bytes; invalid or zero values
+keep the default) or `HttpTransport::with_max_full_body_bytes`.
+
+Transient failures are retried with exponential backoff, up to four retries: request
+errors, and also a connection error while reading a response body or a body shorter
+than announced (`Content-Range` or `Content-Length`). Header, ETag and over-length
+failures are not retried. A truncated chunked response without `Content-Length`
+cannot be detected and is accepted.
+
 ### Custom byte sources
 
 By default local paths are memory-mapped and remote URLs use the built-in HTTP/S3
