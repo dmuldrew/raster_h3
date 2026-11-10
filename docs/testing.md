@@ -133,7 +133,7 @@ See [Super-Sampling](super-sampling.md) for the patterns themselves.
 | [`core/categorical_long_streaming.rs`](../crates/raster-h3-core/tests/it/categorical_long_streaming.rs) (3) | Long-format output on a 300-class raster: batch sizes 1/7/32/4096 equal rows built from the streamer, batches are full except the last, cells split across batches stay contiguous and sorted, limits stop mid-cell, and projecting without entropy keeps values. |
 | [`core/categorical_remap.rs`](../crates/raster-h3-core/tests/it/categorical_remap.rs) (9) | Exact, range, list and wildcard remap syntax; sparse and negative categories; invalid syntax; malformed specs (empty tokens, multibyte first characters) error instead of panicking; 10 000-deep nested brackets; nested-bracket and hyphen specs stream like their plain equivalents; remapping inside single- and multi-resolution categorical streamers. |
 | [`core/accumulators.rs`](../crates/raster-h3-core/tests/it/accumulators.rs) | Accumulator operations and merges, tied majorities, homogeneous rasters, RLE with interspersed NoData, high-cardinality Shannon entropy, the 16-slot inline array spilling to a heap map, SIMD uniformity across types (`test_categorical_*`). |
-| Unit: `aggregator/categorical.rs` (4), `aggregator/remap.rs` (4) | Histogram and remapper internals. |
+| Unit: `aggregator/categorical.rs` (5), `aggregator/remap.rs` (4) | Histogram and remapper internals; NaN, infinite and non-positive weights are ignored in inline and heap storage and across merges. |
 
 ## 7. Multi-resolution & compaction
 
