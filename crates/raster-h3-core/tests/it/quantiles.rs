@@ -417,3 +417,33 @@ fn test_quantile_sketch_merge_matches_single_stream() {
     odds.merge(&evens);
     assert_eq!(odds, single);
 }
+
+/// Values between the smallest normal float and 1e-7 in magnitude used to
+/// share the zero bucket, so their quantiles collapsed to the minimum.
+#[test]
+fn test_quantile_sketch_small_magnitudes_keep_relative_accuracy() {
+    for scale in [1e-8, 1e-30, 1e-300] {
+        let mut sketch = QuantileSketch::new();
+        for k in 1..=101 {
+            sketch.update(scale * k as f64, 1.0);
+        }
+        let p50 = sketch.quantile(0.5, scale, scale * 101.0);
+        let expected = scale * 51.0;
+        assert!(
+            (p50 - expected).abs() <= 0.02 * expected,
+            "scale {scale}: p50 {p50} not within 2% of {expected}"
+        );
+    }
+
+    let scale = 1e-8;
+    let mut sketch = QuantileSketch::new();
+    for k in 1..=101 {
+        sketch.update(-scale * k as f64, 1.0);
+    }
+    let p50 = sketch.quantile(0.5, -scale * 101.0, -scale);
+    let expected = -scale * 51.0;
+    assert!(
+        (p50 - expected).abs() <= 0.02 * -expected,
+        "negative scale: p50 {p50} not within 2% of {expected}"
+    );
+}

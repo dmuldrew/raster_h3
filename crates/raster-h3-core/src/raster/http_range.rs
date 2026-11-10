@@ -30,6 +30,7 @@
 //!   returned, an explicit error is returned.
 
 use rustc_hash::FxHashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, OnceLock, RwLock};
 use ureq::Agent;
@@ -292,11 +293,25 @@ enum BodyAttempt<T> {
     Retry(RasterH3Error),
 }
 
-fn backoff(attempt: usize) -> std::time::Duration {
-    let base_delay_ms = 100u64;
-    let jitter = (attempt as u64 * 37) % 50;
-    let backoff_ms = (base_delay_ms * (1 << attempt) + jitter).min(2000);
-    std::time::Duration::from_millis(backoff_ms)
+const MAX_RETRY_AFTER_MS: u64 = 30_000;
+
+/// Jittered exponential backoff: uniform in [ceiling/2, ceiling] so concurrent
+/// workers do not retry in lockstep. A numeric `Retry-After` (seconds) can
+/// only lengthen the wait, capped at 30 s; the HTTP-date form is ignored.
+fn retry_delay(attempt: usize, entropy: u64, retry_after: Option<&str>) -> std::time::Duration {
+    let ceiling = (100u64 << attempt.min(16)).min(2000);
+    let jittered = ceiling / 2 + entropy % (ceiling / 2 + 1);
+    let delay = match retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(secs) => jittered.max(secs.saturating_mul(1000).min(MAX_RETRY_AFTER_MS)),
+        None => jittered,
+    };
+    std::time::Duration::from_millis(delay)
+}
+
+fn retry_entropy() -> u64 {
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 /// Remote HTTP transport handling connections, retries, headers, and range requests.
@@ -374,7 +389,7 @@ impl HttpTransport {
                     if attempt >= self.max_retries {
                         return Err(e);
                     }
-                    std::thread::sleep(backoff(attempt));
+                    std::thread::sleep(retry_delay(attempt, retry_entropy(), None));
                     attempt += 1;
                 }
             }
@@ -445,6 +460,12 @@ impl HttpTransport {
             match make_request() {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
+                    let retry_after = match &e {
+                        ureq::Error::Status(_, resp) => {
+                            resp.header("Retry-After").map(str::to_owned)
+                        }
+                        _ => None,
+                    };
                     if attempt >= self.max_retries || !is_transient_error(&e) {
                         return match e {
                             ureq::Error::Status(412, _) => Err(RasterH3Error::InvalidParameter(
@@ -471,8 +492,12 @@ impl HttpTransport {
                         };
                     }
 
-                    // Exponential backoff with small jitter
-                    std::thread::sleep(backoff(attempt));
+                    // Jittered exponential backoff, honouring Retry-After
+                    std::thread::sleep(retry_delay(
+                        attempt,
+                        retry_entropy(),
+                        retry_after.as_deref(),
+                    ));
                     attempt += 1;
                 }
             }
@@ -1047,6 +1072,47 @@ mod tests {
             );
         }
         assert_eq!(parse_max_full_body_bytes(Some(" 4096 ")), 4096);
+    }
+
+    #[test]
+    fn retry_delay_is_jittered_within_bounds() {
+        for attempt in 0..8 {
+            let ceiling = (100u64 << attempt).min(2000);
+            for entropy in [0u64, 1, 12345, u64::MAX] {
+                let ms = retry_delay(attempt, entropy, None).as_millis() as u64;
+                assert!(
+                    (ceiling / 2..=ceiling).contains(&ms),
+                    "attempt {attempt} entropy {entropy}: {ms}ms outside [{}, {ceiling}]",
+                    ceiling / 2
+                );
+            }
+        }
+        assert_ne!(
+            retry_delay(3, 0, None),
+            retry_delay(3, 7, None),
+            "different entropy must jitter differently"
+        );
+    }
+
+    #[test]
+    fn retry_delay_honours_retry_after_seconds() {
+        assert_eq!(
+            retry_delay(0, 0, Some("3")),
+            std::time::Duration::from_millis(3000)
+        );
+        assert_eq!(
+            retry_delay(0, 0, Some(" 3 ")),
+            std::time::Duration::from_millis(3000)
+        );
+        assert_eq!(
+            retry_delay(0, 0, Some("9999")),
+            std::time::Duration::from_millis(MAX_RETRY_AFTER_MS)
+        );
+        for invalid in ["abc", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+            assert_eq!(retry_delay(0, 0, Some(invalid)), retry_delay(0, 0, None));
+        }
+        // Retry-After never shortens the backoff
+        assert_eq!(retry_delay(4, 0, Some("0")), retry_delay(4, 0, None));
     }
 
     #[test]

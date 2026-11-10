@@ -1456,6 +1456,63 @@ fn test_export_writes_full_h3_hex_property() {
     }
 }
 
+/// Root directory limit of PMTiles v3: the 16 KiB initial fetch minus the header.
+const MAX_ROOT_DIR_BYTES: usize = 16_384 - 127;
+
+/// Directory entries with irregular tile-ID gaps and lengths, so varint
+/// compression cannot shrink the directories to a trivial size.
+fn irregular_entries(count: usize) -> Vec<raster_h3_core::pmtiles::writer::Entry> {
+    let mut entries = Vec::with_capacity(count);
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut tile_id, mut offset) = (0u64, 0u64);
+    for _ in 0..count {
+        tile_id += 1 + next() % 17;
+        let length = 1 + (next() % 4096) as u32;
+        entries.push(raster_h3_core::pmtiles::writer::Entry {
+            tile_id,
+            offset,
+            length,
+            run_length: 1,
+        });
+        offset += length as u64;
+    }
+    entries
+}
+
+#[test]
+fn test_pmtiles_small_archive_uses_root_only_directory() {
+    use raster_h3_core::pmtiles::writer::build_directories;
+    let (root, leaves) = build_directories(&irregular_entries(100), MAX_ROOT_DIR_BYTES).unwrap();
+    assert!(!root.is_empty());
+    assert!(leaves.is_empty());
+}
+
+/// The root of leaf pointers used to go unchecked once leaves were in use;
+/// leaves now grow until the root fits. A limit one byte below the default
+/// leaf layout's root forces the growth path without a 30-million-tile archive.
+#[test]
+fn test_pmtiles_leaf_size_grows_until_root_fits() {
+    use raster_h3_core::pmtiles::writer::{build_directories, build_leaf_directories};
+    let entries = irregular_entries(200_000);
+    let (default_root, _) = build_leaf_directories(&entries, 4096).unwrap();
+    let (root, leaves) = build_directories(&entries, default_root.len() - 1).unwrap();
+    assert!(root.len() < default_root.len());
+    assert!(!leaves.is_empty());
+}
+
+#[test]
+fn test_pmtiles_impossible_root_limit_is_an_error() {
+    use raster_h3_core::pmtiles::writer::build_directories;
+    let err = build_directories(&irregular_entries(5_000), 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
 /// Gzip-decoded JSON metadata of a PMTiles v3 archive.
 fn read_pmtiles_metadata(path: &str) -> serde_json::Value {
     let mut bytes = Vec::new();

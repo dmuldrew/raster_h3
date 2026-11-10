@@ -17,6 +17,11 @@ thread_local! {
 
 /// PMTiles v3 Constants
 const PMTILES_HEADER_SIZE: usize = 127;
+
+// PMTiles v3 requires the root directory to fit in the initial 16KB fetch
+// (16,384 bytes minus the 127-byte header).
+const MAX_ROOT_DIR_BYTES: usize = 16_384 - PMTILES_HEADER_SIZE;
+const MAX_ENTRIES_PER_LEAF: usize = 4096;
 const COMPRESSION_GZIP: u8 = 2;
 const TILE_TYPE_MVT: u8 = 1;
 
@@ -196,6 +201,35 @@ pub fn build_leaf_directories(
     Ok((root_bytes, all_leaf_bytes))
 }
 
+/// Build a (root, leaves) directory pair whose root fits `max_root_bytes`.
+/// Small archives get a root-only directory; larger ones grow the leaf size
+/// until the root of leaf pointers fits (as go-pmtiles does, by 20% steps).
+pub fn build_directories(
+    entries: &[Entry],
+    max_root_bytes: usize,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    if entries.len() <= MAX_ENTRIES_PER_LEAF {
+        let root = encode_directory(entries)?;
+        if root.len() <= max_root_bytes {
+            return Ok((root, Vec::new()));
+        }
+    }
+    let mut leaf_size = MAX_ENTRIES_PER_LEAF;
+    loop {
+        let (root, leaves) = build_leaf_directories(entries, leaf_size)?;
+        if root.len() <= max_root_bytes {
+            return Ok((root, leaves));
+        }
+        if leaf_size >= entries.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("PMTiles root directory cannot fit in {max_root_bytes} bytes"),
+            ));
+        }
+        leaf_size += leaf_size / 5;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SpillTileEntry {
     tile_id: u64,
@@ -351,21 +385,8 @@ impl PmtilesWriter {
             final_tile_offset += e.length as u64;
         }
 
-        // PMTiles v3 Specification requires the root directory to fit in the initial 16KB fetch
-        // (16,384 bytes - 127 bytes header = 16,257 bytes max root).
-        // For larger archives, split directory into leaf directories of 4,096 entries.
-        const MAX_ENTRIES_PER_LEAF: usize = 4096;
-
-        let (root_dir_bytes, leaf_dirs_bytes) = if directory_entries.len() <= MAX_ENTRIES_PER_LEAF {
-            let root_bytes = encode_directory(&directory_entries)?;
-            if root_bytes.len() <= 16257 {
-                (root_bytes, Vec::new())
-            } else {
-                build_leaf_directories(&directory_entries, MAX_ENTRIES_PER_LEAF)?
-            }
-        } else {
-            build_leaf_directories(&directory_entries, MAX_ENTRIES_PER_LEAF)?
-        };
+        let (root_dir_bytes, leaf_dirs_bytes) =
+            build_directories(&directory_entries, MAX_ROOT_DIR_BYTES)?;
 
         // Compress JSON metadata
         let metadata_bytes = gzip_compress(self.metadata_json.as_bytes())?;
