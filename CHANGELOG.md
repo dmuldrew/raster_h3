@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Continuous streams without quantiles size kernel worker windows by `inline_worker_bytes_per_sample::<H3Accumulator>()` (292 B per sample and resolution) instead of 1 KiB, so windows are about 3.5× larger under the same `aggregation_budget_bytes` and worker maps still fit their allowance when every sample is a new cell. With 5-point sampling at r9 on `BP_CONUS.tif`, system CPU (Rayon workers sleeping and waking between tiny waves) drops by about 62% and wall time from 39.0 to 36.0 min. Per-cell `count` and `sum` can differ from earlier releases in the last bits, because windows group samples differently; cells, `min`, `max` and totals are unchanged. Categorical and quantile streams keep the 1 KiB allowance.
 
+### Fixed
+
+- Arrow C Data import (`ArrowArray::to_record_batch`) rejects Utf8/Binary columns whose offsets are negative or decreasing, or that reference data through a null data buffer, with `InvalidParameter`. Such input used to panic or slice the wrong bytes.
+- `IpcStreamReader` no longer allocates from declared lengths. A row count, string length, validity length or field-name length larger than the bytes that follow now fails as a truncated stream instead of requesting up to gigabytes first.
+- A panic inside an aggregation wave no longer leaves `MultiHorizonStreamer` without its worker maps. They are restored before the panic continues, so a caller that catches it cannot go on to drop every later sample silently.
+- PMTiles tiling skips a cell at any zoom where it would cover more than 65,536 tiles (`MAX_TILE_OPS_PER_CELL_ZOOM`), which only happens for cells containing a pole at fine zooms, where the old enumeration produced millions of features per cell. `for_each_cell_tile_mercator` now returns the number of tiles emitted, and the continuous and categorical tilers report skipped cells as `h3_cells_over_tile_cap` in the archive metadata.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added
