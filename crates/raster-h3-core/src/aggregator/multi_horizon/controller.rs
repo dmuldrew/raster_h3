@@ -849,7 +849,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         if let Some(reason) = self.lifecycle.failure_reason() {
             return Err(RasterH3Error::StreamFailed(reason.to_string()));
         }
-        let result = self.advance_inner(min_rows.min(2048));
+        let result = self.latch_panics(|s| s.advance_inner(min_rows.min(2048)));
         self.metrics.peak_compaction_bytes = self.compactor.peak_bytes();
         self.metrics.forced_compaction_flushes = self.compactor.forced_flushes();
         if let Some(prefetcher) = &self.prefetcher {
@@ -1037,6 +1037,20 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
         }
         len.max(1)
+    }
+
+    /// Run `f`, latching the stream as failed if it panics, then resume the
+    /// unwind. A panic loses the batch in flight (its chunks are already
+    /// taken from the prefetcher), so a caller that catches it must not read
+    /// on past the missing samples.
+    fn latch_panics<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(value) => value,
+            Err(panic) => {
+                self.fail("aggregation panicked; the stream cannot continue".into());
+                std::panic::resume_unwind(panic)
+            }
+        }
     }
 
     /// Latch failures so subsequent reads cannot mistake a failed stream for EOF.
@@ -1280,5 +1294,27 @@ mod tests {
         }));
         assert!(panic.is_err());
         assert_eq!(streamer.worker_maps.len(), maps_before);
+    }
+
+    /// A panic while advancing loses the batch in flight, so the stream
+    /// latches a failure: later reads return an error instead of continuing
+    /// past the missing samples.
+    #[test]
+    fn panic_while_advancing_latches_failure() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_gray_geotiff(tmp.path());
+        let reader = GeoTiffStreamReader::open(tmp.path()).unwrap();
+        let config = MultiResolutionConfig::single(5);
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        // Without horizon maps, the first merge indexes a missing resolution
+        // and panics on the calling thread.
+        streamer.resolution_shards.clear();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = streamer.advance_until_completed(1);
+        }));
+        assert!(panic.is_err(), "the panic must still reach the caller");
+        let err = streamer.advance_until_completed(1).unwrap_err();
+        assert!(err.to_string().contains("panicked"), "{err}");
+        assert!(streamer.fetch_next_batch(16).is_err());
     }
 }
