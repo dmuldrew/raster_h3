@@ -436,6 +436,22 @@ impl MockHttpServer {
         self.recorded_headers.lock().unwrap().clone()
     }
 
+    /// Atomic decrement-if-positive: whether this connection may serve a
+    /// truncated body once.
+    // `try_update` replaces this on Rust 1.95+, but rust-version is 1.94.
+    #[allow(deprecated)]
+    fn try_truncate(body_truncations: &AtomicUsize) -> bool {
+        body_truncations
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count > 0 {
+                    Some(count - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_connection(
         mut stream: TcpStream,
@@ -567,8 +583,13 @@ impl MockHttpServer {
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 total_size
             );
+            let body = if path.contains("truncate_any") && Self::try_truncate(&body_truncations) {
+                &file_bytes[..file_bytes.len() / 2]
+            } else {
+                file_bytes
+            };
             if stream.write_all(header.as_bytes()).is_ok() && method == "GET" {
-                let _ = stream.write_all(file_bytes);
+                let _ = stream.write_all(body);
             }
             return;
         }
@@ -599,18 +620,8 @@ impl MockHttpServer {
 
                 // Simulate a mid-body connection reset: announce the full
                 // Content-Length but close after writing only half the body.
-                // `try_update` replaces this on Rust 1.95+, but rust-version is 1.94.
-                #[allow(deprecated)]
-                let truncate_hit = range_str != "bytes=0-131071"
-                    && body_truncations
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                            if count > 0 {
-                                Some(count - 1)
-                            } else {
-                                None
-                            }
-                        })
-                        .is_ok();
+                let truncate_hit = (range_str != "bytes=0-131071" || path.contains("truncate_any"))
+                    && Self::try_truncate(&body_truncations);
                 if truncate_hit {
                     let header = format!(
                         "HTTP/1.1 206 Partial Content\r\n\
@@ -1355,6 +1366,37 @@ fn persistently_truncated_range_body_fails_after_retries() {
     server.body_truncations.store(100, Ordering::SeqCst);
     assert!(source.fetch_range(200_000, 200_099).is_err());
     assert_eq!(server.request_count.load(Ordering::SeqCst), 1 + 5);
+}
+
+#[test]
+fn truncated_probe_body_is_retried() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..400_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    server.body_truncations.store(1, Ordering::SeqCst);
+    let source = RemoteHttpSource::open(&format!("{}/truncate_any.tif", server.url_base)).unwrap();
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(source.fetch_range(0, 99).unwrap(), data[0..100]);
+}
+
+#[test]
+fn truncated_full_body_is_retried() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    server.body_truncations.store(1, Ordering::SeqCst);
+    let source =
+        RemoteHttpSource::open(&format!("{}/full_body_truncate_any", server.url_base)).unwrap();
+    assert!(source.is_complete_file());
+    let last = data.len() as u64 - 1;
+    assert_eq!(source.fetch_range(0, last).unwrap(), data);
+    assert_eq!(server.request_count.load(Ordering::SeqCst), 2);
 }
 
 #[test]
