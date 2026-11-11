@@ -466,6 +466,68 @@ jobs:
       - name: Run pg-extension tests
         run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
 
+  # The Rust suites above drive the Python crate's C ABI. This runs the package itself,
+  # `python/raster_h3`, against real Polars and PyArrow, loading the in-tree package with
+  # a freshly built cdylib (not an installed wheel; the wheel jobs smoke-test that).
+  # Dependency sets match the `python-polars` engine of manual-tests.yml: the declared
+  # minimums (pyproject: polars>=1.0, pyarrow>=14.0; pyarrow 14 needs numpy 1.x), the first
+  # Polars with register_io_source (1.4, so scan_raster_h3 pushdown runs), and latest.
+  python-pytest:
+    name: Pytest (Polars & PyArrow, ${{ matrix.deps }} deps)
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - deps: min
+            python: '3.11'
+            pip: polars==1.0.* pyarrow==14.* numpy<2
+          - deps: io-source-min
+            python: '3.11'
+            pip: polars==1.4.* pyarrow==14.* numpy<2
+          - deps: latest
+            python: '3.13'
+            pip: polars pyarrow
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+
+      # One cache for the three dependency sets: they build the same library.
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: python-pytest
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Polars and PyArrow (${{ matrix.deps }})
+        env:
+          PIP_SPECS: ${{ matrix.pip }}
+        run: |
+          # Word-split the requirement list on purpose.
+          # shellcheck disable=SC2206
+          specs=($PIP_SPECS)
+          python -m pip install --upgrade pip
+          python -m pip install pytest h3 "${specs[@]}"
+          python -m pip list | grep -iE '^(polars|pyarrow|numpy|h3|pytest) '
+
+      - name: Build the Python cdylib
+        run: cargo build --locked --release -p raster-h3-python --lib
+
+      - name: Run pytest
+        run: |
+          export RASTER_H3_PYTHON_LIB="$PWD/target/release/libraster_h3_python.so"
+          python -m pytest crates/raster-h3-python/tests/pytest -ra -p no:cacheprovider
+
   # raster-h3-sedona is a standalone workspace (DataFusion pinned to SedonaDB's version, plus
   # its Python bindings), so the --workspace jobs above never see it. The `sedona-e2e` suite is left to manual runs:
   # it compiles SedonaDB from git.
@@ -611,7 +673,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, lint, msrv, community-build, test-crates, sedona-adapter, sedona-spark, deny, metadata, package-check, wheel-validation, safety]
+    needs: [build, lint, msrv, community-build, test-crates, python-pytest, sedona-adapter, sedona-spark, deny, metadata, package-check, wheel-validation, safety]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
