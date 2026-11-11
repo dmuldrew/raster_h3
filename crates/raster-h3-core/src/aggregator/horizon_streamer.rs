@@ -28,20 +28,7 @@ impl PartialOrd for HexEvictionEntry {
     }
 }
 
-/// Conservative lower latitude bound for the spherical polygon returned by h3o.
-///
-/// Latitude is 1-Lipschitz in angular distance. Every point on a minor great-circle
-/// edge is at most half that edge's length from one endpoint. The path consisting
-/// of a meridian followed by a parallel has length at most |delta_lat|+|delta_lon|,
-/// so `min(endpoint_latitudes) - (|delta_lat|+|delta_lon|)/2` is a lower bound.
-/// Unlike a stationary-point test this needs no ill-conditioned cross product,
-/// inverse trigonometry, or floating-point arc-membership decision. Bounds are
-/// deliberately loose; spilling handles any additional retained cells.
-///
-/// Basic arithmetic is rounded outward with next_up/next_down. This bound is
-/// relative to h3o's supplied spherical boundary, not a survey/datum accuracy claim.
-/// Northern edges have their minimum at an endpoint. The south pole must be
-/// checked separately because it can be in the polygon interior.
+/// The cell containing the south pole at each resolution.
 static SOUTH_POLE_CELLS: std::sync::OnceLock<[CellIndex; 16]> = std::sync::OnceLock::new();
 
 #[inline]
@@ -56,6 +43,20 @@ fn is_south_pole_cell(cell: CellIndex) -> bool {
     cells[u8::from(cell.resolution()) as usize] == cell
 }
 
+/// Conservative lower latitude bound for the spherical polygon returned by h3o.
+///
+/// Latitude is 1-Lipschitz in angular distance. Every point on a minor great-circle
+/// edge is at most half that edge's length from one endpoint. The path consisting
+/// of a meridian followed by a parallel has length at most |delta_lat|+|delta_lon|,
+/// so `min(endpoint_latitudes) - (|delta_lat|+|delta_lon|)/2` is a lower bound.
+/// Unlike a stationary-point test this needs no ill-conditioned cross product,
+/// inverse trigonometry, or floating-point arc-membership decision. Bounds are
+/// deliberately loose; spilling handles any additional retained cells.
+///
+/// Basic arithmetic is rounded outward with next_up/next_down. This bound is
+/// relative to h3o's supplied spherical boundary, not a survey/datum accuracy claim.
+/// Northern edges have their minimum at an endpoint. The south pole must be
+/// checked separately because it can be in the polygon interior.
 pub fn compute_cell_south_lat(cell_u64: u64) -> f64 {
     let Ok(cell) = CellIndex::try_from(cell_u64) else {
         return -90.0;

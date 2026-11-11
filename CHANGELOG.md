@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `aggregator::accumulator::FastRunAccumulator`, which had no callers. Its `sum_sq - sum²/n` variance was also numerically unstable for values with a large mean.
+- The `serde::Serialize` / `Deserialize` implementations of `H3Accumulator`. They skipped the quantile sketch, so a round trip silently lost it, and nothing used them; spill runs and partial states have their own lossless encoding (`multi_horizon::spill`, `encode_partial_state`).
 - The free functions `pmtiles::tiler::evict_and_write_tiles` and `pmtiles::tiler::flush_all_tiles`, which had no callers; use the `TilePyramidAccumulator` methods `evict_and_write_tiles` and `flush_all` instead.
 
 ### Fixed
