@@ -314,6 +314,25 @@ error while reading a response body or a body shorter than announced
 retried. A truncated chunked response without `Content-Length` cannot be detected
 and is accepted.
 
+### Remote credentials
+
+The built-in client reads credentials from the process environment. The URL is often
+supplied by someone else (a SQL argument, a config file), so each credential is bound to
+where it may go:
+
+| Variable | Sent as | Sent to |
+| :--- | :--- | :--- |
+| `RASTER_H3_AUTH_TOKEN` | `Authorization: Bearer <token>` | Only hosts listed in `RASTER_H3_AUTH_HOSTS`, over `https://` (or to a loopback host). |
+| `RASTER_H3_AUTH_HOSTS` | — | Comma-separated hosts allowed to receive the token. An entry is an exact host (`data.example.com`) or, with a leading `.` or `*.`, a domain and its subdomains (`.example.com`). Unset or empty sends the token nowhere. |
+| `AWS_SESSION_TOKEN` | `x-amz-security-token` | Only S3 endpoints (`*.amazonaws.com`, `*.amazonaws.com.cn`, or the host of `AWS_ENDPOINT_URL` / `AWS_S3_ENDPOINT`), over `https://` (or to a loopback host). Ignored when `RASTER_H3_AUTH_TOKEN` is set. |
+| `AWS_REQUEST_PAYER=requester` | `x-amz-request-payer: requester` | Every request (not a credential). |
+
+Requests are not signed, so `s3://` paths work for public objects and presigned URLs
+only. When a server answers 401 or 403 and a configured token was not sent, the error
+says why (`RASTER_H3_AUTH_TOKEN was not sent: ...`). The scope is resolved for each
+request from the transport's current URL. `Authorization` is dropped on any redirect;
+`x-amz-security-token` is not, so it can follow a redirect issued by an S3 endpoint.
+
 ### Custom byte sources
 
 By default local paths are memory-mapped and remote URLs use the built-in HTTP/S3
