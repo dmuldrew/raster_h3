@@ -525,8 +525,10 @@ one sorted sweep of a sketch's bins, returning exactly what `quantile(q, min, ma
 returns for each target in input order. Targets may be unsorted or repeated; NaN
 targets yield NaN, `q <= 0` yields `min` and `q >= 1` yields `max`.
 
-Each nonzero normal value goes to a logarithmic bucket, which keeps the sketch's 1%
-relative error at any magnitude, including values far below 1. Only zero and
+Each nonzero normal value goes to a logarithmic bucket about 2% wide, and a quantile
+is interpolated inside the bucket its rank falls in. That bounds the relative error at
+about 2.02% (`gamma - 1` with `gamma = 1.01 / 0.99`) at any magnitude, including values
+far below 1; estimates are also clamped to the cell's exact `min` and `max`. Only zero and
 subnormal magnitudes (below `quantiles::ZERO_THRESHOLD`, which is `f64::MIN_POSITIVE`)
 are counted in the exact zero bucket. Data spanning many orders of magnitude keeps
 about 115 buckets per decade per sign. When `min == max` exactly, every quantile is

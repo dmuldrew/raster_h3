@@ -1,7 +1,16 @@
 //! High-Performance Streaming Non-Parametric Quantile Sketch (DDSketch)
 //!
 //! Provides fast, mergeable estimation of arbitrary percentiles
-//! (p01, p05, p10, p25, p50, p75, p90, p95, p99, IQR) with bounded relative error (alpha <= 0.01).
+//! (p01, p05, p10, p25, p50, p75, p90, p95, p99, IQR) with bounded relative error.
+//!
+//! Values are counted in logarithmic buckets `[gamma^k, gamma^(k+1))` with
+//! `gamma = (1 + alpha) / (1 - alpha)` and `alpha = 0.01`. A quantile is
+//! interpolated linearly inside the bucket its rank falls in, so the estimate
+//! and the true value share a bucket and differ by at most `gamma - 1`, about
+//! 2.02% (not `alpha`: DDSketch's 1% guarantee holds for its fixed per-bucket
+//! estimate `2 gamma^(k+1) / (gamma + 1)`, which this sketch does not return).
+//! Estimates are also clamped to the exact `[min, max]` of the data.
+//!
 //! Memory grows with the number of distinct logarithmic buckets observed
 //! (about 115 per decade of magnitude per sign).
 //!
@@ -9,7 +18,8 @@
 
 use rustc_hash::FxHashMap;
 
-/// Bounded relative error alpha (1% relative error guarantee)
+/// Bucket-width parameter: buckets grow by `(1 + alpha) / (1 - alpha)`, which bounds
+/// the relative error of an interpolated quantile by about 2.02% (see the module docs).
 pub const QUANTILE_ALPHA: f64 = 0.01;
 
 /// Magnitudes below this (zero and subnormals) are counted in the exact zero

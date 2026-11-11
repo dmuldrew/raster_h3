@@ -200,7 +200,7 @@ fn with_quantiles_adds_columns_matching_core() {
     let (p25, p50) = (column_f64(&got, "p25"), column_f64(&got, "p50"));
     let (min, max) = (column_f64(&got, "min"), column_f64(&got, "max"));
     for i in 0..p50.len() {
-        // DDSketch keeps a 1% relative error.
+        // Loose ordering checks; the sketch's own bound is about 2.02% per estimate.
         assert!(p25[i] <= p50[i] * 1.01);
         assert!(p50[i] >= min[i] * 0.99 && p50[i] <= max[i] * 1.01);
     }
