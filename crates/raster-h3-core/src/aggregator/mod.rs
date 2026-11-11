@@ -3,7 +3,7 @@
 //! This module implements the core H3 hexagonal aggregation engines. It uses a
 //! "southernmost scan-line horizon eviction" architecture that maintains only
 //! active accumulators under a configurable budget, spilling to disk as needed
-//! of multi-gigabyte rasters.
+//! for multi-gigabyte rasters.
 //!
 //! # Architecture & Key Submodules
 //!
@@ -24,7 +24,7 @@ pub mod accumulator;
 pub mod categorical;
 /// Hashing for maps keyed by raw H3 cell indices.
 pub mod cell_hash;
-/// Scanline lookahead buffering and H3 spatial neighbor traversal caching.
+/// Exact H3 indexing of a WGS84 point.
 pub mod h3_scanline;
 /// Southernmost scan-line horizon eviction engine for single-resolution streaming.
 pub mod horizon_streamer;
@@ -45,7 +45,6 @@ pub mod simd;
 pub use accumulator::H3Accumulator;
 /// Categorical accumulator tracking class frequencies and uniformity metrics for an H3 cell.
 pub use categorical::{CategoricalAccumulator, CategoricalUniformity};
-/// Scanline lookahead buffer and spatial neighbor caching for H3 indexing.
 /// Horizon eviction tracking structures and spatial bounding box helpers.
 pub use horizon_streamer::{chunk_intersects_bbox, compute_cell_south_lat, HexEvictionEntry};
 /// Multi-resolution horizon streamers, output records, and configuration.
