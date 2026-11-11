@@ -49,7 +49,8 @@ fn test_quantile_sketch_uniform_positive() {
     let p75 = sketch.quantile(0.75, min, max);
     let iqr = p75 - p25;
 
-    // DDSketch guarantees relative error <= alpha = 1%
+    // The sketch bounds relative error at gamma - 1 (about 2.02%); evenly spread
+    // data like this lands well inside that.
     assert!((p50 - 5000.0).abs() / 5000.0 < 0.015, "p50: {}", p50);
     assert!((p90 - 9000.0).abs() / 9000.0 < 0.015, "p90: {}", p90);
     assert!((p95 - 9500.0).abs() / 9500.0 < 0.015, "p95: {}", p95);
