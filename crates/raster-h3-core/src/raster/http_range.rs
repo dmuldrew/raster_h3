@@ -213,35 +213,120 @@ pub fn normalize_url(raw_url: &str) -> Result<String> {
     }
 }
 
-/// Retrieve default headers for cloud requests (requester pays, auth tokens)
-fn get_default_headers() -> Vec<(String, String)> {
-    let mut headers = Vec::new();
+/// Comma-separated hosts that may receive `RASTER_H3_AUTH_TOKEN`. An entry is
+/// an exact host (`data.example.com`) or, with a leading `.` or `*.`, a
+/// domain and all of its subdomains (`.example.com`).
+pub const AUTH_HOSTS_ENV: &str = "RASTER_H3_AUTH_HOSTS";
 
-    // Requester pays (AWS Open Data Program)
-    if let Ok(payer) = std::env::var("AWS_REQUEST_PAYER") {
-        if payer.trim().eq_ignore_ascii_case("requester") {
-            headers.push(("x-amz-request-payer".to_string(), "requester".to_string()));
+/// Headers sent with every request to one URL, and what was held back.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RequestHeaders {
+    headers: Vec<(String, String)>,
+    /// Why `RASTER_H3_AUTH_TOKEN` is set but not sent to this URL.
+    withheld_token: Option<&'static str>,
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether `host` is `domain` or one of its subdomains.
+fn host_in_domain(host: &str, domain: &str) -> bool {
+    let (host, domain) = (host.to_ascii_lowercase(), domain.to_ascii_lowercase());
+    !domain.is_empty()
+        && (host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|rest| rest.ends_with('.')))
+}
+
+/// Whether `host` matches an entry of an [`AUTH_HOSTS_ENV`] list.
+fn auth_host_allowed(host: &str, allowed: &str) -> bool {
+    allowed.split(',').map(str::trim).any(|entry| {
+        match entry.strip_prefix("*.").or_else(|| entry.strip_prefix('.')) {
+            Some(domain) => host_in_domain(host, domain),
+            None => !entry.is_empty() && host.eq_ignore_ascii_case(entry),
         }
+    })
+}
+
+/// Whether `host` is an S3 endpoint: AWS itself, or the endpoint configured
+/// through `AWS_ENDPOINT_URL` / `AWS_S3_ENDPOINT` (including its
+/// virtual-hosted bucket subdomains).
+fn is_s3_host(host: &str, custom_endpoint: Option<&str>) -> bool {
+    if ["amazonaws.com", "amazonaws.com.cn"]
+        .iter()
+        .any(|domain| host_in_domain(host, domain))
+    {
+        return true;
     }
+    custom_endpoint
+        .map(str::trim)
+        .and_then(|endpoint| {
+            Url::parse(endpoint)
+                .or_else(|_| Url::parse(&format!("https://{endpoint}")))
+                .ok()
+        })
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|endpoint_host| host_in_domain(host, &endpoint_host))
+}
+
+/// Default headers for requests to `url` (requester pays, auth tokens), with
+/// `env` standing in for the process environment.
+///
+/// Credentials are bound to where they may go, because the URL is often
+/// caller-supplied (a SQL argument) while the environment belongs to the
+/// process:
+///
+/// - Nothing secret is sent over plain `http://`, except to a loopback host.
+/// - `RASTER_H3_AUTH_TOKEN` is sent as a bearer token only to hosts listed in
+///   [`AUTH_HOSTS_ENV`].
+/// - `AWS_SESSION_TOKEN` is sent only to S3 endpoints.
+fn default_headers_for(url: &str, env: &dyn Fn(&str) -> Option<String>) -> RequestHeaders {
+    let mut out = RequestHeaders::default();
+    let var = |name: &str| {
+        env(name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+
+    // Requester pays (AWS Open Data Program). Not a credential.
+    if var("AWS_REQUEST_PAYER").is_some_and(|payer| payer.eq_ignore_ascii_case("requester")) {
+        out.headers
+            .push(("x-amz-request-payer".to_string(), "requester".to_string()));
+    }
+
+    let parsed = Url::parse(url.trim()).ok();
+    let host = parsed.as_ref().and_then(Url::host_str).unwrap_or("");
+    let confidential = !host.is_empty()
+        && (parsed.as_ref().is_some_and(|u| u.scheme() == "https") || is_loopback_host(host));
 
     // Bearer token or AWS session token
-    if let Ok(token) = std::env::var("RASTER_H3_AUTH_TOKEN") {
-        if !token.trim().is_empty() {
-            headers.push((
-                "Authorization".to_string(),
-                format!("Bearer {}", token.trim()),
-            ));
+    if env("RASTER_H3_AUTH_TOKEN").is_some() {
+        if let Some(token) = var("RASTER_H3_AUTH_TOKEN") {
+            if !confidential {
+                out.withheld_token = Some("the URL is not https");
+            } else if !var(AUTH_HOSTS_ENV).is_some_and(|allowed| auth_host_allowed(host, &allowed))
+            {
+                out.withheld_token = Some("its host is not listed in RASTER_H3_AUTH_HOSTS");
+            } else {
+                out.headers
+                    .push(("Authorization".to_string(), format!("Bearer {token}")));
+            }
         }
-    } else if let Ok(session_token) = std::env::var("AWS_SESSION_TOKEN") {
-        if !session_token.trim().is_empty() {
-            headers.push((
-                "x-amz-security-token".to_string(),
-                session_token.trim().to_string(),
-            ));
+    } else if let Some(session_token) = var("AWS_SESSION_TOKEN") {
+        let endpoint = var("AWS_ENDPOINT_URL").or_else(|| var("AWS_S3_ENDPOINT"));
+        if confidential && is_s3_host(host, endpoint.as_deref()) {
+            out.headers
+                .push(("x-amz-security-token".to_string(), session_token));
         }
     }
 
-    headers
+    out
 }
 
 /// Check if an HTTP error is transient and eligible for retry
@@ -328,7 +413,6 @@ pub struct HttpTransport {
     /// Request URL. Clones share a pinned validator only for the same URL.
     pub url: String,
     agent: Agent,
-    headers: Vec<(String, String)>,
     max_retries: usize,
     max_full_body_bytes: u64,
     // Clones share validators per URL, including URLs with no usable strong ETag.
@@ -356,11 +440,9 @@ impl HttpTransport {
             .max_idle_connections_per_host(32)
             .build();
 
-        let headers = get_default_headers();
         Ok(Self {
             url: url.to_string(),
             agent,
-            headers,
             max_retries: 4,
             max_full_body_bytes: parse_max_full_body_bytes(
                 std::env::var("RASTER_H3_MAX_FULL_BODY_BYTES")
@@ -415,13 +497,20 @@ impl HttpTransport {
         ))
     }
 
+    /// Default headers for the current `url`. Resolved per request, not at
+    /// construction: `url` is public, and a credential scoped to one host must
+    /// not follow the transport to another.
+    fn request_headers(&self) -> RequestHeaders {
+        default_headers_for(&self.url, &|name| std::env::var(name).ok())
+    }
+
     fn range_request(&self, range: &str, etag: &OnceLock<Option<String>>) -> ureq::Request {
         let mut req = self
             .agent
             .get(&self.url)
             .set("Range", range)
             .set("Accept-Encoding", "identity");
-        for (k, v) in &self.headers {
+        for (k, v) in &self.request_headers().headers {
             req = req.set(k, v);
         }
         if let Some(Some(etag)) = etag.get() {
@@ -555,11 +644,20 @@ impl HttpTransport {
                                 format!("Remote raster not found (HTTP 404): {}", self.url),
                             )),
                             ureq::Error::Status(status, r) => {
+                                // A refusal is the only sign the caller gets
+                                // that a configured token stayed home.
+                                let hint = match self.request_headers().withheld_token {
+                                    Some(why) if matches!(status, 401 | 403) => {
+                                        format!(" (RASTER_H3_AUTH_TOKEN was not sent: {why})")
+                                    }
+                                    _ => String::new(),
+                                };
                                 Err(RasterH3Error::InvalidParameter(format!(
-                                    "HTTP request failed for '{}': HTTP {} - {}",
+                                    "HTTP request failed for '{}': HTTP {} - {}{}",
                                     self.url,
                                     status,
-                                    r.status_text()
+                                    r.status_text(),
+                                    hint
                                 )))
                             }
                             ureq::Error::Transport(t) => {
@@ -1087,6 +1185,111 @@ impl Seek for HttpRangeReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Headers for `url` under a fixed environment.
+    fn headers_with(url: &str, env: &[(&str, &str)]) -> RequestHeaders {
+        default_headers_for(url, &|name| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    fn header<'a>(headers: &'a RequestHeaders, name: &str) -> Option<&'a str> {
+        headers
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn auth_token_requires_a_listed_host_and_a_confidential_channel() {
+        let token = ("RASTER_H3_AUTH_TOKEN", " secret ");
+        let hosts = (
+            AUTH_HOSTS_ENV,
+            "data.example.com, .example.org ,*.example.net,localhost",
+        );
+        for (url, expected) in [
+            ("https://data.example.com/a.tif", true),
+            ("https://DATA.EXAMPLE.COM:8443/a.tif", true),
+            ("https://example.org/a.tif", true),
+            ("https://tiles.cdn.example.org/a.tif", true),
+            ("https://cdn.example.net/a.tif", true),
+            ("http://localhost:9000/a.tif", true),
+            // Listed, but plain http to a remote host.
+            ("http://data.example.com/a.tif", false),
+            // Not listed, including look-alike and parent domains.
+            ("https://other.example.com/a.tif", false),
+            ("https://example.com/a.tif", false),
+            ("https://evilexample.org/a.tif", false),
+            ("https://data.example.com.evil.test/a.tif", false),
+            ("https://evil.test/data.example.com/a.tif", false),
+            ("https://data.example.com@evil.test/a.tif", false),
+            ("http://127.0.0.1:9000/a.tif", false),
+            ("not a url", false),
+        ] {
+            let headers = headers_with(url, &[token, hosts]);
+            assert_eq!(
+                header(&headers, "Authorization"),
+                expected.then_some("Bearer secret"),
+                "{url}"
+            );
+            assert_eq!(headers.withheld_token.is_some(), !expected, "{url}");
+        }
+
+        // No list, or an empty one, sends the token nowhere.
+        for env in [vec![token], vec![token, (AUTH_HOSTS_ENV, " , ")]] {
+            let headers = headers_with("https://data.example.com/a.tif", &env);
+            assert_eq!(header(&headers, "Authorization"), None);
+            assert!(headers
+                .withheld_token
+                .is_some_and(|why| why.contains(AUTH_HOSTS_ENV)));
+        }
+        // Without a token nothing is withheld.
+        assert_eq!(
+            headers_with("https://data.example.com/a.tif", &[hosts]),
+            RequestHeaders::default()
+        );
+    }
+
+    #[test]
+    fn session_token_goes_only_to_s3_endpoints() {
+        let session = ("AWS_SESSION_TOKEN", "session");
+        let sent = |url: &str, env: &[(&str, &str)]| {
+            header(&headers_with(url, env), "x-amz-security-token").is_some()
+        };
+        for (url, expected) in [
+            ("https://bucket.s3.amazonaws.com/a.tif", true),
+            ("https://bucket.s3.eu-west-1.amazonaws.com/a.tif", true),
+            ("https://bucket.s3.cn-north-1.amazonaws.com.cn/a.tif", true),
+            ("http://bucket.s3.amazonaws.com/a.tif", false),
+            ("https://amazonaws.com.evil.test/a.tif", false),
+            ("https://evil.test/a.tif", false),
+        ] {
+            assert_eq!(sent(url, &[session]), expected, "{url}");
+        }
+
+        // A configured endpoint counts, with path or virtual-hosted buckets.
+        let minio = [session, ("AWS_ENDPOINT_URL", "http://localhost:9000/")];
+        assert!(sent("http://localhost:9000/bucket/a.tif", &minio));
+        assert!(!sent("https://evil.test/bucket/a.tif", &minio));
+        let hosted = [session, ("AWS_S3_ENDPOINT", "storage.example.com")];
+        assert!(sent("https://storage.example.com/bucket/a.tif", &hosted));
+        assert!(sent("https://bucket.storage.example.com/a.tif", &hosted));
+        assert!(!sent("http://storage.example.com/bucket/a.tif", &hosted));
+
+        // As before, a bearer token variable takes the session token's place.
+        let both = [session, ("RASTER_H3_AUTH_TOKEN", "secret")];
+        assert!(!sent("https://bucket.s3.amazonaws.com/a.tif", &both));
+    }
+
+    #[test]
+    fn requester_pays_is_not_scoped() {
+        let env = [("AWS_REQUEST_PAYER", " Requester ")];
+        let headers = headers_with("http://example.com/a.tif", &env);
+        assert_eq!(header(&headers, "x-amz-request-payer"), Some("requester"));
+    }
 
     #[test]
     fn parses_max_full_body_bytes_override() {

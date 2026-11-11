@@ -72,7 +72,9 @@ impl CategoricalAccumulator {
     /// Update with a weighted category (e.g. from sub-pixel super-sampling)
     #[inline(always)]
     pub fn update_weighted(&mut self, category: i64, weight: f64) {
-        if weight <= 0.0 {
+        // NaN slips past `weight <= 0.0`, and an infinite weight can never be
+        // outvoted: require a positive finite weight, as `H3Accumulator` does.
+        if !(weight.is_finite() && weight > 0.0) {
             return;
         }
         self.total_count += weight;
@@ -531,6 +533,50 @@ impl CategoricalUniformity for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_weighted_rejects_non_finite_and_non_positive_weights() {
+        let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0];
+
+        for w in bad {
+            let mut acc = CategoricalAccumulator::new();
+            acc.update_weighted(7, w);
+            assert_eq!(acc.total_count, 0.0, "weight {w} must be rejected");
+            assert_eq!(acc.unique_classes(), 0, "weight {w} must not add a class");
+        }
+
+        // Inline and heap storage: bad weights leave earlier samples intact,
+        // whether they name an existing class or a new one.
+        for classes in [3i64, INLINE_CAPACITY as i64 + 4] {
+            let mut acc = CategoricalAccumulator::new();
+            for c in 0..classes {
+                acc.update_weighted(c, 2.0);
+            }
+            acc.update_weighted(0, 1.0);
+            let expected = acc.clone();
+            for w in bad {
+                acc.update_weighted(0, w);
+                acc.update_weighted(1_000, w);
+            }
+            assert_eq!(acc, expected);
+            assert_eq!(acc.total_count, 2.0 * classes as f64 + 1.0);
+            assert_eq!(acc.majority().0, 0);
+            assert!(acc.shannon_entropy().is_finite());
+        }
+
+        // A merge does not carry a poisoned count across either.
+        let mut poisoned = CategoricalAccumulator::new();
+        poisoned.inline_entries[0] = (5, f64::NAN);
+        poisoned.inline_entries[1] = (6, 3.0);
+        poisoned.inline_len = 2;
+        poisoned.total_count = f64::NAN;
+        let mut acc = CategoricalAccumulator::new();
+        acc.update_weighted(6, 1.0);
+        acc.merge(&poisoned);
+        assert_eq!(acc.total_count, 4.0);
+        assert_eq!(acc.get_class_count(6), 4.0);
+        assert_eq!(acc.get_class_count(5), 0.0);
+    }
 
     #[test]
     fn test_categorical_inline_to_heap_spillover_boundary() {
