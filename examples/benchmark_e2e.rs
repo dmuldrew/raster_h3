@@ -178,7 +178,7 @@ fn main() {
     println!("\n▶ [Stage 3] Sub-Pixel Anti-Aliased Super-Sampling (RGSS 4-Point)");
     let reader_rgss = GeoTiffStreamReader::open(raster_path).unwrap();
     let mut config_rgss = MultiResolutionConfig::single(8);
-    config_rgss.sampling = SamplingPattern::parse("rgss");
+    config_rgss.sampling = SamplingPattern::rgss();
     let mut rgss_streamer = MultiScanHorizonStreamer::new(reader_rgss, &config_rgss).unwrap();
     let start_rgss = Instant::now();
     let mut rgss_mass = 0.0;

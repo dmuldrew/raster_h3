@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error::{RasterH3Error, Result};
+
 /// Represents a single sub-pixel sample offset within the pixel unit box [0.0, 1.0] x [0.0, 1.0]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SamplePoint {
@@ -190,9 +192,10 @@ impl SamplingPattern {
         Self { points }
     }
 
-    /// Parse pattern from string identifier
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
+    /// Parse a sampling preset, rejecting unrecognized names.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "center" | "centre" | "1" => Self::center(),
             "rgss" | "rotated4" | "4point_rotated" | "rotated" | "4" => Self::rgss(),
             "5point" | "5_point" | "quincunx" | "5" => Self::five_point(),
             "gaussian" | "weighted5" | "psf" => Self::gaussian_five_point(),
@@ -200,8 +203,10 @@ impl SamplingPattern {
             "8rooks" | "rooks8" | "stratified8" | "8" => Self::eight_rooks(),
             "9point" | "9_point" | "3x3" | "grid3x3" | "9" => Self::nine_point(),
             "16point" | "16_point" | "4x4" | "grid4x4" | "16" => Self::sixteen_point(),
-            _ => Self::center(),
-        }
+            _ => return Err(RasterH3Error::InvalidParameter(format!(
+                "Invalid sampling '{s}': expected one of center, 5point, gaussian, rgss, hex, 8rooks, 9point, 16point"
+            ))),
+        })
     }
 
     /// Whether this can use the unit-weight pixel-center fast path
@@ -258,11 +263,27 @@ mod tests {
 
     #[test]
     fn test_sampling_parser() {
-        assert_eq!(SamplingPattern::parse("rgss").points.len(), 4);
-        assert_eq!(SamplingPattern::parse("hex").points.len(), 7);
-        assert_eq!(SamplingPattern::parse("gaussian").points.len(), 5);
-        assert_eq!(SamplingPattern::parse("8rooks").points.len(), 8);
-        assert_eq!(SamplingPattern::parse("16point").points.len(), 16);
-        assert_eq!(SamplingPattern::parse("unknown_preset").points.len(), 1);
+        assert_eq!(SamplingPattern::parse("rgss").unwrap().points.len(), 4);
+        assert_eq!(SamplingPattern::parse("hex").unwrap().points.len(), 7);
+        assert_eq!(SamplingPattern::parse("gaussian").unwrap().points.len(), 5);
+        assert_eq!(SamplingPattern::parse("8rooks").unwrap().points.len(), 8);
+        assert_eq!(SamplingPattern::parse("16point").unwrap().points.len(), 16);
+        for name in ["unknown_preset", "", "centered", "rgsss"] {
+            let error = SamplingPattern::parse(name).unwrap_err().to_string();
+            assert!(error.contains("Invalid sampling"), "{error}");
+        }
+        for name in ["center", "centre", "1", " CENTER "] {
+            assert!(SamplingPattern::parse(name).unwrap().is_single_point());
+        }
+        for (name, len) in [
+            ("rotated4", 4), ("4point_rotated", 4), ("rotated", 4), ("4", 4),
+            ("5point", 5), ("5_point", 5), ("quincunx", 5), ("5", 5),
+            ("weighted5", 5), ("psf", 5), ("hex7", 7), ("7point", 7),
+            ("7point_hex", 7), ("7", 7), ("rooks8", 8), ("stratified8", 8),
+            ("8", 8), ("9_point", 9), ("3x3", 9), ("grid3x3", 9),
+            ("9", 9), ("16_point", 16), ("4x4", 16), ("grid4x4", 16), ("16", 16),
+        ] {
+            assert_eq!(SamplingPattern::parse(name).unwrap().points.len(), len, "{name}");
+        }
     }
 }
