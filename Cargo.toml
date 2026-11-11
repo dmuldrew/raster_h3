@@ -122,4 +122,4 @@ panic = "unwind"
 
 [patch.crates-io]
 # Experimental exact row indexing (`LatLngIndexer::index_row`).
-h3o = { git = "https://github.com/dmuldrew/h3o", branch = "raster-row-indexing" }
+h3o = { git = "https://github.com/dmuldrew/h3o", rev = "c880d8242754400f05d149542674f3a409c9ac6d" }
