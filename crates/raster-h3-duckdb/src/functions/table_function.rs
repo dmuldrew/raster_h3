@@ -1,28 +1,25 @@
-use std::ffi::{c_void, CString};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::aggregator::multi_horizon::{
     MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantilePlan,
-    QuantileTarget, ScanPartition,
+    QuantileTarget, ScanPartition, SpectralFormula,
 };
-use crate::encoding::{WkbBuf, WKB_BUF_LEN};
 use crate::ffi::duckdb_c::*;
-use crate::ffi::{ffi_bind_guard, ffi_init_guard, ffi_scan_guard, to_c_string};
 use crate::functions::bind_utils::{
-    add_named_parameter, add_positional_parameter, delete_boxed, estimate_raster_cardinality,
-    extract_projected_columns, init_table_function_local, open_mosaic_or_set_error,
-    register_common_raster_named_parameters, set_table_function_init_data, BindHelper, ChunkWriter,
-    ConcurrentRecordQueue, TableFunctionLocalData,
+    add_named_parameter, BindHelper, CommonRasterParams, ConcurrentRecordQueue,
+    TableFunctionLocalData,
 };
 use crate::functions::partition_functions::{
     drain_continuous, parse_partition_param, write_partial_state_column, ScanRow,
     PARTIAL_STATE_COLUMN,
 };
+use crate::functions::raster_table::{self, add_geom_column, RasterTable, ScanContext};
+use crate::raster::mosaic::MosaicReader;
 
 /// User-data bound during table function query compilation
 pub struct RasterH3BindData {
-    pub common: crate::functions::bind_utils::CommonRasterParams,
-    pub spectral_formula: Option<crate::aggregator::multi_horizon::SpectralFormula>,
+    pub common: CommonRasterParams,
+    pub spectral_formula: Option<SpectralFormula>,
     pub min_count: Option<f64>,
     pub min_mean: Option<f64>,
     pub max_mean: Option<f64>,
@@ -45,304 +42,194 @@ pub struct RasterH3GlobalData {
 /// Thread-local state for parallel DuckDB execution threads (scratch buffers for hex string and WKB encoding)
 pub type RasterH3LocalData = TableFunctionLocalData;
 
-/// Bind callback: parses input arguments, defines output columns, and returns bind data
-///
-/// # Safety
-/// `info` must be the valid bind info DuckDB passes to this callback.
-pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
-    // SAFETY: DuckDB passes this bind callback a live `info` (contract above), and the
-    // `BindHelper` wrapping it is only used inside this callback. Logical types we create
-    // are destroyed once after DuckDB copies them. The boxed `RasterH3BindData` is handed
-    // to DuckDB together with `delete_boxed::<RasterH3BindData>`, its matching destructor,
-    // which DuckDB calls exactly once.
-    unsafe {
-        ffi_bind_guard(info, || {
-            let bind = BindHelper::new(info);
-            let common = match bind.parse_common_raster_params("h3_raster_continuous_aggregate") {
-                Some(p) => p,
-                None => return,
-            };
+/// First quantile column: right after `wkb`, or after `geom` when emitted.
+fn quantile_start_column(emit_geom: bool) -> usize {
+    if emit_geom {
+        11
+    } else {
+        10
+    }
+}
 
-            // Continuous-specific named parameter: formula (VARCHAR)
-            let formula_str = bind.get_named_string("formula");
-            let nir_band = bind
-                .get_named_int("nir_band")
-                .filter(|&b| b > 0)
-                .unwrap_or(4) as usize;
-            let red_band = bind
-                .get_named_int("red_band")
-                .filter(|&b| b > 0)
-                .unwrap_or(3) as usize;
-            let green_band = bind
-                .get_named_int("green_band")
-                .filter(|&b| b > 0)
-                .unwrap_or(2) as usize;
-            let blue_band = bind
-                .get_named_int("blue_band")
-                .filter(|&b| b > 0)
-                .unwrap_or(1) as usize;
-            let swir_band = bind
-                .get_named_int("swir_band")
-                .filter(|&b| b > 0)
-                .unwrap_or(6) as usize;
+/// `h3_raster_continuous_aggregate`: per-cell mean/stddev/count/min/max/sum
+/// and optional quantiles over a continuous raster.
+pub(crate) struct ContinuousTable;
 
-            let spectral_formula = formula_str.as_deref().and_then(|f| {
-                crate::aggregator::multi_horizon::SpectralFormula::parse(
-                    f, nir_band, red_band, green_band, blue_band, swir_band,
-                )
-            });
+impl RasterTable for ContinuousTable {
+    type Bind = RasterH3BindData;
+    type Global = RasterH3GlobalData;
 
-            let min_count = bind.get_named_double("min_count");
-            let min_mean = bind.get_named_double("min_mean");
-            let max_mean = bind.get_named_double("max_mean");
+    const NAMES: &'static [&'static str] = &[
+        "h3_raster_continuous_aggregate",
+        "h3_raster_continuous",
+        "raster_h3",
+    ];
+    const FUNCTION: &'static str = "h3_raster_continuous_aggregate";
+    const MISSING_BIND_DATA: &'static str = "Missing bind data in init";
 
-            let mut quantiles = Vec::new();
-            let q_param_val = bind
-                .get_named_string("quantiles")
-                .or_else(|| bind.get_named_string("percentiles"));
-            if let Some(s) = q_param_val {
-                match QuantileTarget::parse_list(&s) {
-                    Ok(q_targets) => quantiles = q_targets,
-                    Err(e) => {
-                        bind.set_error(&format!("Invalid quantiles parameter: {}", e));
-                        return;
-                    }
-                }
-            }
+    unsafe fn register_named_parameters(tf: duckdb_table_function) {
+        // SAFETY: `tf` is a live, unregistered table function (caller contract).
+        unsafe {
+            add_named_parameter(tf, "chunk_size", DuckDBType::BigInt);
+            add_named_parameter(tf, "formula", DuckDBType::Varchar);
+            add_named_parameter(tf, "nir_band", DuckDBType::BigInt);
+            add_named_parameter(tf, "red_band", DuckDBType::BigInt);
+            add_named_parameter(tf, "green_band", DuckDBType::BigInt);
+            add_named_parameter(tf, "blue_band", DuckDBType::BigInt);
+            add_named_parameter(tf, "swir_band", DuckDBType::BigInt);
+            add_named_parameter(tf, "min_count", DuckDBType::Double);
+            add_named_parameter(tf, "min_mean", DuckDBType::Double);
+            add_named_parameter(tf, "max_mean", DuckDBType::Double);
+            add_named_parameter(tf, "geom", DuckDBType::Boolean);
+            add_named_parameter(tf, "quantiles", DuckDBType::Varchar);
+            add_named_parameter(tf, "percentiles", DuckDBType::Varchar);
+            add_named_parameter(tf, "partition", DuckDBType::Varchar);
+        }
+    }
 
-            let partition = match parse_partition_param(&bind) {
-                Ok(p) => p,
+    unsafe fn bind(bind: &BindHelper, common: CommonRasterParams) -> Option<RasterH3BindData> {
+        let band = |name: &str, default: i64| {
+            bind.get_named_int(name)
+                .filter(|&b| b > 0)
+                .unwrap_or(default) as usize
+        };
+        let (nir, red, green, blue, swir) = (
+            band("nir_band", 4),
+            band("red_band", 3),
+            band("green_band", 2),
+            band("blue_band", 1),
+            band("swir_band", 6),
+        );
+        let spectral_formula = bind
+            .get_named_string("formula")
+            .as_deref()
+            .and_then(|f| SpectralFormula::parse(f, nir, red, green, blue, swir));
+
+        let min_count = bind.get_named_double("min_count");
+        let min_mean = bind.get_named_double("min_mean");
+        let max_mean = bind.get_named_double("max_mean");
+
+        let mut quantiles = Vec::new();
+        let q_param_val = bind
+            .get_named_string("quantiles")
+            .or_else(|| bind.get_named_string("percentiles"));
+        if let Some(s) = q_param_val {
+            match QuantileTarget::parse_list(&s) {
+                Ok(q_targets) => quantiles = q_targets,
                 Err(e) => {
-                    bind.set_error(&format!("Invalid partition parameter: {e}"));
-                    return;
+                    bind.set_error(&format!("Invalid quantiles parameter: {}", e));
+                    return None;
                 }
-            };
-            if partition.is_some() && !quantiles.is_empty() {
-                bind.set_error(
-                    "partition cannot be combined with quantiles: merged cells carry no sketches",
-                );
-                return;
             }
+        }
 
-            // Add Output Columns:
-            bind.add_result_column("h3_index", DuckDBType::UBigInt);
-            bind.add_result_column("h3_hex", DuckDBType::Varchar);
-            bind.add_result_column("mean", DuckDBType::Double);
-            bind.add_result_column("stddev", DuckDBType::Double);
-            bind.add_result_column("count", DuckDBType::Double);
-            bind.add_result_column("min", DuckDBType::Double);
-            bind.add_result_column("max", DuckDBType::Double);
-            bind.add_result_column("sum", DuckDBType::Double);
-            bind.add_result_column("resolution", DuckDBType::UTinyInt);
-            bind.add_result_column("wkb", DuckDBType::Blob);
-
-            if common.emit_geom {
-                let mut type_geom = crate::ffi::create_geometry_logical_type();
-                bind.add_custom_result_column("geom", type_geom);
-                duckdb_destroy_logical_type(&mut type_geom);
+        let partition = match parse_partition_param(bind) {
+            Ok(p) => p,
+            Err(e) => {
+                bind.set_error(&format!("Invalid partition parameter: {e}"));
+                return None;
             }
-
-            for target in &quantiles {
-                bind.add_result_column(target.column_name(), DuckDBType::Double);
-            }
-            if partition.is_some() {
-                bind.add_result_column(PARTIAL_STATE_COLUMN, DuckDBType::Blob);
-            }
-
-            let estimated_cardinality = estimate_raster_cardinality(
-                &common.resolved_paths,
-                &common.resolutions,
-                common.remote_source_factory.as_ref(),
+        };
+        if partition.is_some() && !quantiles.is_empty() {
+            bind.set_error(
+                "partition cannot be combined with quantiles: merged cells carry no sketches",
             );
-            duckdb_bind_set_cardinality(info, estimated_cardinality as idx_t, false);
+            return None;
+        }
 
-            let bind_data = Box::new(RasterH3BindData {
-                common,
-                spectral_formula,
-                min_count,
-                min_mean,
-                max_mean,
-                quantiles,
-                partition,
-            });
+        bind.add_result_column("h3_index", DuckDBType::UBigInt);
+        bind.add_result_column("h3_hex", DuckDBType::Varchar);
+        bind.add_result_column("mean", DuckDBType::Double);
+        bind.add_result_column("stddev", DuckDBType::Double);
+        bind.add_result_column("count", DuckDBType::Double);
+        bind.add_result_column("min", DuckDBType::Double);
+        bind.add_result_column("max", DuckDBType::Double);
+        bind.add_result_column("sum", DuckDBType::Double);
+        bind.add_result_column("resolution", DuckDBType::UTinyInt);
+        bind.add_result_column("wkb", DuckDBType::Blob);
+        if common.emit_geom {
+            // SAFETY: `bind` wraps the live bind info (caller contract).
+            unsafe { add_geom_column(bind) };
+        }
+        for target in &quantiles {
+            bind.add_result_column(target.column_name(), DuckDBType::Double);
+        }
+        if partition.is_some() {
+            bind.add_result_column(PARTIAL_STATE_COLUMN, DuckDBType::Blob);
+        }
 
-            duckdb_bind_set_bind_data(
-                info,
-                Box::into_raw(bind_data) as *mut c_void,
-                Some(delete_boxed::<RasterH3BindData>),
-            );
-        });
+        Some(RasterH3BindData {
+            common,
+            spectral_formula,
+            min_count,
+            min_mean,
+            max_mean,
+            quantiles,
+            partition,
+        })
     }
-}
 
-/// Global init callback: opens GeoTIFF stream reader and initializes streaming scanline horizon aggregator
-///
-/// # Safety
-/// `info` must be the valid init info DuckDB passes to this callback.
-pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
-    // SAFETY: DuckDB passes this init callback a live `info`. The bind-data pointer is the
-    // `Box<RasterH3BindData>` installed by bind (null-checked where it can be absent);
-    // DuckDB keeps it alive and unmodified for the whole query, so a shared borrow is valid
-    // here. The `RasterH3GlobalData` handed to DuckDB is `Send + Sync`, as required because
-    // every scan thread reads it.
-    unsafe {
-        ffi_init_guard(info, || {
-            let bind_data_ptr = duckdb_init_get_bind_data(info) as *const RasterH3BindData;
-            if bind_data_ptr.is_null() {
-                let err_msg = to_c_string("Missing bind data in init");
-                duckdb_init_set_error(info, err_msg.as_ptr());
-                return;
-            }
-            let bind_data = &*bind_data_ptr;
-
-            let mosaic = match open_mosaic_or_set_error(
-                info,
-                &bind_data.common.resolved_paths,
-                bind_data.common.bbox,
-                bind_data.common.source_crs.as_deref(),
-                bind_data.common.overlap_rule,
-                bind_data.common.remote_source_factory.as_ref(),
-            ) {
-                Some(m) => m,
-                None => return,
-            };
-
-            let projected_columns = extract_projected_columns(info);
-
-            let mut config = MultiResolutionConfig::new(bind_data.common.resolutions.clone());
-            config.overlap_rule = bind_data.common.overlap_rule;
-            config.custom_crs = bind_data.common.source_crs.clone();
-            config.custom_nodata = bind_data.common.nodata;
-            config.apply_scale_offset = bind_data.common.scale_offset;
-            config.bbox = bind_data.common.bbox;
-            config.sampling = bind_data.common.sampling.clone();
-            config.band = bind_data.common.band as usize;
-            config.spectral_formula = bind_data.spectral_formula;
-            config.min_count = bind_data.min_count;
-            config.min_mean = bind_data.min_mean;
-            config.max_mean = bind_data.max_mean;
-            config.compact = bind_data.common.compact;
-            config.compact_h3_children = bind_data.common.compact;
-            // Quantile columns follow `wkb` (and `geom` when emitted). Build
-            // per-cell sketches only if the query selects one of them; DuckDB
-            // includes filter columns in the projection, so WHERE clauses on
-            // quantiles still get them.
-            let q_start_col = if bind_data.common.emit_geom { 11 } else { 10 };
-            let q_end_col = q_start_col + bind_data.quantiles.len();
-            if projected_columns
-                .iter()
-                .any(|c| (q_start_col..q_end_col).contains(c))
-            {
-                config.quantiles = bind_data.quantiles.clone();
-            }
-            bind_data.common.execution.apply(&mut config);
-            config.partition = bind_data.partition.clone();
-
-            let streamer = match MultiScanHorizonStreamer::new_mosaic(mosaic, &config) {
-                Ok(s) => s,
-                Err(e) => {
-                    let err_msg =
-                        CString::new(format!("Failed to initialize multi-streamer: {}", e))
-                            .unwrap_or_else(|_| CString::new("Failed to init streamer").unwrap());
-                    duckdb_init_set_error(info, err_msg.as_ptr());
-                    return;
-                }
-            };
-
-            let global_data = RasterH3GlobalData {
-                streamer: Mutex::new(streamer),
-                record_queue: ConcurrentRecordQueue::new(),
-                projected_columns,
-                quantiles: bind_data.quantiles.clone(),
-                emit_geom: bind_data.common.emit_geom,
-                partial_state_column: bind_data.partition.as_ref().map(|_| q_end_col),
-            };
-
-            set_table_function_init_data(info, global_data);
-        });
+    fn common(bind: &RasterH3BindData) -> &CommonRasterParams {
+        &bind.common
     }
-}
 
-/// Thread-local init callback for multi-threaded parallel DuckDB execution
-///
-/// # Safety
-/// `info` must be the valid init info DuckDB passes to this callback.
-pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
-    // SAFETY: DuckDB passes this local-init callback a live `info`, which is forwarded to
-    // `init_table_function_local` with the same contract.
-    unsafe {
-        ffi_init_guard(info, || {
-            init_table_function_local(info);
-        });
+    fn init(
+        bind: &RasterH3BindData,
+        mosaic: Arc<MosaicReader>,
+        projected_columns: Vec<usize>,
+        mut config: MultiResolutionConfig,
+    ) -> Result<RasterH3GlobalData, String> {
+        config.apply_scale_offset = bind.common.scale_offset;
+        config.spectral_formula = bind.spectral_formula;
+        config.min_count = bind.min_count;
+        config.min_mean = bind.min_mean;
+        config.max_mean = bind.max_mean;
+        // Build per-cell sketches only if the query selects a quantile column;
+        // DuckDB includes filter columns in the projection, so WHERE clauses on
+        // quantiles still get them.
+        let q_start_col = quantile_start_column(bind.common.emit_geom);
+        let q_end_col = q_start_col + bind.quantiles.len();
+        if projected_columns
+            .iter()
+            .any(|c| (q_start_col..q_end_col).contains(c))
+        {
+            config.quantiles = bind.quantiles.clone();
+        }
+        config.partition = bind.partition.clone();
+
+        let streamer = MultiScanHorizonStreamer::new_mosaic(mosaic, &config)
+            .map_err(|e| format!("Failed to initialize multi-streamer: {}", e))?;
+
+        Ok(RasterH3GlobalData {
+            streamer: Mutex::new(streamer),
+            record_queue: ConcurrentRecordQueue::new(),
+            projected_columns,
+            quantiles: bind.quantiles.clone(),
+            emit_geom: bind.common.emit_geom,
+            partial_state_column: bind.partition.as_ref().map(|_| q_end_col),
+        })
     }
-}
 
-/// Scan callback: streaming vector emission directly from scanline horizon eviction with projection pushdown
-///
-/// # Safety
-/// `info` and `output` must be the handles DuckDB passes to this scan
-/// callback, with `output` laid out as the columns declared at bind time.
-pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
-    // SAFETY: DuckDB passes this scan callback live `info`/`output` handles. The bind/init
-    // pointers are the `Box<RasterH3BindData>`/`Box<RasterH3GlobalData>` installed earlier
-    // (null-checked), alive until the query ends and only borrowed immutably;
-    // `RasterH3GlobalData` synchronizes its own mutable state. `output` columns follow
-    // `projected_columns` in order, and each arm writes Rust values of exactly the physical
-    // type that column was declared with at bind time (see the column map). Local scratch
-    // data, if present, belongs to the calling DuckDB thread only.
-    unsafe {
-        ffi_scan_guard(info, output, || {
-            let global_data_ptr = duckdb_function_get_init_data(info) as *const RasterH3GlobalData;
-            if global_data_ptr.is_null() {
-                duckdb_data_chunk_set_size(output, 0);
+    unsafe fn scan(global: &RasterH3GlobalData, ctx: &mut ScanContext<'_>) {
+        // SAFETY: `ctx` carries the live scan handles (caller contract). `writer` wraps
+        // the output chunk, whose columns follow `projected_columns` in order, and each
+        // arm writes values of exactly the physical type that column was declared with
+        // at bind time (see the column map).
+        unsafe {
+            let proj_cols = &global.projected_columns;
+            let Some((batch, mut writer)) = ctx.next_batch(
+                &global.record_queue,
+                &global.streamer,
+                proj_cols,
+                |s, max_rows, f| {
+                    drain_continuous(s, max_rows, global.partial_state_column.is_some(), f)
+                },
+            ) else {
                 return;
-            }
-            let global_data = &*global_data_ptr;
-
-            let local_data_ptr =
-                duckdb_function_get_local_init_data(info) as *mut RasterH3LocalData;
-
-            // Retrieve next batch of completed records concurrently across DuckDB worker threads
-            let batch_opt =
-                global_data
-                    .record_queue
-                    .pop_or_refill(&global_data.streamer, |s, max_rows, f| {
-                        drain_continuous(s, max_rows, global_data.partial_state_column.is_some(), f)
-                    });
-
-            let batch = match batch_opt {
-                Ok(Some(b)) if !b.is_empty() => b,
-                Err(error) => {
-                    let message = to_c_string(&error.to_string());
-                    duckdb_function_set_error(info, message.as_ptr());
-                    duckdb_data_chunk_set_size(output, 0);
-                    return;
-                }
-                _ => {
-                    duckdb_data_chunk_set_size(output, 0);
-                    return;
-                }
             };
-
-            let proj_cols = &global_data.projected_columns;
-            let mut writer = ChunkWriter::new(output);
-
-            // Fast path: if 0 columns are projected (e.g. SELECT count(*))
-            if proj_cols.is_empty() {
-                writer.set_size(batch.len());
-                return;
-            }
-
-            let mut fallback_hex_buf = [0u8; 16];
-            let mut fallback_wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
-            let (hex_buf, wkb_buf) = TableFunctionLocalData::get_scratch_buffers(
-                local_data_ptr,
-                &mut fallback_hex_buf,
-                &mut fallback_wkb_buf,
-            );
 
             let batch_len = batch.len();
-            let q_start_col = if global_data.emit_geom { 11 } else { 10 };
+            let q_start_col = quantile_start_column(global.emit_geom);
             let mut out_idx_wkb: Option<usize> = None;
             let mut out_idx_geom: Option<usize> = None;
             let mut out_idx_state: Option<usize> = None;
@@ -352,14 +239,14 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             let mut q_targets: Vec<usize> = proj_cols
                 .iter()
                 .filter_map(|&c| c.checked_sub(q_start_col))
-                .filter(|&q| q < global_data.quantiles.len())
+                .filter(|&q| q < global.quantiles.len())
                 .collect();
             q_targets.sort_unstable();
             q_targets.dedup();
             let q_values: Vec<Vec<f64>> = if q_targets.is_empty() {
                 Vec::new()
             } else {
-                let plan = QuantilePlan::new(q_targets.iter().map(|&i| &global_data.quantiles[i]));
+                let plan = QuantilePlan::new(q_targets.iter().map(|&i| &global.quantiles[i]));
                 let mut columns: Vec<Vec<f64>> = (0..plan.len())
                     .map(|_| Vec::with_capacity(batch_len))
                     .collect();
@@ -386,12 +273,15 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
             // 9: wkb BLOB
             // 10: geom GEOMETRY (if emit_geom)
             // 10/11+: quantiles DOUBLE
+            // then partial_state BLOB (partitioned scans)
             for (out_idx, &orig_col) in proj_cols.iter().enumerate() {
                 match orig_col {
                     0 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.h3_index)),
-                    1 => {
-                        writer.write_hex_column(out_idx, batch.iter().map(|r| &r.h3_index), hex_buf)
-                    }
+                    1 => writer.write_hex_column(
+                        out_idx,
+                        batch.iter().map(|r| &r.h3_index),
+                        ctx.hex_buf,
+                    ),
                     2 => writer.fill_column(
                         out_idx,
                         batch_len,
@@ -423,15 +313,9 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                         batch.iter().map(|r| r.accumulator.sum),
                     ),
                     8 => writer.fill_column(out_idx, batch_len, batch.iter().map(|r| r.resolution)),
-                    9 => {
-                        out_idx_wkb = Some(out_idx);
-                    }
-                    10 if global_data.emit_geom => {
-                        out_idx_geom = Some(out_idx);
-                    }
-                    c if Some(c) == global_data.partial_state_column => {
-                        out_idx_state = Some(out_idx);
-                    }
+                    9 => out_idx_wkb = Some(out_idx),
+                    10 if global.emit_geom => out_idx_geom = Some(out_idx),
+                    c if Some(c) == global.partial_state_column => out_idx_state = Some(out_idx),
                     c if c >= q_start_col => {
                         if let Ok(slot) = q_targets.binary_search(&(c - q_start_col)) {
                             writer.fill_column(out_idx, batch_len, q_values[slot].iter().copied());
@@ -445,15 +329,52 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
                 out_idx_wkb,
                 out_idx_geom,
                 batch.iter().map(|r| &r.h3_index),
-                wkb_buf,
+                ctx.wkb_buf,
             );
             if let Some(col) = out_idx_state {
                 write_partial_state_column(&writer, col, &batch);
             }
 
             writer.set_size(batch_len);
-        });
+        }
     }
+}
+
+/// Bind callback: parses input arguments, defines output columns, and returns bind data
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
+pub unsafe extern "C" fn raster_h3_bind(info: duckdb_bind_info) {
+    // SAFETY: forwarded with the same contract.
+    unsafe { raster_table::bind::<ContinuousTable>(info) }
+}
+
+/// Global init callback: opens the raster mosaic and starts the streaming horizon aggregator
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
+pub unsafe extern "C" fn raster_h3_init(info: duckdb_init_info) {
+    // SAFETY: forwarded with the same contract.
+    unsafe { raster_table::init::<ContinuousTable>(info) }
+}
+
+/// Thread-local init callback for multi-threaded parallel DuckDB execution
+///
+/// # Safety
+/// `info` must be the valid init info DuckDB passes to this callback.
+pub unsafe extern "C" fn raster_h3_init_local(info: duckdb_init_info) {
+    // SAFETY: forwarded with the same contract.
+    unsafe { raster_table::init_local(info) }
+}
+
+/// Scan callback: streaming vector emission with projection pushdown
+///
+/// # Safety
+/// `info` and `output` must be the handles DuckDB passes to this scan
+/// callback, with `output` laid out as the columns declared at bind time.
+pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+    // SAFETY: forwarded with the same contract.
+    unsafe { raster_table::scan::<ContinuousTable>(info, output) }
 }
 
 /// Register `h3_raster_continuous_aggregate` and `h3_raster_continuous` table functions
@@ -461,62 +382,6 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 /// # Safety
 /// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), String> {
-    // SAFETY: `con` is a live connection (caller contract). Each table function created
-    // here is configured with NUL-terminated names that outlive the calls, parameter types
-    // that DuckDB copies, and callbacks with the C ABI DuckDB expects (bind/init/local-
-    // init/scan). It is destroyed exactly once after `duckdb_register_table_function` has
-    // copied it into the catalog.
-    unsafe {
-        let names = [
-            "h3_raster_continuous_aggregate",
-            "h3_raster_continuous",
-            "raster_h3",
-        ];
-
-        for name in &names {
-            let fn_name = to_c_string(name);
-            let tf = duckdb_create_table_function();
-            duckdb_table_function_set_name(tf, fn_name.as_ptr());
-
-            // Positional Parameters:
-            // 0: file_path (VARCHAR)
-            add_positional_parameter(tf, DuckDBType::Varchar);
-
-            // Standard Common Raster Named Parameters
-            register_common_raster_named_parameters(tf);
-
-            // Continuous-specific named parameters
-            add_named_parameter(tf, "chunk_size", DuckDBType::BigInt);
-            add_named_parameter(tf, "formula", DuckDBType::Varchar);
-            add_named_parameter(tf, "nir_band", DuckDBType::BigInt);
-            add_named_parameter(tf, "red_band", DuckDBType::BigInt);
-            add_named_parameter(tf, "green_band", DuckDBType::BigInt);
-            add_named_parameter(tf, "blue_band", DuckDBType::BigInt);
-            add_named_parameter(tf, "swir_band", DuckDBType::BigInt);
-            add_named_parameter(tf, "min_count", DuckDBType::Double);
-            add_named_parameter(tf, "min_mean", DuckDBType::Double);
-            add_named_parameter(tf, "max_mean", DuckDBType::Double);
-            add_named_parameter(tf, "geom", DuckDBType::Boolean);
-            add_named_parameter(tf, "quantiles", DuckDBType::Varchar);
-            add_named_parameter(tf, "percentiles", DuckDBType::Varchar);
-            add_named_parameter(tf, "partition", DuckDBType::Varchar);
-
-            // Set callbacks including parallel init_local and projection pushdown
-            duckdb_table_function_set_bind(tf, raster_h3_bind);
-            duckdb_table_function_set_init(tf, raster_h3_init);
-            duckdb_table_function_set_local_init(tf, raster_h3_init_local);
-            duckdb_table_function_set_function(tf, raster_h3_scan);
-            duckdb_table_function_supports_projection_pushdown(tf, true);
-
-            let state = duckdb_register_table_function(con, tf);
-            let mut tf_mut = tf;
-            duckdb_destroy_table_function(&mut tf_mut);
-
-            if state != DuckDBState::Success {
-                return Err(format!("Failed to register {} table function", name));
-            }
-        }
-
-        Ok(())
-    }
+    // SAFETY: forwarded with the same contract.
+    unsafe { raster_table::register::<ContinuousTable>(con) }
 }
