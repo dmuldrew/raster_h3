@@ -1,0 +1,11 @@
+# Lint settings for every Python file in the repository: `ruff check .` (run in CI).
+# The rule list is explicit so a newer ruff does not change what is checked.
+target-version = "py39"  # crates/raster-h3-python declares requires-python >= 3.9
+extend-exclude = ["extension-ci-tools"]
+
+[lint]
+# pyflakes, the error-level pycodestyle checks, whitespace warnings, bugbear, import order.
+select = ["E4", "E7", "E9", "F", "W", "B", "I"]
+
+[lint.isort]
+known-first-party = ["raster_h3", "raster_h3_sedona", "conftest"]

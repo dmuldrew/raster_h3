@@ -45,7 +45,7 @@ def write_gradient_tif(path, width, height):
     extra_offset = ifd_offset + ifd_size
     extra = b""
     payloads = []
-    for tag, typ, count, payload in entries:
+    for _tag, _typ, _count, payload in entries:
         if payload is not None and len(payload) > 4:
             payloads.append(struct.pack("<I", extra_offset + len(extra)))
             extra += payload
@@ -231,7 +231,8 @@ def test_polygon_to_cells_joins_on_h3_index(sd, raster):
 
 
 def test_polygon_to_cells_rejects_projected_geometry(sd):
-    with pytest.raises(Exception):
+    # A planning error; SedonaDB's Python exception type for it is not part of its API.
+    with pytest.raises(Exception, match="geometry must be lon/lat"):
         sd.sql(
             "SELECT h3_polygon_to_cells(ST_SetSRID(ST_GeomFromWKT("
             "'POLYGON ((0 0, 1 0, 1 1, 0 0))'), 3857), 8)"
