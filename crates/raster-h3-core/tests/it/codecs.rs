@@ -1492,3 +1492,157 @@ pub fn write_planar_geotiff(path: &Path, width: u32, height: u32, bands: u32) {
     file.write_all(&0u32.to_le_bytes()).unwrap(); // next IFD offset
     file.flush().unwrap();
 }
+
+fn f32_samples(data: &DecodingResult) -> &[f32] {
+    match data {
+        DecodingResult::F32(v) => v,
+        other => panic!("expected F32 samples, got {other:?}"),
+    }
+}
+
+// Regression: a tile clipped by the bottom image edge still inflates to a whole
+// tile, which the direct-decode path tried to fit into the clipped sample buffer.
+// libdeflate refused it and every such tile was decoded a second time by the
+// generic decoder.
+#[test]
+fn test_deflate_edge_tiles_decode_on_fast_path() {
+    let temp_file = NamedTempFile::new().unwrap();
+    // 16x16 tiles over 24x24: whole, right-clipped, bottom-clipped and corner tiles.
+    let (width, height, tile) = (24u32, 24u32, 16u32);
+    let ground_truth: Vec<f32> = (0..width * height).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(
+        temp_file.path(),
+        width,
+        height,
+        tile,
+        tile,
+        1,
+        &ground_truth,
+    );
+
+    let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+    for idx in 0..4u32 {
+        let (col0, row0) = ((idx % 2) * tile, (idx / 2) * tile);
+        let (w, h) = ((width - col0).min(tile), (height - row0).min(tile));
+        let expected: Vec<f32> = (0..w * h)
+            .map(|i| ground_truth[((row0 + i / w) * width + col0 + i % w) as usize])
+            .collect();
+
+        let fresh = decoder
+            .decompress_chunk_simd(idx, None)
+            .unwrap_or_else(|e| panic!("tile {idx} ({w}x{h}) left the fast path: {e}"));
+        assert_eq!(f32_samples(fresh.as_ref().unwrap()), expected);
+
+        // A recycled buffer of another size, as the streaming path hands in.
+        let mut recycled = DecodingResult::F32(vec![-1.0; (tile * tile) as usize + 3]);
+        let in_place = decoder
+            .decompress_chunk_simd(idx, Some(&mut recycled))
+            .unwrap_or_else(|e| panic!("tile {idx} ({w}x{h}) left the fast path: {e}"));
+        assert!(
+            in_place.is_none(),
+            "tile {idx} must fill the recycled buffer"
+        );
+        assert_eq!(f32_samples(&recycled), expected);
+
+        let (bounds, data) = decoder.read_chunk(idx).unwrap();
+        assert_eq!((bounds.width, bounds.height), (w, h));
+        assert_eq!(f32_samples(&data), expected);
+    }
+}
+
+// A chunk whose own stored bytes are corrupt is an error from the accelerated
+// decoder, not a silent second attempt through the generic one.
+#[test]
+fn test_corrupt_stored_deflate_tile_reports_fast_path_error() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let ground_truth: Vec<f32> = (0..32 * 32).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(temp_file.path(), 32, 32, 16, 16, 1, &ground_truth);
+
+    let (offset, len) = {
+        let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+        let info = reader.chunk_info.as_ref().unwrap();
+        (info.chunk_offsets[0] as usize, info.chunk_bytes[0] as usize)
+    };
+    let mut bytes = std::fs::read(temp_file.path()).unwrap();
+    for b in &mut bytes[offset + 2..offset + len] {
+        *b = 0xFF;
+    }
+    std::fs::write(temp_file.path(), bytes).unwrap();
+
+    let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+    let err = match decoder.read_chunk(0) {
+        Ok(_) => panic!("a corrupt stored tile must not decode"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("decompress failed"), "{err}");
+    // The other tiles are untouched.
+    assert_eq!(
+        f32_samples(&decoder.read_chunk(3).unwrap().1)[0],
+        ground_truth[16 * 32 + 16]
+    );
+}
+
+// A chunk that cannot be read from the source fails with that read's error.
+#[test]
+fn test_unreadable_stored_tile_reports_read_error() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let ground_truth: Vec<f32> = (0..32 * 32).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(temp_file.path(), 32, 32, 16, 16, 1, &ground_truth);
+
+    let mut bytes = std::fs::read(temp_file.path()).unwrap();
+    let file_len = bytes.len() as u32;
+    // TileOffsets: four LONGs stored out of line. Move tile 0 past the end of the file.
+    let entry = ifd_entry(&mut bytes, 324);
+    assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 4);
+    let array = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+    bytes[array..array + 4].copy_from_slice(&(file_len + 4096).to_le_bytes());
+    std::fs::write(temp_file.path(), bytes).unwrap();
+
+    let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+    let err = match decoder.read_chunk(0) {
+        Ok(_) => panic!("a tile stored past the end of the file must not decode"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("chunk offset out of bounds"),
+        "{err}"
+    );
+}
+
+// A stream that inflates past the chunk's declared layout is not corrupt: the
+// generic decoder reads the samples it needs and ignores the rest.
+#[test]
+fn test_overlong_deflate_tile_falls_back_to_generic_decoder() {
+    let temp_file = NamedTempFile::new().unwrap();
+    // Two 16x32 tiles, then declared as a 32x16 image of 16x16 tiles.
+    let ground_truth: Vec<f32> = (0..32 * 32).map(|v| v as f32).collect();
+    write_tiled_deflate_geotiff(temp_file.path(), 32, 32, 16, 32, 1, &ground_truth);
+    let mut bytes = std::fs::read(temp_file.path()).unwrap();
+    for tag in [257, 323] {
+        let entry = ifd_entry(&mut bytes, tag);
+        assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 1);
+        let value = if u16::from_le_bytes(entry[2..4].try_into().unwrap()) == 3 {
+            8..10
+        } else {
+            8..12
+        };
+        let width = value.len();
+        entry[value].copy_from_slice(&16u32.to_le_bytes()[..width]);
+    }
+    std::fs::write(temp_file.path(), bytes).unwrap();
+
+    let reader = GeoTiffStreamReader::open(temp_file.path()).unwrap();
+    let mut decoder = reader.open_decoder().unwrap();
+    for idx in 0..2u32 {
+        assert!(decoder.decompress_chunk_simd(idx, None).is_err());
+        let (bounds, data) = decoder.read_chunk(idx).unwrap();
+        assert_eq!((bounds.width, bounds.height), (16, 16));
+        let expected: Vec<f32> = (0..16 * 16)
+            .map(|i| ground_truth[((i / 16) * 32 + idx * 16 + i % 16) as usize])
+            .collect();
+        assert_eq!(f32_samples(&data), expected);
+    }
+}
