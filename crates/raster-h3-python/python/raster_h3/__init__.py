@@ -964,7 +964,9 @@ def scan_raster_h3(
 
     A Polars `filter` on `count` (`total_count` for categorical scans), `mean`,
     `majority_fraction` or `resolution`, combined with `&`, is also pushed into the scan
-    as these bounds; Polars still applies the full predicate afterwards.
+    as these bounds; Polars still applies the full predicate afterwards. Before Polars
+    1.22 filters are not pushed into the scan at all, because those versions drop some
+    filters they hand to IO sources; Polars applies them after the scan instead.
     """
     _locals = locals()
     extra = {k: _locals[k] for k in _SCAN_OPTIONS}
@@ -1111,9 +1113,27 @@ def scan_raster_h3(
                     return
 
         # Positional: the parameter is `callable` before Polars 1.25 and `io_source` after.
-        return register_io_source(_source_gen, schema=pl_schema)
+        lazy = register_io_source(_source_gen, schema=pl_schema)
+        if _polars_drops_unpushed_predicates(pl.__version__):
+            # Polars before 1.22 hands an IO source `predicate=None` for a filter it cannot
+            # pass down (a strict cast, a string function, ...) and then never applies it,
+            # so the scan would return unfiltered rows. A pass-through node that predicates
+            # may not cross keeps every filter above the source, where Polars applies it.
+            # Projection and slice pushdown still reach the scan; filter bounds do not.
+            lazy = lazy.map_batches(lambda df: df, predicate_pushdown=False)
+        return lazy
     except ImportError:
         return stream
+
+
+def _polars_drops_unpushed_predicates(version: str) -> bool:
+    """Whether this Polars version silently drops IO-source predicates it cannot push
+    down (1.x before 1.22). Unparseable versions are treated as affected."""
+    try:
+        major, minor = (int(part) for part in version.split(".")[:2])
+    except ValueError:
+        return True
+    return (major, minor) < (1, 22)
 
 
 def _quantile_columns(quantiles: Union[str, Sequence[Union[str, float]]]) -> List[str]:
