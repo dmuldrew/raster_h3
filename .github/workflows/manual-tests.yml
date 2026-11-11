@@ -165,7 +165,7 @@ jobs:
           # shellcheck disable=SC2206
           extra=($TEST_ARGS)
           set -x
-          cargo test "${profile[@]}" --no-fail-fast "${pkgs[@]}" -- "${extra[@]}"
+          cargo test --locked "${profile[@]}" --no-fail-fast "${pkgs[@]}" -- "${extra[@]}"
 
       # The pg-extension feature adds the fmgr unit tests and tests/it fmgr suite.
       # Its server stand-ins assume the Unix fmgr ABI, so Windows is skipped.
@@ -178,7 +178,7 @@ jobs:
           # shellcheck disable=SC2206
           extra=($TEST_ARGS)
           set -x
-          cargo test "${profile[@]}" --no-fail-fast -p raster-h3-pg --features pg-extension -- "${extra[@]}"
+          cargo test --locked "${profile[@]}" --no-fail-fast -p raster-h3-pg --features pg-extension -- "${extra[@]}"
 
       - name: Set up Python
         if: inputs.engine == 'python-polars'
@@ -207,7 +207,7 @@ jobs:
           profile=()
           dir=debug
           if [ "$PROFILE" = release ]; then profile=(--release); dir=release; fi
-          cargo build "${profile[@]}" -p raster-h3-python --lib
+          cargo build --locked "${profile[@]}" -p raster-h3-python --lib
           case "$RUNNER_OS" in
             macOS)   lib=libraster_h3_python.dylib ;;
             Windows) lib=raster_h3_python.dll ;;

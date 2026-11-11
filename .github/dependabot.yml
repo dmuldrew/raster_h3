@@ -9,6 +9,31 @@ updates:
       cargo-minor:
         update-types: [minor, patch]
 
+  # Standalone workspaces with their own lockfiles: the root entry above never sees them.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    groups:
+      fuzz-cargo:
+        patterns: ['*']
+
+  - package-ecosystem: cargo
+    directory: /crates/raster-h3-sedona
+    schedule:
+      interval: monthly
+    ignore:
+      # DataFusion and Arrow must match the versions apache/sedona-db pins, and the
+      # SedonaDB crates are pinned to a tested revision; move them together, by hand.
+      - dependency-name: datafusion
+      - dependency-name: arrow
+        update-types: [version-update:semver-major]
+      - dependency-name: sedona
+      - dependency-name: sedona-extension
+    groups:
+      sedona-cargo-minor:
+        update-types: [minor, patch]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
