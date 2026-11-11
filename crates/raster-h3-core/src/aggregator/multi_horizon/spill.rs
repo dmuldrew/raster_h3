@@ -108,7 +108,7 @@ impl SpillAccumulator for H3Accumulator {
         if m2 < 0.0 {
             return Err(invalid("negative m2 in accumulator state"));
         }
-        if count > 0.0 && !(min <= max) {
+        if count > 0.0 && (min.is_nan() || max.is_nan() || min > max) {
             return Err(invalid("accumulator state has min > max"));
         }
         let mut acc = Self::from_weighted_stats(sum, count, sum_w2, min, max, m2);
@@ -366,8 +366,11 @@ mod tests {
         );
     }
 
+    /// A quantile sketch's zero count, total count and positive buckets.
+    type Sketch<'a> = Option<(f64, f64, &'a [(i32, f64)])>;
+
     /// A continuous state as `write_state` lays it out.
-    fn continuous_bytes(stats: [f64; 6], sketch: Option<(f64, f64, &[(i32, f64)])>) -> Vec<u8> {
+    fn continuous_bytes(stats: [f64; 6], sketch: Sketch<'_>) -> Vec<u8> {
         let mut out = Vec::new();
         for v in stats {
             write_f64(&mut out, v).unwrap();
