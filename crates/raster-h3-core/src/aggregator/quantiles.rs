@@ -1,7 +1,8 @@
 //! High-Performance Streaming Non-Parametric Quantile Sketch (DDSketch)
 //!
 //! Provides fast, mergeable estimation of arbitrary percentiles
-//! (p01, p05, p10, p25, p50, p75, p90, p95, p99, IQR) with bounded relative error.
+//! (p01, p05, p10, p25, p50, p75, p90, p95, p99) with bounded relative error,
+//! and of the interquartile range derived from them.
 //!
 //! Values are counted in logarithmic buckets `[gamma^k, gamma^(k+1))` with
 //! `gamma = (1 + alpha) / (1 - alpha)` and `alpha = 0.01`. A quantile is
@@ -10,6 +11,10 @@
 //! 2.02% (not `alpha`: DDSketch's 1% guarantee holds for its fixed per-bucket
 //! estimate `2 gamma^(k+1) / (gamma + 1)`, which this sketch does not return).
 //! Estimates are also clamped to the exact `[min, max]` of the data.
+//!
+//! The bound applies to each percentile, not to differences of percentiles. The
+//! IQR is `p75 - p25`, so its absolute error is at most about 2.02% of
+//! `|p25| + |p75|`, which can exceed a narrow IQR itself.
 //!
 //! Memory grows with the number of distinct logarithmic buckets observed
 //! (about 115 per decade of magnitude per sign).
