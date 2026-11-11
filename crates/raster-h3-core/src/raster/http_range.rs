@@ -32,6 +32,7 @@
 use rustc_hash::FxHashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use ureq::Agent;
 use url::Url;
@@ -40,6 +41,10 @@ use crate::error::{RasterH3Error, Result};
 
 /// Default block cache size for header and tag reading (128 KB)
 pub const DEFAULT_BLOCK_SIZE: usize = 131072;
+
+/// Most blocks a remote source keeps cached: 512 blocks of [`DEFAULT_BLOCK_SIZE`] are
+/// 64 MiB. Past it the least recently used block is dropped.
+pub const DEFAULT_MAX_CACHED_BLOCKS: usize = 512;
 
 /// Largest body (1 GiB) accepted when a server ignores Range and returns the
 /// whole file, since that body is held in memory; override with env
@@ -822,11 +827,22 @@ impl HttpTransport {
 /// Explicitly distinguishes between:
 /// - A completely downloaded response (e.g. from an HTTP 200 probe or small file),
 ///   where all byte slices can be served directly from memory without network access.
-/// - A block-sparse cache, where chunks are fetched in aligned `block_size` pages.
+/// - A block-sparse cache, where chunks are fetched in aligned `block_size` pages. It holds
+///   at most `max_blocks` blocks ([`DEFAULT_MAX_CACHED_BLOCKS`] unless changed with
+///   [`Self::with_max_blocks`]) and drops the least recently used one past that, so reading
+///   a large file through it does not keep the whole file in memory.
 pub struct ByteCache {
     block_size: usize,
+    max_blocks: usize,
     complete_file: RwLock<Option<Arc<Vec<u8>>>>,
-    blocks: RwLock<FxHashMap<u64, Arc<Vec<u8>>>>,
+    blocks: RwLock<FxHashMap<u64, CachedBlock>>,
+    /// Use counter; a block's `last_used` is the counter value of its latest lookup.
+    clock: AtomicU64,
+}
+
+struct CachedBlock {
+    data: Arc<Vec<u8>>,
+    last_used: AtomicU64,
 }
 
 impl ByteCache {
@@ -834,20 +850,46 @@ impl ByteCache {
     pub fn new_with_complete(data: Vec<u8>, block_size: usize) -> Self {
         Self {
             block_size,
+            max_blocks: DEFAULT_MAX_CACHED_BLOCKS,
             complete_file: RwLock::new(Some(Arc::new(data))),
             blocks: RwLock::new(FxHashMap::default()),
+            clock: AtomicU64::new(0),
         }
     }
 
     /// Create a cache initialized with a single block (e.g. block 0 from a partial range probe).
     pub fn new_with_initial_block(data: Vec<u8>, block_size: usize) -> Self {
         let mut blocks = FxHashMap::default();
-        blocks.insert(0, Arc::new(data));
+        blocks.insert(
+            0,
+            CachedBlock {
+                data: Arc::new(data),
+                last_used: AtomicU64::new(0),
+            },
+        );
         Self {
             block_size,
+            max_blocks: DEFAULT_MAX_CACHED_BLOCKS,
             complete_file: RwLock::new(None),
             blocks: RwLock::new(blocks),
+            clock: AtomicU64::new(0),
         }
+    }
+
+    /// Keep at most `max_blocks` blocks (at least one), dropping the least recently used.
+    pub fn with_max_blocks(mut self, max_blocks: usize) -> Self {
+        self.max_blocks = max_blocks.max(1);
+        self
+    }
+
+    /// Number of blocks currently cached.
+    pub fn cached_blocks(&self) -> usize {
+        self.blocks.read().map_or(0, |guard| guard.len())
+    }
+
+    #[inline]
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Returns `true` if the cache holds the complete file payload.
@@ -882,21 +924,51 @@ impl ByteCache {
         Ok(None)
     }
 
-    /// Get a cached block by block index if present.
+    /// Get a cached block by block index if present, marking it as recently used.
     pub fn get_block(&self, block_idx: u64) -> Result<Option<Arc<Vec<u8>>>> {
         let guard = self.blocks.read().map_err(|_| {
             RasterH3Error::InvalidParameter("Remote HTTP cache lock poisoned".to_string())
         })?;
-        Ok(guard.get(&block_idx).cloned())
+        Ok(guard.get(&block_idx).map(|block| {
+            block.last_used.store(self.tick(), Ordering::Relaxed);
+            Arc::clone(&block.data)
+        }))
     }
 
     /// Insert a block into the cache under write lock, returning the retained reference
-    /// (retaining any existing block if a race occurred).
+    /// (retaining any existing block if a race occurred). Past `max_blocks`, the least
+    /// recently used other blocks are dropped; readers holding them keep their `Arc`.
     pub fn insert_block(&self, block_idx: u64, data: Arc<Vec<u8>>) -> Result<Arc<Vec<u8>>> {
         let mut guard = self.blocks.write().map_err(|_| {
             RasterH3Error::InvalidParameter("Remote HTTP cache lock poisoned".to_string())
         })?;
-        Ok(guard.entry(block_idx).or_insert_with(|| data).clone())
+        let now = self.tick();
+        let kept = match guard.entry(block_idx) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                entry.get().last_used.store(now, Ordering::Relaxed);
+                Arc::clone(&entry.get().data)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let block = entry.insert(CachedBlock {
+                    data,
+                    last_used: AtomicU64::new(now),
+                });
+                Arc::clone(&block.data)
+            }
+        };
+        while guard.len() > self.max_blocks {
+            // A linear scan: at most `max_blocks + 1` entries, once per network fetch.
+            let oldest = guard
+                .iter()
+                .filter(|(&idx, _)| idx != block_idx)
+                .min_by_key(|(_, block)| block.last_used.load(Ordering::Relaxed))
+                .map(|(&idx, _)| idx);
+            match oldest {
+                Some(idx) => guard.remove(&idx),
+                None => break,
+            };
+        }
+        Ok(kept)
     }
 }
 
@@ -1403,6 +1475,95 @@ mod tests {
         let inserted = cache.insert_block(1, block1.clone()).unwrap();
         assert_eq!(&*inserted, &[50, 60, 70, 80]);
         assert_eq!(&*cache.get_block(1).unwrap().unwrap(), &[50, 60, 70, 80]);
+    }
+
+    #[test]
+    fn byte_cache_drops_the_least_recently_used_block() {
+        let cache = ByteCache::new_with_initial_block(vec![0; 4], 4).with_max_blocks(3);
+        cache.insert_block(1, Arc::new(vec![1; 4])).unwrap();
+        cache.insert_block(2, Arc::new(vec![2; 4])).unwrap();
+        // Touch block 0, so block 1 is now the least recently used.
+        cache.get_block(0).unwrap().unwrap();
+        let held = cache.get_block(1).unwrap().unwrap();
+        cache.get_block(2).unwrap().unwrap();
+        cache.get_block(0).unwrap().unwrap();
+
+        cache.insert_block(3, Arc::new(vec![3; 4])).unwrap();
+        assert_eq!(cache.cached_blocks(), 3);
+        assert!(
+            cache.get_block(1).unwrap().is_none(),
+            "block 1 was least recently used"
+        );
+        for idx in [0, 2, 3] {
+            assert!(
+                cache.get_block(idx).unwrap().is_some(),
+                "block {idx} must stay"
+            );
+        }
+        // A reader still holding an evicted block keeps its bytes.
+        assert_eq!(&*held, &[1; 4]);
+
+        // Re-inserting a cached block neither duplicates nor evicts anything.
+        cache.insert_block(3, Arc::new(vec![9; 4])).unwrap();
+        assert_eq!(cache.cached_blocks(), 3);
+        assert_eq!(&*cache.get_block(3).unwrap().unwrap(), &[3; 4]);
+
+        // A limit of zero still keeps the block just inserted.
+        let tiny = ByteCache::new_with_initial_block(vec![0; 4], 4).with_max_blocks(0);
+        tiny.insert_block(1, Arc::new(vec![1; 4])).unwrap();
+        assert_eq!(tiny.cached_blocks(), 1);
+        assert!(tiny.get_block(1).unwrap().is_some());
+    }
+
+    /// Serves a fixed body and counts range requests.
+    struct CountingTransport {
+        data: Vec<u8>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RemoteTransport for CountingTransport {
+        fn fetch_range(&self, start: u64, end: u64, _: Option<u64>) -> Result<Vec<u8>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.data[start as usize..=end as usize].to_vec())
+        }
+
+        fn probe(&self, _: usize) -> Result<ProbeResult> {
+            unreachable!("the test builds the source directly")
+        }
+    }
+
+    #[test]
+    fn reading_a_large_file_keeps_the_block_cache_bounded() {
+        let block = 64;
+        let data: Vec<u8> = (0..block * 100).map(|i| (i % 251) as u8).collect();
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = RemoteHttpSource {
+            url: "http://example.com/large.tif".to_string(),
+            total_size: data.len() as u64,
+            transport: Box::new(CountingTransport {
+                data: data.clone(),
+                fetches: Arc::clone(&fetches),
+            }),
+            cache: ByteCache::new_with_initial_block(data[..block].to_vec(), block)
+                .with_max_blocks(8),
+        };
+        // One small read from each of the 100 blocks, as chunk reads would make.
+        for b in 0..100u64 {
+            let offset = b * block as u64 + 3;
+            assert_eq!(
+                source.read_exact_range(offset, 10).unwrap(),
+                data[offset as usize..offset as usize + 10]
+            );
+            let cached = source.cache.cached_blocks();
+            assert!(cached <= 8, "cache grew to {cached} blocks");
+        }
+        // Block 0 came from the probe; the other 99 were fetched once each.
+        assert_eq!(fetches.load(Ordering::SeqCst), 99);
+        // The most recent block is still served from memory; block 0 was evicted.
+        source.read_exact_range(99 * block as u64, 10).unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 99);
+        source.read_exact_range(0, 10).unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 100);
     }
 
     #[test]
