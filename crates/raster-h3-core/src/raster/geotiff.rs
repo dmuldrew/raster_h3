@@ -331,6 +331,24 @@ fn widen_f16(data: DecodingResult) -> DecodingResult {
     }
 }
 
+/// Why the accelerated decode path produced no samples.
+#[derive(Debug)]
+enum FastDecodeError {
+    /// The accelerated kernels do not cover this layout; the generic TIFF
+    /// decoder may still read it.
+    Unsupported(RasterH3Error),
+    /// The payload does not decode to the chunk's declared layout.
+    Failed(RasterH3Error),
+}
+
+impl FastDecodeError {
+    fn into_inner(self) -> RasterH3Error {
+        match self {
+            Self::Unsupported(e) | Self::Failed(e) => e,
+        }
+    }
+}
+
 /// Persistent chunk decoder that reuses the TIFF decoder across reads.
 /// This avoids re-parsing IFD headers, tag tables, and strip/tile offset
 /// arrays on every chunk read — the single largest I/O optimization.
@@ -391,7 +409,11 @@ impl<'a> ChunkDecoder<'a> {
     /// - If `provided_bytes` is None, retrieves chunk payload via `self.source.get_chunk_payload`
     ///   (zero-copy slice for local memory maps, range request for remote COGs).
     /// - Uses SIMD Deflate or accelerated LZW first, populating `target_buffer` in-place if available.
-    /// - Falls back cleanly to standard TIFF decoder if fast decompression is unsupported or fails.
+    /// - Falls back to the standard TIFF decoder when the accelerated kernels do not cover the
+    ///   chunk's layout, or when `provided_bytes` fails to decode (the chunk is then re-read
+    ///   from the source).
+    /// - A failed read of the source, or source bytes that do not decode to the chunk's declared
+    ///   layout, is returned as an error.
     pub fn read_chunk_with_payload(
         &mut self,
         chunk_index: u32,
@@ -539,25 +561,39 @@ impl<'a> ChunkDecoder<'a> {
             }
         }
 
-        let fast_res = if let Some(bytes) = provided_bytes {
-            self.decompress_chunk_fast_bytes(chunk_index, bytes, target_buffer.as_mut())
+        // Only a payload the caller handed in may be replaced by a re-read: it is
+        // a copy (e.g. a prefetched range) and the source still holds the chunk.
+        let (fast_res, reread_on_failure) = if let Some(bytes) = provided_bytes {
+            (
+                self.fast_decode(chunk_index, bytes, target_buffer.as_mut()),
+                true,
+            )
         } else if let Some(ref info) = self.chunk_info {
-            match self.source.get_chunk_payload(chunk_index, info) {
-                Ok(payload) => self.decompress_chunk_fast_bytes(
-                    chunk_index,
-                    payload.as_ref(),
-                    target_buffer.as_mut(),
-                ),
-                Err(e) => Err(e),
-            }
+            // A failed read is final. The generic decoder would only request the
+            // same bytes again through a second code path.
+            let payload = self.source.get_chunk_payload(chunk_index, info)?;
+            (
+                self.fast_decode(chunk_index, payload.as_ref(), target_buffer.as_mut()),
+                false,
+            )
         } else {
-            Err(RasterH3Error::InvalidMetadata("no chunk info".into()))
+            (
+                Err(FastDecodeError::Unsupported(
+                    RasterH3Error::InvalidMetadata("no chunk info".into()),
+                )),
+                false,
+            )
         };
 
         match fast_res {
             Ok(None) => return Ok((chunk_bounds, target_buffer.unwrap())),
             Ok(Some(new_buf)) => return Ok((chunk_bounds, new_buf)),
-            Err(_) => {}
+            // No accelerated kernel for this layout: the generic decoder handles it.
+            Err(FastDecodeError::Unsupported(_)) => {}
+            Err(FastDecodeError::Failed(_)) if reread_on_failure => {}
+            // The source's own bytes do not decode to the declared layout. Report
+            // that instead of masking it behind a second decode attempt.
+            Err(FastDecodeError::Failed(err)) => return Err(err),
         }
 
         if let Some(buf) = target_buffer {
@@ -594,39 +630,51 @@ impl<'a> ChunkDecoder<'a> {
         compression: CompressionMethod,
         compressed: &[u8],
         out: &mut [u8],
-    ) -> Result<()> {
+    ) -> std::result::Result<(), FastDecodeError> {
+        let unsupported =
+            |why: &str| FastDecodeError::Unsupported(RasterH3Error::InvalidMetadata(why.into()));
+        let failed = |why: String| FastDecodeError::Failed(RasterH3Error::InvalidMetadata(why));
         match compression {
             CompressionMethod::None => {
                 // Uncompressed: the payload is the samples themselves. A strip or
                 // tile shorter than its declared layout is malformed.
                 let raw = compressed.get(..out.len()).ok_or_else(|| {
-                    RasterH3Error::InvalidMetadata(
-                        "uncompressed chunk shorter than its declared layout".into(),
-                    )
+                    failed("uncompressed chunk shorter than its declared layout".into())
                 })?;
                 out.copy_from_slice(raw);
             }
             CompressionMethod::Deflate | CompressionMethod::OldDeflate => {
-                let decompressor = libdeflater
-                    .ok_or_else(|| RasterH3Error::InvalidMetadata("no decompressor".into()))?;
+                let decompressor = libdeflater.ok_or_else(|| unsupported("no decompressor"))?;
                 // zlib_decompress/deflate_decompress return the number of bytes
                 // written; a chunk that decompresses short leaves stale bytes in
                 // the buffer tail, so the output must exactly fill `out`.
                 let decompressed = match decompressor.zlib_decompress(compressed, out) {
                     Ok(n) => n,
-                    Err(_) => decompressor
-                        .deflate_decompress(compressed, out)
-                        .map_err(|_| RasterH3Error::InvalidMetadata("decompress failed".into()))?,
+                    Err(zlib_err) => match decompressor.deflate_decompress(compressed, out) {
+                        Ok(n) => n,
+                        // The stream inflates past the declared layout (e.g. a padded
+                        // final strip). libdeflate cannot stop early; the generic
+                        // decoder reads just the bytes it needs.
+                        Err(raw_err)
+                            if zlib_err == libdeflater::DecompressionError::InsufficientSpace
+                                || raw_err
+                                    == libdeflater::DecompressionError::InsufficientSpace =>
+                        {
+                            return Err(unsupported(
+                                "deflate chunk inflates past its declared layout",
+                            ));
+                        }
+                        Err(_) => return Err(failed("decompress failed".into())),
+                    },
                 };
                 if decompressed != out.len() {
-                    return Err(RasterH3Error::InvalidMetadata(
+                    return Err(failed(
                         "deflate chunk did not fill its declared layout".into(),
                     ));
                 }
             }
             CompressionMethod::LZW => {
-                let lzw = lzw_decoder
-                    .ok_or_else(|| RasterH3Error::InvalidMetadata("no lzw decompressor".into()))?;
+                let lzw = lzw_decoder.ok_or_else(|| unsupported("no lzw decompressor"))?;
                 lzw.reset();
                 let mut inp = compressed;
                 let mut target_out = out;
@@ -642,24 +690,15 @@ impl<'a> ChunkDecoder<'a> {
                             }
                         }
                         Err(e) => {
-                            return Err(RasterH3Error::InvalidMetadata(format!(
-                                "lzw error: {:?}",
-                                e
-                            )));
+                            return Err(failed(format!("lzw error: {:?}", e)));
                         }
                     }
                 }
                 if !target_out.is_empty() {
-                    return Err(RasterH3Error::InvalidMetadata(
-                        "lzw chunk did not fill buffer".into(),
-                    ));
+                    return Err(failed("lzw chunk did not fill buffer".into()));
                 }
             }
-            _ => {
-                return Err(RasterH3Error::InvalidMetadata(
-                    "unsupported fast compression".into(),
-                ))
-            }
+            _ => return Err(unsupported("unsupported fast compression")),
         }
         Ok(())
     }
@@ -668,7 +707,7 @@ impl<'a> ChunkDecoder<'a> {
     /// If target_buffer is provided and of matching type, it will be populated in-place.
     /// Returns Ok(None) if target_buffer was populated in-place.
     /// Returns Ok(Some(new_result)) if a new DecodingResult was created.
-    /// Returns Err(_) if anything is unsupported or failed, triggering standard fallback.
+    /// Returns Err(_) if the layout is unsupported or the payload fails to decode.
     fn decompress_chunk_fast(
         &mut self,
         chunk_index: u32,
@@ -691,10 +730,24 @@ impl<'a> ChunkDecoder<'a> {
         compressed_slice: &[u8],
         target_buffer: Option<&mut DecodingResult>,
     ) -> Result<Option<DecodingResult>> {
+        self.fast_decode(chunk_index, compressed_slice, target_buffer)
+            .map_err(FastDecodeError::into_inner)
+    }
+
+    /// [`Self::decompress_chunk_fast_bytes`], telling a layout the accelerated
+    /// kernels do not cover apart from a payload that fails to decode.
+    fn fast_decode(
+        &mut self,
+        chunk_index: u32,
+        compressed_slice: &[u8],
+        target_buffer: Option<&mut DecodingResult>,
+    ) -> std::result::Result<Option<DecodingResult>, FastDecodeError> {
+        let unsupported =
+            |why: &str| FastDecodeError::Unsupported(RasterH3Error::InvalidMetadata(why.into()));
         let info = self
             .chunk_info
             .as_ref()
-            .ok_or_else(|| RasterH3Error::InvalidMetadata("no chunk info".into()))?;
+            .ok_or_else(|| unsupported("no chunk info"))?;
 
         let (chunk_w, chunk_h) = info.chunk_dimensions;
         let bounds = self
@@ -718,7 +771,16 @@ impl<'a> ChunkDecoder<'a> {
         #[cfg(not(target_endian = "little"))]
         let is_native_endian = info.byte_order == TiffByteOrder::BigEndian;
 
+        // Decoding straight into the sample buffer needs the stored chunk to hold
+        // exactly the samples wanted. A tile is always stored whole, so one
+        // clipped by the right or bottom image edge goes through the scratch
+        // buffer, which drops the padding.
+        let stored_h = match info.chunk_type {
+            ChunkType::Tile => chunk_h as usize,
+            ChunkType::Strip => data_h,
+        };
         let can_direct_decode = tile_w == data_w
+            && stored_h == data_h
             && info.predictor == Predictor::None
             && is_native_endian
             && info.photometric != PhotometricInterpretation::WhiteIsZero;
@@ -801,17 +863,30 @@ impl<'a> ChunkDecoder<'a> {
             predictor: info.predictor,
             photometric: info.photometric,
         };
+        // The float kernels reverse only the floating-point predictor; any other
+        // unpack error means the decoded bytes do not match the declared layout.
+        let float_predictor_supported =
+            matches!(info.predictor, Predictor::None | Predictor::FloatingPoint);
+        let float_err = |e: RasterH3Error| {
+            if float_predictor_supported {
+                FastDecodeError::Failed(e)
+            } else {
+                FastDecodeError::Unsupported(e)
+            }
+        };
         macro_rules! unpack_int_branch {
             ($variant:ident, $t:ty) => {
                 match target_buffer {
                     Some(DecodingResult::$variant(ref mut v)) => {
                         v.resize(total_samples, 0);
-                        unpack_integer_samples(decomp_slice, &mut v[..total_samples], encoding)?;
+                        unpack_integer_samples(decomp_slice, &mut v[..total_samples], encoding)
+                            .map_err(FastDecodeError::Failed)?;
                         Ok(None)
                     }
                     _ => {
                         let mut v = vec![0 as $t; total_samples];
-                        unpack_integer_samples(decomp_slice, &mut v, encoding)?;
+                        unpack_integer_samples(decomp_slice, &mut v, encoding)
+                            .map_err(FastDecodeError::Failed)?;
                         Ok(Some(DecodingResult::$variant(v)))
                     }
                 }
@@ -830,28 +905,30 @@ impl<'a> ChunkDecoder<'a> {
             (SampleFormat::IEEEFP, 32) => match target_buffer {
                 Some(DecodingResult::F32(ref mut v)) => {
                     v.resize(total_samples, 0.0);
-                    unpack_f32(decomp_slice, &mut v[..total_samples], encoding)?;
+                    unpack_f32(decomp_slice, &mut v[..total_samples], encoding)
+                        .map_err(float_err)?;
                     Ok(None)
                 }
                 _ => {
                     let mut v = vec![0.0f32; total_samples];
-                    unpack_f32(decomp_slice, &mut v, encoding)?;
+                    unpack_f32(decomp_slice, &mut v, encoding).map_err(float_err)?;
                     Ok(Some(DecodingResult::F32(v)))
                 }
             },
             (SampleFormat::IEEEFP, 64) => match target_buffer {
                 Some(DecodingResult::F64(ref mut v)) => {
                     v.resize(total_samples, 0.0);
-                    unpack_f64(decomp_slice, &mut v[..total_samples], encoding)?;
+                    unpack_f64(decomp_slice, &mut v[..total_samples], encoding)
+                        .map_err(float_err)?;
                     Ok(None)
                 }
                 _ => {
                     let mut v = vec![0.0f64; total_samples];
-                    unpack_f64(decomp_slice, &mut v, encoding)?;
+                    unpack_f64(decomp_slice, &mut v, encoding).map_err(float_err)?;
                     Ok(Some(DecodingResult::F64(v)))
                 }
             },
-            _ => Err(RasterH3Error::InvalidMetadata("unsupported format".into())),
+            _ => Err(unsupported("unsupported format")),
         }
     }
 
