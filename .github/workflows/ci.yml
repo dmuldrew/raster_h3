@@ -69,6 +69,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Rules and scope are in ruff.toml; the version is pinned so a ruff release cannot
+      # change what CI checks.
+      - name: Lint Python (ruff)
+        run: pipx run ruff==0.17.4 check --output-format github .
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

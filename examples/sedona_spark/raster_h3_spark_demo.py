@@ -192,7 +192,10 @@ def verify(cells, paths: List[str], resolutions: List[int]) -> None:
                 gap = abs(x - y)
                 assert gap <= 1e-9 * max(1.0, abs(x)), f"{path}: {c} of {key} is {y}, expected {x}"
                 worst[c] = max(worst[c], gap)
-        wkb = lambda t: dict(zip(zip(t["resolution"].to_pylist(), t["h3_index"].to_pylist()), t["wkb"].to_pylist()))
+        def wkb(t):
+            cells = zip(t["resolution"].to_pylist(), t["h3_index"].to_pylist())
+            return dict(zip(cells, t["wkb"].to_pylist()))
+
         assert wkb(want) == wkb(mine), f"{path}: cell geometries differ"
         detail = ", ".join(f"{c} {v:.1e}" for c, v in worst.items())
         print(f"verified {path}: {len(a)} cells identical to a single scan (max differences: {detail})")

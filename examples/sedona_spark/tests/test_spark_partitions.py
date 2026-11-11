@@ -13,7 +13,6 @@ import subprocess
 import sys
 
 import pytest
-
 import raster_h3_spark_demo as demo
 
 

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `raster_h3` Python package ships a `py.typed` marker (PEP 561), so type checkers use its annotations instead of treating it as untyped.
 - Test infrastructure: four new cargo-fuzz targets (IPC stream, Arrow array import, remap parser, `Content-Range` parsing), a wider Miri scope (columnar, categorical and predictor unsafe code), a ThreadSanitizer job over the prefetch and aggregation suites, a `cargo llvm-cov` coverage workflow uploading to Codecov, and new proptest invariants in `core/properties.rs`.
 - `HorizonStreamKernel::worker_bytes_per_sample`: the worst-case worker bytes one sample can add to one resolution's cell map (a new table entry, its owned accumulator state and its eviction key). Kernel worker windows are sized from it, so it must not understate. The default keeps the previous 1 KiB allowance, so custom kernels are unaffected. `inline_worker_bytes_per_sample::<A>()` gives the bound for accumulators that own no heap state.
 
