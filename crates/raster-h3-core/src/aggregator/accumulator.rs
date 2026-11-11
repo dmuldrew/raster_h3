@@ -31,9 +31,12 @@ impl Default for H3Accumulator {
 }
 
 impl H3Accumulator {
-    /// Initialize with a single pixel value
+    /// Initialize with a single finite pixel value, or an empty accumulator if invalid.
     #[inline(always)]
     pub fn new(val: f64) -> Self {
+        if !val.is_finite() {
+            return Self::default();
+        }
         Self {
             sum: val,
             count: 1.0,
@@ -45,9 +48,12 @@ impl H3Accumulator {
         }
     }
 
-    /// Initialize with a weighted pixel value
+    /// Initialize with a finite pixel value and positive finite weight, or empty if invalid.
     #[inline(always)]
     pub fn new_weighted(val: f64, weight: f64) -> Self {
+        if !val.is_finite() || !(weight.is_finite() && weight > 0.0) {
+            return Self::default();
+        }
         Self {
             sum: val * weight,
             count: weight,
@@ -345,6 +351,40 @@ impl H3Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructors_reject_the_same_invalid_inputs_as_updates() {
+        let values = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        let weights = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0];
+        for value in values {
+            assert_eq!(H3Accumulator::new(value), H3Accumulator::default());
+            assert_eq!(
+                H3Accumulator::new_weighted(value, 1.0),
+                H3Accumulator::default()
+            );
+        }
+        for weight in weights {
+            assert_eq!(
+                H3Accumulator::new_weighted(42.0, weight),
+                H3Accumulator::default()
+            );
+        }
+
+        for (value, weight) in [(42.0, 1.0), (-3.0, 0.25)] {
+            let mut expected = H3Accumulator::default();
+            expected.update_weighted(value, weight);
+            assert_eq!(H3Accumulator::new_weighted(value, weight), expected);
+        }
+        let mut expected = H3Accumulator::default();
+        expected.update(42.0);
+        assert_eq!(H3Accumulator::new(42.0), expected);
+
+        // Invalid first observations must not poison later valid updates or merges.
+        let mut acc = H3Accumulator::new_weighted(5.0, f64::NAN);
+        acc.update(42.0);
+        acc.merge(&H3Accumulator::new(f64::INFINITY));
+        assert_eq!(acc, expected);
+    }
 
     #[test]
     fn update_rejects_non_finite_values() {
