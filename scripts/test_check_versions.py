@@ -1,10 +1,10 @@
 """Negative-path tests for the release metadata guard."""
 
-from copy import deepcopy
 import json
-from pathlib import Path
 import subprocess
 import unittest
+from copy import deepcopy
+from pathlib import Path
 
 from check_versions import check, field
 

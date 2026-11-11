@@ -29,6 +29,9 @@ cargo test -p raster_h3 --test it pg_extension_e2e -- --ignored --nocapture
 
 # Run tests with output visible
 cargo test --workspace -- --nocapture
+
+# Lint every Python file (rules in ruff.toml; CI pins the version)
+pipx run ruff==0.17.4 check .
 ```
 
 ### Docker

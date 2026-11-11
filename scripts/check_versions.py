@@ -3,10 +3,10 @@
 
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 def field(text, pattern):
