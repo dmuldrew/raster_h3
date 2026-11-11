@@ -19,6 +19,9 @@ from conftest import RES, class_value, pixel_cells, sort  # noqa: E402
 
 MULTI = [8, RES]
 POLARS = tuple(int(x) for x in pl.__version__.split(".")[:2])
+# Before Polars 1.22, `scan_raster_h3` keeps filters out of the scan (those versions drop
+# some filters they hand to IO sources), so nothing is pushed and Polars filters instead.
+PUSHDOWN = POLARS >= (1, 22)
 
 
 @pytest.fixture
@@ -244,17 +247,9 @@ def test_filter_errors(raster_h3, gradient_tif, kwargs, error, match):
         ((pl.col("count") > 10) | (pl.col("mean") < 3), {}),
         (pl.col("count") != 3, {}),
         (pl.col("sum") > 100, {}),
-        pytest.param(
-            pl.col("count").cast(pl.Int64) > 10,
-            {},
-            # Polars before 1.22 hands an IO source `None` for a predicate it cannot pass
-            # down (here the strict cast) and then never applies it, so the scan returns
-            # unfiltered rows. Fixed in Polars 1.22.
-            marks=pytest.mark.skipif(
-                POLARS < (1, 22),
-                reason="polars < 1.22 drops cast predicates on IO sources (passes None)",
-            ),
-        ),
+        # Polars before 1.22 drops this filter if the IO source sees it (a strict cast
+        # cannot be handed down); `scan_raster_h3` keeps it in Polars on those versions.
+        (pl.col("count").cast(pl.Int64) > 10, {}),
     ],
 )
 def test_continuous_predicates(raster_h3, gradient_tif, scans, expr, pushed):
@@ -264,7 +259,8 @@ def test_continuous_predicates(raster_h3, gradient_tif, scans, expr, pushed):
     got = lf.filter(expr).collect()
     assert sort(got).equals(sort(expected))
     assert scans, "the IO source never opened a scan"
-    assert all(s["options"] == pushed for s in scans), scans
+    want = pushed if PUSHDOWN else {}
+    assert all(s["options"] == want for s in scans), scans
 
 
 def test_pushdown_combines_with_explicit_filters(raster_h3, gradient_tif, scans):
@@ -277,7 +273,7 @@ def test_pushdown_combines_with_explicit_filters(raster_h3, gradient_tif, scans)
     assert sort(got).equals(sort(expected))
     assert {s["options"]["min_count"] for s in scans} == {15}
     assert {s["options"]["max_mean"] for s in scans} == {10}
-    assert {s["options"]["min_mean"] for s in scans} == {6.0}
+    assert {s["options"].get("min_mean") for s in scans} == ({6.0} if PUSHDOWN else {None})
 
 
 @pytest.mark.parametrize(
@@ -296,7 +292,8 @@ def test_resolution_predicates_narrow_the_scan(raster_h3, gradient_tif, scans, e
     scans.clear()
     got = lf.filter(expr).collect()
     assert_frames_close(got, expected)
-    assert scans and all(s["resolutions"] == resolutions for s in scans), scans
+    want = resolutions if PUSHDOWN else MULTI
+    assert scans and all(s["resolutions"] == want for s in scans), scans
 
 
 def test_resolution_predicate_rejecting_every_resolution(raster_h3, gradient_tif, scans):
@@ -305,7 +302,8 @@ def test_resolution_predicate_rejecting_every_resolution(raster_h3, gradient_tif
     got = lf.filter(pl.col("resolution") == 12).collect()
     assert got.is_empty()
     assert dict(got.schema) == dict(lf.collect_schema() if hasattr(lf, "collect_schema") else lf.schema)
-    assert scans == []
+    if PUSHDOWN:
+        assert scans == []
 
 
 @pytest.mark.parametrize(
@@ -325,7 +323,8 @@ def test_categorical_wide_predicates(raster_h3, classes_tif, scans, expr, pushed
     scans.clear()
     got = lf.filter(expr).collect()
     assert sort(got).equals(sort(expected))
-    assert all(s["options"] == pushed for s in scans), scans
+    want = pushed if PUSHDOWN else {}
+    assert all(s["options"] == want for s in scans), scans
 
 
 def test_categorical_long_count_is_per_class(raster_h3, classes_tif, scans):
@@ -336,7 +335,8 @@ def test_categorical_long_count_is_per_class(raster_h3, classes_tif, scans):
     scans.clear()
     got = lf.filter(expr).collect()
     assert sort_cells(got).equals(sort_cells(expected))
-    assert all(s["options"] == {"min_count": 10.0} for s in scans), scans
+    want = {"min_count": 10.0} if PUSHDOWN else {}
+    assert all(s["options"] == want for s in scans), scans
 
 
 def test_pushdown_with_row_limit(raster_h3, gradient_tif):
@@ -367,4 +367,5 @@ def test_pushdown_without_native_scan_options(raster_h3, gradient_tif, scans, mo
     got = lf.filter(expr).collect()
     assert_frames_close(got, expected)
     # Narrowing the resolutions needs no new native entry point, so it still happens.
-    assert scans and all(s["options"] == {} and s["resolutions"] == [RES] for s in scans), scans
+    want = [RES] if PUSHDOWN else MULTI
+    assert scans and all(s["options"] == {} and s["resolutions"] == want for s in scans), scans
