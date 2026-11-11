@@ -76,3 +76,25 @@ def test_strict_scans_raise(raster_h3, past_pole_tif):
     if isinstance(lazy, pl.LazyFrame):
         with pytest.raises(Exception, match="strict_transforms"):
             lazy.collect()
+
+
+# PyArrow raises the stream's error and then drops the capsule while that exception is
+# still propagating. A capsule destructor that disturbs the pending exception turns it
+# into `SystemError: ... returned NULL without setting an exception`.
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_stream_errors_survive_pyarrow_dropping_the_capsule(raster_h3, past_pole_tif):
+    import pyarrow as pa
+
+    stream = raster_h3.RasterH3ArrowStream(past_pole_tif, 3, strict_transforms=True)
+    with pytest.raises(OSError, match="strict_transforms"):
+        pa.table(stream)
+    if hasattr(pa.RecordBatchReader, "from_stream"):
+        with pytest.raises(OSError, match="strict_transforms"):
+            pa.RecordBatchReader.from_stream(stream).read_all()
+
+    # Capsules nobody consumes are destroyed without complaint.
+    del stream
+    for _ in range(3):
+        fresh = raster_h3.RasterH3ArrowStream(past_pole_tif, 3)
+        fresh.__arrow_c_stream__()
+        fresh.__arrow_c_schema__()

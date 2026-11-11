@@ -325,6 +325,20 @@ def _get_lib() -> ctypes.CDLL:
             fn.argtypes = args + stats_args
             fn.restype = ctypes.c_int64
 
+    # Capsule destructors implemented in the library (absent from older builds). It never
+    # links libpython, so hand it the two CPython functions it needs to reach a payload.
+    if hasattr(lib, "raster_h3_py_set_capsule_api"):
+        lib.raster_h3_py_set_capsule_api.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.raster_h3_py_set_capsule_api.restype = None
+        lib.raster_h3_py_set_capsule_api(
+            ctypes.cast(ctypes.pythonapi.PyCapsule_GetName, ctypes.c_void_p),
+            ctypes.cast(ctypes.pythonapi.PyCapsule_GetPointer, ctypes.c_void_p),
+        )
+        for kind in ("stream", "schema"):
+            _NATIVE_CAPSULE_DESTRUCTORS[kind] = _PYCAPSULE_DESTRUCTOR(
+                (f"raster_h3_py_{kind}_capsule_destructor", lib)
+            )
+
     _LIB = lib
     return lib
 
@@ -379,6 +393,26 @@ def _stream_capsule_destructor(capsule_ptr: int) -> None:
         ptr = _capsule_pointer(capsule_ptr)
         if ptr:
             _LIB.raster_h3_py_free_arrow_stream(ptr)
+
+
+# Destructors exported by the native library, by capsule kind; filled in by `_get_lib`.
+_NATIVE_CAPSULE_DESTRUCTORS: Dict[str, Any] = {}
+
+
+def _capsule_destructor(kind: str) -> Any:
+    """Destructor for a `"stream"` or `"schema"` capsule.
+
+    A capsule can be destroyed while an exception is propagating: PyArrow raises the
+    stream's own error and then drops the capsule. A destructor written in Python cannot
+    run in that state without clearing the pending exception, which turns the scan's
+    error into `SystemError: ... returned NULL without setting an exception` and leaks
+    the stream. The native destructor does not touch the error state, so it is used
+    whenever the loaded library has one.
+    """
+    native = _NATIVE_CAPSULE_DESTRUCTORS.get(kind)
+    if native is not None:
+        return native
+    return _stream_capsule_destructor if kind == "stream" else _schema_capsule_destructor
 
 
 def _raise_if_err(err_ptr: ctypes.c_void_p) -> None:
@@ -534,7 +568,7 @@ class _OwnedArrowStream:
         if not ptr:
             raise RuntimeError("Arrow stream was already consumed")
         return ctypes.pythonapi.PyCapsule_New(
-            ptr, b"arrow_array_stream", _stream_capsule_destructor
+            ptr, b"arrow_array_stream", _capsule_destructor("stream")
         )
 
     def __del__(self) -> None:
@@ -688,7 +722,7 @@ class RasterH3ArrowStream:
             if not ptr:
                 raise RuntimeError("Failed to create ArrowSchema")
             return ctypes.pythonapi.PyCapsule_New(
-                ptr, b"arrow_schema", _schema_capsule_destructor
+                ptr, b"arrow_schema", _capsule_destructor("schema")
             )
         self._has_v2(lib)  # raises when options need a newer library
         create = lib.raster_h3_py_create_arrow_schema
@@ -705,7 +739,7 @@ class RasterH3ArrowStream:
         if not ptr:
             raise RuntimeError("Failed to create ArrowSchema")
         return ctypes.pythonapi.PyCapsule_New(
-            ptr, b"arrow_schema", _schema_capsule_destructor
+            ptr, b"arrow_schema", _capsule_destructor("schema")
         )
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
@@ -736,7 +770,7 @@ class RasterH3ArrowStream:
         if not ptr:
             raise RuntimeError("Failed to create ArrowArrayStream")
         return ctypes.pythonapi.PyCapsule_New(
-            ptr, b"arrow_array_stream", _stream_capsule_destructor
+            ptr, b"arrow_array_stream", _capsule_destructor("stream")
         )
 
     def to_dict(self) -> Dict[str, List[Any]]:
@@ -1349,8 +1383,10 @@ def _as_pyarrow_table(data: Any) -> Any:
             return pa.concat_tables(list(data))
         if not data:
             return None
-    if hasattr(data, "to_arrow") and not hasattr(data, "__arrow_c_stream__"):
-        return data.to_arrow()  # older Polars
+    if hasattr(data, "to_arrow"):
+        # Polars. Its own conversion targets the installed PyArrow; its Arrow stream can
+        # carry types an older PyArrow cannot import (string views, format `vu`).
+        return data.to_arrow()
     return pa.table(data)
 
 
