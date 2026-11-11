@@ -274,7 +274,9 @@ SELECT * FROM h3_raster_continuous_aggregate(
 > 💡 **Tip**: For optimal remote streaming and maximum local throughput, source rasters should be formatted as tiled WGS84 COGs with $512 \times 512$ blocks. See [Optimal Raster Format & Ingestion Speed](../optimal-raster-format.md).
 
 These reads use the extension's built-in HTTP/S3 client, configured through `AWS_*`
-environment variables, and accept `http(s)://` and `s3://` paths only. Other schemes
+and `RASTER_H3_AUTH_*` environment variables (see
+[Remote credentials](core.md#remote-credentials) for which hosts receive them), and
+accept `http(s)://` and `s3://` paths only. Other schemes
 such as `gs://` fail with an "Unsupported remote protocol" error unless the DuckDB file
 system below is enabled.
 
