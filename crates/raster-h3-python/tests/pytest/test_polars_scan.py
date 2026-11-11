@@ -14,6 +14,9 @@ from conftest import RES, frame, sort  # noqa: E402
 
 KEY = ["h3_index", "mean", "count"]
 POLARS = tuple(int(x) for x in pl.__version__.split(".")[:2])
+# Before Polars 1.22, `scan_raster_h3` keeps filters out of the scan (those versions drop
+# some filters they hand to IO sources); that also stops `head(n)` from reaching it.
+PUSHDOWN = POLARS >= (1, 22)
 
 
 def semi(df, keys):
@@ -71,13 +74,9 @@ def test_columns_argument_limits_schema_and_scan(raster_h3, gradient_tif, eager,
     [
         lambda: pl.col("mean") > 9.0,
         lambda: (pl.col("count") >= 10) & (pl.col("min") <= 3.0),
-        pytest.param(
-            lambda: pl.col("h3_hex").str.ends_with("fffff"),
-            marks=pytest.mark.skipif(
-                POLARS < (1, 22),
-                reason="polars < 1.22 drops str predicates on IO sources (passes None)",
-            ),
-        ),
+        # Polars before 1.22 drops a string filter it hands to an IO source;
+        # `scan_raster_h3` keeps it in Polars on those versions.
+        lambda: pl.col("h3_hex").str.ends_with("fffff"),
         lambda: pl.col("mean") < 0.0,
     ],
     ids=["mean", "count_and_min", "hex", "none_match"],
@@ -108,6 +107,9 @@ def test_head_pushdown_limits_scan(raster_h3, gradient_tif, eager, scans, n):
     # Every returned row is a real cell of the full scan, with identical values.
     assert sort(out).equals(semi(eager, out))
     pushed = [s["limit"] for s in scans]
+    if not PUSHDOWN:
+        assert all(lim is None for lim in pushed), pushed
+        return
     if n == 0:
         # Polars may answer `head(0)` from the schema without calling the source.
         assert all(lim == 0 for lim in pushed), pushed
@@ -175,3 +177,19 @@ def test_scan_errors_raise(raster_h3, gradient_tif, tmp_path):
         raster_h3.scan_raster_h3(gradient_tif, RES).select("nope").collect()
     with pytest.raises(Exception, match="bounding box"):
         raster_h3.scan_raster_h3(gradient_tif, RES, bbox=[5, 5, 6, 6]).collect()
+
+
+@pytest.mark.parametrize(
+    "version, affected",
+    [
+        ("1.4.1", True),
+        ("1.21.0", True),
+        ("1.22.0", False),
+        ("1.22.0b1", False),
+        ("1.35.2", False),
+        ("2.1.0", False),
+        ("unknown", True),
+    ],
+)
+def test_filter_guard_version_check(raster_h3, version, affected):
+    assert raster_h3._polars_drops_unpushed_predicates(version) is affected

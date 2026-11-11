@@ -156,6 +156,14 @@ resolutions can change `stddev` in the last bits (summation order); values are o
 identical. Pushdown reads the predicate through `Expr.meta.serialize`, so Polars versions
 without it fall back to filtering in Polars.
 
+**Polars before 1.22.** These versions hand an IO source no predicate for a filter they
+cannot pass down (a strict `cast`, string functions such as `str.ends_with`, ...) and then
+never apply that filter, so a plain IO source would return unfiltered rows. On these
+versions `scan_raster_h3` keeps every filter above the scan, where Polars applies it: results
+are exact, projection is still pushed, but filters and `head(n)` no longer reach the engine,
+so a filtered or limited query aggregates the whole raster first. Upgrade to Polars 1.22 or
+later to get filter and slice pushdown back.
+
 ### Example
 
 ```python
