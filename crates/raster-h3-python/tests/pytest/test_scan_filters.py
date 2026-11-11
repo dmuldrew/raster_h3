@@ -18,6 +18,7 @@ pytest.importorskip("polars.io.plugins", reason="register_io_source needs polars
 from conftest import RES, class_value, pixel_cells, sort  # noqa: E402
 
 MULTI = [8, RES]
+POLARS = tuple(int(x) for x in pl.__version__.split(".")[:2])
 
 
 @pytest.fixture
@@ -243,7 +244,17 @@ def test_filter_errors(raster_h3, gradient_tif, kwargs, error, match):
         ((pl.col("count") > 10) | (pl.col("mean") < 3), {}),
         (pl.col("count") != 3, {}),
         (pl.col("sum") > 100, {}),
-        (pl.col("count").cast(pl.Int64) > 10, {}),
+        pytest.param(
+            pl.col("count").cast(pl.Int64) > 10,
+            {},
+            # Polars before 1.22 hands an IO source `None` for a predicate it cannot pass
+            # down (here the strict cast) and then never applies it, so the scan returns
+            # unfiltered rows. Fixed in Polars 1.22.
+            marks=pytest.mark.skipif(
+                POLARS < (1, 22),
+                reason="polars < 1.22 drops cast predicates on IO sources (passes None)",
+            ),
+        ),
     ],
 )
 def test_continuous_predicates(raster_h3, gradient_tif, scans, expr, pushed):
