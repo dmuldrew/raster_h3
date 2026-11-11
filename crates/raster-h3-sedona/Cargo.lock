@@ -1873,7 +1873,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "h3o"
 version = "0.11.0"
-source = "git+https://github.com/dmuldrew/h3o?branch=raster-row-indexing#c880d8242754400f05d149542674f3a409c9ac6d"
+source = "git+https://github.com/dmuldrew/h3o?rev=c880d8242754400f05d149542674f3a409c9ac6d#c880d8242754400f05d149542674f3a409c9ac6d"
 dependencies = [
  "ahash",
  "either",
