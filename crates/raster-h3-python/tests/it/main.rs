@@ -5,6 +5,7 @@ mod helpers;
 
 mod batch_reader;
 mod c_abi;
+mod capsules;
 mod exports;
 mod partitions;
 mod scalars;
