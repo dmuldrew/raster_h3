@@ -43,6 +43,8 @@ pub mod parquet_table_function;
 pub mod partition_functions;
 /// Direct streaming export of H3 aggregations to PMTiles archives (`raster_h3_pmtiles`).
 pub mod pmtiles_table_function;
+/// Shared bind/init/scan driver for the raster aggregation table functions.
+pub(crate) mod raster_table;
 /// Helper scalar functions such as `h3_to_string` and coordinate extractors.
 pub mod scalar;
 /// Continuous raster aggregation table function (`raster_h3`).

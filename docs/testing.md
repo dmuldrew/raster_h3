@@ -170,7 +170,7 @@ Results must not depend on thread count, scheduling or pool nesting.
 | :--- | :--- |
 | [`core/memory_budgets.rs`](../crates/raster-h3-core/tests/it/memory_budgets.rs) (2) | The decoded-chunk budget bounds held chunks without changing results; the compaction limit decomposes groups without losing or duplicating samples. |
 | [`core/sparse_chunks_and_spilling.rs`](../crates/raster-h3-core/tests/it/sparse_chunks_and_spilling.rs) (4) | Sparse COG chunks are filled with a non-zero NoData and skipped; a low aggregation budget creates spill runs (`spill_run_count() > 0`) and the external merge matches an in-memory reference; with resolutions 6 and 8, compaction and four aggregation workers, a budget that spills only resolution 8 (resolution 6 stays in memory, checked per resolution) reproduces the in-memory continuous (count, sum, min, max, p50) and categorical (heap class maps) output exactly. |
-| Unit: `multi_horizon/spill.rs` (5) | Spill file writing and merging. |
+| Unit: `multi_horizon/spill.rs` (8) | Spill file writing and merging; the shared spill and partial-state decoder accepts every state an accumulator can reach (including overflowed sums) and rejects NaN, negative or infinite counts, totals and weights, a negative `m2`, `min > max`, and duplicate buckets or classes. |
 | Unit: `pmtiles/external_export.rs` (6) | The external-sort PMTiles exporter: with a 4 KiB budget (several spilled runs) and eviction every 8 features, the archive is byte-identical to an unspilled export and has the same tile count as single-pass accumulation; run records round-trip every `MvtValue` kind; an empty export is a valid archive; the spill directory is created only when a run is written. |
 | [`memory`](../crates/raster-h3-core/tests/memory/scenarios.rs) (7 scenarios, 38 checks) | Measured, not estimated, memory. A counting allocator records peak live heap and allocations; each scenario variant runs in its own process. `spill_sorted_run`: the sorted vector built for a spill run is the only new heap while the map's shards drain (accumulators move, nothing is cloned), it fits within the map's accounted bytes, and the map is freed afterwards (plain, quantile and categorical maps). `spill_stream_quantiles`, `categorical_high_cardinality`: p50/p90 sketches and ~46-class heap histograms forced to spill reproduce the in-memory output bit for bit per cell, stay within the budget and lower peak heap. `slow_http_consumer`: with a slow consumer, held response bytes stay within `max_buffered_bytes`, peak heap within twice it and under half of the chunk-count bound alone, with one request per coalesced range. `slow_parquet_writer`: a writer that sleeps per row group adds at most three row-group buffers. `many_tiny_chunks`: 512 one-row strips cost at most 16 allocations each and coalesce into one HTTP range. `concurrent_streams`: four streams use at most 5× the heap of one. |
 
@@ -418,8 +418,8 @@ The [safety workflow](../.github/workflows/safety.yml) runs a short coverage-gui
 AddressSanitizer-enabled fuzz smoke test on code changes and tags, and longer weekly runs.
 Targets cover the core WKB/EWKB parser, GeoTIFF metadata reader, integer/floating-point
 chunk unpacking and predictors, the columnar IPC stream reader, Arrow `ArrowArray` import
-with forged variable-length offsets, the categorical remap parser, and `Content-Range`
-header parsing. Dimensions and allocations in the predictor harness are bounded;
+with forged variable-length offsets, the categorical remap parser, `Content-Range`
+header parsing, and the partial-state decoder (which also reads spill runs). Dimensions and allocations in the predictor harness are bounded;
 GeoTIFF metadata fuzzing deliberately does not decode attacker-controlled image dimensions.
 These are not exhaustive CRS or database ABI fuzzers.
 
@@ -433,6 +433,7 @@ cargo +nightly fuzz run ipc -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run arrow_import -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run remap -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run content_range -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run partial_state -- -max_total_time=60 -max_len=65536
 rustup component add --toolchain nightly miri rust-src
 cargo +nightly miri test --locked -p raster-h3-core --lib -- columnar:: aggregator::categorical:: raster::predictor::
 # FFI layers (the full list of commands, including the leak exceptions, is in safety.yml)

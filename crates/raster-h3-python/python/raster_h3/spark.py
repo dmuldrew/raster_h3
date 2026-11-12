@@ -395,7 +395,6 @@ def merge_partials(
     """
     _require_pyspark()
     from pyspark.sql.pandas.types import to_arrow_schema
-
     from pyspark.sql.types import StructType
 
     state = raster_h3.PARTIAL_STATE_COLUMN
