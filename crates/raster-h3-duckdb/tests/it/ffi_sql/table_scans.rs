@@ -358,14 +358,14 @@ fn test_categorical_table_function_wide_and_long_formats() {
         unsafe {
             let maj_classes = chunk.vectors[2].data.as_ptr() as *const i64;
             let totals = chunk.vectors[6].data.as_ptr() as *const f64;
-            for i in 0..chunk.size {
+            for (i, hist) in chunk.vectors[7].strings[..chunk.size].iter().enumerate() {
                 let mc = *maj_classes.add(i);
                 assert!(
                     mc == 10 || mc == 20 || mc == 30,
                     "Remapped majority class must be in {{10, 20, 30}}, got {mc}"
                 );
                 wide_total_pixels += *totals.add(i);
-                let hist = std::str::from_utf8(&chunk.vectors[7].strings[i]).unwrap();
+                let hist = std::str::from_utf8(hist).unwrap();
                 assert!(hist.starts_with('{') && hist.ends_with('}'));
             }
         }

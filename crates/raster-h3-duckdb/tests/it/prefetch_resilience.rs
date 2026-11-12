@@ -265,7 +265,9 @@ fn test_ordered_prefetch_queue_worker_panic_latches_error() {
             panic!("unexpected decoder decompression failure");
         }));
 
-        if let Err(payload) = res {
+        // `.err()`: the closure always panics, so newer compilers infer `!` for its
+        // return type and `if let Err(..)` would be irrefutable.
+        if let Some(payload) = res.err() {
             let msg = raster_h3_duckdb::ffi::panic_payload_to_string(payload);
             q.fail(Err(raster_h3_core::error::RasterH3Error::InvalidParameter(
                 format!("Decode worker panicked: {msg}"),
