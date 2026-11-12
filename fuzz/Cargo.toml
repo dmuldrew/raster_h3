@@ -65,6 +65,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "partial_state"
+path = "fuzz_targets/partial_state.rs"
+test = false
+doc = false
+bench = false
+
 # Keep in sync with the workspace `[patch.crates-io]`: this crate is its own
 # workspace, so the root patch does not apply here.
 [patch.crates-io]

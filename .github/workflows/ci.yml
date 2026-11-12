@@ -69,6 +69,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Rules and scope are in ruff.toml; the version is pinned so a ruff release cannot
+      # change what CI checks.
+      - name: Lint Python (ruff)
+        run: pipx run ruff==0.17.4 check --output-format github .
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -215,13 +220,13 @@ jobs:
         env:
           DUCKDB_EXTENSION_SIGNING_KEY: ${{ secrets.DUCKDB_EXTENSION_SIGNING_KEY }}
         run: |
-          cargo run --release --bin package_extension -- \
+          cargo run --locked --release --bin package_extension -- \
             --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
             --output target/${{ matrix.target }}/release/raster_h3.duckdb_extension \
             --platform ${{ matrix.platform }} \
             --duckdb-version v1.2.0
 
-          cargo run --release --bin package_extension -- \
+          cargo run --locked --release --bin package_extension -- \
             --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
             --output target/${{ matrix.target }}/release/raster_h3.duckdb_extension.gz \
             --platform ${{ matrix.platform }} \
@@ -240,12 +245,12 @@ jobs:
           # On Linux x86_64, also package under the `linux_amd64` platform tag used by DuckDB v1.3+ and v2.0+
           if [[ "${{ matrix.platform }}" == "linux_amd64_gcc4" ]]; then
             mkdir -p dist/v1.2.0/linux_amd64
-            cargo run --release --bin package_extension -- \
+            cargo run --locked --release --bin package_extension -- \
               --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
               --output dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension \
               --platform linux_amd64 \
               --duckdb-version v1.2.0
-            cargo run --release --bin package_extension -- \
+            cargo run --locked --release --bin package_extension -- \
               --input target/${{ matrix.target }}/release/${{ matrix.lib_file }} \
               --output dist/v1.2.0/linux_amd64/raster_h3.duckdb_extension.gz \
               --platform linux_amd64 \
@@ -268,13 +273,13 @@ jobs:
           CARGO_TARGET_DIR=target-v156 cargo build --locked --release --target ${{ matrix.target }} \
             -p raster_h3 --lib --features duckdb-api-v1_5_6
 
-          cargo run --release --bin package_extension -- \
+          cargo run --locked --release --bin package_extension -- \
             --input target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }} \
             --output "dist/v2.0.0/$V2_PLATFORM/raster_h3.duckdb_extension" \
             --platform "$V2_PLATFORM" \
             --duckdb-version v1.5.6
 
-          cargo run --release --bin package_extension -- \
+          cargo run --locked --release --bin package_extension -- \
             --input target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }} \
             --output "dist/v2.0.0/$V2_PLATFORM/raster_h3.duckdb_extension.gz" \
             --platform "$V2_PLATFORM" \
@@ -284,7 +289,7 @@ jobs:
           # Signed builds must verify before they are uploaded for release
           if [[ -n "${DUCKDB_EXTENSION_SIGNING_KEY:-}" ]]; then
             for ext in dist/v*/*/raster_h3.duckdb_extension*; do
-              cargo run --release --bin package_extension -- --verify "$ext"
+              cargo run --locked --release --bin package_extension -- --verify "$ext"
             done
           fi
 
@@ -325,8 +330,8 @@ jobs:
             DUCKDB_BIN="$(cygpath -w "$(pwd)/duckdb.exe")"
           fi
           export DUCKDB_BIN
-          cargo build --release --lib
-          cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
+          cargo build --locked --release --lib
+          cargo test --locked --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
 
       - name: Run DuckDB 1.5.6 SQL Smoke Test
         if: matrix.cli_arch != ''
@@ -350,7 +355,7 @@ jobs:
           export DUCKDB_BIN
           export DUCKDB_VERSION=v1.2.0
           chmod +x "$DUCKDB_BIN" || true
-          cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
+          cargo test --locked --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
 
       - name: Run DuckDB 2.0.0 SQL Smoke Test
         if: matrix.cli_arch != ''
@@ -389,10 +394,10 @@ jobs:
           export DUCKDB_VERSION=v1.5.6
           export RASTER_H3_LIBRARY="$(pwd)/target-v156/${{ matrix.target }}/release/${{ matrix.lib_file }}"
           chmod +x "$DUCKDB_BIN" || true
-          cargo test --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
+          cargo test --locked --release -p raster_h3 --test it duckdb_sql_smoke -- --ignored
           # Signed install/load through CREATE EXTENSION REPOSITORY (no -unsigned), plus
           # rejection of unsigned and wrong-key extensions
-          cargo test --release -p raster_h3 --test it duckdb_trusted_repository -- --ignored
+          cargo test --locked --release -p raster_h3 --test it duckdb_trusted_repository -- --ignored
 
       - name: Upload Extension Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -461,10 +466,10 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run tests
-        run: cargo test --release --no-fail-fast -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg
+        run: cargo test --locked --release --no-fail-fast -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg
 
       - name: Run pg-extension tests
-        run: cargo test --release --no-fail-fast -p raster-h3-pg --features pg-extension
+        run: cargo test --locked --release --no-fail-fast -p raster-h3-pg --features pg-extension
 
   # The Rust suites above drive the Python crate's C ABI. This runs the package itself,
   # `python/raster_h3`, against real Polars and PyArrow, loading the in-tree package with

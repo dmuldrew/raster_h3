@@ -116,6 +116,10 @@ returns a `LazyFrame` backed by an IO source; otherwise it returns the
 | `predicate` | Comparisons on `count` / `total_count`, `mean`, `majority_fraction` and `resolution` joined by `&` are pushed into the engine as `min_count`, `min_mean`, `max_mean`, `min_majority_fraction` and a narrower set of resolutions; Polars then applies the full predicate to each batch. See [Query optimisation](../polars-api-reference.md#query-optimisation) |
 | `batch_size` | Passed to `iter_batches` |
 
+Before Polars 1.22 neither `predicate` nor `n_rows` reaches the engine: those versions drop
+some filters they hand to IO sources, so `scan_raster_h3` keeps all filters in Polars. See
+[Query optimisation](../polars-api-reference.md#query-optimisation).
+
 The declared `LazyFrame` schema has no quantile columns, which matches the Python API
 (quantiles cannot be requested from Python).
 
