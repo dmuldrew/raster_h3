@@ -56,11 +56,14 @@ fn versioned_source(mode: &str) -> (MockHttpServer, Arc<RemoteHttpSource>) {
     (server, source)
 }
 
+/// The `If-Match` request header lines, with the header name normalised to
+/// `If-Match` (header names are case-insensitive; the client may send any case).
 fn conditional_requests(server: &MockHttpServer) -> Vec<String> {
     server
         .recorded_headers()
         .into_iter()
         .filter(|h| h.to_ascii_lowercase().starts_with("if-match:"))
+        .map(|h| format!("If-Match:{}", &h["if-match:".len()..]))
         .collect()
 }
 
@@ -570,9 +573,18 @@ impl MockHttpServer {
             let _ = stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             return;
         }
-        let version_header = etag
+        let mut version_header = etag
             .map(|tag| format!("ETag: {tag}\r\n"))
             .unwrap_or_default();
+        // `padded_head_<N>` adds an N-byte header value to every response head.
+        if let Some(n) = path
+            .split("padded_head_")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            version_header.push_str(&format!("X-Padding: {}\r\n", "p".repeat(n)));
+        }
         let replacement;
         let file_bytes = if replaced {
             replacement = file_bytes
@@ -2267,6 +2279,54 @@ fn auth_token_is_sent_only_to_listed_hosts() {
             "{retargeted:?}"
         );
     }
+}
+
+// The HTTP agent's per-connection buffers are fixed in size: a request head
+// must fit the output buffer and a response head the input buffer. Typical
+// large heads (a 6 KiB bearer token, 12 KiB of response headers) still work.
+// The token is process-wide while set, so it must stay small enough that
+// concurrent loopback tests that do not take ENV_MUTEX still fit their heads;
+// the oversized case is the `check_request_head` unit test instead.
+#[test]
+fn large_request_and_response_heads_fit_the_agent_buffers() {
+    let _env_lock = ENV_MUTEX.lock().unwrap();
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let token = "t".repeat(6 * 1024);
+    std::env::set_var("RASTER_H3_AUTH_TOKEN", &token);
+    std::env::set_var("RASTER_H3_AUTH_HOSTS", "127.0.0.1");
+    let server = MockHttpServer::start(data.clone());
+    let transport = HttpTransport::new(&format!("{}/padded_head_12288.tif", server.url_base));
+    let result = transport.and_then(|t| t.fetch_range(0, 9, None));
+    std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
+
+    assert_eq!(result.unwrap(), data[..10]);
+    let expected = format!("authorization: bearer {token}");
+    assert!(recorded_lowercase(&server)
+        .iter()
+        .any(|h| h.trim() == expected));
+}
+
+// A response head larger than the agent's input buffer fails the request
+// with a clear transport error instead of hanging or being misread.
+#[test]
+fn oversized_response_head_is_a_transport_error() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let server = MockHttpServer::start(vec![0u8; 4096]);
+    let url = format!("{}/padded_head_20480.tif", server.url_base);
+    let error = match RemoteHttpSource::open(&url) {
+        Ok(_) => panic!("a 20 KiB response head must be rejected"),
+        Err(err) => err.to_string(),
+    };
+    assert!(error.contains("Network transport error"), "{error}");
+    assert!(error.contains("response header is too big"), "{error}");
 }
 
 // A server that refuses the request is the only sign the caller gets that a

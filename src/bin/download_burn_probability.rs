@@ -221,9 +221,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
 
             let t0 = Instant::now();
-            let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(60))
-                .build();
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(60)))
+                .proxy(None)
+                .build()
+                .into();
 
             match agent.get(&url).call() {
                 Ok(resp) => {
@@ -231,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     match File::create(&temp_path) {
                         Ok(file) => {
                             let mut writer = BufWriter::new(file);
-                            match copy(&mut resp.into_reader(), &mut writer) {
+                            match copy(&mut resp.into_body().into_reader(), &mut writer) {
                                 Ok(bytes_written) => {
                                     drop(writer);
                                     if let Err(e) = fs::rename(&temp_path, &job.out_path) {
