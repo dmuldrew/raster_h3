@@ -32,8 +32,8 @@ use raster_h3::core::columnar::ipc::read_ipc_stream;
 use raster_h3::core::columnar::{
     ArrowArrayStream, CategoricalBatchReader, CategoricalFormat, ColumnArray, ContinuousBatchReader,
 };
-use raster_h3::datafusion::{FilterPredicate, RasterH3SessionCatalog, TableProvider};
-use raster_h3::pg::{
+use raster_h3_datafusion::{FilterPredicate, RasterH3SessionCatalog, TableProvider};
+use raster_h3_pg::{
     datum_to_float8, datum_to_int64, int64_to_datum, pg_h3_cell_to_parent, pg_h3_get_resolution,
     pg_h3_is_valid, pg_h3_to_lat, pg_h3_to_lng, pg_scalar_h3_to_string, pg_scalar_h3_to_wkb_u64,
     pg_scalar_string_to_h3, pg_srf_continuous_close, pg_srf_continuous_next,
