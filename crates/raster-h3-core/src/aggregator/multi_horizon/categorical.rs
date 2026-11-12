@@ -112,6 +112,50 @@ fn process_categorical_slice_into_maps<T: CategoricalUniformity + Default>(
     remapper: Option<&CategoryRemapper>,
     chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, H3BuildHasher>],
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the running CPU supports FMA, checked just above.
+        unsafe {
+            process_categorical_slice_into_maps_fma(
+                ctx,
+                slice,
+                native_nodata,
+                band,
+                remapper,
+                chunk_maps,
+            )
+        };
+        return;
+    }
+    process_categorical_slice_into_maps_impl(ctx, slice, native_nodata, band, remapper, chunk_maps);
+}
+
+/// [`process_categorical_slice_into_maps`] compiled with hardware FMA. h3o's projection math uses
+/// `f64::mul_add`, which without the `fma` target feature lowers to a software
+/// routine; hardware and software FMA are both correctly rounded, so results
+/// are bit-identical.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn process_categorical_slice_into_maps_fma<T: CategoricalUniformity + Default>(
+    ctx: &WalkContext<'_>,
+    slice: &[T],
+    native_nodata: Option<T>,
+    band: usize,
+    remapper: Option<&CategoryRemapper>,
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, H3BuildHasher>],
+) {
+    process_categorical_slice_into_maps_impl(ctx, slice, native_nodata, band, remapper, chunk_maps);
+}
+
+#[inline(always)]
+fn process_categorical_slice_into_maps_impl<T: CategoricalUniformity + Default>(
+    ctx: &WalkContext<'_>,
+    slice: &[T],
+    native_nodata: Option<T>,
+    band: usize,
+    remapper: Option<&CategoryRemapper>,
+    chunk_maps: &mut [HashMap<u64, CategoricalAccumulator, H3BuildHasher>],
+) {
     let engine = CategoricalEngine::new(native_nodata, remapper);
     let samples_per_pixel = ctx.samples_per_pixel as usize;
     if samples_per_pixel <= 1 {
@@ -332,4 +376,41 @@ pub fn process_categorical_borrowed_into(
         process_categorical_slice_into_maps(window, slice, nd, band, remapper, chunk_maps);
     });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hardware-FMA copy of the kernel must produce exactly the class
+    /// counts the portable copy does.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_and_portable_kernels_agree_bit_for_bit() {
+        if !std::arch::is_x86_feature_detected!("fma") {
+            eprintln!("skipping: this CPU has no FMA");
+            return;
+        }
+        let values: Vec<u8> = (0..48 * 32)
+            .map(|i| if i % 41 == 0 { 255 } else { (i % 23) as u8 })
+            .collect();
+        super::super::walker::for_each_kernel_test_context(|name, ctx| {
+            let mut portable = vec![HashMap::default(); ctx.resolutions.len()];
+            let mut fma = vec![HashMap::default(); ctx.resolutions.len()];
+            process_categorical_slice_into_maps_impl(
+                ctx,
+                &values,
+                Some(255),
+                1,
+                None,
+                &mut portable,
+            );
+            // SAFETY: FMA support was checked above.
+            unsafe {
+                process_categorical_slice_into_maps_fma(ctx, &values, Some(255), 1, None, &mut fma)
+            };
+            assert!(portable.iter().all(|m| !m.is_empty()), "{name}: empty maps");
+            assert!(portable == fma, "{name}: kernels disagree");
+        });
+    }
 }

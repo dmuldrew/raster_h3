@@ -105,6 +105,7 @@ pub fn is_transparent<T: Copy + Default + PartialEq>(ctx: &WalkContext<'_>, px: 
 
 /// Walk a single-band window. Center sampling batches contiguous pixels
 /// through the engine's span kernels.
+#[inline(always)]
 pub fn walk_direct<T, Acc, E, N>(
     ctx: &WalkContext<'_>,
     slice: &[T],
@@ -132,6 +133,7 @@ pub fn walk_direct<T, Acc, E, N>(
 
 /// Walk a window of `ctx.samples_per_pixel` interleaved values; `read` reduces
 /// one pixel's values (a band selection or spectral index) to a sample.
+#[inline(always)]
 pub fn walk_interleaved<T, Acc, E, R>(
     ctx: &WalkContext<'_>,
     slice: &[T],
@@ -158,6 +160,7 @@ pub fn walk_interleaved<T, Acc, E, R>(
 
 /// Single-band walk without mosaic ownership; retained for existing callers.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn scanline_walk<T, Acc, E, FNoData>(
     slice: &[T],
     chunk: &RasterChunk,
@@ -193,6 +196,7 @@ pub fn scanline_walk<T, Acc, E, FNoData>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn walk<T, Acc, E, N, R>(
     ctx: &WalkContext<'_>,
     slice: &[T],
@@ -503,7 +507,7 @@ impl<Acc: Clone> Runs<Acc> {
     }
 
     /// Index every resolution and flush the preceding span before restarting any run.
-    #[inline]
+    #[inline(always)]
     fn advance_cells<T, E: ScanlineEngine<T, Acc>>(
         &mut self,
         ll: LatLng,
@@ -679,6 +683,91 @@ impl RowPruner {
         let clamp = |v: f64| v.clamp(0.0, row_px as f64) as usize;
         let cols = clamp(first)..clamp(last);
         (!cols.is_empty()).then_some(cols)
+    }
+}
+
+/// Walk contexts for checking that two kernel builds agree: WGS84 north-up,
+/// WGS84 rotated and sheared, UTM and Web Mercator, each with centre and
+/// sixteen-point sampling, at resolutions 7, 9 and 11. `f` gets each context.
+#[cfg(test)]
+pub(crate) fn for_each_kernel_test_context(mut f: impl FnMut(&str, &WalkContext<'_>)) {
+    let chunk = RasterChunk {
+        col_offset: 3,
+        row_offset: 5,
+        width: 48,
+        height: 32,
+    };
+    let resolutions = [7u8, 9, 11].map(|r| Resolution::try_from(r).unwrap());
+    let utm = CrsTransformer::from_epsg_code(32610).unwrap();
+    let mercator = CrsTransformer::from_epsg_code(3857).unwrap();
+    let wgs84 = CrsTransformer::Wgs84Identity;
+    let cases: [(&str, &CrsTransformer, GeoTransform); 4] = [
+        (
+            "wgs84",
+            &wgs84,
+            GeoTransform {
+                c0: -122.41,
+                a: 0.0007,
+                b: 0.0,
+                f0: 37.81,
+                d: 0.0,
+                e: -0.0007,
+            },
+        ),
+        (
+            "wgs84 rotated",
+            &wgs84,
+            GeoTransform {
+                c0: -122.41,
+                a: 0.0006,
+                b: 0.0002,
+                f0: 37.81,
+                d: 0.0001,
+                e: -0.0006,
+            },
+        ),
+        (
+            "utm 10n",
+            &utm,
+            GeoTransform {
+                c0: 551_000.0,
+                a: 30.0,
+                b: 0.0,
+                f0: 4_180_000.0,
+                d: 0.0,
+                e: -30.0,
+            },
+        ),
+        (
+            "web mercator",
+            &mercator,
+            GeoTransform {
+                c0: -13_627_665.27,
+                a: 38.2,
+                b: 0.0,
+                f0: 4_547_675.35,
+                d: 0.0,
+                e: -38.2,
+            },
+        ),
+    ];
+    for (name, crs, gt) in cases {
+        for sampling in [SamplingPattern::center(), SamplingPattern::sixteen_point()] {
+            let ctx = WalkContext {
+                chunk: &chunk,
+                resolutions: &resolutions,
+                crs,
+                gt: &gt,
+                sampling: &sampling,
+                bbox: None,
+                stride: 0,
+                samples_per_pixel: 1,
+                owner: None,
+                band_scaling: &[],
+                alpha_sample: None,
+            };
+            f(name, &ctx);
+        }
     }
 }
 
