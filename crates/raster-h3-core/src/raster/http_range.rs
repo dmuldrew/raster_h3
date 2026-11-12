@@ -33,7 +33,7 @@ use rustc_hash::FxHashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use ureq::Agent;
 use url::Url;
 
@@ -1193,12 +1193,80 @@ impl RemoteHttpSource {
 pub struct HttpRangeReader {
     pub source: Arc<RemoteHttpSource>,
     pub cursor: u64,
+    overlay: Option<Arc<ReadOverlay>>,
+}
+
+/// Bytes of one range of a remote file that are already in memory. An [`HttpRangeReader`]
+/// built with [`HttpRangeReader::with_overlay`] serves reads inside the staged range from
+/// it instead of fetching them again.
+#[derive(Debug, Default)]
+pub struct ReadOverlay {
+    staged: Mutex<Option<(u64, Vec<u8>)>>,
+}
+
+impl ReadOverlay {
+    /// Serve `bytes` for the file range starting at `offset` until [`Self::clear`].
+    pub fn stage(&self, offset: u64, bytes: &[u8]) {
+        if let Ok(mut staged) = self.staged.lock() {
+            let mut buf = staged.take().map(|(_, buf)| buf).unwrap_or_default();
+            buf.clear();
+            buf.extend_from_slice(bytes);
+            *staged = Some((offset, buf));
+        }
+    }
+
+    /// Stop serving the staged bytes (the allocation is kept for the next stage).
+    pub fn clear(&self) {
+        if let Ok(mut staged) = self.staged.lock() {
+            if let Some((offset, buf)) = staged.as_mut() {
+                *offset = 0;
+                buf.clear();
+            }
+        }
+    }
+
+    /// Copy staged bytes at `cursor` into `out`. `Ok(n)` with `n > 0` when `cursor` is inside
+    /// the staged range; otherwise `Ok(0)`, with `out_len` cut to stop at the range's start.
+    fn read_at(&self, cursor: u64, out: &mut [u8], out_len: &mut usize) -> std::io::Result<usize> {
+        let staged = self
+            .staged
+            .lock()
+            .map_err(|_| std::io::Error::other("remote read overlay lock poisoned"))?;
+        let Some((start, bytes)) = staged.as_ref() else {
+            return Ok(0);
+        };
+        let end = start + bytes.len() as u64;
+        if cursor >= *start && cursor < end {
+            let from = (cursor - start) as usize;
+            let n = (*out_len).min(bytes.len() - from);
+            out[..n].copy_from_slice(&bytes[from..from + n]);
+            return Ok(n);
+        }
+        if cursor < *start && cursor + *out_len as u64 > *start {
+            // Read up to the staged range; the next read starts inside it.
+            *out_len = (*start - cursor) as usize;
+        }
+        Ok(0)
+    }
 }
 
 impl HttpRangeReader {
     /// Create a new reader with its cursor positioned at offset 0
     pub fn new(source: Arc<RemoteHttpSource>) -> Self {
-        Self { source, cursor: 0 }
+        Self {
+            source,
+            cursor: 0,
+            overlay: None,
+        }
+    }
+
+    /// A reader that serves reads inside `overlay`'s staged range from memory.
+    pub fn with_overlay(source: Arc<RemoteHttpSource>, overlay: Arc<ReadOverlay>) -> Self {
+        Self {
+            source,
+            cursor: 0,
+            overlay: Some(overlay),
+        }
     }
 }
 
@@ -1208,9 +1276,16 @@ impl Read for HttpRangeReader {
             return Ok(0);
         }
 
-        let to_read = buf
+        let mut to_read = buf
             .len()
             .min((self.source.total_size - self.cursor) as usize);
+        if let Some(overlay) = &self.overlay {
+            let n = overlay.read_at(self.cursor, buf, &mut to_read)?;
+            if n > 0 {
+                self.cursor += n as u64;
+                return Ok(n);
+            }
+        }
         let bytes_read = self
             .source
             .read_range_into(self.cursor, &mut buf[..to_read])
@@ -1475,6 +1550,72 @@ mod tests {
         let inserted = cache.insert_block(1, block1.clone()).unwrap();
         assert_eq!(&*inserted, &[50, 60, 70, 80]);
         assert_eq!(&*cache.get_block(1).unwrap().unwrap(), &[50, 60, 70, 80]);
+    }
+
+    /// Serves a fixed body and counts range requests (overlay tests).
+    struct OverlayTestTransport {
+        data: Vec<u8>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RemoteTransport for OverlayTestTransport {
+        fn fetch_range(&self, start: u64, end: u64, _: Option<u64>) -> Result<Vec<u8>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.data[start as usize..=end as usize].to_vec())
+        }
+
+        fn probe(&self, _: usize) -> Result<ProbeResult> {
+            unreachable!("the test builds the source directly")
+        }
+    }
+
+    #[test]
+    fn overlay_serves_the_staged_range_from_memory() {
+        use std::sync::atomic::Ordering;
+        let data: Vec<u8> = (0..=255).collect();
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(RemoteHttpSource {
+            url: "http://example.com/overlay.tif".to_string(),
+            total_size: data.len() as u64,
+            transport: Box::new(OverlayTestTransport {
+                data: data.clone(),
+                fetches: Arc::clone(&fetches),
+            }),
+            cache: ByteCache::new_with_initial_block(data[..16].to_vec(), 16),
+        });
+        let overlay = Arc::new(ReadOverlay::default());
+        let mut reader = HttpRangeReader::with_overlay(Arc::clone(&source), Arc::clone(&overlay));
+        // Staged bytes deliberately differ from the file, to show where reads come from.
+        overlay.stage(100, &[9; 40]);
+
+        // Inside the range: from memory, cut at its end, no fetch.
+        let mut buf = [0u8; 64];
+        reader.seek(SeekFrom::Start(120)).unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 20);
+        assert_eq!(buf[..20], [9; 20]);
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
+
+        // A read running into the range stops at its start; the next read is from memory.
+        reader.seek(SeekFrom::Start(90)).unwrap();
+        let mut buf = [0u8; 20];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(buf[..10], data[90..100]);
+        assert_eq!(reader.read(&mut buf).unwrap(), 20);
+        assert_eq!(buf, [9; 20]);
+
+        // Cleared: the same offsets come from the source again.
+        overlay.clear();
+        reader.seek(SeekFrom::Start(120)).unwrap();
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, data[120..128]);
+
+        // A reader without an overlay ignores staged bytes.
+        overlay.stage(0, &[7; 8]);
+        let mut plain = HttpRangeReader::new(source);
+        plain.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, data[..8]);
     }
 
     #[test]
