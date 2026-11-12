@@ -1,5 +1,6 @@
 pub mod geotiff;
 pub mod geotransform;
+pub mod ground_area;
 pub mod http_range;
 pub mod metadata;
 pub mod mosaic;
