@@ -177,7 +177,7 @@ crates/raster-h3-core/tests/it/      # Core engine suites (no DuckDB/DataFusion/
 ├── pmtiles.rs               # PMTiles v3 archive & MVT encoding tests
 ├── projected_eviction.rs    # Projected-CRS eviction soundness
 ├── quantiles.rs             # Streaming quantile sketch tests
-├── remote_cog.rs            # Remote COG/S3 streaming tests
+├── remote_cog/              # Remote COG/S3 streaming tests
 ├── rotated_grid_correctness.rs  # Sheared/rotated grids vs exhaustive reference
 ├── sharding.rs              # H3 shard balance and sharded merges
 ├── sparse_chunks_and_spilling.rs  # Sparse COG chunks and aggregation spilling
