@@ -576,6 +576,7 @@ impl<Acc: Clone> Runs<Acc> {
         self.cells[i] = Some(cell);
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn update<T, E: ScanlineEngine<T, Acc>>(
         &mut self,
