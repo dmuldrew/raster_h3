@@ -80,7 +80,12 @@ crates/raster-h3-core/src/
 │   │   ├── continuous_streamer.rs # Multi-resolution continuous horizon streamer
 │   │   ├── categorical.rs   # Categorical landcover chunk aggregation
 │   │   ├── categorical_streamer.rs # Multi-resolution categorical horizon streamer
-│   │   ├── controller.rs    # Resolution controller & batch horizon sizing
+│   │   ├── controller/      # Resolution controller & batch horizon sizing
+│   │   │   ├── mod.rs       # MultiHorizonStreamer, HorizonStreamKernel, RecordStreamer, drains
+│   │   │   ├── construct.rs # Streamer construction over a mosaic
+│   │   │   ├── batch.rs     # One prefetched batch: windows, horizon merge, eviction, spill
+│   │   │   ├── advance.rs   # Batch sizing, EOF finalization, failure latching
+│   │   │   └── pipeline.rs  # Worker windows and the in-order merge pipeline
 │   │   ├── sharded_map.rs   # Fixed-array sharded accumulator map
 │   │   ├── spectral.rs      # On-the-fly spectral formulas (NDVI, NDWI, NBR, EVI)
 │   │   └── walker.rs        # Generic ScanlineEngine trait & unified scanline_walk
