@@ -35,6 +35,12 @@ pub trait ScanlineEngine<T, Acc> {
         false
     }
 
+    /// Opt in to absolute pixel coordinates for each retained cell contribution.
+    /// This disables the span fast path for direct walks.
+    fn needs_pixel_coordinates(&self) -> bool {
+        false
+    }
+
     /// Allocate a fresh empty accumulator (or with quantiles if configured)
     fn new_acc(&self) -> Acc;
 
@@ -58,6 +64,19 @@ pub trait ScanlineEngine<T, Acc> {
 
     /// Update an accumulator with a sample and weight
     fn update_sample(&self, acc: &mut Acc, sample: Self::Sample, weight: f64);
+
+    /// Update with absolute raster column and row for location-dependent weights.
+    /// Called only when `needs_pixel_coordinates` returns true.
+    fn update_sample_at(
+        &self,
+        acc: &mut Acc,
+        sample: Self::Sample,
+        weight: f64,
+        _col: usize,
+        _row: usize,
+    ) {
+        self.update_sample(acc, sample, weight);
+    }
 }
 
 type CellMap<Acc> = HashMap<u64, Acc, H3BuildHasher>;
@@ -118,7 +137,7 @@ pub fn walk_direct<T, Acc, E, N>(
     E: ScanlineEngine<T, Acc>,
     N: Fn(&[T]) -> bool,
 {
-    let batch = ctx.sampling.is_single_point();
+    let batch = ctx.sampling.is_single_point() && !engine.needs_pixel_coordinates();
     walk(
         ctx,
         slice,
@@ -358,7 +377,7 @@ fn walk<T, Acc, E, N, R>(
                     combine_by_cell(&mut assignments);
                 }
                 for &(cell, weight) in &assignments {
-                    runs.update(i, cell, sample, weight, engine, &mut maps[i]);
+                    runs.update(i, cell, sample, weight, (col, row_idx), engine, &mut maps[i]);
                 }
             }
         }
@@ -556,13 +575,18 @@ impl<Acc: Clone> Runs<Acc> {
         cell: u64,
         sample: E::Sample,
         weight: f64,
+        pixel: (usize, usize),
         engine: &E,
         map: &mut CellMap<Acc>,
     ) {
         if Some(cell) != self.cells[i] {
             self.restart(i, cell, engine, map);
         }
-        engine.update_sample(&mut self.accs[i], sample, weight);
+        if engine.needs_pixel_coordinates() {
+            engine.update_sample_at(&mut self.accs[i], sample, weight, pixel.0, pixel.1);
+        } else {
+            engine.update_sample(&mut self.accs[i], sample, weight);
+        }
     }
 
     /// Only called once every resolution has a current cell.
@@ -774,6 +798,83 @@ pub(crate) fn for_each_kernel_test_context(mut f: impl FnMut(&str, &WalkContext<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinate_aware_engine_receives_absolute_pixel_positions() {
+        type Observation = (usize, usize, u8, f64);
+        struct Engine;
+        impl ScanlineEngine<u8, Vec<Observation>> for Engine {
+            type Sample = u8;
+
+            fn needs_pixel_coordinates(&self) -> bool { true }
+            fn combine_sample_weights(&self) -> bool { true }
+            fn new_acc(&self) -> Vec<Observation> { Vec::new() }
+            fn clear_acc(&self, acc: &mut Vec<Observation>) { acc.clear(); }
+            fn has_samples(&self, acc: &Vec<Observation>) -> bool { !acc.is_empty() }
+            fn merge_acc(&self, dest: &mut Vec<Observation>, src: &Vec<Observation>) {
+                dest.extend_from_slice(src);
+            }
+            fn accumulate_span(&self, _: &mut Vec<Observation>, _: &[u8]) {
+                panic!("coordinate-aware scans must not use spans");
+            }
+            fn accumulate_span_multi(&self, _: &mut [Vec<Observation>], _: &[u8]) {
+                panic!("coordinate-aware scans must not use spans");
+            }
+            fn get_sample(&self, value: u8) -> Option<u8> {
+                (value != 0).then_some(value)
+            }
+            fn update_sample(&self, _: &mut Vec<Observation>, _: u8, _: f64) {
+                panic!("expected an update with coordinates");
+            }
+            fn update_sample_at(
+                &self, acc: &mut Vec<Observation>, value: u8, weight: f64,
+                col: usize, row: usize,
+            ) {
+                acc.push((col, row, value, weight));
+            }
+        }
+
+        let chunk = RasterChunk { col_offset: 10, row_offset: 20, width: 2, height: 2 };
+        let gt = GeoTransform { c0: -122.5, a: 0.001, b: 0.0, f0: 38.0, d: 0.0, e: -0.001 };
+        let resolutions = [5u8, 9].map(|r| Resolution::try_from(r).unwrap());
+        let crs = CrsTransformer::Wgs84Identity;
+        let engine = Engine;
+
+        for sampling in [SamplingPattern::center(), SamplingPattern::rgss()] {
+            let ctx = WalkContext {
+                chunk: &chunk,
+                resolutions: &resolutions,
+                crs: &crs,
+                gt: &gt,
+                sampling: &sampling,
+                bbox: None,
+                stride: 0,
+                samples_per_pixel: 1,
+                owner: None,
+                band_scaling: &[],
+                alpha_sample: None,
+            };
+            for interleaved in [false, true] {
+                let mut maps: Vec<CellMap<Vec<Observation>>> =
+                    (0..resolutions.len()).map(|_| CellMap::default()).collect();
+                if interleaved {
+                    let ctx = WalkContext { samples_per_pixel: 2, ..ctx };
+                    walk_interleaved(&ctx, &[1, 99, 2, 99, 3, 99, 4, 99], |p| Some(p[0]), &engine, &mut maps);
+                } else {
+                    walk_direct(&ctx, &[1, 2, 3, 4], |_| false, &engine, &mut maps);
+                }
+                for map in maps {
+                    let mut sums = [0.0; 4];
+                    for &(col, row, value, weight) in map.values().flatten() {
+                        let index = (value - 1) as usize;
+                        assert_eq!((col, row), (10 + index % 2, 20 + index / 2));
+                        sums[index] += weight;
+                    }
+                    for sum in sums { assert!((sum - 1.0).abs() < 1e-12); }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_is_point_in_bbox() {
