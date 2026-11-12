@@ -9,8 +9,13 @@
 mod albers;
 mod bounds;
 mod proj_tokens;
+mod row_bounds;
 mod tm;
 
+#[cfg(test)]
+mod albers_row_tests;
+#[cfg(test)]
+mod line_row_tests;
 #[cfg(test)]
 mod tests;
 
@@ -18,6 +23,7 @@ pub use albers::AlbersConicFast;
 pub(crate) use albers::AlbersInverse;
 pub(crate) use proj_tokens::tokenize_proj_string;
 use proj_tokens::{fast_path_accepts, parse_opt_f64};
+pub(crate) use row_bounds::{mercator_line_bounds, wgs84_line_bounds, RowPathBounds};
 pub use tm::TmCertificate;
 
 use crate::error::{RasterH3Error, Result};

@@ -71,3 +71,8 @@ path = "fuzz_targets/partial_state.rs"
 test = false
 doc = false
 bench = false
+
+# Keep in sync with the workspace `[patch.crates-io]`: this crate is its own
+# workspace, so the root patch does not apply here.
+[patch.crates-io]
+h3o = { git = "https://github.com/dmuldrew/h3o", rev = "c880d8242754400f05d149542674f3a409c9ac6d" }

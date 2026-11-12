@@ -3,6 +3,7 @@
 use super::proj_tokens::{
     fast_path_accepts, is_all_zero_towgs84, parse_opt_f64, tokenize_proj_string,
 };
+use super::row_bounds::RowPathBounds;
 use super::{wrap_lon, RAD_TO_DEG};
 
 /// Precomputed constants for analytical, closed-form inverse Albers Equal Area Conic projection
@@ -39,6 +40,8 @@ pub(crate) struct AlbersInverse<'a> {
     n_over_a_sq: f64,
     inv_qp: f64,
     apa: [f64; 4],
+    /// Series coefficients: phi = beta + sum(p[k-1] * sin(2*k*beta)).
+    p: [f64; 4],
 }
 
 impl AlbersConicFast {
@@ -291,11 +294,189 @@ impl AlbersConicFast {
             n_over_a_sq: n_over_a * n_over_a,
             inv_qp: 1.0 / self.qp,
             apa: [p1 - p3, 2.0 * p2 - 4.0 * p4, 4.0 * p3, 8.0 * p4],
+            p: [p1, p2, p3, p4],
         }
     }
 }
 
 impl AlbersInverse<'_> {
+    /// Bounds for a north-up row evaluated with [`Self::transform_with_yp`]
+    /// at constant `y_p`, for projected x in `[x_lo, x_hi]` advancing by
+    /// `step` metres per column. See [`Self::line_path_bounds`].
+    pub(crate) fn row_path_bounds(
+        &self,
+        x_lo: f64,
+        x_hi: f64,
+        y_p: f64,
+        step: f64,
+    ) -> Option<RowPathBounds> {
+        if x_lo > x_hi {
+            return None;
+        }
+        let x_0 = self.albers.x_0;
+        // `y_p` is hoisted, so only x rounds per location.
+        let coord_mag = x_lo.abs().max(x_hi.abs()) + x_0.abs();
+        self.line_path_bounds_p((x_lo - x_0, y_p), (x_hi - x_0, y_p), (step, 0.0), coord_mag)
+    }
+
+    /// Bounds for locations evaluated with [`Self::transform_point`] along a
+    /// straight line of projected coordinates (a rotated or sheared raster
+    /// row) from `start` to `end`, advancing by `step` = (dx, dy) metres per
+    /// column. `coord_mag` bounds the magnitude of the terms summed into each
+    /// location's x and y (it sizes their rounding).
+    pub(crate) fn line_path_bounds(
+        &self,
+        start: (f64, f64),
+        end: (f64, f64),
+        step: (f64, f64),
+        coord_mag: f64,
+    ) -> Option<RowPathBounds> {
+        let albers = self.albers;
+        let to_p = |(x, y): (f64, f64)| (x - albers.x_0, albers.rho0 - (y - albers.y_0));
+        let coord_mag = coord_mag + albers.x_0.abs() + albers.y_0.abs() + albers.rho0.abs();
+        self.line_path_bounds_p(to_p(start), to_p(end), (step.0, -step.1), coord_mag)
+    }
+
+    /// [`Self::line_path_bounds`] in cone coordinates x_p = x - x_0 and
+    /// y_p = rho0 - (y - y_0), from `p0` to `p1` advancing by `v` per column.
+    ///
+    /// With rho² = x_p² + y_p², |v|² = v_x² + v_y² and theta = atan2(x_p, y_p):
+    ///
+    /// - lambda = lambda_0 + theta / n. theta' = (v_x y_p - v_y x_p) / rho²,
+    ///   so |theta'| ≤ min((|v_x| |y_p| + |v_y| |x_p|) / rho², |v| / rho).
+    ///   For straight-line motion at distance h from the apex and s along the
+    ///   line, theta'' = -2 |v|² h s / rho⁴ and 2 |h s| ≤ rho², so
+    ///   |theta''| ≤ |v|² / rho²;
+    /// - q = (C - rho² n²/a²) / n is linear in rho², with (rho²)' = 2 (x_p
+    ///   v_x + y_p v_y) and (rho²)'' = 2 |v|²: |q'| ≤ 2 |n| (|x_p v_x| + |y_p
+    ///   v_y|) / a², |q''| = 2 |n| |v|² / a². rho² is convex along the line,
+    ///   so its extremes (and q's) are at the point closest to the apex and
+    ///   at an end;
+    /// - beta = asin(q / qp): beta' = q' / (qp cos beta) and beta'' = q'' /
+    ///   (qp cos beta) + sin beta q'² / (qp² cos³ beta);
+    /// - phi = beta + sum(p_k sin(2k beta)): |dphi/dbeta| ≤ 1 + sum(2k |p_k|)
+    ///   and |d²phi/dbeta²| ≤ sum(4k² |p_k|);
+    /// - on the unit sphere, |P'| ≤ |phi'| + |lambda'| and |P''| ≤ |phi''| +
+    ///   |lambda''| + (|phi'| + |lambda'|)².
+    ///
+    /// For a north-up row (v_y = 0, constant y_p) these are the bounds of
+    /// the constant-y derivation: |lambda'| = step |y_p| / (|n| rho²) and
+    /// |lambda''| ≤ step² / (|n| rho²).
+    ///
+    /// The noise term bounds the rounding of that formula chain, dominated by
+    /// `asin` near the poles (error / cos beta), plus the rounding of x_p and
+    /// y_p themselves. Returns `None` when the line may reach the cone apex,
+    /// the atan2 branch cut, or the `sin beta` clamp (poles), where the
+    /// inverse isn't smooth.
+    fn line_path_bounds_p(
+        &self,
+        p0: (f64, f64),
+        p1: (f64, f64),
+        v: (f64, f64),
+        coord_mag: f64,
+    ) -> Option<RowPathBounds> {
+        let albers = self.albers;
+        let n = albers.n;
+        let a = albers.a;
+        if ![p0.0, p0.1, p1.0, p1.1, v.0, v.1, coord_mag, n, a, albers.qp]
+            .iter()
+            .all(|v| v.is_finite())
+            || n == 0.0
+        {
+            return None;
+        }
+        // Conservatively reject a segment whose rounded bounding box touches
+        // atan2's cut: x_p = 0 on the far side of the apex for this sign of n.
+        let delta = 8.0 * f64::EPSILON * coord_mag;
+        if p0.0.min(p1.0) <= delta
+            && p0.0.max(p1.0) >= -delta
+            && (if n > 0.0 {
+                p0.1.min(p1.1) <= delta
+            } else {
+                p0.1.max(p1.1) >= -delta
+            })
+        {
+            return None;
+        }
+        let (vx, vy) = (v.0.abs(), v.1.abs());
+        let v_sq = vx * vx + vy * vy;
+        let xp_max = p0.0.abs().max(p1.0.abs());
+        let yp_max = p0.1.abs().max(p1.1.abs());
+        // Closest point of the segment to the apex, deflated for the rounding
+        // of its computation (absolute, ~ε of the coordinates).
+        let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+        let len_sq = dx * dx + dy * dy;
+        let t = if len_sq > 0.0 {
+            (-(p0.0 * dx + p0.1 * dy) / len_sq).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let rho_min = (p0.0 + t * dx).hypot(p0.1 + t * dy) - 1e-12 * (xp_max + yp_max);
+        if rho_min.is_nan() || rho_min <= 0.0 {
+            return None;
+        }
+        let rho_sq_min = rho_min * rho_min;
+        let rho_sq_max = (p0.0 * p0.0 + p0.1 * p0.1).max(p1.0 * p1.0 + p1.1 * p1.1) * (1.0 + 1e-12);
+
+        let inv_n_abs = 1.0 / n.abs();
+        let theta1 = ((vx * yp_max + vy * xp_max) / rho_sq_min).min(v_sq.sqrt() / rho_min);
+        let theta2 = v_sq / rho_sq_min;
+        let lam1 = theta1 * inv_n_abs;
+        let lam2 = theta2 * inv_n_abs;
+
+        let q_of = |rho_sq: f64| (albers.c - rho_sq * self.n_over_a_sq) * self.inv_n;
+        let s_max = q_of(rho_sq_min).abs().max(q_of(rho_sq_max).abs()) * self.inv_qp.abs();
+        if s_max.is_nan() || s_max >= 1.0 - 1e-9 {
+            return None;
+        }
+        let cos_min = (1.0 - s_max * s_max).sqrt();
+        let qp = albers.qp.abs();
+        let q1 = 2.0 * n.abs() * (vx * xp_max + vy * yp_max) / (a * a);
+        let q2 = 2.0 * n.abs() * v_sq / (a * a);
+        let beta1 = q1 / (qp * cos_min);
+        let beta2 = q2 / (qp * cos_min) + s_max * q1 * q1 / (qp * qp * cos_min.powi(3));
+
+        let (mut d1, mut d2) = (1.0, 0.0);
+        for (k, p) in self.p.iter().enumerate() {
+            let k = (k + 1) as f64;
+            d1 += 2.0 * k * p.abs();
+            d2 += 4.0 * k * k * p.abs();
+        }
+        let phi1 = d1 * beta1;
+        let phi2 = d2 * beta1 * beta1 + d1 * beta2;
+
+        let speed = phi1 + lam1;
+        let accel = phi2 + lam2 + speed * speed;
+
+        // Rounding: x and rho² (relative), q, sin beta amplified by asin
+        // (1/cos beta), the series, theta/n, and the degree conversions
+        // round trip. 64 ulps per term is deliberately generous.
+        let q_scale =
+            (albers.c.abs() + rho_sq_max * self.n_over_a_sq) * self.inv_n.abs() * self.inv_qp.abs();
+        let theta_max = std::f64::consts::PI;
+        let formula = 64.0
+            * f64::EPSILON
+            * ((q_scale + 1.0) / cos_min
+                + (theta_max + 1.0) * self.inv_n.abs()
+                + 4.0 * std::f64::consts::PI);
+        // Absolute rounding of x_p and y_p (a few ulps of `coord_mag` each),
+        // through theta (1 / rho) and through rho² (2 rho) into q.
+        let coords = delta * inv_n_abs / rho_min
+            + d1 * 2.0 * rho_sq_max.sqrt() * delta * self.n_over_a_sq * inv_n_abs / (qp * cos_min);
+        let noise = formula + coords;
+
+        let inflate = 1.0 + 1e-9;
+        let bounds = RowPathBounds {
+            speed: speed * inflate + 1e-300,
+            accel: accel * inflate + 1e-300,
+            noise: noise * inflate,
+        };
+        [bounds.speed, bounds.accel, bounds.noise]
+            .iter()
+            .all(|v| v.is_finite())
+            .then_some(bounds)
+    }
+
     #[inline(always)]
     pub(crate) fn row_yp(&self, y: f64) -> (f64, f64) {
         self.albers.row_yp(y)
