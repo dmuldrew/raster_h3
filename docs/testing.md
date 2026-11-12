@@ -17,7 +17,7 @@ explains how to run each group and what CI runs. The counts below are the number
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 12 (8 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 6 modules, 1 binary | 20 |
 | [`crates/raster-h3-sedona/tests/`](../crates/raster-h3-sedona/tests) (`sedona/…`, standalone workspace; one binary per module) | 6 modules | 34 (5 need `sedona-e2e`) |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 294 (3 need `pg-extension`) |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 299 (3 need `pg-extension`) |
 | [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 7 modules | 84 |
 | [`crates/raster-h3-sedona/python/tests/`](../crates/raster-h3-sedona/python/tests) (`sedona-pytest/…`, needs the `sedonadb` 0.5.0 wheel) | 1 module | 14 |
 | [`examples/sedona_spark/tests/`](../examples/sedona_spark/tests) (`spark/…`, needs PySpark, Apache Sedona and `raster_h3`, as in the `sedona` image) | 2 modules | 17 (23 cases) |
