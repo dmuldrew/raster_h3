@@ -895,6 +895,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "reads a memory-mapped raster, which Miri cannot follow"
+    )]
     fn test_pg_continuous_and_categorical_srf_streaming() {
         let tif = write_test_tif(16, 16, 7.0);
         let path_str = tif.path().to_string_lossy().to_string();
