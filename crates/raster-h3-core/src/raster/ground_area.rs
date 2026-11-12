@@ -29,7 +29,9 @@ pub fn wgs84_rectangle_area(west: f64, south: f64, east: f64, north: f64) -> Res
         return Err(invalid("longitude must be in [-180, 180]"));
     }
     if south < -90.0 || north > 90.0 || south >= north {
-        return Err(invalid("latitude bounds must satisfy -90 <= south < north <= 90"));
+        return Err(invalid(
+            "latitude bounds must satisfy -90 <= south < north <= 90",
+        ));
     }
     let mut width = east - west;
     if width < 0.0 {
@@ -45,13 +47,9 @@ pub fn wgs84_rectangle_area(west: f64, south: f64, east: f64, north: f64) -> Res
     let span = (north - south).to_radians();
     let midpoint = (north + south) * 0.5;
     let cos_mid = if midpoint > 45.0 {
-        (((90.0 - north) + (90.0 - south)) * 0.5)
-            .to_radians()
-            .sin()
+        (((90.0 - north) + (90.0 - south)) * 0.5).to_radians().sin()
     } else if midpoint < -45.0 {
-        (((90.0 + north) + (90.0 + south)) * 0.5)
-            .to_radians()
-            .sin()
+        (((90.0 + north) + (90.0 + south)) * 0.5).to_radians().sin()
     } else {
         midpoint.to_radians().cos()
     };
@@ -62,8 +60,7 @@ pub fn wgs84_rectangle_area(west: f64, south: f64, east: f64, north: f64) -> Res
     let e = WGS84_E2.sqrt();
     let t = e * sin_difference / cross;
     let atanh_ratio = if t == 0.0 { 1.0 } else { t.atanh() / t };
-    let rational = (1.0 + WGS84_E2 * u * v)
-        / ((1.0 - WGS84_E2 * u * u) * (1.0 - WGS84_E2 * v * v));
+    let rational = (1.0 + WGS84_E2 * u * v) / ((1.0 - WGS84_E2 * u * u) * (1.0 - WGS84_E2 * v * v));
     let integral = 0.5 * sin_difference * (rational + atanh_ratio / cross);
     Ok(WGS84_A * WGS84_A * (1.0 - WGS84_E2) * width.to_radians() * integral)
 }
@@ -82,7 +79,9 @@ pub fn wgs84_pixel_area(gt: &GeoTransform, col: usize, row: usize) -> Result<f64
         || !(gt.a > 0.0 && gt.a <= 360.0)
         || gt.e >= 0.0
     {
-        return Err(invalid("expected a finite north-up, axis-aligned transform"));
+        return Err(invalid(
+            "expected a finite north-up, axis-aligned transform",
+        ));
     }
     let west_unwrapped = gt.c0 + col as f64 * gt.a;
     let north = gt.f0 + row as f64 * gt.e;
@@ -117,7 +116,13 @@ mod tests {
             (0.0, 89.0, 1.0, 90.0, 108_866_681.636_207_67),
             (179.5, -1.0, -179.5, 1.0, 24_616_927_787.950_706),
             (-180.0, -90.0, 180.0, 90.0, 510_065_621_724_088.5),
-            (0.0, 89.999_999, 0.000_001, 90.0, 1.088_696_687_240_833_9e-10),
+            (
+                0.0,
+                89.999_999,
+                0.000_001,
+                90.0,
+                1.088_696_687_240_833_9e-10,
+            ),
         ];
         for (west, south, east, north, expected) in cases {
             let actual = wgs84_rectangle_area(west, south, east, north).unwrap();
