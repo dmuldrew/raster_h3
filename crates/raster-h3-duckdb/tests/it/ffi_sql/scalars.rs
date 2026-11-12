@@ -1,0 +1,237 @@
+// =============================================================================
+// 2. Scalar Function Execution & NULL Propagation Tests
+// =============================================================================
+
+use std::ptr;
+
+use raster_h3_duckdb::ffi::duckdb_c::*;
+use raster_h3_duckdb::functions::scalar::*;
+
+use super::mock_api::{duckdb_validity_set_row_invalid, install_mock_api};
+use super::{MockDataChunk, MockVector};
+
+#[test]
+fn test_all_scalar_functions_and_null_propagation() {
+    install_mock_api();
+    let valid_cell: u64 = 0x8828308281fffff; // Res 8 SF
+    let invalid_cell: u64 = 0;
+
+    // 1. h3_to_string & string_to_h3 with NULL row at index 1
+    let mut chunk_u64 = MockDataChunk::new(1, 4);
+    chunk_u64.size = 3;
+    // SAFETY: mock vector buffers are 8-aligned `u64` storage with two slots per row and
+    // capacity 4, so writing `u64`/`i64` rows 0..3 is in bounds; the validity mask covers
+    // that capacity.
+    unsafe {
+        let data = chunk_u64.vectors[0].data.as_mut_ptr();
+        *data.add(0) = valid_cell;
+        *data.add(1) = valid_cell;
+        *data.add(2) = invalid_cell;
+        chunk_u64.vectors[0].has_validity = true;
+        duckdb_validity_set_row_invalid(chunk_u64.vectors[0].validity.as_mut_ptr(), 1);
+    }
+
+    let mut out_str = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
+    unsafe {
+        scalar_h3_to_string(
+            ptr::null_mut(),
+            &mut chunk_u64 as *mut MockDataChunk as duckdb_data_chunk,
+            &mut out_str as *mut MockVector as duckdb_vector,
+        );
+    }
+    assert!(out_str.is_valid(0));
+    assert!(
+        !out_str.is_valid(1),
+        "NULL input must propagate to NULL output"
+    );
+    assert_eq!(
+        std::str::from_utf8(&out_str.strings[0]).unwrap(),
+        "8828308281fffff"
+    );
+
+    // 2. h3_to_lat, h3_to_lng, h3_get_resolution, h3_is_valid(u64), h3_to_wkb(u64), h3_to_geometry(u64)
+    let mut out_lat = MockVector::new(4);
+    let mut out_lng = MockVector::new(4);
+    let mut out_res = MockVector::new(4);
+    let mut out_valid = MockVector::new(4);
+    let mut out_wkb = MockVector::new(4);
+    let mut out_geom = MockVector::new(4);
+    let mut out_cell_geom = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
+    unsafe {
+        let in_ptr = &mut chunk_u64 as *mut MockDataChunk as duckdb_data_chunk;
+        scalar_h3_to_lat(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_lat as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_lng(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_lng as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_get_resolution(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_res as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_is_valid_u64(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_valid as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_wkb_u64(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_wkb as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_geometry_u64(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_geom as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_geometry_u64(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_cell_geom as *mut MockVector as duckdb_vector,
+        );
+    }
+    // SAFETY: the callbacks above wrote values of these columns' declared types for rows
+    // `0..size` into 8-aligned buffers with room for at least that many rows.
+    unsafe {
+        let lats = out_lat.data.as_ptr() as *const f64;
+        let lngs = out_lng.data.as_ptr() as *const f64;
+        let res = out_res.data.as_ptr() as *const i64;
+        let valid = out_valid.data.as_ptr() as *const bool;
+        assert!((*lats.add(0) - 37.77).abs() < 0.1);
+        assert!((*lats.add(2)).is_nan());
+        assert!((*lngs.add(0) - (-122.42)).abs() < 0.1);
+        assert!((*lngs.add(2)).is_nan());
+        assert_eq!(*res.add(0), 8);
+        assert_eq!(*res.add(2), -1);
+        assert!(*valid.add(0));
+        assert!(!*valid.add(2));
+        assert_eq!(out_wkb.strings[0].len(), 125);
+        assert!(
+            !out_wkb.is_valid(2),
+            "Invalid H3 cell must produce NULL WKB"
+        );
+        assert_eq!(out_geom.strings[0], out_wkb.strings[0]);
+        assert_eq!(out_cell_geom.strings[0], out_geom.strings[0]);
+        assert!(!out_cell_geom.is_valid(2));
+    }
+
+    // 3. String scalar functions: string_to_h3, h3_is_valid(VARCHAR), h3_to_wkb(VARCHAR), h3_to_geometry(VARCHAR)
+    let mut chunk_str = MockDataChunk::new(1, 4);
+    chunk_str.size = 2;
+    chunk_str.vectors[0].set_str_input(0, "8828308281fffff");
+    chunk_str.vectors[0].set_str_input(1, "invalid_hex");
+
+    let mut out_u64 = MockVector::new(4);
+    let mut out_valid_s = MockVector::new(4);
+    let mut out_wkb_s = MockVector::new(4);
+    let mut out_geom_s = MockVector::new(4);
+    let mut out_cell_geom_s = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
+    unsafe {
+        let in_ptr = &mut chunk_str as *mut MockDataChunk as duckdb_data_chunk;
+        scalar_string_to_h3(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_u64 as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_is_valid_str(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_valid_s as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_wkb_str(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_wkb_s as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_geometry_str(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_geom_s as *mut MockVector as duckdb_vector,
+        );
+        scalar_h3_to_geometry_str(
+            ptr::null_mut(),
+            in_ptr,
+            &mut out_cell_geom_s as *mut MockVector as duckdb_vector,
+        );
+        let parsed = out_u64.data.as_ptr();
+        let valid_s = out_valid_s.data.as_ptr() as *const bool;
+        assert_eq!(*parsed.add(0), valid_cell);
+        assert_eq!(*parsed.add(1), 0);
+        assert!(*valid_s.add(0));
+        assert!(!*valid_s.add(1));
+        assert_eq!(out_wkb_s.strings[0].len(), 125);
+        assert!(!out_wkb_s.is_valid(1));
+        assert_eq!(out_geom_s.strings[0].len(), 125);
+        assert_eq!(out_cell_geom_s.strings[0], out_geom_s.strings[0]);
+        assert!(!out_cell_geom_s.is_valid(1));
+    }
+
+    // 4. Binary scalar functions: h3_cell_to_parent(u64, i64) and h3_cell_to_parent(VARCHAR, i64)
+    let mut chunk_bin_u64 = MockDataChunk::new(2, 4);
+    chunk_bin_u64.size = 2;
+    // SAFETY: mock vector buffers are 8-aligned `u64` storage with two slots per row and
+    // capacity 4, so writing `u64`/`i64` rows 0..3 is in bounds; the validity mask covers
+    // that capacity.
+    unsafe {
+        *chunk_bin_u64.vectors[0].data.as_mut_ptr().add(0) = valid_cell;
+        *chunk_bin_u64.vectors[0].data.as_mut_ptr().add(1) = valid_cell;
+        *(chunk_bin_u64.vectors[1].data.as_mut_ptr() as *mut i64).add(0) = 7;
+        *(chunk_bin_u64.vectors[1].data.as_mut_ptr() as *mut i64).add(1) = 9; // invalid coarser > 8
+    }
+    let mut out_parent_u64 = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
+    unsafe {
+        scalar_h3_cell_to_parent_u64(
+            ptr::null_mut(),
+            &mut chunk_bin_u64 as *mut MockDataChunk as duckdb_data_chunk,
+            &mut out_parent_u64 as *mut MockVector as duckdb_vector,
+        );
+        let p = out_parent_u64.data.as_ptr();
+        let expected_parent: u64 = h3o::CellIndex::try_from(valid_cell)
+            .unwrap()
+            .parent(h3o::Resolution::Seven)
+            .unwrap()
+            .into();
+        assert_eq!(*p.add(0), expected_parent);
+        assert_eq!(*p.add(1), 0);
+    }
+
+    let mut chunk_bin_str = MockDataChunk::new(2, 4);
+    chunk_bin_str.size = 2;
+    chunk_bin_str.vectors[0].set_str_input(0, "8828308281fffff");
+    chunk_bin_str.vectors[0].set_str_input(1, "8828308281fffff");
+    // SAFETY: mock vector buffers are 8-aligned `u64` storage with two slots per row and
+    // capacity 4, so writing `u64`/`i64` rows 0..3 is in bounds; the validity mask covers
+    // that capacity.
+    unsafe {
+        *(chunk_bin_str.vectors[1].data.as_mut_ptr() as *mut i64).add(0) = 7;
+        *(chunk_bin_str.vectors[1].data.as_mut_ptr() as *mut i64).add(1) = 9;
+    }
+    let mut out_parent_str = MockVector::new(4);
+    // SAFETY: the handles point to live mock chunks/vectors whose columns have the types
+    // each callback is registered for, and the mock accepts a null `info`.
+    unsafe {
+        scalar_h3_cell_to_parent_str(
+            ptr::null_mut(),
+            &mut chunk_bin_str as *mut MockDataChunk as duckdb_data_chunk,
+            &mut out_parent_str as *mut MockVector as duckdb_vector,
+        );
+        assert!(out_parent_str.is_valid(0));
+        assert!(!out_parent_str.is_valid(1));
+        assert!(std::str::from_utf8(&out_parent_str.strings[0])
+            .unwrap()
+            .starts_with("8728308"));
+    }
+}
