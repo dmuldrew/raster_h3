@@ -20,6 +20,8 @@
 
 /// Online statistical accumulators using Welford's algorithm.
 pub mod accumulator;
+/// Ground-area-weighted continuous accumulator state.
+pub mod area_accumulator;
 /// Frequency tracking and summary metrics for categorical raster data.
 pub mod categorical;
 /// Hashing for maps keyed by raw H3 cell indices.

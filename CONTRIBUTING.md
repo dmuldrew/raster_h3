@@ -80,7 +80,12 @@ crates/raster-h3-core/src/
 │   │   ├── continuous_streamer.rs # Multi-resolution continuous horizon streamer
 │   │   ├── categorical.rs   # Categorical landcover chunk aggregation
 │   │   ├── categorical_streamer.rs # Multi-resolution categorical horizon streamer
-│   │   ├── controller.rs    # Resolution controller & batch horizon sizing
+│   │   ├── controller/      # Resolution controller & batch horizon sizing
+│   │   │   ├── mod.rs       # MultiHorizonStreamer, HorizonStreamKernel, RecordStreamer, drains
+│   │   │   ├── construct.rs # Streamer construction over a mosaic
+│   │   │   ├── batch.rs     # One prefetched batch: windows, horizon merge, eviction, spill
+│   │   │   ├── advance.rs   # Batch sizing, EOF finalization, failure latching
+│   │   │   └── pipeline.rs  # Worker windows and the in-order merge pipeline
 │   │   ├── sharded_map.rs   # Fixed-array sharded accumulator map
 │   │   ├── spectral.rs      # On-the-fly spectral formulas (NDVI, NDWI, NBR, EVI)
 │   │   └── walker.rs        # Generic ScanlineEngine trait & unified scanline_walk
@@ -193,7 +198,7 @@ crates/raster-h3-core/tests/it/      # Core engine suites (no DuckDB/DataFusion/
 
 crates/raster-h3-duckdb/tests/it/    # DuckDB binding suites
 ├── cell_bbox_pushdown.rs    # cell_wgs84_bbox pushdown soundness
-├── ffi_sql.rs               # Mock C-API callbacks for every registered function
+├── ffi_sql/                 # Mock C-API callbacks for every registered function
 ├── prefetch_resilience.rs   # Prefetch queues under panics and remote mosaics
 ├── record_queue.rs          # Bind-side record queue propagates stream failures
 └── spatial_geometry.rs      # WKB geometry emission and hex formatting

@@ -109,7 +109,21 @@ impl MockHttpServer {
     }
 
     fn start_with_failures(file_bytes: Vec<u8>, failure_count: usize) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+        Self::try_start_on("127.0.0.1", file_bytes, failure_count)
+            .expect("Failed to bind ephemeral port")
+    }
+
+    /// A server on another loopback address (`127.0.0.2`), so a redirect can
+    /// cross hosts; `None` where that address is not configured (macOS by default).
+    fn start_on_second_loopback(file_bytes: Vec<u8>) -> Option<Self> {
+        let server = Self::try_start_on("127.0.0.2", file_bytes, 0)?;
+        let addr = format!("127.0.0.2:{}", server.port).parse().ok()?;
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
+        Some(server)
+    }
+
+    fn try_start_on(ip: &str, file_bytes: Vec<u8>, failure_count: usize) -> Option<Self> {
+        let listener = TcpListener::bind((ip, 0)).ok()?;
         let port = listener.local_addr().unwrap().port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let bytes_served = Arc::new(AtomicUsize::new(0));
@@ -167,9 +181,9 @@ impl MockHttpServer {
             }
         });
 
-        Self {
+        Some(Self {
             port,
-            url_base: format!("http://127.0.0.1:{}", port),
+            url_base: format!("http://{ip}:{port}"),
             bytes_served,
             request_count,
             transient_failures,
@@ -178,11 +192,38 @@ impl MockHttpServer {
             gate,
             shutdown,
             handle: Some(handle),
-        }
+        })
     }
 
     fn recorded_headers(&self) -> Vec<String> {
         self.recorded_headers.lock().unwrap().clone()
+    }
+
+    /// For a redirect fixture, `Some(Location)` (`Some(None)` for a redirect
+    /// without one):
+    /// - `redirect_hops_<k>`: `k` relative hops to the same path with `k - 1`;
+    /// - `redirect_without_location`: a 302 with no `Location`;
+    /// - `redirect_to_<ip>_<port>/<rest>`: an absolute redirect to `http://<ip>:<port>/<rest>`.
+    #[allow(clippy::option_option)]
+    fn redirect_location(path: &str) -> Option<Option<String>> {
+        if path.contains("redirect_without_location") {
+            return Some(None);
+        }
+        if let Some((_, rest)) = path.split_once("redirect_to_") {
+            let (target, tail) = rest.split_once('/')?;
+            let (ip, port) = target.rsplit_once('_')?;
+            return Some(Some(format!("http://{ip}:{port}/{tail}")));
+        }
+        let (_, rest) = path.split_once("redirect_hops_")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let hops: usize = digits.parse().ok()?;
+        (hops > 0).then(|| {
+            Some(path.replacen(
+                &format!("redirect_hops_{digits}"),
+                &format!("redirect_hops_{}", hops - 1),
+                1,
+            ))
+        })
     }
 
     /// Atomic decrement-if-positive: whether this connection may serve a
@@ -248,6 +289,19 @@ impl MockHttpServer {
         if method != "GET" && method != "HEAD" {
             let resp =
                 "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+
+        // Redirect fixtures answer before the request is counted, so the
+        // version fixtures below see only the final hop.
+        if let Some(location) = Self::redirect_location(path) {
+            let location = location
+                .map(|l| format!("Location: {l}\r\n"))
+                .unwrap_or_default();
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             let _ = stream.write_all(resp.as_bytes());
             return;
         }

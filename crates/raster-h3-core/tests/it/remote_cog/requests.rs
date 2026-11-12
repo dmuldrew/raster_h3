@@ -209,6 +209,144 @@ fn auth_token_is_sent_only_to_listed_hosts() {
     }
 }
 
+fn count_lines(headers: &[String], line: &str) -> usize {
+    headers.iter().filter(|h| h.trim() == line).count()
+}
+
+// The transport follows redirects itself, keeping `Range` and the pinned
+// validator on every hop.
+#[test]
+fn redirects_are_followed_with_range_and_validator() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let url = format!("{}/redirect_hops_2_etag_stable.tif", server.url_base);
+    let source = RemoteHttpSource::open(&url).unwrap();
+    assert_eq!(
+        source.fetch_range(150_000, 150_009).unwrap(),
+        data[150_000..150_010]
+    );
+    let headers = recorded_lowercase(&server);
+    // Probe and range fetch, each two redirects plus the final request.
+    let ranges = headers.iter().filter(|h| h.starts_with("range:")).count();
+    assert_eq!(ranges, 6, "{headers:?}");
+    assert_eq!(count_lines(&headers, "range: bytes=0-131071"), 3);
+    // The validator pinned by the probe goes with every hop of the fetch.
+    assert_eq!(count_lines(&headers, "if-match: \"v1\""), 3, "{headers:?}");
+}
+
+#[test]
+fn redirect_limits_and_missing_locations_fail_clearly() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let server = MockHttpServer::start(vec![3u8; 4096]);
+    let open = |path: &str| RemoteHttpSource::open(&format!("{}/{path}", server.url_base));
+    assert!(
+        open("redirect_hops_5.tif").is_ok(),
+        "five redirects are followed"
+    );
+    let too_many = open("redirect_hops_6.tif").err().unwrap().to_string();
+    assert!(
+        too_many.contains("redirected more than 5 times"),
+        "{too_many}"
+    );
+    let missing = open("redirect_without_location.tif")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(missing.contains("no usable Location header"), "{missing}");
+}
+
+// Credential headers are resolved for each hop's own URL: a redirect away
+// from the host a credential is scoped to does not carry it, and a redirect to
+// that host does. ureq alone would carry `x-amz-security-token` to any host.
+// The bearer and session tokens are exclusive, so each gets its own round.
+#[test]
+fn credentials_do_not_follow_a_redirect_to_another_host() {
+    let _env_lock = ENV_MUTEX.lock().unwrap();
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let Some(other) = MockHttpServer::start_on_second_loopback(data.clone()) else {
+        eprintln!("Skipping test: 127.0.0.2 is not a usable loopback address here");
+        return;
+    };
+    let listed = MockHttpServer::start(data.clone());
+    let vars = [
+        "RASTER_H3_AUTH_TOKEN",
+        "RASTER_H3_AUTH_HOSTS",
+        "AWS_SESSION_TOKEN",
+        "AWS_ENDPOINT_URL",
+    ];
+    let rounds = [
+        (
+            vec![
+                ("RASTER_H3_AUTH_TOKEN", "scoped-token".to_string()),
+                ("RASTER_H3_AUTH_HOSTS", "127.0.0.1".to_string()),
+            ],
+            "authorization: bearer scoped-token",
+        ),
+        (
+            vec![
+                ("AWS_SESSION_TOKEN", "session-token".to_string()),
+                ("AWS_ENDPOINT_URL", listed.url_base.clone()),
+            ],
+            "x-amz-security-token: session-token",
+        ),
+    ];
+    let fetch = |url: String| HttpTransport::new(&url).and_then(|t| t.fetch_range(0, 9, None));
+
+    for (env, credential) in rounds {
+        for (name, value) in &env {
+            std::env::set_var(name, value);
+        }
+        let (listed_before, other_before) = (
+            recorded_lowercase(&listed).len(),
+            recorded_lowercase(&other).len(),
+        );
+        let away = fetch(format!(
+            "{}/redirect_to_127.0.0.2_{}/away.tif",
+            listed.url_base, other.port
+        ));
+        let (listed_mid, other_mid) = (
+            recorded_lowercase(&listed).len(),
+            recorded_lowercase(&other).len(),
+        );
+        let back = fetch(format!(
+            "{}/redirect_to_127.0.0.1_{}/back.tif",
+            other.url_base, listed.port
+        ));
+        for name in vars {
+            std::env::remove_var(name);
+        }
+
+        assert_eq!(away.unwrap(), data[..10], "{credential}");
+        assert_eq!(back.unwrap(), data[..10], "{credential}");
+        let listed_all = recorded_lowercase(&listed);
+        let other_all = recorded_lowercase(&other);
+        for (headers, sent) in [
+            (&listed_all[listed_before..listed_mid], true),
+            (&other_all[other_before..other_mid], false),
+            (&other_all[other_mid..], false),
+            (&listed_all[listed_mid..], true),
+        ] {
+            assert!(!headers.is_empty(), "{credential}");
+            assert_eq!(
+                count_lines(headers, credential),
+                usize::from(sent),
+                "{credential}: {headers:?}"
+            );
+        }
+    }
+}
+
 // The HTTP agent's per-connection buffers are fixed in size: a request head
 // must fit the output buffer and a response head the input buffer. Typical
 // large heads (a 6 KiB bearer token, 12 KiB of response headers) still work.
