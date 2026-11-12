@@ -98,7 +98,10 @@ fn dimension(low: f64, high: f64, step: f64) -> Result<usize> {
     }
     let intervals = (high - low) / step;
     let rounded = intervals.round();
-    if !intervals.is_finite() || (intervals - rounded).abs() > 1e-7 || rounded > u32::MAX as f64 - 1.0 {
+    if !intervals.is_finite()
+        || (intervals - rounded).abs() > 1e-7
+        || rounded > u32::MAX as f64 - 1.0
+    {
         return Err(invalid("extent does not match spacing"));
     }
     Ok(rounded as usize + 1)
@@ -110,7 +113,22 @@ impl Ntv2Grid {
     pub fn read(mut input: impl Read, max_nodes: usize) -> Result<Self> {
         let mut overview = [0u8; HEADER];
         input.read_exact(&mut overview)?;
-        labels(&overview, &[b"NUM_OREC", b"NUM_SREC", b"NUM_FILE", b"GS_TYPE ", b"VERSION ", b"SYSTEM_F", b"SYSTEM_T", b"MAJOR_F ", b"MINOR_F ", b"MAJOR_T ", b"MINOR_T "])?;
+        labels(
+            &overview,
+            &[
+                b"NUM_OREC",
+                b"NUM_SREC",
+                b"NUM_FILE",
+                b"GS_TYPE ",
+                b"VERSION ",
+                b"SYSTEM_F",
+                b"SYSTEM_T",
+                b"MAJOR_F ",
+                b"MINOR_F ",
+                b"MAJOR_T ",
+                b"MINOR_T ",
+            ],
+        )?;
         let endian = if u32::from_le_bytes(overview[8..12].try_into().unwrap()) == 11 {
             Endian::Little
         } else if u32::from_be_bytes(overview[8..12].try_into().unwrap()) == 11 {
@@ -131,7 +149,22 @@ impl Ntv2Grid {
         }
         let mut header = [0u8; HEADER];
         input.read_exact(&mut header)?;
-        labels(&header, &[b"SUB_NAME", b"PARENT  ", b"CREATED ", b"UPDATED ", b"S_LAT   ", b"N_LAT   ", b"E_LONG  ", b"W_LONG  ", b"LAT_INC ", b"LONG_INC", b"GS_COUNT"])?;
+        labels(
+            &header,
+            &[
+                b"SUB_NAME",
+                b"PARENT  ",
+                b"CREATED ",
+                b"UPDATED ",
+                b"S_LAT   ",
+                b"N_LAT   ",
+                b"E_LONG  ",
+                b"W_LONG  ",
+                b"LAT_INC ",
+                b"LONG_INC",
+                b"GS_COUNT",
+            ],
+        )?;
         if field_string(&header[8..16])?.is_empty() || field_string(&header[24..32])? != "NONE" {
             return Err(invalid("expected a named root subgrid"));
         }
@@ -146,12 +179,16 @@ impl Ntv2Grid {
         }
         let rows = dimension(south, north, latitude_step)?;
         let columns = dimension(east, west, longitude_step)?;
-        let count = rows.checked_mul(columns).ok_or_else(|| invalid("node count overflow"))?;
+        let count = rows
+            .checked_mul(columns)
+            .ok_or_else(|| invalid("node count overflow"))?;
         if count != endian.u32(&header[168..172]) as usize || count > max_nodes {
             return Err(invalid("node count mismatch or limit exceeded"));
         }
         let mut nodes = Vec::new();
-        nodes.try_reserve_exact(count).map_err(|_| invalid("node allocation failed"))?;
+        nodes
+            .try_reserve_exact(count)
+            .map_err(|_| invalid("node allocation failed"))?;
         for _ in 0..count {
             let mut raw = [0u8; RECORD];
             input.read_exact(&mut raw)?;
@@ -160,14 +197,31 @@ impl Ntv2Grid {
             if !latitude_seconds.is_finite() || !longitude_seconds_west.is_finite() {
                 return Err(invalid("non-finite node shift"));
             }
-            nodes.push(Ntv2Shift { latitude_seconds, longitude_seconds_west });
+            nodes.push(Ntv2Shift {
+                latitude_seconds,
+                longitude_seconds_west,
+            });
         }
-        Ok(Self { source, target, south, north, east, west, latitude_step, longitude_step, rows, columns, nodes: nodes.into_boxed_slice() })
+        Ok(Self {
+            source,
+            target,
+            south,
+            north,
+            east,
+            west,
+            latitude_step,
+            longitude_step,
+            rows,
+            columns,
+            nodes: nodes.into_boxed_slice(),
+        })
     }
 
     /// Return the shift at a row and column, in the file's native order.
     pub fn node(&self, row: usize, column: usize) -> Option<Ntv2Shift> {
-        if row >= self.rows || column >= self.columns { return None; }
+        if row >= self.rows || column >= self.columns {
+            return None;
+        }
         self.nodes.get(row * self.columns + column).copied()
     }
 }
@@ -178,16 +232,58 @@ mod tests {
 
     fn fixture(big: bool) -> Vec<u8> {
         let mut data = vec![0u8; HEADER * 2 + RECORD * 4];
-        let overview = [b"NUM_OREC", b"NUM_SREC", b"NUM_FILE", b"GS_TYPE ", b"VERSION ", b"SYSTEM_F", b"SYSTEM_T", b"MAJOR_F ", b"MINOR_F ", b"MAJOR_T ", b"MINOR_T "];
-        let subgrid = [b"SUB_NAME", b"PARENT  ", b"CREATED ", b"UPDATED ", b"S_LAT   ", b"N_LAT   ", b"E_LONG  ", b"W_LONG  ", b"LAT_INC ", b"LONG_INC", b"GS_COUNT"];
+        let overview = [
+            b"NUM_OREC",
+            b"NUM_SREC",
+            b"NUM_FILE",
+            b"GS_TYPE ",
+            b"VERSION ",
+            b"SYSTEM_F",
+            b"SYSTEM_T",
+            b"MAJOR_F ",
+            b"MINOR_F ",
+            b"MAJOR_T ",
+            b"MINOR_T ",
+        ];
+        let subgrid = [
+            b"SUB_NAME",
+            b"PARENT  ",
+            b"CREATED ",
+            b"UPDATED ",
+            b"S_LAT   ",
+            b"N_LAT   ",
+            b"E_LONG  ",
+            b"W_LONG  ",
+            b"LAT_INC ",
+            b"LONG_INC",
+            b"GS_COUNT",
+        ];
         for (base, names) in [(0, overview), (HEADER, subgrid)] {
             for (i, name) in names.iter().enumerate() {
                 data[base + i * RECORD..base + i * RECORD + 8].copy_from_slice(*name);
             }
         }
-        let int = |v: u32| if big { v.to_be_bytes() } else { v.to_le_bytes() };
-        let double = |v: f64| if big { v.to_be_bytes() } else { v.to_le_bytes() };
-        let float = |v: f32| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let int = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let double = |v: f64| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let float = |v: f32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
         for (offset, value) in [(8, 11), (24, 11), (40, 1), (HEADER + 168, 4)] {
             data[offset..offset + 4].copy_from_slice(&int(value));
         }
@@ -196,7 +292,14 @@ mod tests {
         data[104..112].copy_from_slice(b"DST     ");
         data[HEADER + 8..HEADER + 16].copy_from_slice(b"ROOT    ");
         data[HEADER + 24..HEADER + 32].copy_from_slice(b"NONE    ");
-        for (offset, value) in [(72, 0.0), (88, 3600.0), (104, 0.0), (120, 3600.0), (136, 3600.0), (152, 3600.0)] {
+        for (offset, value) in [
+            (72, 0.0),
+            (88, 3600.0),
+            (104, 0.0),
+            (120, 3600.0),
+            (136, 3600.0),
+            (152, 3600.0),
+        ] {
             data[HEADER + offset..HEADER + offset + 8].copy_from_slice(&double(value));
         }
         for i in 0..4 {
