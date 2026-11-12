@@ -345,6 +345,8 @@ const AGENT_OUTPUT_BUFFER_BYTES: usize = 8 * 1024;
 /// ureq adds itself (`Host`, `User-Agent`, `Accept`), so the size check in
 /// `check_request_head` errs on the safe side.
 const REQUEST_HEAD_RESERVE_BYTES: usize = 1024;
+/// Redirects followed per request, as ureq 2 did by default.
+const MAX_REDIRECTS: usize = 5;
 
 /// An HTTP response as returned by the agent; status codes are not turned
 /// into errors (`http_status_as_error(false)`), so `Retry-After` stays readable.
@@ -374,6 +376,42 @@ impl RequestFailure {
             RequestFailure::Transport(_) => true,
         }
     }
+}
+
+/// A request ready to send: its URL, the headers this crate sets, and why a
+/// configured `RASTER_H3_AUTH_TOKEN` was held back from it, if it was.
+struct PreparedRequest {
+    url: String,
+    headers: Vec<(String, String)>,
+    withheld_token: Option<&'static str>,
+}
+
+/// The URL a response redirects to, resolved against `current`; `None` when
+/// the response is not a redirect. Like ureq, every 3xx except 304 redirects.
+fn redirect_target(current: &str, resp: &HttpResponse) -> Result<Option<String>> {
+    let status = resp.status().as_u16();
+    if !(300..400).contains(&status) || status == 304 {
+        return Ok(None);
+    }
+    let location = header_str(resp, "Location").ok_or_else(|| {
+        RasterH3Error::InvalidParameter(format!(
+            "HTTP {status} redirect from '{current}' has no usable Location header"
+        ))
+    })?;
+    let next = Url::parse(current)
+        .and_then(|base| base.join(location))
+        .map_err(|e| {
+            RasterH3Error::InvalidParameter(format!(
+                "HTTP {status} redirect from '{current}' has an invalid Location: {e}"
+            ))
+        })?;
+    if !matches!(next.scheme(), "http" | "https") {
+        return Err(RasterH3Error::InvalidParameter(format!(
+            "HTTP {status} redirect from '{current}' leads to an unsupported '{}' URL",
+            next.scheme()
+        )));
+    }
+    Ok(Some(next.into()))
 }
 
 /// A response header as text; `None` when absent or not visible ASCII
@@ -486,9 +524,13 @@ impl HttpTransport {
             // Statuses are classified in `execute_request`, which needs the
             // response (for `Retry-After`) rather than a bare status error.
             .http_status_as_error(false)
-            // ureq 2 defaults: follow at most 5 redirects, and never read
-            // proxy settings from the environment.
-            .max_redirects(5)
+            // Redirects are followed by `send_range`, which recomputes the
+            // credential headers for every hop; ureq would carry custom headers
+            // such as `x-amz-security-token` to any host. 3xx responses are
+            // returned instead of failing as "too many redirects".
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            // Never read proxy settings from the environment (ureq 2 behaviour).
             .proxy(None)
             .build()
             .into();
@@ -550,45 +592,56 @@ impl HttpTransport {
         ))
     }
 
-    /// Default headers for the current `url`. Resolved per request, not at
-    /// construction: `url` is public, and a credential scoped to one host must
-    /// not follow the transport to another.
-    fn request_headers(&self) -> RequestHeaders {
-        default_headers_for(&self.url, &|name| std::env::var(name).ok())
+    /// Default headers for `url` (the current `url`, or a redirect target).
+    /// Resolved per request, not at construction: `url` is public, and a
+    /// credential scoped to one host must not follow the transport, or a
+    /// redirect, to another.
+    fn request_headers_for(url: &str) -> RequestHeaders {
+        default_headers_for(url, &|name| std::env::var(name).ok())
     }
 
-    /// The headers this crate sets on one range request, in send order; ureq
-    /// adds `Host`, `User-Agent` and `Accept` itself.
-    fn range_request_headers(
-        &self,
+    /// One range request to `url`: the headers this crate sets, in send order
+    /// (ureq adds `Host`, `User-Agent` and `Accept` itself), with the
+    /// credential headers resolved for `url`.
+    fn prepare_range_request(
+        url: &str,
         range: &str,
         etag: &OnceLock<Option<String>>,
-    ) -> Vec<(String, String)> {
+    ) -> PreparedRequest {
+        let RequestHeaders {
+            headers: auth,
+            withheld_token,
+        } = Self::request_headers_for(url);
         let mut headers = vec![
             ("Range".to_string(), range.to_string()),
             ("Accept-Encoding".to_string(), "identity".to_string()),
         ];
-        headers.extend(self.request_headers().headers);
+        headers.extend(auth);
         if let Some(Some(etag)) = etag.get() {
             headers.push(("If-Match".to_string(), etag.clone()));
         }
-        headers
+        PreparedRequest {
+            url: url.to_string(),
+            headers,
+            withheld_token,
+        }
     }
 
     /// Fail before sending when a request head cannot fit the agent's output
     /// buffer, which would otherwise surface as an opaque protocol error.
     /// Neither the message nor the check exposes header values.
-    fn check_request_head(&self, headers: &[(String, String)]) -> Result<()> {
-        let needed = self.url.len()
+    fn check_request_head(request: &PreparedRequest) -> Result<()> {
+        let needed = request.url.len()
             + REQUEST_HEAD_RESERVE_BYTES
-            + headers
+            + request
+                .headers
                 .iter()
                 .map(|(k, v)| k.len() + v.len() + 4)
                 .sum::<usize>();
         if needed > AGENT_OUTPUT_BUFFER_BYTES {
             return Err(RasterH3Error::InvalidParameter(format!(
                 "HTTP request headers for '{}' need about {} bytes, more than the {}-byte limit; check that RASTER_H3_AUTH_TOKEN or AWS_SESSION_TOKEN is not unusually long",
-                self.url, needed, AGENT_OUTPUT_BUFFER_BYTES
+                request.url, needed, AGENT_OUTPUT_BUFFER_BYTES
             )));
         }
         Ok(())
@@ -596,13 +649,34 @@ impl HttpTransport {
 
     fn range_request(
         &self,
-        headers: &[(String, String)],
+        request: &PreparedRequest,
     ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-        let mut req = self.agent.get(&self.url);
-        for (k, v) in headers {
+        let mut req = self.agent.get(&request.url);
+        for (k, v) in &request.headers {
             req = req.header(k, v);
         }
         req
+    }
+
+    /// Send a range request, following up to [`MAX_REDIRECTS`] redirects.
+    /// Each hop gets the credential headers its own URL is entitled to, so a
+    /// token never follows a redirect to a host (or a plain-http URL) it is
+    /// not scoped to; `Range`, `Accept-Encoding` and `If-Match` carry over.
+    fn send_range(&self, range: &str, etag: &OnceLock<Option<String>>) -> Result<HttpResponse> {
+        let mut url = self.url.clone();
+        for _ in 0..=MAX_REDIRECTS {
+            let request = Self::prepare_range_request(&url, range, etag);
+            Self::check_request_head(&request)?;
+            let resp = self.execute_request(&request, || self.range_request(&request).call())?;
+            match redirect_target(&url, &resp)? {
+                Some(next) => url = next,
+                None => return Ok(resp),
+            }
+        }
+        Err(RasterH3Error::InvalidParameter(format!(
+            "Remote server at '{}' redirected more than {} times",
+            self.url, MAX_REDIRECTS
+        )))
     }
 
     /// Pin only a strong ETag: weak tags do not guarantee byte-for-byte identity.
@@ -705,7 +779,11 @@ impl HttpTransport {
     }
 
     /// Execute a request with automatic exponential backoff retry on transient errors
-    fn execute_request<F>(&self, mut make_request: F) -> Result<HttpResponse>
+    fn execute_request<F>(
+        &self,
+        request: &PreparedRequest,
+        mut make_request: F,
+    ) -> Result<HttpResponse>
     where
         F: FnMut() -> std::result::Result<HttpResponse, ureq::Error>,
     {
@@ -735,7 +813,7 @@ impl HttpTransport {
                         status => {
                             // A refusal is the only sign the caller gets
                             // that a configured token stayed home.
-                            let hint = match self.request_headers().withheld_token {
+                            let hint = match request.withheld_token {
                                 Some(why) if matches!(status, 401 | 403) => {
                                     format!(" (RASTER_H3_AUTH_TOKEN was not sent: {why})")
                                 }
@@ -781,9 +859,7 @@ impl HttpTransport {
         etag: &OnceLock<Option<String>>,
     ) -> Result<BodyAttempt<ProbeResult>> {
         let range_header = format!("bytes=0-{}", initial_fetch_len.saturating_sub(1));
-        let headers = self.range_request_headers(&range_header, etag);
-        self.check_request_head(&headers)?;
-        let resp = self.execute_request(|| self.range_request(&headers).call())?;
+        let resp = self.send_range(&range_header, etag)?;
 
         let status = resp.status().as_u16();
         if status == 206 {
@@ -878,9 +954,7 @@ impl HttpTransport {
         etag: &OnceLock<Option<String>>,
     ) -> Result<BodyAttempt<Vec<u8>>> {
         let range_header = format!("bytes={}-{}", start, end);
-        let headers = self.range_request_headers(&range_header, etag);
-        self.check_request_head(&headers)?;
-        let resp = self.execute_request(|| self.range_request(&headers).call())?;
+        let resp = self.send_range(&range_header, etag)?;
 
         let status = resp.status().as_u16();
         let content_range = header_str(&resp, "Content-Range").map(str::to_owned);
@@ -1523,7 +1597,7 @@ mod tests {
     }
 
     /// The agent keeps ureq 2's behaviour: environment proxy variables are
-    /// ignored, at most 5 redirects, a per-read (not whole-body) timeout, and
+    /// ignored, redirects are returned to `send_range` to follow, a per-read (not whole-body) timeout, and
     /// status codes returned as responses so `Retry-After` can be read. Its
     /// per-connection buffers are sized down from ureq 3's 128 KiB defaults,
     /// and a response head that does not fit is reported as too big.
@@ -1532,7 +1606,9 @@ mod tests {
         let transport = HttpTransport::new("https://example.com/a.tif").unwrap();
         let config = transport.agent.config();
         assert!(config.proxy().is_none(), "proxy env vars must be ignored");
-        assert_eq!(config.max_redirects(), 5);
+        // Redirects are followed by `send_range` (up to MAX_REDIRECTS), not ureq.
+        assert_eq!(config.max_redirects(), 0);
+        assert!(!config.max_redirects_will_error());
         assert!(!config.http_status_as_error());
         assert_eq!(
             config.timeout_per_read(),
@@ -1549,19 +1625,67 @@ mod tests {
         assert!(config.max_response_header_size() < AGENT_INPUT_BUFFER_BYTES);
     }
 
+    fn response(status: u16, location: Option<&str>) -> HttpResponse {
+        let mut builder = ureq::http::Response::builder().status(status);
+        if let Some(location) = location {
+            builder = builder.header("Location", location);
+        }
+        builder
+            .body(ureq::Body::builder().data(Vec::new()))
+            .unwrap()
+    }
+
+    /// Redirect targets resolve like ureq's: every 3xx but 304 redirects,
+    /// relative locations resolve against the current URL, and only http(s)
+    /// targets are followed.
+    #[test]
+    fn redirect_targets_resolve_against_the_current_url() {
+        let base = "https://data.example.com/dir/a.tif?x=1";
+        let target = |status, location| redirect_target(base, &response(status, location));
+        assert_eq!(target(200, None).unwrap(), None);
+        assert_eq!(target(206, Some("/elsewhere")).unwrap(), None);
+        assert_eq!(target(304, Some("/elsewhere")).unwrap(), None);
+        for status in [300, 301, 302, 303, 307, 308] {
+            assert_eq!(
+                target(status, Some("b.tif")).unwrap().as_deref(),
+                Some("https://data.example.com/dir/b.tif"),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            target(302, Some("/c.tif")).unwrap().as_deref(),
+            Some("https://data.example.com/c.tif")
+        );
+        assert_eq!(
+            target(302, Some("http://other.example.org/d.tif"))
+                .unwrap()
+                .as_deref(),
+            Some("http://other.example.org/d.tif")
+        );
+        let missing = target(302, None).unwrap_err().to_string();
+        assert!(missing.contains("no usable Location"), "{missing}");
+        let scheme = target(302, Some("file:///etc/passwd"))
+            .unwrap_err()
+            .to_string();
+        assert!(scheme.contains("unsupported 'file' URL"), "{scheme}");
+    }
+
     /// A request head that cannot fit the agent's output buffer is rejected
     /// before sending, without the header value in the message.
     #[test]
     fn oversized_request_head_is_rejected_before_sending() {
-        let transport = HttpTransport::new("https://data.example.com/a.tif").unwrap();
         let etag = OnceLock::new();
         let with_token = |len: usize| {
-            let mut headers = transport.range_request_headers("bytes=0-9", &etag);
-            headers.push((
+            let mut request = HttpTransport::prepare_range_request(
+                "https://data.example.com/a.tif",
+                "bytes=0-9",
+                &etag,
+            );
+            request.headers.push((
                 "Authorization".into(),
                 format!("Bearer {}", "t".repeat(len)),
             ));
-            transport.check_request_head(&headers)
+            HttpTransport::check_request_head(&request)
         };
         assert!(with_token(6 * 1024).is_ok());
         let error = with_token(10 * 1024).unwrap_err().to_string();

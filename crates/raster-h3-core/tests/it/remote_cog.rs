@@ -363,7 +363,21 @@ impl MockHttpServer {
     }
 
     fn start_with_failures(file_bytes: Vec<u8>, failure_count: usize) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+        Self::try_start_on("127.0.0.1", file_bytes, failure_count)
+            .expect("Failed to bind ephemeral port")
+    }
+
+    /// A server on another loopback address (`127.0.0.2`), so a redirect can
+    /// cross hosts; `None` where that address is not configured (macOS by default).
+    fn start_on_second_loopback(file_bytes: Vec<u8>) -> Option<Self> {
+        let server = Self::try_start_on("127.0.0.2", file_bytes, 0)?;
+        let addr = format!("127.0.0.2:{}", server.port).parse().ok()?;
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
+        Some(server)
+    }
+
+    fn try_start_on(ip: &str, file_bytes: Vec<u8>, failure_count: usize) -> Option<Self> {
+        let listener = TcpListener::bind((ip, 0)).ok()?;
         let port = listener.local_addr().unwrap().port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let bytes_served = Arc::new(AtomicUsize::new(0));
@@ -421,9 +435,9 @@ impl MockHttpServer {
             }
         });
 
-        Self {
+        Some(Self {
             port,
-            url_base: format!("http://127.0.0.1:{}", port),
+            url_base: format!("http://{ip}:{port}"),
             bytes_served,
             request_count,
             transient_failures,
@@ -432,11 +446,38 @@ impl MockHttpServer {
             gate,
             shutdown,
             handle: Some(handle),
-        }
+        })
     }
 
     fn recorded_headers(&self) -> Vec<String> {
         self.recorded_headers.lock().unwrap().clone()
+    }
+
+    /// For a redirect fixture, `Some(Location)` (`Some(None)` for a redirect
+    /// without one):
+    /// - `redirect_hops_<k>`: `k` relative hops to the same path with `k - 1`;
+    /// - `redirect_without_location`: a 302 with no `Location`;
+    /// - `redirect_to_<ip>_<port>/<rest>`: an absolute redirect to `http://<ip>:<port>/<rest>`.
+    #[allow(clippy::option_option)]
+    fn redirect_location(path: &str) -> Option<Option<String>> {
+        if path.contains("redirect_without_location") {
+            return Some(None);
+        }
+        if let Some((_, rest)) = path.split_once("redirect_to_") {
+            let (target, tail) = rest.split_once('/')?;
+            let (ip, port) = target.rsplit_once('_')?;
+            return Some(Some(format!("http://{ip}:{port}/{tail}")));
+        }
+        let (_, rest) = path.split_once("redirect_hops_")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let hops: usize = digits.parse().ok()?;
+        (hops > 0).then(|| {
+            Some(path.replacen(
+                &format!("redirect_hops_{digits}"),
+                &format!("redirect_hops_{}", hops - 1),
+                1,
+            ))
+        })
     }
 
     /// Atomic decrement-if-positive: whether this connection may serve a
@@ -502,6 +543,19 @@ impl MockHttpServer {
         if method != "GET" && method != "HEAD" {
             let resp =
                 "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+
+        // Redirect fixtures answer before the request is counted, so the
+        // version fixtures below see only the final hop.
+        if let Some(location) = Self::redirect_location(path) {
+            let location = location
+                .map(|l| format!("Location: {l}\r\n"))
+                .unwrap_or_default();
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             let _ = stream.write_all(resp.as_bytes());
             return;
         }
@@ -2278,6 +2332,144 @@ fn auth_token_is_sent_only_to_listed_hosts() {
             !retargeted.is_empty() && !sent(&retargeted),
             "{retargeted:?}"
         );
+    }
+}
+
+fn count_lines(headers: &[String], line: &str) -> usize {
+    headers.iter().filter(|h| h.trim() == line).count()
+}
+
+// The transport follows redirects itself, keeping `Range` and the pinned
+// validator on every hop.
+#[test]
+fn redirects_are_followed_with_range_and_validator() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+    let server = MockHttpServer::start(data.clone());
+    let url = format!("{}/redirect_hops_2_etag_stable.tif", server.url_base);
+    let source = RemoteHttpSource::open(&url).unwrap();
+    assert_eq!(
+        source.fetch_range(150_000, 150_009).unwrap(),
+        data[150_000..150_010]
+    );
+    let headers = recorded_lowercase(&server);
+    // Probe and range fetch, each two redirects plus the final request.
+    let ranges = headers.iter().filter(|h| h.starts_with("range:")).count();
+    assert_eq!(ranges, 6, "{headers:?}");
+    assert_eq!(count_lines(&headers, "range: bytes=0-131071"), 3);
+    // The validator pinned by the probe goes with every hop of the fetch.
+    assert_eq!(count_lines(&headers, "if-match: \"v1\""), 3, "{headers:?}");
+}
+
+#[test]
+fn redirect_limits_and_missing_locations_fail_clearly() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let server = MockHttpServer::start(vec![3u8; 4096]);
+    let open = |path: &str| RemoteHttpSource::open(&format!("{}/{path}", server.url_base));
+    assert!(
+        open("redirect_hops_5.tif").is_ok(),
+        "five redirects are followed"
+    );
+    let too_many = open("redirect_hops_6.tif").err().unwrap().to_string();
+    assert!(
+        too_many.contains("redirected more than 5 times"),
+        "{too_many}"
+    );
+    let missing = open("redirect_without_location.tif")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(missing.contains("no usable Location header"), "{missing}");
+}
+
+// Credential headers are resolved for each hop's own URL: a redirect away
+// from the host a credential is scoped to does not carry it, and a redirect to
+// that host does. ureq alone would carry `x-amz-security-token` to any host.
+// The bearer and session tokens are exclusive, so each gets its own round.
+#[test]
+fn credentials_do_not_follow_a_redirect_to_another_host() {
+    let _env_lock = ENV_MUTEX.lock().unwrap();
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let Some(other) = MockHttpServer::start_on_second_loopback(data.clone()) else {
+        eprintln!("Skipping test: 127.0.0.2 is not a usable loopback address here");
+        return;
+    };
+    let listed = MockHttpServer::start(data.clone());
+    let vars = [
+        "RASTER_H3_AUTH_TOKEN",
+        "RASTER_H3_AUTH_HOSTS",
+        "AWS_SESSION_TOKEN",
+        "AWS_ENDPOINT_URL",
+    ];
+    let rounds = [
+        (
+            vec![
+                ("RASTER_H3_AUTH_TOKEN", "scoped-token".to_string()),
+                ("RASTER_H3_AUTH_HOSTS", "127.0.0.1".to_string()),
+            ],
+            "authorization: bearer scoped-token",
+        ),
+        (
+            vec![
+                ("AWS_SESSION_TOKEN", "session-token".to_string()),
+                ("AWS_ENDPOINT_URL", listed.url_base.clone()),
+            ],
+            "x-amz-security-token: session-token",
+        ),
+    ];
+    let fetch = |url: String| HttpTransport::new(&url).and_then(|t| t.fetch_range(0, 9, None));
+
+    for (env, credential) in rounds {
+        for (name, value) in &env {
+            std::env::set_var(name, value);
+        }
+        let (listed_before, other_before) = (
+            recorded_lowercase(&listed).len(),
+            recorded_lowercase(&other).len(),
+        );
+        let away = fetch(format!(
+            "{}/redirect_to_127.0.0.2_{}/away.tif",
+            listed.url_base, other.port
+        ));
+        let (listed_mid, other_mid) = (
+            recorded_lowercase(&listed).len(),
+            recorded_lowercase(&other).len(),
+        );
+        let back = fetch(format!(
+            "{}/redirect_to_127.0.0.1_{}/back.tif",
+            other.url_base, listed.port
+        ));
+        for name in vars {
+            std::env::remove_var(name);
+        }
+
+        assert_eq!(away.unwrap(), data[..10], "{credential}");
+        assert_eq!(back.unwrap(), data[..10], "{credential}");
+        let listed_all = recorded_lowercase(&listed);
+        let other_all = recorded_lowercase(&other);
+        for (headers, sent) in [
+            (&listed_all[listed_before..listed_mid], true),
+            (&other_all[other_before..other_mid], false),
+            (&other_all[other_mid..], false),
+            (&listed_all[listed_mid..], true),
+        ] {
+            assert!(!headers.is_empty(), "{credential}");
+            assert_eq!(
+                count_lines(headers, credential),
+                usize::from(sent),
+                "{credential}: {headers:?}"
+            );
+        }
     }
 }
 
