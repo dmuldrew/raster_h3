@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_sedona::scan::{
-    CategoricalRasterTableProvider, ContinuousRasterTableProvider, ExecutionPlan, TableProvider,
+    CategoricalRasterTableProvider, ContinuousRasterTableProvider, RasterScan, RasterScanExec,
 };
 
 use crate::helpers::TestGeoTiffBuilder;
 
 /// Rows from a full scan, or the first scan error.
-fn run(plan: Box<dyn ExecutionPlan>) -> Result<usize, String> {
+fn run(plan: Box<dyn RasterScanExec>) -> Result<usize, String> {
     let mut rows = 0;
     for batch in plan.execute().map_err(|e| e.to_string())? {
         rows += batch.map_err(|e| e.to_string())?.num_rows;

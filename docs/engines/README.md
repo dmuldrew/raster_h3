@@ -12,14 +12,13 @@ in every engine.
 flowchart TD
     CORE["raster-h3-core<br/>GeoTIFF/COG I/O · CRS · scanline H3 aggregation<br/>RecordBatch · Arrow C Stream · IPC/JSONL · Parquet · PMTiles"]
     DUCK["raster-h3-duckdb<br/>DuckDB C-API extension"]
-    DF["raster-h3-datafusion<br/>TableProvider / ExecutionPlan / ScalarUDF"]
+    SED["raster-h3-sedona (standalone workspace)<br/>Apache DataFusion / SedonaDB adapter + scan layer"]
     PY["raster-h3-python<br/>ctypes C-ABI + Arrow PyCapsules + Polars IO source"]
     PG["raster-h3-pg<br/>PostgreSQL V1 fmgr extension"]
     CLI["raster-h3-cli<br/>ipc · jsonl · parquet · pmtiles"]
     ROOT["raster_h3 (root crate)<br/>facade + libraster_h3 cdylib (DuckDB)"]
-    CORE --> DUCK & DF & PY & PG & CLI
-    DF --> PY
-    DUCK & DF & PY & PG & CLI --> ROOT
+    CORE --> DUCK & SED & PY & PG & CLI
+    DUCK & PY & PG & CLI --> ROOT
 ```
 
 ## Workspace Layout
@@ -28,8 +27,7 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | `raster-h3-core` | [`crates/raster-h3-core`](../../crates/raster-h3-core) | `rlib` | [Core Engine](core.md) |
 | `raster-h3-duckdb` | [`crates/raster-h3-duckdb`](../../crates/raster-h3-duckdb) | `rlib`, linked into `libraster_h3.{so,dylib,dll}` by the root crate | [DuckDB](duckdb.md) |
-| `raster-h3-datafusion` | [`crates/raster-h3-datafusion`](../../crates/raster-h3-datafusion) | `rlib` | [DataFusion](datafusion.md) |
-| `raster-h3-sedona` | [`crates/raster-h3-sedona`](../../crates/raster-h3-sedona) | `rlib`, standalone workspace (DataFusion version pinned to SedonaDB's) | [DataFusion](datafusion.md#using-with-apache-datafusion-and-sedonadb) |
+| `raster-h3-sedona` | [`crates/raster-h3-sedona`](../../crates/raster-h3-sedona) | `rlib`, standalone workspace (DataFusion version pinned to SedonaDB's) | [DataFusion & SedonaDB](datafusion.md) |
 | `raster-h3-python` | [`crates/raster-h3-python`](../../crates/raster-h3-python) | `cdylib` + `raster-h3` wheel | [Python & Polars](python-polars.md), [Spark & Apache Sedona](spark.md) |
 | `raster-h3-pg` | [`crates/raster-h3-pg`](../../crates/raster-h3-pg) | `cdylib` (`raster_h3_pg.so` with `--features pg-extension`) | [PostgreSQL](postgresql.md) |
 | `raster-h3-cli` | [`crates/raster-h3-cli`](../../crates/raster-h3-cli) | `raster-h3-cli` executable (also built as `raster-h3` from the root crate) | [CLI](cli.md) |

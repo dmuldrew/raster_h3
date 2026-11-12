@@ -61,7 +61,6 @@ src/                         # Root crate: libraster_h3 (DuckDB extension) and `
 crates/
 ├── raster-h3-core/          # Engine: raster I/O, CRS, aggregation, columnar, Parquet, PMTiles
 ├── raster-h3-duckdb/        # DuckDB C-API extension (ffi/, functions/)
-├── raster-h3-datafusion/    # TableProvider / ExecutionPlan / ScalarUDF adapters
 ├── raster-h3-python/        # C-ABI cdylib, python/raster_h3 package, hatch wheel build
 ├── raster-h3-pg/            # PostgreSQL fmgr extension, raster_h3.control, sql/
 └── raster-h3-cli/           # raster-h3-cli executable (ipc, jsonl, parquet, pmtiles)

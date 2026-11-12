@@ -7,7 +7,7 @@ use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::columnar::{CategoricalFormat, ColumnArray, RecordBatch};
 use raster_h3_sedona::scan::{
     merge_partial_batches, CategoricalRasterTableProvider, ContinuousRasterTableProvider,
-    FilterPredicate, FilterPushdownStatus, TableProvider, PARTIAL_STATE_COLUMN,
+    FilterPredicate, FilterPushdownStatus, RasterScan, PARTIAL_STATE_COLUMN,
 };
 
 use crate::helpers::{write_geotiff, Crs, Layout};
@@ -90,7 +90,7 @@ fn partitioned_rows<P>(
     config: &MultiResolutionConfig,
 ) -> (Vec<String>, Vec<Row>, usize)
 where
-    P: TableProvider + Clone,
+    P: RasterScan + Clone,
 {
     let mut finals = Vec::new();
     let mut partials = Vec::new();

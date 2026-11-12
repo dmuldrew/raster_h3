@@ -1,4 +1,4 @@
-//! Vectorized DataFusion `ScalarUDFImpl` implementations for H3 cell operations.
+//! Vectorized [`H3ScalarFn`] implementations for H3 cell operations.
 //!
 //! Operates directly on [`ColumnArray`] batches with full null-validity propagation.
 
@@ -10,8 +10,9 @@ use raster_h3_core::scalar_ops::{
     h3_is_valid_u64, h3_to_lat, h3_to_lng,
 };
 
-/// Trait modeling DataFusion's `ScalarUDFImpl` for vectorized columnar execution.
-pub trait ScalarUDFImpl: Send + Sync {
+/// A vectorized H3 scalar function over [`ColumnArray`]s. [`crate::udf::RasterH3ScalarUdf`]
+/// adapts it to DataFusion's `ScalarUDFImpl`.
+pub trait H3ScalarFn: Send + Sync {
     /// Canonical function name in SQL.
     fn name(&self) -> &str;
 
@@ -30,7 +31,7 @@ pub trait ScalarUDFImpl: Send + Sync {
 /// `h3_to_string(UBIGINT) -> VARCHAR`
 pub struct H3ToStringUdf;
 
-impl ScalarUDFImpl for H3ToStringUdf {
+impl H3ScalarFn for H3ToStringUdf {
     fn name(&self) -> &str {
         "h3_to_string"
     }
@@ -77,7 +78,7 @@ impl ScalarUDFImpl for H3ToStringUdf {
 /// `string_to_h3(VARCHAR) -> UBIGINT`
 pub struct StringToH3Udf;
 
-impl ScalarUDFImpl for StringToH3Udf {
+impl H3ScalarFn for StringToH3Udf {
     fn name(&self) -> &str {
         "string_to_h3"
     }
@@ -111,7 +112,7 @@ impl ScalarUDFImpl for StringToH3Udf {
 /// `h3_to_lat(UBIGINT) -> DOUBLE`
 pub struct H3ToLatUdf;
 
-impl ScalarUDFImpl for H3ToLatUdf {
+impl H3ScalarFn for H3ToLatUdf {
     fn name(&self) -> &str {
         "h3_to_lat"
     }
@@ -142,7 +143,7 @@ impl ScalarUDFImpl for H3ToLatUdf {
 /// `h3_to_lng(UBIGINT) -> DOUBLE`
 pub struct H3ToLngUdf;
 
-impl ScalarUDFImpl for H3ToLngUdf {
+impl H3ScalarFn for H3ToLngUdf {
     fn name(&self) -> &str {
         "h3_to_lng"
     }
@@ -173,7 +174,7 @@ impl ScalarUDFImpl for H3ToLngUdf {
 /// `h3_get_resolution(UBIGINT) -> BIGINT`
 pub struct H3GetResolutionUdf;
 
-impl ScalarUDFImpl for H3GetResolutionUdf {
+impl H3ScalarFn for H3GetResolutionUdf {
     fn name(&self) -> &str {
         "h3_get_resolution"
     }
@@ -204,7 +205,7 @@ impl ScalarUDFImpl for H3GetResolutionUdf {
 /// `h3_is_valid(UBIGINT | VARCHAR) -> BOOLEAN`
 pub struct H3IsValidUdf;
 
-impl ScalarUDFImpl for H3IsValidUdf {
+impl H3ScalarFn for H3IsValidUdf {
     fn name(&self) -> &str {
         "h3_is_valid"
     }
@@ -244,7 +245,7 @@ impl ScalarUDFImpl for H3IsValidUdf {
 /// `h3_to_wkb(UBIGINT | VARCHAR) -> BINARY` (also aliased as `h3_to_geometry`, `h3_cell_to_geometry`)
 pub struct H3ToWkbUdf;
 
-impl ScalarUDFImpl for H3ToWkbUdf {
+impl H3ScalarFn for H3ToWkbUdf {
     fn name(&self) -> &str {
         "h3_to_wkb"
     }
@@ -321,7 +322,7 @@ impl ScalarUDFImpl for H3ToWkbUdf {
 /// `h3_cell_to_parent(UBIGINT | VARCHAR, BIGINT) -> UBIGINT | VARCHAR`
 pub struct H3CellToParentUdf;
 
-impl ScalarUDFImpl for H3CellToParentUdf {
+impl H3ScalarFn for H3CellToParentUdf {
     fn name(&self) -> &str {
         "h3_cell_to_parent"
     }

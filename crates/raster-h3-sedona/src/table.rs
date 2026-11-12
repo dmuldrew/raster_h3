@@ -1,4 +1,4 @@
-//! [`RasterH3Table`]: a DataFusion `TableProvider` over the `raster-h3-datafusion` providers.
+//! [`RasterH3Table`]: a DataFusion `TableProvider` over the [`scan`](crate::scan) providers.
 
 use std::fmt;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub enum TableKind {
 /// Aggregation runs on DataFusion's blocking thread pool and streams batches back through
 /// the Arrow C Stream Interface without copying.
 pub struct RasterH3Table {
-    inner: Arc<dyn crate::scan::TableProvider>,
+    inner: Arc<dyn crate::scan::RasterScan>,
     kind: TableKind,
     schema: arrow::datatypes::SchemaRef,
     untagged: Untagged,
@@ -60,7 +60,7 @@ impl RasterH3Table {
         Self::new(Arc::new(provider), TableKind::Categorical)
     }
 
-    fn new(inner: Arc<dyn crate::scan::TableProvider>, kind: TableKind) -> Self {
+    fn new(inner: Arc<dyn crate::scan::RasterScan>, kind: TableKind) -> Self {
         let core_schema = inner.schema();
         let schema = to_arrow_schema(&core_schema);
         Self {
@@ -201,7 +201,7 @@ impl TableProvider for RasterH3Table {
 
 /// One aggregation run, streamed as a single DataFusion partition.
 struct RasterH3Partition {
-    plan: Arc<dyn crate::scan::ExecutionPlan>,
+    plan: Arc<dyn crate::scan::RasterScanExec>,
     schema: arrow::datatypes::SchemaRef,
 }
 

@@ -16,7 +16,7 @@ use raster_h3_core::columnar::ArrowDataType;
 use crate::convert::{from_column_array, geometry_field, to_arrow_type, to_column_array};
 
 /// All `raster_h3` scalar functions, ready for `SessionContext::register_udf`: the
-/// `raster-h3-datafusion` H3 functions plus [`H3PolygonToCells`](crate::H3PolygonToCells).
+/// [`scan`](crate::scan) H3 functions plus [`H3PolygonToCells`](crate::H3PolygonToCells).
 pub fn scalar_udfs() -> Vec<ScalarUDF> {
     default_scalar_udfs()
         .into_iter()
@@ -27,19 +27,19 @@ pub fn scalar_udfs() -> Vec<ScalarUDF> {
         .collect()
 }
 
-/// Adapts a `raster-h3-datafusion` scalar UDF to DataFusion's `ScalarUDFImpl`.
+/// Adapts a [`scan`](crate::scan) H3 scalar function to DataFusion's `ScalarUDFImpl`.
 ///
 /// Arguments are coerced to the types the core functions take (`UInt64` cells, `Utf8`
 /// hex strings, `Int64` resolutions), so SQL integer and string literals work directly.
 /// Functions returning WKB return a `geoarrow.wkb` field.
 pub struct RasterH3ScalarUdf {
-    inner: Arc<dyn crate::scan::ScalarUDFImpl>,
+    inner: Arc<dyn crate::scan::H3ScalarFn>,
     aliases: Vec<String>,
     signature: Signature,
 }
 
 impl RasterH3ScalarUdf {
-    pub fn new(inner: Arc<dyn crate::scan::ScalarUDFImpl>) -> Self {
+    pub fn new(inner: Arc<dyn crate::scan::H3ScalarFn>) -> Self {
         let aliases = inner.aliases().iter().map(|a| a.to_string()).collect();
         Self {
             inner,

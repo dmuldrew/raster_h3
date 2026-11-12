@@ -149,7 +149,7 @@ In commit `0fd67df`, the monolithic repository was split into a modular 6-crate 
 * [`crates/raster-h3-duckdb`](../crates/raster-h3-duckdb): Loadable DuckDB extension via stable C-API (`C_STRUCT` ABI).
 * [`crates/raster-h3-python`](../crates/raster-h3-python): `ctypes` C-ABI library exposing zero-copy Arrow PyCapsule streams (`__arrow_c_stream__`) and Polars IO plugins (`register_io_source`).
 * [`crates/raster-h3-cli`](../crates/raster-h3-cli): Standalone CLI for GeoParquet, PMTiles, Arrow IPC, and ClickHouse `JSONEachRow` streaming.
-* [`crates/raster-h3-datafusion`](../crates/raster-h3-datafusion): Apache Arrow DataFusion `TableProvider` and scalar UDFs.
+* [`crates/raster-h3-sedona`](../crates/raster-h3-sedona): Apache DataFusion / SedonaDB adapter (`TableProvider`s, table functions and scalar UDFs), with the engine-neutral `scan` layer that was the `raster-h3-datafusion` crate.
 * [`crates/raster-h3-pg`](../crates/raster-h3-pg): PostgreSQL C-ABI extension (`pg_tle` / native SRF).
 
 ### CONUS Level 9 Multi-Engine Benchmark (Measured October 2026)

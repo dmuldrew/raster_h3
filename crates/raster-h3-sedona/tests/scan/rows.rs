@@ -1,4 +1,4 @@
-//! Order-independent row comparison between DataFusion plans and core batch readers.
+//! Order-independent row comparison between `scan` plans and core batch readers.
 
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::columnar::{
     CategoricalBatchReader, CategoricalFormat, ColumnArray, ContinuousBatchReader, RecordBatch,
 };
-use raster_h3_sedona::scan::ExecutionPlan;
+use raster_h3_sedona::scan::RasterScanExec;
 
 /// One output row rendered as text, so whole tables compare with `assert_eq!`.
 /// Floats keep 12 significant digits: shard merge order may differ between runs.
@@ -52,7 +52,7 @@ pub fn table(batches: &[RecordBatch]) -> (Vec<String>, Vec<Row>) {
     (names, rows)
 }
 
-pub fn plan_table(plan: Box<dyn ExecutionPlan>) -> (Vec<String>, Vec<Row>) {
+pub fn plan_table(plan: Box<dyn RasterScanExec>) -> (Vec<String>, Vec<Row>) {
     let batches: Vec<RecordBatch> = plan
         .execute()
         .unwrap()

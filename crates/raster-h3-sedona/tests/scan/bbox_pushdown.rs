@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use h3o::CellIndex;
 use raster_h3_sedona::scan::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
-    FilterPushdownStatus, TableProvider,
+    FilterPushdownStatus, RasterScan,
 };
 
 use crate::helpers::TestGeoTiffBuilder;
@@ -162,8 +162,8 @@ fn limit_is_not_spent_on_cells_outside_a_pushed_bbox() {
     let cont = ContinuousRasterTableProvider::try_new(src, vec![8]).unwrap();
     let cat = CategoricalRasterTableProvider::try_new(src, vec![8]).unwrap();
     for (name, provider) in [
-        ("continuous", &cont as &dyn TableProvider),
-        ("categorical", &cat as &dyn TableProvider),
+        ("continuous", &cont as &dyn RasterScan),
+        ("categorical", &cat as &dyn RasterScan),
     ] {
         // The widened box emits padding cells the caller drops, so a reader-level limit
         // could be used up before every matching cell is produced.
@@ -185,8 +185,8 @@ fn pushed_bbox_off_the_raster_scans_empty() {
     let cont = ContinuousRasterTableProvider::try_new(src, vec![8]).unwrap();
     let cat = CategoricalRasterTableProvider::try_new(src, vec![8]).unwrap();
     for (name, provider) in [
-        ("continuous", &cont as &dyn TableProvider),
-        ("categorical", &cat as &dyn TableProvider),
+        ("continuous", &cont as &dyn RasterScan),
+        ("categorical", &cat as &dyn RasterScan),
     ] {
         // A pushed filter only narrows the table, so no data means no rows.
         let pushed = plan_table(provider.scan(None, &bbox, None).unwrap());

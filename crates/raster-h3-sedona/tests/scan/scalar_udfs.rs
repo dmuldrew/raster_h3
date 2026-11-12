@@ -4,8 +4,15 @@ use std::str::FromStr;
 
 use h3o::{CellIndex, LatLng, Resolution};
 use raster_h3_core::columnar::{ArrowDataType, ColumnArray};
+use raster_h3_core::error::{RasterH3Error, Result};
 use raster_h3_core::scalar_ops;
-use raster_h3_sedona::scan::{RasterH3SessionCatalog, ScalarUDFImpl, StringToH3Udf};
+use raster_h3_sedona::scan::{find_scalar_udf, H3ScalarFn, StringToH3Udf};
+
+fn invoke_scalar(name: &str, args: &[ColumnArray]) -> Result<ColumnArray> {
+    find_scalar_udf(name)
+        .ok_or_else(|| RasterH3Error::InvalidParameter(format!("no scalar function '{name}'")))?
+        .invoke(args)
+}
 
 /// Cells spread over the globe, including a pentagon and cells near the poles and antimeridian.
 fn sample_cells() -> Vec<u64> {
@@ -32,7 +39,6 @@ fn sample_cells() -> Vec<u64> {
 
 #[test]
 fn string_to_h3_parses_like_h3o_and_keeps_validity() {
-    let ctx = RasterH3SessionCatalog::new();
     let cells = sample_cells();
     let mut strings: Vec<String> = cells
         .iter()
@@ -46,15 +52,14 @@ fn string_to_h3_parses_like_h3o_and_keeps_validity() {
     let mut validity = vec![true; n];
     validity[n - 1] = false;
 
-    let out = ctx
-        .invoke_scalar(
-            "STRING_TO_H3",
-            &[ColumnArray::Utf8 {
-                values: strings.clone(),
-                validity: Some(validity.clone()),
-            }],
-        )
-        .unwrap();
+    let out = invoke_scalar(
+        "STRING_TO_H3",
+        &[ColumnArray::Utf8 {
+            values: strings.clone(),
+            validity: Some(validity.clone()),
+        }],
+    )
+    .unwrap();
     let ColumnArray::UInt64 {
         values,
         validity: out_validity,
@@ -89,7 +94,6 @@ fn string_to_h3_parses_like_h3o_and_keeps_validity() {
 
 #[test]
 fn h3_to_lat_and_lng_return_h3o_cell_centres() {
-    let ctx = RasterH3SessionCatalog::new();
     let mut cells = sample_cells();
     cells.push(0);
     cells.push(u64::MAX);
@@ -102,7 +106,7 @@ fn h3_to_lat_and_lng_return_h3o_cell_centres() {
     };
 
     for name in ["h3_to_lat", "h3_to_lng"] {
-        let udf = ctx.udf(name).unwrap();
+        let udf = find_scalar_udf(name).unwrap();
         assert_eq!(udf.name(), name);
         assert_eq!(
             udf.return_type(&[ArrowDataType::UInt64]).unwrap(),
@@ -119,9 +123,7 @@ fn h3_to_lat_and_lng_return_h3o_cell_centres() {
         let ColumnArray::Float64 {
             values,
             validity: out_validity,
-        } = ctx
-            .invoke_scalar(name, std::slice::from_ref(&input))
-            .unwrap()
+        } = invoke_scalar(name, std::slice::from_ref(&input)).unwrap()
         else {
             panic!("expected Float64");
         };
@@ -155,22 +157,18 @@ fn h3_to_lat_and_lng_return_h3o_cell_centres() {
 
 #[test]
 fn string_round_trip_through_lat_lng_matches_cell_centre() {
-    let ctx = RasterH3SessionCatalog::new();
     let cells = sample_cells();
-    let hex = ctx
-        .invoke_scalar(
-            "h3_to_string",
-            &[ColumnArray::UInt64 {
-                values: cells.clone(),
-                validity: None,
-            }],
-        )
-        .unwrap();
-    let parsed = ctx.invoke_scalar("string_to_h3", &[hex]).unwrap();
-    let lat = ctx
-        .invoke_scalar("h3_to_lat", std::slice::from_ref(&parsed))
-        .unwrap();
-    let lng = ctx.invoke_scalar("h3_to_lng", &[parsed]).unwrap();
+    let hex = invoke_scalar(
+        "h3_to_string",
+        &[ColumnArray::UInt64 {
+            values: cells.clone(),
+            validity: None,
+        }],
+    )
+    .unwrap();
+    let parsed = invoke_scalar("string_to_h3", &[hex]).unwrap();
+    let lat = invoke_scalar("h3_to_lat", std::slice::from_ref(&parsed)).unwrap();
+    let lng = invoke_scalar("h3_to_lng", &[parsed]).unwrap();
     let (ColumnArray::Float64 { values: lat, .. }, ColumnArray::Float64 { values: lng, .. }) =
         (lat, lng)
     else {
