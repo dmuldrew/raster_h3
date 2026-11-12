@@ -375,12 +375,17 @@ impl BindHelper {
         None
     }
 
-    /// Parse sampling pattern (`center`, `5point`, `9point`, `cross`, `9point_bilinear`)
-    pub fn parse_sampling(&self) -> SamplingPattern {
-        if let Some(s) = self.get_named_string("sampling") {
-            SamplingPattern::parse(&s)
-        } else {
-            SamplingPattern::default()
+    /// Parse the sampling preset; report unknown names as binding errors.
+    pub fn parse_sampling(&self) -> Option<SamplingPattern> {
+        match self.get_named_string("sampling") {
+            Some(s) => match SamplingPattern::parse(&s) {
+                Ok(pattern) => Some(pattern),
+                Err(error) => {
+                    self.set_error(&error.to_string());
+                    None
+                }
+            },
+            None => Some(SamplingPattern::default()),
         }
     }
 
@@ -464,7 +469,7 @@ impl BindHelper {
             .filter(|&cs| cs > 0)
             .unwrap_or(512) as u32;
         let band = self.get_named_int("band").filter(|&b| b > 0).unwrap_or(1) as u32;
-        let sampling = self.parse_sampling();
+        let sampling = self.parse_sampling()?;
         let bbox = self.parse_bbox();
         let compact = self.get_named_bool("compact").unwrap_or(false);
         let overlap_rule = self.parse_overlap_rule();

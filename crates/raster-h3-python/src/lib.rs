@@ -521,28 +521,10 @@ struct PyScanOptions {
     max_mean: Option<f64>,
 }
 
-/// Names accepted for `sampling`, as in DuckDB's `sampling :=`.
-const SAMPLING_NAMES: &str = "center, 5point, gaussian, rgss, hex, 8rooks, 9point, 16point";
 /// Names accepted for `overlap_rule`, as in DuckDB's `overlap_rule :=`.
 const OVERLAP_RULE_NAMES: &str = "cutline, first, average";
 /// Names accepted for `spectral_formula`.
 const SPECTRAL_FORMULA_NAMES: &str = "ndvi, ndwi, nbr, evi";
-
-/// Core's [`SamplingPattern::parse`] falls back to the centre pattern for unknown names;
-/// reject them instead.
-fn parse_sampling_strict(name: &str) -> Result<SamplingPattern> {
-    let pattern = SamplingPattern::parse(name);
-    let is_center_name = matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "center" | "centre" | "1"
-    );
-    if pattern == SamplingPattern::center() && !is_center_name {
-        return Err(RasterH3Error::InvalidParameter(format!(
-            "Invalid sampling '{name}': expected one of {SAMPLING_NAMES}"
-        )));
-    }
-    Ok(pattern)
-}
 
 /// Core's [`OverlapRule::parse`] falls back to `Cutline` for unknown names; reject them
 /// instead.
@@ -584,7 +566,7 @@ fn apply_scan_options(cfg: &mut PyScanConfig, options: Option<&str>) -> Result<(
 
     cfg.band = band_option("band", opts.band, 1)?;
     if let Some(name) = &opts.sampling {
-        cfg.sampling = parse_sampling_strict(name)?;
+        cfg.sampling = SamplingPattern::parse(name)?;
     }
     if let Some(name) = &opts.overlap_rule {
         cfg.overlap_rule = parse_overlap_rule_strict(name)?;

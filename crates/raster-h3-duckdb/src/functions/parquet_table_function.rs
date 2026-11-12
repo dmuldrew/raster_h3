@@ -97,7 +97,9 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
 
             let resolutions = bind.parse_resolutions(8, None);
             let source_crs = bind.parse_source_crs();
-            let sampling = bind.parse_sampling();
+            let Some(sampling) = bind.parse_sampling() else {
+                return;
+            };
             let overlap_rule = bind.parse_overlap_rule();
             let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
             let custom_nodata = bind.get_named_double("nodata");

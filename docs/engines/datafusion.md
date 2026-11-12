@@ -205,7 +205,7 @@ let provider = ContinuousRasterTableProvider::try_new("temperature_global.tif", 
     .with_crs("EPSG:4326")
     .with_nodata(-9999.0)
     .with_bbox([-122.50, 37.70, -122.35, 37.85])
-    .with_sampling(SamplingPattern::parse("rgss"));
+    .with_sampling(SamplingPattern::parse("rgss")?);
 ```
 
 ### Multiple resolutions and quantiles in one pass

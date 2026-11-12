@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("  Sampling Preset : {}", sampling_str);
     println!("-----------------------------------------------------------");
 
-    let sampling = SamplingPattern::parse(&sampling_str);
+    let sampling = SamplingPattern::parse(&sampling_str)?;
     let mut config = MultiResolutionConfig::new(res_list);
     config.sampling = sampling;
 
