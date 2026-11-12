@@ -351,7 +351,7 @@ The sections below are the original analysis of `P0`–`P5`, kept for reference.
 ### Tier 1: High-Impact Inner-Loop Optimizations
 
 #### 1. Replace Newton-Raphson + `.ln()` in `AlbersConicFast` with Snyder's Authalic Series & Eliminate Redundant `sqrt()` (`P0`, shipped in `v0.5.0`)
-* **Where:** [`crates/raster-h3-core/src/crs/transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs) (`AlbersConicFast::transform_point`)
+* **Where:** [`crates/raster-h3-core/src/crs/transformer/albers.rs`](../crates/raster-h3-core/src/crs/transformer/albers.rs) (`AlbersConicFast::transform_point`)
 * **The Bottleneck:** On CONUS Albers (`EPSG:5070`), coordinate reprojection accounts for the entire ~400–550 second gap versus native WGS84. Currently, `AlbersConicFast::transform_point` executes:
   1. `let rho = (x_p * x_p + y_p * y_p).sqrt();` followed immediately by `rho * rho` (`rho` is never used unsquared).
   2. Two iterations of Newton-Raphson, invoking **6 transcendental functions per pixel** (`2× sin`, `2× cos`, `2× ln`) in addition to `atan2` and `asin`.
