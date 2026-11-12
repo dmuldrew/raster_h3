@@ -77,6 +77,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Clippy (root facade, all adapter features)
+        run: cargo clippy -p raster_h3 --features full --all-targets --locked -- -D warnings
+
       - name: Clippy (pg-extension)
         run: cargo clippy -p raster-h3-pg --features pg-extension --all-targets --locked -- -D warnings
 

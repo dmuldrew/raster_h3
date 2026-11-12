@@ -56,11 +56,14 @@ fn versioned_source(mode: &str) -> (MockHttpServer, Arc<RemoteHttpSource>) {
     (server, source)
 }
 
+/// The `If-Match` request header lines, with the header name normalised to
+/// `If-Match` (header names are case-insensitive; the client may send any case).
 fn conditional_requests(server: &MockHttpServer) -> Vec<String> {
     server
         .recorded_headers()
         .into_iter()
         .filter(|h| h.to_ascii_lowercase().starts_with("if-match:"))
+        .map(|h| format!("If-Match:{}", &h["if-match:".len()..]))
         .collect()
 }
 
@@ -570,9 +573,18 @@ impl MockHttpServer {
             let _ = stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             return;
         }
-        let version_header = etag
+        let mut version_header = etag
             .map(|tag| format!("ETag: {tag}\r\n"))
             .unwrap_or_default();
+        // `padded_head_<N>` adds an N-byte header value to every response head.
+        if let Some(n) = path
+            .split("padded_head_")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            version_header.push_str(&format!("X-Padding: {}\r\n", "p".repeat(n)));
+        }
         let replacement;
         let file_bytes = if replaced {
             replacement = file_bytes
@@ -2269,6 +2281,54 @@ fn auth_token_is_sent_only_to_listed_hosts() {
     }
 }
 
+// The HTTP agent's per-connection buffers are fixed in size: a request head
+// must fit the output buffer and a response head the input buffer. Typical
+// large heads (a 6 KiB bearer token, 12 KiB of response headers) still work.
+// The token is process-wide while set, so it must stay small enough that
+// concurrent loopback tests that do not take ENV_MUTEX still fit their heads;
+// the oversized case is the `check_request_head` unit test instead.
+#[test]
+fn large_request_and_response_heads_fit_the_agent_buffers() {
+    let _env_lock = ENV_MUTEX.lock().unwrap();
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let token = "t".repeat(6 * 1024);
+    std::env::set_var("RASTER_H3_AUTH_TOKEN", &token);
+    std::env::set_var("RASTER_H3_AUTH_HOSTS", "127.0.0.1");
+    let server = MockHttpServer::start(data.clone());
+    let transport = HttpTransport::new(&format!("{}/padded_head_12288.tif", server.url_base));
+    let result = transport.and_then(|t| t.fetch_range(0, 9, None));
+    std::env::remove_var("RASTER_H3_AUTH_TOKEN");
+    std::env::remove_var("RASTER_H3_AUTH_HOSTS");
+
+    assert_eq!(result.unwrap(), data[..10]);
+    let expected = format!("authorization: bearer {token}");
+    assert!(recorded_lowercase(&server)
+        .iter()
+        .any(|h| h.trim() == expected));
+}
+
+// A response head larger than the agent's input buffer fails the request
+// with a clear transport error instead of hanging or being misread.
+#[test]
+fn oversized_response_head_is_a_transport_error() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    let server = MockHttpServer::start(vec![0u8; 4096]);
+    let url = format!("{}/padded_head_20480.tif", server.url_base);
+    let error = match RemoteHttpSource::open(&url) {
+        Ok(_) => panic!("a 20 KiB response head must be rejected"),
+        Err(err) => err.to_string(),
+    };
+    assert!(error.contains("Network transport error"), "{error}");
+    assert!(error.contains("response header is too big"), "{error}");
+}
+
 // A server that refuses the request is the only sign the caller gets that a
 // configured token was not sent, so the error says so.
 #[test]
@@ -2368,4 +2428,106 @@ fn test_remote_cog_to_parquet_streaming_pipeline() {
 
     // Clean up
     let _ = std::fs::remove_file(temp_parquet_path);
+}
+
+/// A georeferenced 8-bit GeoTIFF in 16-row strips, compressed with PackBits: a codec the
+/// accelerated decoder does not cover, so every strip goes to the generic TIFF decoder.
+fn packbits_geotiff(width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
+    use tiff::encoder::{colortype, Compression, TiffEncoder};
+    // Pseudo-random samples, so PackBits cannot shrink the strips much.
+    let pixels: Vec<u8> = (0..width * height)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut out = std::io::Cursor::new(Vec::new());
+    {
+        let mut encoder = TiffEncoder::new(&mut out)
+            .unwrap()
+            .with_compression(Compression::Packbits);
+        let mut image = encoder
+            .new_image::<colortype::Gray8>(width, height)
+            .unwrap();
+        image.rows_per_strip(16).unwrap();
+        image
+            .encoder()
+            .write_tag(
+                tiff::tags::Tag::ModelPixelScaleTag,
+                &[0.001f64, 0.001, 0.0][..],
+            )
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(
+                tiff::tags::Tag::ModelTiepointTag,
+                &[0.0f64, 0.0, 0.0, -122.45, 37.85, 0.0][..],
+            )
+            .unwrap();
+        image
+            .encoder()
+            .write_tag(
+                tiff::tags::Tag::GeoKeyDirectoryTag,
+                &[1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326][..],
+            )
+            .unwrap();
+        image.write_data(&pixels).unwrap();
+    }
+    (out.into_inner(), pixels)
+}
+
+// Chunks the accelerated decoder hands to the generic TIFF decoder were downloaded twice:
+// once by the prefetch queue and again by the generic decoder reading the source.
+#[test]
+fn remote_chunks_for_the_generic_decoder_are_downloaded_once() {
+    if !MockHttpServer::is_networking_supported() {
+        eprintln!("Skipping test: localhost networking not permitted in test environment");
+        return;
+    }
+    use raster_h3_core::aggregator::multi_horizon::{
+        MultiResolutionConfig, MultiScanHorizonStreamer,
+    };
+
+    let (bytes, _) = packbits_geotiff(512, 1024);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    let local = GeoTiffStreamReader::open(file.path()).unwrap();
+    let info = local.chunk_info.as_ref().unwrap().clone();
+    assert_eq!(info.compression, tiff::tags::CompressionMethod::PackBits);
+    let chunk_bytes: u64 = info.chunk_bytes.iter().sum();
+    assert!(
+        chunk_bytes > 400_000,
+        "fixture too compressible: {chunk_bytes}"
+    );
+
+    let collect = |reader: GeoTiffStreamReader| {
+        let config = MultiResolutionConfig::new(vec![8]);
+        let mut streamer = MultiScanHorizonStreamer::new(reader, &config).unwrap();
+        let mut records = Vec::new();
+        loop {
+            let batch = streamer.fetch_next_batch(1024).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            records.extend(batch);
+        }
+        records.sort_by_key(|r| (r.resolution, r.h3_index));
+        records
+    };
+
+    let server = MockHttpServer::start(bytes);
+    let remote = GeoTiffStreamReader::open(format!("{}/packbits.tif", server.url_base)).unwrap();
+    let after_open = server.bytes_served.load(Ordering::SeqCst);
+    let got = collect(remote);
+    let streamed = (server.bytes_served.load(Ordering::SeqCst) - after_open) as u64;
+
+    eprintln!("streamed {streamed} bytes for {chunk_bytes} bytes of strips");
+    assert_eq!(
+        got,
+        collect(local),
+        "remote output must match the local file"
+    );
+    // Every strip is fetched once by the prefetch queue; allow for strips the open
+    // already cached and for range coalescing, but not for a second download.
+    assert!(
+        streamed <= chunk_bytes + chunk_bytes / 4,
+        "streamed {streamed} bytes for {chunk_bytes} bytes of strips"
+    );
 }

@@ -265,6 +265,10 @@ fn srf_args(
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads a memory-mapped raster, which Miri cannot follow"
+)]
 fn categorical_aggregate_srf_matches_core() {
     let (_tmp, path) = classes_tif();
     let cases = [
@@ -340,6 +344,10 @@ fn categorical_aggregate_srf_matches_core() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads a memory-mapped raster, which Miri cannot follow"
+)]
 fn categorical_aggregate_srf_releases_state_on_early_termination() {
     let (_tmp, path) = classes_tif();
     let rows = run_srf(
@@ -352,6 +360,10 @@ fn categorical_aggregate_srf_releases_state_on_early_termination() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads a memory-mapped raster, which Miri cannot follow"
+)]
 fn continuous_aggregate_srf_matches_rust_srf() {
     let (_tmp, path) = gradient_tif();
     let rows = run_srf(
@@ -402,6 +414,10 @@ fn continuous_aggregate_srf_matches_rust_srf() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads a memory-mapped raster, which Miri cannot follow"
+)]
 fn srfs_warn_when_samples_are_dropped_by_failed_transforms() {
     use raster_h3_pg::fmgr::transform_failure_warning;
     assert!(transform_failure_warning(50).starts_with("raster_h3: 50 valid sample(s)"));

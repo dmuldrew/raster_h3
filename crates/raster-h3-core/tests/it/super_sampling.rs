@@ -1074,14 +1074,14 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
 
 #[test]
 fn test_subpixel_sampling_patterns() {
-    let center = SamplingPattern::parse("center");
+    let center = SamplingPattern::parse("center").unwrap();
     assert!(center.is_single_point());
 
     let presets = [
         "rgss", "5point", "gaussian", "hex", "8rooks", "9point", "16point",
     ];
     for name in presets {
-        let pattern = SamplingPattern::parse(name);
+        let pattern = SamplingPattern::parse(name).unwrap();
         assert!(!pattern.is_single_point());
         let sum_w: f64 = pattern.points.iter().map(|p| p.weight).sum();
         assert!(
@@ -1168,11 +1168,6 @@ fn test_subpixel_hex_streaming() {
 }
 
 #[test]
-fn test_sampling_pattern_fallback_to_center() {
-    let default_pattern = SamplingPattern::parse("unknown_nonexistent_mode");
-    assert!(default_pattern.is_single_point());
-    assert_eq!(default_pattern.points.len(), 1);
-    assert_eq!(default_pattern.points[0].weight, 1.0);
-    assert_eq!(default_pattern.points[0].dx, 0.5);
-    assert_eq!(default_pattern.points[0].dy, 0.5);
+fn test_sampling_pattern_rejects_unknown_names() {
+    assert!(SamplingPattern::parse("unknown_nonexistent_mode").is_err());
 }

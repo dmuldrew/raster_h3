@@ -104,7 +104,9 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
             let source_crs = bind.parse_source_crs();
             let custom_nodata = bind.get_named_double("nodata");
             let scale_offset = bind.parse_scale_offset();
-            let sampling = bind.parse_sampling();
+            let Some(sampling) = bind.parse_sampling() else {
+                return;
+            };
             let overlap_rule = bind.parse_overlap_rule();
             let bbox = bind.parse_bbox();
             let is_categorical = bind.get_named_bool("categorical").unwrap_or(false);

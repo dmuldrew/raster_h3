@@ -33,7 +33,7 @@ use rustc_hash::FxHashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use ureq::Agent;
 use url::Url;
 
@@ -334,19 +334,52 @@ fn default_headers_for(url: &str, env: &dyn Fn(&str) -> Option<String>) -> Reque
     out
 }
 
-/// Check if an HTTP error is transient and eligible for retry
-fn is_transient_error(err: &ureq::Error) -> bool {
-    match err {
-        ureq::Error::Status(status, _) => {
+/// Per-connection buffer sizes for the HTTP agent. ureq 3 defaults to 128 KiB
+/// each, allocated per connection, which quadrupled the heap of eight
+/// concurrent prefetch workers versus ureq 2's 8 KiB read buffer. The input
+/// buffer must hold a whole response head (status line and headers) and the
+/// output buffer a whole request head, including any auth header.
+const AGENT_INPUT_BUFFER_BYTES: usize = 16 * 1024;
+const AGENT_OUTPUT_BUFFER_BYTES: usize = 8 * 1024;
+/// Output-buffer bytes kept for the request line's fixed parts and the headers
+/// ureq adds itself (`Host`, `User-Agent`, `Accept`), so the size check in
+/// `check_request_head` errs on the safe side.
+const REQUEST_HEAD_RESERVE_BYTES: usize = 1024;
+
+/// An HTTP response as returned by the agent; status codes are not turned
+/// into errors (`http_status_as_error(false)`), so `Retry-After` stays readable.
+type HttpResponse = ureq::http::Response<ureq::Body>;
+
+/// A request that did not produce a usable response.
+enum RequestFailure {
+    /// The server answered with a status of 400 or above.
+    Status(HttpResponse),
+    /// No response: connection, TLS, timeout, protocol or request errors.
+    Transport(ureq::Error),
+}
+
+impl RequestFailure {
+    /// Check if a failure is transient and eligible for retry. Every
+    /// transport error is retried, as with ureq 2's `Error::Transport`.
+    fn is_transient(&self) -> bool {
+        match self {
             // 429: Too Many Requests / S3 SlowDown
             // 500: Internal Server Error
             // 502: Bad Gateway
             // 503: Service Unavailable (S3 503 SlowDown)
             // 504: Gateway Timeout
-            matches!(*status, 429 | 500 | 502 | 503 | 504)
+            RequestFailure::Status(resp) => {
+                matches!(resp.status().as_u16(), 429 | 500 | 502 | 503 | 504)
+            }
+            RequestFailure::Transport(_) => true,
         }
-        ureq::Error::Transport(_) => true,
     }
+}
+
+/// A response header as text; `None` when absent or not visible ASCII
+/// (matching ureq 2's `Response::header`).
+fn header_str<'a>(resp: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
 /// Result of an initial probe request against a remote raster
@@ -438,12 +471,27 @@ impl RemoteTransport for HttpTransport {
 impl HttpTransport {
     /// Create a new transport client with configured connection pooling and timeouts
     pub fn new(url: &str) -> Result<Self> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(15))
-            .timeout_read(std::time::Duration::from_secs(60))
+        let agent: Agent = Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(15)))
+            // Per transport read, like ureq 2's `timeout_read`; there is no
+            // total body timeout, so large full-body fallbacks are not cut off.
+            .timeout_per_read(Some(std::time::Duration::from_secs(60)))
             .max_idle_connections(128)
             .max_idle_connections_per_host(32)
-            .build();
+            .input_buffer_size(AGENT_INPUT_BUFFER_BYTES)
+            .output_buffer_size(AGENT_OUTPUT_BUFFER_BYTES)
+            // A response head that does not fit the input buffer then fails as
+            // "response header is too big" instead of a misleading disconnect.
+            .max_response_header_size(AGENT_INPUT_BUFFER_BYTES - 1)
+            // Statuses are classified in `execute_request`, which needs the
+            // response (for `Retry-After`) rather than a bare status error.
+            .http_status_as_error(false)
+            // ureq 2 defaults: follow at most 5 redirects, and never read
+            // proxy settings from the environment.
+            .max_redirects(5)
+            .proxy(None)
+            .build()
+            .into();
 
         Ok(Self {
             url: url.to_string(),
@@ -509,17 +557,50 @@ impl HttpTransport {
         default_headers_for(&self.url, &|name| std::env::var(name).ok())
     }
 
-    fn range_request(&self, range: &str, etag: &OnceLock<Option<String>>) -> ureq::Request {
-        let mut req = self
-            .agent
-            .get(&self.url)
-            .set("Range", range)
-            .set("Accept-Encoding", "identity");
-        for (k, v) in &self.request_headers().headers {
-            req = req.set(k, v);
-        }
+    /// The headers this crate sets on one range request, in send order; ureq
+    /// adds `Host`, `User-Agent` and `Accept` itself.
+    fn range_request_headers(
+        &self,
+        range: &str,
+        etag: &OnceLock<Option<String>>,
+    ) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("Range".to_string(), range.to_string()),
+            ("Accept-Encoding".to_string(), "identity".to_string()),
+        ];
+        headers.extend(self.request_headers().headers);
         if let Some(Some(etag)) = etag.get() {
-            req = req.set("If-Match", etag);
+            headers.push(("If-Match".to_string(), etag.clone()));
+        }
+        headers
+    }
+
+    /// Fail before sending when a request head cannot fit the agent's output
+    /// buffer, which would otherwise surface as an opaque protocol error.
+    /// Neither the message nor the check exposes header values.
+    fn check_request_head(&self, headers: &[(String, String)]) -> Result<()> {
+        let needed = self.url.len()
+            + REQUEST_HEAD_RESERVE_BYTES
+            + headers
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 4)
+                .sum::<usize>();
+        if needed > AGENT_OUTPUT_BUFFER_BYTES {
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "HTTP request headers for '{}' need about {} bytes, more than the {}-byte limit; check that RASTER_H3_AUTH_TOKEN or AWS_SESSION_TOKEN is not unusually long",
+                self.url, needed, AGENT_OUTPUT_BUFFER_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    fn range_request(
+        &self,
+        headers: &[(String, String)],
+    ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+        let mut req = self.agent.get(&self.url);
+        for (k, v) in headers {
+            req = req.header(k, v);
         }
         req
     }
@@ -558,12 +639,12 @@ impl HttpTransport {
     #[allow(clippy::result_large_err)]
     fn read_body(
         &self,
-        resp: ureq::Response,
+        resp: HttpResponse,
         expected: ExpectedBody,
         etag: &OnceLock<Option<String>>,
         what: &str,
     ) -> Result<BodyAttempt<Vec<u8>>> {
-        let response_etag = resp.header("ETag").map(str::to_owned);
+        let response_etag = header_str(&resp, "ETag").map(str::to_owned);
         let (take_limit, capacity) = match &expected {
             ExpectedBody::Range {
                 start,
@@ -577,7 +658,8 @@ impl HttpTransport {
                 (self.max_full_body_bytes.saturating_add(1), 0)
             }
         };
-        let reader = resp.into_reader();
+        // `into_reader` applies no size limit of its own; `take_limit` caps it.
+        let reader = resp.into_body().into_reader();
         let mut buf = Vec::with_capacity(capacity);
         if let Err(e) = reader.take(take_limit).read_to_end(&mut buf) {
             return Ok(BodyAttempt::Retry(RasterH3Error::InvalidParameter(
@@ -623,66 +705,65 @@ impl HttpTransport {
     }
 
     /// Execute a request with automatic exponential backoff retry on transient errors
-    pub fn execute_request<F>(&self, mut make_request: F) -> Result<ureq::Response>
+    fn execute_request<F>(&self, mut make_request: F) -> Result<HttpResponse>
     where
-        F: FnMut() -> std::result::Result<ureq::Response, ureq::Error>,
+        F: FnMut() -> std::result::Result<HttpResponse, ureq::Error>,
     {
         let mut attempt = 0;
 
         loop {
-            match make_request() {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    let retry_after = match &e {
-                        ureq::Error::Status(_, resp) => {
-                            resp.header("Retry-After").map(str::to_owned)
+            let failure = match make_request() {
+                Ok(resp) if resp.status().as_u16() < 400 => return Ok(resp),
+                Ok(resp) => RequestFailure::Status(resp),
+                Err(e) => RequestFailure::Transport(e),
+            };
+            let retry_after = match &failure {
+                RequestFailure::Status(resp) => header_str(resp, "Retry-After").map(str::to_owned),
+                RequestFailure::Transport(_) => None,
+            };
+            if attempt >= self.max_retries || !failure.is_transient() {
+                return Err(match failure {
+                    RequestFailure::Status(resp) => match resp.status().as_u16() {
+                        412 => RasterH3Error::InvalidParameter(
+                            "Remote raster changed during scan (HTTP 412 Precondition Failed)"
+                                .into(),
+                        ),
+                        404 => RasterH3Error::InvalidParameter(format!(
+                            "Remote raster not found (HTTP 404): {}",
+                            self.url
+                        )),
+                        status => {
+                            // A refusal is the only sign the caller gets
+                            // that a configured token stayed home.
+                            let hint = match self.request_headers().withheld_token {
+                                Some(why) if matches!(status, 401 | 403) => {
+                                    format!(" (RASTER_H3_AUTH_TOKEN was not sent: {why})")
+                                }
+                                _ => String::new(),
+                            };
+                            RasterH3Error::InvalidParameter(format!(
+                                "HTTP request failed for '{}': HTTP {} - {}{}",
+                                self.url,
+                                status,
+                                resp.status().canonical_reason().unwrap_or("Unknown Status"),
+                                hint
+                            ))
                         }
-                        _ => None,
-                    };
-                    if attempt >= self.max_retries || !is_transient_error(&e) {
-                        return match e {
-                            ureq::Error::Status(412, _) => Err(RasterH3Error::InvalidParameter(
-                                "Remote raster changed during scan (HTTP 412 Precondition Failed)"
-                                    .into(),
-                            )),
-                            ureq::Error::Status(404, _) => Err(RasterH3Error::InvalidParameter(
-                                format!("Remote raster not found (HTTP 404): {}", self.url),
-                            )),
-                            ureq::Error::Status(status, r) => {
-                                // A refusal is the only sign the caller gets
-                                // that a configured token stayed home.
-                                let hint = match self.request_headers().withheld_token {
-                                    Some(why) if matches!(status, 401 | 403) => {
-                                        format!(" (RASTER_H3_AUTH_TOKEN was not sent: {why})")
-                                    }
-                                    _ => String::new(),
-                                };
-                                Err(RasterH3Error::InvalidParameter(format!(
-                                    "HTTP request failed for '{}': HTTP {} - {}{}",
-                                    self.url,
-                                    status,
-                                    r.status_text(),
-                                    hint
-                                )))
-                            }
-                            ureq::Error::Transport(t) => {
-                                Err(RasterH3Error::InvalidParameter(format!(
-                                    "Network transport error connecting to '{}': {}",
-                                    self.url, t
-                                )))
-                            }
-                        };
-                    }
-
-                    // Jittered exponential backoff, honouring Retry-After
-                    std::thread::sleep(retry_delay(
-                        attempt,
-                        retry_entropy(),
-                        retry_after.as_deref(),
-                    ));
-                    attempt += 1;
-                }
+                    },
+                    RequestFailure::Transport(t) => RasterH3Error::InvalidParameter(format!(
+                        "Network transport error connecting to '{}': {}",
+                        self.url, t
+                    )),
+                });
             }
+
+            // Jittered exponential backoff, honouring Retry-After
+            std::thread::sleep(retry_delay(
+                attempt,
+                retry_entropy(),
+                retry_after.as_deref(),
+            ));
+            attempt += 1;
         }
     }
 
@@ -700,11 +781,13 @@ impl HttpTransport {
         etag: &OnceLock<Option<String>>,
     ) -> Result<BodyAttempt<ProbeResult>> {
         let range_header = format!("bytes=0-{}", initial_fetch_len.saturating_sub(1));
-        let resp = self.execute_request(|| self.range_request(&range_header, etag).call())?;
+        let headers = self.range_request_headers(&range_header, etag);
+        self.check_request_head(&headers)?;
+        let resp = self.execute_request(|| self.range_request(&headers).call())?;
 
-        let status = resp.status();
+        let status = resp.status().as_u16();
         if status == 206 {
-            let content_range = resp.header("Content-Range").map(str::to_owned);
+            let content_range = header_str(&resp, "Content-Range").map(str::to_owned);
             let (_, _, parsed_total) = content_range
                 .as_deref()
                 .and_then(parse_content_range)
@@ -740,8 +823,7 @@ impl HttpTransport {
             }))
         } else if status == 200 {
             // Server returned entire body (or file is small / server ignores ranges)
-            let cl = resp
-                .header("Content-Length")
+            let cl = header_str(&resp, "Content-Length")
                 .and_then(|h| h.parse::<u64>().ok())
                 .unwrap_or(0);
             let buf = match self.read_body(
@@ -796,10 +878,12 @@ impl HttpTransport {
         etag: &OnceLock<Option<String>>,
     ) -> Result<BodyAttempt<Vec<u8>>> {
         let range_header = format!("bytes={}-{}", start, end);
-        let resp = self.execute_request(|| self.range_request(&range_header, etag).call())?;
+        let headers = self.range_request_headers(&range_header, etag);
+        self.check_request_head(&headers)?;
+        let resp = self.execute_request(|| self.range_request(&headers).call())?;
 
-        let status = resp.status();
-        let content_range = resp.header("Content-Range").map(str::to_owned);
+        let status = resp.status().as_u16();
+        let content_range = header_str(&resp, "Content-Range").map(str::to_owned);
 
         validate_range_response_headers(
             status,
@@ -1193,12 +1277,80 @@ impl RemoteHttpSource {
 pub struct HttpRangeReader {
     pub source: Arc<RemoteHttpSource>,
     pub cursor: u64,
+    overlay: Option<Arc<ReadOverlay>>,
+}
+
+/// Bytes of one range of a remote file that are already in memory. An [`HttpRangeReader`]
+/// built with [`HttpRangeReader::with_overlay`] serves reads inside the staged range from
+/// it instead of fetching them again.
+#[derive(Debug, Default)]
+pub struct ReadOverlay {
+    staged: Mutex<Option<(u64, Vec<u8>)>>,
+}
+
+impl ReadOverlay {
+    /// Serve `bytes` for the file range starting at `offset` until [`Self::clear`].
+    pub fn stage(&self, offset: u64, bytes: &[u8]) {
+        if let Ok(mut staged) = self.staged.lock() {
+            let mut buf = staged.take().map(|(_, buf)| buf).unwrap_or_default();
+            buf.clear();
+            buf.extend_from_slice(bytes);
+            *staged = Some((offset, buf));
+        }
+    }
+
+    /// Stop serving the staged bytes (the allocation is kept for the next stage).
+    pub fn clear(&self) {
+        if let Ok(mut staged) = self.staged.lock() {
+            if let Some((offset, buf)) = staged.as_mut() {
+                *offset = 0;
+                buf.clear();
+            }
+        }
+    }
+
+    /// Copy staged bytes at `cursor` into `out`. `Ok(n)` with `n > 0` when `cursor` is inside
+    /// the staged range; otherwise `Ok(0)`, with `out_len` cut to stop at the range's start.
+    fn read_at(&self, cursor: u64, out: &mut [u8], out_len: &mut usize) -> std::io::Result<usize> {
+        let staged = self
+            .staged
+            .lock()
+            .map_err(|_| std::io::Error::other("remote read overlay lock poisoned"))?;
+        let Some((start, bytes)) = staged.as_ref() else {
+            return Ok(0);
+        };
+        let end = start + bytes.len() as u64;
+        if cursor >= *start && cursor < end {
+            let from = (cursor - start) as usize;
+            let n = (*out_len).min(bytes.len() - from);
+            out[..n].copy_from_slice(&bytes[from..from + n]);
+            return Ok(n);
+        }
+        if cursor < *start && cursor + *out_len as u64 > *start {
+            // Read up to the staged range; the next read starts inside it.
+            *out_len = (*start - cursor) as usize;
+        }
+        Ok(0)
+    }
 }
 
 impl HttpRangeReader {
     /// Create a new reader with its cursor positioned at offset 0
     pub fn new(source: Arc<RemoteHttpSource>) -> Self {
-        Self { source, cursor: 0 }
+        Self {
+            source,
+            cursor: 0,
+            overlay: None,
+        }
+    }
+
+    /// A reader that serves reads inside `overlay`'s staged range from memory.
+    pub fn with_overlay(source: Arc<RemoteHttpSource>, overlay: Arc<ReadOverlay>) -> Self {
+        Self {
+            source,
+            cursor: 0,
+            overlay: Some(overlay),
+        }
     }
 }
 
@@ -1208,9 +1360,16 @@ impl Read for HttpRangeReader {
             return Ok(0);
         }
 
-        let to_read = buf
+        let mut to_read = buf
             .len()
             .min((self.source.total_size - self.cursor) as usize);
+        if let Some(overlay) = &self.overlay {
+            let n = overlay.read_at(self.cursor, buf, &mut to_read)?;
+            if n > 0 {
+                self.cursor += n as u64;
+                return Ok(n);
+            }
+        }
         let bytes_read = self
             .source
             .read_range_into(self.cursor, &mut buf[..to_read])
@@ -1363,6 +1522,53 @@ mod tests {
         assert_eq!(header(&headers, "x-amz-request-payer"), Some("requester"));
     }
 
+    /// The agent keeps ureq 2's behaviour: environment proxy variables are
+    /// ignored, at most 5 redirects, a per-read (not whole-body) timeout, and
+    /// status codes returned as responses so `Retry-After` can be read. Its
+    /// per-connection buffers are sized down from ureq 3's 128 KiB defaults,
+    /// and a response head that does not fit is reported as too big.
+    #[test]
+    fn transport_agent_keeps_ureq2_defaults() {
+        let transport = HttpTransport::new("https://example.com/a.tif").unwrap();
+        let config = transport.agent.config();
+        assert!(config.proxy().is_none(), "proxy env vars must be ignored");
+        assert_eq!(config.max_redirects(), 5);
+        assert!(!config.http_status_as_error());
+        assert_eq!(
+            config.timeout_per_read(),
+            Some(std::time::Duration::from_secs(60))
+        );
+        let timeouts = config.timeouts();
+        assert_eq!(timeouts.connect, Some(std::time::Duration::from_secs(15)));
+        assert_eq!(timeouts.recv_body, None);
+        assert_eq!(timeouts.global, None);
+        assert_eq!(config.max_idle_connections(), 128);
+        assert_eq!(config.max_idle_connections_per_host(), 32);
+        assert_eq!(config.input_buffer_size(), AGENT_INPUT_BUFFER_BYTES);
+        assert_eq!(config.output_buffer_size(), AGENT_OUTPUT_BUFFER_BYTES);
+        assert!(config.max_response_header_size() < AGENT_INPUT_BUFFER_BYTES);
+    }
+
+    /// A request head that cannot fit the agent's output buffer is rejected
+    /// before sending, without the header value in the message.
+    #[test]
+    fn oversized_request_head_is_rejected_before_sending() {
+        let transport = HttpTransport::new("https://data.example.com/a.tif").unwrap();
+        let etag = OnceLock::new();
+        let with_token = |len: usize| {
+            let mut headers = transport.range_request_headers("bytes=0-9", &etag);
+            headers.push((
+                "Authorization".into(),
+                format!("Bearer {}", "t".repeat(len)),
+            ));
+            transport.check_request_head(&headers)
+        };
+        assert!(with_token(6 * 1024).is_ok());
+        let error = with_token(10 * 1024).unwrap_err().to_string();
+        assert!(error.contains("8192-byte limit"), "{error}");
+        assert!(!error.contains("tttttttt"), "{error}");
+    }
+
     #[test]
     fn parses_max_full_body_bytes_override() {
         for value in [None, Some(""), Some("abc"), Some("0")] {
@@ -1475,6 +1681,72 @@ mod tests {
         let inserted = cache.insert_block(1, block1.clone()).unwrap();
         assert_eq!(&*inserted, &[50, 60, 70, 80]);
         assert_eq!(&*cache.get_block(1).unwrap().unwrap(), &[50, 60, 70, 80]);
+    }
+
+    /// Serves a fixed body and counts range requests (overlay tests).
+    struct OverlayTestTransport {
+        data: Vec<u8>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RemoteTransport for OverlayTestTransport {
+        fn fetch_range(&self, start: u64, end: u64, _: Option<u64>) -> Result<Vec<u8>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.data[start as usize..=end as usize].to_vec())
+        }
+
+        fn probe(&self, _: usize) -> Result<ProbeResult> {
+            unreachable!("the test builds the source directly")
+        }
+    }
+
+    #[test]
+    fn overlay_serves_the_staged_range_from_memory() {
+        use std::sync::atomic::Ordering;
+        let data: Vec<u8> = (0..=255).collect();
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(RemoteHttpSource {
+            url: "http://example.com/overlay.tif".to_string(),
+            total_size: data.len() as u64,
+            transport: Box::new(OverlayTestTransport {
+                data: data.clone(),
+                fetches: Arc::clone(&fetches),
+            }),
+            cache: ByteCache::new_with_initial_block(data[..16].to_vec(), 16),
+        });
+        let overlay = Arc::new(ReadOverlay::default());
+        let mut reader = HttpRangeReader::with_overlay(Arc::clone(&source), Arc::clone(&overlay));
+        // Staged bytes deliberately differ from the file, to show where reads come from.
+        overlay.stage(100, &[9; 40]);
+
+        // Inside the range: from memory, cut at its end, no fetch.
+        let mut buf = [0u8; 64];
+        reader.seek(SeekFrom::Start(120)).unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 20);
+        assert_eq!(buf[..20], [9; 20]);
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
+
+        // A read running into the range stops at its start; the next read is from memory.
+        reader.seek(SeekFrom::Start(90)).unwrap();
+        let mut buf = [0u8; 20];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(buf[..10], data[90..100]);
+        assert_eq!(reader.read(&mut buf).unwrap(), 20);
+        assert_eq!(buf, [9; 20]);
+
+        // Cleared: the same offsets come from the source again.
+        overlay.clear();
+        reader.seek(SeekFrom::Start(120)).unwrap();
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, data[120..128]);
+
+        // A reader without an overlay ignores staged bytes.
+        overlay.stage(0, &[7; 8]);
+        let mut plain = HttpRangeReader::new(source);
+        plain.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, data[..8]);
     }
 
     #[test]

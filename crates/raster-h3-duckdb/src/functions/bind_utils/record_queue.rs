@@ -126,6 +126,10 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a 10 s wall-clock deadline that Miri is too slow to meet; no unsafe code, covered by ThreadSanitizer"
+    )]
     fn paused_record_consumer_stalls_prefetch_and_resumes_in_order() {
         const TOTAL: usize = 15_840;
         const CAPACITY: usize = 16;

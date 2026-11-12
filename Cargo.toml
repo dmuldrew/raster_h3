@@ -50,7 +50,7 @@ flate2 = "1.0"
 libdeflater = "1.23"
 parquet = { version = "60", default-features = false, features = ["flate2-rust_backend", "snap", "zstd", "lz4", "brotli"] }
 tempfile = "3.10"
-ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "gzip"] }
 url = "2.5"
 weezl = "0.2"
 libc = "0.2"
@@ -84,6 +84,13 @@ path = "crates/raster-h3-cli/src/bin/raster_h3.rs"
 
 [features]
 default = []
+# Facade re-exports of the non-DuckDB adapters. Off by default so the root cdylib
+# (packaged as `raster_h3.duckdb_extension`) does not link those crates and only
+# exports the DuckDB entry points.
+datafusion = ["dep:raster-h3-datafusion"]
+python = ["dep:raster-h3-python"]
+pg = ["dep:raster-h3-pg"]
+full = ["datafusion", "python", "pg"]
 duckdb-api-v1_5_6 = ["raster-h3-duckdb/duckdb-api-v1_5_6"]
 stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
 
@@ -91,28 +98,29 @@ stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-prof
 raster-h3-core = { version = "0.7.0", path = "crates/raster-h3-core" }
 raster-h3-cli = { version = "0.7.0", path = "crates/raster-h3-cli" }
 raster-h3-duckdb = { version = "0.7.0", path = "crates/raster-h3-duckdb" }
-raster-h3-datafusion = { version = "0.7.0", path = "crates/raster-h3-datafusion" }
-raster-h3-python = { version = "0.7.0", path = "crates/raster-h3-python" }
-raster-h3-pg = { version = "0.7.0", path = "crates/raster-h3-pg" }
+raster-h3-datafusion = { version = "0.7.0", path = "crates/raster-h3-datafusion", optional = true }
+raster-h3-python = { version = "0.7.0", path = "crates/raster-h3-python", optional = true }
+raster-h3-pg = { version = "0.7.0", path = "crates/raster-h3-pg", optional = true }
 
-h3o.workspace = true
-rayon.workspace = true
-tiff.workspace = true
-proj4rs.workspace = true
-memmap2.workspace = true
-rustc-hash.workspace = true
-thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+# Used by the bins in `src/bin/` (`package_extension`, `conus_batch_and_evict`,
+# `download_burn_probability`, `inspect_tif`). All are already in `raster-h3-core`'s
+# dependency graph, so listing them here adds no compile time.
 flate2.workspace = true
-libdeflater.workspace = true
+h3o.workspace = true
+libc.workspace = true
 parquet.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 ureq.workspace = true
-url.workspace = true
-weezl.workspace = true
-libc.workspace = true
-crossbeam-deque.workspace = true
+
+[dev-dependencies]
+# Used directly by `tests/it` (never linked into the cdylib).
+raster-h3-datafusion = { version = "0.7.0", path = "crates/raster-h3-datafusion" }
+raster-h3-pg = { version = "0.7.0", path = "crates/raster-h3-pg" }
+# Used only by `examples/`.
+libdeflater.workspace = true
+tiff.workspace = true
 
 [profile.release]
 opt-level = 3

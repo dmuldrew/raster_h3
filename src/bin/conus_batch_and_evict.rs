@@ -246,9 +246,11 @@ fn download_band_tiles(
                 job.width_px, job.height_px
             );
 
-            let agent = ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(90))
-                .build();
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(90)))
+                .proxy(None)
+                .build()
+                .into();
 
             let mut backoff = Duration::from_secs(1);
             let max_attempts = 3;
@@ -261,7 +263,7 @@ fn download_band_tiles(
                     Ok(resp) => {
                         if let Ok(file) = File::create(&temp_path) {
                             let mut writer = BufWriter::new(file);
-                            if let Ok(bytes_written) = copy(&mut resp.into_reader(), &mut writer) {
+                            if let Ok(bytes_written) = copy(&mut resp.into_body().into_reader(), &mut writer) {
                                 drop(writer);
                                 if is_valid_tiff(&temp_path) {
                                     if fs::rename(&temp_path, &job.out_path).is_ok() {

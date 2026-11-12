@@ -15,7 +15,7 @@ use tiff::tags::{CompressionMethod, PhotometricInterpretation, Predictor, Sample
 use crate::error::{RasterH3Error, Result};
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::http_range::{
-    is_remote_url, HttpRangeReader, RemoteHttpSource, RemoteSourceFactory,
+    is_remote_url, HttpRangeReader, ReadOverlay, RemoteHttpSource, RemoteSourceFactory,
 };
 use crate::raster::metadata::{
     extract_alpha_sample, extract_band_scaling, extract_crs, extract_geotransform, extract_nodata,
@@ -364,6 +364,9 @@ pub struct ChunkDecoder<'a> {
     libdeflater: Option<libdeflater::Decompressor>,
     lzw_decoder: Option<weezl::decode::Decoder>,
     decomp_scratch: Vec<u8>,
+    /// Remote sources only: chunk bytes already in memory, served to the generic decoder
+    /// so it does not download a chunk the accelerated path already holds.
+    remote_overlay: Option<Arc<ReadOverlay>>,
 }
 
 impl<'a> ChunkDecoder<'a> {
@@ -564,18 +567,16 @@ impl<'a> ChunkDecoder<'a> {
         // Only a payload the caller handed in may be replaced by a re-read: it is
         // a copy (e.g. a prefetched range) and the source still holds the chunk.
         let (fast_res, reread_on_failure) = if let Some(bytes) = provided_bytes {
-            (
-                self.fast_decode(chunk_index, bytes, target_buffer.as_mut()),
-                true,
-            )
+            let res = self.fast_decode(chunk_index, bytes, target_buffer.as_mut());
+            self.stage_for_generic_decoder(&res, chunk_index, bytes);
+            (res, true)
         } else if let Some(ref info) = self.chunk_info {
             // A failed read is final. The generic decoder would only request the
             // same bytes again through a second code path.
             let payload = self.source.get_chunk_payload(chunk_index, info)?;
-            (
-                self.fast_decode(chunk_index, payload.as_ref(), target_buffer.as_mut()),
-                false,
-            )
+            let res = self.fast_decode(chunk_index, payload.as_ref(), target_buffer.as_mut());
+            self.stage_for_generic_decoder(&res, chunk_index, payload.as_ref());
+            (res, false)
         } else {
             (
                 Err(FastDecodeError::Unsupported(
@@ -596,11 +597,40 @@ impl<'a> ChunkDecoder<'a> {
             Err(FastDecodeError::Failed(err)) => return Err(err),
         }
 
-        if let Some(buf) = target_buffer {
+        let result = if let Some(buf) = target_buffer {
             self.read_chunk_fallback_into(chunk_index, chunk_bounds, buf)
         } else {
-            let data = self.inner.read_chunk(chunk_index)?;
-            Ok((chunk_bounds, data))
+            self.inner
+                .read_chunk(chunk_index)
+                .map(|data| (chunk_bounds, data))
+        };
+        if let Some(overlay) = &self.remote_overlay {
+            overlay.clear();
+        }
+        result
+    }
+
+    /// When the accelerated path turns down a remote chunk's layout, hand its bytes to the
+    /// generic decoder's reader so it decodes them instead of downloading the chunk again.
+    /// Bytes that failed to decode are not staged: a caller-supplied copy is then re-read
+    /// from the source, which is the point of that retry.
+    fn stage_for_generic_decoder(
+        &self,
+        fast_res: &std::result::Result<Option<DecodingResult>, FastDecodeError>,
+        chunk_index: u32,
+        bytes: &[u8],
+    ) {
+        let (Some(overlay), Err(FastDecodeError::Unsupported(_))) =
+            (&self.remote_overlay, fast_res)
+        else {
+            return;
+        };
+        let offset = self
+            .chunk_info
+            .as_ref()
+            .and_then(|info| info.chunk_offsets.get(chunk_index as usize));
+        if let Some(&offset) = offset {
+            overlay.stage(offset, bytes);
         }
     }
 
@@ -1238,6 +1268,7 @@ impl GeoTiffStreamReader {
     /// Create a persistent ChunkDecoder that reuses the TIFF decoder for multiple chunk reads.
     /// The decoder parses the IFD once and then seeks directly to tile data on each read_chunk call.
     pub fn open_decoder(&self) -> Result<ChunkDecoder<'_>> {
+        let remote_overlay = Arc::new(ReadOverlay::default());
         let inner = match &self.source {
             RasterSource::Local(mmap) => {
                 let cursor = Cursor::new(&mmap[..]);
@@ -1245,11 +1276,14 @@ impl GeoTiffStreamReader {
                 InnerDecoder::Local(decoder)
             }
             RasterSource::Remote(remote) => {
-                let reader = HttpRangeReader::new(Arc::clone(remote));
+                let reader =
+                    HttpRangeReader::with_overlay(Arc::clone(remote), Arc::clone(&remote_overlay));
                 let decoder = Decoder::new(reader)?;
                 InnerDecoder::Remote(decoder)
             }
         };
+        let remote_overlay =
+            matches!(self.source, RasterSource::Remote(_)).then_some(remote_overlay);
 
         let libdeflater = if self.chunk_info.as_ref().is_some_and(|info| {
             matches!(
@@ -1292,6 +1326,7 @@ impl GeoTiffStreamReader {
             libdeflater,
             lzw_decoder,
             decomp_scratch: Vec::new(),
+            remote_overlay,
         })
     }
 
