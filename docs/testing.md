@@ -436,11 +436,19 @@ cargo +nightly fuzz run content_range -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run partial_state -- -max_total_time=60 -max_len=65536
 rustup component add --toolchain nightly miri rust-src
 cargo +nightly miri test --locked -p raster-h3-core --lib -- columnar:: aggregator::categorical:: raster::predictor::
+# FFI layers (the full list of commands, including the leak exceptions, is in safety.yml)
+export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-deterministic-floats" RASTER_H3_PG_MAJOR=16
+cargo +nightly miri test --locked -p raster-h3-python --lib
+cargo +nightly miri test --locked -p raster-h3-python --test it -- capsules:: scalars::
 ```
 
 Miri checks Arrow schema/array/stream ownership, callbacks, round trips and slicing, the
-categorical raw-slice casts, and the predictor byte-cast paths (NEON on aarch64 hosts); it
-does not run mmap or the external DuckDB/PostgreSQL/Python hosts. Existing real-host smoke
+categorical raw-slice casts, and the predictor byte-cast paths (NEON on aarch64 hosts). In the
+FFI crates it checks the DuckDB C-API structs, chunk writer, boxed lifecycles and panic
+containment, the Python C ABI with its PyCapsule destructors and string helpers, and the
+PostgreSQL fmgr entry points against in-process server stand-ins. It cannot follow
+memory-mapped files or call C libraries (libdeflate, the DuckDB/PostgreSQL/Python hosts), so
+tests that open a raster are `#[cfg_attr(miri, ignore)]` there. Existing real-host smoke
 tests remain necessary. The `tsan` job in the same workflow runs the prefetch,
 remote-prefetch and controller unit tests plus the `threading::`, `chunks_and_prefetch::`
 and `streaming_failures::` integration suites under ThreadSanitizer
@@ -557,7 +565,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | `ci.yml` (`sedona-adapter`, Linux) | `cargo test --locked --no-fail-fast` in `crates/raster-h3-sedona`, Clippy on the Python bindings, then a built wheel tested with `pytest` against `sedonadb==0.5.0` | The standalone SedonaDB adapter workspace (without `sedona-e2e`) and its Python bindings |
 | `ci.yml` (`sedona-spark`, Linux) | `docker build -f Dockerfile.sedona`, then `pytest /opt/raster_h3/examples/tests` in the image with `SPARK_MASTER=local[2]`, and `pytest crates/raster-h3-python/tests/spark` with PySpark 4.1 installed beside the image's Spark 4.0 | Partitioned scans on real Spark with Apache Sedona, the Sedona SQL interop and the demo; also that the `sedona` image builds |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
-| [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets, scoped Miri tests over the columnar/categorical/predictor unsafe code, and a ThreadSanitizer run over prefetch and aggregation tests | Malformed input, sanitizer smoke checks, FFI ownership and data races; longer fuzz runs weekly |
+| [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets, scoped Miri tests over the columnar/categorical/predictor unsafe code and the DuckDB, Python and PostgreSQL FFI layers, and a ThreadSanitizer run over prefetch and aggregation tests | Malformed input, sanitizer smoke checks, FFI ownership and data races; longer fuzz runs weekly |
 | [`coverage.yml`](../.github/workflows/coverage.yml) | `cargo llvm-cov --locked --lcov --output-path lcov.info -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg --lib --test it`, uploaded to Codecov | Line/region/function coverage on every push to main and PR; statuses informational |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
 | `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example profile_hotspots` | Hotspot harness ownership-sampling correctness; profiling experiments are excluded |

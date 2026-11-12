@@ -13,7 +13,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use raster_h3_core::aggregator::multi_horizon::{
@@ -883,10 +883,11 @@ pub unsafe extern "C" fn raster_h3_py_free_arrow_stream(ptr: *mut ArrowArrayStre
     }
 }
 
-/// `const char *PyCapsule_GetName(PyObject *)`, as an address.
-static CAPSULE_GET_NAME: AtomicUsize = AtomicUsize::new(0);
-/// `void *PyCapsule_GetPointer(PyObject *, const char *)`, as an address.
-static CAPSULE_GET_POINTER: AtomicUsize = AtomicUsize::new(0);
+/// `const char *PyCapsule_GetName(PyObject *)`. Stored as a pointer, not an integer, so it
+/// keeps its provenance and can be called again.
+static CAPSULE_GET_NAME: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// `void *PyCapsule_GetPointer(PyObject *, const char *)`.
+static CAPSULE_GET_POINTER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 /// Register the interpreter's `PyCapsule_GetName` and `PyCapsule_GetPointer`, which
 /// [`raster_h3_py_stream_capsule_destructor`] and
@@ -903,8 +904,8 @@ pub unsafe extern "C" fn raster_h3_py_set_capsule_api(
     get_name: *const c_void,
     get_pointer: *const c_void,
 ) {
-    CAPSULE_GET_NAME.store(get_name as usize, Ordering::Release);
-    CAPSULE_GET_POINTER.store(get_pointer as usize, Ordering::Release);
+    CAPSULE_GET_NAME.store(get_name.cast_mut(), Ordering::Release);
+    CAPSULE_GET_POINTER.store(get_pointer.cast_mut(), Ordering::Release);
 }
 
 /// Payload pointer of a live capsule, or null when the capsule API is not registered.
@@ -914,7 +915,7 @@ pub unsafe extern "C" fn raster_h3_py_set_capsule_api(
 unsafe fn capsule_payload(capsule: *mut c_void) -> *mut c_void {
     let get_name = CAPSULE_GET_NAME.load(Ordering::Acquire);
     let get_pointer = CAPSULE_GET_POINTER.load(Ordering::Acquire);
-    if capsule.is_null() || get_name == 0 || get_pointer == 0 {
+    if capsule.is_null() || get_name.is_null() || get_pointer.is_null() {
         return ptr::null_mut();
     }
     // SAFETY: both addresses were registered through `raster_h3_py_set_capsule_api`,
@@ -922,9 +923,9 @@ unsafe fn capsule_payload(capsule: *mut c_void) -> *mut c_void {
     // is live and the GIL is held (caller contract).
     unsafe {
         let get_name: unsafe extern "C" fn(*mut c_void) -> *const c_char =
-            std::mem::transmute(get_name);
+            std::mem::transmute::<*mut c_void, _>(get_name);
         let get_pointer: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void =
-            std::mem::transmute(get_pointer);
+            std::mem::transmute::<*mut c_void, _>(get_pointer);
         // A consumer may rename a capsule it took ownership of (e.g. to
         // `used_arrow_array_stream`); looking the payload up by the current name
         // cannot fail, so it leaves the interpreter's error state alone.
@@ -2400,6 +2401,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "reads a memory-mapped raster, which Miri cannot follow"
+    )]
     fn test_py_scanner_arrow_c_stream_and_c_abi() {
         let tif = write_test_tif(16, 16, 25.5);
         let path_c = CString::new(tif.path().to_string_lossy().as_bytes()).unwrap();
