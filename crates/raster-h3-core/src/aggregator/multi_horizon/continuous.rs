@@ -37,6 +37,41 @@ fn process_continuous_slice_into_maps<T: SimdSpanAccumulate + Default>(
     options: ContinuousOptions,
     chunk_maps: &mut [HashMap<u64, H3Accumulator, H3BuildHasher>],
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the running CPU supports FMA, checked just above.
+        unsafe {
+            process_continuous_slice_into_maps_fma(ctx, slice, native_nodata, options, chunk_maps)
+        };
+        return;
+    }
+    process_continuous_slice_into_maps_impl(ctx, slice, native_nodata, options, chunk_maps);
+}
+
+/// [`process_continuous_slice_into_maps`] compiled with hardware FMA. h3o's projection math uses
+/// `f64::mul_add`, which without the `fma` target feature lowers to a software
+/// routine; hardware and software FMA are both correctly rounded, so results
+/// are bit-identical.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn process_continuous_slice_into_maps_fma<T: SimdSpanAccumulate + Default>(
+    ctx: &WalkContext<'_>,
+    slice: &[T],
+    native_nodata: Option<T>,
+    options: ContinuousOptions,
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, H3BuildHasher>],
+) {
+    process_continuous_slice_into_maps_impl(ctx, slice, native_nodata, options, chunk_maps);
+}
+
+#[inline(always)]
+fn process_continuous_slice_into_maps_impl<T: SimdSpanAccumulate + Default>(
+    ctx: &WalkContext<'_>,
+    slice: &[T],
+    native_nodata: Option<T>,
+    options: ContinuousOptions,
+    chunk_maps: &mut [HashMap<u64, H3Accumulator, H3BuildHasher>],
+) {
     let engine = ContinuousEngine {
         native_nodata,
         track_quantiles: options.track_quantiles,
@@ -294,6 +329,69 @@ pub fn process_continuous_borrowed_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hardware-FMA copy of the kernel must produce exactly the maps the
+    /// portable copy does: every statistic bit for bit, and the same sketches.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_and_portable_kernels_agree_bit_for_bit() {
+        if !std::arch::is_x86_feature_detected!("fma") {
+            eprintln!("skipping: this CPU has no FMA");
+            return;
+        }
+        let values: Vec<f32> = (0..48 * 32)
+            .map(|i| {
+                if i % 37 == 0 {
+                    -9999.0
+                } else {
+                    (i % 211) as f32 * 0.37 - 20.0
+                }
+            })
+            .collect();
+        let options = ContinuousOptions {
+            band: 1,
+            spectral_formula: None,
+            track_quantiles: true,
+        };
+        let bits = |maps: &[HashMap<u64, H3Accumulator, H3BuildHasher>]| {
+            let mut out: Vec<_> = maps
+                .iter()
+                .enumerate()
+                .flat_map(|(r, m)| {
+                    m.iter().map(move |(&cell, a)| {
+                        let stats =
+                            [a.sum, a.count, a.min, a.max, a.m2, a.sum_w2].map(f64::to_bits);
+                        (r, cell, stats, a.quantiles.clone())
+                    })
+                })
+                .collect();
+            out.sort_by_key(|(r, cell, ..)| (*r, *cell));
+            out
+        };
+        super::super::walker::for_each_kernel_test_context(|name, ctx| {
+            let mut portable = vec![HashMap::default(); ctx.resolutions.len()];
+            let mut fma = vec![HashMap::default(); ctx.resolutions.len()];
+            process_continuous_slice_into_maps_impl(
+                ctx,
+                &values,
+                Some(-9999.0),
+                options,
+                &mut portable,
+            );
+            // SAFETY: FMA support was checked above.
+            unsafe {
+                process_continuous_slice_into_maps_fma(
+                    ctx,
+                    &values,
+                    Some(-9999.0),
+                    options,
+                    &mut fma,
+                )
+            };
+            assert!(portable.iter().all(|m| !m.is_empty()), "{name}: empty maps");
+            assert!(bits(&portable) == bits(&fma), "{name}: kernels disagree");
+        });
+    }
 
     #[test]
     fn calibrated_overflow_agrees_between_samples_and_spans() {

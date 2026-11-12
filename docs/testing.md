@@ -17,7 +17,7 @@ explains how to run each group and what CI runs. The counts below are the number
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 12 (8 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 6 modules, 1 binary | 20 |
 | [`crates/raster-h3-sedona/tests/`](../crates/raster-h3-sedona/tests) (`sedona/…`, standalone workspace; one binary per module) | 6 modules | 34 (5 need `sedona-e2e`) |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 300 (3 need `pg-extension`) |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 308 (3 need `pg-extension`) |
 | [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 7 modules | 84 |
 | [`crates/raster-h3-sedona/python/tests/`](../crates/raster-h3-sedona/python/tests) (`sedona-pytest/…`, needs the `sedonadb` 0.5.0 wheel) | 1 module | 14 |
 | [`examples/sedona_spark/tests/`](../examples/sedona_spark/tests) (`spark/…`, needs PySpark, Apache Sedona and `raster_h3`, as in the `sedona` image) | 2 modules | 17 (23 cases) |
@@ -92,6 +92,7 @@ grid orientation or bbox edges.
 | [`core/antimeridian_bbox.rs`](../crates/raster-h3-core/tests/it/antimeridian_bbox.rs) (7) | Bboxes crossing ±180° keep every sample inside them, on grids ending at 180°, crossing 180°, spanning 0–360°, and on multiband rasters. |
 | [`core/antimeridian_bbox.rs`](../crates/raster-h3-core/tests/it/antimeridian_bbox.rs), [`core/chunks_and_prefetch.rs`](../crates/raster-h3-core/tests/it/chunks_and_prefetch.rs) | `test_antimeridian_crossing_and_wrap`, `test_bounding_box_pruning`, `test_chunk_intersects_bbox_tile_filtering`, `test_spatial_filter_pushdown_chunk_skipping`. |
 | Unit: `aggregator/multi_horizon/walker.rs` (5) | Pixel walker spans and row pruning; horizontal/vertical shear mode selection and bit-identical WGS84/Mercator/Albers center and supersampled projection, including transform counts under `stream-profile`. |
+| Unit: `multi_horizon/continuous.rs` and `multi_horizon/categorical.rs` (1 each, x86_64 with FMA only) | The hardware-FMA copy of each scan kernel produces exactly the maps the portable copy does (every continuous statistic bit for bit, the same quantile sketches and class counts) on WGS84 north-up and rotated/sheared, UTM 10N and Web Mercator chunks with centre and sixteen-point sampling at resolutions 7, 9 and 11. They also run the portable copy, which CI otherwise never reaches. |
 
 ## 3. Horizon eviction soundness
 
