@@ -470,8 +470,7 @@ mod tests {
                 assert!((actual_lat - expected_lat).abs() < 5e-11);
                 // Feed PROJ's target coordinates directly to the inverse;
                 // this does not reuse our forward result as an oracle.
-                let (inverse_lon, inverse_lat) =
-                    grid.inverse(expected_lon, expected_lat).unwrap();
+                let (inverse_lon, inverse_lat) = grid.inverse(expected_lon, expected_lat).unwrap();
                 assert!((inverse_lon - lon).abs() < 5e-11);
                 assert!((inverse_lat - lat).abs() < 5e-11);
             }
