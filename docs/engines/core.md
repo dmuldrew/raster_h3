@@ -305,6 +305,14 @@ reading past the limit; a larger announced `Content-Length` fails without readin
 Raise the limit with `RASTER_H3_MAX_FULL_BODY_BYTES` (bytes; invalid or zero values
 keep the default) or `HttpTransport::with_max_full_body_bytes`.
 
+Reads that do not come from the prefetch queue (the TIFF header, and chunks the
+accelerated decoder hands to the generic one) go through a block cache of 128 KiB
+blocks (`http_range::DEFAULT_BLOCK_SIZE`). It keeps at most 512 blocks, 64 MiB
+(`http_range::DEFAULT_MAX_CACHED_BLOCKS`), and drops the least recently used block past
+that, so reading a large file this way does not keep it all in memory. A read spanning
+two blocks is fetched directly and not cached. `ByteCache::with_max_blocks` changes the
+limit for a cache you build yourself.
+
 Transient failures are retried up to four times, each after a random delay between
 half and the full exponential backoff, so concurrent workers do not retry in
 lockstep; a numeric `Retry-After` header of up to 30 s lengthens the delay (the
