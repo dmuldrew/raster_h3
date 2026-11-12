@@ -1,10 +1,10 @@
 import contextlib
 import io
-from pathlib import Path
 import runpy
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 

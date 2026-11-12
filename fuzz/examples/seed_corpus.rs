@@ -14,6 +14,7 @@ fn main() -> std::io::Result<()> {
         "arrow_import",
         "remap",
         "content_range",
+        "partial_state",
     ] {
         fs::create_dir_all(corpus.join(target))?;
     }
@@ -94,5 +95,21 @@ fn main() -> std::io::Result<()> {
     }
 
     fs::write(corpus.join("content_range/basic"), "bytes 0-9/100")?;
+
+    {
+        use raster_h3_core::aggregator::multi_horizon::encode_partial_state;
+        use raster_h3_core::aggregator::{CategoricalAccumulator, H3Accumulator};
+        let mut continuous = H3Accumulator::with_quantiles();
+        for v in [-3.5, 0.0, 2.0, 1e-9, 4096.0] {
+            continuous.update_weighted(v, 0.5);
+        }
+        let mut categorical = CategoricalAccumulator::new();
+        for class in -20..20 {
+            categorical.update_weighted(class, 0.25);
+        }
+        let dir = corpus.join("partial_state");
+        fs::write(dir.join("continuous"), encode_partial_state(&continuous))?;
+        fs::write(dir.join("categorical"), encode_partial_state(&categorical))?;
+    }
     Ok(())
 }

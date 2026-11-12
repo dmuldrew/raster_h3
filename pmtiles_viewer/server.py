@@ -5,7 +5,8 @@ Lightweight Static HTTP Server with HTTP Range Requests and CORS support for PMT
 import os
 import re
 import sys
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
 
 class PMTilesHTTPRequestHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -25,10 +26,10 @@ class PMTilesHTTPRequestHandler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Range, If-Match, If-None-Match, Content-Type, Authorization, X-Requested-With, *')
         self.send_header('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, ETag')
         self.send_header('Access-Control-Max-Age', '86400')
-        
+
         # Never cache HTML pages so updates are immediately visible on reload
         clean_path = self.path.split('?')[0].split('#')[0]
-        if clean_path.endswith('.html') or clean_path.endswith('/') or not '.' in clean_path.split('/')[-1]:
+        if clean_path.endswith('.html') or clean_path.endswith('/') or '.' not in clean_path.split('/')[-1]:
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.send_header('Pragma', 'no-cache')
             self.send_header('Expires', '0')
@@ -86,7 +87,7 @@ class PMTilesHTTPRequestHandler(SimpleHTTPRequestHandler):
     def send_head(self):
         self._range_length = None
         path = self.translate_path(self.path)
-        
+
         if not os.path.exists(path) or os.path.isdir(path):
             return super().send_head()
 

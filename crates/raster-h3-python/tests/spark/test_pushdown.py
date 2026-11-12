@@ -93,7 +93,9 @@ def test_resolution_filter_on_a_view_merges_like_a_narrower_scan(spark, terrain)
     assert "Filter" not in plan(parts)
     got = spark_ds.merge_partials(parts).toArrow()
     want = pa.table(raster_h3.RasterH3ArrowStream(terrain, resolutions=[9]))
-    as_rows = lambda t: {(r["resolution"], r["h3_index"], False): [r] for r in t.to_pylist()}
+    def as_rows(t):
+        return {(r["resolution"], r["h3_index"], False): [r] for r in t.to_pylist()}
+
     assert_same_rows(as_rows(got), as_rows(want))
 
 

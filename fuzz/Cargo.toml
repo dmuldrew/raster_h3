@@ -64,3 +64,10 @@ path = "fuzz_targets/content_range.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "partial_state"
+path = "fuzz_targets/partial_state.rs"
+test = false
+doc = false
+bench = false
