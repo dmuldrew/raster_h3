@@ -377,7 +377,15 @@ fn walk<T, Acc, E, N, R>(
                     combine_by_cell(&mut assignments);
                 }
                 for &(cell, weight) in &assignments {
-                    runs.update(i, cell, sample, weight, (col, row_idx), engine, &mut maps[i]);
+                    runs.update(
+                        i,
+                        cell,
+                        sample,
+                        weight,
+                        (col, row_idx),
+                        engine,
+                        &mut maps[i],
+                    );
                 }
             }
         }
@@ -806,11 +814,21 @@ mod tests {
         impl ScanlineEngine<u8, Vec<Observation>> for Engine {
             type Sample = u8;
 
-            fn needs_pixel_coordinates(&self) -> bool { true }
-            fn combine_sample_weights(&self) -> bool { true }
-            fn new_acc(&self) -> Vec<Observation> { Vec::new() }
-            fn clear_acc(&self, acc: &mut Vec<Observation>) { acc.clear(); }
-            fn has_samples(&self, acc: &Vec<Observation>) -> bool { !acc.is_empty() }
+            fn needs_pixel_coordinates(&self) -> bool {
+                true
+            }
+            fn combine_sample_weights(&self) -> bool {
+                true
+            }
+            fn new_acc(&self) -> Vec<Observation> {
+                Vec::new()
+            }
+            fn clear_acc(&self, acc: &mut Vec<Observation>) {
+                acc.clear();
+            }
+            fn has_samples(&self, acc: &Vec<Observation>) -> bool {
+                !acc.is_empty()
+            }
             fn merge_acc(&self, dest: &mut Vec<Observation>, src: &Vec<Observation>) {
                 dest.extend_from_slice(src);
             }
@@ -827,15 +845,31 @@ mod tests {
                 panic!("expected an update with coordinates");
             }
             fn update_sample_at(
-                &self, acc: &mut Vec<Observation>, value: u8, weight: f64,
-                col: usize, row: usize,
+                &self,
+                acc: &mut Vec<Observation>,
+                value: u8,
+                weight: f64,
+                col: usize,
+                row: usize,
             ) {
                 acc.push((col, row, value, weight));
             }
         }
 
-        let chunk = RasterChunk { col_offset: 10, row_offset: 20, width: 2, height: 2 };
-        let gt = GeoTransform { c0: -122.5, a: 0.001, b: 0.0, f0: 38.0, d: 0.0, e: -0.001 };
+        let chunk = RasterChunk {
+            col_offset: 10,
+            row_offset: 20,
+            width: 2,
+            height: 2,
+        };
+        let gt = GeoTransform {
+            c0: -122.5,
+            a: 0.001,
+            b: 0.0,
+            f0: 38.0,
+            d: 0.0,
+            e: -0.001,
+        };
         let resolutions = [5u8, 9].map(|r| Resolution::try_from(r).unwrap());
         let crs = CrsTransformer::Wgs84Identity;
         let engine = Engine;
@@ -858,8 +892,17 @@ mod tests {
                 let mut maps: Vec<CellMap<Vec<Observation>>> =
                     (0..resolutions.len()).map(|_| CellMap::default()).collect();
                 if interleaved {
-                    let ctx = WalkContext { samples_per_pixel: 2, ..ctx };
-                    walk_interleaved(&ctx, &[1, 99, 2, 99, 3, 99, 4, 99], |p| Some(p[0]), &engine, &mut maps);
+                    let ctx = WalkContext {
+                        samples_per_pixel: 2,
+                        ..ctx
+                    };
+                    walk_interleaved(
+                        &ctx,
+                        &[1, 99, 2, 99, 3, 99, 4, 99],
+                        |p| Some(p[0]),
+                        &engine,
+                        &mut maps,
+                    );
                 } else {
                     walk_direct(&ctx, &[1, 2, 3, 4], |_| false, &engine, &mut maps);
                 }
@@ -870,7 +913,9 @@ mod tests {
                         assert_eq!((col, row), (10 + index % 2, 20 + index / 2));
                         sums[index] += weight;
                     }
-                    for sum in sums { assert!((sum - 1.0).abs() < 1e-12); }
+                    for sum in sums {
+                        assert!((sum - 1.0).abs() < 1e-12);
+                    }
                 }
             }
         }
