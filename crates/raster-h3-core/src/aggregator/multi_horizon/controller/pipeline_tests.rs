@@ -2,7 +2,6 @@ use super::super::eviction_space::CellKeys;
 use super::super::sharded_map::ShardedResolutionMap;
 use super::super::spill::SpillRuns;
 use super::pipeline::{run_pipelined, CellMaps, MergeTarget, WindowJobs};
-use super::*;
 use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::cell_hash::H3BuildHasher;
 use crate::error::{RasterH3Error, Result};

@@ -1,5 +1,4 @@
 use super::super::config::MultiResolutionConfig;
-use super::*;
 use crate::aggregator::multi_horizon::continuous_streamer::MultiScanHorizonStreamer;
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::prefetch::MosaicPrefetchItem;
