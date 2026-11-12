@@ -246,10 +246,18 @@ impl Ntv2Grid {
         let col = (col_position.floor() as usize).min(self.columns - 2);
         let dy = (row_position - row as f64).clamp(0.0, 1.0);
         let dx = (col_position - col as f64).clamp(0.0, 1.0);
-        let a = self.node(row, col).ok_or_else(|| invalid("invalid grid dimensions"))?;
-        let b = self.node(row, col + 1).ok_or_else(|| invalid("invalid grid dimensions"))?;
-        let c = self.node(row + 1, col).ok_or_else(|| invalid("invalid grid dimensions"))?;
-        let d = self.node(row + 1, col + 1).ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let a = self
+            .node(row, col)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let b = self
+            .node(row, col + 1)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let c = self
+            .node(row + 1, col)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let d = self
+            .node(row + 1, col + 1)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
         let interpolate = |a: f32, b: f32, c: f32, d: f32| {
             let low = f64::from(a) * (1.0 - dx) + f64::from(b) * dx;
             let high = f64::from(c) * (1.0 - dx) + f64::from(d) * dx;
@@ -257,12 +265,16 @@ impl Ntv2Grid {
         };
         Ok((
             interpolate(
-                a.longitude_seconds_west, b.longitude_seconds_west,
-                c.longitude_seconds_west, d.longitude_seconds_west,
+                a.longitude_seconds_west,
+                b.longitude_seconds_west,
+                c.longitude_seconds_west,
+                d.longitude_seconds_west,
             ),
             interpolate(
-                a.latitude_seconds, b.latitude_seconds,
-                c.latitude_seconds, d.latitude_seconds,
+                a.latitude_seconds,
+                b.latitude_seconds,
+                c.latitude_seconds,
+                d.latitude_seconds,
             ),
         ))
     }
@@ -442,9 +454,14 @@ mod tests {
     #[test]
     fn rejects_outside_and_nonfinite_coordinates() {
         let grid = Ntv2Grid::read(&fixture(false)[..], 4).unwrap();
-        for (lon, lat) in [(0.0001, 0.5), (-1.0001, 0.5), (-0.5, -0.0001),
-                           (-0.5, 1.0001), (f64::NAN, 0.5),
-                           (-0.5, f64::INFINITY)] {
+        for (lon, lat) in [
+            (0.0001, 0.5),
+            (-1.0001, 0.5),
+            (-0.5, -0.0001),
+            (-0.5, 1.0001),
+            (f64::NAN, 0.5),
+            (-0.5, f64::INFINITY),
+        ] {
             assert!(grid.forward(lon, lat).is_err());
             assert!(grid.inverse(lon, lat).is_err());
         }
