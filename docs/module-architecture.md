@@ -27,7 +27,7 @@ Defines `RasterH3Error` via `thiserror`, unifying all recoverable error types ac
 | File | Responsibility |
 | :--- | :--- |
 | [`mod.rs`](../crates/raster-h3-core/src/crs/mod.rs) | CRS detection and parsing from the built-in EPSG codes (geographic, Web Mercator, Albers, UTM, polar, and European national grids with Helmert datum shifts; see crs-and-projection.md) or PROJ definition strings. Automatic UTM zone string synthesis. |
-| [`transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs) | Three-tier coordinate reprojection pipeline: **Tier 1** `Wgs84Identity` (zero-cost passthrough for EPSG:4326/4269), **Tier 2** `WebMercatorFast` and `AlbersConicFast` (closed-form analytical transforms including 2-iteration Newton-Raphson inverse solver), **Tier 3** `Proj4` (general-purpose fallback via pure-Rust `proj4rs`). |
+| [`transformer/`](../crates/raster-h3-core/src/crs/transformer/mod.rs) | Three-tier coordinate reprojection pipeline: **Tier 1** `Wgs84Identity` (zero-cost passthrough for EPSG:4326/4269), **Tier 2** `WebMercatorFast` and `AlbersConicFast` (closed-form analytical transforms including 2-iteration Newton-Raphson inverse solver), **Tier 3** `Proj4` (general-purpose fallback via pure-Rust `proj4rs`). |
 
 ---
 
@@ -101,7 +101,7 @@ H3 scalar helpers (`h3_to_string`, `string_to_h3`, `h3_to_lat/lng`, `h3_get_reso
 
 | File | Responsibility |
 | :--- | :--- |
-| [`controller.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs) | Central multi-resolution scanline horizon streamer controller (`MultiHorizonStreamer`). Orchestrates chunk prefetch dispatch, Rayon parallel chunk-row execution, 32-way sharded aggregation maps, horizon latitude progression, eviction & compaction delegation, and lifecycle state transitions. |
+| [`controller/`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller/mod.rs) | Central multi-resolution scanline horizon streamer controller (`MultiHorizonStreamer`). Orchestrates chunk prefetch dispatch, Rayon parallel chunk-row execution, 32-way sharded aggregation maps, horizon latitude progression, eviction & compaction delegation, and lifecycle state transitions. |
 | [`config.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/config.rs) | Query-level configuration (`MultiResolutionConfig`) — resolution arrays, sub-pixel sampling patterns, spectral index formulas (`SpectralFormula` for NDVI/NDWI/NBR/EVI computation), streaming quantile targets (`QuantileTarget`), value filters, and category remapping settings. |
 | [`lifecycle.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/lifecycle.rs) | Stream lifecycle state machine (`StreamLifecycle`) with latched three-state transitions (`Running` → `Finished` / `Failed`). Ensures stream failures are never mistaken for normal EOF. Includes `OutputBuffer` for record queue buffering. |
 | [`sharded_map.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/sharded_map.rs) | 32-way partitioned lock-free hash map (`ShardedEvictionMap`) using `SplitMix64` on H3 cell indices to distribute accumulator entries across shards. Eliminates thread contention during concurrent row aggregation and horizon eviction. |

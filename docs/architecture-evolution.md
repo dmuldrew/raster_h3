@@ -327,13 +327,13 @@ The original post-`v0.4.0` roadmap was ranked from the CONUS Resolution 9 teleme
 * **What to record:** wall, user/sys CPU and peak RSS for CLI, Polars and DuckDB on both `BP_CONUS` rasters at resolution 9; plus `StreamProfile` merge, spill and `eviction_key_fallbacks`, and `worker_scaling` at 1/2/4/8/16 workers on the same machine. Add a partitioned run (`raster-h3-cli plan` / `ipc --partition` / `merge`) to confirm partitioning stays free at continental scale.
 
 #### R2. Weight Budget Shares by Expected Cell Count
-* **Where:** `map_budget = aggregation_budget_bytes / num_res / 4` in [`crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs) and the horizon maps that enforce it.
+* **Where:** `map_budget = aggregation_budget_bytes / num_res / 4` in [`crates/raster-h3-core/src/aggregator/multi_horizon/controller/construct.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller/construct.rs) and the horizon maps that enforce it.
 * **The bottleneck:** Each resolution's horizon map gets a quarter of the aggregation budget divided by the number of resolutions ([`engineering.md`](engineering.md)). A batch of resolution-11 cells on a 4096-pixel-wide, 64-row-strip raster needs ~53 MiB, but gets 16 MiB alone or ~5 MiB in a three-resolution run, while resolution 7 in the same run holds a few thousand cells. The fine resolution spills on every batch.
 * **The fix:** Size each resolution's share from its expected cells per batch (batch pixels divided by pixels per cell, capped at batch pixels), so coarse resolutions give up memory they cannot use. Keep the total budget unchanged, and keep spilling as the fallback so the result is always correct.
 * **Validate with:** the `worker_scaling` `res 11` and `res 7, 9, 11` workloads at 64 MiB, and the memory benchmark suite, which must show peak memory still within the budget.
 
 #### R3. Parallelise the Merge Only If It Still Dominates
-* **Where:** the serial horizon merge in [`crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller.rs).
+* **Where:** the serial horizon merge in [`crates/raster-h3-core/src/aggregator/multi_horizon/controller/pipeline.rs`](../crates/raster-h3-core/src/aggregator/multi_horizon/controller/pipeline.rs).
 * **Status:** After PR #82 the merge is a hash insert and an eviction-heap push per new cell. The horizon map already has 32 shards, so a sharded merge is possible, but merge order also feeds the eviction heap and spill runs, both of which must stay deterministic.
 * **Gate:** the `worker_scaling` decision rule: proceed only if the merge exceeds 20% of wall time on a common workload in R1's 8+ core runs.
 
@@ -351,7 +351,7 @@ The sections below are the original analysis of `P0`–`P5`, kept for reference.
 ### Tier 1: High-Impact Inner-Loop Optimizations
 
 #### 1. Replace Newton-Raphson + `.ln()` in `AlbersConicFast` with Snyder's Authalic Series & Eliminate Redundant `sqrt()` (`P0`, shipped in `v0.5.0`)
-* **Where:** [`crates/raster-h3-core/src/crs/transformer.rs`](../crates/raster-h3-core/src/crs/transformer.rs) (`AlbersConicFast::transform_point`)
+* **Where:** [`crates/raster-h3-core/src/crs/transformer/albers.rs`](../crates/raster-h3-core/src/crs/transformer/albers.rs) (`AlbersConicFast::transform_point`)
 * **The Bottleneck:** On CONUS Albers (`EPSG:5070`), coordinate reprojection accounts for the entire ~400–550 second gap versus native WGS84. Currently, `AlbersConicFast::transform_point` executes:
   1. `let rho = (x_p * x_p + y_p * y_p).sqrt();` followed immediately by `rho * rho` (`rho` is never used unsquared).
   2. Two iterations of Newton-Raphson, invoking **6 transcendental functions per pixel** (`2× sin`, `2× cos`, `2× ln`) in addition to `atan2` and `asin`.

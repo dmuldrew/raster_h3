@@ -80,7 +80,12 @@ crates/raster-h3-core/src/
 │   │   ├── continuous_streamer.rs # Multi-resolution continuous horizon streamer
 │   │   ├── categorical.rs   # Categorical landcover chunk aggregation
 │   │   ├── categorical_streamer.rs # Multi-resolution categorical horizon streamer
-│   │   ├── controller.rs    # Resolution controller & batch horizon sizing
+│   │   ├── controller/      # Resolution controller & batch horizon sizing
+│   │   │   ├── mod.rs       # MultiHorizonStreamer, HorizonStreamKernel, RecordStreamer, drains
+│   │   │   ├── construct.rs # Streamer construction over a mosaic
+│   │   │   ├── batch.rs     # One prefetched batch: windows, horizon merge, eviction, spill
+│   │   │   ├── advance.rs   # Batch sizing, EOF finalization, failure latching
+│   │   │   └── pipeline.rs  # Worker windows and the in-order merge pipeline
 │   │   ├── sharded_map.rs   # Fixed-array sharded accumulator map
 │   │   ├── spectral.rs      # On-the-fly spectral formulas (NDVI, NDWI, NBR, EVI)
 │   │   └── walker.rs        # Generic ScanlineEngine trait & unified scanline_walk
@@ -91,7 +96,13 @@ crates/raster-h3-core/src/
 │   └── simd.rs              # SIMD-vectorized span accumulation for Welford statistics
 ├── crs/                     # Geodetic reprojection layer
 │   ├── mod.rs
-│   └── transformer.rs       # 3-tier CRS reprojection (Identity → Analytical → PROJ4)
+│   └── transformer/         # 3-tier CRS reprojection (Identity → Analytical → PROJ4)
+│       ├── mod.rs           # CrsTransformer, EPSG/PROJ-string resolution, point transforms
+│       ├── albers.rs        # Closed-form Albers Equal Area Conic fast path
+│       ├── bounds.rs        # WGS84 bounds of pixel rectangles and their certification
+│       ├── proj_tokens.rs   # PROJ-string tokenizing and fast-path parameter checks
+│       ├── tm.rs            # Certified transverse Mercator bounds
+│       └── tests.rs         # Unit tests
 ├── encoding/                # Shared zero-allocation encoding & geometry serialization
 │   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter & parser
 │   ├── wkb.rs               # Stack-allocated OGC WKB 2D Polygon hexagon geometry serialization
