@@ -4,8 +4,15 @@ use std::collections::HashMap;
 use std::ptr;
 
 use raster_h3_duckdb::ffi::duckdb_c::*;
+use raster_h3_duckdb::functions::categorical_table_function::{
+    raster_h3_categorical_bind, raster_h3_categorical_init, raster_h3_categorical_init_local,
+    raster_h3_categorical_scan,
+};
 use raster_h3_duckdb::functions::parquet_table_function::{
     parquet_bind, parquet_init, parquet_scan,
+};
+use raster_h3_duckdb::functions::table_function::{
+    raster_h3_bind, raster_h3_init, raster_h3_init_local, raster_h3_scan,
 };
 
 use super::mock_api::install_mock_api;
