@@ -276,14 +276,37 @@ mod tests {
             assert!(SamplingPattern::parse(name).unwrap().is_single_point());
         }
         for (name, len) in [
-            ("rotated4", 4), ("4point_rotated", 4), ("rotated", 4), ("4", 4),
-            ("5point", 5), ("5_point", 5), ("quincunx", 5), ("5", 5),
-            ("weighted5", 5), ("psf", 5), ("hex7", 7), ("7point", 7),
-            ("7point_hex", 7), ("7", 7), ("rooks8", 8), ("stratified8", 8),
-            ("8", 8), ("9_point", 9), ("3x3", 9), ("grid3x3", 9),
-            ("9", 9), ("16_point", 16), ("4x4", 16), ("grid4x4", 16), ("16", 16),
+            ("rotated4", 4),
+            ("4point_rotated", 4),
+            ("rotated", 4),
+            ("4", 4),
+            ("5point", 5),
+            ("5_point", 5),
+            ("quincunx", 5),
+            ("5", 5),
+            ("weighted5", 5),
+            ("psf", 5),
+            ("hex7", 7),
+            ("7point", 7),
+            ("7point_hex", 7),
+            ("7", 7),
+            ("rooks8", 8),
+            ("stratified8", 8),
+            ("8", 8),
+            ("9_point", 9),
+            ("3x3", 9),
+            ("grid3x3", 9),
+            ("9", 9),
+            ("16_point", 16),
+            ("4x4", 16),
+            ("grid4x4", 16),
+            ("16", 16),
         ] {
-            assert_eq!(SamplingPattern::parse(name).unwrap().points.len(), len, "{name}");
+            assert_eq!(
+                SamplingPattern::parse(name).unwrap().points.len(),
+                len,
+                "{name}"
+            );
         }
     }
 }

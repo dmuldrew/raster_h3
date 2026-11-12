@@ -759,8 +759,7 @@ fn real_sql_v156_features() {
 #[ignore = "requires DuckDB CLI and a built cdylib (cargo build --lib)"]
 fn invalid_sampling_is_a_bind_error_in_all_raster_entry_points() {
     let duckdb = DuckDbHarness::new();
-    let (_file, tif) = helpers::TestGeoTiffBuilder::new(4, 4)
-        .create_constant_tempfile(42.0_f32);
+    let (_file, tif) = helpers::TestGeoTiffBuilder::new(4, 4).create_constant_tempfile(42.0_f32);
     let source = quoted(&tif);
     let parquet = quoted(&duckdb.path("invalid.parquet"));
     let pmtiles = quoted(&duckdb.path("invalid.pmtiles"));
@@ -771,17 +770,13 @@ fn invalid_sampling_is_a_bind_error_in_all_raster_entry_points() {
         format!("SELECT * FROM h3_raster_to_pmtiles({source}, {pmtiles}, sampling := 'rgsss')"),
     ];
     for sql in queries {
-        let output = Command::new(&duckdb.cli)
-            .args([
-                "-unsigned",
-                "-batch",
-                "-c",
-                &format!("LOAD {}; {sql}", quoted(&duckdb.extension)),
-            ])
-            .output()
-            .unwrap();
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{sql} unexpectedly succeeded");
+        // The DuckDB CLI can exit 0 after a failed statement, so detect the
+        // failure from stderr as the other negative-path tests do.
+        let error = try_query_cli(
+            &duckdb.cli,
+            &format!("LOAD {}; {sql}", quoted(&duckdb.extension)),
+        )
+        .expect_err(&format!("{sql} unexpectedly succeeded"));
         assert!(error.contains("Invalid sampling"), "{sql}: {error}");
         assert!(error.contains("rgsss"), "{sql}: {error}");
     }
