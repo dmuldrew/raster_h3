@@ -232,7 +232,12 @@ def test_polygon_to_cells_joins_on_h3_index(sd, raster):
 
 def test_polygon_to_cells_rejects_projected_geometry(sd):
     # A planning error; SedonaDB's Python exception type for it is not part of its API.
-    with pytest.raises(Exception, match="geometry must be lon/lat"):
+    # sedonadb 0.5 refuses the projected geometry while matching kernels, before our
+    # own lon/lat check runs; either way the error must name this function.
+    with pytest.raises(
+        Exception,
+        match=r"h3_polygon_to_cells.*(geometry must be lon/lat|No kernel matching arguments)",
+    ):
         sd.sql(
             "SELECT h3_polygon_to_cells(ST_SetSRID(ST_GeomFromWKT("
             "'POLYGON ((0 0, 1 0, 1 1, 0 0))'), 3857), 8)"
