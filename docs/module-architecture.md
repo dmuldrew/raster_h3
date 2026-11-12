@@ -12,7 +12,7 @@ under the root `src/`.
 ---
 
 ### [`raster-h3-duckdb/src/lib.rs`](../crates/raster-h3-duckdb/src/lib.rs) — Crate Root & Extension Entry Points
-Re-exports `raster_h3_core::*` and declares the `ffi` and `functions` modules. Implements the DuckDB loadable extension entry points (`raster_h3_init`, `raster_h3_init_c_api`, `raster_h3_version`) and coordinates registration of all table and scalar functions. The root crate's [`src/lib.rs`](../src/lib.rs) re-exports this crate (and the other workspace members) and builds the `libraster_h3` shared library.
+Re-exports `raster_h3_core::*` and declares the `ffi` and `functions` modules. Implements the DuckDB loadable extension entry points (`raster_h3_init`, `raster_h3_init_c_api`, `raster_h3_version`) and coordinates registration of all table and scalar functions. The root crate's [`src/lib.rs`](../src/lib.rs) re-exports this crate, `raster-h3-core` and `raster-h3-cli` and builds the `libraster_h3` shared library; the DataFusion, Python and PostgreSQL re-exports are behind its opt-in `datafusion`, `python` and `pg` features (`full` enables all three), so the shared library exports only the DuckDB entry points.
 
 ### [`raster-h3-core/src/lib.rs`](../crates/raster-h3-core/src/lib.rs) — Engine Crate Root
 Declares the engine modules below and re-exports `h3o` (`CellIndex`, `LatLng`, `Resolution`).

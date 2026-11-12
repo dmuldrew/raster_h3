@@ -1213,14 +1213,11 @@ dependencies = [
 name = "raster_h3"
 version = "0.7.0"
 dependencies = [
- "crossbeam-deque",
  "flate2",
  "h3o",
  "libc",
  "libdeflater",
- "memmap2",
  "parquet",
- "proj4rs",
  "raster-h3-cli",
  "raster-h3-core",
  "raster-h3-datafusion",
@@ -1228,15 +1225,10 @@ dependencies = [
  "raster-h3-pg",
  "raster-h3-python",
  "rayon",
- "rustc-hash",
- "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tiff",
  "ureq",
- "url",
- "weezl 0.2.1",
 ]
 
 [[package]]

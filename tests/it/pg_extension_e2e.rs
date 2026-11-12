@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use raster_h3::core::scalar_ops;
-use raster_h3::pg::{PgCategoricalRow, PgCategoricalSrf, PgContinuousRow, PgContinuousSrf};
+use raster_h3_pg::{PgCategoricalRow, PgCategoricalSrf, PgContinuousRow, PgContinuousSrf};
 
 const CELL: u64 = 0x8828308281fffff;
 const CRS: &str = "EPSG:4326";
