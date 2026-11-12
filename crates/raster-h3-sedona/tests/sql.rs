@@ -9,7 +9,7 @@ use datafusion::arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
 use datafusion::catalog::TableProvider;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::prelude::{col, lit, SessionContext};
-use raster_h3_datafusion::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
+use raster_h3_sedona::scan::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
 use raster_h3_sedona::{register_all, RasterH3Table, GEOARROW_WKB_EXTENSION};
 
 use common::{collect, gradient_tif, rows, source, write_tif};

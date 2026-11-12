@@ -16,7 +16,7 @@ use datafusion::logical_expr::{
     create_udf, ColumnarValue, Expr, TableProviderFilterPushDown, Volatility,
 };
 use datafusion::prelude::{col, lit, SessionContext};
-use raster_h3_datafusion::ContinuousRasterTableProvider;
+use raster_h3_sedona::scan::ContinuousRasterTableProvider;
 use raster_h3_sedona::{RasterH3Table, GEOARROW_WKB_EXTENSION, GEOARROW_WKB_METADATA};
 use sedona_extension::extension::SedonaCTableProvider;
 use sedona_extension::runtime::RuntimeHandle;

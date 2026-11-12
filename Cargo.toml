@@ -5,7 +5,6 @@ members = [
     "crates/raster-h3-core",
     "crates/raster-h3-cli",
     "crates/raster-h3-duckdb",
-    "crates/raster-h3-datafusion",
     "crates/raster-h3-python",
     "crates/raster-h3-pg",
 ]
@@ -87,10 +86,9 @@ default = []
 # Facade re-exports of the non-DuckDB adapters. Off by default so the root cdylib
 # (packaged as `raster_h3.duckdb_extension`) does not link those crates and only
 # exports the DuckDB entry points.
-datafusion = ["dep:raster-h3-datafusion"]
 python = ["dep:raster-h3-python"]
 pg = ["dep:raster-h3-pg"]
-full = ["datafusion", "python", "pg"]
+full = ["python", "pg"]
 duckdb-api-v1_5_6 = ["raster-h3-duckdb/duckdb-api-v1_5_6"]
 stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-profile"]
 
@@ -98,7 +96,6 @@ stream-profile = ["raster-h3-core/stream-profile", "raster-h3-duckdb/stream-prof
 raster-h3-core = { version = "0.7.0", path = "crates/raster-h3-core" }
 raster-h3-cli = { version = "0.7.0", path = "crates/raster-h3-cli" }
 raster-h3-duckdb = { version = "0.7.0", path = "crates/raster-h3-duckdb" }
-raster-h3-datafusion = { version = "0.7.0", path = "crates/raster-h3-datafusion", optional = true }
 raster-h3-python = { version = "0.7.0", path = "crates/raster-h3-python", optional = true }
 raster-h3-pg = { version = "0.7.0", path = "crates/raster-h3-pg", optional = true }
 
@@ -116,7 +113,6 @@ ureq.workspace = true
 
 [dev-dependencies]
 # Used directly by `tests/it` (never linked into the cdylib).
-raster-h3-datafusion = { version = "0.7.0", path = "crates/raster-h3-datafusion" }
 raster-h3-pg = { version = "0.7.0", path = "crates/raster-h3-pg" }
 # Used only by `examples/`.
 libdeflater.workspace = true

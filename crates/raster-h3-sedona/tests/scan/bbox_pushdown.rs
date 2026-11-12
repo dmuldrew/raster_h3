@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use h3o::CellIndex;
-use raster_h3_datafusion::{
+use raster_h3_sedona::scan::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
     FilterPushdownStatus, TableProvider,
 };

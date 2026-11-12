@@ -6,7 +6,7 @@ use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::columnar::{
     CategoricalBatchReader, CategoricalFormat, ColumnArray, ContinuousBatchReader, RecordBatch,
 };
-use raster_h3_datafusion::ExecutionPlan;
+use raster_h3_sedona::scan::ExecutionPlan;
 
 /// One output row rendered as text, so whole tables compare with `assert_eq!`.
 /// Floats keep 12 significant digits: shard merge order may differ between runs.

@@ -5,10 +5,10 @@
 //! inclusive bound down as `Inexact` (a superset) and DataFusion re-applies the predicate.
 //! Spatial predicates on a cell's geometry push a `Bbox` (see the `spatial` module).
 
+use crate::scan::FilterPredicate;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
-use raster_h3_datafusion::FilterPredicate;
 
 use crate::spatial::{translate_spatial, Untagged};
 use crate::table::TableKind;

@@ -3,6 +3,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::scan::default_scalar_udfs;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::Result;
@@ -11,7 +12,6 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use raster_h3_core::columnar::ArrowDataType;
-use raster_h3_datafusion::default_scalar_udfs;
 
 use crate::convert::{from_column_array, geometry_field, to_arrow_type, to_column_array};
 
@@ -33,13 +33,13 @@ pub fn scalar_udfs() -> Vec<ScalarUDF> {
 /// hex strings, `Int64` resolutions), so SQL integer and string literals work directly.
 /// Functions returning WKB return a `geoarrow.wkb` field.
 pub struct RasterH3ScalarUdf {
-    inner: Arc<dyn raster_h3_datafusion::ScalarUDFImpl>,
+    inner: Arc<dyn crate::scan::ScalarUDFImpl>,
     aliases: Vec<String>,
     signature: Signature,
 }
 
 impl RasterH3ScalarUdf {
-    pub fn new(inner: Arc<dyn raster_h3_datafusion::ScalarUDFImpl>) -> Self {
+    pub fn new(inner: Arc<dyn crate::scan::ScalarUDFImpl>) -> Self {
         let aliases = inner.aliases().iter().map(|a| a.to_string()).collect();
         Self {
             inner,

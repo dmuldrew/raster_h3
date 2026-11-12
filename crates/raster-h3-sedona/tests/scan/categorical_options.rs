@@ -7,7 +7,7 @@ use std::sync::Arc;
 use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::aggregator::remap::CategoryRemapper;
 use raster_h3_core::columnar::CategoricalFormat;
-use raster_h3_datafusion::{
+use raster_h3_sedona::scan::{
     CategoricalRasterTableProvider, FilterPredicate, FilterPushdownStatus, TableProvider,
 };
 use tempfile::NamedTempFile;

@@ -8,26 +8,26 @@
 //! - Vectorized [`ScalarUDFImpl`] implementations for all H3 scalar functions
 //! - [`RasterH3SessionCatalog`] for registering and invoking table functions and scalar UDFs
 
-pub mod scalar_udf;
-pub mod table_provider;
+pub mod provider;
+pub mod scalar;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub use provider::{
+    CategoricalRasterExec, CategoricalRasterTableProvider, ContinuousRasterExec,
+    ContinuousRasterTableProvider, ExecutionPlan, FilterPredicate, FilterPushdownStatus,
+    PartitionedRasterExec, TableProvider, TableStatistics,
+};
 pub use raster_h3_core::aggregator::multi_horizon::ScanPartition;
 pub use raster_h3_core::columnar::{
     merge_partial_batches, ArrowArray, ArrowArrayStream, ArrowDataType, ArrowSchema,
     CategoricalFormat, ColumnArray, ColumnField, ColumnSchema, RecordBatch, PARTIAL_STATE_COLUMN,
 };
 use raster_h3_core::error::{RasterH3Error, Result};
-pub use scalar_udf::{
+pub use scalar::{
     H3CellToParentUdf, H3GetResolutionUdf, H3IsValidUdf, H3ToLatUdf, H3ToLngUdf, H3ToStringUdf,
     H3ToWkbUdf, ScalarUDFImpl, StringToH3Udf,
-};
-pub use table_provider::{
-    CategoricalRasterExec, CategoricalRasterTableProvider, ContinuousRasterExec,
-    ContinuousRasterTableProvider, ExecutionPlan, FilterPredicate, FilterPushdownStatus,
-    PartitionedRasterExec, TableProvider, TableStatistics,
 };
 
 /// Return all standard `raster_h3` vectorized scalar UDFs.

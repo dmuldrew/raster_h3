@@ -1,7 +1,7 @@
 //! `TableProvider::statistics()` cardinality estimates for both providers.
 
 use raster_h3_core::scalar_ops::estimate_raster_cardinality;
-use raster_h3_datafusion::{
+use raster_h3_sedona::scan::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, TableProvider,
 };
 

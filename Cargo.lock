@@ -1161,17 +1161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raster-h3-datafusion"
-version = "0.7.0"
-dependencies = [
- "h3o",
- "raster-h3-core",
- "serde_json",
- "tempfile",
- "tiff",
-]
-
-[[package]]
 name = "raster-h3-duckdb"
 version = "0.7.0"
 dependencies = [
@@ -1202,7 +1191,6 @@ dependencies = [
  "h3o",
  "libc",
  "raster-h3-core",
- "raster-h3-datafusion",
  "serde",
  "serde_json",
  "tempfile",
@@ -1220,7 +1208,6 @@ dependencies = [
  "parquet",
  "raster-h3-cli",
  "raster-h3-core",
- "raster-h3-datafusion",
  "raster-h3-duckdb",
  "raster-h3-pg",
  "raster-h3-python",

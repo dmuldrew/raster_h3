@@ -32,6 +32,7 @@ mod filters;
 pub mod merge;
 pub mod pmtiles;
 mod polyfill;
+pub mod scan;
 mod spatial;
 pub mod table;
 pub mod udf;

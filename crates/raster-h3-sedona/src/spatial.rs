@@ -2,7 +2,7 @@
 //!
 //! A predicate between a cell's geometry and a constant lon/lat geometry `g` is translated
 //! into the envelope of `g` (for `ST_DWithin(..., d)`, the envelope grown by `d` degrees)
-//! and pushed down as a [`FilterPredicate::Bbox`](raster_h3_datafusion::FilterPredicate).
+//! and pushed down as a [`FilterPredicate::Bbox`](crate::scan::FilterPredicate).
 //! `raster-h3-datafusion` widens that box past the largest cell before clipping samples, so
 //! cells on the box edge keep their full aggregates. The pushdown is `Inexact`: DataFusion
 //! re-applies the predicate to drop the extra cells.

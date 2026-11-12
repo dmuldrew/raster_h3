@@ -469,7 +469,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run tests
-        run: cargo test --locked --release --no-fail-fast -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg
+        run: cargo test --locked --release --no-fail-fast -p raster-h3-cli -p raster-h3-python -p raster-h3-pg
 
       - name: Run pg-extension tests
         run: cargo test --locked --release --no-fail-fast -p raster-h3-pg --features pg-extension

@@ -3,6 +3,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::scan::{
+    CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
+    FilterPushdownStatus,
+};
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use async_trait::async_trait;
@@ -17,10 +21,6 @@ use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::ExecutionPlan;
 use raster_h3_core::columnar::ArrowArrayStream;
-use raster_h3_datafusion::{
-    CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
-    FilterPushdownStatus,
-};
 
 use crate::convert::{to_arrow_schema, to_df_error};
 use crate::filters::translate;
@@ -43,7 +43,7 @@ pub enum TableKind {
 /// Aggregation runs on DataFusion's blocking thread pool and streams batches back through
 /// the Arrow C Stream Interface without copying.
 pub struct RasterH3Table {
-    inner: Arc<dyn raster_h3_datafusion::TableProvider>,
+    inner: Arc<dyn crate::scan::TableProvider>,
     kind: TableKind,
     schema: arrow::datatypes::SchemaRef,
     untagged: Untagged,
@@ -60,7 +60,7 @@ impl RasterH3Table {
         Self::new(Arc::new(provider), TableKind::Categorical)
     }
 
-    fn new(inner: Arc<dyn raster_h3_datafusion::TableProvider>, kind: TableKind) -> Self {
+    fn new(inner: Arc<dyn crate::scan::TableProvider>, kind: TableKind) -> Self {
         let core_schema = inner.schema();
         let schema = to_arrow_schema(&core_schema);
         Self {
@@ -201,7 +201,7 @@ impl TableProvider for RasterH3Table {
 
 /// One aggregation run, streamed as a single DataFusion partition.
 struct RasterH3Partition {
-    plan: Arc<dyn raster_h3_datafusion::ExecutionPlan>,
+    plan: Arc<dyn crate::scan::ExecutionPlan>,
     schema: arrow::datatypes::SchemaRef,
 }
 

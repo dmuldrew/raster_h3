@@ -5,7 +5,7 @@ use std::str::FromStr;
 use h3o::{CellIndex, LatLng, Resolution};
 use raster_h3_core::columnar::{ArrowDataType, ColumnArray};
 use raster_h3_core::scalar_ops;
-use raster_h3_datafusion::{RasterH3SessionCatalog, ScalarUDFImpl, StringToH3Udf};
+use raster_h3_sedona::scan::{RasterH3SessionCatalog, ScalarUDFImpl, StringToH3Udf};
 
 /// Cells spread over the globe, including a pentagon and cells near the poles and antimeridian.
 fn sample_cells() -> Vec<u64> {

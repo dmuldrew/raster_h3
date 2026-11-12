@@ -1,7 +1,7 @@
 //! Residual predicates must see completed compacted rows, with LIMIT applied last.
 
 use raster_h3_core::columnar::CategoricalFormat;
-use raster_h3_datafusion::{
+use raster_h3_sedona::scan::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
     FilterPushdownStatus, TableProvider,
 };

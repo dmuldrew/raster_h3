@@ -20,7 +20,8 @@ name = "raster_h3_sedona"
 
 [dependencies]
 raster-h3-core = { version = "0.7.0", path = "../raster-h3-core" }
-raster-h3-datafusion = { version = "0.7.0", path = "../raster-h3-datafusion" }
+# Cell geometry for bbox pushdown in `scan::provider`; same version as raster-h3-core.
+h3o = "0.11.1"
 # Must match the DataFusion / arrow versions pinned by apache/sedona-db.
 datafusion = { version = "=54.1.0", default-features = false, features = ["sql"] }
 arrow = { version = "58.3.0", default-features = false, features = ["ffi"] }
@@ -42,7 +43,6 @@ sedona-e2e = ["dep:sedona"]
 [dev-dependencies]
 # Reads the gzipped JSON metadata of PMTiles archives in the `pmtiles` tests.
 flate2 = "1"
-h3o = "0.11"
 # SedonaDB's extension ABI, for the `extension_abi` round-trip tests (same revision as `sedona`).
 sedona-extension = { git = "https://github.com/apache/sedona-db", rev = "55da508d9f5297bc06fae0ff5662e99608d7e8b1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
