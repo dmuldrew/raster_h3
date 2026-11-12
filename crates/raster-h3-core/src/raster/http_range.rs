@@ -1560,8 +1560,7 @@ mod tests {
 
     impl RemoteTransport for OverlayTestTransport {
         fn fetch_range(&self, start: u64, end: u64, _: Option<u64>) -> Result<Vec<u8>> {
-            self.fetches
-                .fetch_add(1, Ordering::SeqCst);
+            self.fetches.fetch_add(1, Ordering::SeqCst);
             Ok(self.data[start as usize..=end as usize].to_vec())
         }
 
