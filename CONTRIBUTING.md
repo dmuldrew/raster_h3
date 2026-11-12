@@ -91,7 +91,13 @@ crates/raster-h3-core/src/
 │   └── simd.rs              # SIMD-vectorized span accumulation for Welford statistics
 ├── crs/                     # Geodetic reprojection layer
 │   ├── mod.rs
-│   └── transformer.rs       # 3-tier CRS reprojection (Identity → Analytical → PROJ4)
+│   └── transformer/         # 3-tier CRS reprojection (Identity → Analytical → PROJ4)
+│       ├── mod.rs           # CrsTransformer, EPSG/PROJ-string resolution, point transforms
+│       ├── albers.rs        # Closed-form Albers Equal Area Conic fast path
+│       ├── bounds.rs        # WGS84 bounds of pixel rectangles and their certification
+│       ├── proj_tokens.rs   # PROJ-string tokenizing and fast-path parameter checks
+│       ├── tm.rs            # Certified transverse Mercator bounds
+│       └── tests.rs         # Unit tests
 ├── encoding/                # Shared zero-allocation encoding & geometry serialization
 │   ├── fast_hex.rs          # Zero-allocation SIMD/LUT hex formatter & parser
 │   ├── wkb.rs               # Stack-allocated OGC WKB 2D Polygon hexagon geometry serialization

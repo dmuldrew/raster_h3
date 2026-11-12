@@ -14,11 +14,14 @@ fn versioned_source(mode: &str) -> (MockHttpServer, Arc<RemoteHttpSource>) {
     (server, source)
 }
 
+/// The `If-Match` request header lines, with the header name normalised to
+/// `If-Match` (header names are case-insensitive; the client may send any case).
 fn conditional_requests(server: &MockHttpServer) -> Vec<String> {
     server
         .recorded_headers()
         .into_iter()
         .filter(|h| h.to_ascii_lowercase().starts_with("if-match:"))
+        .map(|h| format!("If-Match:{}", &h["if-match:".len()..]))
         .collect()
 }
 

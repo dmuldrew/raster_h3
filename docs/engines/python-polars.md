@@ -401,7 +401,7 @@ gdf = gpd.GeoDataFrame(
 ## Native C ABI
 
 The wrapper calls these exports from `libraster_h3_python`
-([`src/lib.rs`](../../crates/raster-h3-python/src/lib.rs)). All entry points catch panics and
+([`src/ffi/`](../../crates/raster-h3-python/src/ffi/mod.rs)). All entry points catch panics and
 return errors through an out-parameter string freed with `raster_h3_py_free_string`.
 
 | Export | Purpose |

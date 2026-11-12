@@ -319,9 +319,18 @@ impl MockHttpServer {
             let _ = stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             return;
         }
-        let version_header = etag
+        let mut version_header = etag
             .map(|tag| format!("ETag: {tag}\r\n"))
             .unwrap_or_default();
+        // `padded_head_<N>` adds an N-byte header value to every response head.
+        if let Some(n) = path
+            .split("padded_head_")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            version_header.push_str(&format!("X-Padding: {}\r\n", "p".repeat(n)));
+        }
         let replacement;
         let file_bytes = if replaced {
             replacement = file_bytes
