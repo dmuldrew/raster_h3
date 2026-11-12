@@ -217,12 +217,107 @@ impl Ntv2Grid {
         })
     }
 
+    /// Bilinearly interpolate a horizontal shift at longitude and latitude in degrees.
+    ///
+    /// The input is on the grid's source datum. Longitudes use the conventional
+    /// positive-east sign; NTv2 grid longitudes are positive west. All four grid
+    /// boundaries are inclusive. Points outside the grid are rejected.
+    pub fn interpolate(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
+        if !lon.is_finite() || !lat.is_finite() {
+            return Err(invalid("non-finite coordinate"));
+        }
+        if self.rows < 2
+            || self.columns < 2
+            || !self.latitude_step.is_finite()
+            || self.latitude_step <= 0.0
+            || !self.longitude_step.is_finite()
+            || self.longitude_step <= 0.0
+        {
+            return Err(invalid("invalid grid dimensions or spacing"));
+        }
+        let west = -lon * 3600.0;
+        let north = lat * 3600.0;
+        if west < self.east || west > self.west || north < self.south || north > self.north {
+            return Err(invalid("coordinate outside grid coverage"));
+        }
+        let row_position = (north - self.south) / self.latitude_step;
+        let col_position = (west - self.east) / self.longitude_step;
+        let row = (row_position.floor() as usize).min(self.rows - 2);
+        let col = (col_position.floor() as usize).min(self.columns - 2);
+        let dy = (row_position - row as f64).clamp(0.0, 1.0);
+        let dx = (col_position - col as f64).clamp(0.0, 1.0);
+        let a = self
+            .node(row, col)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let b = self
+            .node(row, col + 1)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let c = self
+            .node(row + 1, col)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let d = self
+            .node(row + 1, col + 1)
+            .ok_or_else(|| invalid("invalid grid dimensions"))?;
+        let interpolate = |a: f32, b: f32, c: f32, d: f32| {
+            let low = f64::from(a) * (1.0 - dx) + f64::from(b) * dx;
+            let high = f64::from(c) * (1.0 - dx) + f64::from(d) * dx;
+            low * (1.0 - dy) + high * dy
+        };
+        Ok((
+            interpolate(
+                a.longitude_seconds_west,
+                b.longitude_seconds_west,
+                c.longitude_seconds_west,
+                d.longitude_seconds_west,
+            ),
+            interpolate(
+                a.latitude_seconds,
+                b.latitude_seconds,
+                c.latitude_seconds,
+                d.latitude_seconds,
+            ),
+        ))
+    }
+
+    /// Apply the source-to-target grid shift to longitude and latitude in degrees.
+    pub fn forward(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
+        let (west_shift, lat_shift) = self.interpolate(lon, lat)?;
+        Ok((lon - west_shift / 3600.0, lat + lat_shift / 3600.0))
+    }
+
+    /// Invert a shift with a bounded fixed-point iteration.
+    ///
+    /// The target and each trial coordinate must lie within the source grid's
+    /// coverage. This conservative restriction can reject valid inverse points
+    /// near the grid boundary. Convergence uses a 1e-11 degree residual.
+    pub fn inverse(&self, lon: f64, lat: f64) -> Result<(f64, f64)> {
+        const TOLERANCE: f64 = 1e-11;
+        const MAX_ITERATIONS: usize = 20;
+        let (mut x, mut y) = (lon, lat);
+        for _ in 0..MAX_ITERATIONS {
+            let (west_shift, lat_shift) = self.interpolate(x, y)?;
+            let next_x = lon + west_shift / 3600.0;
+            let next_y = lat - lat_shift / 3600.0;
+            if (next_x - x).abs().max((next_y - y).abs()) <= TOLERANCE {
+                let (out_x, out_y) = self.forward(next_x, next_y)?;
+                if (out_x - lon).abs().max((out_y - lat).abs()) <= TOLERANCE {
+                    return Ok((next_x, next_y));
+                }
+            }
+            (x, y) = (next_x, next_y);
+        }
+        Err(invalid("inverse grid shift did not converge"))
+    }
+
     /// Return the shift at a row and column, in the file's native order.
     pub fn node(&self, row: usize, column: usize) -> Option<Ntv2Shift> {
         if row >= self.rows || column >= self.columns {
             return None;
         }
-        self.nodes.get(row * self.columns + column).copied()
+        row.checked_mul(self.columns)
+            .and_then(|offset| offset.checked_add(column))
+            .and_then(|index| self.nodes.get(index))
+            .copied()
     }
 }
 
@@ -320,6 +415,55 @@ mod tests {
             assert_eq!(grid.node(1, 1).unwrap().longitude_seconds_west, -3.0);
             assert!(grid.node(0, 2).is_none());
             assert!(grid.node(2, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn interpolates_nodes_edges_and_interior_with_ntv2_longitude_sign() {
+        for big in [false, true] {
+            let grid = Ntv2Grid::read(&fixture(big)[..], 4).unwrap();
+            // Native layout: southwest is row 0, column 1; southeast is column 0.
+            assert_eq!(grid.interpolate(0.0, 0.0).unwrap(), (0.0, 0.5));
+            assert_eq!(grid.interpolate(-1.0, 0.0).unwrap(), (-1.0, 1.5));
+            assert_eq!(grid.interpolate(0.0, 1.0).unwrap(), (-2.0, 2.5));
+            assert_eq!(grid.interpolate(-1.0, 1.0).unwrap(), (-3.0, 3.5));
+            assert_eq!(grid.interpolate(-0.5, 0.5).unwrap(), (-1.5, 2.0));
+            let (lon, lat) = grid.forward(-0.5, 0.5).unwrap();
+            assert!((lon - (-0.5 + 1.5 / 3600.0)).abs() < 1e-12);
+            assert!((lat - (0.5 + 2.0 / 3600.0)).abs() < 1e-12);
+            let (back_lon, back_lat) = grid.inverse(lon, lat).unwrap();
+            assert!((back_lon + 0.5).abs() < 1e-11);
+            assert!((back_lat - 0.5).abs() < 1e-11);
+        }
+    }
+
+    #[test]
+    fn inverse_reports_nonconvergent_grid() {
+        let mut data = fixture(false);
+        for i in 0..4 {
+            let offset = HEADER * 2 + RECORD * i;
+            let shift = if i < 2 { -1800.0_f32 } else { 1800.0_f32 };
+            data[offset..offset + 4].copy_from_slice(&shift.to_le_bytes());
+            data[offset + 4..offset + 8].copy_from_slice(&0.0_f32.to_le_bytes());
+        }
+        let grid = Ntv2Grid::read(&data[..], 4).unwrap();
+        let error = grid.inverse(-0.5, 0.6).unwrap_err().to_string();
+        assert!(error.contains("did not converge"), "{error}");
+    }
+
+    #[test]
+    fn rejects_outside_and_nonfinite_coordinates() {
+        let grid = Ntv2Grid::read(&fixture(false)[..], 4).unwrap();
+        for (lon, lat) in [
+            (0.0001, 0.5),
+            (-1.0001, 0.5),
+            (-0.5, -0.0001),
+            (-0.5, 1.0001),
+            (f64::NAN, 0.5),
+            (-0.5, f64::INFINITY),
+        ] {
+            assert!(grid.forward(lon, lat).is_err());
+            assert!(grid.inverse(lon, lat).is_err());
         }
     }
 
