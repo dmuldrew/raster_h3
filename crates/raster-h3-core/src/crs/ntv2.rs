@@ -217,7 +217,7 @@ impl Ntv2Grid {
         })
     }
 
-    /// Interpolate a horizontal shift at longitude and latitude in degrees.
+    /// Bilinearly interpolate a horizontal shift at longitude and latitude in degrees.
     ///
     /// The input is on the grid's source datum. Longitudes use the conventional
     /// positive-east sign; NTv2 grid longitudes are positive west. All four grid
