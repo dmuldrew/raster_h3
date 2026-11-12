@@ -2,7 +2,7 @@
 // C-ABI & PyCapsule Entry Points for Python (`ctypes` / `PyCapsule_New`)
 // =============================================================================
 
-mod args;
+pub(crate) mod args;
 mod arrow;
 mod batch_reader;
 mod capsules;
@@ -22,13 +22,12 @@ pub use scalars::*;
 pub use v2::*;
 
 use std::ffi::{c_char, CStr, CString};
-use std::ptr;
 
 use raster_h3_core::error::{safe_panic_payload_to_string, Result};
 
 /// # Safety
 /// `ptr` must be null or a valid NUL-terminated C string.
-pub(crate) unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
+unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
     // SAFETY: `ptr` is non-null and NUL-terminated (caller contract); the bytes are copied
     // into an owned `String` before returning.
     unsafe {
@@ -46,7 +45,7 @@ pub(crate) unsafe fn opt_cstr(ptr: *const c_char) -> Option<String> {
 
 /// # Safety
 /// `out_err` must be null or a writable `char **`.
-pub(crate) unsafe fn set_c_err(out_err: *mut *mut c_char, msg: &str) {
+unsafe fn set_c_err(out_err: *mut *mut c_char, msg: &str) {
     // SAFETY: non-null `out_err` is a writable `char **` (caller contract). Ownership of
     // the `CString::into_raw` string passes to the caller, who frees it with
     // `raster_h3_py_free_string`.
@@ -62,7 +61,7 @@ pub(crate) unsafe fn set_c_err(out_err: *mut *mut c_char, msg: &str) {
 ///
 /// # Safety
 /// `out_err` must be null or a writable `char **`.
-pub(crate) unsafe fn ffi_call<T>(
+unsafe fn ffi_call<T>(
     what: &str,
     out_err: *mut *mut c_char,
     f: impl FnOnce() -> Result<T>,

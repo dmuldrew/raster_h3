@@ -1,7 +1,6 @@
 //! Parsing of C-ABI arguments and the `options` JSON object into a [`PyScanConfig`].
 
 use std::ffi::{c_char, c_int, CStr};
-use std::ptr;
 
 use raster_h3_core::aggregator::multi_horizon::{QuantileTarget, ScanPartition, SpectralFormula};
 use raster_h3_core::aggregator::{CategoryRemapper, SamplingPattern};
