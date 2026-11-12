@@ -90,15 +90,27 @@ impl SpillAccumulator for AreaAccumulator {
         input.read_exact(&mut bytes)?;
         let pixel_count = f64::from_le_bytes(bytes);
         if !pixel_count.is_finite() || pixel_count < 0.0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid pixel count"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid pixel count",
+            ));
         }
         let area_stats = H3Accumulator::read_state(input, limit)?;
         if (pixel_count == 0.0) != (area_stats.count == 0.0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "inconsistent area state"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inconsistent area state",
+            ));
         }
-        let acc = Self { pixel_count, area_stats };
+        let acc = Self {
+            pixel_count,
+            area_stats,
+        };
         if acc.memory_bytes() > limit {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "area state exceeds budget"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "area state exceeds budget",
+            ));
         }
         Ok(acc)
     }
@@ -130,7 +142,8 @@ mod tests {
         assert!((a.area_stats().count - expected_area).abs() < 1e-5);
         assert!((a.area_stats().mean() - expected_mean).abs() < 1e-12);
         assert!(a.area_stats().variance() > 0.0);
-        let back: AreaAccumulator = decode_partial_state(&encode_partial_state(&a), 1 << 20).unwrap();
+        let back: AreaAccumulator =
+            decode_partial_state(&encode_partial_state(&a), 1 << 20).unwrap();
         assert_eq!(back, a);
     }
 
@@ -140,8 +153,11 @@ mod tests {
         acc.update_pixel(2.0, 0.5, 4.0).unwrap();
         let before = acc.clone();
         for (value, fraction, area) in [
-            (f64::NAN, 1.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.1, 1.0),
-            (1.0, f64::NAN, 1.0), (1.0, 1.0, f64::INFINITY),
+            (f64::NAN, 1.0, 1.0),
+            (1.0, 0.0, 1.0),
+            (1.0, 1.1, 1.0),
+            (1.0, f64::NAN, 1.0),
+            (1.0, 1.0, f64::INFINITY),
             (1.0, 1.0, f64::MAX),
         ] {
             assert!(acc.update_pixel(value, fraction, area).is_err());
