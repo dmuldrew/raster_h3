@@ -684,7 +684,7 @@ README's [Troubleshooting](../../README.md#troubleshooting--common-pitfalls) sec
 
 | Test | Scope |
 | :--- | :--- |
-| `crates/raster-h3-duckdb/tests/it/ffi_sql.rs` | Mock C-API harness emulating the v1.2.0 function table; compiled only for the default build |
+| `crates/raster-h3-duckdb/tests/it/ffi_sql/` | Mock C-API harness emulating the v1.2.0 function table; compiled only for the default build |
 | `tests/it/duckdb_sql_smoke.rs` | SQL through a real DuckDB CLI when available; `real_sql_v156_features` covers the DuckDB 2.0 build (session options, DuckDB file-system reads, `COPY ... (FORMAT pmtiles)` including spilling and overwrite, plan-time validation, native `GEOMETRY`) and runs when `DUCKDB_VERSION=v1.5.6` |
 | `tests/it/package_extension.rs` | Extension footer packaging |
 | `tests/it/multi_engine_e2e.rs` | DuckDB results compared with the other engines when `duckdb` is on `PATH` |

@@ -187,7 +187,7 @@ crates/raster-h3-core/tests/it/      # Core engine suites (no DuckDB/DataFusion/
 
 crates/raster-h3-duckdb/tests/it/    # DuckDB binding suites
 ├── cell_bbox_pushdown.rs    # cell_wgs84_bbox pushdown soundness
-├── ffi_sql.rs               # Mock C-API callbacks for every registered function
+├── ffi_sql/                 # Mock C-API callbacks for every registered function
 ├── prefetch_resilience.rs   # Prefetch queues under panics and remote mosaics
 ├── record_queue.rs          # Bind-side record queue propagates stream failures
 └── spatial_geometry.rs      # WKB geometry emission and hex formatting
