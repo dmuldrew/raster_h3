@@ -60,7 +60,7 @@ pub struct CellKeys {
 /// How cell keys and chunk bounds are measured for one stream.
 #[derive(Debug, Clone)]
 pub enum EvictionSpace {
-    /// Keys are latitudes ([`compute_cell_south_lat`], [`eviction_north_bound`]).
+    /// Keys are latitudes ([`compute_cell_south_lat_for`], [`eviction_north_bound`]).
     Latitude,
     /// Keys are negated rows of a reference grid in a shared Albers projection.
     Rows(Box<RowSpace>),
