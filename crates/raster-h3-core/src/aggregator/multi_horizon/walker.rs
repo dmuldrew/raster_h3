@@ -644,6 +644,11 @@ fn flush_run<T, Acc, E: ScanlineEngine<T, Acc>>(
     let Some(cell) = cell.filter(|_| engine.has_samples(acc)) else {
         return;
     };
+    if cell == 0 {
+        // 0 is no cell in any grid: it marks a sample the backend could not index.
+        engine.clear_acc(acc);
+        return;
+    }
     match map.entry(cell) {
         Entry::Occupied(mut entry) => {
             engine.merge_acc(entry.get_mut(), acc);

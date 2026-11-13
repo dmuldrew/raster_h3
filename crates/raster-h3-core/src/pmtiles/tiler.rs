@@ -636,7 +636,7 @@ impl H3PmtilesTiler {
                     let (resolution, h3_index, accumulator) = K::parts(record);
                     let summary = kind.summarize(&accumulator);
 
-                    let (c_lat, c_lon) = grid.cell_to_lat_lng(h3_index)?;
+                    let (c_lat, c_lon) = grid.center_lat_lng(h3_index)?;
                     let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
                     let (v_merc, v_count) = cell_boundary_mercator_for(grid, h3_index)?;
                     let vertices_merc = &v_merc[..v_count];

@@ -1,6 +1,6 @@
 //! Well-Known Binary (WKB) geometry serialization for H3 cells.
 
-use crate::grid::GridKind;
+use crate::grid::{a5_pole_cells, GridKind};
 use h3o::CellIndex;
 use std::sync::OnceLock;
 
@@ -15,17 +15,6 @@ fn pole_cells(res: h3o::Resolution) -> [CellIndex; 2] {
             [north.to_cell(res), south.to_cell(res)]
         })
     })[u8::from(res) as usize]
-}
-
-/// The north and south pole resolution-0 cells in A5 (higher resolutions meet at the pole as a vertex).
-pub(crate) fn a5_pole_cells() -> [u64; 2] {
-    static A5_POLES: OnceLock<[u64; 2]> = OnceLock::new();
-    *A5_POLES.get_or_init(|| {
-        [
-            a5::lonlat_to_cell(a5::LonLat::new(0.0, 90.0), 0).expect("north pole a5"),
-            a5::lonlat_to_cell(a5::LonLat::new(0.0, -90.0), 0).expect("south pole a5"),
-        ]
-    })
 }
 
 /// Most boundary vertices of any H3 cell (class III pentagons).

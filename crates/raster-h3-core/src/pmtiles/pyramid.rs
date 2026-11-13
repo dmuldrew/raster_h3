@@ -322,7 +322,7 @@ impl Wgs84BoundsAccumulator {
                 }
             }
             GridKind::A5 => {
-                let Some((c_lat, c_lng)) = grid.cell_to_lat_lng(cell_u64) else {
+                let Some((c_lat, c_lng)) = grid.center_lat_lng(cell_u64) else {
                     return;
                 };
                 let mut verts = [(0.0, 0.0); 10];
@@ -331,7 +331,7 @@ impl Wgs84BoundsAccumulator {
                     return;
                 }
                 self.count += 1;
-                let [north_pole, south_pole] = crate::encoding::wkb::a5_pole_cells();
+                let [north_pole, south_pole] = crate::grid::a5_pole_cells();
                 let is_north_pole = cell_u64 == north_pole;
                 let is_south_pole = cell_u64 == south_pole;
                 if is_north_pole {
@@ -545,9 +545,10 @@ pub fn max_cell_radius_deg(grid: GridKind, res: u8) -> f64 {
     match grid {
         GridKind::H3 => max_hex_radius_deg(res),
         GridKind::A5 => match res {
+            // Measured extents are 37.5, 21.5 and 11.5 degrees, then halve per level.
             0 => 42.0,
-            1 => 22.0,
-            r => 22.0 * 0.5_f64.powi(i32::from(r - 1)),
+            1 => 23.0,
+            r => 12.5 * 0.5_f64.powi(i32::from(r - 2)),
         },
     }
 }

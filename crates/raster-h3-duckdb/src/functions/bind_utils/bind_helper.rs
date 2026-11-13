@@ -35,10 +35,7 @@ pub fn cell_wgs84_bbox_for(grid: GridKind, cell_u64: u64) -> Option<[f64; 4]> {
             )
         }
         GridKind::A5 => {
-            let north =
-                crate::a5::lonlat_to_cell(crate::a5::LonLat::new(0.0, 90.0), 0).unwrap_or(0);
-            let south =
-                crate::a5::lonlat_to_cell(crate::a5::LonLat::new(0.0, -90.0), 0).unwrap_or(0);
+            let [north, south] = crate::grid::a5_pole_cells();
             (cell_u64 == north, cell_u64 == south)
         }
     };
@@ -57,7 +54,8 @@ pub fn cell_wgs84_bbox_for(grid: GridKind, cell_u64: u64) -> Option<[f64; 4]> {
             let (p_lng, p_lat) = verts[i];
             let (q_lng, q_lat) = verts[(i + 1) % n];
             let mut edge_north = p_lat.max(q_lat).next_up();
-            if p_lat >= 0.0 || q_lat >= 0.0 {
+            // A5 edges are not great-circle arcs: pad them in both hemispheres.
+            if grid == GridKind::A5 || p_lat >= 0.0 || q_lat >= 0.0 {
                 let direct = (p_lng - q_lng).abs();
                 let delta_lon = direct.min(360.0 - direct);
                 let delta_lat = (p_lat - q_lat).abs();
