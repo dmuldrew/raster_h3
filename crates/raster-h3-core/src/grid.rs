@@ -196,24 +196,6 @@ impl GridKind {
         }
     }
 
-    /// Alias for [`Self::center_lat_lng`].
-    #[inline]
-    pub fn cell_to_lat_lng(self, cell: u64) -> Option<(f64, f64)> {
-        self.center_lat_lng(cell)
-    }
-
-    /// Alias for [`Self::resolution`].
-    #[inline]
-    pub fn cell_resolution(self, cell: u64) -> Option<u8> {
-        self.resolution(cell)
-    }
-
-    /// Alias for [`Self::parent`].
-    #[inline]
-    pub fn cell_to_parent(self, cell: u64, parent_res: u8) -> Option<u64> {
-        self.parent(cell, parent_res)
-    }
-
     /// Write the unclosed counter-clockwise boundary vertices `(lng, lat)` in degrees
     /// (`lng` in `[-180, 180]`) into `out` and return the vertex count (`<= 10`).
     #[inline]
@@ -243,9 +225,26 @@ impl GridKind {
                 ) else {
                     return 0;
                 };
-                let count = verts.len().min(10);
-                for (i, v) in verts.iter().take(count).enumerate() {
-                    out[i] = (wrap_lon_180(v.longitude()), v.latitude());
+                // Leave room for one pole vertex to become two.
+                let m = verts.len().min(9);
+                let mut count = 0;
+                let mut pole_expanded = false;
+                for i in 0..m {
+                    let lat = verts[i].latitude();
+                    if !pole_expanded && lat.abs() >= 90.0 - 1e-9 {
+                        // A pole has no longitude (A5 reports an arbitrary one). Run the
+                        // ring along the pole between the neighbouring vertices' meridians
+                        // so the lon/lat ring covers the cell.
+                        let prev = wrap_lon_180(verts[(i + m - 1) % m].longitude());
+                        let next = wrap_lon_180(verts[(i + 1) % m].longitude());
+                        out[count] = (prev, lat);
+                        out[count + 1] = (next, lat);
+                        count += 2;
+                        pole_expanded = true;
+                    } else {
+                        out[count] = (wrap_lon_180(verts[i].longitude()), lat);
+                        count += 1;
+                    }
                 }
                 count
             }
@@ -296,13 +295,7 @@ impl GridKind {
                 });
                 cells[u8::from(idx.resolution()) as usize] == idx
             }
-            Self::A5 => {
-                static A5_SOUTH_POLE_RES0: OnceLock<u64> = OnceLock::new();
-                let res0 = *A5_SOUTH_POLE_RES0.get_or_init(|| {
-                    a5::lonlat_to_cell(a5::LonLat::new(0.0, -90.0), 0).unwrap_or(0)
-                });
-                cell == res0
-            }
+            Self::A5 => cell == a5_pole_cells()[1],
         }
     }
 }
@@ -319,6 +312,18 @@ impl FromStr for GridKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s).ok_or_else(|| format!("Invalid grid system '{s}': expected 'h3' or 'a5'"))
     }
+}
+
+/// The resolution-0 A5 cells containing the north and south poles, in that order
+/// (finer cells meet at a pole as a vertex).
+pub fn a5_pole_cells() -> [u64; 2] {
+    static A5_POLES: OnceLock<[u64; 2]> = OnceLock::new();
+    *A5_POLES.get_or_init(|| {
+        [
+            a5::lonlat_to_cell(a5::LonLat::new(0.0, 90.0), 0).expect("north pole a5"),
+            a5::lonlat_to_cell(a5::LonLat::new(0.0, -90.0), 0).expect("south pole a5"),
+        ]
+    })
 }
 
 /// Normalize a finite longitude (in degrees) into `[-180.0, 180.0]`.
@@ -338,9 +343,25 @@ pub fn wrap_lon_180(lon: f64) -> f64 {
 /// Check whether `cell` is a valid, canonical A5 cell index at resolution `0..=30`.
 #[inline]
 pub fn a5_is_valid_cell(cell: u64) -> bool {
+    thread_local! {
+        /// The last cell this thread found valid (0 is never valid). Callers ask for a
+        /// cell's centre, boundary and resolution in turn, each of which validates it.
+        static LAST_VALID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
     if cell == 0 {
         return false;
     }
+    if LAST_VALID.get() == cell {
+        return true;
+    }
+    let valid = a5_decodes_canonically(cell);
+    if valid {
+        LAST_VALID.set(cell);
+    }
+    valid
+}
+
+fn a5_decodes_canonically(cell: u64) -> bool {
     let Ok(parsed) = a5::core::serialization::deserialize(cell) else {
         return false;
     };
@@ -482,5 +503,57 @@ mod tests {
         let mut boundary = [(0.0, 0.0); 10];
         let n = GridKind::A5.boundary_lng_lat(cell, &mut boundary);
         assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn a5_south_lat_bound_covers_curved_edges() {
+        use crate::aggregator::horizon_streamer::compute_cell_south_lat_for;
+        for res in 2u8..=5 {
+            let mut lat = -88.0;
+            while lat < 89.0 {
+                let mut lon = -179.0;
+                while lon < 180.0 {
+                    let cell = GridKind::A5.cell_at(lat, lon, res).unwrap();
+                    let dense = a5::cell_to_boundary(
+                        cell,
+                        Some(a5::CellToBoundaryOptions {
+                            closed_ring: false,
+                            segments: Some(32),
+                        }),
+                    )
+                    .unwrap();
+                    let true_south = dense
+                        .iter()
+                        .map(|p| p.latitude())
+                        .fold(f64::INFINITY, f64::min);
+                    let bound = compute_cell_south_lat_for(GridKind::A5, cell);
+                    assert!(bound <= true_south, "res {res} cell {cell:x}");
+                    lon += 9.7;
+                }
+                lat += 4.3;
+            }
+        }
+    }
+
+    #[test]
+    fn a5_pole_vertex_is_spread_along_neighbour_meridians() {
+        let mut buf = [0u8; crate::encoding::WKB_BUF_LEN];
+        for lat in [89.999, -89.999] {
+            for res in [1u8, 2, 5] {
+                let cell = GridKind::A5.cell_at(lat, 100.0, res).unwrap();
+                let mut verts = [(0.0, 0.0); 10];
+                let n = GridKind::A5.boundary_lng_lat(cell, &mut verts);
+                let verts = &verts[..n];
+                assert_eq!(verts.iter().filter(|v| v.1.abs() == 90.0).count(), 2);
+                let (w, e) = verts
+                    .iter()
+                    .fold((f64::MAX, f64::MIN), |(w, e), v| (w.min(v.0), e.max(v.0)));
+                assert!(w <= 100.0 && 100.0 <= e && e - w < 180.0, "{verts:?}");
+                // One plain polygon, not an antimeridian split.
+                let len = crate::encoding::a5_index_to_wkb(cell, &mut buf).unwrap();
+                assert_eq!(buf[1..5], 3u32.to_le_bytes());
+                assert_eq!(len, 9 + 4 + 16 * (n + 1));
+            }
+        }
     }
 }

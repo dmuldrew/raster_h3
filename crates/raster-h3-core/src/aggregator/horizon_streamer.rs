@@ -62,7 +62,9 @@ pub fn compute_cell_south_lat_for(grid: GridKind, cell_u64: u64) -> f64 {
             return -90.0;
         }
         let mut edge_south = p_lat.min(q_lat).next_down();
-        if p_lat <= 0.0 || q_lat <= 0.0 {
+        // A5 edges are not great-circle arcs, so they can dip below both endpoints in
+        // either hemisphere; pad every A5 edge.
+        if grid == GridKind::A5 || p_lat <= 0.0 || q_lat <= 0.0 {
             // Longitude differences are bounded above by both the direct and wrapped routes.
             let direct_lo = (p_lng - q_lng).abs();
             let direct_hi = direct_lo.next_up();

@@ -62,7 +62,7 @@ pub fn scan_row_group_grid_extent(
     let mut min_res = 255u8;
 
     let mut process_h3 = |h3: u64| {
-        if let Some(res) = grid.cell_resolution(h3) {
+        if let Some(res) = grid.resolution(h3) {
             bounds.record_cell_for(grid, h3);
             if res < min_res {
                 min_res = res;
@@ -367,7 +367,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
                 }
             };
 
-            let Some((c_lat, c_lon)) = grid.cell_to_lat_lng(h3_u64) else {
+            let Some((c_lat, c_lon)) = grid.center_lat_lng(h3_u64) else {
                 invalid_dropped += 1;
                 continue;
             };
@@ -375,7 +375,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
                 invalid_dropped += 1;
                 continue;
             };
-            let Some(res_u8) = grid.cell_resolution(h3_u64) else {
+            let Some(res_u8) = grid.resolution(h3_u64) else {
                 invalid_dropped += 1;
                 continue;
             };

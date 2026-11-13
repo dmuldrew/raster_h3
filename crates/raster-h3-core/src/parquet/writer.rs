@@ -171,7 +171,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             let hex_slice = fast_hex_u64(cell_u64, &mut hex_buf);
             self.h3_hexes.push(ByteArray::from(hex_slice));
 
-            if let Some((lat, lng)) = self.grid.cell_to_lat_lng(cell_u64) {
+            if let Some((lat, lng)) = self.grid.center_lat_lng(cell_u64) {
                 self.lats.push(lat);
                 self.lngs.push(lng);
             } else {
@@ -475,7 +475,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             let hex_slice = fast_hex_u64(cell_u64, &mut hex_buf);
             self.h3_hexes.push(ByteArray::from(hex_slice));
 
-            if let Some((lat, lng)) = self.grid.cell_to_lat_lng(cell_u64) {
+            if let Some((lat, lng)) = self.grid.center_lat_lng(cell_u64) {
                 self.lats.push(lat);
                 self.lngs.push(lng);
             } else {

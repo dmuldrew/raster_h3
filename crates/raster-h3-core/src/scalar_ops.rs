@@ -103,10 +103,7 @@ pub fn estimate_raster_cardinality_for(
 
             let mut total_hex_est = 0u64;
             for &res in resolutions {
-                let cell_area = match grid {
-                    GridKind::H3 => H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5),
-                    GridKind::A5 => a5::cell_area(i32::from(res)).max(1e-6),
-                };
+                let cell_area = grid.area_m2(res);
                 let hex_count = (area_m2 / cell_area).ceil() as u64;
                 total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
             }
@@ -343,7 +340,11 @@ pub fn a5_lonlat_to_cell(lon: f64, lat: f64, res: i64) -> Option<u64> {
     if !lon.is_finite() || !(-90.0..=90.0).contains(&lat) || !(0..=30).contains(&res) {
         return None;
     }
-    a5::lonlat_to_cell(a5::LonLat::new(lon.clamp(-180.0, 180.0), lat), res as i32).ok()
+    a5::lonlat_to_cell(
+        a5::LonLat::new(crate::grid::wrap_lon_180(lon), lat),
+        res as i32,
+    )
+    .ok()
 }
 
 /// Extract the centroid latitude (in degrees, WGS84) of an A5 cell index.
@@ -351,7 +352,7 @@ pub fn a5_lonlat_to_cell(lon: f64, lat: f64, res: i64) -> Option<u64> {
 #[inline]
 pub fn a5_to_lat(cell: u64) -> f64 {
     GridKind::A5
-        .cell_to_lat_lng(cell)
+        .center_lat_lng(cell)
         .map_or(f64::NAN, |(lat, _)| lat)
 }
 
@@ -360,14 +361,14 @@ pub fn a5_to_lat(cell: u64) -> f64 {
 #[inline]
 pub fn a5_to_lng(cell: u64) -> f64 {
     GridKind::A5
-        .cell_to_lat_lng(cell)
+        .center_lat_lng(cell)
         .map_or(f64::NAN, |(_, lng)| lng)
 }
 
 /// Extract the A5 resolution (`0..=30`) of a 64-bit A5 cell index, or `-1` if invalid.
 #[inline]
 pub fn a5_get_resolution(cell: u64) -> i64 {
-    GridKind::A5.cell_resolution(cell).map_or(-1, i64::from)
+    GridKind::A5.resolution(cell).map_or(-1, i64::from)
 }
 
 /// Return `true` if `cell` is a valid 64-bit A5 cell index.
@@ -403,7 +404,7 @@ pub fn a5_cell_to_parent_u64(cell: u64, parent_res: i64) -> Option<u64> {
     if !(0..=30).contains(&parent_res) {
         return None;
     }
-    GridKind::A5.cell_to_parent(cell, parent_res as u8)
+    GridKind::A5.parent(cell, parent_res as u8)
 }
 
 /// Compute the parent A5 cell hex string at `parent_res` (`0..=30`) for a hexadecimal A5 cell string.
@@ -439,6 +440,20 @@ pub fn a5_polygon_to_cells_wkb_into(
     out: &mut Vec<u64>,
 ) -> Result<(), PolygonToCellsError> {
     out.clear();
+    let result = a5_fill_polygons(wkb, res, mode, out);
+    if result.is_err() {
+        // Earlier polygons of a multipolygon may already be in `out`.
+        out.clear();
+    }
+    result
+}
+
+fn a5_fill_polygons(
+    wkb: &[u8],
+    res: i64,
+    mode: ContainmentMode,
+    out: &mut Vec<u64>,
+) -> Result<(), PolygonToCellsError> {
     if !(0..=30).contains(&res) {
         return Err(PolygonToCellsError::InvalidResolution(res));
     }
@@ -878,6 +893,16 @@ mod tests {
         let wkb = a5_to_wkb_u64(cell).unwrap();
         assert_eq!(wkb.len(), 109);
         assert_eq!(a5_to_wkb_str(&hex).unwrap(), wkb);
+
+        // Longitudes outside [-180, 180] wrap rather than clamp.
+        assert_eq!(
+            a5_lonlat_to_cell(190.0, 10.0, 8),
+            a5_lonlat_to_cell(-170.0, 10.0, 8)
+        );
+        assert_ne!(
+            a5_lonlat_to_cell(190.0, 10.0, 8),
+            a5_lonlat_to_cell(180.0, 10.0, 8)
+        );
 
         let parent = a5_cell_to_parent_u64(cell, 5).unwrap();
         assert_eq!(a5_get_resolution(parent), 5);
