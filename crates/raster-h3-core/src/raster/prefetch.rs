@@ -1519,7 +1519,9 @@ mod tests {
                 panic!("intentional test panic in decode worker");
             }));
 
-            if let Err(payload) = res {
+            // `.err()` rather than `if let Err(..)`: the closure always panics, and newer
+            // compilers infer its return type as `!`, which makes `Err(..)` irrefutable.
+            if let Some(payload) = res.err() {
                 let msg = crate::error::panic_payload_to_string(payload);
                 q.fail(Err(format!("Decode worker panicked: {msg}")));
             }
