@@ -15,7 +15,7 @@
 //! siblings can never form a complete group, so no parent duplicates them.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
-use h3o::CellIndex;
+use crate::grid::{GridKind, MAX_GRID_RESOLUTIONS};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -23,10 +23,10 @@ use super::controller::HorizonStreamKernel;
 use super::lifecycle::OutputBuffer;
 use super::sharded_map::AccumulatorMerge;
 use super::spill::table_bytes;
-use crate::aggregator::horizon_streamer::compute_cell_south_lat;
+use crate::aggregator::horizon_streamer::compute_cell_south_lat_for;
 
-/// H3 resolutions 0..=15.
-const RESOLUTIONS: usize = 16;
+/// Maximum resolutions across supported grids (`0..=30`).
+const RESOLUTIONS: usize = MAX_GRID_RESOLUTIONS;
 
 /// Children of one logical parent awaiting completion.
 struct Group<A> {
@@ -81,8 +81,9 @@ impl Ord for HeapEntry {
     }
 }
 
-/// Generic hierarchical H3 7-to-1 compaction aggregator.
+/// Generic hierarchical child-to-parent compaction aggregator.
 pub struct HierarchicalCompactor<K: HorizonStreamKernel> {
+    grid: GridKind,
     enabled: bool,
     pending: HashMap<u64, Group<K::Accumulator>, H3BuildHasher>,
     /// Per child resolution, groups by `siblings_south`, northernmost first.
@@ -105,7 +106,13 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
     /// Initialize a compactor that decomposes groups early once its estimated
     /// pending state exceeds `byte_limit`.
     pub fn with_byte_limit(enabled: bool, byte_limit: usize) -> Self {
+        Self::with_grid_and_byte_limit(GridKind::H3, enabled, byte_limit)
+    }
+
+    /// Initialize a compactor for `grid` with an optional `byte_limit`.
+    pub fn with_grid_and_byte_limit(grid: GridKind, enabled: bool, byte_limit: usize) -> Self {
         Self {
+            grid,
             enabled,
             pending: HashMap::with_hasher(H3BuildHasher),
             completion: (0..RESOLUTIONS).map(|_| BinaryHeap::new()).collect(),
@@ -179,21 +186,27 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
         if !kernel.passes_filter(&acc) {
             return;
         }
-        let cell = CellIndex::try_from(cell_u64).ok().filter(|_| self.enabled);
-        let Some((cell, parent)) =
-            cell.and_then(|cell| Some((cell, cell.parent(cell.resolution().pred()?)?)))
-        else {
-            kernel.buffer_record(res_u8, cell_u64, acc, output);
+        let grid = self.grid;
+        let parent_info = self
+            .enabled
+            .then(|| grid.immediate_parent(cell_u64))
+            .flatten()
+            .filter(|&(parent_res, _)| parent_res + 1 == res_u8);
+        let Some((parent_res, parent_u64)) = parent_info else {
+            let actual_res = grid.resolution(cell_u64).unwrap_or(res_u8);
+            kernel.buffer_record(actual_res, cell_u64, acc, output);
             return;
         };
 
-        let parent_u64 = u64::from(parent);
+        let siblings = grid.expected_immediate_children(parent_u64, parent_res);
         let group = match self.pending.entry(parent_u64) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let siblings_south = parent
-                    .children(cell.resolution())
-                    .map(|child| compute_cell_south_lat(child.into()))
+                let mut child_ids = Vec::with_capacity(siblings);
+                grid.children_into(parent_u64, res_u8, &mut child_ids);
+                let siblings_south = child_ids
+                    .into_iter()
+                    .map(|child| compute_cell_south_lat_for(grid, child))
                     .fold(f64::INFINITY, f64::min);
                 self.completion[usize::from(res_u8) % RESOLUTIONS].push(HeapEntry {
                     lat: siblings_south,
@@ -201,16 +214,16 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
                 });
                 entry.insert(Group {
                     parent_acc: kernel.new_parent_accumulator(),
-                    children: Vec::with_capacity(7),
+                    children: Vec::with_capacity(siblings),
                     child_res: res_u8,
                     siblings_south,
-                    emit_south: compute_cell_south_lat(parent_u64),
+                    emit_south: compute_cell_south_lat_for(grid, parent_u64),
                     bytes: 0,
                 })
             }
         };
         group.parent_acc.merge(&acc);
-        let cell_south = compute_cell_south_lat(cell_u64);
+        let cell_south = compute_cell_south_lat_for(grid, cell_u64);
         if cell_south > group.emit_south {
             group.emit_south = cell_south;
         }
@@ -220,11 +233,8 @@ impl<K: HorizonStreamKernel> HierarchicalCompactor<K> {
             parent: parent_u64,
         });
 
-        // A pentagon has six children at the next resolution.
-        let siblings = if parent.is_pentagon() { 6 } else { 7 };
         if group.children.len() == siblings {
             let group = self.remove(parent_u64).unwrap();
-            let parent_res = u8::from(parent.resolution());
             kernel.buffer_record(parent_res, parent_u64, group.parent_acc, output);
         } else {
             let bytes = group.owned_bytes();
@@ -424,8 +434,9 @@ fn decompose<K: HorizonStreamKernel>(
 mod tests {
     use super::*;
     use crate::aggregator::accumulator::H3Accumulator;
+    use crate::aggregator::horizon_streamer::compute_cell_south_lat;
     use crate::aggregator::multi_horizon::continuous_streamer::ContinuousKernel;
-    use h3o::{LatLng, Resolution};
+    use h3o::{CellIndex, LatLng, Resolution};
 
     fn kernel() -> ContinuousKernel {
         ContinuousKernel {
@@ -570,5 +581,28 @@ mod tests {
                 assert!(!seen.contains(&parent), "child and parent both emitted");
             }
         }
+    }
+
+    #[test]
+    fn a5_four_child_compaction_emits_parent() {
+        let k = kernel();
+        let mut compactor = HierarchicalCompactor::<ContinuousKernel>::with_grid_and_byte_limit(
+            GridKind::A5,
+            true,
+            usize::MAX,
+        );
+        let mut output = OutputBuffer::with_capacity(16);
+        let parent = GridKind::A5.cell_at(37.7749, -122.4194, 9).unwrap();
+        let mut children = Vec::new();
+        GridKind::A5.children_into(parent, 10, &mut children);
+        assert_eq!(children.len(), 4);
+
+        for &child in &children[..3] {
+            compactor.push_cell(&k, 10, child, H3Accumulator::new(2.0), &mut output);
+            assert!(output.is_empty());
+        }
+        compactor.push_cell(&k, 10, children[3], H3Accumulator::new(2.0), &mut output);
+        let records = drain(&mut output);
+        assert_eq!(records, vec![(9, parent, 4.0)]);
     }
 }

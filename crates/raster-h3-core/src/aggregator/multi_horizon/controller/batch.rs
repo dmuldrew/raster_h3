@@ -3,8 +3,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use h3o::CellIndex;
-
 use super::super::eviction_space::CellKeys;
 use super::super::partition::PartialCell;
 use super::super::sharded_map::AccumulatorMerge;
@@ -38,10 +36,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             }
         }
         if self.compactor.is_enabled() && self.finishing {
-            let parent = CellIndex::try_from(key)
-                .ok()
-                .and_then(|cell| cell.resolution().pred().and_then(|r| cell.parent(r)))
-                .map(u64::from);
+            let parent = self.grid.immediate_parent(key).map(|(_, p)| p);
             if parent != self.compaction_parent {
                 if let Some(previous) = self.compaction_parent {
                     self.compactor
@@ -98,7 +93,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let set_budget = self.worker_budget / map_sets.max(1);
         let Self {
             kernel,
+            grid,
             resolutions,
+            resolution_u8s,
             sampling,
             bbox,
             apply_scale_offset,
@@ -117,10 +114,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             finished_sets,
             ..
         } = self;
-        let (kernel, mosaic, resolutions, sampling, eviction_space) = (
+        let (kernel, mosaic, grid, resolutions, resolution_u8s, sampling, eviction_space) = (
             &*kernel,
             mosaic,
+            *grid,
             &*resolutions,
+            &*resolution_u8s,
             &*sampling,
             &*eviction_space,
         );
@@ -136,7 +135,9 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             let start = std::time::Instant::now();
             let window = WalkContext {
                 chunk,
+                grid,
                 resolutions,
+                resolution_u8s,
                 crs: &tile.crs_transformer,
                 gt: &tile.reader.metadata.geotransform,
                 sampling,
@@ -163,7 +164,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         let compute_keys = |cells: &[(usize, u64)]| -> Vec<CellKeys> {
             cells
                 .iter()
-                .map(|&(_, cell)| eviction_space.cell_keys(cell))
+                .map(|&(_, cell)| eviction_space.cell_keys_for(grid, cell))
                 .collect()
         };
         let compactor_bytes = compactor.estimated_bytes();
@@ -260,7 +261,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             Err(panic) => {
                 free.iter_mut().flatten().for_each(HashMap::clear);
                 free.resize_with(map_sets, || {
-                    (0..resolutions.len())
+                    (0..resolution_u8s.len())
                         .map(|_| HashMap::with_hasher(H3BuildHasher))
                         .collect()
                 });

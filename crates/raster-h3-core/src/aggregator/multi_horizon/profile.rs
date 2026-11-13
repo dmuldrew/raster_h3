@@ -112,6 +112,41 @@ pub fn index_all(
     });
 }
 #[inline(always)]
+pub fn index_a5(spherical: a5::coordinate_systems::Spherical, res: u8) -> Option<u64> {
+    #[cfg(feature = "stream-profile")]
+    let start = std::time::Instant::now();
+    let result = a5::core::cell::spherical_to_cell(spherical, i32::from(res)).ok();
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.h3_calls += 1;
+        p.h3_ns += start.elapsed().as_nanos() as u64;
+        v.set(p);
+    });
+    result
+}
+/// Index one spherical point across every requested A5 resolution, sharing the
+/// authalic projection computed once per sample.
+#[inline(always)]
+pub fn index_all_a5(
+    spherical: a5::coordinate_systems::Spherical,
+    resolutions: &[u8],
+    cells: &mut [u64],
+) {
+    #[cfg(feature = "stream-profile")]
+    let start = std::time::Instant::now();
+    for (cell, &res) in cells.iter_mut().zip(resolutions.iter()) {
+        *cell = a5::core::cell::spherical_to_cell(spherical, i32::from(res)).unwrap_or(0);
+    }
+    #[cfg(feature = "stream-profile")]
+    PROFILE.with(|v| {
+        let mut p = v.get();
+        p.h3_calls += resolutions.len() as u64;
+        p.h3_ns += start.elapsed().as_nanos() as u64;
+        v.set(p);
+    });
+}
+#[inline(always)]
 pub fn transform(
     crs: &crate::crs::transformer::CrsTransformer,
     x: f64,

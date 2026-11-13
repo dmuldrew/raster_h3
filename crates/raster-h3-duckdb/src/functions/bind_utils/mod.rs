@@ -12,16 +12,16 @@ pub mod record_queue;
 pub mod registration;
 
 pub use bind_helper::{
-    cell_wgs84_bbox, BindHelper, CommonRasterBindParams, CommonRasterParams, ExecutionParams,
-    OwnedValue,
+    cell_wgs84_bbox, cell_wgs84_bbox_for, BindHelper, CommonRasterBindParams, CommonRasterParams,
+    ExecutionParams, OwnedValue,
 };
 pub use chunk_writer::ChunkWriter;
 pub use lifecycle::{
-    delete_boxed, estimate_raster_cardinality, extract_projected_columns,
-    init_table_function_local, open_mosaic_or_set_error, set_table_function_init_data,
-    TableFunctionLocalData, H3_AREA_M2,
+    delete_boxed, estimate_raster_cardinality, estimate_raster_cardinality_for,
+    extract_projected_columns, init_table_function_local, open_mosaic_or_set_error,
+    set_table_function_init_data, TableFunctionLocalData, H3_AREA_M2,
 };
-pub use parsing::{parse_bbox_str, parse_resolutions_str};
+pub use parsing::{parse_bbox_str, parse_resolutions_str, parse_resolutions_str_for};
 pub use record_queue::ConcurrentRecordQueue;
 pub use registration::{
     add_named_parameter, add_positional_parameter, register_common_raster_named_parameters,

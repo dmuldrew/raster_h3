@@ -17,6 +17,7 @@ use super::pipeline::{shared_aggregation_pool, worker_map_fixed_bytes};
 use super::{HorizonStreamKernel, MultiHorizonStreamer, PartitionOutput};
 use crate::aggregator::cell_hash::H3BuildHasher;
 use crate::error::{RasterH3Error, Result};
+use crate::grid::GridKind;
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::prefetch::PrefetchedMosaicReader;
@@ -75,7 +76,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             Some(spec) => {
                 let restricted = Arc::new(restrict_mosaic(&mosaic, spec)?);
                 let output = PartitionOutput {
-                    classifier: BoundaryClassifier::new(&mosaic, spec),
+                    classifier: BoundaryClassifier::with_grid(&mosaic, spec, config.grid),
                     partials: OutputBuffer::with_capacity(16),
                 };
                 (restricted, Some(output))
@@ -83,13 +84,19 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             None => (mosaic, None),
         };
 
-        let mut resolutions = Vec::with_capacity(config.resolutions.len());
+        let mut resolutions = Vec::with_capacity(if config.grid == GridKind::H3 {
+            config.resolutions.len()
+        } else {
+            0
+        });
         let mut resolution_u8s = Vec::with_capacity(config.resolutions.len());
         for &res_u8 in &config.resolutions {
-            let res = Resolution::try_from(res_u8).map_err(|_| {
-                RasterH3Error::InvalidParameter(format!("Invalid H3 resolution: {}", res_u8))
-            })?;
-            resolutions.push(res);
+            if config.grid == GridKind::H3 {
+                let res = Resolution::try_from(res_u8).map_err(|_| {
+                    RasterH3Error::InvalidParameter(format!("Invalid H3 resolution: {}", res_u8))
+                })?;
+                resolutions.push(res);
+            }
             resolution_u8s.push(res_u8);
         }
 
@@ -100,11 +107,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             config.fetch_workers,
             config.decode_budget_bytes,
         );
-        let num_res = resolutions.len();
+        let num_res = resolution_u8s.len();
         let mut resolution_shards: Vec<_> =
             (0..num_res).map(|_| ShardedResolutionMap::new()).collect();
         // Past an opt-in limit, pending sibling groups are decomposed before completion.
-        let compactor = HierarchicalCompactor::with_byte_limit(
+        let compactor = HierarchicalCompactor::with_grid_and_byte_limit(
+            config.grid,
             should_compact,
             config.compaction_budget_bytes.unwrap_or(usize::MAX),
         );
@@ -131,7 +139,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         }
         // Cells are evicted by `eviction_space`; latitude bounds still guard
         // compaction and the horizon published to tilers.
-        let eviction_space = EvictionSpace::for_mosaic(&mosaic);
+        let eviction_space = EvictionSpace::for_mosaic_with_grid(&mosaic, config.grid);
         let suffix_eviction_bound = eviction_space.is_rows().then(|| {
             let mut suffix = vec![f64::NEG_INFINITY; n_chunks + 1];
             for k in (0..n_chunks).rev() {
@@ -205,6 +213,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             kernel,
             prefetcher: Some(prefetcher),
             mosaic,
+            grid: config.grid,
             resolutions,
             resolution_u8s,
             nodata: config.custom_nodata,

@@ -3,7 +3,6 @@
 //! Orchestrates the streaming aggregation of GeoTIFF rasters across multiple H3 resolutions
 //! and packages the resulting vector hexagons directly into a single PMTiles v3 archive.
 
-use h3o::{CellIndex, LatLng};
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use serde_json::json;
@@ -29,9 +28,11 @@ use crate::raster::geotiff::GeoTiffStreamReader;
 
 // Re-export tile pyramid coordinate math and zoom calculations from pyramid module
 pub use crate::pmtiles::pyramid::{
-    cell_boundary_mercator, cell_tile_range, cell_tile_range_mercator, for_each_cell_tile_mercator,
-    h3_res_for_zoom, h3_res_to_zoom, lon_lat_to_tile_xy, max_hex_radius_deg, mercator_to_tile_xy,
-    tile_xy_to_bbox, zoom_to_h3_res, zooms_for_h3_res, Wgs84BoundsAccumulator,
+    cell_boundary_mercator, cell_boundary_mercator_for, cell_tile_range, cell_tile_range_mercator,
+    for_each_cell_tile_mercator, grid_res_for_zoom, grid_res_to_zoom, h3_res_for_zoom,
+    h3_res_to_zoom, lon_lat_to_tile_xy, max_cell_radius_deg, max_hex_radius_deg,
+    mercator_to_tile_xy, tile_xy_to_bbox, zoom_to_h3_res, zooms_for_grid_res, zooms_for_h3_res,
+    Wgs84BoundsAccumulator,
 };
 
 // Re-export feature definitions, metadata, accumulator, and export summaries from features module
@@ -47,9 +48,9 @@ struct PreparedTileOp {
     is_parent: bool,
 }
 
-/// Precomputed hexagon ready for thread-safe insertion into tile buckets
+/// Precomputed cell ready for thread-safe insertion into tile buckets
 struct PreparedHex<K: TileKind> {
-    cell: CellIndex,
+    cell_u64: u64,
     resolution: u8,
     summary: K::Summary,
     accumulator: K::Acc,
@@ -139,6 +140,7 @@ impl TileKind for ContinuousTiles {
     }
 
     fn describe(&self, stats: Self::Stats, filter: &PropertyFilter) -> ArchiveDescription {
+        let grid = filter.grid;
         let mut sorted_res: Vec<u8> = stats.keys().copied().collect();
         sorted_res.sort_unstable();
         let min_res_val = sorted_res.first().copied().unwrap_or(0);
@@ -146,18 +148,20 @@ impl TileKind for ContinuousTiles {
         let mut res_stats_json = serde_json::Map::new();
         for res in sorted_res {
             if let Some(st) = stats.get(&res) {
-                let zooms = zooms_for_h3_res(res, min_res_val);
+                let zooms = zooms_for_grid_res(grid, res, min_res_val);
                 res_stats_json.insert(res.to_string(), st.to_json(&zooms));
             }
         }
 
+        let index_col = grid.index_column_name();
+        let hex_col = grid.hex_column_name();
         let fields_json = if filter.is_custom {
             let mut m = serde_json::Map::new();
             if filter.has_continuous(PROP_H3_INDEX) {
-                m.insert("h3_index".to_string(), json!("Number"));
+                m.insert(index_col.to_string(), json!("Number"));
             }
             if filter.has_continuous(PROP_H3_HEX) {
-                m.insert("h3_hex".to_string(), json!("String"));
+                m.insert(hex_col.to_string(), json!("String"));
             }
             if filter.has_continuous(PROP_RESOLUTION) {
                 m.insert("resolution".to_string(), json!("Number"));
@@ -182,17 +186,17 @@ impl TileKind for ContinuousTiles {
             }
             serde_json::Value::Object(m)
         } else {
-            json!({
-                "h3_index": "Number",
-                "h3_hex": "String",
-                "resolution": "Number",
-                "mean": "Number",
-                "sum": "Number",
-                "stddev": "Number",
-                "count": "Number",
-                "min": "Number",
-                "max": "Number"
-            })
+            let mut m = serde_json::Map::new();
+            m.insert(index_col.to_string(), json!("Number"));
+            m.insert(hex_col.to_string(), json!("String"));
+            m.insert("resolution".to_string(), json!("Number"));
+            m.insert("mean".to_string(), json!("Number"));
+            m.insert("sum".to_string(), json!("Number"));
+            m.insert("stddev".to_string(), json!("Number"));
+            m.insert("count".to_string(), json!("Number"));
+            m.insert("min".to_string(), json!("Number"));
+            m.insert("max".to_string(), json!("Number"));
+            serde_json::Value::Object(m)
         };
 
         let mut extras = serde_json::Map::new();
@@ -287,13 +291,14 @@ impl TileKind for CategoricalTiles {
     }
 
     fn describe(&self, stats: Self::Stats, filter: &PropertyFilter) -> ArchiveDescription {
+        let grid = filter.grid;
         let mut sorted_res: Vec<u8> = stats.cell_counts.keys().copied().collect();
         sorted_res.sort_unstable();
         let min_res_val = sorted_res.first().copied().unwrap_or(0);
 
         let mut res_stats_json = serde_json::Map::new();
         for res in sorted_res {
-            let zooms = zooms_for_h3_res(res, min_res_val);
+            let zooms = zooms_for_grid_res(grid, res, min_res_val);
             let cell_count = stats.cell_counts.get(&res).copied().unwrap_or(0);
             let purity_sum = stats.purity_sums.get(&res).copied().unwrap_or(0.0);
             let entropy_sum = stats.entropy_sums.get(&res).copied().unwrap_or(0.0);
@@ -342,13 +347,15 @@ impl TileKind for CategoricalTiles {
             res_stats_json.insert(res.to_string(), stat_entry);
         }
 
+        let index_col = grid.index_column_name();
+        let hex_col = grid.hex_column_name();
         let fields_json = if filter.is_custom {
             let mut m = serde_json::Map::new();
             if filter.has_categorical(PROP_CAT_H3_INDEX) {
-                m.insert("h3_index".to_string(), json!("Number"));
+                m.insert(index_col.to_string(), json!("Number"));
             }
             if filter.has_categorical(PROP_CAT_H3_HEX) {
-                m.insert("h3_hex".to_string(), json!("String"));
+                m.insert(hex_col.to_string(), json!("String"));
             }
             if filter.has_categorical(PROP_CAT_RESOLUTION) {
                 m.insert("resolution".to_string(), json!("Number"));
@@ -370,16 +377,16 @@ impl TileKind for CategoricalTiles {
             }
             serde_json::Value::Object(m)
         } else {
-            json!({
-                "h3_index": "Number",
-                "h3_hex": "String",
-                "resolution": "Number",
-                "majority": "Number",
-                "majority_fraction": "Number",
-                "distinct_classes": "Number",
-                "entropy": "Number",
-                "count": "Number"
-            })
+            let mut m = serde_json::Map::new();
+            m.insert(index_col.to_string(), json!("Number"));
+            m.insert(hex_col.to_string(), json!("String"));
+            m.insert("resolution".to_string(), json!("Number"));
+            m.insert("majority".to_string(), json!("Number"));
+            m.insert("majority_fraction".to_string(), json!("Number"));
+            m.insert("distinct_classes".to_string(), json!("Number"));
+            m.insert("entropy".to_string(), json!("Number"));
+            m.insert("count".to_string(), json!("Number"));
+            serde_json::Value::Object(m)
         };
 
         let mut extras = serde_json::Map::new();
@@ -541,6 +548,8 @@ impl H3PmtilesTiler {
         K: TileKind,
     {
         reject_compaction(&streamer)?;
+        let grid = streamer.grid();
+        let property_filter = property_filter.with_grid(grid);
 
         let resolutions = streamer.resolution_u8s().to_vec();
         let min_res = resolutions.iter().copied().min().unwrap_or(0);
@@ -548,7 +557,7 @@ impl H3PmtilesTiler {
         let mut max_zoom = 0u8;
 
         for &res in &resolutions {
-            let zooms = zooms_for_h3_res(res, min_res);
+            let zooms = zooms_for_grid_res(grid, res, min_res);
             for &z in &zooms {
                 if z < min_zoom {
                     min_zoom = z;
@@ -563,7 +572,7 @@ impl H3PmtilesTiler {
         // rules out coarser parent records that would exceed this margin.
         let max_cell_radius = resolutions
             .iter()
-            .map(|&r| max_hex_radius_deg(r))
+            .map(|&r| max_cell_radius_deg(grid, r))
             .fold(0.0f64, f64::max);
         let safety_margin = 2.5 * max_cell_radius;
 
@@ -577,15 +586,15 @@ impl H3PmtilesTiler {
         // Cells whose per-zoom tile range exceeded the enumeration cap
         // (polar-cap cells at fine zooms); surfaced in the archive metadata.
         let capped_cells = AtomicUsize::new(0);
-        let min_res_zooms = zooms_for_h3_res(min_res, min_res);
+        let min_res_zooms = zooms_for_grid_res(grid, min_res, min_res);
         let mut coarse_res_list: Vec<u8> = min_res_zooms
             .iter()
-            .map(|&z| h3_res_for_zoom(z))
+            .map(|&z| grid_res_for_zoom(grid, z))
             .filter(|&r| r < min_res)
             .collect();
         coarse_res_list.sort_unstable();
         coarse_res_list.dedup();
-        let mut coarse_parents = Overview::<K::Acc>::new(&coarse_res_list);
+        let mut coarse_parents = Overview::<K::Acc>::new(grid, &coarse_res_list);
 
         let mut writer = PmtilesWriter::new(
             min_zoom,
@@ -627,23 +636,19 @@ impl H3PmtilesTiler {
                     let (resolution, h3_index, accumulator) = K::parts(record);
                     let summary = kind.summarize(&accumulator);
 
-                    let cell = CellIndex::try_from(h3_index).ok()?;
-                    let center: LatLng = cell.into();
-                    let c_lat = center.lat();
-                    let c_lon = center.lng();
-
+                    let (c_lat, c_lon) = grid.center_lat_lng(h3_index)?;
                     let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
-                    let (v_merc, v_count) = cell_boundary_mercator(cell);
+                    let (v_merc, v_count) = cell_boundary_mercator_for(grid, h3_index)?;
                     let vertices_merc = &v_merc[..v_count];
 
                     let properties = kind.properties(h3_index, resolution, &accumulator, &summary);
 
-                    let zooms = zooms_for_h3_res(resolution, min_res);
+                    let zooms = zooms_for_grid_res(grid, resolution, min_res);
                     let num_zooms = zooms.len();
                     let mut ops = Vec::with_capacity(num_zooms);
 
                     for &zoom in &zooms {
-                        let optimal_res = h3_res_for_zoom(zoom);
+                        let optimal_res = grid_res_for_zoom(grid, zoom);
                         if optimal_res < resolution {
                             // Coarse overview parents are aggregated across all
                             // contributing children using bounded spill buffers.
@@ -677,7 +682,7 @@ impl H3PmtilesTiler {
                     }
 
                     Some(PreparedHex {
-                        cell,
+                        cell_u64: h3_index,
                         resolution,
                         summary,
                         accumulator,
@@ -690,10 +695,10 @@ impl H3PmtilesTiler {
                 K::record(&mut stats, hex.resolution, &hex.accumulator, &hex.summary);
 
                 if hex.resolution == min_res {
-                    coarse_parents.push(hex.cell, &hex.accumulator)?;
+                    coarse_parents.push(hex.cell_u64, &hex.accumulator)?;
                 }
 
-                bounds_acc.record_cell(hex.cell);
+                bounds_acc.record_cell_for(grid, hex.cell_u64);
 
                 for op in hex.ops {
                     accumulator.add_op(op.tile_key, op.feature, op.is_parent);

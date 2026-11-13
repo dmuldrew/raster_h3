@@ -14,6 +14,7 @@ use crate::functions::partition_functions::{
     PARTIAL_STATE_COLUMN,
 };
 use crate::functions::raster_table::{self, add_geom_column, RasterTable, ScanContext};
+use crate::grid::GridKind;
 use crate::raster::mosaic::MosaicReader;
 
 /// User-data bound during table function query compilation
@@ -30,6 +31,7 @@ pub struct RasterH3BindData {
 
 /// Global scan state holding the streaming multi-core horizon aggregator and concurrent batch queue
 pub struct RasterH3GlobalData {
+    pub grid: GridKind,
     pub streamer: Mutex<MultiScanHorizonStreamer>,
     pub record_queue: ConcurrentRecordQueue<ScanRow<MultiContinuousRecord>>,
     pub projected_columns: Vec<usize>,
@@ -137,8 +139,8 @@ impl RasterTable for ContinuousTable {
             return None;
         }
 
-        bind.add_result_column("h3_index", DuckDBType::UBigInt);
-        bind.add_result_column("h3_hex", DuckDBType::Varchar);
+        bind.add_result_column(common.grid.index_column_name(), DuckDBType::UBigInt);
+        bind.add_result_column(common.grid.hex_column_name(), DuckDBType::Varchar);
         bind.add_result_column("mean", DuckDBType::Double);
         bind.add_result_column("stddev", DuckDBType::Double);
         bind.add_result_column("count", DuckDBType::Double);
@@ -201,6 +203,7 @@ impl RasterTable for ContinuousTable {
             .map_err(|e| format!("Failed to initialize multi-streamer: {}", e))?;
 
         Ok(RasterH3GlobalData {
+            grid: bind.common.grid,
             streamer: Mutex::new(streamer),
             record_queue: ConcurrentRecordQueue::new(),
             projected_columns,
@@ -325,7 +328,8 @@ impl RasterTable for ContinuousTable {
                 }
             }
 
-            writer.write_wkb_and_geom_columns(
+            writer.write_wkb_and_geom_columns_for(
+                global.grid,
                 out_idx_wkb,
                 out_idx_geom,
                 batch.iter().map(|r| &r.h3_index),
@@ -337,6 +341,53 @@ impl RasterTable for ContinuousTable {
 
             writer.set_size(batch_len);
         }
+    }
+}
+
+/// `a5_raster_continuous_aggregate`: per-cell statistics over an A5 pentagon grid.
+pub(crate) struct A5ContinuousTable;
+
+impl RasterTable for A5ContinuousTable {
+    type Bind = RasterH3BindData;
+    type Global = RasterH3GlobalData;
+
+    const NAMES: &'static [&'static str] = &[
+        "a5_raster_continuous_aggregate",
+        "a5_raster_continuous",
+        "read_raster_a5",
+        "raster_to_a5",
+        "raster_a5",
+    ];
+    const FUNCTION: &'static str = "a5_raster_continuous_aggregate";
+    const MISSING_BIND_DATA: &'static str = "Missing bind data in init";
+    const DEFAULT_GRID: GridKind = GridKind::A5;
+
+    unsafe fn register_named_parameters(tf: duckdb_table_function) {
+        // SAFETY: forwarded with the same contract.
+        unsafe { ContinuousTable::register_named_parameters(tf) }
+    }
+
+    unsafe fn bind(bind: &BindHelper, common: CommonRasterParams) -> Option<RasterH3BindData> {
+        // SAFETY: forwarded with the same contract.
+        unsafe { ContinuousTable::bind(bind, common) }
+    }
+
+    fn common(bind: &RasterH3BindData) -> &CommonRasterParams {
+        ContinuousTable::common(bind)
+    }
+
+    fn init(
+        bind: &RasterH3BindData,
+        mosaic: Arc<MosaicReader>,
+        projected_columns: Vec<usize>,
+        config: MultiResolutionConfig,
+    ) -> Result<RasterH3GlobalData, String> {
+        ContinuousTable::init(bind, mosaic, projected_columns, config)
+    }
+
+    unsafe fn scan(global: &RasterH3GlobalData, ctx: &mut ScanContext<'_>) {
+        // SAFETY: forwarded with the same contract.
+        unsafe { ContinuousTable::scan(global, ctx) }
     }
 }
 
@@ -383,5 +434,8 @@ pub unsafe extern "C" fn raster_h3_scan(info: duckdb_function_info, output: duck
 /// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), String> {
     // SAFETY: forwarded with the same contract.
-    unsafe { raster_table::register::<ContinuousTable>(con) }
+    unsafe {
+        raster_table::register::<ContinuousTable>(con)?;
+        raster_table::register::<A5ContinuousTable>(con)
+    }
 }

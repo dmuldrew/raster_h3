@@ -14,8 +14,9 @@ use crate::aggregator::multi_horizon::{
     MultiCategoricalRecord, MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer,
     QuantilePlan, QuantileTarget,
 };
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb, WkbBuf, WKB_BUF_LEN};
+use crate::encoding::{cell_index_to_wkb, fast_hex_u64, WkbBuf, WKB_BUF_LEN};
 use crate::error::{RasterH3Error, Result};
+use crate::grid::GridKind;
 use crate::raster::mosaic::MosaicReader;
 
 pub use arrow_c::{ArrowArray, ArrowArrayStream, ArrowSchema};
@@ -83,9 +84,14 @@ impl ColumnSchema {
 
     /// Standard schema for `h3_raster_continuous_aggregate`.
     pub fn continuous(quantiles: &[QuantileTarget]) -> Self {
+        Self::continuous_for(GridKind::H3, quantiles)
+    }
+
+    /// Standard schema for continuous raster aggregation on `grid`.
+    pub fn continuous_for(grid: GridKind, quantiles: &[QuantileTarget]) -> Self {
         let mut fields = vec![
-            ColumnField::new("h3_index", ArrowDataType::UInt64, false),
-            ColumnField::new("h3_hex", ArrowDataType::Utf8, false),
+            ColumnField::new(grid.index_column_name(), ArrowDataType::UInt64, false),
+            ColumnField::new(grid.hex_column_name(), ArrowDataType::Utf8, false),
             ColumnField::new("mean", ArrowDataType::Float64, false),
             ColumnField::new("stddev", ArrowDataType::Float64, true),
             ColumnField::new("count", ArrowDataType::Float64, false),
@@ -107,10 +113,15 @@ impl ColumnSchema {
 
     /// Standard wide-format schema for `h3_raster_categorical_aggregate`.
     pub fn categorical_wide() -> Self {
+        Self::categorical_wide_for(GridKind::H3)
+    }
+
+    /// Standard wide-format schema for categorical raster aggregation on `grid`.
+    pub fn categorical_wide_for(grid: GridKind) -> Self {
         Self {
             fields: vec![
-                ColumnField::new("h3_index", ArrowDataType::UInt64, false),
-                ColumnField::new("h3_hex", ArrowDataType::Utf8, false),
+                ColumnField::new(grid.index_column_name(), ArrowDataType::UInt64, false),
+                ColumnField::new(grid.hex_column_name(), ArrowDataType::Utf8, false),
                 ColumnField::new("majority_class", ArrowDataType::Int64, false),
                 ColumnField::new("majority_fraction", ArrowDataType::Float64, false),
                 ColumnField::new("majority_count", ArrowDataType::Float64, false),
@@ -128,10 +139,15 @@ impl ColumnSchema {
 
     /// Standard long-format schema for `h3_raster_categorical_aggregate`.
     pub fn categorical_long() -> Self {
+        Self::categorical_long_for(GridKind::H3)
+    }
+
+    /// Standard long-format schema for categorical raster aggregation on `grid`.
+    pub fn categorical_long_for(grid: GridKind) -> Self {
         Self {
             fields: vec![
-                ColumnField::new("h3_index", ArrowDataType::UInt64, false),
-                ColumnField::new("h3_hex", ArrowDataType::Utf8, false),
+                ColumnField::new(grid.index_column_name(), ArrowDataType::UInt64, false),
+                ColumnField::new(grid.hex_column_name(), ArrowDataType::Utf8, false),
                 ColumnField::new("category", ArrowDataType::Int64, false),
                 ColumnField::new("count", ArrowDataType::Float64, false),
                 ColumnField::new("fraction", ArrowDataType::Float64, false),
@@ -382,7 +398,17 @@ impl RecordBatch {
         quantiles: &[QuantileTarget],
         projection: Option<&[usize]>,
     ) -> Result<Self> {
-        let full_schema = ColumnSchema::continuous(quantiles);
+        Self::from_continuous_records_for(GridKind::H3, records, quantiles, projection)
+    }
+
+    /// Convert a slice of [`MultiContinuousRecord`] into a columnar [`RecordBatch`] for `grid`.
+    pub fn from_continuous_records_for(
+        grid: GridKind,
+        records: &[MultiContinuousRecord],
+        quantiles: &[QuantileTarget],
+        projection: Option<&[usize]>,
+    ) -> Result<Self> {
+        let full_schema = ColumnSchema::continuous_for(grid, quantiles);
         let active_indices: Vec<usize> = match projection {
             Some(indices) => indices.to_vec(),
             None => (0..full_schema.fields.len()).collect(),
@@ -483,7 +509,7 @@ impl RecordBatch {
                 9 => {
                     let mut values = Vec::with_capacity(n);
                     for r in records {
-                        if let Some(len) = h3_index_to_wkb(r.h3_index, &mut wkb_buf) {
+                        if let Some(len) = cell_index_to_wkb(grid, r.h3_index, &mut wkb_buf) {
                             values.push(wkb_buf[..len].to_vec());
                         } else {
                             values.push(Vec::new());
@@ -537,7 +563,16 @@ impl RecordBatch {
         records: &[MultiCategoricalRecord],
         projection: Option<&[usize]>,
     ) -> Result<Self> {
-        let full_schema = ColumnSchema::categorical_wide();
+        Self::from_categorical_wide_records_for(GridKind::H3, records, projection)
+    }
+
+    /// Convert a slice of [`MultiCategoricalRecord`] into a Wide-format [`RecordBatch`] for `grid`.
+    pub fn from_categorical_wide_records_for(
+        grid: GridKind,
+        records: &[MultiCategoricalRecord],
+        projection: Option<&[usize]>,
+    ) -> Result<Self> {
+        let full_schema = ColumnSchema::categorical_wide_for(grid);
         let active_indices: Vec<usize> = match projection {
             Some(indices) => indices.to_vec(),
             None => (0..full_schema.fields.len()).collect(),
@@ -625,7 +660,7 @@ impl RecordBatch {
                 12 => {
                     let mut values = Vec::with_capacity(n);
                     for r in records {
-                        if let Some(len) = h3_index_to_wkb(r.h3_index, &mut wkb_buf) {
+                        if let Some(len) = cell_index_to_wkb(grid, r.h3_index, &mut wkb_buf) {
                             values.push(wkb_buf[..len].to_vec());
                         } else {
                             values.push(Vec::new());
@@ -713,7 +748,7 @@ impl ContinuousBatchReader {
         batch_size: usize,
         limit: Option<usize>,
     ) -> Result<Self> {
-        let full_schema = ColumnSchema::continuous(&quantiles);
+        let full_schema = ColumnSchema::continuous_for(streamer.grid(), &quantiles);
         let schema = match &projection {
             Some(indices) => Arc::new(full_schema.project(indices)?),
             None => Arc::new(full_schema),
@@ -774,7 +809,8 @@ impl Iterator for ContinuousBatchReader {
                 if let Some(rem) = &mut self.remaining_limit {
                     *rem = rem.saturating_sub(count);
                 }
-                Some(RecordBatch::from_continuous_records(
+                Some(RecordBatch::from_continuous_records_for(
+                    self.streamer.grid(),
                     &records,
                     &self.quantiles,
                     self.projection.as_deref(),
@@ -827,8 +863,8 @@ impl CategoricalBatchReader {
         limit: Option<usize>,
     ) -> Result<Self> {
         let full_schema = match format {
-            CategoricalFormat::Wide => ColumnSchema::categorical_wide(),
-            CategoricalFormat::Long => ColumnSchema::categorical_long(),
+            CategoricalFormat::Wide => ColumnSchema::categorical_wide_for(streamer.grid()),
+            CategoricalFormat::Long => ColumnSchema::categorical_long_for(streamer.grid()),
         };
         let schema = match &projection {
             Some(indices) => Arc::new(full_schema.project(indices)?),
@@ -900,7 +936,8 @@ impl CategoricalBatchReader {
             *rem = rem.saturating_sub(n);
         }
 
-        let full_schema = ColumnSchema::categorical_long();
+        let grid = self.streamer.grid();
+        let full_schema = ColumnSchema::categorical_long_for(grid);
         let active_indices: Vec<usize> = match &self.projection {
             Some(indices) => indices.clone(),
             None => (0..full_schema.fields.len()).collect(),
@@ -957,7 +994,7 @@ impl CategoricalBatchReader {
                     values: rows
                         .iter()
                         .map(|r| {
-                            if let Some(len) = h3_index_to_wkb(r.cell_u64, &mut wkb_buf) {
+                            if let Some(len) = cell_index_to_wkb(grid, r.cell_u64, &mut wkb_buf) {
                                 wkb_buf[..len].to_vec()
                             } else {
                                 Vec::new()
@@ -1009,7 +1046,8 @@ impl Iterator for CategoricalBatchReader {
                         if let Some(rem) = &mut self.remaining_limit {
                             *rem = rem.saturating_sub(count);
                         }
-                        Some(RecordBatch::from_categorical_wide_records(
+                        Some(RecordBatch::from_categorical_wide_records_for(
+                            self.streamer.grid(),
                             &records,
                             self.projection.as_deref(),
                         ))

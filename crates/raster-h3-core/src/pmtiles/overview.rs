@@ -3,12 +3,10 @@
 //! zooms are disjoint from detail zooms and are written exactly once per tile.
 use std::io::{self, Read, Write};
 
-use h3o::{CellIndex, LatLng, Resolution};
-
 use super::{
     mvt::{FeatureProperties, MercatorPoint, MvtLayer, PropertyFilter},
     pyramid::{
-        cell_boundary_mercator, for_each_cell_tile_mercator, h3_res_for_zoom,
+        cell_boundary_mercator_for, for_each_cell_tile_mercator, grid_res_for_zoom,
         Wgs84BoundsAccumulator,
     },
     writer::{tile_id_to_zxy, zxy_to_tile_id, PmtilesWriter},
@@ -17,6 +15,7 @@ use crate::aggregator::multi_horizon::{
     sharded_map::{AccumulatorMerge, ShardedResolutionMap},
     spill::{SpillAccumulator, SpillRuns},
 };
+use crate::grid::GridKind;
 
 // Each phase holds a bounded map plus merge readers and one accumulator/tile.
 const BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -107,25 +106,24 @@ impl<A: SpillAccumulator> SpillAccumulator for TileCells<A> {
 }
 
 pub(super) struct Overview<A: SpillAccumulator> {
+    grid: GridKind,
     parents: BufferedMerge<A>,
-    resolutions: Vec<Resolution>,
+    resolutions: Vec<u8>,
 }
 
 impl<A: SpillAccumulator> Overview<A> {
-    pub fn new(resolutions: &[u8]) -> Self {
+    pub fn new(grid: GridKind, resolutions: &[u8]) -> Self {
         Self {
+            grid,
             parents: BufferedMerge::new(BUFFER_BYTES),
-            resolutions: resolutions
-                .iter()
-                .map(|&r| Resolution::try_from(r).expect("H3 resolution"))
-                .collect(),
+            resolutions: resolutions.to_vec(),
         }
     }
 
-    pub fn push(&mut self, cell: CellIndex, value: &A) -> io::Result<()> {
+    pub fn push(&mut self, cell_u64: u64, value: &A) -> io::Result<()> {
         for &res in &self.resolutions {
-            if let Some(parent) = cell.parent(res) {
-                self.parents.push(parent.into(), value.clone())?;
+            if let Some(parent) = self.grid.parent(cell_u64, res) {
+                self.parents.push(parent, value.clone())?;
             }
         }
         Ok(())
@@ -143,16 +141,17 @@ impl<A: SpillAccumulator> Overview<A> {
         bounds: &mut Wgs84BoundsAccumulator,
         properties: impl Fn(u64, u8, &A) -> FeatureProperties,
     ) -> io::Result<usize> {
+        let grid = self.grid;
         let mut tiles = BufferedMerge::new(BUFFER_BYTES);
         let mut capped = 0;
         self.parents.finish(|id, acc| {
-            let cell = CellIndex::try_from(id).expect("validated parent");
-            let center: LatLng = cell.into();
-            let center = MercatorPoint::from_lat_lng(center.lat(), center.lng());
-            let (vertices, len) = cell_boundary_mercator(cell);
+            let (c_lat, c_lng) = grid.center_lat_lng(id).expect("validated parent");
+            let center = MercatorPoint::from_lat_lng(c_lat, c_lng);
+            let (vertices, len) = cell_boundary_mercator_for(grid, id).expect("validated parent");
+            let cell_res = grid.resolution(id).expect("validated parent");
             let mut emitted = false;
             for &z in zooms {
-                if h3_res_for_zoom(z) != u8::from(cell.resolution()) {
+                if grid_res_for_zoom(grid, z) != cell_res {
                     continue;
                 }
                 let mut result = Ok(());
@@ -169,7 +168,7 @@ impl<A: SpillAccumulator> Overview<A> {
                 emitted |= count > 0;
             }
             if emitted {
-                bounds.record_cell(cell);
+                bounds.record_cell_for(grid, id);
             }
             Ok(())
         })?;
@@ -177,15 +176,16 @@ impl<A: SpillAccumulator> Overview<A> {
             let (z, x, y) = tile_id_to_zxy(tile_id);
             let mut layer = MvtLayer::with_filter("h3_hexagons", filter.clone());
             for (id, acc) in cells.0 {
-                let cell = CellIndex::try_from(id).expect("validated parent");
-                let (vertices, len) = cell_boundary_mercator(cell);
+                let (vertices, len) =
+                    cell_boundary_mercator_for(grid, id).expect("validated parent");
+                let cell_res = grid.resolution(id).expect("validated parent");
                 layer.add_hexagon_mercator(
                     id,
                     &vertices[..len],
                     z,
                     x,
                     y,
-                    properties(id, cell.resolution().into(), &acc),
+                    properties(id, cell_res, &acc),
                 );
             }
             writer.add_tile(z, x, y, &layer.encode())

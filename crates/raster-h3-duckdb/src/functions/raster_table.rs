@@ -16,11 +16,12 @@ use crate::encoding::{WkbBuf, WKB_BUF_LEN};
 use crate::ffi::duckdb_c::*;
 use crate::ffi::{ffi_bind_guard, ffi_init_guard, ffi_scan_guard, to_c_string};
 use crate::functions::bind_utils::{
-    add_positional_parameter, delete_boxed, estimate_raster_cardinality, extract_projected_columns,
-    init_table_function_local, open_mosaic_or_set_error, register_common_raster_named_parameters,
-    set_table_function_init_data, BindHelper, ChunkWriter, CommonRasterParams,
-    ConcurrentRecordQueue, TableFunctionLocalData,
+    add_positional_parameter, delete_boxed, estimate_raster_cardinality_for,
+    extract_projected_columns, init_table_function_local, open_mosaic_or_set_error,
+    register_common_raster_named_parameters, set_table_function_init_data, BindHelper, ChunkWriter,
+    CommonRasterParams, ConcurrentRecordQueue, TableFunctionLocalData,
 };
+use crate::grid::GridKind;
 use crate::raster::mosaic::MosaicReader;
 
 /// What a raster aggregation table function adds on top of the shared driver.
@@ -36,6 +37,8 @@ pub(crate) trait RasterTable: 'static {
     const FUNCTION: &'static str;
     /// Init error when DuckDB hands init no bind data.
     const MISSING_BIND_DATA: &'static str;
+    /// Default grid system when `grid` is not explicitly specified.
+    const DEFAULT_GRID: GridKind = GridKind::H3;
 
     /// Register the function-specific named parameters.
     ///
@@ -158,14 +161,16 @@ pub(crate) unsafe extern "C" fn bind<K: RasterTable>(info: duckdb_bind_info) {
     unsafe {
         ffi_bind_guard(info, || {
             let helper = BindHelper::new(info);
-            let Some(common) = helper.parse_common_raster_params(K::FUNCTION) else {
+            let Some(common) = helper.parse_common_raster_params_for(K::FUNCTION, K::DEFAULT_GRID)
+            else {
                 return;
             };
             let Some(bind_data) = K::bind(&helper, common) else {
                 return;
             };
             let common = K::common(&bind_data);
-            let estimated_cardinality = estimate_raster_cardinality(
+            let estimated_cardinality = estimate_raster_cardinality_for(
+                common.grid,
                 &common.resolved_paths,
                 &common.resolutions,
                 common.remote_source_factory.as_ref(),
@@ -213,7 +218,8 @@ pub(crate) unsafe extern "C" fn init<K: RasterTable>(info: duckdb_init_info) {
 
             let projected_columns = extract_projected_columns(info);
 
-            let mut config = MultiResolutionConfig::new(common.resolutions.clone());
+            let mut config =
+                MultiResolutionConfig::new(common.resolutions.clone()).with_grid(common.grid);
             config.overlap_rule = common.overlap_rule;
             config.custom_crs = common.source_crs.clone();
             config.custom_nodata = common.nodata;

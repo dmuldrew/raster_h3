@@ -9,37 +9,56 @@ use crate::ffi::{
     duckdb_get_double, duckdb_get_int64, duckdb_get_uint64, duckdb_get_varchar,
     duckdb_logical_type, duckdb_value, from_duckdb_string, to_c_string, DuckDBType,
 };
+use crate::grid::GridKind;
 use crate::raster::mosaic::OverlapRule;
 
-use super::parsing::{parse_bbox_str, parse_resolutions_str};
+use super::parsing::{parse_bbox_str, parse_resolutions_str_for};
 
 /// Conservative WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]` for an H3 cell.
 /// Accounts for high-latitude longitudinal widening, polar containment, and antimeridian
 /// crossing (`min_lon > max_lon`), so `is_point_in_bbox` and `rect_intersects_bbox` never
 /// clip valid samples belonging to `cell`.
 pub fn cell_wgs84_bbox(cell: h3o::CellIndex) -> [f64; 4] {
-    let res = cell.resolution();
-    let is_north_pole = cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(res);
-    let is_south_pole = cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(res);
-    let boundary = cell.boundary();
-    let n = boundary.len();
+    cell_wgs84_bbox_for(GridKind::H3, u64::from(cell)).unwrap_or([-180.0, -90.0, 180.0, 90.0])
+}
+
+/// Conservative WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]` for a cell on `grid`.
+pub fn cell_wgs84_bbox_for(grid: GridKind, cell_u64: u64) -> Option<[f64; 4]> {
+    let res = grid.resolution(cell_u64)?;
+    let (is_north_pole, is_south_pole) = match grid {
+        GridKind::H3 => {
+            let cell = h3o::CellIndex::try_from(cell_u64).ok()?;
+            let r = cell.resolution();
+            (
+                cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(r),
+                cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(r),
+            )
+        }
+        GridKind::A5 => {
+            let [north, south] = crate::grid::a5_pole_cells();
+            (cell_u64 == north, cell_u64 == south)
+        }
+    };
+    let mut verts = [(0.0, 0.0); 10];
+    let n = grid.boundary_lng_lat(cell_u64, &mut verts);
     if n == 0 {
-        return [-180.0, -90.0, 180.0, 90.0];
+        return Some([-180.0, -90.0, 180.0, 90.0]);
     }
 
-    let south_lat = crate::aggregator::horizon_streamer::compute_cell_south_lat(cell.into());
+    let south_lat = crate::aggregator::horizon_streamer::compute_cell_south_lat_for(grid, cell_u64);
     // By symmetry, great-circle edges in the northern hemisphere can bulge northward by at most
     // (|delta_lat| + |delta_lon|) / 2 relative to their endpoints.
     let mut north_lat = if is_north_pole { 90.0 } else { -90.0_f64 };
     if !is_north_pole {
         for i in 0..n {
-            let p = boundary[i];
-            let q = boundary[(i + 1) % n];
-            let mut edge_north = p.lat().max(q.lat()).next_up();
-            if p.lat() >= 0.0 || q.lat() >= 0.0 {
-                let direct = (p.lng() - q.lng()).abs();
+            let (p_lng, p_lat) = verts[i];
+            let (q_lng, q_lat) = verts[(i + 1) % n];
+            let mut edge_north = p_lat.max(q_lat).next_up();
+            // A5 edges are not great-circle arcs: pad them in both hemispheres.
+            if grid == GridKind::A5 || p_lat >= 0.0 || q_lat >= 0.0 {
+                let direct = (p_lng - q_lng).abs();
                 let delta_lon = direct.min(360.0 - direct);
-                let delta_lat = (p.lat() - q.lat()).abs();
+                let delta_lat = (p_lat - q_lat).abs();
                 edge_north = (edge_north + 0.5 * (delta_lat + delta_lon)).next_up();
             }
             north_lat = north_lat.max(edge_north);
@@ -48,17 +67,17 @@ pub fn cell_wgs84_bbox(cell: h3o::CellIndex) -> [f64; 4] {
     }
 
     if is_north_pole || is_south_pole || north_lat >= 89.5 || south_lat <= -89.5 {
-        return [-180.0, south_lat, 180.0, north_lat];
+        return Some([-180.0, south_lat, 180.0, north_lat]);
     }
 
     // Unwrap boundary vertex longitudes around vertex 0 so antimeridian-crossing
     // cells form a tight continuous interval instead of [-180, 180].
     let mut lngs = [0.0f64; 10];
-    lngs[0] = boundary[0].lng();
+    lngs[0] = verts[0].0;
     let mut min_u = lngs[0];
     let mut max_u = lngs[0];
     for i in 1..n {
-        let mut lng = boundary[i].lng();
+        let mut lng = verts[i].0;
         while lng - lngs[i - 1] > 180.0 {
             lng -= 360.0;
         }
@@ -72,25 +91,22 @@ pub fn cell_wgs84_bbox(cell: h3o::CellIndex) -> [f64; 4] {
 
     // Pad longitude by a small geodesic safety margin scaled by sec(lat).
     let max_abs_lat = south_lat.abs().max(north_lat.abs()).min(89.0);
-    let r = crate::pmtiles::tiler::max_hex_radius_deg(res.into());
+    let r = crate::pmtiles::tiler::max_cell_radius_deg(grid, res);
     let pad_lon = (r * 0.25 / max_abs_lat.to_radians().cos()).max(1e-5);
     let lo = min_u - pad_lon;
     let hi = max_u + pad_lon;
     if hi - lo >= 360.0 {
-        return [-180.0, south_lat, 180.0, north_lat];
+        return Some([-180.0, south_lat, 180.0, north_lat]);
     }
 
     let wrap = crate::crs::transformer::wrap_lon;
-    // If [lo, hi] stays within [-180, 180], return non-crossing bounds;
-    // if it crosses ±180, wrap both endpoints so min_lon > max_lon, which
-    // `is_point_in_bbox` and `rect_intersects_bbox` treat as an antimeridian bbox.
     let (min_lon, max_lon) = if lo >= -180.0 && hi <= 180.0 {
         (lo, hi)
     } else {
         (wrap(lo), wrap(hi))
     };
 
-    [min_lon, south_lat, max_lon, north_lat]
+    Some([min_lon, south_lat, max_lon, north_lat])
 }
 
 /// RAII guard ensuring DuckDB allocated value handle is destroyed
@@ -288,15 +304,43 @@ impl BindHelper {
     // High-Level Standard Raster Parameter Parsers
     // =========================================================================
 
+    /// Parse `grid := 'h3' | 'a5'`, defaulting to `default_grid`.
+    pub fn parse_grid(&self, default_grid: GridKind) -> Option<GridKind> {
+        match self.get_named_string("grid") {
+            Some(s) => match GridKind::parse(&s) {
+                Some(g) => Some(g),
+                None => {
+                    self.set_error(&format!(
+                        "Invalid grid parameter '{}': expected 'h3' or 'a5'",
+                        s
+                    ));
+                    None
+                }
+            },
+            None => Some(default_grid),
+        }
+    }
+
     /// Parse target H3 resolutions across all supported conventions:
     /// 1. `resolutions := '7,8'` (comma/whitespace separated list)
     /// 2. `min_resolution := 6, max_resolution := 8` (inclusive integer range)
     /// 3. `resolution := 8` (named integer)
     /// 4. Positional fallback parameter at `positional_idx`
     pub fn parse_resolutions(&self, default_res: u8, positional_idx: Option<usize>) -> Vec<u8> {
+        self.parse_resolutions_for(GridKind::H3, default_res, positional_idx)
+    }
+
+    /// Parse target resolutions for `grid` across all supported conventions.
+    pub fn parse_resolutions_for(
+        &self,
+        grid: GridKind,
+        default_res: u8,
+        positional_idx: Option<usize>,
+    ) -> Vec<u8> {
+        let max_res = i64::from(grid.max_resolution());
         // 1. Named parameter: resolutions (VARCHAR, e.g. '7,8' or '7, 8, 9')
         if let Some(s) = self.get_named_string("resolutions") {
-            let list = parse_resolutions_str(&s);
+            let list = parse_resolutions_str_for(grid, &s);
             if !list.is_empty() {
                 return list;
             }
@@ -306,14 +350,14 @@ impl BindHelper {
         let min_res_val = self.get_named_int("min_resolution");
         let max_res_val = self.get_named_int("max_resolution");
         if let (Some(min_r), Some(max_r)) = (min_res_val, max_res_val) {
-            if (0..=15).contains(&min_r) && (0..=15).contains(&max_r) && min_r <= max_r {
+            if (0..=max_res).contains(&min_r) && (0..=max_res).contains(&max_r) && min_r <= max_r {
                 return ((min_r as u8)..=(max_r as u8)).collect();
             }
         }
 
         // 3. Named parameter: resolution (BIGINT)
         if let Some(res_int) = self.get_named_int("resolution") {
-            if (0..=15).contains(&res_int) {
+            if (0..=max_res).contains(&res_int) {
                 return vec![res_int as u8];
             }
         }
@@ -321,7 +365,7 @@ impl BindHelper {
         // 4. Positional fallback parameter
         if let Some(pos_idx) = positional_idx {
             if let Some(res_int) = self.get_int_param(pos_idx) {
-                if (0..=15).contains(&res_int) {
+                if (0..=max_res).contains(&res_int) {
                     return vec![res_int as u8];
                 }
             }
@@ -330,11 +374,11 @@ impl BindHelper {
         vec![default_res]
     }
 
-    /// Parse spatial bounding box from coordinates or H3 cell:
+    /// Parse spatial bounding box from coordinates or H3/A5 cell:
     /// 1. `min_lon, min_lat, max_lon, max_lat` (4 explicit coordinates)
     /// 2. `bbox := 'min_lon,min_lat,max_lon,max_lat'` (list/string)
-    /// 3. `h3_cell := 613725953826226175` (BIGINT/UBIGINT)
-    /// 4. `h3_hex := '8846480db3fffff'` (VARCHAR)
+    /// 3. `h3_cell` / `a5_cell` (BIGINT/UBIGINT)
+    /// 4. `h3_hex` / `a5_hex` (VARCHAR)
     pub fn parse_bbox(&self) -> Option<[f64; 4]> {
         // 1. Explicit min_lon, min_lat, max_lon, max_lat
         let min_lon = self.get_named_double("min_lon");
@@ -369,6 +413,25 @@ impl BindHelper {
         if let Some(hex_str) = self.get_named_string("h3_hex") {
             if let Ok(cell) = hex_str.trim().parse::<h3o::CellIndex>() {
                 return Some(cell_wgs84_bbox(cell));
+            }
+        }
+
+        // 5. A5 cell index (u64 / i64)
+        if let Some(cell_u64) = self
+            .get_named_uint("a5_cell")
+            .or_else(|| self.get_named_int("a5_cell").map(|v| v as u64))
+        {
+            if let Some(bbox) = cell_wgs84_bbox_for(GridKind::A5, cell_u64) {
+                return Some(bbox);
+            }
+        }
+
+        // 6. A5 hex string
+        if let Some(hex_str) = self.get_named_string("a5_hex") {
+            if let Some(cell_u64) = crate::encoding::parse_hex_u64(hex_str.trim()) {
+                if let Some(bbox) = cell_wgs84_bbox_for(GridKind::A5, cell_u64) {
+                    return Some(bbox);
+                }
             }
         }
 
@@ -444,6 +507,16 @@ impl BindHelper {
 
     /// Parse common raster parameters shared across continuous and categorical aggregations
     pub fn parse_common_raster_params(&self, func_name: &str) -> Option<CommonRasterParams> {
+        self.parse_common_raster_params_for(func_name, GridKind::H3)
+    }
+
+    /// Parse common raster parameters shared across continuous and categorical aggregations
+    /// using `default_grid` when `grid` is not explicitly specified.
+    pub fn parse_common_raster_params_for(
+        &self,
+        func_name: &str,
+        default_grid: GridKind,
+    ) -> Option<CommonRasterParams> {
         if self.parameter_count() < 1 {
             self.set_error(&format!(
                 "{} requires at least 1 argument: file_path",
@@ -460,7 +533,8 @@ impl BindHelper {
             }
         };
 
-        let resolutions = self.parse_resolutions(8, Some(1));
+        let grid = self.parse_grid(default_grid)?;
+        let resolutions = self.parse_resolutions_for(grid, 8, Some(1));
         let source_crs = self.parse_source_crs();
         let nodata = self.get_named_double("nodata");
         let scale_offset = self.parse_scale_offset();
@@ -489,6 +563,7 @@ impl BindHelper {
         Some(CommonRasterParams {
             file_path,
             resolved_paths,
+            grid,
             resolutions,
             source_crs,
             nodata,
@@ -518,6 +593,7 @@ impl BindHelper {
 pub struct CommonRasterParams {
     pub file_path: String,
     pub resolved_paths: Vec<PathBuf>,
+    pub grid: GridKind,
     pub resolutions: Vec<u8>,
     pub source_crs: Option<String>,
     pub nodata: Option<f64>,

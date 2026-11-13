@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "a5"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecf0fdafcaa236433fd5f43c069c403c51a9efbfd788b9819c88ab4cdbf20b67"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2385,6 +2394,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
 name = "lexical-core"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3119,6 +3134,7 @@ dependencies = [
 name = "raster-h3-core"
 version = "0.7.0"
 dependencies = [
+ "a5",
  "crossbeam-deque",
  "flate2",
  "geo-types",

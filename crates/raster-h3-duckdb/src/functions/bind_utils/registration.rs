@@ -50,6 +50,7 @@ pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_functio
     // SAFETY: forwards the caller's live, unregistered `func` to
     // `add_named_parameter`, which has the same contract.
     unsafe {
+        add_named_parameter(func, "grid", DuckDBType::Varchar);
         add_named_parameter(func, "resolution", DuckDBType::BigInt);
         add_named_parameter(func, "resolutions", DuckDBType::Varchar);
         add_named_parameter(func, "min_resolution", DuckDBType::BigInt);
@@ -67,6 +68,9 @@ pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_functio
         add_named_parameter(func, "bbox", DuckDBType::Varchar);
         add_named_parameter(func, "h3_cell", DuckDBType::BigInt);
         add_named_parameter(func, "h3_hex", DuckDBType::Varchar);
+        // A5 ids use all 64 bits, so BIGINT would reject about half of them.
+        add_named_parameter(func, "a5_cell", DuckDBType::UBigInt);
+        add_named_parameter(func, "a5_hex", DuckDBType::Varchar);
         add_named_parameter(func, "compact", DuckDBType::Boolean);
         add_named_parameter(func, "overlap_rule", DuckDBType::Varchar);
         add_named_parameter(func, "workers", DuckDBType::BigInt);

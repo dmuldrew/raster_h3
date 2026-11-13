@@ -303,4 +303,9 @@ impl RecordStreamer for MultiCategoricalHorizonStreamer {
     fn resolution_u8s(&self) -> &[u8] {
         self.inner.resolution_u8s()
     }
+
+    #[inline(always)]
+    fn grid(&self) -> crate::grid::GridKind {
+        self.inner.grid()
+    }
 }

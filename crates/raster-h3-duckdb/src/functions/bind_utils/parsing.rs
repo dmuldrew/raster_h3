@@ -1,4 +1,6 @@
-pub use raster_h3_core::scalar_ops::{parse_bbox_str, parse_resolutions_str};
+pub use raster_h3_core::scalar_ops::{
+    parse_bbox_str, parse_resolutions_str, parse_resolutions_str_for,
+};
 
 #[cfg(test)]
 mod tests {
