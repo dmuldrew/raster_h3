@@ -42,8 +42,8 @@ impl CategoricalAccumulator {
             }
         } else {
             let len = self.inline_len as usize;
-            for i in 0..len {
-                f(self.inline_entries[i].0, self.inline_entries[i].1);
+            for &(cat, cnt) in &self.inline_entries[..len] {
+                f(cat, cnt);
             }
         }
     }
@@ -54,12 +54,10 @@ impl CategoricalAccumulator {
             heap.get(&category).copied().unwrap_or(0.0)
         } else {
             let len = self.inline_len as usize;
-            for i in 0..len {
-                if self.inline_entries[i].0 == category {
-                    return self.inline_entries[i].1;
-                }
-            }
-            0.0
+            self.inline_entries[..len]
+                .iter()
+                .find(|&&(cat, _)| cat == category)
+                .map_or(0.0, |&(_, cnt)| cnt)
         }
     }
 
@@ -85,11 +83,12 @@ impl CategoricalAccumulator {
         }
 
         let len = self.inline_len as usize;
-        for i in 0..len {
-            if self.inline_entries[i].0 == category {
-                self.inline_entries[i].1 += weight;
-                return;
-            }
+        if let Some(entry) = self.inline_entries[..len]
+            .iter_mut()
+            .find(|(cat, _)| *cat == category)
+        {
+            entry.1 += weight;
+            return;
         }
 
         if len < INLINE_CAPACITY {
@@ -99,8 +98,8 @@ impl CategoricalAccumulator {
             // Spill to heap
             let mut map: HashMap<i64, f64, FxBuildHasher> =
                 HashMap::with_capacity_and_hasher(32, FxBuildHasher);
-            for i in 0..INLINE_CAPACITY {
-                map.insert(self.inline_entries[i].0, self.inline_entries[i].1);
+            for &(cat, cnt) in &self.inline_entries {
+                map.insert(cat, cnt);
             }
             map.insert(category, weight);
             self.heap_counts = Some(Box::new(map));

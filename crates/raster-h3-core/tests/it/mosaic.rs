@@ -284,14 +284,13 @@ fn test_prefetched_mosaic_reader_multi_worker_concurrency() {
     let prefetcher = PrefetchedMosaicReader::spawn_with_workers(Arc::clone(&mosaic), 16, 4);
 
     let mut received_chunks = 0;
-    for job_id in 0..total_jobs {
+    for (job_id, &expected_ref) in mosaic.chunk_refs[..total_jobs].iter().enumerate() {
         let item = prefetcher
             .next_chunk()
             .expect("Expected chunk from prefetcher");
         let (tile_idx, chunk_idx, bounds, data, has_overlap) = item.expect("Chunk decoding failed");
 
         // Verify sequential job ordering invariants
-        let expected_ref = mosaic.chunk_refs[job_id];
         assert_eq!(
             tile_idx, expected_ref.tile_idx,
             "tile_idx mismatch at job {}",
