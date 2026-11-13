@@ -21,8 +21,9 @@
 
 use h3o::{CellIndex, LatLng};
 
-use crate::aggregator::horizon_streamer::compute_cell_south_lat;
+use crate::aggregator::horizon_streamer::compute_cell_south_lat_for;
 use crate::crs::transformer::{wrap_lon, AlbersConicFast, CrsTransformer};
+use crate::grid::GridKind;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::RasterChunk;
@@ -59,7 +60,7 @@ pub struct CellKeys {
 /// How cell keys and chunk bounds are measured for one stream.
 #[derive(Debug, Clone)]
 pub enum EvictionSpace {
-    /// Keys are latitudes ([`compute_cell_south_lat`], [`eviction_north_bound`]).
+    /// Keys are latitudes ([`compute_cell_south_lat_for`], [`eviction_north_bound`]).
     Latitude,
     /// Keys are negated rows of a reference grid in a shared Albers projection.
     Rows(Box<RowSpace>),
@@ -120,17 +121,32 @@ impl EvictionSpace {
             .map_or(Self::Latitude, |rows| Self::Rows(Box::new(rows)))
     }
 
+    /// [`Self::for_mosaic`] parameterized by the active [`GridKind`].
+    /// Row-space cap certification assumes great-circle cell edges (H3); non-H3
+    /// grids use conservative latitude-bound eviction.
+    pub fn for_mosaic_with_grid(mosaic: &MosaicReader, grid: GridKind) -> Self {
+        match grid {
+            GridKind::H3 => Self::for_mosaic(mosaic),
+            GridKind::A5 | GridKind::S2 | GridKind::Healpix => Self::Latitude,
+        }
+    }
+
     /// Whether keys are rows rather than latitudes.
     pub fn is_rows(&self) -> bool {
         matches!(self, Self::Rows(_))
     }
 
-    /// Keys of `cell_u64`. Never larger than the value of any point of the
+    /// Keys of `cell_u64` (H3). Never larger than the value of any point of the
     /// cell; non-finite geometry yields `-inf`, so the cell stays until the end.
     pub fn cell_keys(&self, cell_u64: u64) -> CellKeys {
+        self.cell_keys_for(GridKind::H3, cell_u64)
+    }
+
+    /// Keys of `cell_u64` in `grid`.
+    pub fn cell_keys_for(&self, grid: GridKind, cell_u64: u64) -> CellKeys {
         match self {
             Self::Latitude => {
-                let south = compute_cell_south_lat(cell_u64);
+                let south = compute_cell_south_lat_for(grid, cell_u64);
                 CellKeys {
                     key: south,
                     south_lat_upper: south,

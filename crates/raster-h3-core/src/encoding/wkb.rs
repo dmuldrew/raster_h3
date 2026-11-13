@@ -1,5 +1,6 @@
 //! Well-Known Binary (WKB) geometry serialization for H3 cells.
 
+use crate::grid::GridKind;
 use h3o::CellIndex;
 use std::sync::OnceLock;
 
@@ -220,19 +221,33 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
 
     let mut lngs = [0.0f64; MAX_CELL_VERTICES];
     let mut lats = [0.0f64; MAX_CELL_VERTICES];
-    let mut min_lng = f64::INFINITY;
-    let mut max_lng = f64::NEG_INFINITY;
     for (i, v) in boundary.iter().enumerate() {
         lngs[i] = v.lng();
         lats[i] = v.lat();
-        min_lng = min_lng.min(lngs[i]);
-        max_lng = max_lng.max(lngs[i]);
     }
-    let (lngs, lats) = (&mut lngs[..n], &lats[..n]);
+    let poles = pole_cells(cell.resolution());
+    let pole_north = poles.contains(&cell).then(|| cell == poles[0]);
+    write_cell_ring_wkb(&mut lngs[..n], &lats[..n], pole_north, buf)
+}
+
+#[inline]
+fn write_cell_ring_wkb(
+    lngs: &mut [f64],
+    lats: &[f64],
+    pole_north: Option<bool>,
+    buf: &mut WkbBuf,
+) -> usize {
+    let n = lngs.len();
+    let mut min_lng = f64::INFINITY;
+    let mut max_lng = f64::NEG_INFINITY;
+    for &lng in lngs.iter() {
+        min_lng = min_lng.min(lng);
+        max_lng = max_lng.max(lng);
+    }
     let mut out = WkbWriter { buf, pos: 0 };
 
     if max_lng - min_lng <= 180.0 {
-        // Common case: H3's ring as is, written without an intermediate copy.
+        // Common case: cell's ring as is, written without an intermediate copy.
         out.header(WKB_POLYGON, 1);
         out.put(&((n + 1) as u32).to_le_bytes());
         for i in (0..n).chain([0]) {
@@ -242,9 +257,8 @@ pub fn cell_to_wkb(cell: CellIndex, buf: &mut WkbBuf) -> usize {
         return out.pos;
     }
 
-    let poles = pole_cells(cell.resolution());
-    if poles.contains(&cell) {
-        out.polygon(&polar_cap(lngs, lats, cell == poles[0]));
+    if let Some(north) = pole_north {
+        out.polygon(&polar_cap(lngs, lats, north));
         return out.pos;
     }
 
@@ -343,6 +357,39 @@ pub fn extend_wkb_bounds(wkb: &[u8], bounds: &mut [f64; 4]) {
 pub fn h3_index_to_wkb(h3_index: u64, buf: &mut WkbBuf) -> Option<usize> {
     let cell = CellIndex::try_from(h3_index).ok()?;
     Some(cell_to_wkb(cell, buf))
+}
+
+/// Convert a raw 64-bit A5 cell index to standard 2D WKB polygon bytes.
+/// Returns `None` if the index is not a valid A5 cell.
+#[inline]
+pub fn a5_index_to_wkb(a5_index: u64, buf: &mut WkbBuf) -> Option<usize> {
+    cell_index_to_wkb(GridKind::A5, a5_index, buf)
+}
+
+/// Convert a raw 64-bit cell index in `grid` to standard 2D WKB polygon bytes.
+/// Returns `None` if the index is not a valid cell of `grid`.
+#[inline]
+pub fn cell_index_to_wkb(grid: GridKind, cell_index: u64, buf: &mut WkbBuf) -> Option<usize> {
+    if grid == GridKind::H3 {
+        return h3_index_to_wkb(cell_index, buf);
+    }
+    let mut verts = [(0.0, 0.0); MAX_CELL_VERTICES];
+    let n = grid.boundary_lng_lat(cell_index, &mut verts);
+    if n < 3 {
+        return None;
+    }
+    let mut lngs = [0.0f64; MAX_CELL_VERTICES];
+    let mut lats = [0.0f64; MAX_CELL_VERTICES];
+    for (i, &(lng, lat)) in verts[..n].iter().enumerate() {
+        lngs[i] = lng;
+        lats[i] = lat;
+    }
+    Some(write_cell_ring_wkb(
+        &mut lngs[..n],
+        &lats[..n],
+        grid.interior_pole(cell_index),
+        buf,
+    ))
 }
 
 #[cfg(test)]

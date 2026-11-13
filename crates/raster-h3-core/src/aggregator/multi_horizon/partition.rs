@@ -25,11 +25,13 @@
 //! [`MultiResolutionConfig::partition`]: super::config::MultiResolutionConfig::partition
 //! [`CrsTransformer::rejection_bounds`]: crate::crs::transformer::CrsTransformer::rejection_bounds
 
+#[cfg(test)]
 use h3o::{CellIndex, Resolution};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RasterH3Error, Result};
+use crate::grid::GridKind;
 use crate::raster::mosaic::{MosaicChunkRef, MosaicReader};
 
 /// A rectangle of one tile's chunk grid: chunk columns `col_start..col_end` and chunk rows
@@ -380,9 +382,15 @@ fn normalized_foreign_bounds(b: [f64; 4]) -> Rect {
 /// in every direction so it encloses every descendant of the cell at any finer resolution
 /// (H3 children are not nested inside their parent but stay within a fraction of its
 /// radius of it).
+#[cfg(test)]
 fn cell_box(cell: CellIndex, descendants: bool) -> Option<Rect> {
-    let boundary = cell.boundary();
-    if boundary.is_empty() {
+    cell_box_for(GridKind::H3, u64::from(cell), descendants)
+}
+
+fn cell_box_for(grid: GridKind, cell_u64: u64, descendants: bool) -> Option<Rect> {
+    let mut verts = [(0.0, 0.0); 10];
+    let len = grid.boundary_lng_lat(cell_u64, &mut verts);
+    if len == 0 {
         return None;
     }
     let (mut w, mut s, mut e, mut n) = (
@@ -392,14 +400,14 @@ fn cell_box(cell: CellIndex, descendants: bool) -> Option<Rect> {
         f64::NEG_INFINITY,
     );
     let mut pad = 0.0f64;
-    for i in 0..boundary.len() {
-        let p = boundary[i];
-        let q = boundary[(i + 1) % boundary.len()];
-        w = w.min(p.lng());
-        e = e.max(p.lng());
-        s = s.min(p.lat());
-        n = n.max(p.lat());
-        let half = 0.5 * ((p.lat() - q.lat()).abs() + (p.lng() - q.lng()).abs());
+    for i in 0..len {
+        let (p_lng, p_lat) = verts[i];
+        let (q_lng, q_lat) = verts[(i + 1) % len];
+        w = w.min(p_lng);
+        e = e.max(p_lng);
+        s = s.min(p_lat);
+        n = n.max(p_lat);
+        let half = 0.5 * ((p_lat - q_lat).abs() + (p_lng - q_lng).abs());
         pad = pad.max(half);
     }
     let lon_span = e - w;
@@ -517,6 +525,7 @@ const ANCESTOR_CACHE_LIMIT: usize = 1 << 18;
 
 /// Classifies finalized cells of a partitioned stream as interior or boundary.
 pub(crate) struct BoundaryClassifier {
+    grid: GridKind,
     foreign: ForeignChunks,
     caches: [FxHashMap<u64, bool>; ANCESTOR_LEVELS.len()],
     interior: u64,
@@ -525,7 +534,17 @@ pub(crate) struct BoundaryClassifier {
 
 impl BoundaryClassifier {
     /// Index the chunks of `mosaic` (the full, unrestricted mosaic) outside `partition`.
+    #[allow(dead_code)]
     pub(crate) fn new(mosaic: &MosaicReader, partition: &ScanPartition) -> Self {
+        Self::with_grid(mosaic, partition, GridKind::H3)
+    }
+
+    /// Index the chunks of `mosaic` outside `partition` for `grid`.
+    pub(crate) fn with_grid(
+        mosaic: &MosaicReader,
+        partition: &ScanPartition,
+        grid: GridKind,
+    ) -> Self {
         let rects = mosaic
             .chunk_refs
             .iter()
@@ -548,6 +567,7 @@ impl BoundaryClassifier {
             })
             .collect();
         Self {
+            grid,
             foreign: ForeignChunks::new(rects),
             caches: Default::default(),
             interior: 0,
@@ -570,16 +590,12 @@ impl BoundaryClassifier {
         if self.foreign.rects.is_empty() {
             return true; // a single partition covers the whole mosaic
         }
-        let Ok(cell) = CellIndex::try_from(cell_u64) else {
+        let grid = self.grid;
+        let Some(res) = grid.resolution(cell_u64) else {
             return false;
         };
-        let res = u8::from(cell.resolution());
         for (level, &up) in ANCESTOR_LEVELS.iter().enumerate() {
-            let Some(ancestor) = res
-                .checked_sub(up)
-                .and_then(|r| Resolution::try_from(r).ok())
-                .and_then(|r| cell.parent(r))
-            else {
+            let Some(ancestor) = res.checked_sub(up).and_then(|r| grid.parent(cell_u64, r)) else {
                 continue;
             };
             let foreign = &self.foreign;
@@ -587,14 +603,14 @@ impl BoundaryClassifier {
             if cache.len() >= ANCESTOR_CACHE_LIMIT {
                 cache.clear();
             }
-            let clear = *cache.entry(u64::from(ancestor)).or_insert_with(|| {
-                cell_box(ancestor, true).is_some_and(|r| !foreign.intersects(&r))
+            let clear = *cache.entry(ancestor).or_insert_with(|| {
+                cell_box_for(grid, ancestor, true).is_some_and(|r| !foreign.intersects(&r))
             });
             if clear {
                 return true;
             }
         }
-        cell_box(cell, false).is_some_and(|r| !self.foreign.intersects(&r))
+        cell_box_for(grid, cell_u64, false).is_some_and(|r| !self.foreign.intersects(&r))
     }
 
     /// `(interior, boundary)` cells classified so far.

@@ -2,13 +2,14 @@ use std::ffi::CString;
 
 #[cfg(test)]
 use crate::encoding::WKB_BUF_LEN;
-use crate::encoding::{fast_hex_u64, h3_index_to_wkb, WkbBuf};
+use crate::encoding::{cell_index_to_wkb, fast_hex_u64, WkbBuf};
 use crate::ffi::{
     duckdb_data_chunk, duckdb_data_chunk_get_column_count, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size, duckdb_vector, duckdb_vector_assign_string_element,
     duckdb_vector_assign_string_element_len, duckdb_vector_get_data, duckdb_vector_set_row_invalid,
     get_vector_size, idx_t,
 };
+use crate::grid::GridKind;
 
 /// Ergonomic wrapper around DuckDB's output `duckdb_data_chunk` with row and column bounds checking.
 /// This writer does not schedule or throttle upstream work. Scan callbacks pull
@@ -358,6 +359,34 @@ impl ChunkWriter {
     ) where
         I: IntoIterator<Item = &'a u64>,
     {
+        // SAFETY: forwarded with `GridKind::H3`.
+        unsafe {
+            self.write_wkb_and_geom_columns_for(
+                GridKind::H3,
+                out_idx_wkb,
+                out_idx_geom,
+                cells,
+                wkb_buf,
+            )
+        }
+    }
+
+    /// Write WKB and Native GEOMETRY columns from cell indices on `grid` with NULL handling
+    ///
+    /// # Safety
+    /// `self.chunk` must be a live output chunk whose vectors hold at least
+    /// `self.vector_size` rows, and the given columns must be BLOB or GEOMETRY.
+    #[inline(always)]
+    pub unsafe fn write_wkb_and_geom_columns_for<'a, I>(
+        &self,
+        grid: GridKind,
+        out_idx_wkb: Option<usize>,
+        out_idx_geom: Option<usize>,
+        cells: I,
+        wkb_buf: &mut WkbBuf,
+    ) where
+        I: IntoIterator<Item = &'a u64>,
+    {
         // SAFETY: forwards the caller's contract (live chunk, BLOB/GEOMETRY columns) to
         // `set_string_bytes`/`set_null`; rows are capped at `vector_size`.
         unsafe {
@@ -365,7 +394,7 @@ impl ChunkWriter {
                 return;
             }
             for (i, &cell_u64) in cells.into_iter().take(self.vector_size).enumerate() {
-                if let Some(wkb_len) = h3_index_to_wkb(cell_u64, wkb_buf) {
+                if let Some(wkb_len) = cell_index_to_wkb(grid, cell_u64, wkb_buf) {
                     let bytes = &wkb_buf[..wkb_len];
                     if let Some(out_wkb) = out_idx_wkb {
                         self.set_string_bytes(out_wkb, i, bytes);

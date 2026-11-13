@@ -39,6 +39,7 @@ use super::walker::WalkContext;
 use crate::aggregator::cell_hash::H3BuildHasher;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::error::{RasterH3Error, Result};
+use crate::grid::GridKind;
 use crate::raster::mosaic::MosaicReader;
 use crate::raster::prefetch::PrefetchedMosaicReader;
 
@@ -133,13 +134,19 @@ pub trait RecordStreamer {
     fn compacts_children(&self) -> bool {
         false
     }
+
+    /// Spatial grid system used by this streamer
+    fn grid(&self) -> GridKind {
+        GridKind::H3
+    }
 }
 
-/// Generic single-pass streaming aggregator across multiple H3 resolutions
+/// Generic single-pass streaming aggregator across multiple grid resolutions
 pub struct MultiHorizonStreamer<K: HorizonStreamKernel> {
     kernel: K,
     prefetcher: Option<PrefetchedMosaicReader>,
     mosaic: Arc<MosaicReader>,
+    grid: GridKind,
     resolutions: Vec<Resolution>,
     resolution_u8s: Vec<u8>,
     nodata: Option<f64>,
@@ -219,7 +226,12 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
         &self.resolutions
     }
 
-    /// Target H3 resolution integer levels
+    /// Spatial grid system used by this streamer
+    pub fn grid(&self) -> GridKind {
+        self.grid
+    }
+
+    /// Target resolution integer levels
     pub fn resolution_u8s(&self) -> &[u8] {
         &self.resolution_u8s
     }
@@ -400,6 +412,11 @@ impl<K: HorizonStreamKernel> RecordStreamer for MultiHorizonStreamer<K> {
     #[inline(always)]
     fn compacts_children(&self) -> bool {
         self.compactor.is_enabled()
+    }
+
+    #[inline(always)]
+    fn grid(&self) -> GridKind {
+        self.grid
     }
 }
 

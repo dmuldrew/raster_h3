@@ -17,13 +17,15 @@ use crate::functions::bind_utils::{
     add_named_parameter, add_positional_parameter, delete_boxed,
     register_common_raster_named_parameters, BindHelper, ChunkWriter, ExecutionParams,
 };
-use crate::pmtiles::tiler::{h3_res_to_zoom, H3PmtilesTiler};
+use crate::grid::GridKind;
+use crate::pmtiles::tiler::{grid_res_to_zoom, H3PmtilesTiler};
 use crate::raster::mosaic::OverlapRule;
 
 /// Bind data parsed during SQL query planning
 pub struct PmtilesBindData {
     pub file_path: String,
     pub output_pmtiles: String,
+    pub grid: GridKind,
     pub resolutions: Vec<u8>,
     pub band: usize,
     pub source_crs: Option<String>,
@@ -65,6 +67,30 @@ fn add_pmtiles_summary_columns(bind: &BindHelper) {
 /// # Safety
 /// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
+    // SAFETY: forwarded with `GridKind::H3` as default.
+    unsafe { pmtiles_bind_for::<{ GridKind::H3 as u8 }>(info) }
+}
+
+/// Bind callback for `a5_raster_to_pmtiles` (defaulting `grid` to `GridKind::A5`).
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
+pub unsafe extern "C" fn a5_pmtiles_bind(info: duckdb_bind_info) {
+    // SAFETY: forwarded with `GridKind::A5` as default.
+    unsafe { pmtiles_bind_for::<{ GridKind::A5 as u8 }>(info) }
+}
+
+/// Bind callback for `<grid>_raster_to_pmtiles`, defaulting `grid` to the grid whose
+/// discriminant is `GRID`.
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
+pub unsafe extern "C" fn grid_pmtiles_bind<const GRID: u8>(info: duckdb_bind_info) {
+    // SAFETY: forwarded with the same contract.
+    unsafe { pmtiles_bind_for::<GRID>(info) }
+}
+
+unsafe fn pmtiles_bind_for<const GRID: u8>(info: duckdb_bind_info) {
     // SAFETY: DuckDB passes this bind callback a live `info` (contract above), and the
     // `BindHelper` wrapping it is only used inside this callback. Logical types we create
     // are destroyed once after DuckDB copies them. The boxed `PmtilesBindData` is handed to
@@ -73,11 +99,13 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
     unsafe {
         ffi_bind_guard(info, || {
             let bind = BindHelper::new(info);
+            let default_grid = GridKind::from_index(GRID);
+            let func_name = format!("{default_grid}_raster_to_pmtiles");
 
             if bind.parameter_count() < 2 {
-                bind.set_error(
-                    "h3_raster_to_pmtiles requires at least 2 arguments: file_path and output_pmtiles",
-                );
+                bind.set_error(&format!(
+                    "{func_name} requires at least 2 arguments: file_path and output_pmtiles",
+                ));
                 return;
             }
 
@@ -99,7 +127,10 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
                 }
             };
 
-            let resolutions = bind.parse_resolutions(8, None);
+            let Some(grid) = bind.parse_grid(default_grid) else {
+                return;
+            };
+            let resolutions = bind.parse_resolutions_for(grid, 8, None);
             let band = bind.get_named_int("band").unwrap_or(1).max(1) as usize;
             let source_crs = bind.parse_source_crs();
             let custom_nodata = bind.get_named_double("nodata");
@@ -123,6 +154,7 @@ pub unsafe extern "C" fn pmtiles_bind(info: duckdb_bind_info) {
             let bind_data = Box::new(PmtilesBindData {
                 file_path,
                 output_pmtiles,
+                grid,
                 resolutions,
                 band,
                 source_crs,
@@ -192,7 +224,8 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
                 return;
             }
 
-            let mut config = MultiResolutionConfig::new(bind_data.resolutions.clone());
+            let mut config =
+                MultiResolutionConfig::new(bind_data.resolutions.clone()).with_grid(bind_data.grid);
             config.band = bind_data.band;
             config.custom_crs = bind_data.source_crs.clone();
             config.custom_nodata = bind_data.custom_nodata;
@@ -236,7 +269,7 @@ pub unsafe extern "C" fn pmtiles_scan(info: duckdb_function_info, output: duckdb
             let mut min_z = 255u8;
             let mut max_z = 0u8;
             for &r in &bind_data.resolutions {
-                let z = h3_res_to_zoom(r);
+                let z = grid_res_to_zoom(bind_data.grid, r);
                 if z < min_z {
                     min_z = z;
                 }
@@ -434,32 +467,51 @@ pub unsafe fn register_pmtiles_table_function(con: duckdb_connection) -> Result<
     // both functions). It is destroyed exactly once after `duckdb_register_table_function`
     // has copied it into the catalog.
     unsafe {
-        // 1. Register h3_raster_to_pmtiles
-        let fn_name = to_c_string("h3_raster_to_pmtiles");
-        let tf = duckdb_create_table_function();
-        duckdb_table_function_set_name(tf, fn_name.as_ptr());
+        // 1. Register h3_raster_to_pmtiles and a5_raster_to_pmtiles
+        for (name, bind_fn) in [
+            (
+                "h3_raster_to_pmtiles",
+                pmtiles_bind as duckdb_table_function_bind_t,
+            ),
+            (
+                "a5_raster_to_pmtiles",
+                a5_pmtiles_bind as duckdb_table_function_bind_t,
+            ),
+            (
+                "s2_raster_to_pmtiles",
+                grid_pmtiles_bind::<{ GridKind::S2 as u8 }> as duckdb_table_function_bind_t,
+            ),
+            (
+                "healpix_raster_to_pmtiles",
+                grid_pmtiles_bind::<{ GridKind::Healpix as u8 }> as duckdb_table_function_bind_t,
+            ),
+        ] {
+            let fn_name = to_c_string(name);
+            let tf = duckdb_create_table_function();
+            duckdb_table_function_set_name(tf, fn_name.as_ptr());
 
-        // Positional parameters:
-        add_positional_parameter(tf, DuckDBType::Varchar);
-        add_positional_parameter(tf, DuckDBType::Varchar);
+            // Positional parameters:
+            add_positional_parameter(tf, DuckDBType::Varchar);
+            add_positional_parameter(tf, DuckDBType::Varchar);
 
-        // Named parameters:
-        register_common_raster_named_parameters(tf);
-        add_named_parameter(tf, "categorical", DuckDBType::Boolean);
-        add_named_parameter(tf, "properties", DuckDBType::Varchar);
+            // Named parameters:
+            register_common_raster_named_parameters(tf);
+            add_named_parameter(tf, "categorical", DuckDBType::Boolean);
+            add_named_parameter(tf, "properties", DuckDBType::Varchar);
 
-        // Set callbacks
-        duckdb_table_function_set_bind(tf, pmtiles_bind);
-        duckdb_table_function_set_init(tf, pmtiles_init);
-        duckdb_table_function_set_function(tf, pmtiles_scan);
+            // Set callbacks
+            duckdb_table_function_set_bind(tf, bind_fn);
+            duckdb_table_function_set_init(tf, pmtiles_init);
+            duckdb_table_function_set_function(tf, pmtiles_scan);
 
-        let state = duckdb_register_table_function(con, tf);
+            let state = duckdb_register_table_function(con, tf);
 
-        let mut tf_mut = tf;
-        duckdb_destroy_table_function(&mut tf_mut);
+            let mut tf_mut = tf;
+            duckdb_destroy_table_function(&mut tf_mut);
 
-        if state != DuckDBState::Success {
-            return Err("Failed to register h3_raster_to_pmtiles table function".to_string());
+            if state != DuckDBState::Success {
+                return Err(format!("Failed to register {name} table function"));
+            }
         }
 
         // 2. Register h3_parquet_to_pmtiles

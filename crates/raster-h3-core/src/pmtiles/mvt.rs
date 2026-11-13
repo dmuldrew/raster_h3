@@ -4,6 +4,7 @@
 //! standard MVT protocol buffer byte streams without intermediate GIS allocations.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
+use crate::grid::GridKind;
 use h3o::LatLng;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -214,6 +215,7 @@ pub const PROP_ALL_CATEGORICAL: u16 = (1 << 8) - 1;
 /// Filter determining which properties are encoded into Mapbox Vector Tile (MVT) protobufs
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyFilter {
+    pub grid: GridKind,
     pub continuous_mask: u16,
     pub categorical_mask: u16,
     pub generic_whitelist: Option<rustc_hash::FxHashSet<String>>,
@@ -230,11 +232,18 @@ impl PropertyFilter {
     /// Allow all properties (default backwards-compatible behavior)
     pub fn all() -> Self {
         Self {
+            grid: GridKind::H3,
             continuous_mask: PROP_ALL_CONTINUOUS,
             categorical_mask: PROP_ALL_CATEGORICAL,
             generic_whitelist: None,
             is_custom: false,
         }
+    }
+
+    /// Set the spatial grid system used for cell index/hex property names
+    pub fn with_grid(mut self, grid: GridKind) -> Self {
+        self.grid = grid;
+        self
     }
 
     /// Parse a comma-delimited whitelist string (e.g. "mean,count" or "majority,entropy")
@@ -256,11 +265,12 @@ impl PropertyFilter {
             generic_set.insert(token.clone());
 
             match token.as_str() {
-                "h3_index" | "index" | "h3" => {
+                "h3_index" | "a5_index" | "s2_index" | "healpix_index" | "index" | "h3" | "a5"
+                | "s2" | "healpix" => {
                     cont_mask |= PROP_H3_INDEX;
                     cat_mask |= PROP_CAT_H3_INDEX;
                 }
-                "h3_hex" | "hex" => {
+                "h3_hex" | "a5_hex" | "s2_hex" | "healpix_hex" | "hex" => {
                     cont_mask |= PROP_H3_HEX;
                     cat_mask |= PROP_CAT_H3_HEX;
                 }
@@ -290,6 +300,7 @@ impl PropertyFilter {
         }
 
         Self {
+            grid: GridKind::H3,
             continuous_mask: cont_mask,
             categorical_mask: cat_mask,
             generic_whitelist: Some(generic_set),
@@ -385,10 +396,13 @@ impl FeatureProperties {
                 max,
             } => {
                 if filter.has_continuous(PROP_H3_INDEX) {
-                    f("h3_index", &MvtValue::UInt(*h3_index));
+                    f(filter.grid.index_column_name(), &MvtValue::UInt(*h3_index));
                 }
                 if filter.has_continuous(PROP_H3_HEX) {
-                    f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
+                    f(
+                        filter.grid.hex_column_name(),
+                        &MvtValue::from_hex_u64(*h3_index),
+                    );
                 }
                 if filter.has_continuous(PROP_RESOLUTION) {
                     f("resolution", &MvtValue::UInt(*resolution as u64));
@@ -422,10 +436,13 @@ impl FeatureProperties {
                 count,
             } => {
                 if filter.has_categorical(PROP_CAT_H3_INDEX) {
-                    f("h3_index", &MvtValue::UInt(*h3_index));
+                    f(filter.grid.index_column_name(), &MvtValue::UInt(*h3_index));
                 }
                 if filter.has_categorical(PROP_CAT_H3_HEX) {
-                    f("h3_hex", &MvtValue::from_hex_u64(*h3_index));
+                    f(
+                        filter.grid.hex_column_name(),
+                        &MvtValue::from_hex_u64(*h3_index),
+                    );
                 }
                 if filter.has_categorical(PROP_CAT_RESOLUTION) {
                     f("resolution", &MvtValue::UInt(*resolution as u64));
@@ -986,7 +1003,7 @@ impl MvtLayer {
                             idx
                         }
                     };
-                    let val_idx = if k == "h3_index" || k == "h3_hex" {
+                    let val_idx = if GridKind::from_cell_column_name(k).is_some() {
                         let idx = values.len() as u32;
                         values.push(v.clone());
                         idx

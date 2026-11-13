@@ -24,15 +24,14 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use h3o::{CellIndex, LatLng};
-
+use crate::grid::GridKind;
 use crate::pmtiles::features::{
     build_default_pmtiles_fields, build_pmtiles_metadata, H3Feature, PmtilesExportSummary,
     TilePyramidAccumulator,
 };
 use crate::pmtiles::mvt::{MercatorPoint, MvtValue};
 use crate::pmtiles::pyramid::{
-    cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg, Wgs84BoundsAccumulator,
+    cell_boundary_mercator_for, grid_res_to_zoom, max_cell_radius_deg, Wgs84BoundsAccumulator,
 };
 use crate::pmtiles::writer::PmtilesWriter;
 
@@ -214,6 +213,7 @@ impl Ord for MergeHead {
 /// External-sort PMTiles exporter for H3 features in arbitrary order. See
 /// the module documentation.
 pub struct ExternalFeatureExport {
+    grid: GridKind,
     budget_bytes: usize,
     spill_dir: Option<PathBuf>,
     buffer: Vec<SortRecord>,
@@ -243,6 +243,7 @@ impl ExternalFeatureExport {
     /// writer's tile spill goes to `spill_dir` only if it exists by then.
     pub fn new(budget_bytes: usize, spill_dir: Option<&Path>) -> Self {
         Self {
+            grid: GridKind::H3,
             budget_bytes: budget_bytes.max(1),
             spill_dir: spill_dir.map(Path::to_path_buf),
             buffer: Vec::new(),
@@ -277,22 +278,30 @@ impl ExternalFeatureExport {
         self
     }
 
+    /// Configure the spatial grid system (H3, A5, S2 or HEALPix).
+    pub fn with_grid(mut self, grid: GridKind) -> Self {
+        self.grid = grid;
+        self
+    }
+
     /// Number of sorted runs spilled to disk so far.
     pub fn spilled_runs(&self) -> usize {
         self.runs.len()
     }
 
-    /// Add one feature. Features whose index is not a valid H3 cell are
+    /// Add one feature. Features whose index is not a valid cell are
     /// counted and dropped, as in [`crate::pmtiles::H3PmtilesTiler::export_h3_features`].
     pub fn push(&mut self, feature: H3Feature) -> io::Result<()> {
         self.total_features += 1;
-        let Ok(cell) = CellIndex::try_from(feature.h3_index) else {
+        let Some((c_lat, _c_lng)) = self.grid.center_lat_lng(feature.h3_index) else {
+            return Ok(());
+        };
+        let Some(res) = self.grid.resolution(feature.h3_index) else {
             return Ok(());
         };
         self.valid_features += 1;
-        self.bounds.record_cell(cell);
-        let res = u8::from(cell.resolution());
-        let zoom = h3_res_to_zoom(res);
+        self.bounds.record_cell_for(self.grid, feature.h3_index);
+        let zoom = grid_res_to_zoom(self.grid, res);
         self.min_zoom = self.min_zoom.min(zoom);
         self.max_zoom = self.max_zoom.max(zoom);
         self.coarsest_res = self.coarsest_res.min(res);
@@ -302,7 +311,7 @@ impl ExternalFeatureExport {
             properties.push((self.intern(key)?, value));
         }
         let record = SortRecord {
-            lat: LatLng::from(cell).lat(),
+            lat: c_lat,
             h3_index: feature.h3_index,
             properties,
         };
@@ -372,9 +381,24 @@ impl ExternalFeatureExport {
 
     /// The default fields plus [`Self::with_layer_fields`]'s, the caller's types winning.
     fn fields_metadata(&self) -> serde_json::Value {
-        let mut fields = match build_default_pmtiles_fields() {
-            serde_json::Value::Object(map) => map,
-            _ => serde_json::Map::new(),
+        let mut fields = match self.grid {
+            GridKind::H3 => match build_default_pmtiles_fields() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            },
+            grid => {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    grid.index_column_name().to_string(),
+                    serde_json::json!("Number"),
+                );
+                map.insert(
+                    grid.hex_column_name().to_string(),
+                    serde_json::json!("String"),
+                );
+                map.insert("resolution".to_string(), serde_json::json!("Number"));
+                map
+            }
         };
         for (name, kind) in &self.layer_fields {
             fields.insert(name.clone(), kind.clone());
@@ -413,10 +437,11 @@ impl ExternalFeatureExport {
         // final once its south edge is that far north of the merge position.
         // The coarsest resolution present bounds the radius; the 2.5 factor
         // matches the raster tilers' margin.
+        let grid = self.grid;
         let margin = if self.valid_features == 0 {
             0.0
         } else {
-            2.5 * max_hex_radius_deg(self.coarsest_res)
+            2.5 * max_cell_radius_deg(grid, self.coarsest_res)
         };
         let mut accumulator = TilePyramidAccumulator::new(margin);
         let keys = std::mem::take(&mut self.keys);
@@ -424,7 +449,7 @@ impl ExternalFeatureExport {
         let mut merged = 0usize;
         let mut add = |record: SortRecord, writer: &mut PmtilesWriter| -> io::Result<()> {
             let lat = record.lat;
-            add_record(&mut accumulator, &keys, record);
+            add_record(&mut accumulator, grid, &keys, record);
             merged += 1;
             if merged.is_multiple_of(evict_every) {
                 accumulator.evict_and_write_tiles(lat, writer)?;
@@ -469,29 +494,39 @@ impl ExternalFeatureExport {
     }
 }
 
-/// Add one sorted record to the accumulator, with the default `h3_index`,
-/// `h3_hex` and `resolution` properties unless the caller supplied them.
-fn add_record(acc: &mut TilePyramidAccumulator, keys: &[Cow<'static, str>], record: SortRecord) {
+/// Add one sorted record to the accumulator, with the default index,
+/// hex and `resolution` properties unless the caller supplied them.
+fn add_record(
+    acc: &mut TilePyramidAccumulator,
+    grid: GridKind,
+    keys: &[Cow<'static, str>],
+    record: SortRecord,
+) {
     // Only valid cells are buffered (checked in `push`).
-    let Ok(cell) = CellIndex::try_from(record.h3_index) else {
+    let Some((c_lat, c_lng)) = grid.center_lat_lng(record.h3_index) else {
         return;
     };
-    let center: LatLng = cell.into();
-    let center_merc = MercatorPoint::from_lat_lng(center.lat(), center.lng());
-    let (v_merc, v_count) = cell_boundary_mercator(cell);
-    let res = u8::from(cell.resolution());
+    let Some((v_merc, v_count)) = cell_boundary_mercator_for(grid, record.h3_index) else {
+        return;
+    };
+    let Some(res) = grid.resolution(record.h3_index) else {
+        return;
+    };
+    let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lng);
+    let idx_col = grid.index_column_name();
+    let hex_col = grid.hex_column_name();
 
     let mut properties: Vec<(Cow<'static, str>, MvtValue)> = record
         .properties
         .into_iter()
         .map(|(id, v)| (keys[usize::from(id)].clone(), v))
         .collect();
-    if !properties.iter().any(|(k, _)| k == "h3_index") {
-        properties.push((Cow::Borrowed("h3_index"), MvtValue::UInt(record.h3_index)));
+    if !properties.iter().any(|(k, _)| k == idx_col) {
+        properties.push((Cow::Borrowed(idx_col), MvtValue::UInt(record.h3_index)));
     }
-    if !properties.iter().any(|(k, _)| k == "h3_hex") {
+    if !properties.iter().any(|(k, _)| k == hex_col) {
         properties.push((
-            Cow::Borrowed("h3_hex"),
+            Cow::Borrowed(hex_col),
             MvtValue::from_hex_u64(record.h3_index),
         ));
     }
@@ -502,7 +537,7 @@ fn add_record(acc: &mut TilePyramidAccumulator, keys: &[Cow<'static, str>], reco
         record.h3_index,
         center_merc,
         &v_merc[..v_count],
-        h3_res_to_zoom(res),
+        grid_res_to_zoom(grid, res),
         properties,
     );
 }
@@ -510,6 +545,7 @@ fn add_record(acc: &mut TilePyramidAccumulator, keys: &[Cow<'static, str>], reco
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3o::{CellIndex, LatLng};
 
     fn sample_features() -> Vec<H3Feature> {
         // All 343 res-8 descendants of a res-5 cell, plus the res-5 cell and
@@ -639,7 +675,7 @@ mod tests {
                 h3_index: f.h3_index,
                 properties,
             };
-            add_record(&mut acc, &keys, record);
+            add_record(&mut acc, GridKind::H3, &keys, record);
         }
         let legacy_tiles = acc.active_tile_count();
         let (summary, _, _) = export(4 << 10);

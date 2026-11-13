@@ -10,6 +10,7 @@ use crate::aggregator::accumulator::H3Accumulator;
 use crate::aggregator::remap::CategoryRemapper;
 use crate::aggregator::sampling::SamplingPattern;
 use crate::error::{RasterH3Error, Result};
+use crate::grid::GridKind;
 use crate::raster::mosaic::OverlapRule;
 
 pub use super::spectral::SpectralFormula;
@@ -265,7 +266,9 @@ pub struct MultiResolutionConfig {
     pub aggregation_workers: Option<usize>,
     /// Concurrent HTTP range-request workers for remote tiles.
     pub fetch_workers: usize,
-    /// Sorted list of target H3 resolution levels.
+    /// Discrete Global Grid System backend (H3, A5, S2 or HEALPix).
+    pub grid: GridKind,
+    /// Sorted list of target resolution levels (`0..=15` for H3, `0..=30` for A5 and S2, `0..=29` for HEALPix).
     pub resolutions: Vec<u8>,
     /// 1-indexed raster band to extract.
     pub band: usize,
@@ -338,6 +341,7 @@ impl MultiResolutionConfig {
             decode_workers: 4,
             aggregation_workers: None,
             fetch_workers: crate::raster::remote_prefetch::DEFAULT_PREFETCH_WORKERS,
+            grid: GridKind::H3,
             resolutions,
             band: 1,
             custom_nodata: None,
@@ -366,6 +370,12 @@ impl MultiResolutionConfig {
     /// Create a single-resolution configuration (convenience constructor)
     pub fn single(resolution: u8) -> Self {
         Self::new(vec![resolution])
+    }
+
+    /// Builder helper to select the Discrete Global Grid System (`GridKind::H3` or `GridKind::A5`).
+    pub fn with_grid(mut self, grid: GridKind) -> Self {
+        self.grid = grid;
+        self
     }
 
     /// Whether hierarchical 7-cell compaction is enabled (checking both new and legacy fields)
@@ -427,26 +437,27 @@ impl MultiResolutionConfig {
                 "Resolutions list cannot be empty".to_string(),
             ));
         }
+        let max_res = self.grid.max_resolution();
+        let grid_label = self.grid.label();
         let unique: std::collections::HashSet<_> = self.resolutions.iter().collect();
         if unique.len() != self.resolutions.len() {
-            return Err(RasterH3Error::InvalidParameter(
-                "duplicate H3 resolutions".into(),
-            ));
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "duplicate {grid_label} resolutions"
+            )));
         }
         for &r in &self.resolutions {
-            if r > 15 {
+            if r > max_res {
                 return Err(RasterH3Error::InvalidParameter(format!(
-                    "Invalid H3 resolution: {}",
+                    "Invalid {grid_label} resolution: {}",
                     r
                 )));
             }
         }
         if self.partition.is_some() && self.should_compact_h3_children() {
-            return Err(RasterH3Error::InvalidParameter(
-                "partitioned scans cannot compact H3 children: sibling groups may span partitions; \
+            return Err(RasterH3Error::InvalidParameter(format!(
+                "partitioned scans cannot compact {grid_label} children: sibling groups may span partitions; \
                  compact after merging the partials"
-                    .into(),
-            ));
+            )));
         }
         if self.should_compact_h3_children() {
             let requested: std::collections::HashSet<u8> =
@@ -457,7 +468,7 @@ impl MultiResolutionConfig {
                 .find(|&&res| res > 0 && requested.contains(&(res - 1)))
             {
                 return Err(RasterH3Error::InvalidParameter(format!(
-                    "compact output cannot combine H3 resolutions {} and {}: compaction would emit duplicate parent cells",
+                    "compact output cannot combine {grid_label} resolutions {} and {}: compaction would emit duplicate parent cells",
                     child - 1,
                     child
                 )));

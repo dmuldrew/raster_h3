@@ -89,34 +89,76 @@ fn test_extension_init_and_registration_completeness() {
         assert!(f.has_functions && f.has_destructor, "{}", f.name);
     }
 
-    // The mock reports DuckDB v1.2.0, so h3_polygon_to_cells registers only its BLOB overloads.
-    assert_eq!(con.scalar_functions.len(), 17);
-    let polygon_fns: Vec<_> = con
-        .scalar_functions
-        .iter()
-        .filter(|f| f.name == "h3_polygon_to_cells")
-        .collect();
-    assert_eq!(polygon_fns.len(), 2);
-    for sf in &polygon_fns {
-        assert_eq!(sf.params[..2], [DuckDBType::Blob, DuckDBType::BigInt]);
-        assert_eq!(sf.ret, DuckDBType::List);
+    // The mock reports DuckDB v1.2.0, so <grid>_polygon_to_cells register only their BLOB overloads.
+    // 17 H3 scalar overloads + 20 each for A5, S2 and HEALPix = 77 total.
+    assert_eq!(con.scalar_functions.len(), 77);
+    for grid in ["a5", "s2", "healpix"] {
+        let overloads = con
+            .scalar_functions
+            .iter()
+            .filter(|f| {
+                f.name.starts_with(&format!("{grid}_")) || f.name == format!("string_to_{grid}")
+            })
+            .count();
+        assert_eq!(overloads, 20, "{grid}");
     }
-    assert_eq!(polygon_fns[1].params.get(2), Some(&DuckDBType::Varchar));
-    let geometry_aliases: Vec<_> = con
-        .scalar_functions
-        .iter()
-        .filter(|f| f.name == "h3_cell_to_geometry")
-        .collect();
-    assert_eq!(geometry_aliases.len(), 2);
-    assert!(geometry_aliases
-        .iter()
-        .any(|f| f.params == [DuckDBType::UBigInt]));
-    assert!(geometry_aliases
-        .iter()
-        .any(|f| f.params == [DuckDBType::Varchar]));
-    assert!(geometry_aliases
-        .iter()
-        .all(|f| f.ret != DuckDBType::Invalid));
+    for poly_name in [
+        "h3_polygon_to_cells",
+        "a5_polygon_to_cells",
+        "s2_polygon_to_cells",
+        "healpix_polygon_to_cells",
+    ] {
+        let polygon_fns: Vec<_> = con
+            .scalar_functions
+            .iter()
+            .filter(|f| f.name == poly_name)
+            .collect();
+        assert_eq!(polygon_fns.len(), 2, "{poly_name}");
+        for sf in &polygon_fns {
+            assert_eq!(sf.params[..2], [DuckDBType::Blob, DuckDBType::BigInt]);
+            assert_eq!(sf.ret, DuckDBType::List);
+        }
+        assert_eq!(polygon_fns[1].params.get(2), Some(&DuckDBType::Varchar));
+    }
+    for lonlat_name in [
+        "a5_lonlat_to_cell",
+        "s2_lonlat_to_cell",
+        "healpix_lonlat_to_cell",
+    ] {
+        let lonlat: Vec<_> = con
+            .scalar_functions
+            .iter()
+            .filter(|f| f.name == lonlat_name)
+            .collect();
+        assert_eq!(lonlat.len(), 1, "{lonlat_name}");
+        assert_eq!(
+            lonlat[0].params,
+            [DuckDBType::Double, DuckDBType::Double, DuckDBType::BigInt]
+        );
+        assert_eq!(lonlat[0].ret, DuckDBType::UBigInt);
+    }
+    for geom_name in [
+        "h3_cell_to_geometry",
+        "a5_cell_to_geometry",
+        "s2_cell_to_geometry",
+        "healpix_cell_to_geometry",
+    ] {
+        let geometry_aliases: Vec<_> = con
+            .scalar_functions
+            .iter()
+            .filter(|f| f.name == geom_name)
+            .collect();
+        assert_eq!(geometry_aliases.len(), 2, "{geom_name}");
+        assert!(geometry_aliases
+            .iter()
+            .any(|f| f.params == [DuckDBType::UBigInt]));
+        assert!(geometry_aliases
+            .iter()
+            .any(|f| f.params == [DuckDBType::Varchar]));
+        assert!(geometry_aliases
+            .iter()
+            .all(|f| f.ret != DuckDBType::Invalid));
+    }
     for sf in &con.scalar_functions {
         assert!(!sf.name.is_empty());
         assert!(!sf.params.is_empty());
@@ -131,11 +173,36 @@ fn test_extension_init_and_registration_completeness() {
         "h3_raster_continuous_aggregate",
         "h3_raster_continuous",
         "raster_h3",
+        "a5_raster_continuous_aggregate",
+        "a5_raster_continuous",
+        "raster_a5",
         "h3_raster_categorical_aggregate",
         "h3_raster_categorical",
+        "a5_raster_categorical_aggregate",
+        "a5_raster_categorical",
         "h3_raster_to_pmtiles",
+        "a5_raster_to_pmtiles",
         "h3_parquet_to_pmtiles",
         "h3_raster_to_parquet",
+        "a5_raster_to_parquet",
+        "s2_raster_continuous_aggregate",
+        "s2_raster_continuous",
+        "read_raster_s2",
+        "raster_to_s2",
+        "raster_s2",
+        "s2_raster_categorical_aggregate",
+        "raster_s2_categorical",
+        "s2_raster_to_parquet",
+        "s2_raster_to_pmtiles",
+        "healpix_raster_continuous_aggregate",
+        "healpix_raster_continuous",
+        "read_raster_healpix",
+        "raster_to_healpix",
+        "raster_healpix",
+        "healpix_raster_categorical_aggregate",
+        "raster_healpix_categorical",
+        "healpix_raster_to_parquet",
+        "healpix_raster_to_pmtiles",
     ] {
         let tf = con
             .table_functions
@@ -143,20 +210,48 @@ fn test_extension_init_and_registration_completeness() {
             .find(|f| f.name == expected)
             .unwrap_or_else(|| panic!("Missing table function {expected}"));
         assert!(!tf.positional_params.is_empty());
-        if expected.contains("aggregate") || expected == "raster_h3" {
+        if expected.contains("aggregate")
+            || ["raster_h3", "raster_a5", "raster_s2", "raster_healpix"].contains(&expected)
+        {
             assert!(tf.projection_pushdown);
         }
         assert!(tf_names.contains(&expected));
+        if expected == "h3_parquet_to_pmtiles" {
+            continue; // reads Parquet: no raster cell filters
+        }
+        // Cell filters: H3 ids fit BIGINT, the other grids need all 64 bits.
+        assert_eq!(tf.named_params.get("h3_cell"), Some(&DuckDBType::BigInt));
+        for grid in ["a5", "s2", "healpix"] {
+            assert_eq!(
+                tf.named_params.get(&format!("{grid}_cell")),
+                Some(&DuckDBType::UBigInt),
+                "{expected} {grid}_cell"
+            );
+            assert_eq!(
+                tf.named_params.get(&format!("{grid}_hex")),
+                Some(&DuckDBType::Varchar)
+            );
+        }
     }
 
-    // Verify h3_raster_to_parquet and h3_raster_to_pmtiles register source_crs/crs and overlap_rule
-    for export_fn in ["h3_raster_to_parquet", "h3_raster_to_pmtiles"] {
+    // Verify export functions register source_crs/crs, grid, and overlap_rule
+    for export_fn in [
+        "h3_raster_to_parquet",
+        "a5_raster_to_parquet",
+        "h3_raster_to_pmtiles",
+        "a5_raster_to_pmtiles",
+        "s2_raster_to_parquet",
+        "s2_raster_to_pmtiles",
+        "healpix_raster_to_parquet",
+        "healpix_raster_to_pmtiles",
+    ] {
         let tf = con
             .table_functions
             .iter()
             .find(|f| f.name == export_fn)
             .unwrap();
         for param in [
+            "grid",
             "source_crs",
             "crs",
             "overlap_rule",

@@ -20,6 +20,7 @@ use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 
 pub use crate::aggregator::multi_horizon::RecordStreamer;
+use crate::grid::GridKind;
 use crate::parquet::column_order::restore_type_defined_float_orders;
 use crate::parquet::geoparquet_metadata::build_geoparquet_metadata;
 use crate::parquet::writer::ParquetExportConfig;
@@ -44,6 +45,11 @@ pub trait ParquetStreamer {
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         None
     }
+
+    /// Spatial grid system used by this streamer
+    fn grid(&self) -> GridKind {
+        GridKind::H3
+    }
 }
 
 impl<T: RecordStreamer> ParquetStreamer for T {
@@ -64,6 +70,11 @@ impl<T: RecordStreamer> ParquetStreamer for T {
     #[inline]
     fn bounds_wgs84(&self) -> Option<[f64; 4]> {
         RecordStreamer::bounds_wgs84(self)
+    }
+
+    #[inline]
+    fn grid(&self) -> GridKind {
+        RecordStreamer::grid(self)
     }
 }
 
@@ -155,6 +166,16 @@ pub trait ParquetRowGroupBuffer: Sized + Send + 'static {
     /// Allocate a new buffer with target row group capacity and options
     fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self;
 
+    /// Allocate a new buffer with target row group capacity, options, and grid kind
+    fn with_capacity_and_grid_options(
+        capacity: usize,
+        compact: bool,
+        geoparquet: bool,
+        _grid: GridKind,
+    ) -> Self {
+        Self::with_capacity_and_options(capacity, compact, geoparquet)
+    }
+
     /// Allocate a new buffer with target row group capacity (default geoparquet: false)
     fn with_capacity(capacity: usize, compact: bool) -> Self {
         Self::with_capacity_and_options(capacity, compact, false)
@@ -191,6 +212,15 @@ pub trait ParquetRowGroupBuffer: Sized + Send + 'static {
 
     /// Return schema definition string for this buffer type
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str;
+
+    /// Return schema definition string for this buffer type and grid kind
+    fn schema_message_for(
+        _grid: GridKind,
+        compact: bool,
+        geoparquet: bool,
+    ) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(Self::schema_message(compact, geoparquet))
+    }
 }
 
 /// Generic double-buffered streaming pipeline from any horizon streamer to Parquet with progress reporting
@@ -209,13 +239,17 @@ where
     let compact = parquet_config.should_omit_redundant_columns();
     let geoparquet = parquet_config.geoparquet;
     let row_group_size = parquet_config.row_group_size.max(1);
+    let grid = streamer.grid();
 
-    let message_type = B::schema_message(compact, geoparquet);
-    let schema = Arc::new(parse_message_type(message_type)?);
+    let message_type = B::schema_message_for(grid, compact, geoparquet);
+    let schema = Arc::new(parse_message_type(&message_type)?);
 
     let props_builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_column_encoding(ColumnPath::from("h3_index"), Encoding::DELTA_BINARY_PACKED)
+        .set_column_encoding(
+            ColumnPath::from(grid.index_column_name()),
+            Encoding::DELTA_BINARY_PACKED,
+        )
         .set_compression(parquet_config.compression);
 
     // The GeoParquet `geo` metadata is appended once every row is written, so its
@@ -247,8 +281,8 @@ where
     let (writer_tx, writer_rx) = sync_channel::<B>(2);
     let (recycle_tx, recycle_rx) = sync_channel::<B>(2);
 
-    let buf1 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
-    let buf2 = B::with_capacity_and_options(row_group_size, compact, geoparquet);
+    let buf1 = B::with_capacity_and_grid_options(row_group_size, compact, geoparquet, grid);
+    let buf2 = B::with_capacity_and_grid_options(row_group_size, compact, geoparquet, grid);
     let _ = recycle_tx.send(buf2);
 
     let writer_handle = thread::spawn(
@@ -316,7 +350,9 @@ where
             }
             current_buf = match recycle_rx.recv() {
                 Ok(b) => b,
-                Err(_) => B::with_capacity_and_options(row_group_size, compact, geoparquet),
+                Err(_) => {
+                    B::with_capacity_and_grid_options(row_group_size, compact, geoparquet, grid)
+                }
             };
         }
 

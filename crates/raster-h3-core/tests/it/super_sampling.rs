@@ -684,7 +684,9 @@ fn fused_samples_match_reference_statistics_histograms_and_quantiles() {
                 }
                 let window = WalkContext {
                     chunk: &chunk,
+                    grid: raster_h3_core::GridKind::H3,
                     resolutions: &resolutions,
+                    resolution_u8s: &[7, 9],
                     crs: &crs,
                     gt: &gt,
                     sampling: &pattern,

@@ -8,9 +8,10 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use raster_h3_cli::{
-    export_raster_to_parquet, export_raster_to_pmtiles, merge_partition_files, parse_merge_args,
-    parse_parquet_to_pmtiles_args, parse_plan_args, parse_stream_args, plan_raster_partitions,
-    stream_raster_to_writer, transcode_parquet_to_pmtiles, write_plan, StreamOutputFormat,
+    export_raster_to_parquet_with_grid, export_raster_to_pmtiles_with_grid, merge_partition_files,
+    parse_merge_args, parse_parquet_to_pmtiles_args, parse_plan_args, parse_stream_args,
+    plan_raster_partitions, stream_raster_to_writer, transcode_parquet_to_pmtiles, write_plan,
+    StreamOutputFormat,
 };
 use raster_h3_core::error::Result;
 
@@ -34,7 +35,9 @@ fn print_help() {
           raster-h3-cli plan <input.tif> [options]       Print partition specs (JSON Lines) for parallel scans\n  \
           raster-h3-cli merge <part.rh3>... [-o <out>]   Combine partitioned `ipc` outputs into final cells\n\n\
         Options:\n  \
-          -r, --resolutions <LIST>   H3 resolutions (e.g. 8 or 7,8,9; default: 8)\n  \
+          --grid <h3|a5|s2|healpix>  Discrete global grid system (default: h3)\n  \
+          -r, --resolutions <LIST>   Grid resolutions (H3: 0..=15, A5 and S2: 0..=30,\n                                     \
+                                     HEALPix: 0..=29; default: 8)\n  \
           -c, --categorical          Enable categorical aggregation\n  \
           --format <wide|long>       Categorical output format (default: wide)\n  \
           --crs <CRS>                Override source CRS (e.g. EPSG:4326)\n  \
@@ -107,7 +110,8 @@ fn main() {
                     "Missing -o / --output path for parquet export".into(),
                 )
             })?;
-            export_raster_to_parquet(
+            export_raster_to_parquet_with_grid(
+                opts.grid,
                 &opts.input_path,
                 Path::new(&out_path),
                 opts.resolutions,
@@ -126,7 +130,8 @@ fn main() {
                     "Missing -o / --output path for pmtiles export".into(),
                 )
             })?;
-            export_raster_to_pmtiles(
+            export_raster_to_pmtiles_with_grid(
+                opts.grid,
                 &opts.input_path,
                 Path::new(&out_path),
                 opts.resolutions,
