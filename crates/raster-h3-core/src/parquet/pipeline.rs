@@ -214,8 +214,12 @@ pub trait ParquetRowGroupBuffer: Sized + Send + 'static {
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str;
 
     /// Return schema definition string for this buffer type and grid kind
-    fn schema_message_for(_grid: GridKind, compact: bool, geoparquet: bool) -> &'static str {
-        Self::schema_message(compact, geoparquet)
+    fn schema_message_for(
+        _grid: GridKind,
+        compact: bool,
+        geoparquet: bool,
+    ) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(Self::schema_message(compact, geoparquet))
     }
 }
 
@@ -238,7 +242,7 @@ where
     let grid = streamer.grid();
 
     let message_type = B::schema_message_for(grid, compact, geoparquet);
-    let schema = Arc::new(parse_message_type(message_type)?);
+    let schema = Arc::new(parse_message_type(&message_type)?);
 
     let props_builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)

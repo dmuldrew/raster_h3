@@ -203,22 +203,16 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
             .columns()
             .iter()
             .position(|field| {
-                matches!(
-                    field.name().to_ascii_lowercase().as_str(),
-                    "h3_index" | "h3_hex" | "h3" | "a5_index" | "a5_hex" | "a5" | "cell" | "hex"
-                )
+                GridKind::from_cell_column_name(field.name()).is_some()
+                    || matches!(field.name().to_ascii_lowercase().as_str(), "cell" | "hex")
             })
             .unwrap_or(0)
     };
-    let grid = match schema
+    let grid = schema
         .columns()
         .get(h3_idx)
-        .map(|f| f.name().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("a5_index" | "a5_hex" | "a5") => GridKind::A5,
-        _ => GridKind::H3,
-    };
+        .and_then(|f| GridKind::from_cell_column_name(f.name()))
+        .unwrap_or(GridKind::H3);
 
     // Pre-scan row group extents to compute global bounds and row group horizons
     let mut rg_extents = Vec::with_capacity(num_rgs);

@@ -509,6 +509,77 @@ impl RasterTable for A5CategoricalTable {
     }
 }
 
+/// Declare a [`RasterTable`] that is [`CategoricalTable`] with another default grid.
+macro_rules! grid_categorical_table {
+    ($(#[$doc:meta])* $table:ident, $grid:expr, $function:literal, [$($alias:literal),+ $(,)?]) => {
+        $(#[$doc])*
+        pub(crate) struct $table;
+
+        impl RasterTable for $table {
+            type Bind = RasterH3CategoricalBindData;
+            type Global = RasterH3CategoricalGlobalData;
+
+            const NAMES: &'static [&'static str] = &[$function, $($alias),+];
+            const FUNCTION: &'static str = $function;
+            const MISSING_BIND_DATA: &'static str = "Missing bind data in categorical init";
+            const DEFAULT_GRID: GridKind = $grid;
+
+            unsafe fn register_named_parameters(tf: duckdb_table_function) {
+                // SAFETY: forwarded with the same contract.
+                unsafe { CategoricalTable::register_named_parameters(tf) }
+            }
+
+            unsafe fn bind(bind: &BindHelper, common: CommonRasterParams) -> Option<RasterH3CategoricalBindData> {
+                // SAFETY: forwarded with the same contract.
+                unsafe { CategoricalTable::bind(bind, common) }
+            }
+
+            fn common(bind: &RasterH3CategoricalBindData) -> &CommonRasterParams {
+                CategoricalTable::common(bind)
+            }
+
+            fn init(
+                bind: &RasterH3CategoricalBindData,
+                mosaic: Arc<MosaicReader>,
+                projected_columns: Vec<usize>,
+                config: MultiResolutionConfig,
+            ) -> Result<RasterH3CategoricalGlobalData, String> {
+                CategoricalTable::init(bind, mosaic, projected_columns, config)
+            }
+
+            unsafe fn scan(global: &RasterH3CategoricalGlobalData, ctx: &mut ScanContext<'_>) {
+                // SAFETY: forwarded with the same contract.
+                unsafe { CategoricalTable::scan(global, ctx) }
+            }
+        }
+    };
+}
+
+grid_categorical_table!(
+    /// `s2_raster_categorical_aggregate`: the categorical aggregation over Google S2 cells.
+    S2CategoricalTable,
+    GridKind::S2,
+    "s2_raster_categorical_aggregate",
+    [
+        "s2_raster_categorical",
+        "read_raster_s2_categorical",
+        "raster_to_s2_categorical",
+        "raster_s2_categorical",
+    ]
+);
+grid_categorical_table!(
+    /// `healpix_raster_categorical_aggregate`: the categorical aggregation over HEALPix cells.
+    HealpixCategoricalTable,
+    GridKind::Healpix,
+    "healpix_raster_categorical_aggregate",
+    [
+        "healpix_raster_categorical",
+        "read_raster_healpix_categorical",
+        "raster_to_healpix_categorical",
+        "raster_healpix_categorical",
+    ]
+);
+
 /// Bind callback for categorical aggregation table function
 ///
 /// # Safety
@@ -557,6 +628,8 @@ pub unsafe fn register_categorical_table_function(con: duckdb_connection) -> Res
     // SAFETY: forwarded with the same contract.
     unsafe {
         raster_table::register::<CategoricalTable>(con)?;
-        raster_table::register::<A5CategoricalTable>(con)
+        raster_table::register::<A5CategoricalTable>(con)?;
+        raster_table::register::<S2CategoricalTable>(con)?;
+        raster_table::register::<HealpixCategoricalTable>(con)
     }
 }

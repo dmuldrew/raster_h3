@@ -266,9 +266,9 @@ pub struct MultiResolutionConfig {
     pub aggregation_workers: Option<usize>,
     /// Concurrent HTTP range-request workers for remote tiles.
     pub fetch_workers: usize,
-    /// Discrete Global Grid System backend (`GridKind::H3` or `GridKind::A5`).
+    /// Discrete Global Grid System backend (H3, A5, S2 or HEALPix).
     pub grid: GridKind,
-    /// Sorted list of target resolution levels (`0..=15` for H3, `0..=30` for A5).
+    /// Sorted list of target resolution levels (`0..=15` for H3, `0..=30` for A5 and S2, `0..=29` for HEALPix).
     pub resolutions: Vec<u8>,
     /// 1-indexed raster band to extract.
     pub band: usize,
@@ -438,10 +438,7 @@ impl MultiResolutionConfig {
             ));
         }
         let max_res = self.grid.max_resolution();
-        let grid_label = match self.grid {
-            GridKind::H3 => "H3",
-            GridKind::A5 => "A5",
-        };
+        let grid_label = self.grid.label();
         let unique: std::collections::HashSet<_> = self.resolutions.iter().collect();
         if unique.len() != self.resolutions.len() {
             return Err(RasterH3Error::InvalidParameter(format!(

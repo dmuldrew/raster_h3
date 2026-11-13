@@ -543,3 +543,125 @@ fn test_a5_continuous_table_scan() {
     assert!(total_rows > 0);
     assert!((total_pixel_count - 1024.0).abs() < 1e-6);
 }
+
+/// Scan `path` on `grid` with the continuous table function, returning `(cell, count)`
+/// per row and checking the columns every grid shares.
+fn scan_nested_grid(
+    path: &std::path::Path,
+    grid: raster_h3_duckdb::grid::GridKind,
+    extra: Option<(String, MockVal)>,
+) -> Vec<(u64, f64)> {
+    let mut named = HashMap::new();
+    named.insert("grid".to_string(), MockVal::Str(grid.to_string()));
+    named.insert("resolution".to_string(), MockVal::Int(14));
+    named.insert("geom".to_string(), MockVal::Bool(true));
+    named.extend(extra);
+
+    let mut bind_ctx = MockBindContext::new(
+        vec![MockVal::Str(path.to_string_lossy().into_owned())],
+        named,
+    );
+    // SAFETY: live `MockBindContext` for the installed mock C API.
+    unsafe {
+        raster_h3_bind(&mut bind_ctx as *mut MockBindContext as duckdb_bind_info);
+    }
+    assert!(
+        bind_ctx.error.is_none(),
+        "{grid} bind: {:?}",
+        bind_ctx.error
+    );
+    assert_eq!(bind_ctx.result_columns[0].0, grid.index_column_name());
+    assert_eq!(bind_ctx.result_columns[1].0, grid.hex_column_name());
+    assert_eq!(bind_ctx.result_columns[10].0, "geom");
+
+    let mut init_ctx = MockInitContext::new(bind_ctx.bind_data, (0..11).collect());
+    let mut local_ctx = MockInitContext::new(bind_ctx.bind_data, Vec::new());
+    // SAFETY: live `MockInitContext`s carrying bind_data from `bind_ctx`.
+    unsafe {
+        raster_h3_init(&mut init_ctx as *mut MockInitContext as duckdb_init_info);
+        raster_h3_init_local(&mut local_ctx as *mut MockInitContext as duckdb_init_info);
+    }
+    assert!(init_ctx.error.is_none());
+
+    let mut func_ctx = MockFuncContext {
+        bind_data: bind_ctx.bind_data,
+        init_data: init_ctx.init_data,
+        local_init_data: local_ctx.init_data,
+        error: None,
+    };
+    let mut rows = Vec::new();
+    loop {
+        let mut chunk = MockDataChunk::new(11, 2048);
+        // SAFETY: live `MockFuncContext` and `MockDataChunk`.
+        unsafe {
+            raster_h3_scan(
+                &mut func_ctx as *mut MockFuncContext as duckdb_function_info,
+                &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
+            );
+        }
+        assert!(func_ctx.error.is_none());
+        if chunk.size == 0 {
+            break;
+        }
+        // SAFETY: columns populated by `raster_h3_scan`.
+        unsafe {
+            let cells = chunk.vectors[0].data.as_ptr();
+            let counts = chunk.vectors[4].data.as_ptr() as *const f64;
+            for i in 0..chunk.size {
+                let cell = *cells.add(i);
+                assert_eq!(grid.resolution(cell), Some(14), "{grid}");
+                assert_eq!(
+                    std::str::from_utf8(&chunk.vectors[1].strings[i]).unwrap(),
+                    format!("{cell:x}")
+                );
+                // Four corners plus the closing point: 13 + 5 * 16 bytes.
+                assert_eq!(chunk.vectors[9].strings[i].len(), 93);
+                assert_eq!(chunk.vectors[10].strings[i], chunk.vectors[9].strings[i]);
+                rows.push((cell, *counts.add(i)));
+            }
+        }
+    }
+    rows
+}
+
+#[test]
+fn test_s2_and_healpix_continuous_table_scans_and_cell_filters() {
+    use raster_h3_duckdb::grid::GridKind;
+    install_mock_api();
+    let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
+        .origin(-122.45, 37.80)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|c, r| (c + r + 10) as f32);
+
+    for grid in [GridKind::S2, GridKind::Healpix] {
+        let rows = scan_nested_grid(&path, grid, None);
+        assert!(rows.len() > 1, "{grid}");
+        let pixels: f64 = rows.iter().map(|r| r.1).sum();
+        assert!((pixels - 1024.0).abs() < 1e-6, "{grid}");
+        // Every pixel centre's cell is present.
+        for (col, row) in [(0.5, 0.5), (15.5, 20.5), (31.5, 31.5)] {
+            let cell = grid
+                .cell_at(37.80 - row * 0.001, -122.45 + col * 0.001, 14)
+                .unwrap();
+            assert!(rows.iter().any(|r| r.0 == cell), "{grid}");
+        }
+
+        // `<grid>_cell` and `<grid>_hex` restrict the scan to one coarser cell's box.
+        let parent = grid.parent(rows[rows.len() / 2].0, 13).unwrap();
+        let mut children = Vec::new();
+        grid.children_into(parent, 14, &mut children);
+        for filter in [
+            (format!("{grid}_cell"), MockVal::UInt(parent)),
+            (format!("{grid}_hex"), MockVal::Str(format!("{parent:x}"))),
+        ] {
+            let filtered = scan_nested_grid(&path, grid, Some(filter));
+            assert!(filtered.len() < rows.len(), "{grid}");
+            for (cell, count) in &rows {
+                if children.contains(cell) {
+                    // Cells inside the filter cell keep all their pixels.
+                    assert!(filtered.contains(&(*cell, *count)), "{grid}");
+                }
+            }
+        }
+    }
+}

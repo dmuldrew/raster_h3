@@ -278,7 +278,7 @@ impl ExternalFeatureExport {
         self
     }
 
-    /// Configure the spatial grid system (`GridKind::H3` or `GridKind::A5`).
+    /// Configure the spatial grid system (H3, A5, S2 or HEALPix).
     pub fn with_grid(mut self, grid: GridKind) -> Self {
         self.grid = grid;
         self
@@ -386,10 +386,16 @@ impl ExternalFeatureExport {
                 serde_json::Value::Object(map) => map,
                 _ => serde_json::Map::new(),
             },
-            GridKind::A5 => {
+            grid => {
                 let mut map = serde_json::Map::new();
-                map.insert("a5_index".to_string(), serde_json::json!("Number"));
-                map.insert("a5_hex".to_string(), serde_json::json!("String"));
+                map.insert(
+                    grid.index_column_name().to_string(),
+                    serde_json::json!("Number"),
+                );
+                map.insert(
+                    grid.hex_column_name().to_string(),
+                    serde_json::json!("String"),
+                );
                 map.insert("resolution".to_string(), serde_json::json!("Number"));
                 map
             }

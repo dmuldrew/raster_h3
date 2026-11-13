@@ -391,6 +391,77 @@ impl RasterTable for A5ContinuousTable {
     }
 }
 
+/// Declare a [`RasterTable`] that is [`ContinuousTable`] with another default grid.
+macro_rules! grid_continuous_table {
+    ($(#[$doc:meta])* $table:ident, $grid:expr, $function:literal, [$($alias:literal),+ $(,)?]) => {
+        $(#[$doc])*
+        pub(crate) struct $table;
+
+        impl RasterTable for $table {
+            type Bind = RasterH3BindData;
+            type Global = RasterH3GlobalData;
+
+            const NAMES: &'static [&'static str] = &[$function, $($alias),+];
+            const FUNCTION: &'static str = $function;
+            const MISSING_BIND_DATA: &'static str = "Missing bind data in init";
+            const DEFAULT_GRID: GridKind = $grid;
+
+            unsafe fn register_named_parameters(tf: duckdb_table_function) {
+                // SAFETY: forwarded with the same contract.
+                unsafe { ContinuousTable::register_named_parameters(tf) }
+            }
+
+            unsafe fn bind(bind: &BindHelper, common: CommonRasterParams) -> Option<RasterH3BindData> {
+                // SAFETY: forwarded with the same contract.
+                unsafe { ContinuousTable::bind(bind, common) }
+            }
+
+            fn common(bind: &RasterH3BindData) -> &CommonRasterParams {
+                ContinuousTable::common(bind)
+            }
+
+            fn init(
+                bind: &RasterH3BindData,
+                mosaic: Arc<MosaicReader>,
+                projected_columns: Vec<usize>,
+                config: MultiResolutionConfig,
+            ) -> Result<RasterH3GlobalData, String> {
+                ContinuousTable::init(bind, mosaic, projected_columns, config)
+            }
+
+            unsafe fn scan(global: &RasterH3GlobalData, ctx: &mut ScanContext<'_>) {
+                // SAFETY: forwarded with the same contract.
+                unsafe { ContinuousTable::scan(global, ctx) }
+            }
+        }
+    };
+}
+
+grid_continuous_table!(
+    /// `s2_raster_continuous_aggregate`: the continuous aggregation over Google S2 cells.
+    S2ContinuousTable,
+    GridKind::S2,
+    "s2_raster_continuous_aggregate",
+    [
+        "s2_raster_continuous",
+        "read_raster_s2",
+        "raster_to_s2",
+        "raster_s2",
+    ]
+);
+grid_continuous_table!(
+    /// `healpix_raster_continuous_aggregate`: the continuous aggregation over HEALPix cells.
+    HealpixContinuousTable,
+    GridKind::Healpix,
+    "healpix_raster_continuous_aggregate",
+    [
+        "healpix_raster_continuous",
+        "read_raster_healpix",
+        "raster_to_healpix",
+        "raster_healpix",
+    ]
+);
+
 /// Bind callback: parses input arguments, defines output columns, and returns bind data
 ///
 /// # Safety
@@ -436,6 +507,8 @@ pub unsafe fn register_table_function(con: duckdb_connection) -> Result<(), Stri
     // SAFETY: forwarded with the same contract.
     unsafe {
         raster_table::register::<ContinuousTable>(con)?;
-        raster_table::register::<A5ContinuousTable>(con)
+        raster_table::register::<A5ContinuousTable>(con)?;
+        raster_table::register::<S2ContinuousTable>(con)?;
+        raster_table::register::<HealpixContinuousTable>(con)
     }
 }

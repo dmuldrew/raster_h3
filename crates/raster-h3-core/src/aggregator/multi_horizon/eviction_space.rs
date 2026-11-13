@@ -127,7 +127,7 @@ impl EvictionSpace {
     pub fn for_mosaic_with_grid(mosaic: &MosaicReader, grid: GridKind) -> Self {
         match grid {
             GridKind::H3 => Self::for_mosaic(mosaic),
-            GridKind::A5 => Self::Latitude,
+            GridKind::A5 | GridKind::S2 | GridKind::Healpix => Self::Latitude,
         }
     }
 

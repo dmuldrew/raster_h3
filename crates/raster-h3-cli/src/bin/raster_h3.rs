@@ -35,8 +35,9 @@ fn print_help() {
           raster-h3-cli plan <input.tif> [options]       Print partition specs (JSON Lines) for parallel scans\n  \
           raster-h3-cli merge <part.rh3>... [-o <out>]   Combine partitioned `ipc` outputs into final cells\n\n\
         Options:\n  \
-          --grid <h3|a5>             Discrete global grid system (default: h3)\n  \
-          -r, --resolutions <LIST>   Grid resolutions (H3: 0..=15, A5: 0..=30; default: 8)\n  \
+          --grid <h3|a5|s2|healpix>  Discrete global grid system (default: h3)\n  \
+          -r, --resolutions <LIST>   Grid resolutions (H3: 0..=15, A5 and S2: 0..=30,\n                                     \
+                                     HEALPix: 0..=29; default: 8)\n  \
           -c, --categorical          Enable categorical aggregation\n  \
           --format <wide|long>       Categorical output format (default: wide)\n  \
           --crs <CRS>                Override source CRS (e.g. EPSG:4326)\n  \

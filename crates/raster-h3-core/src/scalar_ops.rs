@@ -251,8 +251,8 @@ pub fn parse_containment_mode(s: &str) -> Option<ContainmentMode> {
 /// Why [`h3_polygon_to_cells_wkb`] produced no cell list.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolygonToCellsError {
-    /// Resolution outside `0..=15`.
-    #[error("resolution {0} is outside 0..=15")]
+    /// Resolution outside the grid's range (`0..=15` for H3).
+    #[error("resolution {0} is outside the grid's range")]
     InvalidResolution(i64),
     /// Input is not a valid WKB `POLYGON` / `MULTIPOLYGON` with finite coordinates.
     #[error("invalid polygon geometry: {0}")]
@@ -313,6 +313,87 @@ pub fn h3_polygon_to_cells_wkb_into(
     out.sort_unstable();
     out.dedup();
     Ok(())
+}
+
+/// Index a WGS84 `(lon, lat)` coordinate (in degrees) to a cell of `grid` at `res`.
+/// Longitudes outside `[-180, 180]` wrap.
+#[inline]
+pub fn grid_lonlat_to_cell(grid: GridKind, lon: f64, lat: f64, res: i64) -> Option<u64> {
+    let res = u8::try_from(res)
+        .ok()
+        .filter(|&r| r <= grid.max_resolution())?;
+    grid.cell_at(lat, crate::grid::wrap_lon_180(lon), res)
+}
+
+/// Centroid latitude (degrees, WGS84) of a cell of `grid`, `f64::NAN` if invalid.
+#[inline]
+pub fn grid_to_lat(grid: GridKind, cell: u64) -> f64 {
+    grid.center_lat_lng(cell).map_or(f64::NAN, |(lat, _)| lat)
+}
+
+/// Centroid longitude (degrees, WGS84) of a cell of `grid`, `f64::NAN` if invalid.
+#[inline]
+pub fn grid_to_lng(grid: GridKind, cell: u64) -> f64 {
+    grid.center_lat_lng(cell).map_or(f64::NAN, |(_, lng)| lng)
+}
+
+/// Resolution of a cell of `grid`, or `-1` if invalid.
+#[inline]
+pub fn grid_get_resolution(grid: GridKind, cell: u64) -> i64 {
+    grid.resolution(cell).map_or(-1, i64::from)
+}
+
+/// Whether `hex` is a valid hexadecimal cell index of `grid`.
+#[inline]
+pub fn grid_is_valid_str(grid: GridKind, hex: &str) -> bool {
+    parse_hex_u64(hex).is_some_and(|cell| grid.is_valid(cell))
+}
+
+/// Serialize a cell of `grid` to an OGC Well-Known Binary (WKB) 2D polygon.
+#[inline]
+pub fn grid_to_wkb_u64(grid: GridKind, cell: u64) -> Option<Vec<u8>> {
+    let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
+    let len = crate::encoding::cell_index_to_wkb(grid, cell, &mut buf)?;
+    Some(buf[..len].to_vec())
+}
+
+/// Ancestor of a cell of `grid` at `parent_res`, `None` if invalid or finer than `cell`.
+#[inline]
+pub fn grid_cell_to_parent_u64(grid: GridKind, cell: u64, parent_res: i64) -> Option<u64> {
+    let parent_res = u8::try_from(parent_res).ok()?;
+    grid.parent(cell, parent_res)
+}
+
+/// Fill a WKB `POLYGON` / `MULTIPOLYGON` (WGS84 longitude/latitude degrees) with cells
+/// of `grid` at `res`, writing them sorted and deduplicated into `out`.
+///
+/// S2 and HEALPix cells are tested against the polygon in lon/lat degrees, the model
+/// their geometry is published in; a request whose bounding box holds more than
+/// [`H3_POLYGON_TO_CELLS_MAX_CELLS`] cells is rejected before generation.
+pub fn grid_polygon_to_cells_wkb_into(
+    grid: GridKind,
+    wkb: &[u8],
+    res: i64,
+    mode: ContainmentMode,
+    out: &mut Vec<u64>,
+) -> Result<(), PolygonToCellsError> {
+    match grid {
+        GridKind::H3 => h3_polygon_to_cells_wkb_into(wkb, res, mode, out),
+        GridKind::A5 => a5_polygon_to_cells_wkb_into(wkb, res, mode, out),
+        GridKind::S2 | GridKind::Healpix => {
+            out.clear();
+            let level = u8::try_from(res)
+                .ok()
+                .filter(|&r| r <= grid.max_resolution())
+                .ok_or(PolygonToCellsError::InvalidResolution(res))?;
+            let multi = wkb_to_multipolygon(wkb).map_err(PolygonToCellsError::InvalidGeometry)?;
+            let result = crate::polygon_fill::fill_nested_grid(grid, &multi, level, mode, out);
+            if result.is_err() {
+                out.clear();
+            }
+            result
+        }
+    }
 }
 
 /// Convert a 64-bit A5 cell index into its canonical lowercase hexadecimal string.
@@ -1070,5 +1151,170 @@ mod tests {
                 .unwrap()
                 .contains(&cell)
         );
+    }
+
+    const NESTED: [GridKind; 2] = [GridKind::S2, GridKind::Healpix];
+
+    fn fill(grid: GridKind, wkb: &[u8], res: i64, mode: ContainmentMode) -> Vec<u64> {
+        let mut out = vec![123];
+        grid_polygon_to_cells_wkb_into(grid, wkb, res, mode, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn nested_grid_scalar_ops_round_trip() {
+        for grid in NESTED {
+            let cell = grid_lonlat_to_cell(grid, -122.4194, 37.7749, 12).unwrap();
+            assert_eq!(grid_get_resolution(grid, cell), 12);
+            assert!((grid_to_lat(grid, cell) - 37.7749).abs() < 0.1);
+            assert!((grid_to_lng(grid, cell) + 122.4194).abs() < 0.1);
+            let hex = h3_to_string(cell).unwrap();
+            assert!(grid_is_valid_str(grid, &hex));
+            assert!(!grid_is_valid_str(grid, "0"));
+            assert_eq!(grid_to_wkb_u64(grid, cell).unwrap().len(), 93);
+            let parent = grid_cell_to_parent_u64(grid, cell, 5).unwrap();
+            assert_eq!(grid_get_resolution(grid, parent), 5);
+            assert_eq!(grid_cell_to_parent_u64(grid, cell, 13), None);
+            assert_eq!(grid_cell_to_parent_u64(grid, cell, -1), None);
+            // Out-of-range longitudes wrap; out-of-range resolutions and latitudes fail.
+            assert_eq!(
+                grid_lonlat_to_cell(grid, 190.0, 10.0, 8),
+                grid_lonlat_to_cell(grid, -170.0, 10.0, 8)
+            );
+            assert_eq!(grid_lonlat_to_cell(grid, 0.0, 0.0, 31), None);
+            assert_eq!(grid_lonlat_to_cell(grid, 0.0, 91.0, 3), None);
+            assert_eq!(grid_get_resolution(grid, 0), -1);
+            assert!(grid_to_lat(grid, 0).is_nan());
+            assert_eq!(grid_to_wkb_u64(grid, 0), None);
+        }
+    }
+
+    #[test]
+    fn nested_grid_polygon_fill_matches_a_scan_of_the_box() {
+        let (w, s, e, n) = (-122.5, 37.7, -122.3, 37.85);
+        let wkb = rect_wkb(w, s, e, n);
+        for grid in NESTED {
+            let res = 11u8;
+            let centroid = fill(
+                grid,
+                &wkb,
+                i64::from(res),
+                ContainmentMode::ContainsCentroid,
+            );
+            let boundary = fill(
+                grid,
+                &wkb,
+                i64::from(res),
+                ContainmentMode::ContainsBoundary,
+            );
+            let covers = fill(grid, &wkb, i64::from(res), ContainmentMode::Covers);
+            let intersects = fill(
+                grid,
+                &wkb,
+                i64::from(res),
+                ContainmentMode::IntersectsBoundary,
+            );
+            assert!(!boundary.is_empty(), "{grid}");
+            assert!(boundary.iter().all(|c| centroid.contains(c)));
+            assert!(centroid.iter().all(|c| covers.contains(c)));
+            assert!(boundary.len() < centroid.len() && centroid.len() < covers.len());
+            assert_eq!(covers, intersects);
+            assert!(centroid.windows(2).all(|pair| pair[0] < pair[1]));
+
+            // Every cell a dense scan of a wider box finds, classified by its centre.
+            let mut scanned = std::collections::BTreeSet::new();
+            let step = 0.0005;
+            let mut lat = s - 0.1;
+            while lat < n + 0.1 {
+                let mut lon = w - 0.1;
+                while lon < e + 0.1 {
+                    scanned.insert(grid.cell_at(lat, lon, res).unwrap());
+                    lon += step;
+                }
+                lat += step;
+            }
+            let expected: Vec<u64> = scanned
+                .into_iter()
+                .filter(|&cell| {
+                    let (lat, lon) = grid.center_lat_lng(cell).unwrap();
+                    (w..e).contains(&lon) && (s..n).contains(&lat)
+                })
+                .collect();
+            assert_eq!(centroid, expected, "{grid}");
+        }
+    }
+
+    #[test]
+    fn nested_grid_polygon_fill_handles_holes_tiny_polygons_and_poles() {
+        for grid in NESTED {
+            let cell = grid.cell_at(37.7749, -122.4194, 9).unwrap();
+            let (lat, lon) = grid.center_lat_lng(cell).unwrap();
+            let outer = square(lon, lat, 1.0);
+            let solid = polygon_with_holes_wkb(std::slice::from_ref(&outer));
+            assert!(fill(grid, &solid, 9, ContainmentMode::ContainsBoundary).contains(&cell));
+            // A hole inside the cell: its centre stays in, full containment fails.
+            let holed = polygon_with_holes_wkb(&[outer, square(lon + 0.01, lat + 0.01, 0.002)]);
+            assert!(fill(grid, &holed, 9, ContainmentMode::ContainsCentroid).contains(&cell));
+            assert!(!fill(grid, &holed, 9, ContainmentMode::ContainsBoundary).contains(&cell));
+            assert!(fill(grid, &holed, 9, ContainmentMode::Covers).contains(&cell));
+
+            // A polygon smaller than a cell: only the overlap modes find it.
+            let tiny = polygon_with_holes_wkb(&[square(lon, lat, 0.0005)]);
+            assert_eq!(fill(grid, &tiny, 9, ContainmentMode::Covers), vec![cell]);
+            assert!(fill(grid, &tiny, 9, ContainmentMode::ContainsBoundary).is_empty());
+
+            // A polar cap box finds the cells around the pole.
+            let cap = rect_wkb(-180.0, 88.0, 180.0, 90.0);
+            let cells = fill(grid, &cap, 6, ContainmentMode::Covers);
+            for lon in [-170.0, -60.0, 45.0, 179.0] {
+                assert!(
+                    cells.contains(&grid.cell_at(89.5, lon, 6).unwrap()),
+                    "{grid} {lon}"
+                );
+            }
+            // Resolution 0 returns base cells.
+            let base = fill(grid, &solid, 0, ContainmentMode::Covers);
+            assert_eq!(base, vec![grid.cell_at(lat, lon, 0).unwrap()]);
+        }
+    }
+
+    #[test]
+    fn nested_grid_polygon_fill_rejects_bad_requests() {
+        for grid in NESTED {
+            let mut out = vec![123];
+            let big = rect_wkb(-123.0, 37.0, -122.0, 38.0);
+            let error = grid_polygon_to_cells_wkb_into(
+                grid,
+                &big,
+                i64::from(grid.max_resolution()),
+                ContainmentMode::Covers,
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(matches!(error, PolygonToCellsError::TooManyCells { .. }));
+            assert!(out.is_empty());
+            for res in [-1, i64::from(grid.max_resolution()) + 1] {
+                assert_eq!(
+                    grid_polygon_to_cells_wkb_into(
+                        grid,
+                        &big,
+                        res,
+                        ContainmentMode::Covers,
+                        &mut out
+                    ),
+                    Err(PolygonToCellsError::InvalidResolution(res))
+                );
+            }
+            assert!(matches!(
+                grid_polygon_to_cells_wkb_into(
+                    grid,
+                    &[1, 2, 3],
+                    5,
+                    ContainmentMode::Covers,
+                    &mut out
+                ),
+                Err(PolygonToCellsError::InvalidGeometry(_))
+            ));
+        }
     }
 }

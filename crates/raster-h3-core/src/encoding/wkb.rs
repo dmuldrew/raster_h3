@@ -1,6 +1,6 @@
 //! Well-Known Binary (WKB) geometry serialization for H3 cells.
 
-use crate::grid::{a5_pole_cells, GridKind};
+use crate::grid::GridKind;
 use h3o::CellIndex;
 use std::sync::OnceLock;
 
@@ -363,8 +363,18 @@ pub fn h3_index_to_wkb(h3_index: u64, buf: &mut WkbBuf) -> Option<usize> {
 /// Returns `None` if the index is not a valid A5 cell.
 #[inline]
 pub fn a5_index_to_wkb(a5_index: u64, buf: &mut WkbBuf) -> Option<usize> {
+    cell_index_to_wkb(GridKind::A5, a5_index, buf)
+}
+
+/// Convert a raw 64-bit cell index in `grid` to standard 2D WKB polygon bytes.
+/// Returns `None` if the index is not a valid cell of `grid`.
+#[inline]
+pub fn cell_index_to_wkb(grid: GridKind, cell_index: u64, buf: &mut WkbBuf) -> Option<usize> {
+    if grid == GridKind::H3 {
+        return h3_index_to_wkb(cell_index, buf);
+    }
     let mut verts = [(0.0, 0.0); MAX_CELL_VERTICES];
-    let n = GridKind::A5.boundary_lng_lat(a5_index, &mut verts);
+    let n = grid.boundary_lng_lat(cell_index, &mut verts);
     if n < 3 {
         return None;
     }
@@ -374,23 +384,12 @@ pub fn a5_index_to_wkb(a5_index: u64, buf: &mut WkbBuf) -> Option<usize> {
         lngs[i] = lng;
         lats[i] = lat;
     }
-    let poles = a5_pole_cells();
-    let pole_north = poles.contains(&a5_index).then(|| a5_index == poles[0]);
     Some(write_cell_ring_wkb(
         &mut lngs[..n],
         &lats[..n],
-        pole_north,
+        grid.interior_pole(cell_index),
         buf,
     ))
-}
-
-/// Convert a raw 64-bit cell index in `grid` to standard 2D WKB polygon bytes.
-#[inline]
-pub fn cell_index_to_wkb(grid: GridKind, cell_index: u64, buf: &mut WkbBuf) -> Option<usize> {
-    match grid {
-        GridKind::H3 => h3_index_to_wkb(cell_index, buf),
-        GridKind::A5 => a5_index_to_wkb(cell_index, buf),
-    }
 }
 
 #[cfg(test)]

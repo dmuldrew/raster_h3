@@ -22,6 +22,7 @@ use crate::aggregator::multi_horizon::{
     MultiContinuousRecord, MultiResolutionConfig, MultiScanHorizonStreamer, QuantileTarget,
 };
 use crate::error::{RasterH3Error, Result};
+use crate::grid::GridKind;
 use crate::raster::mosaic::MosaicReader;
 
 use super::{
@@ -336,9 +337,9 @@ fn partial_columns(batch: &RecordBatch) -> Result<PartialColumns<'_>> {
         }) if v.iter().all(|&b| b) => values.as_slice(),
         _ => return Err(missing("resolution")),
     };
-    let h3 = match batch
-        .column_by_name("h3_index")
-        .or_else(|| batch.column_by_name("a5_index"))
+    let h3 = match GridKind::ALL
+        .into_iter()
+        .find_map(|grid| batch.column_by_name(grid.index_column_name()))
     {
         Some(ColumnArray::UInt64 {
             values,

@@ -3,7 +3,9 @@ use std::ffi::c_char;
 
 #[cfg(test)]
 use crate::encoding::WKB_BUF_LEN;
-use crate::encoding::{a5_index_to_wkb, fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf};
+use crate::encoding::{
+    a5_index_to_wkb, cell_index_to_wkb, fast_hex_u64, h3_index_to_wkb, parse_hex_u64, WkbBuf,
+};
 use crate::ffi::*;
 use crate::grid::GridKind;
 use crate::scalar_ops;
@@ -913,6 +915,63 @@ pub unsafe extern "C" fn scalar_a5_cell_to_parent_str(
     }
 }
 
+/// Shared body of `<grid>_lonlat_to_cell(DOUBLE, DOUBLE, BIGINT) -> UBIGINT`; rows with
+/// a NULL argument or that `index` rejects yield NULL.
+///
+/// # Safety
+/// `input` and `output` must be live handles from a DuckDB scalar callback, with
+/// `input` holding `(DOUBLE, DOUBLE, BIGINT)` and `output` holding `UBIGINT`.
+unsafe fn lonlat_to_cell_kernel(
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+    index: impl Fn(f64, f64, i64) -> Option<u64>,
+) {
+    // SAFETY: handles are live and typed per the caller contract; every buffer holds at
+    // least `count` rows and null pointers are rejected before use.
+    unsafe {
+        if input.is_null() || output.is_null() {
+            return;
+        }
+        let count = duckdb_data_chunk_get_size(input);
+        if count == 0 {
+            return;
+        }
+        let v_lon = duckdb_data_chunk_get_vector(input, 0);
+        let v_lat = duckdb_data_chunk_get_vector(input, 1);
+        let v_res = duckdb_data_chunk_get_vector(input, 2);
+        if v_lon.is_null() || v_lat.is_null() || v_res.is_null() {
+            return;
+        }
+        let p_lon = duckdb_vector_get_data(v_lon) as *const f64;
+        let p_lat = duckdb_vector_get_data(v_lat) as *const f64;
+        let p_res = duckdb_vector_get_data(v_res) as *const i64;
+        let p_out = duckdb_vector_get_data(output) as *mut u64;
+        if p_lon.is_null() || p_lat.is_null() || p_res.is_null() || p_out.is_null() {
+            return;
+        }
+        let val_lon = duckdb_vector_get_validity(v_lon);
+        let val_lat = duckdb_vector_get_validity(v_lat);
+        let val_res = duckdb_vector_get_validity(v_res);
+
+        for i in 0..count {
+            if !duckdb_validity_is_valid(val_lon, i)
+                || !duckdb_validity_is_valid(val_lat, i)
+                || !duckdb_validity_is_valid(val_res, i)
+            {
+                duckdb_vector_set_row_invalid(output, i);
+                continue;
+            }
+            let lon = *p_lon.add(i as usize);
+            let lat = *p_lat.add(i as usize);
+            let res = *p_res.add(i as usize);
+            match index(lon, lat, res) {
+                Some(cell) => *p_out.add(i as usize) = cell,
+                None => duckdb_vector_set_row_invalid(output, i),
+            }
+        }
+    }
+}
+
 /// Scalar function: a5_lonlat_to_cell(DOUBLE, DOUBLE, BIGINT) -> UBIGINT
 ///
 /// # Safety
@@ -928,48 +987,272 @@ pub unsafe extern "C" fn scalar_a5_lonlat_to_cell(
     // (contract above). Registered only as `a5_lonlat_to_cell(DOUBLE, DOUBLE, BIGINT) -> UBIGINT`.
     unsafe {
         ffi_scalar_guard(info, || {
-            if input.is_null() || output.is_null() {
-                return;
-            }
-            let count = duckdb_data_chunk_get_size(input);
-            if count == 0 {
-                return;
-            }
-            let v_lon = duckdb_data_chunk_get_vector(input, 0);
-            let v_lat = duckdb_data_chunk_get_vector(input, 1);
-            let v_res = duckdb_data_chunk_get_vector(input, 2);
-            if v_lon.is_null() || v_lat.is_null() || v_res.is_null() {
-                return;
-            }
-            let p_lon = duckdb_vector_get_data(v_lon) as *const f64;
-            let p_lat = duckdb_vector_get_data(v_lat) as *const f64;
-            let p_res = duckdb_vector_get_data(v_res) as *const i64;
-            let p_out = duckdb_vector_get_data(output) as *mut u64;
-            if p_lon.is_null() || p_lat.is_null() || p_res.is_null() || p_out.is_null() {
-                return;
-            }
-            let val_lon = duckdb_vector_get_validity(v_lon);
-            let val_lat = duckdb_vector_get_validity(v_lat);
-            let val_res = duckdb_vector_get_validity(v_res);
-
-            for i in 0..count {
-                if !duckdb_validity_is_valid(val_lon, i)
-                    || !duckdb_validity_is_valid(val_lat, i)
-                    || !duckdb_validity_is_valid(val_res, i)
-                {
-                    duckdb_vector_set_row_invalid(output, i);
-                    continue;
-                }
-                let lon = *p_lon.add(i as usize);
-                let lat = *p_lat.add(i as usize);
-                let res = *p_res.add(i as usize);
-                match scalar_ops::a5_lonlat_to_cell(lon, lat, res) {
-                    Some(cell) => *p_out.add(i as usize) = cell,
-                    None => duckdb_vector_set_row_invalid(output, i),
-                }
-            }
+            lonlat_to_cell_kernel(input, output, scalar_ops::a5_lonlat_to_cell);
         });
     }
+}
+
+// =========================================================================
+// Grid-generic scalar functions (S2, HEALPix)
+//
+// `GRID` is the grid's discriminant (`GridKind as u8`), so each grid gets its own
+// monomorphized C callback.
+// =========================================================================
+
+/// Scalar function: `<grid>_to_lat(UBIGINT) -> DOUBLE`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_to_lat<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(UBIGINT) -> DOUBLE`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_scalar_kernel(input, output, |cell: u64| {
+                scalar_ops::grid_to_lat(GridKind::from_index(GRID), cell)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_to_lng(UBIGINT) -> DOUBLE`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_to_lng<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(UBIGINT) -> DOUBLE`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_scalar_kernel(input, output, |cell: u64| {
+                scalar_ops::grid_to_lng(GridKind::from_index(GRID), cell)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_get_resolution(UBIGINT) -> BIGINT`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_get_resolution<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(UBIGINT) -> BIGINT`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_scalar_kernel(input, output, |cell: u64| {
+                scalar_ops::grid_get_resolution(GridKind::from_index(GRID), cell)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_is_valid(UBIGINT) -> BOOLEAN`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_is_valid_u64<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(UBIGINT) -> BOOLEAN`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_scalar_kernel(input, output, |cell: u64| {
+                GridKind::from_index(GRID).is_valid(cell)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_is_valid(VARCHAR) -> BOOLEAN`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_is_valid_str<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(VARCHAR) -> BOOLEAN`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_str_to_scalar_kernel(input, output, |hex: &str| {
+                scalar_ops::grid_is_valid_str(GridKind::from_index(GRID), hex)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_to_wkb(UBIGINT) -> BLOB` and `<grid>_to_geometry(UBIGINT) -> GEOMETRY`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_to_wkb_u64<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(UBIGINT) -> BLOB/GEOMETRY`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_to_str_kernel(input, output, |cell: u64, buf: &mut WkbBuf| {
+                cell_index_to_wkb(GridKind::from_index(GRID), cell, buf).map(|len| &buf[..len])
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_to_wkb(VARCHAR) -> BLOB` and `<grid>_to_geometry(VARCHAR) -> GEOMETRY`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_to_wkb_str<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(VARCHAR) -> BLOB/GEOMETRY`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            unary_str_to_str_kernel(input, output, |s, buf: &mut WkbBuf| {
+                parse_hex_u64(s)
+                    .and_then(|cell| cell_index_to_wkb(GridKind::from_index(GRID), cell, buf))
+                    .map(|len| &buf[..len])
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_cell_to_parent(UBIGINT, BIGINT) -> UBIGINT`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_cell_to_parent_u64<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(UBIGINT, BIGINT) -> UBIGINT`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            binary_scalar_kernel(input, output, |cell: u64, parent_res: i64| {
+                scalar_ops::grid_cell_to_parent_u64(GridKind::from_index(GRID), cell, parent_res)
+                    .unwrap_or(0)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_cell_to_parent(VARCHAR, BIGINT) -> VARCHAR`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_cell_to_parent_str<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(VARCHAR, BIGINT) -> VARCHAR`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            binary_str_scalar_to_str_kernel(
+                input,
+                output,
+                |s, parent_res: i64, buf: &mut [u8; 16]| {
+                    let cell = parse_hex_u64(s)?;
+                    let parent = scalar_ops::grid_cell_to_parent_u64(
+                        GridKind::from_index(GRID),
+                        cell,
+                        parent_res,
+                    )?;
+                    Some(fast_hex_u64(parent, buf))
+                },
+            );
+        });
+    }
+}
+
+/// Scalar function: `<grid>_lonlat_to_cell(DOUBLE, DOUBLE, BIGINT) -> UBIGINT`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_lonlat_to_cell<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: live handles, registered only as `(DOUBLE, DOUBLE, BIGINT) -> UBIGINT`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            lonlat_to_cell_kernel(input, output, |lon, lat, res| {
+                scalar_ops::grid_lonlat_to_cell(GridKind::from_index(GRID), lon, lat, res)
+            });
+        });
+    }
+}
+
+/// Scalar function: `<grid>_polygon_to_cells(BLOB | GEOMETRY, BIGINT) -> UBIGINT[]`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_polygon_to_cells<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: registered only as `(BLOB|GEOMETRY, BIGINT) -> UBIGINT[]`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            polygon_to_cells_kernel_for(GridKind::from_index(GRID), info, input, output, false);
+        });
+    }
+}
+
+/// Scalar function: `<grid>_polygon_to_cells(BLOB | GEOMETRY, BIGINT, VARCHAR) -> UBIGINT[]`
+///
+/// # Safety
+/// `info`, `input`, and `output` must be the handles DuckDB passes to this scalar
+/// callback, typed as declared.
+pub unsafe extern "C" fn scalar_grid_polygon_to_cells_mode<const GRID: u8>(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    // SAFETY: registered only as `(BLOB|GEOMETRY, BIGINT, VARCHAR) -> UBIGINT[]`.
+    unsafe {
+        ffi_scalar_guard(info, || {
+            polygon_to_cells_kernel_for(GridKind::from_index(GRID), info, input, output, true);
+        });
+    }
+}
+
+/// Bind callback for `<grid>_polygon_to_cells`.
+#[cfg(feature = "duckdb-api-v1_5_6")]
+unsafe extern "C" fn grid_polygon_cells_bind<const GRID: u8>(info: duckdb_bind_info) {
+    // SAFETY: `info` is the live scalar-bind handle.
+    unsafe { polygon_cells_bind_for(info, GridKind::from_index(GRID)) };
 }
 
 /// Owns a scalar-bind expression and destroys it on drop.
@@ -1054,10 +1337,7 @@ unsafe fn fold_constant_argument(
 /// Shared bind callback for `h3_polygon_to_cells` / `a5_polygon_to_cells`.
 #[cfg(feature = "duckdb-api-v1_5_6")]
 unsafe fn polygon_cells_bind_for(info: duckdb_bind_info, grid: GridKind) {
-    let fn_name = match grid {
-        GridKind::H3 => "h3_polygon_to_cells",
-        GridKind::A5 => "a5_polygon_to_cells",
-    };
+    let fn_name = format!("{grid}_polygon_to_cells");
     let max_res = i64::from(grid.max_resolution());
     let set_error = |msg: String| {
         let c = to_c_string(&format!("{fn_name}: {msg}"));
@@ -1141,10 +1421,7 @@ unsafe fn polygon_to_cells_kernel_for(
     output: duckdb_vector,
     has_mode: bool,
 ) {
-    let fn_name = match grid {
-        GridKind::H3 => "h3_polygon_to_cells",
-        GridKind::A5 => "a5_polygon_to_cells",
-    };
+    let fn_name = format!("{grid}_polygon_to_cells");
     // SAFETY: handles are live and typed per the caller contract: column 0 is BLOB/GEOMETRY
     // (`duckdb_string_t`), column 1 BIGINT (`i64`), optional column 2 VARCHAR, and `output`
     // a `UBIGINT[]` list vector. Input/entry buffers hold at least `count` rows, so
@@ -1229,14 +1506,8 @@ unsafe fn polygon_to_cells_kernel_for(
             };
             let wkb = (*p_geom.add(i as usize)).as_bytes();
             let res_val = *p_res.add(i as usize);
-            let fill_res = match grid {
-                GridKind::H3 => {
-                    scalar_ops::h3_polygon_to_cells_wkb_into(wkb, res_val, mode, &mut cells)
-                }
-                GridKind::A5 => {
-                    scalar_ops::a5_polygon_to_cells_wkb_into(wkb, res_val, mode, &mut cells)
-                }
-            };
+            let fill_res =
+                scalar_ops::grid_polygon_to_cells_wkb_into(grid, wkb, res_val, mode, &mut cells);
             match fill_res {
                 Ok(()) => {}
                 Err(err @ scalar_ops::PolygonToCellsError::TooManyCells { .. }) => {
@@ -1406,9 +1677,11 @@ unsafe fn register_scalar_fn_set_ex(
             duckdb_scalar_function_set_function(scalar_fn, func);
             #[cfg(feature = "duckdb-api-v1_5_6")]
             if let Some(grid) = bind_grid {
-                let bind_cb = match grid {
+                let bind_cb: duckdb_scalar_function_bind_t = match grid {
                     GridKind::H3 => polygon_cells_bind,
                     GridKind::A5 => a5_polygon_cells_bind,
+                    GridKind::S2 => grid_polygon_cells_bind::<{ GridKind::S2 as u8 }>,
+                    GridKind::Healpix => grid_polygon_cells_bind::<{ GridKind::Healpix as u8 }>,
                 };
                 duckdb_scalar_function_set_bind(scalar_fn, bind_cb);
             }
@@ -1721,6 +1994,123 @@ pub unsafe fn register_scalar_functions(con: duckdb_connection) -> Result<(), St
                 None
             },
         ));
+        // S2 and HEALPix scalar functions, the same set as A5's.
+        macro_rules! register_grid_scalars {
+            ($grid:expr) => {{
+                const G: u8 = $grid as u8;
+                let grid: GridKind = $grid;
+                let name = |suffix: &str| format!("{grid}_{suffix}");
+                register_unary_scalar_fn(
+                    con,
+                    &name("to_string"),
+                    type_ubigint,
+                    type_varchar,
+                    scalar_h3_to_string,
+                );
+                register_unary_scalar_fn(
+                    con,
+                    &format!("string_to_{grid}"),
+                    type_varchar,
+                    type_ubigint,
+                    scalar_string_to_h3,
+                );
+                register_unary_scalar_fn(
+                    con,
+                    &name("to_lat"),
+                    type_ubigint,
+                    type_double,
+                    scalar_grid_to_lat::<G>,
+                );
+                register_unary_scalar_fn(
+                    con,
+                    &name("to_lng"),
+                    type_ubigint,
+                    type_double,
+                    scalar_grid_to_lng::<G>,
+                );
+                register_unary_scalar_fn(
+                    con,
+                    &name("get_resolution"),
+                    type_ubigint,
+                    type_bigint,
+                    scalar_grid_get_resolution::<G>,
+                );
+                for suffix in ["is_valid", "is_valid_cell"] {
+                    results.push(register_scalar_fn_set(
+                        con,
+                        &name(suffix),
+                        &[
+                            (&[type_ubigint], type_bool, scalar_grid_is_valid_u64::<G>),
+                            (&[type_varchar], type_bool, scalar_grid_is_valid_str::<G>),
+                        ],
+                    ));
+                }
+                for (suffix, ret) in [
+                    ("to_wkb", type_blob),
+                    ("to_geometry", type_geom),
+                    ("cell_to_geometry", type_geom),
+                ] {
+                    results.push(register_scalar_fn_set(
+                        con,
+                        &name(suffix),
+                        &[
+                            (&[type_ubigint], ret, scalar_grid_to_wkb_u64::<G>),
+                            (&[type_varchar], ret, scalar_grid_to_wkb_str::<G>),
+                        ],
+                    ));
+                }
+                results.push(register_scalar_fn_set(
+                    con,
+                    &name("cell_to_parent"),
+                    &[
+                        (
+                            &[type_ubigint, type_bigint],
+                            type_ubigint,
+                            scalar_grid_cell_to_parent_u64::<G>,
+                        ),
+                        (
+                            &[type_varchar, type_bigint],
+                            type_varchar,
+                            scalar_grid_cell_to_parent_str::<G>,
+                        ),
+                    ],
+                ));
+                results.push(register_scalar_fn_set(
+                    con,
+                    &name("lonlat_to_cell"),
+                    &[(
+                        &[type_double, type_double, type_bigint],
+                        type_ubigint,
+                        scalar_grid_lonlat_to_cell::<G>,
+                    )],
+                ));
+                let overloads: Vec<ScalarOverload<'_>> = polygon_params
+                    .iter()
+                    .flat_map(|params| {
+                        [
+                            (
+                                &params[..2],
+                                type_cell_list,
+                                scalar_grid_polygon_to_cells::<G> as duckdb_scalar_function_t,
+                            ),
+                            (
+                                &params[..],
+                                type_cell_list,
+                                scalar_grid_polygon_to_cells_mode::<G> as duckdb_scalar_function_t,
+                            ),
+                        ]
+                    })
+                    .collect();
+                results.push(register_scalar_fn_set_ex(
+                    con,
+                    &name("polygon_to_cells"),
+                    &overloads,
+                    cfg!(feature = "duckdb-api-v1_5_6").then_some(grid),
+                ));
+            }};
+        }
+        register_grid_scalars!(GridKind::S2);
+        register_grid_scalars!(GridKind::Healpix);
         let mut type_cell_list_mut = type_cell_list;
         duckdb_destroy_logical_type(&mut type_cell_list_mut);
 

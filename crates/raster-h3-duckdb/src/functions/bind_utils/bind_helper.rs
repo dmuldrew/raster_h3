@@ -25,20 +25,8 @@ pub fn cell_wgs84_bbox(cell: h3o::CellIndex) -> [f64; 4] {
 /// Conservative WGS84 bounding box `[min_lon, min_lat, max_lon, max_lat]` for a cell on `grid`.
 pub fn cell_wgs84_bbox_for(grid: GridKind, cell_u64: u64) -> Option<[f64; 4]> {
     let res = grid.resolution(cell_u64)?;
-    let (is_north_pole, is_south_pole) = match grid {
-        GridKind::H3 => {
-            let cell = h3o::CellIndex::try_from(cell_u64).ok()?;
-            let r = cell.resolution();
-            (
-                cell == h3o::LatLng::new(90.0, 0.0).expect("valid").to_cell(r),
-                cell == h3o::LatLng::new(-90.0, 0.0).expect("valid").to_cell(r),
-            )
-        }
-        GridKind::A5 => {
-            let [north, south] = crate::grid::a5_pole_cells();
-            (cell_u64 == north, cell_u64 == south)
-        }
-    };
+    let pole = grid.interior_pole(cell_u64);
+    let (is_north_pole, is_south_pole) = (pole == Some(true), pole == Some(false));
     let mut verts = [(0.0, 0.0); 10];
     let n = grid.boundary_lng_lat(cell_u64, &mut verts);
     if n == 0 {
@@ -54,8 +42,11 @@ pub fn cell_wgs84_bbox_for(grid: GridKind, cell_u64: u64) -> Option<[f64; 4]> {
             let (p_lng, p_lat) = verts[i];
             let (q_lng, q_lat) = verts[(i + 1) % n];
             let mut edge_north = p_lat.max(q_lat).next_up();
-            // A5 edges are not great-circle arcs: pad them in both hemispheres.
-            if grid == GridKind::A5 || p_lat >= 0.0 || q_lat >= 0.0 {
+            // A HEALPix cell's north vertex is its northernmost point: no padding. A5
+            // edges are not great-circle arcs: pad them in both hemispheres.
+            if grid != GridKind::Healpix
+                && (!grid.has_geodesic_edges() || p_lat >= 0.0 || q_lat >= 0.0)
+            {
                 let direct = (p_lng - q_lng).abs();
                 let delta_lon = direct.min(360.0 - direct);
                 let delta_lat = (p_lat - q_lat).abs();
@@ -311,8 +302,9 @@ impl BindHelper {
                 Some(g) => Some(g),
                 None => {
                     self.set_error(&format!(
-                        "Invalid grid parameter '{}': expected 'h3' or 'a5'",
-                        s
+                        "Invalid grid parameter '{}': expected {}",
+                        s,
+                        GridKind::EXPECTED
                     ));
                     None
                 }
@@ -377,8 +369,8 @@ impl BindHelper {
     /// Parse spatial bounding box from coordinates or H3/A5 cell:
     /// 1. `min_lon, min_lat, max_lon, max_lat` (4 explicit coordinates)
     /// 2. `bbox := 'min_lon,min_lat,max_lon,max_lat'` (list/string)
-    /// 3. `h3_cell` / `a5_cell` (BIGINT/UBIGINT)
-    /// 4. `h3_hex` / `a5_hex` (VARCHAR)
+    /// 3. `h3_cell` (BIGINT), `a5_cell` / `s2_cell` / `healpix_cell` (UBIGINT)
+    /// 4. `h3_hex` / `a5_hex` / `s2_hex` / `healpix_hex` (VARCHAR)
     pub fn parse_bbox(&self) -> Option<[f64; 4]> {
         // 1. Explicit min_lon, min_lat, max_lon, max_lat
         let min_lon = self.get_named_double("min_lon");
@@ -416,22 +408,14 @@ impl BindHelper {
             }
         }
 
-        // 5. A5 cell index (u64 / i64)
-        if let Some(cell_u64) = self
-            .get_named_uint("a5_cell")
-            .or_else(|| self.get_named_int("a5_cell").map(|v| v as u64))
-        {
-            if let Some(bbox) = cell_wgs84_bbox_for(GridKind::A5, cell_u64) {
+        // 5. A5, S2 or HEALPix cell index (`a5_cell`, ...) or hex string (`a5_hex`, ...)
+        for grid in [GridKind::A5, GridKind::S2, GridKind::Healpix] {
+            let cell = self.get_named_uint(&format!("{grid}_cell")).or_else(|| {
+                self.get_named_string(grid.hex_column_name())
+                    .and_then(|hex| crate::encoding::parse_hex_u64(hex.trim()))
+            });
+            if let Some(bbox) = cell.and_then(|cell| cell_wgs84_bbox_for(grid, cell)) {
                 return Some(bbox);
-            }
-        }
-
-        // 6. A5 hex string
-        if let Some(hex_str) = self.get_named_string("a5_hex") {
-            if let Some(cell_u64) = crate::encoding::parse_hex_u64(hex_str.trim()) {
-                if let Some(bbox) = cell_wgs84_bbox_for(GridKind::A5, cell_u64) {
-                    return Some(bbox);
-                }
             }
         }
 

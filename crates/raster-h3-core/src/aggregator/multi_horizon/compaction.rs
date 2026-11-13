@@ -605,4 +605,28 @@ mod tests {
         let records = drain(&mut output);
         assert_eq!(records, vec![(9, parent, 4.0)]);
     }
+
+    #[test]
+    fn nested_grid_four_child_compaction_emits_parent() {
+        let k = kernel();
+        for grid in [GridKind::S2, GridKind::Healpix] {
+            let mut compactor = HierarchicalCompactor::<ContinuousKernel>::with_grid_and_byte_limit(
+                grid,
+                true,
+                usize::MAX,
+            );
+            let mut output = OutputBuffer::with_capacity(16);
+            let parent = grid.cell_at(37.7749, -122.4194, 9).unwrap();
+            let mut children = Vec::new();
+            grid.children_into(parent, 10, &mut children);
+            assert_eq!(children.len(), 4, "{grid}");
+
+            for &child in &children[..3] {
+                compactor.push_cell(&k, 10, child, H3Accumulator::new(2.0), &mut output);
+                assert!(output.is_empty());
+            }
+            compactor.push_cell(&k, 10, children[3], H3Accumulator::new(2.0), &mut output);
+            assert_eq!(drain(&mut output), vec![(9, parent, 4.0)], "{grid}");
+        }
+    }
 }
