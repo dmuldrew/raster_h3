@@ -17,17 +17,6 @@ fn pole_cells(res: h3o::Resolution) -> [CellIndex; 2] {
     })[u8::from(res) as usize]
 }
 
-/// The north and south pole resolution-0 cells in A5 (higher resolutions meet at the pole as a vertex).
-pub(crate) fn a5_pole_cells() -> [u64; 2] {
-    static A5_POLES: OnceLock<[u64; 2]> = OnceLock::new();
-    *A5_POLES.get_or_init(|| {
-        [
-            a5::lonlat_to_cell(a5::LonLat::new(0.0, 90.0), 0).expect("north pole a5"),
-            a5::lonlat_to_cell(a5::LonLat::new(0.0, -90.0), 0).expect("south pole a5"),
-        ]
-    })
-}
-
 /// Most boundary vertices of any H3 cell (class III pentagons).
 const MAX_CELL_VERTICES: usize = 10;
 
@@ -374,8 +363,18 @@ pub fn h3_index_to_wkb(h3_index: u64, buf: &mut WkbBuf) -> Option<usize> {
 /// Returns `None` if the index is not a valid A5 cell.
 #[inline]
 pub fn a5_index_to_wkb(a5_index: u64, buf: &mut WkbBuf) -> Option<usize> {
+    cell_index_to_wkb(GridKind::A5, a5_index, buf)
+}
+
+/// Convert a raw 64-bit cell index in `grid` to standard 2D WKB polygon bytes.
+/// Returns `None` if the index is not a valid cell of `grid`.
+#[inline]
+pub fn cell_index_to_wkb(grid: GridKind, cell_index: u64, buf: &mut WkbBuf) -> Option<usize> {
+    if grid == GridKind::H3 {
+        return h3_index_to_wkb(cell_index, buf);
+    }
     let mut verts = [(0.0, 0.0); MAX_CELL_VERTICES];
-    let n = GridKind::A5.boundary_lng_lat(a5_index, &mut verts);
+    let n = grid.boundary_lng_lat(cell_index, &mut verts);
     if n < 3 {
         return None;
     }
@@ -385,23 +384,12 @@ pub fn a5_index_to_wkb(a5_index: u64, buf: &mut WkbBuf) -> Option<usize> {
         lngs[i] = lng;
         lats[i] = lat;
     }
-    let poles = a5_pole_cells();
-    let pole_north = poles.contains(&a5_index).then(|| a5_index == poles[0]);
     Some(write_cell_ring_wkb(
         &mut lngs[..n],
         &lats[..n],
-        pole_north,
+        grid.interior_pole(cell_index),
         buf,
     ))
-}
-
-/// Convert a raw 64-bit cell index in `grid` to standard 2D WKB polygon bytes.
-#[inline]
-pub fn cell_index_to_wkb(grid: GridKind, cell_index: u64, buf: &mut WkbBuf) -> Option<usize> {
-    match grid {
-        GridKind::H3 => h3_index_to_wkb(cell_index, buf),
-        GridKind::A5 => a5_index_to_wkb(cell_index, buf),
-    }
 }
 
 #[cfg(test)]

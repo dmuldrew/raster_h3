@@ -59,10 +59,7 @@ pub fn estimate_raster_cardinality_for(
 
             let mut total_hex_est = 0u64;
             for &res in resolutions {
-                let hex_area = match grid {
-                    GridKind::H3 => H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5),
-                    GridKind::A5 => crate::a5::cell_area(i32::from(res)).max(1e-6),
-                };
+                let hex_area = grid.area_m2(res);
                 let hex_count = (area_m2 / hex_area).ceil() as u64;
                 total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
             }

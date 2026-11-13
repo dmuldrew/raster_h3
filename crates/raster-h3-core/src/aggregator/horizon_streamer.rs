@@ -58,11 +58,16 @@ pub fn compute_cell_south_lat_for(grid: GridKind, cell_u64: u64) -> f64 {
     for i in 0..n {
         let (p_lng, p_lat) = verts[i];
         let (q_lng, q_lat) = verts[(i + 1) % n];
-        if grid == GridKind::A5 && (p_lat <= -89.0 || q_lat <= -89.0) {
+        if grid != GridKind::H3 && (p_lat <= -89.0 || q_lat <= -89.0) {
             return -90.0;
         }
         let mut edge_south = p_lat.min(q_lat).next_down();
-        if p_lat <= 0.0 || q_lat <= 0.0 {
+        // A HEALPix cell is a diamond in a projection whose y depends on latitude alone,
+        // so its south vertex is its southernmost point: no padding. A5 edges are not
+        // great-circle arcs and can dip below both endpoints in either hemisphere, so
+        // every A5 edge is padded.
+        if grid != GridKind::Healpix && (!grid.has_geodesic_edges() || p_lat <= 0.0 || q_lat <= 0.0)
+        {
             // Longitude differences are bounded above by both the direct and wrapped routes.
             let direct_lo = (p_lng - q_lng).abs();
             let direct_hi = direct_lo.next_up();

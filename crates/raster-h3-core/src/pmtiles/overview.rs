@@ -122,7 +122,7 @@ impl<A: SpillAccumulator> Overview<A> {
 
     pub fn push(&mut self, cell_u64: u64, value: &A) -> io::Result<()> {
         for &res in &self.resolutions {
-            if let Some(parent) = self.grid.cell_to_parent(cell_u64, res) {
+            if let Some(parent) = self.grid.parent(cell_u64, res) {
                 self.parents.push(parent, value.clone())?;
             }
         }
@@ -145,10 +145,10 @@ impl<A: SpillAccumulator> Overview<A> {
         let mut tiles = BufferedMerge::new(BUFFER_BYTES);
         let mut capped = 0;
         self.parents.finish(|id, acc| {
-            let (c_lat, c_lng) = grid.cell_to_lat_lng(id).expect("validated parent");
+            let (c_lat, c_lng) = grid.center_lat_lng(id).expect("validated parent");
             let center = MercatorPoint::from_lat_lng(c_lat, c_lng);
             let (vertices, len) = cell_boundary_mercator_for(grid, id).expect("validated parent");
-            let cell_res = grid.cell_resolution(id).expect("validated parent");
+            let cell_res = grid.resolution(id).expect("validated parent");
             let mut emitted = false;
             for &z in zooms {
                 if grid_res_for_zoom(grid, z) != cell_res {
@@ -178,7 +178,7 @@ impl<A: SpillAccumulator> Overview<A> {
             for (id, acc) in cells.0 {
                 let (vertices, len) =
                     cell_boundary_mercator_for(grid, id).expect("validated parent");
-                let cell_res = grid.cell_resolution(id).expect("validated parent");
+                let cell_res = grid.resolution(id).expect("validated parent");
                 layer.add_hexagon_mercator(
                     id,
                     &vertices[..len],

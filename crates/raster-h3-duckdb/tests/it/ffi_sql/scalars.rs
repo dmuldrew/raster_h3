@@ -360,3 +360,106 @@ fn test_all_scalar_functions_and_null_propagation() {
         assert!(!out_a5_parent_str.is_valid(1));
     }
 }
+
+#[test]
+fn test_s2_and_healpix_scalar_functions() {
+    use raster_h3_duckdb::grid::GridKind;
+    install_mock_api();
+
+    fn run<const G: u8>() {
+        let grid = GridKind::from_index(G);
+        let expected = grid.cell_at(37.7749, -122.4194, 8).unwrap();
+
+        let mut lonlat = MockDataChunk::new(3, 4);
+        lonlat.size = 3;
+        // SAFETY: mock vector buffers are 8-aligned `u64` storage with capacity 4.
+        unsafe {
+            for row in 0..2 {
+                *(lonlat.vectors[0].data.as_mut_ptr() as *mut f64).add(row) = -122.4194;
+                *(lonlat.vectors[1].data.as_mut_ptr() as *mut f64).add(row) = 37.7749;
+            }
+            *(lonlat.vectors[2].data.as_mut_ptr() as *mut i64).add(0) = 8;
+            // Row 1: a resolution past the grid's range -> NULL. Row 2: NULL input.
+            *(lonlat.vectors[2].data.as_mut_ptr() as *mut i64).add(1) = 31;
+            lonlat.vectors[0].has_validity = true;
+            duckdb_validity_set_row_invalid(lonlat.vectors[0].validity.as_mut_ptr(), 2);
+        }
+        let mut out_cell = MockVector::new(4);
+        // SAFETY: live mock chunk/vector matching `(DOUBLE, DOUBLE, BIGINT) -> UBIGINT`.
+        unsafe {
+            scalar_grid_lonlat_to_cell::<G>(
+                ptr::null_mut(),
+                &mut lonlat as *mut MockDataChunk as duckdb_data_chunk,
+                &mut out_cell as *mut MockVector as duckdb_vector,
+            );
+            assert_eq!(*out_cell.data.as_ptr(), expected, "{grid}");
+        }
+        assert!(out_cell.is_valid(0));
+        assert_eq!(out_cell.is_valid(1), grid.max_resolution() >= 31);
+        assert!(!out_cell.is_valid(2));
+
+        let mut cells = MockDataChunk::new(1, 4);
+        cells.size = 2;
+        // SAFETY: mock vector buffer with capacity 4.
+        unsafe {
+            *cells.vectors[0].data.as_mut_ptr().add(0) = expected;
+            *cells.vectors[0].data.as_mut_ptr().add(1) = 0u64; // no grid has cell 0
+        }
+        let [mut hex, mut lat, mut lng, mut res, mut valid, mut wkb] =
+            std::array::from_fn(|_| MockVector::new(4));
+        // SAFETY: live mock chunks/vectors matching the registered scalar types.
+        unsafe {
+            let input = &mut cells as *mut MockDataChunk as duckdb_data_chunk;
+            let out = |v: &mut MockVector| v as *mut MockVector as duckdb_vector;
+            scalar_h3_to_string(ptr::null_mut(), input, out(&mut hex));
+            scalar_grid_to_lat::<G>(ptr::null_mut(), input, out(&mut lat));
+            scalar_grid_to_lng::<G>(ptr::null_mut(), input, out(&mut lng));
+            scalar_grid_get_resolution::<G>(ptr::null_mut(), input, out(&mut res));
+            scalar_grid_is_valid_u64::<G>(ptr::null_mut(), input, out(&mut valid));
+            scalar_grid_to_wkb_u64::<G>(ptr::null_mut(), input, out(&mut wkb));
+
+            let lats = lat.data.as_ptr() as *const f64;
+            let lngs = lng.data.as_ptr() as *const f64;
+            assert!((*lats - 37.7749).abs() < 1.0 && (*lats.add(1)).is_nan());
+            assert!((*lngs + 122.4194).abs() < 1.0 && (*lngs.add(1)).is_nan());
+            assert_eq!(*(res.data.as_ptr() as *const i64), 8);
+            assert_eq!(*(res.data.as_ptr() as *const i64).add(1), -1);
+            assert!(*(valid.data.as_ptr() as *const bool));
+            assert!(!*(valid.data.as_ptr() as *const bool).add(1));
+        }
+        assert_eq!(wkb.strings[0].len(), 93); // four corners and the closing point
+        assert!(!wkb.is_valid(1));
+
+        // The hex overloads agree with the integer ones.
+        let hex = std::str::from_utf8(&hex.strings[0]).unwrap().to_string();
+        assert_eq!(hex, format!("{expected:x}"));
+        let mut hexes = MockDataChunk::new(2, 4);
+        hexes.size = 2;
+        hexes.vectors[0].set_str_input(0, &hex);
+        hexes.vectors[0].set_str_input(1, &hex);
+        // SAFETY: mock vector buffer with capacity 4.
+        unsafe {
+            *(hexes.vectors[1].data.as_mut_ptr() as *mut i64).add(0) = 6;
+            *(hexes.vectors[1].data.as_mut_ptr() as *mut i64).add(1) = 9; // finer than the cell
+        }
+        let [mut parent, mut valid_str, mut wkb_str] = std::array::from_fn(|_| MockVector::new(4));
+        // SAFETY: live mock chunks/vectors matching the registered scalar types.
+        unsafe {
+            let input = &mut hexes as *mut MockDataChunk as duckdb_data_chunk;
+            let out = |v: &mut MockVector| v as *mut MockVector as duckdb_vector;
+            scalar_grid_cell_to_parent_str::<G>(ptr::null_mut(), input, out(&mut parent));
+            scalar_grid_is_valid_str::<G>(ptr::null_mut(), input, out(&mut valid_str));
+            scalar_grid_to_wkb_str::<G>(ptr::null_mut(), input, out(&mut wkb_str));
+            assert!(*(valid_str.data.as_ptr() as *const bool));
+        }
+        assert_eq!(
+            std::str::from_utf8(&parent.strings[0]).unwrap(),
+            format!("{:x}", grid.parent(expected, 6).unwrap())
+        );
+        assert!(!parent.is_valid(1));
+        assert_eq!(wkb_str.strings[0], wkb.strings[0]);
+    }
+
+    run::<{ GridKind::S2 as u8 }>();
+    run::<{ GridKind::Healpix as u8 }>();
+}

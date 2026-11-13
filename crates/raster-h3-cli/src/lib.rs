@@ -410,14 +410,20 @@ pub fn merge_partition_files<W: Write>(opts: &CliMergeOptions, writer: &mut W) -
         .map(|&i| input_schema.fields[i].name.as_str())
         .collect();
 
-    let grid = if input_schema.index_of("a5_index").is_some()
-        || input_schema.index_of("a5_hex").is_some()
-        || headers[0].scan.get("grid").and_then(|v| v.as_str()) == Some("a5")
-    {
-        GridKind::A5
-    } else {
-        GridKind::H3
-    };
+    // The partitions' own header names the grid; older files only show it in the
+    // index column's name.
+    let grid = headers[0]
+        .scan
+        .get("grid")
+        .and_then(|v| v.as_str())
+        .and_then(GridKind::parse)
+        .or_else(|| {
+            GridKind::ALL.into_iter().find(|grid| {
+                input_schema.index_of(grid.index_column_name()).is_some()
+                    || input_schema.index_of(grid.hex_column_name()).is_some()
+            })
+        })
+        .unwrap_or(GridKind::H3);
     let continuous = ColumnSchema::continuous_for(grid, &[]);
     let wide = ColumnSchema::categorical_wide_for(grid);
     let categorical_only = names.iter().any(|n| continuous.index_of(n).is_none());
@@ -975,7 +981,8 @@ pub fn parse_stream_args(
             }
             "--grid" => {
                 let v = value()?;
-                opts.grid = GridKind::parse(v).ok_or_else(|| invalid(flag, v, "'h3' or 'a5'"))?;
+                opts.grid =
+                    GridKind::parse(v).ok_or_else(|| invalid(flag, v, GridKind::EXPECTED))?;
             }
             "-r" | "--resolution" | "--resolutions" => {
                 let v = value()?;
@@ -1048,12 +1055,13 @@ pub fn parse_stream_args(
     }
 
     if let Some((flag, v)) = raw_resolutions {
-        let expected = match opts.grid {
-            GridKind::H3 => "H3 resolutions between 0 and 15, e.g. 7,8",
-            GridKind::A5 => "A5 resolutions between 0 and 30, e.g. 7,8",
-        };
+        let expected = format!(
+            "{} resolutions between 0 and {}, e.g. 7,8",
+            opts.grid.label(),
+            opts.grid.max_resolution()
+        );
         opts.resolutions = try_parse_resolutions_str_for(opts.grid, &v)
-            .ok_or_else(|| invalid(&flag, &v, expected))?;
+            .ok_or_else(|| invalid(&flag, &v, &expected))?;
     }
 
     if opts.input_path.is_empty() {
@@ -1282,7 +1290,8 @@ mod tests {
             &["--bbox", "10,20,30"][..],
             &["-r", "16"],
             &["--grid", "a5", "-r", "31"],
-            &["--grid", "s2"],
+            &["--grid", "healpix", "-r", "30"],
+            &["--grid", "s9"],
             &["-r", "8,abc"],
             &["--nodata", "abc"],
             &["--limit", "-1"],
@@ -1344,5 +1353,138 @@ mod tests {
         assert!(decoded.iter().all(|row| row["mean"] == 42.0
             && row["a5_index"].is_u64()
             && row["a5_hex"].is_string()));
+    }
+
+    #[test]
+    fn test_cli_s2_and_healpix_streaming_and_partition_merge() {
+        let tif = write_test_tif(16, 16, 42.0);
+        for grid in [GridKind::S2, GridKind::Healpix] {
+            let name = grid.as_str();
+            let args = |extra: &[&str]| -> Vec<String> {
+                [
+                    tif.path().to_str().unwrap(),
+                    "--grid",
+                    name,
+                    "--resolution",
+                    "10",
+                    "--crs",
+                    "EPSG:4326",
+                ]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect()
+            };
+            let columns = format!("{name}_index,{name}_hex,resolution,mean,count");
+            let (opts, _) =
+                parse_stream_args(&args(&["--columns", &columns]), StreamOutputFormat::Jsonl)
+                    .unwrap();
+            assert_eq!(opts.grid, grid);
+            let mut json = Vec::new();
+            let rows = stream_raster_to_writer(&opts, &mut json).unwrap();
+            assert!(rows > 0);
+            let whole: Vec<serde_json::Value> = String::from_utf8(json)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for row in &whole {
+                let cell = row[format!("{name}_index")].as_u64().unwrap();
+                assert_eq!(grid.resolution(cell), Some(10));
+                assert_eq!(row["mean"], 42.0);
+                assert!(row[format!("{name}_hex")].is_string());
+            }
+
+            // The same scan split in two partitions and merged gives the same cells.
+            let plan =
+                plan_raster_partitions(tif.path().to_str().unwrap(), 1, Some("EPSG:4326"), None)
+                    .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut parts = Vec::new();
+            for (i, partition) in plan.iter().enumerate() {
+                let spec = partition.to_json();
+                let (opts, _) = parse_stream_args(
+                    &args(&["--columns", &columns, "--partition", &spec]),
+                    StreamOutputFormat::Ipc,
+                )
+                .unwrap();
+                let path = dir.path().join(format!("part{i}.rh3"));
+                let mut file = std::fs::File::create(&path).unwrap();
+                stream_raster_to_writer(&opts, &mut file).unwrap();
+                parts.push(path.to_string_lossy().to_string());
+            }
+            let (merge, _) = parse_merge_args(&parts).unwrap();
+            let mut merged = Vec::new();
+            merge_partition_files(&merge, &mut merged).unwrap();
+            let (schema, batches) = read_ipc_stream(&mut std::io::Cursor::new(merged)).unwrap();
+            assert_eq!(schema.fields[0].name, format!("{name}_index"));
+            let total: usize = batches.iter().map(|b| b.num_rows).sum();
+            assert_eq!(total, whole.len(), "{grid}");
+        }
+    }
+
+    #[test]
+    fn test_cli_s2_and_healpix_parquet_and_pmtiles_exports() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::RowAccessor;
+        let tif = write_test_tif(16, 16, 42.0);
+        let input = tif.path().to_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for grid in [GridKind::S2, GridKind::Healpix] {
+            for categorical in [false, true] {
+                for geoparquet in [false, true] {
+                    let parquet = dir
+                        .path()
+                        .join(format!("{grid}-{categorical}-{geoparquet}.parquet"));
+                    let rows = export_raster_to_parquet_with_grid(
+                        grid,
+                        input,
+                        &parquet,
+                        vec![10],
+                        categorical,
+                        Some("EPSG:4326".into()),
+                        None,
+                        None,
+                        geoparquet,
+                        false,
+                    )
+                    .unwrap();
+                    assert!(rows > 0);
+                    let reader =
+                        SerializedFileReader::new(std::fs::File::open(&parquet).unwrap()).unwrap();
+                    let schema = reader.metadata().file_metadata().schema_descr();
+                    assert_eq!(schema.column(0).name(), grid.index_column_name());
+                    let cells: Vec<u64> = reader
+                        .get_row_iter(None)
+                        .unwrap()
+                        .map(|row| row.unwrap().get_ulong(0).unwrap())
+                        .collect();
+                    assert_eq!(cells.len(), rows);
+                    assert!(cells.iter().all(|&c| grid.resolution(c) == Some(10)));
+
+                    // The Parquet file transcodes to tiles on the grid its column names.
+                    let tiles = dir.path().join("from-parquet.pmtiles");
+                    let summary = transcode_parquet_to_pmtiles(&parquet, &tiles, None).unwrap();
+                    assert_eq!(summary.valid_features, rows, "{grid}");
+                    assert_eq!(summary.invalid_features_dropped, 0);
+                    assert_eq!(summary.max_zoom, 10);
+                }
+                let tiles = dir.path().join(format!("{grid}-{categorical}.pmtiles"));
+                let written = export_raster_to_pmtiles_with_grid(
+                    grid,
+                    input,
+                    &tiles,
+                    vec![10],
+                    categorical,
+                    Some("EPSG:4326".into()),
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert!(written > 0, "{grid}");
+                assert!(std::fs::metadata(&tiles).unwrap().len() > 127);
+            }
+        }
     }
 }

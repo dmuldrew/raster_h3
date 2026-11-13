@@ -6,6 +6,7 @@
 //!
 //! Employs lock-free double-buffered channel streaming via [`super::pipeline`].
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
 
@@ -171,7 +172,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             let hex_slice = fast_hex_u64(cell_u64, &mut hex_buf);
             self.h3_hexes.push(ByteArray::from(hex_slice));
 
-            if let Some((lat, lng)) = self.grid.cell_to_lat_lng(cell_u64) {
+            if let Some((lat, lng)) = self.grid.center_lat_lng(cell_u64) {
                 self.lats.push(lat);
                 self.lngs.push(lng);
             } else {
@@ -260,11 +261,20 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
     }
 
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
-        Self::schema_message_for(GridKind::H3, compact, geoparquet)
+        match Self::schema_message_for(GridKind::H3, compact, geoparquet) {
+            Cow::Borrowed(schema) => schema,
+            Cow::Owned(_) => unreachable!("the H3 schema is static"),
+        }
     }
 
-    fn schema_message_for(grid: GridKind, compact: bool, geoparquet: bool) -> &'static str {
-        match (grid, compact, geoparquet) {
+    fn schema_message_for(grid: GridKind, compact: bool, geoparquet: bool) -> Cow<'static, str> {
+        // S2 and HEALPix share the A5 layout (unsigned ids) under their own column names.
+        let layout = if grid == GridKind::H3 {
+            GridKind::H3
+        } else {
+            GridKind::A5
+        };
+        let template: &'static str = match (layout, compact, geoparquet) {
             (GridKind::H3, true, false) => {
                 "
                 message schema {
@@ -377,6 +387,11 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                 }
             "
             }
+            (GridKind::S2 | GridKind::Healpix, _, _) => unreachable!("layout is H3 or A5"),
+        };
+        match grid {
+            GridKind::H3 | GridKind::A5 => Cow::Borrowed(template),
+            _ => Cow::Owned(template.replace("a5_", &format!("{}_", grid.as_str()))),
         }
     }
 }
@@ -475,7 +490,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             let hex_slice = fast_hex_u64(cell_u64, &mut hex_buf);
             self.h3_hexes.push(ByteArray::from(hex_slice));
 
-            if let Some((lat, lng)) = self.grid.cell_to_lat_lng(cell_u64) {
+            if let Some((lat, lng)) = self.grid.center_lat_lng(cell_u64) {
                 self.lats.push(lat);
                 self.lngs.push(lng);
             } else {
@@ -564,11 +579,20 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     }
 
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
-        Self::schema_message_for(GridKind::H3, compact, geoparquet)
+        match Self::schema_message_for(GridKind::H3, compact, geoparquet) {
+            Cow::Borrowed(schema) => schema,
+            Cow::Owned(_) => unreachable!("the H3 schema is static"),
+        }
     }
 
-    fn schema_message_for(grid: GridKind, compact: bool, geoparquet: bool) -> &'static str {
-        match (grid, compact, geoparquet) {
+    fn schema_message_for(grid: GridKind, compact: bool, geoparquet: bool) -> Cow<'static, str> {
+        // S2 and HEALPix share the A5 layout (unsigned ids) under their own column names.
+        let layout = if grid == GridKind::H3 {
+            GridKind::H3
+        } else {
+            GridKind::A5
+        };
+        let template: &'static str = match (layout, compact, geoparquet) {
             (GridKind::H3, true, false) => {
                 "
                 message schema {
@@ -681,6 +705,11 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                 }
             "
             }
+            (GridKind::S2 | GridKind::Healpix, _, _) => unreachable!("layout is H3 or A5"),
+        };
+        match grid {
+            GridKind::H3 | GridKind::A5 => Cow::Borrowed(template),
+            _ => Cow::Owned(template.replace("a5_", &format!("{}_", grid.as_str()))),
         }
     }
 }

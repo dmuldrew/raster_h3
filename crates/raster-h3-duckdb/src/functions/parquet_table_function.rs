@@ -64,7 +64,7 @@ pub struct ParquetGlobalData {
 /// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
     // SAFETY: forwarded with `GridKind::H3` as default.
-    unsafe { parquet_bind_for::<false>(info) }
+    unsafe { parquet_bind_for::<{ GridKind::H3 as u8 }>(info) }
 }
 
 /// Bind callback for `a5_raster_to_parquet` (defaulting `grid` to `GridKind::A5`).
@@ -73,10 +73,20 @@ pub unsafe extern "C" fn parquet_bind(info: duckdb_bind_info) {
 /// `info` must be the valid bind info DuckDB passes to this callback.
 pub unsafe extern "C" fn a5_parquet_bind(info: duckdb_bind_info) {
     // SAFETY: forwarded with `GridKind::A5` as default.
-    unsafe { parquet_bind_for::<true>(info) }
+    unsafe { parquet_bind_for::<{ GridKind::A5 as u8 }>(info) }
 }
 
-unsafe fn parquet_bind_for<const DEFAULT_A5: bool>(info: duckdb_bind_info) {
+/// Bind callback for `<grid>_raster_to_parquet`, defaulting `grid` to the grid whose
+/// discriminant is `GRID`.
+///
+/// # Safety
+/// `info` must be the valid bind info DuckDB passes to this callback.
+pub unsafe extern "C" fn grid_parquet_bind<const GRID: u8>(info: duckdb_bind_info) {
+    // SAFETY: forwarded with the same contract.
+    unsafe { parquet_bind_for::<GRID>(info) }
+}
+
+unsafe fn parquet_bind_for<const GRID: u8>(info: duckdb_bind_info) {
     // SAFETY: DuckDB passes this bind callback a live `info` (contract above), and the
     // `BindHelper` wrapping it is only used inside this callback. Logical types we create
     // are destroyed once after DuckDB copies them. The boxed `ParquetBindData` is handed to
@@ -85,16 +95,8 @@ unsafe fn parquet_bind_for<const DEFAULT_A5: bool>(info: duckdb_bind_info) {
     unsafe {
         ffi_bind_guard(info, || {
             let bind = BindHelper::new(info);
-            let default_grid = if DEFAULT_A5 {
-                GridKind::A5
-            } else {
-                GridKind::H3
-            };
-            let func_name = if DEFAULT_A5 {
-                "a5_raster_to_parquet"
-            } else {
-                "h3_raster_to_parquet"
-            };
+            let default_grid = GridKind::from_index(GRID);
+            let func_name = format!("{default_grid}_raster_to_parquet");
 
             if bind.parameter_count() < 2 {
                 bind.set_error(&format!(
@@ -334,6 +336,14 @@ pub unsafe fn register_parquet_table_function(con: duckdb_connection) -> Result<
             (
                 "a5_raster_to_parquet",
                 a5_parquet_bind as duckdb_table_function_bind_t,
+            ),
+            (
+                "s2_raster_to_parquet",
+                grid_parquet_bind::<{ GridKind::S2 as u8 }> as duckdb_table_function_bind_t,
+            ),
+            (
+                "healpix_raster_to_parquet",
+                grid_parquet_bind::<{ GridKind::Healpix as u8 }> as duckdb_table_function_bind_t,
             ),
         ] {
             let fn_name = to_c_string(name);

@@ -265,11 +265,12 @@ impl PropertyFilter {
             generic_set.insert(token.clone());
 
             match token.as_str() {
-                "h3_index" | "a5_index" | "index" | "h3" | "a5" => {
+                "h3_index" | "a5_index" | "s2_index" | "healpix_index" | "index" | "h3" | "a5"
+                | "s2" | "healpix" => {
                     cont_mask |= PROP_H3_INDEX;
                     cat_mask |= PROP_CAT_H3_INDEX;
                 }
-                "h3_hex" | "a5_hex" | "hex" => {
+                "h3_hex" | "a5_hex" | "s2_hex" | "healpix_hex" | "hex" => {
                     cont_mask |= PROP_H3_HEX;
                     cat_mask |= PROP_CAT_H3_HEX;
                 }
@@ -1002,22 +1003,21 @@ impl MvtLayer {
                             idx
                         }
                     };
-                    let val_idx =
-                        if k == "h3_index" || k == "h3_hex" || k == "a5_index" || k == "a5_hex" {
-                            let idx = values.len() as u32;
-                            values.push(v.clone());
-                            idx
-                        } else {
-                            match val_map.get(v) {
-                                Some(&idx) => idx,
-                                None => {
-                                    let idx = values.len() as u32;
-                                    values.push(v.clone());
-                                    val_map.insert(v.clone(), idx);
-                                    idx
-                                }
+                    let val_idx = if GridKind::from_cell_column_name(k).is_some() {
+                        let idx = values.len() as u32;
+                        values.push(v.clone());
+                        idx
+                    } else {
+                        match val_map.get(v) {
+                            Some(&idx) => idx,
+                            None => {
+                                let idx = values.len() as u32;
+                                values.push(v.clone());
+                                val_map.insert(v.clone(), idx);
+                                idx
                             }
-                        };
+                        }
+                    };
                     write_varint(&mut tag_bytes, key_idx as u64);
                     write_varint(&mut tag_bytes, val_idx as u64);
                 });

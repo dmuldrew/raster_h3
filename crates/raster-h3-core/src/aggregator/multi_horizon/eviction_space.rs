@@ -60,7 +60,7 @@ pub struct CellKeys {
 /// How cell keys and chunk bounds are measured for one stream.
 #[derive(Debug, Clone)]
 pub enum EvictionSpace {
-    /// Keys are latitudes ([`compute_cell_south_lat`], [`eviction_north_bound`]).
+    /// Keys are latitudes ([`compute_cell_south_lat_for`], [`eviction_north_bound`]).
     Latitude,
     /// Keys are negated rows of a reference grid in a shared Albers projection.
     Rows(Box<RowSpace>),
@@ -127,7 +127,7 @@ impl EvictionSpace {
     pub fn for_mosaic_with_grid(mosaic: &MosaicReader, grid: GridKind) -> Self {
         match grid {
             GridKind::H3 => Self::for_mosaic(mosaic),
-            GridKind::A5 => Self::Latitude,
+            GridKind::A5 | GridKind::S2 | GridKind::Healpix => Self::Latitude,
         }
     }
 

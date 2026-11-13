@@ -9,7 +9,7 @@
 //! pattern and resolution count, not by row or raster size.
 
 use crate::aggregator::cell_hash::H3BuildHasher;
-use crate::grid::{A5Backend, GridBackend, GridKind, H3Backend};
+use crate::grid::{A5Backend, GridBackend, GridKind, H3Backend, HealpixBackend, S2Backend};
 use h3o::Resolution;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -238,6 +238,28 @@ fn walk<T, Acc, E, N, R>(
             maps,
         ),
         GridKind::A5 => walk_grid::<T, Acc, E, N, R, A5Backend>(
+            ctx,
+            res_u8s,
+            slice,
+            spp,
+            is_row_all_nodata,
+            read,
+            batch,
+            engine,
+            maps,
+        ),
+        GridKind::S2 => walk_grid::<T, Acc, E, N, R, S2Backend>(
+            ctx,
+            res_u8s,
+            slice,
+            spp,
+            is_row_all_nodata,
+            read,
+            batch,
+            engine,
+            maps,
+        ),
+        GridKind::Healpix => walk_grid::<T, Acc, E, N, R, HealpixBackend>(
             ctx,
             res_u8s,
             slice,
@@ -644,6 +666,11 @@ fn flush_run<T, Acc, E: ScanlineEngine<T, Acc>>(
     let Some(cell) = cell.filter(|_| engine.has_samples(acc)) else {
         return;
     };
+    if cell == 0 {
+        // 0 is no cell in any grid: it marks a sample the backend could not index.
+        engine.clear_acc(acc);
+        return;
+    }
     match map.entry(cell) {
         Entry::Occupied(mut entry) => {
             engine.merge_acc(entry.get_mut(), acc);

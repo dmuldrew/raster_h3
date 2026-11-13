@@ -68,8 +68,14 @@ pub unsafe fn register_common_raster_named_parameters(func: duckdb_table_functio
         add_named_parameter(func, "bbox", DuckDBType::Varchar);
         add_named_parameter(func, "h3_cell", DuckDBType::BigInt);
         add_named_parameter(func, "h3_hex", DuckDBType::Varchar);
-        add_named_parameter(func, "a5_cell", DuckDBType::BigInt);
+        // A5 ids use all 64 bits, so BIGINT would reject about half of them.
+        add_named_parameter(func, "a5_cell", DuckDBType::UBigInt);
         add_named_parameter(func, "a5_hex", DuckDBType::Varchar);
+        // S2 ids use all 64 bits too (the face is the top three).
+        add_named_parameter(func, "s2_cell", DuckDBType::UBigInt);
+        add_named_parameter(func, "s2_hex", DuckDBType::Varchar);
+        add_named_parameter(func, "healpix_cell", DuckDBType::UBigInt);
+        add_named_parameter(func, "healpix_hex", DuckDBType::Varchar);
         add_named_parameter(func, "compact", DuckDBType::Boolean);
         add_named_parameter(func, "overlap_rule", DuckDBType::Varchar);
         add_named_parameter(func, "workers", DuckDBType::BigInt);

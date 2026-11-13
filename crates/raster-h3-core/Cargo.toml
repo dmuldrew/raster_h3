@@ -26,6 +26,8 @@ test-hooks = []
 
 [dependencies]
 a5.workspace = true
+healpix.workspace = true
+s2.workspace = true
 # `geo` enables h3o's polygon-to-cells tiling (`h3o::geom`).
 h3o = { workspace = true, features = ["geo"] }
 geo-types = "0.7"

@@ -278,7 +278,7 @@ impl ExternalFeatureExport {
         self
     }
 
-    /// Configure the spatial grid system (`GridKind::H3` or `GridKind::A5`).
+    /// Configure the spatial grid system (H3, A5, S2 or HEALPix).
     pub fn with_grid(mut self, grid: GridKind) -> Self {
         self.grid = grid;
         self
@@ -293,10 +293,10 @@ impl ExternalFeatureExport {
     /// counted and dropped, as in [`crate::pmtiles::H3PmtilesTiler::export_h3_features`].
     pub fn push(&mut self, feature: H3Feature) -> io::Result<()> {
         self.total_features += 1;
-        let Some((c_lat, _c_lng)) = self.grid.cell_to_lat_lng(feature.h3_index) else {
+        let Some((c_lat, _c_lng)) = self.grid.center_lat_lng(feature.h3_index) else {
             return Ok(());
         };
-        let Some(res) = self.grid.cell_resolution(feature.h3_index) else {
+        let Some(res) = self.grid.resolution(feature.h3_index) else {
             return Ok(());
         };
         self.valid_features += 1;
@@ -386,10 +386,16 @@ impl ExternalFeatureExport {
                 serde_json::Value::Object(map) => map,
                 _ => serde_json::Map::new(),
             },
-            GridKind::A5 => {
+            grid => {
                 let mut map = serde_json::Map::new();
-                map.insert("a5_index".to_string(), serde_json::json!("Number"));
-                map.insert("a5_hex".to_string(), serde_json::json!("String"));
+                map.insert(
+                    grid.index_column_name().to_string(),
+                    serde_json::json!("Number"),
+                );
+                map.insert(
+                    grid.hex_column_name().to_string(),
+                    serde_json::json!("String"),
+                );
                 map.insert("resolution".to_string(), serde_json::json!("Number"));
                 map
             }
@@ -497,13 +503,13 @@ fn add_record(
     record: SortRecord,
 ) {
     // Only valid cells are buffered (checked in `push`).
-    let Some((c_lat, c_lng)) = grid.cell_to_lat_lng(record.h3_index) else {
+    let Some((c_lat, c_lng)) = grid.center_lat_lng(record.h3_index) else {
         return;
     };
     let Some((v_merc, v_count)) = cell_boundary_mercator_for(grid, record.h3_index) else {
         return;
     };
-    let Some(res) = grid.cell_resolution(record.h3_index) else {
+    let Some(res) = grid.resolution(record.h3_index) else {
         return;
     };
     let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lng);
