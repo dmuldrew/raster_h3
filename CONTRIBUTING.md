@@ -220,6 +220,7 @@ examples/                    # CLI conversion & benchmark examples
 ├── parquet_to_pmtiles.rs    # CLI: Parquet to PMTiles converter
 ├── raster_to_pmtiles.rs     # CLI: GeoTIFF to PMTiles converter
 ├── test_hawaii_files.rs     # Hawaii real-world dataset benchmark
+├── benchmark_grids.rs       # Hawaii time and peak memory per grid (H3, A5, S2, HEALPix)
 ├── test_mosaic_burn_probability.rs  # Multi-tile mosaic benchmark
 ├── verify_pushdown.rs       # Predicate pushdown verification
 └── debug/                   # Developer diagnostics (inspect_pmtiles, etc.)

@@ -30,6 +30,7 @@ cargo run --example <name> --release
 | Example | Description |
 |:---|:---|
 | `test_hawaii_files` | Real-world benchmark on Hawaii CFL and LANDFIRE FBFM40 datasets. |
+| `benchmark_grids` | Time and peak memory of a full Hawaii scan on each grid (H3, A5, S2, HEALPix), one process per case, resolutions matched by cell area. |
 | `test_mosaic_burn_probability` | Multi-tile mosaic ingestion using USFS Burn Probability GeoTIFF tiles. |
 | `verify_pushdown` | Verifies spatial bounding box predicate pushdown with chunk-level pruning statistics. |
 | `generate_sample` | Generates a synthetic WGS84 GeoTIFF with a radial elevation gradient for testing. |
