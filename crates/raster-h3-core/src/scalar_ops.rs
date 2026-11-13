@@ -1279,6 +1279,42 @@ mod tests {
     }
 
     #[test]
+    fn nested_grid_fill_rejects_thin_high_resolution_boxes() {
+        for grid in NESTED {
+            for bbox in [(-170.0, 0.0, 170.0, 1e-12), (0.0, -80.0, 1e-12, 80.0)] {
+                let mut out = vec![123];
+                let error = grid_polygon_to_cells_wkb_into(
+                    grid,
+                    &rect_wkb(bbox.0, bbox.1, bbox.2, bbox.3),
+                    i64::from(grid.max_resolution()),
+                    ContainmentMode::ContainsBoundary,
+                    &mut out,
+                )
+                .unwrap_err();
+                assert!(matches!(error, PolygonToCellsError::TooManyCells { .. }));
+                assert!(out.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn nested_grid_fill_rejects_invalid_latitudes() {
+        for grid in NESTED {
+            let mut out = vec![123];
+            let error = grid_polygon_to_cells_wkb_into(
+                grid,
+                &rect_wkb(0.0, 89.0, 1.0, 91.0),
+                4,
+                ContainmentMode::Covers,
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(matches!(error, PolygonToCellsError::InvalidGeometry(_)));
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
     fn nested_grid_polygon_fill_rejects_bad_requests() {
         for grid in NESTED {
             let mut out = vec![123];

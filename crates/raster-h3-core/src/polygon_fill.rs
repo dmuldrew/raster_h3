@@ -26,6 +26,11 @@ impl Ring {
                 "non-finite coordinates",
             ));
         }
+        if points.iter().any(|p| !(-90.0..=90.0).contains(&p.1)) {
+            return Err(PolygonToCellsError::InvalidGeometry(
+                "latitude outside [-90, 90]",
+            ));
+        }
         if points.len() > 1 && points.first() == points.last() {
             points.pop();
         }
@@ -262,8 +267,16 @@ fn estimate_cells(grid: GridKind, res: u8, bbox: &LonLatBox) -> usize {
     let area = lon_span * band.max(0.0) * EARTH_RADIUS_M * EARTH_RADIUS_M;
     // Cells along the box's edge are visited too.
     let cell_area = grid.area_m2(res);
-    let across = (area / cell_area).sqrt();
-    (area / cell_area + 4.0 * across + 16.0).ceil() as usize
+    // sqrt(area) undercounts the perimeter of long, thin boxes, even tending
+    // to zero for a line that crosses millions of cells.
+    let height = (bbox[3] - bbox[1]).to_radians() * EARTH_RADIUS_M;
+    let nearest_equator = if bbox[1] <= 0.0 && bbox[3] >= 0.0 {
+        0.0
+    } else {
+        bbox[1].abs().min(bbox[3].abs())
+    };
+    let width = lon_span * nearest_equator.to_radians().cos() * EARTH_RADIUS_M;
+    (area / cell_area + 2.0 * (width + height) / cell_area.sqrt() + 16.0).ceil() as usize
 }
 
 /// Fill `multi` with cells of `grid` (S2 or HEALPix) at `res`, appending to `out`.
