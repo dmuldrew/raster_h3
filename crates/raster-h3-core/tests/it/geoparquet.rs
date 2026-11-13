@@ -752,7 +752,8 @@ fn a5_unsigned_ids_round_trip_all_parquet_layouts() {
     for categorical in [false, true] {
         for compact in [false, true] {
             for geoparquet in [false, true] {
-                let output = NamedTempFile::new().unwrap();
+                let output_dir = tempfile::tempdir().unwrap();
+                let output = output_dir.path().join("output.parquet");
                 let options = ParquetExportConfig {
                     compact,
                     geoparquet,
@@ -762,19 +763,19 @@ fn a5_unsigned_ids_round_trip_all_parquet_layouts() {
                 if categorical {
                     H3ParquetWriter::write_categorical_streamer_to_parquet(
                         MultiCategoricalHorizonStreamer::new(raster, &config).unwrap(),
-                        output.path(),
+                        &output,
                         options,
                     )
                     .unwrap();
                 } else {
                     H3ParquetWriter::write_continuous_streamer_to_parquet(
                         MultiScanHorizonStreamer::new(raster, &config).unwrap(),
-                        output.path(),
+                        &output,
                         options,
                     )
                     .unwrap();
                 }
-                let reader = SerializedFileReader::new(File::open(output.path()).unwrap()).unwrap();
+                let reader = SerializedFileReader::new(File::open(&output).unwrap()).unwrap();
                 let rows: Vec<_> = reader
                     .get_row_iter(None)
                     .unwrap()
