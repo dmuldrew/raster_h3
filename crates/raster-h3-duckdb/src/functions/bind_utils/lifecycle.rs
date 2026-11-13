@@ -6,6 +6,7 @@ use crate::ffi::{
     duckdb_init_get_column_count, duckdb_init_get_column_index, duckdb_init_info,
     duckdb_init_set_error, duckdb_init_set_init_data,
 };
+use crate::grid::GridKind;
 use crate::raster::geotiff::GeoTiffStreamReader;
 use crate::raster::mosaic::{MosaicReader, OverlapRule};
 
@@ -17,6 +18,21 @@ pub const H3_AREA_M2: [f64; 16] = [
 
 /// Estimate query cardinality (number of H3 cells emitted) for a set of raster sources and resolutions
 pub fn estimate_raster_cardinality(
+    resolved_paths: &[PathBuf],
+    resolutions: &[u8],
+    remote_source_factory: Option<&raster_h3_core::raster::http_range::RemoteSourceFactory>,
+) -> u64 {
+    estimate_raster_cardinality_for(
+        GridKind::H3,
+        resolved_paths,
+        resolutions,
+        remote_source_factory,
+    )
+}
+
+/// Estimate query cardinality (number of grid cells emitted) for `grid`.
+pub fn estimate_raster_cardinality_for(
+    grid: GridKind,
     resolved_paths: &[PathBuf],
     resolutions: &[u8],
     remote_source_factory: Option<&raster_h3_core::raster::http_range::RemoteSourceFactory>,
@@ -43,7 +59,10 @@ pub fn estimate_raster_cardinality(
 
             let mut total_hex_est = 0u64;
             for &res in resolutions {
-                let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
+                let hex_area = match grid {
+                    GridKind::H3 => H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5),
+                    GridKind::A5 => crate::a5::cell_area(i32::from(res)).max(1e-6),
+                };
                 let hex_count = (area_m2 / hex_area).ceil() as u64;
                 total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
             }

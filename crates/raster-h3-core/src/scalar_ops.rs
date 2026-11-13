@@ -8,8 +8,10 @@ use h3o::geom::TilerBuilder;
 use h3o::{CellIndex, LatLng, Resolution};
 
 use crate::encoding::{
-    fast_hex_u64, h3_index_to_wkb, parse_hex_u64, wkb_to_multipolygon, WkbBuf, WKB_BUF_LEN,
+    a5_index_to_wkb, fast_hex_u64, h3_index_to_wkb, parse_hex_u64, wkb_to_multipolygon, WkbBuf,
+    WKB_BUF_LEN,
 };
+use crate::grid::{a5_is_valid_cell, GridKind};
 use crate::raster::geotiff::GeoTiffStreamReader;
 
 /// Approximate H3 cell areas in m^2 by resolution (0 to 15) for query planner cardinality estimation.
@@ -20,11 +22,17 @@ pub const H3_AREA_M2: [f64; 16] = [
 
 /// Parse a list of H3 resolutions from a string (comma/whitespace separated, sorted, deduplicated, <= 15).
 pub fn parse_resolutions_str(s: &str) -> Vec<u8> {
+    parse_resolutions_str_for(GridKind::H3, s)
+}
+
+/// Parse a list of resolutions for `grid` from a string (comma/whitespace separated, sorted, deduplicated).
+pub fn parse_resolutions_str_for(grid: GridKind, s: &str) -> Vec<u8> {
+    let max_res = grid.max_resolution();
     let mut list: Vec<u8> = s
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|item| !item.is_empty())
         .filter_map(|item| item.parse::<u8>().ok())
-        .filter(|&r| r <= 15)
+        .filter(|&r| r <= max_res)
         .collect();
     list.sort_unstable();
     list.dedup();
@@ -34,10 +42,16 @@ pub fn parse_resolutions_str(s: &str) -> Vec<u8> {
 /// Strict variant of [`parse_resolutions_str`]: `None` if any entry is not an integer in
 /// `0..=15` or the list is empty, instead of silently dropping invalid entries.
 pub fn try_parse_resolutions_str(s: &str) -> Option<Vec<u8>> {
+    try_parse_resolutions_str_for(GridKind::H3, s)
+}
+
+/// Strict variant of [`parse_resolutions_str_for`] for `grid`.
+pub fn try_parse_resolutions_str_for(grid: GridKind, s: &str) -> Option<Vec<u8>> {
+    let max_res = grid.max_resolution();
     let mut list = s
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|item| !item.is_empty())
-        .map(|item| item.parse::<u8>().ok().filter(|&r| r <= 15))
+        .map(|item| item.parse::<u8>().ok().filter(|&r| r <= max_res))
         .collect::<Option<Vec<u8>>>()?;
     if list.is_empty() {
         return None;
@@ -60,6 +74,15 @@ pub fn parse_bbox_str(s: &str) -> Option<[f64; 4]> {
 
 /// Estimate query cardinality (number of H3 cells emitted) for a set of raster sources and resolutions.
 pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8]) -> u64 {
+    estimate_raster_cardinality_for(GridKind::H3, resolved_paths, resolutions)
+}
+
+/// Estimate query cardinality (number of cells emitted) for a set of raster sources, `grid`, and resolutions.
+pub fn estimate_raster_cardinality_for(
+    grid: GridKind,
+    resolved_paths: &[PathBuf],
+    resolutions: &[u8],
+) -> u64 {
     if let Some(first_path) = resolved_paths.first() {
         if let Ok(reader) = GeoTiffStreamReader::open(first_path) {
             let w = reader.metadata.width as f64;
@@ -80,8 +103,11 @@ pub fn estimate_raster_cardinality(resolved_paths: &[PathBuf], resolutions: &[u8
 
             let mut total_hex_est = 0u64;
             for &res in resolutions {
-                let hex_area = H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5);
-                let hex_count = (area_m2 / hex_area).ceil() as u64;
+                let cell_area = match grid {
+                    GridKind::H3 => H3_AREA_M2.get(res as usize).copied().unwrap_or(7.373e5),
+                    GridKind::A5 => a5::cell_area(i32::from(res)).max(1e-6),
+                };
+                let hex_count = (area_m2 / cell_area).ceil() as u64;
                 total_hex_est = total_hex_est.saturating_add(hex_count.min(total_pixels).max(1));
             }
             total_hex_est.max(1)
@@ -292,6 +318,216 @@ pub fn h3_polygon_to_cells_wkb_into(
     Ok(())
 }
 
+/// Convert a 64-bit A5 cell index into its canonical lowercase hexadecimal string.
+/// Returns `None` if `cell` is `0`.
+#[inline]
+pub fn a5_to_string(cell: u64) -> Option<String> {
+    h3_to_string(cell)
+}
+
+/// Parse a hexadecimal A5 string into a 64-bit unsigned integer.
+#[inline]
+pub fn try_string_to_a5(hex: &str) -> Option<u64> {
+    parse_hex_u64(hex)
+}
+
+/// Parse a hexadecimal A5 string into a 64-bit unsigned integer, returning `0` on failure.
+#[inline]
+pub fn string_to_a5(hex: &str) -> u64 {
+    parse_hex_u64(hex).unwrap_or(0)
+}
+
+/// Index a WGS84 `(lon, lat)` coordinate (in degrees) to an A5 cell at `res` (`0..=30`).
+#[inline]
+pub fn a5_lonlat_to_cell(lon: f64, lat: f64, res: i64) -> Option<u64> {
+    if !lon.is_finite() || !(-90.0..=90.0).contains(&lat) || !(0..=30).contains(&res) {
+        return None;
+    }
+    a5::lonlat_to_cell(a5::LonLat::new(lon.clamp(-180.0, 180.0), lat), res as i32).ok()
+}
+
+/// Extract the centroid latitude (in degrees, WGS84) of an A5 cell index.
+/// Returns `f64::NAN` if `cell` is not a valid A5 index.
+#[inline]
+pub fn a5_to_lat(cell: u64) -> f64 {
+    GridKind::A5
+        .cell_to_lat_lng(cell)
+        .map_or(f64::NAN, |(lat, _)| lat)
+}
+
+/// Extract the centroid longitude (in degrees, WGS84) of an A5 cell index.
+/// Returns `f64::NAN` if `cell` is not a valid A5 index.
+#[inline]
+pub fn a5_to_lng(cell: u64) -> f64 {
+    GridKind::A5
+        .cell_to_lat_lng(cell)
+        .map_or(f64::NAN, |(_, lng)| lng)
+}
+
+/// Extract the A5 resolution (`0..=30`) of a 64-bit A5 cell index, or `-1` if invalid.
+#[inline]
+pub fn a5_get_resolution(cell: u64) -> i64 {
+    GridKind::A5.cell_resolution(cell).map_or(-1, i64::from)
+}
+
+/// Return `true` if `cell` is a valid 64-bit A5 cell index.
+#[inline]
+pub fn a5_is_valid_u64(cell: u64) -> bool {
+    a5_is_valid_cell(cell)
+}
+
+/// Return `true` if `hex` is a valid hexadecimal A5 cell index string.
+#[inline]
+pub fn a5_is_valid_str(hex: &str) -> bool {
+    parse_hex_u64(hex).is_some_and(a5_is_valid_cell)
+}
+
+/// Serialize a 64-bit A5 cell index to an OGC Well-Known Binary (WKB) 2D Polygon.
+#[inline]
+pub fn a5_to_wkb_u64(cell: u64) -> Option<Vec<u8>> {
+    let mut buf: WkbBuf = [0u8; WKB_BUF_LEN];
+    let len = a5_index_to_wkb(cell, &mut buf)?;
+    Some(buf[..len].to_vec())
+}
+
+/// Serialize a hexadecimal A5 cell index string to an OGC Well-Known Binary (WKB) 2D Polygon.
+#[inline]
+pub fn a5_to_wkb_str(hex: &str) -> Option<Vec<u8>> {
+    let cell = parse_hex_u64(hex)?;
+    a5_to_wkb_u64(cell)
+}
+
+/// Compute the parent A5 cell index at `parent_res` (`0..=30`) for a 64-bit A5 cell index.
+#[inline]
+pub fn a5_cell_to_parent_u64(cell: u64, parent_res: i64) -> Option<u64> {
+    if !(0..=30).contains(&parent_res) {
+        return None;
+    }
+    GridKind::A5.cell_to_parent(cell, parent_res as u8)
+}
+
+/// Compute the parent A5 cell hex string at `parent_res` (`0..=30`) for a hexadecimal A5 cell string.
+#[inline]
+pub fn a5_cell_to_parent_str(hex: &str, parent_res: i64) -> Option<String> {
+    let cell = parse_hex_u64(hex)?;
+    let parent = a5_cell_to_parent_u64(cell, parent_res)?;
+    a5_to_string(parent)
+}
+
+/// Fill a WKB `POLYGON` / `MULTIPOLYGON` (WGS84 longitude/latitude degrees) with A5 cells
+/// at `res` (`0..=30`) using `a5::polygon_to_cells` and the given containment `mode`.
+///
+/// Returns the cells sorted ascending and deduplicated; an empty geometry yields an empty list.
+pub fn a5_polygon_to_cells_wkb(
+    wkb: &[u8],
+    res: i64,
+    mode: ContainmentMode,
+) -> Result<Vec<u64>, PolygonToCellsError> {
+    let mut cells = Vec::new();
+    a5_polygon_to_cells_wkb_into(wkb, res, mode, &mut cells)?;
+    Ok(cells)
+}
+
+/// [`a5_polygon_to_cells_wkb`] writing into a caller-supplied buffer.
+pub fn a5_polygon_to_cells_wkb_into(
+    wkb: &[u8],
+    res: i64,
+    mode: ContainmentMode,
+    out: &mut Vec<u64>,
+) -> Result<(), PolygonToCellsError> {
+    out.clear();
+    if !(0..=30).contains(&res) {
+        return Err(PolygonToCellsError::InvalidResolution(res));
+    }
+    let multi = wkb_to_multipolygon(wkb).map_err(PolygonToCellsError::InvalidGeometry)?;
+    if multi.0.is_empty() {
+        return Ok(());
+    }
+    let containment = match mode {
+        ContainmentMode::IntersectsBoundary | ContainmentMode::Covers => {
+            a5::Containment::Overlapping
+        }
+        _ => a5::Containment::Center,
+    };
+    let opts = a5::PolygonToCellsOptions { containment };
+    for poly in &multi.0 {
+        let mut rings = Vec::with_capacity(1 + poly.interiors().len());
+        let ext: Vec<a5::LonLat> = poly
+            .exterior()
+            .coords()
+            .map(|c| {
+                if !c.x.is_finite() || !c.y.is_finite() {
+                    Err(PolygonToCellsError::InvalidGeometry(
+                        "non-finite coordinates",
+                    ))
+                } else {
+                    Ok(a5::LonLat::new(c.x, c.y))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        rings.push(ext);
+        for interior in poly.interiors() {
+            let hole: Vec<a5::LonLat> = interior
+                .coords()
+                .map(|c| {
+                    if !c.x.is_finite() || !c.y.is_finite() {
+                        Err(PolygonToCellsError::InvalidGeometry(
+                            "non-finite coordinates",
+                        ))
+                    } else {
+                        Ok(a5::LonLat::new(c.x, c.y))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            rings.push(hole);
+        }
+        let compacted = a5::polygon_to_cells(&rings, res as i32, Some(opts))
+            .map_err(|_| PolygonToCellsError::InvalidGeometry("invalid polygon"))?;
+        let mut cells = a5::uncompact(&compacted, res as i32)
+            .map_err(|_| PolygonToCellsError::InvalidGeometry("uncompact failed"))?;
+        if matches!(mode, ContainmentMode::ContainsBoundary) {
+            cells.retain(|&c| {
+                let mut verts = [(0.0, 0.0); 10];
+                let n = GridKind::A5.boundary_lng_lat(c, &mut verts);
+                n > 0
+                    && verts[..n]
+                        .iter()
+                        .all(|&(lng, lat)| point_in_polygon(poly, lng, lat))
+            });
+        }
+        if out.len().saturating_add(cells.len()) > H3_POLYGON_TO_CELLS_MAX_CELLS {
+            return Err(PolygonToCellsError::TooManyCells {
+                estimate: out.len().saturating_add(cells.len()),
+                limit: H3_POLYGON_TO_CELLS_MAX_CELLS,
+            });
+        }
+        out.extend(cells);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(())
+}
+
+fn point_in_ring(ring: &geo_types::LineString<f64>, x: f64, y: f64) -> bool {
+    let mut inside = false;
+    for line in ring.lines() {
+        let (x1, y1) = (line.start.x, line.start.y);
+        let (x2, y2) = (line.end.x, line.end.y);
+        if ((y1 > y) != (y2 > y)) && (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn point_in_polygon(poly: &geo_types::Polygon<f64>, x: f64, y: f64) -> bool {
+    point_in_ring(poly.exterior(), x, y)
+        && !poly
+            .interiors()
+            .iter()
+            .any(|hole| point_in_ring(hole, x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +709,42 @@ mod tests {
         assert_eq!(parse_bbox_str("1,2,3,4,5"), None);
         assert_eq!(parse_bbox_str("1,2,3,inf"), None);
         assert_eq!(parse_bbox_str("1,2,NaN,4"), None);
+    }
+
+    #[test]
+    fn test_a5_scalar_ops_and_polygon_to_cells() {
+        let cell = a5_lonlat_to_cell(-122.4194, 37.7749, 8).expect("valid A5 cell");
+        assert!(a5_is_valid_u64(cell));
+        assert!(!a5_is_valid_u64(0));
+        assert_eq!(a5_get_resolution(cell), 8);
+
+        let hex = a5_to_string(cell).unwrap();
+        assert!(a5_is_valid_str(&hex));
+        assert_eq!(string_to_a5(&hex), cell);
+
+        let lat = a5_to_lat(cell);
+        let lng = a5_to_lng(cell);
+        assert!((lat - 37.77).abs() < 1.0);
+        assert!((lng - (-122.42)).abs() < 1.0);
+
+        let wkb = a5_to_wkb_u64(cell).unwrap();
+        assert_eq!(wkb.len(), 109);
+        assert_eq!(a5_to_wkb_str(&hex).unwrap(), wkb);
+
+        let parent = a5_cell_to_parent_u64(cell, 5).unwrap();
+        assert_eq!(a5_get_resolution(parent), 5);
+        assert!(a5_cell_to_parent_u64(cell, 10).is_none());
+
+        let box_wkb = rect_wkb(-122.5, 37.7, -122.3, 37.85);
+        let centroid = a5_polygon_to_cells_wkb(&box_wkb, 10, ContainmentMode::ContainsCentroid)
+            .expect("a5 polyfill centroid");
+        let boundary = a5_polygon_to_cells_wkb(&box_wkb, 10, ContainmentMode::ContainsBoundary)
+            .expect("a5 polyfill boundary");
+        let covers = a5_polygon_to_cells_wkb(&box_wkb, 10, ContainmentMode::Covers)
+            .expect("a5 polyfill covers");
+        assert!(!boundary.is_empty());
+        assert!(boundary.len() <= centroid.len());
+        assert!(centroid.len() <= covers.len());
+        assert!(centroid.iter().all(|&c| a5_get_resolution(c) == 10));
     }
 }

@@ -9,7 +9,6 @@
 use std::fs::File;
 use std::path::Path;
 
-use h3o::{CellIndex, LatLng};
 use parquet::basic::Compression;
 use parquet::data_type::ByteArray;
 use parquet::file::writer::SerializedFileWriter;
@@ -18,7 +17,8 @@ use crate::aggregator::multi_horizon::{
     MultiCategoricalHorizonStreamer, MultiCategoricalRecord, MultiContinuousRecord,
     MultiResolutionConfig, MultiScanHorizonStreamer,
 };
-use crate::encoding::{cell_to_wkb, extend_wkb_bounds, fast_hex_u64, WkbBuf, WKB_BUF_LEN};
+use crate::encoding::{cell_index_to_wkb, extend_wkb_bounds, fast_hex_u64, WkbBuf, WKB_BUF_LEN};
+use crate::grid::GridKind;
 
 /// Bounds that any point extends (`min > max` until the first point).
 const EMPTY_BOUNDS: [f64; 4] = [
@@ -80,6 +80,7 @@ impl Default for ParquetExportConfig {
 
 /// Columnar buffer for continuous raster aggregation row groups
 pub struct ContinuousRowGroupBuffer {
+    grid: GridKind,
     compact: bool,
     geoparquet: bool,
     h3_indices: Vec<i64>,
@@ -100,7 +101,17 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
     type Record = MultiContinuousRecord;
 
     fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self {
+        Self::with_capacity_and_grid_options(capacity, compact, geoparquet, GridKind::H3)
+    }
+
+    fn with_capacity_and_grid_options(
+        capacity: usize,
+        compact: bool,
+        geoparquet: bool,
+        grid: GridKind,
+    ) -> Self {
         Self {
+            grid,
             compact,
             geoparquet,
             h3_indices: Vec::with_capacity(capacity),
@@ -140,9 +151,8 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
         self.h3_indices.push(cell_u64 as i64);
 
         if self.geoparquet {
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
-                let len = cell_to_wkb(cell, &mut wkb_buf);
+            let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
+            if let Some(len) = cell_index_to_wkb(self.grid, cell_u64, &mut wkb_buf) {
                 extend_wkb_bounds(&wkb_buf[..len], &mut self.geometry_bounds);
                 self.geometries.push(ByteArray::from(&wkb_buf[..len]));
             } else {
@@ -161,10 +171,9 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             let hex_slice = fast_hex_u64(cell_u64, &mut hex_buf);
             self.h3_hexes.push(ByteArray::from(hex_slice));
 
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                let ll: LatLng = cell.into();
-                self.lats.push(ll.lat());
-                self.lngs.push(ll.lng());
+            if let Some((lat, lng)) = self.grid.cell_to_lat_lng(cell_u64) {
+                self.lats.push(lat);
+                self.lngs.push(lng);
             } else {
                 self.lats.push(0.0);
                 self.lngs.push(0.0);
@@ -251,8 +260,12 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
     }
 
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
-        match (compact, geoparquet) {
-            (true, false) => {
+        Self::schema_message_for(GridKind::H3, compact, geoparquet)
+    }
+
+    fn schema_message_for(grid: GridKind, compact: bool, geoparquet: bool) -> &'static str {
+        match (grid, compact, geoparquet) {
+            (GridKind::H3, true, false) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
@@ -264,7 +277,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                 }
             "
             }
-            (true, true) => {
+            (GridKind::H3, true, true) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
@@ -277,7 +290,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                 }
             "
             }
-            (false, false) => {
+            (GridKind::H3, false, false) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
@@ -292,11 +305,67 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
                 }
             "
             }
-            (false, true) => {
+            (GridKind::H3, false, true) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED DOUBLE min_value;
+                    REQUIRED DOUBLE max_value;
+                    REQUIRED DOUBLE sum_value;
+                    REQUIRED DOUBLE avg_value;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED DOUBLE lat;
+                    REQUIRED DOUBLE lng;
+                }
+            "
+            }
+            (GridKind::A5, true, false) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED DOUBLE min_value;
+                    REQUIRED DOUBLE max_value;
+                    REQUIRED DOUBLE sum_value;
+                    REQUIRED DOUBLE avg_value;
+                    REQUIRED DOUBLE pixel_count;
+                }
+            "
+            }
+            (GridKind::A5, true, true) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED DOUBLE min_value;
+                    REQUIRED DOUBLE max_value;
+                    REQUIRED DOUBLE sum_value;
+                    REQUIRED DOUBLE avg_value;
+                    REQUIRED DOUBLE pixel_count;
+                }
+            "
+            }
+            (GridKind::A5, false, false) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED BYTE_ARRAY a5_hex (UTF8);
+                    REQUIRED DOUBLE min_value;
+                    REQUIRED DOUBLE max_value;
+                    REQUIRED DOUBLE sum_value;
+                    REQUIRED DOUBLE avg_value;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED DOUBLE lat;
+                    REQUIRED DOUBLE lng;
+                }
+            "
+            }
+            (GridKind::A5, false, true) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED BYTE_ARRAY a5_hex (UTF8);
                     REQUIRED BYTE_ARRAY geometry;
                     REQUIRED DOUBLE min_value;
                     REQUIRED DOUBLE max_value;
@@ -314,6 +383,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
 
 /// Columnar buffer for categorical raster aggregation row groups
 pub struct CategoricalRowGroupBuffer {
+    grid: GridKind,
     compact: bool,
     geoparquet: bool,
     h3_indices: Vec<i64>,
@@ -334,7 +404,17 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     type Record = MultiCategoricalRecord;
 
     fn with_capacity_and_options(capacity: usize, compact: bool, geoparquet: bool) -> Self {
+        Self::with_capacity_and_grid_options(capacity, compact, geoparquet, GridKind::H3)
+    }
+
+    fn with_capacity_and_grid_options(
+        capacity: usize,
+        compact: bool,
+        geoparquet: bool,
+        grid: GridKind,
+    ) -> Self {
         Self {
+            grid,
             compact,
             geoparquet,
             h3_indices: Vec::with_capacity(capacity),
@@ -375,9 +455,8 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
         self.h3_indices.push(cell_u64 as i64);
 
         if self.geoparquet {
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
-                let len = cell_to_wkb(cell, &mut wkb_buf);
+            let mut wkb_buf: WkbBuf = [0u8; WKB_BUF_LEN];
+            if let Some(len) = cell_index_to_wkb(self.grid, cell_u64, &mut wkb_buf) {
                 extend_wkb_bounds(&wkb_buf[..len], &mut self.geometry_bounds);
                 self.geometries.push(ByteArray::from(&wkb_buf[..len]));
             } else {
@@ -396,10 +475,9 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             let hex_slice = fast_hex_u64(cell_u64, &mut hex_buf);
             self.h3_hexes.push(ByteArray::from(hex_slice));
 
-            if let Ok(cell) = CellIndex::try_from(cell_u64) {
-                let ll: LatLng = cell.into();
-                self.lats.push(ll.lat());
-                self.lngs.push(ll.lng());
+            if let Some((lat, lng)) = self.grid.cell_to_lat_lng(cell_u64) {
+                self.lats.push(lat);
+                self.lngs.push(lng);
             } else {
                 self.lats.push(0.0);
                 self.lngs.push(0.0);
@@ -486,8 +564,12 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
     }
 
     fn schema_message(compact: bool, geoparquet: bool) -> &'static str {
-        match (compact, geoparquet) {
-            (true, false) => {
+        Self::schema_message_for(GridKind::H3, compact, geoparquet)
+    }
+
+    fn schema_message_for(grid: GridKind, compact: bool, geoparquet: bool) -> &'static str {
+        match (grid, compact, geoparquet) {
+            (GridKind::H3, true, false) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
@@ -499,7 +581,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                 }
             "
             }
-            (true, true) => {
+            (GridKind::H3, true, true) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
@@ -512,7 +594,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                 }
             "
             }
-            (false, false) => {
+            (GridKind::H3, false, false) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
@@ -527,11 +609,67 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
                 }
             "
             }
-            (false, true) => {
+            (GridKind::H3, false, true) => {
                 "
                 message schema {
                     REQUIRED INT64 h3_index;
                     REQUIRED BYTE_ARRAY h3_hex (UTF8);
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED INT64 majority;
+                    REQUIRED DOUBLE majority_fraction;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED INT64 distinct_classes;
+                    REQUIRED DOUBLE entropy;
+                    REQUIRED DOUBLE lat;
+                    REQUIRED DOUBLE lng;
+                }
+            "
+            }
+            (GridKind::A5, true, false) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 majority;
+                    REQUIRED DOUBLE majority_fraction;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED INT64 distinct_classes;
+                    REQUIRED DOUBLE entropy;
+                }
+            "
+            }
+            (GridKind::A5, true, true) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED BYTE_ARRAY geometry;
+                    REQUIRED INT64 majority;
+                    REQUIRED DOUBLE majority_fraction;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED INT64 distinct_classes;
+                    REQUIRED DOUBLE entropy;
+                }
+            "
+            }
+            (GridKind::A5, false, false) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED BYTE_ARRAY a5_hex (UTF8);
+                    REQUIRED INT64 majority;
+                    REQUIRED DOUBLE majority_fraction;
+                    REQUIRED DOUBLE pixel_count;
+                    REQUIRED INT64 distinct_classes;
+                    REQUIRED DOUBLE entropy;
+                    REQUIRED DOUBLE lat;
+                    REQUIRED DOUBLE lng;
+                }
+            "
+            }
+            (GridKind::A5, false, true) => {
+                "
+                message schema {
+                    REQUIRED INT64 a5_index;
+                    REQUIRED BYTE_ARRAY a5_hex (UTF8);
                     REQUIRED BYTE_ARRAY geometry;
                     REQUIRED INT64 majority;
                     REQUIRED DOUBLE majority_fraction;

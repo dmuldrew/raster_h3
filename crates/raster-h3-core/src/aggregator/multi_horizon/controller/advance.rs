@@ -59,7 +59,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
                     self.compaction_parent = None;
                     continue;
                 }
-                if self.final_resolution < self.resolutions.len() {
+                if self.final_resolution < self.resolution_u8s.len() {
                     let i = self.final_resolution;
                     self.final_reader = if self.spill_runs[i].has_spilled() {
                         self.spill_resolution(i)?;
@@ -87,7 +87,7 @@ impl<K: HorizonStreamKernel> MultiHorizonStreamer<K> {
             // Never finalize a cell that may have an earlier partial state on disk.
             let mut emitted = false;
             if self.can_evict_early {
-                for i in 0..self.resolutions.len() {
+                for i in 0..self.resolution_u8s.len() {
                     if !self.spill_runs[i].has_spilled() {
                         if let Some((key, acc)) =
                             self.resolution_shards[i].pop_completed(self.eviction_horizon)

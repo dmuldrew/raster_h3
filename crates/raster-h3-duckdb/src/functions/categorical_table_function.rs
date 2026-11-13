@@ -16,6 +16,7 @@ use crate::functions::partition_functions::{
     PARTIAL_STATE_COLUMN,
 };
 use crate::functions::raster_table::{self, add_geom_column, RasterTable, ScanContext};
+use crate::grid::GridKind;
 use crate::raster::mosaic::MosaicReader;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub struct RasterH3CategoricalBindData {
 }
 
 pub struct RasterH3CategoricalGlobalData {
+    pub grid: GridKind,
     pub streamer: Mutex<MultiCategoricalHorizonStreamer>,
     pub record_queue: ConcurrentRecordQueue<ScanRow<MultiCategoricalRecord>>,
     pub format: CategoricalOutputFormat,
@@ -114,8 +116,8 @@ impl RasterTable for CategoricalTable {
             return None;
         }
 
-        bind.add_result_column("h3_index", DuckDBType::UBigInt);
-        bind.add_result_column("h3_hex", DuckDBType::Varchar);
+        bind.add_result_column(common.grid.index_column_name(), DuckDBType::UBigInt);
+        bind.add_result_column(common.grid.hex_column_name(), DuckDBType::Varchar);
         match format {
             CategoricalOutputFormat::Wide => {
                 bind.add_result_column("majority_class", DuckDBType::BigInt);
@@ -183,6 +185,7 @@ impl RasterTable for CategoricalTable {
         // Long-format columns 7/8 are the entropy aliases.
         let with_entropy = projected_columns.iter().any(|&c| c == 7 || c == 8);
         Ok(RasterH3CategoricalGlobalData {
+            grid: bind.common.grid,
             streamer: Mutex::new(streamer),
             record_queue: ConcurrentRecordQueue::new(),
             format: bind.format,
@@ -331,7 +334,8 @@ unsafe fn scan_wide(global: &RasterH3CategoricalGlobalData, ctx: &mut ScanContex
             }
         }
 
-        writer.write_wkb_and_geom_columns(
+        writer.write_wkb_and_geom_columns_for(
+            global.grid,
             out_idx_wkb,
             out_idx_geom,
             batch.iter().map(|r| &r.h3_index),
@@ -443,7 +447,8 @@ unsafe fn scan_long(global: &RasterH3CategoricalGlobalData, ctx: &mut ScanContex
             }
         }
 
-        writer.write_wkb_and_geom_columns(
+        writer.write_wkb_and_geom_columns_for(
+            global.grid,
             out_idx_wkb,
             out_idx_geom,
             rows.iter().map(|r| &r.cell_u64),
@@ -451,6 +456,56 @@ unsafe fn scan_long(global: &RasterH3CategoricalGlobalData, ctx: &mut ScanContex
         );
 
         writer.set_size(num_taken);
+    }
+}
+
+/// `a5_raster_categorical_aggregate`: per-cell class histograms over an A5 pentagon grid.
+pub(crate) struct A5CategoricalTable;
+
+impl RasterTable for A5CategoricalTable {
+    type Bind = RasterH3CategoricalBindData;
+    type Global = RasterH3CategoricalGlobalData;
+
+    const NAMES: &'static [&'static str] = &[
+        "a5_raster_categorical_aggregate",
+        "a5_raster_categorical",
+        "read_raster_a5_categorical",
+        "raster_to_a5_categorical",
+        "raster_a5_categorical",
+    ];
+    const FUNCTION: &'static str = "a5_raster_categorical_aggregate";
+    const MISSING_BIND_DATA: &'static str = "Missing bind data in categorical init";
+    const DEFAULT_GRID: GridKind = GridKind::A5;
+
+    unsafe fn register_named_parameters(tf: duckdb_table_function) {
+        // SAFETY: forwarded with the same contract.
+        unsafe { CategoricalTable::register_named_parameters(tf) }
+    }
+
+    unsafe fn bind(
+        bind: &BindHelper,
+        common: CommonRasterParams,
+    ) -> Option<RasterH3CategoricalBindData> {
+        // SAFETY: forwarded with the same contract.
+        unsafe { CategoricalTable::bind(bind, common) }
+    }
+
+    fn common(bind: &RasterH3CategoricalBindData) -> &CommonRasterParams {
+        CategoricalTable::common(bind)
+    }
+
+    fn init(
+        bind: &RasterH3CategoricalBindData,
+        mosaic: Arc<MosaicReader>,
+        projected_columns: Vec<usize>,
+        config: MultiResolutionConfig,
+    ) -> Result<RasterH3CategoricalGlobalData, String> {
+        CategoricalTable::init(bind, mosaic, projected_columns, config)
+    }
+
+    unsafe fn scan(global: &RasterH3CategoricalGlobalData, ctx: &mut ScanContext<'_>) {
+        // SAFETY: forwarded with the same contract.
+        unsafe { CategoricalTable::scan(global, ctx) }
     }
 }
 
@@ -500,5 +555,8 @@ pub unsafe extern "C" fn raster_h3_categorical_scan(
 /// `con` must be a valid, open DuckDB connection.
 pub unsafe fn register_categorical_table_function(con: duckdb_connection) -> Result<(), String> {
     // SAFETY: forwarded with the same contract.
-    unsafe { raster_table::register::<CategoricalTable>(con) }
+    unsafe {
+        raster_table::register::<CategoricalTable>(con)?;
+        raster_table::register::<A5CategoricalTable>(con)
+    }
 }

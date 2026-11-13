@@ -4,7 +4,6 @@
 //! multi-zoom PMTiles v3 vector hexagon archive with streaming latitude
 //! horizon eviction to maintain a bounded memory footprint.
 
-use h3o::{CellIndex, LatLng};
 use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use serde_json::json;
 use std::borrow::Cow;
@@ -12,12 +11,13 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::encoding::parse_hex_u64;
+use crate::grid::GridKind;
 use crate::pmtiles::features::{
     build_pmtiles_metadata, PmtilesExportSummary, TilePyramidAccumulator,
 };
 use crate::pmtiles::mvt::{MercatorPoint, MvtValue};
 use crate::pmtiles::pyramid::{
-    cell_boundary_mercator, h3_res_to_zoom, max_hex_radius_deg, Wgs84BoundsAccumulator,
+    cell_boundary_mercator_for, grid_res_to_zoom, max_cell_radius_deg, Wgs84BoundsAccumulator,
 };
 use crate::pmtiles::writer::PmtilesWriter;
 
@@ -41,6 +41,16 @@ pub fn scan_row_group_h3_extent(
     h3_idx: usize,
     rg_idx: usize,
 ) -> Result<Option<RowGroupExtent>, Box<dyn std::error::Error + Send + Sync>> {
+    scan_row_group_grid_extent(GridKind::H3, rg, h3_idx, rg_idx)
+}
+
+/// Pre-scanned geographical and resolution extent of a Parquet row group for `grid`
+pub fn scan_row_group_grid_extent(
+    grid: GridKind,
+    rg: &dyn RowGroupReader,
+    h3_idx: usize,
+    rg_idx: usize,
+) -> Result<Option<RowGroupExtent>, Box<dyn std::error::Error + Send + Sync>> {
     let col_reader = match rg.get_column_reader(h3_idx) {
         Ok(c) => c,
         Err(_) => return Ok(None),
@@ -52,13 +62,12 @@ pub fn scan_row_group_h3_extent(
     let mut min_res = 255u8;
 
     let mut process_h3 = |h3: u64| {
-        if let Ok(cell) = CellIndex::try_from(h3) {
-            bounds.record_cell(cell);
-            let res: u8 = cell.resolution().into();
+        if let Some(res) = grid.cell_resolution(h3) {
+            bounds.record_cell_for(grid, h3);
             if res < min_res {
                 min_res = res;
             }
-            let zoom = h3_res_to_zoom(res);
+            let zoom = grid_res_to_zoom(grid, res);
             if zoom < min_zoom {
                 min_zoom = zoom;
             }
@@ -196,17 +205,26 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
             .position(|field| {
                 matches!(
                     field.name().to_ascii_lowercase().as_str(),
-                    "h3_index" | "h3_hex" | "h3" | "cell" | "hex"
+                    "h3_index" | "h3_hex" | "h3" | "a5_index" | "a5_hex" | "a5" | "cell" | "hex"
                 )
             })
             .unwrap_or(0)
+    };
+    let grid = match schema
+        .columns()
+        .get(h3_idx)
+        .map(|f| f.name().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("a5_index" | "a5_hex" | "a5") => GridKind::A5,
+        _ => GridKind::H3,
     };
 
     // Pre-scan row group extents to compute global bounds and row group horizons
     let mut rg_extents = Vec::with_capacity(num_rgs);
     for rg_i in 0..num_rgs {
         if let Ok(rg) = reader.get_row_group(rg_i) {
-            if let Ok(Some(ext)) = scan_row_group_h3_extent(&*rg, h3_idx, rg_i) {
+            if let Ok(Some(ext)) = scan_row_group_grid_extent(grid, &*rg, h3_idx, rg_i) {
                 rg_extents.push(ext);
             }
         }
@@ -244,7 +262,7 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
     let min_zoom = rg_extents.iter().map(|e| e.min_zoom).min().unwrap_or(0);
     let max_zoom = rg_extents.iter().map(|e| e.max_zoom).max().unwrap_or(0);
     let min_res = rg_extents.iter().map(|e| e.min_res).min().unwrap_or(0);
-    let max_cell_radius = max_hex_radius_deg(min_res);
+    let max_cell_radius = max_cell_radius_deg(grid, min_res);
     let safety_margin = 2.5 * max_cell_radius;
 
     // Schedule row groups North-to-South (descending max_lat)
@@ -261,9 +279,11 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
     }
 
     // Build dynamic fields metadata for vector layer
+    let idx_col = grid.index_column_name();
+    let hex_col = grid.hex_column_name();
     let mut fields_map = serde_json::Map::new();
-    fields_map.insert("h3_index".to_string(), json!("Number"));
-    fields_map.insert("h3_hex".to_string(), json!("String"));
+    fields_map.insert(idx_col.to_string(), json!("Number"));
+    fields_map.insert(hex_col.to_string(), json!("String"));
     fields_map.insert("resolution".to_string(), json!("Number"));
     for (idx, col) in schema.columns().iter().enumerate() {
         if idx == h3_idx {
@@ -347,25 +367,23 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
                 }
             };
 
-            let cell = match CellIndex::try_from(h3_u64) {
-                Ok(c) => c,
-                Err(_) => {
-                    invalid_dropped += 1;
-                    continue;
-                }
+            let Some((c_lat, c_lon)) = grid.cell_to_lat_lng(h3_u64) else {
+                invalid_dropped += 1;
+                continue;
+            };
+            let Some((v_merc, v_count)) = cell_boundary_mercator_for(grid, h3_u64) else {
+                invalid_dropped += 1;
+                continue;
+            };
+            let Some(res_u8) = grid.cell_resolution(h3_u64) else {
+                invalid_dropped += 1;
+                continue;
             };
             valid_features += 1;
 
-            let center: LatLng = cell.into();
-            let c_lat = center.lat();
-            let c_lon = center.lng();
-
             let center_merc = MercatorPoint::from_lat_lng(c_lat, c_lon);
-            let (v_merc, v_count) = cell_boundary_mercator(cell);
             let vertices_merc = &v_merc[..v_count];
-
-            let res_u8: u8 = cell.resolution().into();
-            let zoom = h3_res_to_zoom(res_u8);
+            let zoom = grid_res_to_zoom(grid, res_u8);
 
             let mut properties = Vec::with_capacity(col_names.len().saturating_sub(1) + 3);
             for (col_i, (_, field_val)) in row.get_column_iter().enumerate() {
@@ -392,11 +410,11 @@ pub fn process_parquet_to_pmtiles<P1: AsRef<Path>, P2: AsRef<Path>>(
                 }
             }
 
-            if !properties.iter().any(|(k, _)| k == "h3_index") {
-                properties.push((Cow::Borrowed("h3_index"), MvtValue::UInt(h3_u64)));
+            if !properties.iter().any(|(k, _)| k == idx_col) {
+                properties.push((Cow::Borrowed(idx_col), MvtValue::UInt(h3_u64)));
             }
-            if !properties.iter().any(|(k, _)| k == "h3_hex") {
-                properties.push((Cow::Borrowed("h3_hex"), MvtValue::from_hex_u64(h3_u64)));
+            if !properties.iter().any(|(k, _)| k == hex_col) {
+                properties.push((Cow::Borrowed(hex_col), MvtValue::from_hex_u64(h3_u64)));
             }
             if !properties.iter().any(|(k, _)| k == "resolution") {
                 properties.push((Cow::Borrowed("resolution"), MvtValue::UInt(res_u8 as u64)));

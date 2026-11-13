@@ -369,8 +369,8 @@ mod tests {
             out
         };
         super::super::walker::for_each_kernel_test_context(|name, ctx| {
-            let mut portable = vec![HashMap::default(); ctx.resolutions.len()];
-            let mut fma = vec![HashMap::default(); ctx.resolutions.len()];
+            let mut portable = vec![HashMap::default(); ctx.resolution_u8s.len()];
+            let mut fma = vec![HashMap::default(); ctx.resolution_u8s.len()];
             process_continuous_slice_into_maps_impl(
                 ctx,
                 &values,

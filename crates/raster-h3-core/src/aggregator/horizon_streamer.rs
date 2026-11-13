@@ -1,6 +1,5 @@
-use h3o::{CellIndex, LatLng, Resolution};
-
 use crate::crs::transformer::CrsTransformer;
+use crate::grid::GridKind;
 use crate::raster::geotransform::GeoTransform;
 use crate::raster::RasterChunk;
 
@@ -28,21 +27,6 @@ impl PartialOrd for HexEvictionEntry {
     }
 }
 
-/// The cell containing the south pole at each resolution.
-static SOUTH_POLE_CELLS: std::sync::OnceLock<[CellIndex; 16]> = std::sync::OnceLock::new();
-
-#[inline]
-fn is_south_pole_cell(cell: CellIndex) -> bool {
-    let cells = SOUTH_POLE_CELLS.get_or_init(|| {
-        core::array::from_fn(|r| {
-            LatLng::new(-90.0, 0.0)
-                .unwrap()
-                .to_cell(Resolution::try_from(r as u8).unwrap())
-        })
-    });
-    cells[u8::from(cell.resolution()) as usize] == cell
-}
-
 /// Conservative lower latitude bound for the spherical polygon returned by h3o.
 ///
 /// Latitude is 1-Lipschitz in angular distance. Every point on a minor great-circle
@@ -58,28 +42,33 @@ fn is_south_pole_cell(cell: CellIndex) -> bool {
 /// Northern edges have their minimum at an endpoint. The south pole must be
 /// checked separately because it can be in the polygon interior.
 pub fn compute_cell_south_lat(cell_u64: u64) -> f64 {
-    let Ok(cell) = CellIndex::try_from(cell_u64) else {
-        return -90.0;
-    };
-    if is_south_pole_cell(cell) {
+    compute_cell_south_lat_for(GridKind::H3, cell_u64)
+}
+
+pub fn compute_cell_south_lat_for(grid: GridKind, cell_u64: u64) -> f64 {
+    if grid.is_south_pole_cell(cell_u64) {
         return -90.0;
     }
-    let boundary = cell.boundary();
-    if boundary.is_empty() {
+    let mut verts = [(0.0, 0.0); 10];
+    let n = grid.boundary_lng_lat(cell_u64, &mut verts);
+    if n == 0 {
         return -90.0;
     }
     let mut south = 90.0_f64;
-    for i in 0..boundary.len() {
-        let p = boundary[i];
-        let q = boundary[(i + 1) % boundary.len()];
-        let mut edge_south = p.lat().min(q.lat()).next_down();
-        if p.lat() <= 0.0 || q.lat() <= 0.0 {
+    for i in 0..n {
+        let (p_lng, p_lat) = verts[i];
+        let (q_lng, q_lat) = verts[(i + 1) % n];
+        if grid == GridKind::A5 && (p_lat <= -89.0 || q_lat <= -89.0) {
+            return -90.0;
+        }
+        let mut edge_south = p_lat.min(q_lat).next_down();
+        if p_lat <= 0.0 || q_lat <= 0.0 {
             // Longitude differences are bounded above by both the direct and wrapped routes.
-            let direct_lo = (p.lng() - q.lng()).abs();
+            let direct_lo = (p_lng - q_lng).abs();
             let direct_hi = direct_lo.next_up();
             let wrapped_hi = (360.0_f64 - direct_lo.next_down()).next_up();
             let delta_lon = direct_hi.min(wrapped_hi);
-            let delta_lat = (p.lat() - q.lat()).abs().next_up();
+            let delta_lat = (p_lat - q_lat).abs().next_up();
             let half_length = ((delta_lat + delta_lon).next_up() * 0.5).next_up();
             edge_south = (edge_south - half_length).next_down();
         }

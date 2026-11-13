@@ -452,3 +452,84 @@ fn test_categorical_table_function_wide_and_long_formats() {
     );
     assert!((long_total_pixels - 1024.0).abs() < 1e-6);
 }
+
+#[test]
+fn test_a5_continuous_and_categorical_table_scans() {
+    install_mock_api();
+    let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
+        .origin(-122.45, 37.80)
+        .pixel_size(0.001)
+        .create_f32_tempfile(|c, r| (c + r + 10) as f32);
+
+    let mut named = HashMap::new();
+    named.insert("grid".to_string(), MockVal::Str("a5".to_string()));
+    named.insert("resolution".to_string(), MockVal::Int(14));
+    named.insert("geom".to_string(), MockVal::Bool(true));
+
+    let mut bind_ctx = MockBindContext::new(
+        vec![MockVal::Str(path.to_string_lossy().into_owned())],
+        named,
+    );
+    // SAFETY: live `MockBindContext` for the installed mock C API.
+    unsafe {
+        raster_h3_bind(&mut bind_ctx as *mut MockBindContext as duckdb_bind_info);
+    }
+    assert!(
+        bind_ctx.error.is_none(),
+        "A5 Bind failed: {:?}",
+        bind_ctx.error
+    );
+    assert_eq!(bind_ctx.result_columns[0].0, "a5_index");
+    assert_eq!(bind_ctx.result_columns[1].0, "a5_hex");
+    assert_eq!(bind_ctx.result_columns[10].0, "geom");
+
+    let all_cols: Vec<usize> = (0..11).collect();
+    let mut init_ctx = MockInitContext::new(bind_ctx.bind_data, all_cols);
+    let mut local_ctx = MockInitContext::new(bind_ctx.bind_data, Vec::new());
+    // SAFETY: live `MockInitContext`s carrying bind_data from `bind_ctx`.
+    unsafe {
+        raster_h3_init(&mut init_ctx as *mut MockInitContext as duckdb_init_info);
+        raster_h3_init_local(&mut local_ctx as *mut MockInitContext as duckdb_init_info);
+    }
+    assert!(init_ctx.error.is_none());
+
+    let mut func_ctx = MockFuncContext {
+        bind_data: bind_ctx.bind_data,
+        init_data: init_ctx.init_data,
+        local_init_data: local_ctx.init_data,
+        error: None,
+    };
+
+    let mut total_rows = 0usize;
+    let mut total_pixel_count = 0.0f64;
+    loop {
+        let mut chunk = MockDataChunk::new(11, 2048);
+        // SAFETY: live `MockFuncContext` and `MockDataChunk`.
+        unsafe {
+            raster_h3_scan(
+                &mut func_ctx as *mut MockFuncContext as duckdb_function_info,
+                &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
+            );
+        }
+        assert!(func_ctx.error.is_none());
+        if chunk.size == 0 {
+            break;
+        }
+        total_rows += chunk.size;
+        // SAFETY: columns populated by `raster_h3_scan`.
+        unsafe {
+            let cells = chunk.vectors[0].data.as_ptr();
+            let counts = chunk.vectors[4].data.as_ptr() as *const f64;
+            for i in 0..chunk.size {
+                let cell = *cells.add(i);
+                assert!(raster_h3_duckdb::grid::a5_is_valid_cell(cell));
+                total_pixel_count += *counts.add(i);
+                // A5 pentagon WKB is 109 bytes (5 vertices + closing vertex = 6 points * 16 + 13)
+                assert_eq!(chunk.vectors[9].strings[i].len(), 109);
+                assert_eq!(chunk.vectors[10].strings[i].len(), 109);
+            }
+        }
+    }
+    assert!(total_rows > 0);
+    assert!((total_pixel_count - 1024.0).abs() < 1e-6);
+}

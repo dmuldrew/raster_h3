@@ -380,8 +380,6 @@ pub fn process_categorical_borrowed_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// The hardware-FMA copy of the kernel must produce exactly the class
     /// counts the portable copy does.
     #[cfg(target_arch = "x86_64")]
@@ -395,8 +393,8 @@ mod tests {
             .map(|i| if i % 41 == 0 { 255 } else { (i % 23) as u8 })
             .collect();
         super::super::walker::for_each_kernel_test_context(|name, ctx| {
-            let mut portable = vec![HashMap::default(); ctx.resolutions.len()];
-            let mut fma = vec![HashMap::default(); ctx.resolutions.len()];
+            let mut portable = vec![HashMap::default(); ctx.resolution_u8s.len()];
+            let mut fma = vec![HashMap::default(); ctx.resolution_u8s.len()];
             process_categorical_slice_into_maps_impl(
                 ctx,
                 &values,
