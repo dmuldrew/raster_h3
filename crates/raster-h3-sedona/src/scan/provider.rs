@@ -1,4 +1,4 @@
-//! DataFusion `TableProvider`, `ExecutionPlan`, and `TableFunctionImpl` implementations
+//! [`RasterScan`] providers and [`RasterScanExec`] plans for continuous and categorical rasters
 //! for continuous and categorical GeoTIFF/COG to H3 aggregation.
 
 use std::path::PathBuf;
@@ -48,7 +48,7 @@ pub enum FilterPushdownStatus {
 }
 
 /// Physical execution plan producing columnar [`RecordBatch`] streams or [`ArrowArrayStream`].
-pub trait ExecutionPlan: Send + Sync {
+pub trait RasterScanExec: Send + Sync {
     /// Output schema of this physical plan (after projection pushdown).
     fn schema(&self) -> Arc<ColumnSchema>;
 
@@ -63,8 +63,9 @@ pub trait ExecutionPlan: Send + Sync {
     }
 }
 
-/// DataFusion-compatible `TableProvider` trait for scanning GeoTIFF/COG rasters as H3 tables.
-pub trait TableProvider: Send + Sync {
+/// A GeoTIFF/COG raster (or mosaic) scannable as an H3 table, with projection, filter and
+/// limit pushdown. [`crate::table::RasterH3Table`] adapts it to DataFusion's `TableProvider`.
+pub trait RasterScan: Send + Sync {
     /// Table schema prior to projection.
     fn schema(&self) -> Arc<ColumnSchema>;
 
@@ -74,13 +75,13 @@ pub trait TableProvider: Send + Sync {
     /// Classify which filter predicates can be pushed down into the scanline aggregator.
     fn supports_filters_pushdown(&self, filters: &[FilterPredicate]) -> Vec<FilterPushdownStatus>;
 
-    /// Create a physical [`ExecutionPlan`] with projection, filter, and limit pushdown.
+    /// Create a physical [`RasterScanExec`] with projection, filter, and limit pushdown.
     fn scan(
         &self,
         projection: Option<&[usize]>,
         filters: &[FilterPredicate],
         limit: Option<usize>,
-    ) -> Result<Box<dyn ExecutionPlan>>;
+    ) -> Result<Box<dyn RasterScanExec>>;
 }
 
 /// Compaction changes both row identity and aggregate values. Scan predicates must
@@ -407,7 +408,7 @@ pub struct PartitionedRasterExec {
     empty: bool,
 }
 
-impl ExecutionPlan for PartitionedRasterExec {
+impl RasterScanExec for PartitionedRasterExec {
     fn schema(&self) -> Arc<ColumnSchema> {
         Arc::clone(&self.schema)
     }
@@ -449,7 +450,7 @@ fn partitioned_scan(
     projection: Option<&[usize]>,
     filters: &[FilterPredicate],
     batch_size: usize,
-) -> Result<Box<dyn ExecutionPlan>> {
+) -> Result<Box<dyn RasterScanExec>> {
     let mut config = config.clone();
     let mut empty = false;
     for f in filters {
@@ -488,7 +489,7 @@ pub struct ContinuousRasterExec {
     bbox_pushed: bool,
 }
 
-impl ExecutionPlan for ContinuousRasterExec {
+impl RasterScanExec for ContinuousRasterExec {
     fn schema(&self) -> Arc<ColumnSchema> {
         Arc::clone(&self.schema)
     }
@@ -513,7 +514,7 @@ impl ExecutionPlan for ContinuousRasterExec {
     }
 }
 
-/// `TableProvider` for `h3_raster_continuous_aggregate`.
+/// `RasterScan` for `h3_raster_continuous_aggregate`.
 #[derive(Clone)]
 pub struct ContinuousRasterTableProvider {
     pub paths: Vec<PathBuf>,
@@ -637,7 +638,7 @@ impl ContinuousRasterTableProvider {
     }
 }
 
-impl TableProvider for ContinuousRasterTableProvider {
+impl RasterScan for ContinuousRasterTableProvider {
     fn schema(&self) -> Arc<ColumnSchema> {
         let base = ColumnSchema::continuous(&self.config.quantiles);
         match self.config.partition {
@@ -679,7 +680,7 @@ impl TableProvider for ContinuousRasterTableProvider {
         projection: Option<&[usize]>,
         filters: &[FilterPredicate],
         limit: Option<usize>,
-    ) -> Result<Box<dyn ExecutionPlan>> {
+    ) -> Result<Box<dyn RasterScanExec>> {
         if self.config.partition.is_some() {
             let base = ColumnSchema::continuous(&self.config.quantiles);
             return partitioned_scan(
@@ -744,7 +745,7 @@ pub struct CategoricalRasterExec {
     bbox_pushed: bool,
 }
 
-impl ExecutionPlan for CategoricalRasterExec {
+impl RasterScanExec for CategoricalRasterExec {
     fn schema(&self) -> Arc<ColumnSchema> {
         Arc::clone(&self.schema)
     }
@@ -770,7 +771,7 @@ impl ExecutionPlan for CategoricalRasterExec {
     }
 }
 
-/// `TableProvider` for `h3_raster_categorical_aggregate`.
+/// `RasterScan` for `h3_raster_categorical_aggregate`.
 #[derive(Clone)]
 pub struct CategoricalRasterTableProvider {
     pub paths: Vec<PathBuf>,
@@ -862,7 +863,7 @@ impl CategoricalRasterTableProvider {
     }
 }
 
-impl TableProvider for CategoricalRasterTableProvider {
+impl RasterScan for CategoricalRasterTableProvider {
     fn schema(&self) -> Arc<ColumnSchema> {
         let base = match self.format {
             CategoricalFormat::Wide => ColumnSchema::categorical_wide(),
@@ -906,7 +907,7 @@ impl TableProvider for CategoricalRasterTableProvider {
         projection: Option<&[usize]>,
         filters: &[FilterPredicate],
         limit: Option<usize>,
-    ) -> Result<Box<dyn ExecutionPlan>> {
+    ) -> Result<Box<dyn RasterScanExec>> {
         if self.config.partition.is_some() {
             if self.format == CategoricalFormat::Long {
                 return Err(RasterH3Error::InvalidParameter(

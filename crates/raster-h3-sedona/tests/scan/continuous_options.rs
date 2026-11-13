@@ -11,7 +11,7 @@ use raster_h3_core::aggregator::multi_horizon::{
 };
 use raster_h3_core::aggregator::sampling::SamplingPattern;
 use raster_h3_core::raster::mosaic::OverlapRule;
-use raster_h3_datafusion::{ContinuousRasterTableProvider, FilterPredicate, TableProvider};
+use raster_h3_sedona::scan::{ContinuousRasterTableProvider, FilterPredicate, RasterScan};
 use tempfile::NamedTempFile;
 use tiff::encoder::colortype::RGBA8;
 use tiff::encoder::TiffEncoder;

@@ -19,7 +19,6 @@ on:
           - all
           - core
           - duckdb
-          - datafusion
           - cli
           - python
           - python-polars
@@ -152,7 +151,6 @@ jobs:
             all)        pkgs=(--workspace) ;;
             core)       pkgs=(-p raster-h3-core) ;;
             duckdb)     pkgs=(-p raster-h3-duckdb) ;;
-            datafusion) pkgs=(-p raster-h3-datafusion) ;;
             cli)        pkgs=(-p raster-h3-cli) ;;
             python)     pkgs=(-p raster-h3-python) ;;
             pg)         pkgs=(-p raster-h3-pg) ;;

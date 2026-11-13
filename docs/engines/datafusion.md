@@ -1,36 +1,35 @@
-# DataFusion Deep Dive: `raster-h3-datafusion`
+# DataFusion & SedonaDB: `raster-h3-sedona`
 
 [← Engines Overview](README.md) · [← Back to README](../../README.md)
 
-`raster-h3-datafusion` ([`crates/raster-h3-datafusion`](../../crates/raster-h3-datafusion))
-exposes rasters as scannable tables and the H3 helpers as vectorized scalar functions,
-using the same shapes as Apache DataFusion's `TableProvider`, `ExecutionPlan` and
-`ScalarUDFImpl`.
+[`crates/raster-h3-sedona`](../../crates/raster-h3-sedona) is the Apache DataFusion adapter:
+real DataFusion `TableProvider`s, table functions and scalar UDFs that register into a plain
+`SessionContext` or into SedonaDB. It is a standalone workspace with DataFusion pinned to
+SedonaDB's version. [Using with Apache DataFusion and SedonaDB](#using-with-apache-datafusion-and-sedonadb)
+covers registering it, SQL, PMTiles output, partitioned scans and SedonaDB's Python API.
 
-> **Scope.** The crate does **not** depend on the `datafusion` crate. `TableProvider`,
-> `ExecutionPlan` and `ScalarUDFImpl` here are this crate's own traits, modelled on
-> DataFusion's, operating on `raster_h3_core::columnar` types (`ColumnSchema`,
-> `RecordBatch`, `ColumnArray`). To use them inside a real DataFusion `SessionContext`, wrap
-> them in DataFusion's traits and import batches through the Arrow C Stream
-> (`execute_arrow_c_stream`), or use [`raster-h3-sedona`](#using-with-apache-datafusion-and-sedonadb),
-> which does exactly that. Its only dependencies are `raster-h3-core` and `h3o`.
+Underneath, its `scan` module (`raster_h3_sedona::scan`) plans and runs the raster scans and
+H3 scalar functions on `raster_h3_core::columnar` types (`ColumnSchema`, `RecordBatch`,
+`ColumnArray`) without DataFusion. The sections up to [Recipes](#recipes) describe that layer;
+DataFusion code normally reaches it through the adapter instead. Its traits are deliberately not
+named like DataFusion's: `RasterScan` (implemented by the two table providers),
+`RasterScanExec` (their execution plans) and `H3ScalarFn` (the scalar functions).
+
+> Previously this layer was the separate `raster-h3-datafusion` crate, which used DataFusion's
+> trait names without depending on DataFusion. It moved into `raster-h3-sedona`, its only
+> user; see the [CHANGELOG](../../CHANGELOG.md).
 
 ```toml
 [dependencies]
-raster-h3-datafusion = { path = "crates/raster-h3-datafusion" }
+raster-h3-sedona = { path = "crates/raster-h3-sedona" }
 ```
 
 ## Quick Start
 
 ```rust
-use raster_h3_datafusion::{
-    CategoricalFormat, FilterPredicate, RasterH3SessionCatalog, TableProvider,
-};
+use raster_h3_sedona::scan::{ContinuousRasterTableProvider, FilterPredicate, RasterScan};
 
-let ctx = RasterH3SessionCatalog::new(); // all scalar UDFs registered
-
-let provider = ctx
-    .h3_raster_continuous_aggregate("dem.tif", vec![7, 8])?
+let provider = ContinuousRasterTableProvider::try_new("dem.tif", vec![7, 8])?
     .with_crs("EPSG:4326")
     .with_batch_size(8192);
 
@@ -47,21 +46,8 @@ for batch in plan.execute()? {
 let stream = plan.execute_arrow_c_stream()?;
 ```
 
-## Catalog
-
-`RasterH3SessionCatalog` is a small registry, not a query planner:
-
-| Method | Purpose |
-| :--- | :--- |
-| `new()` | Catalog with every default scalar UDF registered (`register_all`). |
-| `register_udf(udf)` / `udf(name)` | Register / look up a UDF by name or alias (case-insensitive). |
-| `register_table(name, provider)` / `table(name)` | Register / look up a `TableProvider` by name. |
-| `invoke_scalar(name, &[ColumnArray])` | Run a registered UDF on columnar arguments. |
-| `h3_raster_continuous_aggregate(source, resolutions)` | Build a `ContinuousRasterTableProvider`. |
-| `h3_raster_categorical_aggregate(source, resolutions)` | Build a `CategoricalRasterTableProvider`. |
-
-`source` accepts anything `resolve_raster_sources` accepts (a path, glob, comma-separated
-list or VRT). An empty `resolutions` vector defaults to `[8]`.
+`try_new(source, resolutions)` accepts anything `resolve_raster_sources` accepts (a path,
+glob, comma-separated list or VRT). An empty `resolutions` vector defaults to `[8]`.
 
 ## Table Providers
 
@@ -99,8 +85,8 @@ Schema: `categorical_wide()` (default) or `categorical_long()`.
 
 ## Pushdown
 
-`TableProvider::scan(projection, filters, limit)` clones the provider's configuration,
-narrows it with the filters and returns an `ExecutionPlan`.
+`RasterScan::scan(projection, filters, limit)` clones the provider's configuration,
+narrows it with the filters and returns a `RasterScanExec`.
 
 | `FilterPredicate` | Continuous | Categorical | Effect |
 | :--- | :---: | :---: | :--- |
@@ -133,7 +119,7 @@ The scan emits the full compacted table instead.
 
 ## Execution Plans
 
-`ContinuousRasterExec` and `CategoricalRasterExec` implement:
+`ContinuousRasterExec` and `CategoricalRasterExec` implement `RasterScanExec`:
 
 | Method | Returns |
 | :--- | :--- |
@@ -143,7 +129,7 @@ The scan emits the full compacted table instead.
 
 ## Scalar UDFs
 
-`ScalarUDFImpl` has `name()`, `aliases()`, `return_type(&[ArrowDataType])` and
+`H3ScalarFn` has `name()`, `aliases()`, `return_type(&[ArrowDataType])` and
 `invoke(&[ColumnArray]) -> ColumnArray`. Input validity propagates to the output.
 
 | UDF | Signature(s) | Aliases |
@@ -156,12 +142,14 @@ The scan emits the full compacted table instead.
 | `H3ToWkbUdf` | `h3_to_wkb(UInt64 \| Utf8) -> Binary` ([cell geometry](../sql-api-reference.md#cell-geometry)) | `h3_to_geometry`, `h3_cell_to_geometry` |
 | `H3CellToParentUdf` | `h3_cell_to_parent(UInt64, Int64) -> UInt64`, `(Utf8, Int64) -> Utf8` | |
 
-```rust
-use raster_h3_datafusion::{ColumnArray, RasterH3SessionCatalog};
+`default_scalar_udfs()` lists them all, and `find_scalar_udf(name)` finds one by name or alias
+(ignoring ASCII case). In DataFusion they are registered by `raster_h3_sedona::scalar_udfs()`.
 
-let ctx = RasterH3SessionCatalog::new();
+```rust
+use raster_h3_sedona::scan::{find_scalar_udf, ColumnArray};
+
 let cells = ColumnArray::UInt64 { values: vec![0x8828308281fffff], validity: None };
-let hex = ctx.invoke_scalar("h3_to_string", &[cells])?;
+let hex = find_scalar_udf("h3_to_string").expect("default UDF").invoke(&[cells])?;
 ```
 
 ## Recipes
@@ -169,7 +157,7 @@ let hex = ctx.invoke_scalar("h3_to_string", &[cells])?;
 These mirror the [DuckDB SQL recipes](duckdb.md#sql-usage--recipes) as Rust builder calls.
 The option types (`SamplingPattern`, `SpectralFormula`, `QuantileTarget`, `OverlapRule`,
 `CategoryRemapper`) live in `raster-h3-core`, so add it as a dependency next to
-`raster-h3-datafusion`. The snippets assume a function returning
+`raster-h3-sedona`. The snippets assume a function returning
 `raster_h3_core::error::Result<()>`.
 
 ```rust
@@ -179,9 +167,9 @@ use raster_h3_core::aggregator::multi_horizon::{QuantileTarget, SpectralFormula}
 use raster_h3_core::aggregator::remap::CategoryRemapper;
 use raster_h3_core::aggregator::sampling::SamplingPattern;
 use raster_h3_core::raster::mosaic::OverlapRule;
-use raster_h3_datafusion::{
-    CategoricalFormat, CategoricalRasterTableProvider, ColumnArray, ContinuousRasterTableProvider,
-    FilterPredicate, RasterH3SessionCatalog, TableProvider,
+use raster_h3_sedona::scan::{
+    find_scalar_udf, CategoricalFormat, CategoricalRasterTableProvider, ColumnArray,
+    ContinuousRasterTableProvider, FilterPredicate, RasterScan,
 };
 ```
 
@@ -261,30 +249,22 @@ let long = CategoricalRasterTableProvider::try_new("nlcd_landcover_2021.tif", ve
 ### Scalar UDFs over a batch column
 
 ```rust
-let ctx = RasterH3SessionCatalog::new();
+let to_parent = find_scalar_udf("h3_cell_to_parent").expect("default UDF");
+let to_lat = find_scalar_udf("h3_to_lat").expect("default UDF");
 let plan = provider.scan(Some(&[0]), &[], Some(10))?; // h3_index only
 for batch in plan.execute()? {
     let cells = batch?.columns.remove(0);
-    let parents = ctx.invoke_scalar("h3_cell_to_parent", &[
+    let parents = to_parent.invoke(&[
         cells.clone(),
         ColumnArray::Int64 { values: vec![6; cells.len()], validity: None },
     ])?;
-    let lat = ctx.invoke_scalar("h3_to_lat", &[cells])?;
+    let lat = to_lat.invoke(&[cells])?;
 }
-```
-
-### Registering tables in the catalog
-
-```rust
-let mut ctx = RasterH3SessionCatalog::new();
-ctx.register_table("dem", Arc::new(ContinuousRasterTableProvider::try_new("dem.tif", vec![8])?));
-let dem = ctx.table("dem").expect("registered");
-let plan = dem.scan(None, &[], None)?;
 ```
 
 ### Exports
 
-The `raster-h3-datafusion` crate has no file writers. For Parquet/GeoParquet or PMTiles, use
+The `scan` layer has no file writers. For Parquet/GeoParquet or PMTiles, use
 the core exporters (`H3ParquetWriter`, `H3PmtilesTiler`, see [Core](core.md#file-exporters))
 with the same `MultiResolutionConfig`, or write the Arrow stream with any Arrow-based writer.
 In real DataFusion and SedonaDB, `raster-h3-sedona` adds `COPY ... TO '*.pmtiles'`; see
@@ -312,7 +292,7 @@ ctx.sql(
 | :--- | :--- |
 | `RasterH3Table` | `datafusion::catalog::TableProvider` over a configured `Continuous`/`CategoricalRasterTableProvider`. Aggregation runs on DataFusion's blocking pool and streams through the Arrow C Stream into a `StreamingTableExec` without copying. Projection (including empty, for `COUNT(*)`) is pushed down; `LIMIT` is pushed to the reader and `StreamingTableExec` only when every supplied filter is `Exact` (or there are none). Otherwise the caller applies the limit after residual filtering. A `WHERE` filter is pushed only as far as the wrapped provider's `supports_filters_pushdown` allows, so on compacted tables (and for non-`resolution` filters on partitioned ones) DataFusion evaluates it on the completed rows. |
 | Filter pushdown | `count`/`total_count >= x`, `mean >= x`, `mean <= x`, `mean BETWEEN a AND b`, `majority_fraction >= x` and `resolution = n` are `Exact`; the strict forms (`>`, `<`) push the inclusive bound as `Inexact` and DataFusion re-applies them. Anything else is `Unsupported`. |
-| Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals`, and `ST_DWithin(..., d)` with a non-negative numeric literal `d`, between a cell's geometry (`wkb`, or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)` under any alias) and a constant geometry push an `Inexact` `FilterPredicate::Bbox`. The constant is a `geoarrow.wkb` literal in `OGC:CRS84` / `EPSG:4326` with planar edges (what `ST_SetSRID(ST_GeomFromWKT(...), 4326)` folds to) or `h3_to_wkb(<cell literal>)`. The box is the constant's envelope, grown by `d` degrees for `ST_DWithin` (planar distance in CRS units) and clamped to lon/lat range. `raster-h3-datafusion` then widens it past the largest cell before clipping samples (see `Bbox(b)` above), so every cell the predicate can match keeps its full aggregate; DataFusion re-applies the predicate to drop the extra cells. Compacted tables accept the filter but do not prune. |
+| Spatial pushdown | `ST_Intersects` / `ST_Contains` / `ST_Within` / `ST_Covers` / `ST_CoveredBy` / `ST_Overlaps` / `ST_Touches` / `ST_Crosses` / `ST_Equals`, and `ST_DWithin(..., d)` with a non-negative numeric literal `d`, between a cell's geometry (`wkb`, or `h3_to_wkb(h3_index)` / `h3_to_wkb(h3_hex)` under any alias) and a constant geometry push an `Inexact` `FilterPredicate::Bbox`. The constant is a `geoarrow.wkb` literal in `OGC:CRS84` / `EPSG:4326` with planar edges (what `ST_SetSRID(ST_GeomFromWKT(...), 4326)` folds to) or `h3_to_wkb(<cell literal>)`. The box is the constant's envelope, grown by `d` degrees for `ST_DWithin` (planar distance in CRS units) and clamped to lon/lat range. The `scan` layer then widens it past the largest cell before clipping samples (see `Bbox(b)` above), so every cell the predicate can match keeps its full aggregate; DataFusion re-applies the predicate to drop the extra cells. Compacted tables accept the filter but do not prune. |
 | Table functions | `h3_raster_continuous_aggregate(source [, resolution ...] [, crs])` and `h3_raster_categorical_aggregate(...)` (wide format). Use `RasterH3Table` with a configured provider for other options. |
 | Scalar UDFs | All eight H3 functions and their aliases, with SQL integer/string literals coerced to the core types, plus `h3_polygon_to_cells(geometry, resolution [, containment])` → `List<UInt64>`, with DuckDB's containment modes and NULL handling (see the [SQL reference](../sql-api-reference.md#h3_polygon_to_cells)). The geometry is WKB in lon/lat; a `geoarrow.wkb` argument tagged with another CRS is a planning error. The rows of each batch are polyfilled in parallel. |
 | Geometry | The `wkb` column and `h3_to_wkb` results are `geoarrow.wkb` fields with CRS `OGC:CRS84` (planar edges, as in the GeoParquet export), so Sedona's `ST_*` functions accept them directly. |
@@ -447,14 +427,13 @@ Invalid H3 values and bad options raise `ValueError`, and a file-system error ra
 ## Testing
 
 ```bash
-cargo test -p raster-h3-datafusion
-# DataFusion / SedonaDB adapter (standalone workspace)
+# DataFusion / SedonaDB adapter, including the `scan` layer (standalone workspace)
 cargo test --manifest-path crates/raster-h3-sedona/Cargo.toml
 cargo test --manifest-path crates/raster-h3-sedona/Cargo.toml --features sedona-e2e  # inside a real SedonaContext
 # SedonaDB Python bindings
 (cd crates/raster-h3-sedona/python && maturin develop --release --extras test && pytest)
 ```
 
-Unit tests cover projection, limit, filter narrowing (resolution and bbox), the Arrow C
-stream round trip and every UDF. `tests/it/multi_engine_e2e.rs` checks the providers
-against the other engines.
+The `scan` tests (unit tests in `src/scan` and the `tests/scan` binary) cover projection,
+limit, filter narrowing (resolution and bbox), the Arrow C stream round trip and every UDF,
+and check the providers against the core batch readers for each option.

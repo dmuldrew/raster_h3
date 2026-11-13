@@ -40,7 +40,7 @@ jobs:
       # merge both runs into one report.
       - name: Collect coverage
         run: |
-          cargo llvm-cov --locked --no-report -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python --lib --test it
+          cargo llvm-cov --locked --no-report -p raster-h3-core -p raster-h3-cli -p raster-h3-python --lib --test it
           cargo llvm-cov --locked --no-report -p raster-h3-pg --features pg-extension --lib --test it
           cargo llvm-cov report --lcov --output-path lcov.info
 

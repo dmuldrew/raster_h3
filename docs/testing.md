@@ -11,13 +11,12 @@ explains how to run each group and what CI runs. The counts below are the number
 | [`crates/raster-h3-core/tests/it/`](../crates/raster-h3-core/tests/it) (`core/…`) | 40 modules, 1 binary | 447 |
 | [`crates/raster-h3-core/tests/memory/`](../crates/raster-h3-core/tests/memory) (`memory`, one child process per scenario variant) | 7 scenarios, 1 binary | 38 checks |
 | [`crates/raster-h3-duckdb/tests/it/`](../crates/raster-h3-duckdb/tests/it) (`duckdb/…`) | 5 modules, 1 binary | 25 |
-| [`crates/raster-h3-datafusion/tests/it/`](../crates/raster-h3-datafusion/tests/it) (`datafusion/…`) | 8 modules (plus shared `rows.rs`), 1 binary | 28 |
 | [`crates/raster-h3-cli/tests/it/`](../crates/raster-h3-cli/tests/it) (`cli/…`, runs the crate's `raster-h3-cli` bin) | 2 modules, 1 binary | 14 |
 | [`crates/raster-h3-python/tests/it/`](../crates/raster-h3-python/tests/it) (`python/…`) | 7 modules, 1 binary | 24 |
 | [`crates/raster-h3-pg/tests/it/`](../crates/raster-h3-pg/tests/it) (`pg/…`) | 2 modules, 1 binary | 12 (8 need `pg-extension`) |
 | [`tests/it/`](../tests/it) (`root/…`, needs the root cdylib or bins) | 6 modules, 1 binary | 20 |
-| [`crates/raster-h3-sedona/tests/`](../crates/raster-h3-sedona/tests) (`sedona/…`, standalone workspace; one binary per module) | 6 modules | 34 (5 need `sedona-e2e`) |
-| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 7 crates | 308 (3 need `pg-extension`) |
+| [`crates/raster-h3-sedona/tests/`](../crates/raster-h3-sedona/tests) (`sedona/…`, standalone workspace; one binary per module, plus the [`tests/scan/`](../crates/raster-h3-sedona/tests/scan) binary (`scan/…`) for the `scan` layer, formerly `raster-h3-datafusion`) | 6 modules + `scan` (8 modules plus shared `rows.rs`) | 62 (5 need `sedona-e2e`) |
+| Crate unit tests (`#[cfg(test)]` in `crates/*/src`) | 6 crates | 308 (3 need `pg-extension`) |
 | [`crates/raster-h3-python/tests/pytest/`](../crates/raster-h3-python/tests/pytest) (`pytest/…`, needs `polars`, `pyarrow`, `h3`) | 7 modules | 84 |
 | [`crates/raster-h3-sedona/python/tests/`](../crates/raster-h3-sedona/python/tests) (`sedona-pytest/…`, needs the `sedonadb` 0.5.0 wheel) | 1 module | 14 |
 | [`examples/sedona_spark/tests/`](../examples/sedona_spark/tests) (`spark/…`, needs PySpark, Apache Sedona and `raster_h3`, as in the `sedona` image) | 2 modules | 17 (23 cases) |
@@ -218,7 +217,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | :--- | :--- |
 | [`core/streaming_failures.rs`](../crates/raster-h3-core/tests/it/streaming_failures.rs) (6), [`duckdb/record_queue.rs`](../crates/raster-h3-duckdb/tests/it/record_queue.rs) (1) | Corrupt-chunk errors latch in both streamers; a missing or non-directory spill directory fails both streamers with a latched error and no records after it, and spill runs leave no files in a usable one (on Unix, not even mid-stream); the DuckDB record queue propagates failure instead of EOF; failed exports leave existing outputs untouched; a Parquet file is not published after a late failure; premature prefetch termination is an error. |
 | [`core/transform_failures.rs`](../crates/raster-h3-core/tests/it/transform_failures.rs) (7) | Samples beyond the pole and failed inverse projections are counted; valid rasters and bbox exclusions report none; batch readers and exporters report through the shared counter; `strict_transforms` fails the stream instead of dropping samples and accepts rasters without failures. |
-| [`datafusion/transform_failures.rs`](../crates/raster-h3-datafusion/tests/it/transform_failures.rs) (1), [`python/transform_failures.rs`](../crates/raster-h3-python/tests/it/transform_failures.rs) (3), [`pytest/test_transform_failures.py`](../crates/raster-h3-python/tests/pytest/test_transform_failures.py) (5) | DataFusion providers, the Python batch reader and `raster_h3_py_scan_json` count failures in lenient mode and fail in strict mode; a strict Arrow stream fails while reading; lenient Python scans warn once with the count (and free the result even when warnings are errors), and valid rasters do not warn. A strict scan's error also reaches the caller when PyArrow (`pa.table`, `RecordBatchReader.from_stream`) drops the stream capsule while raising it. |
+| [`scan/transform_failures.rs`](../crates/raster-h3-sedona/tests/scan/transform_failures.rs) (1), [`python/transform_failures.rs`](../crates/raster-h3-python/tests/it/transform_failures.rs) (3), [`pytest/test_transform_failures.py`](../crates/raster-h3-python/tests/pytest/test_transform_failures.py) (5) | DataFusion providers, the Python batch reader and `raster_h3_py_scan_json` count failures in lenient mode and fail in strict mode; a strict Arrow stream fails while reading; lenient Python scans warn once with the count (and free the result even when warnings are errors), and valid rasters do not warn. A strict scan's error also reaches the caller when PyArrow (`pa.table`, `RecordBatchReader.from_stream`) drops the stream capsule while raising it. |
 | [`duckdb/prefetch_resilience.rs`](../crates/raster-h3-duckdb/tests/it/prefetch_resilience.rs) (3) | Mixed local/remote mosaics finish without deadlock; a decode-worker panic latches into the queue; a corrupt chunk unblocks readers instead of hanging. |
 | [`core/horizon_streaming.rs`](../crates/raster-h3-core/tests/it/horizon_streaming.rs) | `test_nonexistent_file_path_error`, `test_corrupted_and_empty_tiff_error_handling`. |
 | [`cli/binary.rs`](../crates/raster-h3-cli/tests/it/binary.rs), [`python/batch_reader.rs`](../crates/raster-h3-python/tests/it/batch_reader.rs), [`python/exports.rs`](../crates/raster-h3-python/tests/it/exports.rs), [`pg/srf.rs`](../crates/raster-h3-pg/tests/it/srf.rs) | A strip that fails to decode part-way is a non-zero CLI exit, an `out_err` from `raster_h3_py_batch_reader_next` / `scan_json` / the exporters, and `-1` from `pg_srf_continuous_next`, never a short successful result; failed Python and CLI Parquet exports leave no file. |
@@ -250,7 +249,7 @@ A failure after a valid header must reach the consumer as an error, never as a s
 | [`core/cutline_ownership.rs`](../crates/raster-h3-core/tests/it/cutline_ownership.rs) (3) | `Cutline` ownership with cached centre vectors matches the original per-call computation for every tile at thousands of points: an overlapping 4×4 grid, three identical footprints (exact distance ties go to the lower index), tiles on different longitude branches across the antimeridian, and near-polar tiles. |
 | [`core/mosaic.rs`](../crates/raster-h3-core/tests/it/mosaic.rs) (4) | Mosaic opening keeps antimeridian tiles; overlap rules test real tile footprints, not WGS84 rectangles, including rotated footprints and mixed longitude branches. |
 | [`core/conus_pipeline.rs`](../crates/raster-h3-core/tests/it/conus_pipeline.rs) | `test_conus_batch_and_evict_pipeline_simulation`: multi-tile ingestion, batch eviction, Parquet progress and PMTiles from partitioned input. |
-| [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) | `with_overlap_rule_on_a_multi_file_source_matches_core`: `cutline`, `first` and `average` over a comma-list source, with exact per-rule pixel counts. |
+| [`scan/continuous_options.rs`](../crates/raster-h3-sedona/tests/scan/continuous_options.rs) | `with_overlap_rule_on_a_multi_file_source_matches_core`: `cutline`, `first` and `average` over a comma-list source, with exact per-rule pixel counts. |
 
 ## 15. Geometry encoding (WKB)
 
@@ -300,17 +299,17 @@ See [DuckDB](engines/duckdb.md).
 
 ## 19. DataFusion
 
-The `raster-h3-datafusion` table providers must return what a core batch reader returns for the same configuration, with every pushed filter either exact or left to DataFusion.
+The `scan` table providers (`raster_h3_sedona::scan`, formerly `raster-h3-datafusion`) must return what a core batch reader returns for the same configuration, with every pushed filter either exact or left to DataFusion.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`datafusion/continuous_options.rs`](../crates/raster-h3-datafusion/tests/it/continuous_options.rs) (8) | Each `ContinuousRasterTableProvider` builder option equals a core `ContinuousBatchReader` run with the same config and changes the output: `with_nodata` (drops exactly the matching pixels), `with_sampling`, `with_band` (0 clamps to 1), `with_spectral_formula`, `with_quantiles` (extra columns, projectable), `with_min_count`/`with_min_mean`/`with_max_mean` intersected with pushed `MinCount`/`MinMean`/`MaxMean` (the stricter bound wins), `with_compact` (mass conserved; adjacent resolutions rejected), `with_overlap_rule` on a two-file source. |
-| [`datafusion/categorical_options.rs`](../crates/raster-h3-datafusion/tests/it/categorical_options.rs) (3) | `CategoricalRasterTableProvider` `with_nodata`, `with_remapper` (wide and long) and `with_min_majority_fraction` / `with_min_count` intersected with pushed filters, against `CategoricalBatchReader`. |
-| [`datafusion/statistics.rs`](../crates/raster-h3-datafusion/tests/it/statistics.rs) (3) | `statistics()` returns the inexact core cardinality estimate for both providers, grows with resolution, resolution count and mosaic files, stays within 4× of the real row count, and falls back to 10 000 per resolution for unreadable rasters. |
-| [`datafusion/scalar_udfs.rs`](../crates/raster-h3-datafusion/tests/it/scalar_udfs.rs) (3) | `string_to_h3`, `h3_to_lat`, `h3_to_lng` against `h3o` and the core scalars on cells near the poles, the antimeridian and a pentagon: validity pass-through, NaN for invalid cells, type errors, round trip back to the same cell. |
-| [`datafusion/compaction_pushdown.rs`](../crates/raster-h3-datafusion/tests/it/compaction_pushdown.rs) (2) | With `compact` or `compact_h3_children` set, every predicate reports `Unsupported` and `scan` emits the unfiltered compacted table: residual resolution and aggregate filters see completed parent rows, and `limit` is spent only after them — for both providers (categorical in wide and long formats). |
-| [`datafusion/bbox_pushdown.rs`](../crates/raster-h3-datafusion/tests/it/bbox_pushdown.rs) (5) | A pushed `Bbox` keeps edge cells whole (continuous and categorical statistics equal an unpruned scan); compacted scans ignore it; `LIMIT` is not spent on cells outside the box; a box off the raster scans empty. |
-| Unit: `raster-h3-datafusion` (6) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
+| [`scan/continuous_options.rs`](../crates/raster-h3-sedona/tests/scan/continuous_options.rs) (8) | Each `ContinuousRasterTableProvider` builder option equals a core `ContinuousBatchReader` run with the same config and changes the output: `with_nodata` (drops exactly the matching pixels), `with_sampling`, `with_band` (0 clamps to 1), `with_spectral_formula`, `with_quantiles` (extra columns, projectable), `with_min_count`/`with_min_mean`/`with_max_mean` intersected with pushed `MinCount`/`MinMean`/`MaxMean` (the stricter bound wins), `with_compact` (mass conserved; adjacent resolutions rejected), `with_overlap_rule` on a two-file source. |
+| [`scan/categorical_options.rs`](../crates/raster-h3-sedona/tests/scan/categorical_options.rs) (3) | `CategoricalRasterTableProvider` `with_nodata`, `with_remapper` (wide and long) and `with_min_majority_fraction` / `with_min_count` intersected with pushed filters, against `CategoricalBatchReader`. |
+| [`scan/statistics.rs`](../crates/raster-h3-sedona/tests/scan/statistics.rs) (3) | `statistics()` returns the inexact core cardinality estimate for both providers, grows with resolution, resolution count and mosaic files, stays within 4× of the real row count, and falls back to 10 000 per resolution for unreadable rasters. |
+| [`scan/scalar_udfs.rs`](../crates/raster-h3-sedona/tests/scan/scalar_udfs.rs) (3) | `string_to_h3`, `h3_to_lat`, `h3_to_lng` against `h3o` and the core scalars on cells near the poles, the antimeridian and a pentagon: validity pass-through, NaN for invalid cells, type errors, round trip back to the same cell. |
+| [`scan/compaction_pushdown.rs`](../crates/raster-h3-sedona/tests/scan/compaction_pushdown.rs) (2) | With `compact` or `compact_h3_children` set, every predicate reports `Unsupported` and `scan` emits the unfiltered compacted table: residual resolution and aggregate filters see completed parent rows, and `limit` is spent only after them — for both providers (categorical in wide and long formats). |
+| [`scan/bbox_pushdown.rs`](../crates/raster-h3-sedona/tests/scan/bbox_pushdown.rs) (5) | A pushed `Bbox` keeps edge cells whole (continuous and categorical statistics equal an unpruned scan); compacted scans ignore it; `LIMIT` is not spent on cells outside the box; a box off the raster scans empty. |
+| Unit: `raster-h3-sedona` `src/scan` (6) | Projection, limit, filter narrowing, Arrow stream, UDFs. |
 
 Also covered elsewhere: transform failures in [§11](#11-failure-propagation--resilience); overlap rules in [§14](#14-mosaics--overlap-rules); partitioned scans in [§26](#26-partitioned-scans); cross-engine parity in [§24](#24-cross-engine-parity).
 
@@ -386,7 +385,7 @@ One raster, every engine: per-cell results must agree.
 
 | Suite | What it checks |
 | :--- | :--- |
-| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), DataFusion (scan, pushdown, UDFs), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
+| [`root/multi_engine_e2e.rs`](../tests/it/multi_engine_e2e.rs) (4) | Continuous and categorical per-cell parity across core batch readers, the Arrow C stream, the CLI binary (`ipc`, `jsonl`, `parquet`, `pmtiles`), Python (a `python3` subprocess loading the cdylib), the PostgreSQL SRFs and fmgr scalars in process, and DuckDB when `duckdb` is on `PATH`; continuous parity also covers EPSG:5070 and EPSG:27700 rasters, and polygon results are compared exactly across core, Python and DuckDB. |
 | Unit: `raster-h3-core` columnar (6), `scalar_ops.rs` (6) | Arrow C stream round trip, release callback null-safety/idempotence, cross-thread owned export release, `RH3IPC01` round trip, scalar helpers. |
 
 See the [engine deep dives](engines/README.md).
@@ -457,11 +456,12 @@ and `streaming_failures::` integration suites under ThreadSanitizer
 (`RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --locked -p raster-h3-core
 --test it -- threading:: chunks_and_prefetch:: streaming_failures::`, with `--target` for
 cross builds). The [coverage workflow](../.github/workflows/coverage.yml) measures
-`--lib --test it` across the core, cli, datafusion, python and pg crates with
+`--lib --test it` across the core, cli, python and pg crates with
 `cargo llvm-cov` and uploads `lcov.info` to Codecov (informational statuses); run it
 locally as `RASTER_H3_PG_MAJOR=16 cargo llvm-cov --locked --lcov --output-path lcov.info
--p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python
--p raster-h3-pg --lib --test it`.
+-p raster-h3-core -p raster-h3-cli -p raster-h3-python
+-p raster-h3-pg --lib --test it`. The standalone `raster-h3-sedona` workspace (including its `scan`
+layer) is not in the coverage report.
 
 Fuzz crash artifacts are retained on CI failure. Minimize a reproducer
 with `cargo +nightly fuzz tmin <target> <artifact>` and add a deterministic regression test;
@@ -477,7 +477,7 @@ in every engine.
 | Suite | What it checks |
 | :--- | :--- |
 | [`core/partitioned_scan.rs`](../crates/raster-h3-core/tests/it/partitioned_scan.rs) (13) | Partitioned scans (tiled, striped, mosaics, categorical, spilling) merged through encoded partial states match a single scan, including `sum_w2` and variance; `fractional_sampling_variance_survives_spills_and_partitions` repeats this with RGSS sampling, a spilling budget and two resolutions; partial states round-trip fractional weights and version 1 states are rejected. |
-| [`datafusion/partitions.rs`](../crates/raster-h3-datafusion/tests/it/partitions.rs) (3) | Continuous and categorical `with_partition` providers merge to the unpartitioned provider; pushed filters keep partial rows mergeable. |
+| [`scan/partitions.rs`](../crates/raster-h3-sedona/tests/scan/partitions.rs) (3) | Continuous and categorical `with_partition` providers merge to the unpartitioned provider; pushed filters keep partial rows mergeable. |
 | [`sedona/partitions.rs`](../crates/raster-h3-sedona/tests/partitions.rs) (3) | SQL `h3_raster_plan_partitions`, a partition spec argument and the `h3_merge_partials` aggregates equal an unpartitioned query, also with filters and limits. |
 | [`cli/partitions.rs`](../crates/raster-h3-cli/tests/it/partitions.rs) (4) | `plan` / `ipc --partition` / `merge` fan-outs equal a single scan for continuous, categorical and projected rasters; a spec on the command line and the plan on stdout; misuse is rejected. |
 | [`python/partitions.rs`](../crates/raster-h3-python/tests/it/partitions.rs) (5) | Through the C ABI: continuous and categorical partitions merge to a single scan; unsupported options are rejected; the merge accepts the scan's projection including `partial_state`, and rejects rows without a state. |
@@ -562,13 +562,13 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 | [`ci.yml`](../.github/workflows/ci.yml), per platform (Linux, macOS, Windows) | `cargo test --release --no-fail-fast -p raster_h3 -p raster-h3-core -p raster-h3-duckdb` | Unit tests and `tests/it` binaries of the root, core and DuckDB crates (gated ones excluded), and the core `memory` benchmark checks |
 | `ci.yml` | `cargo build --release --lib`, plus `cargo build --features duckdb-api-v1_5_6` into `target-v156/` (packaged with `--duckdb-version v1.5.6` under `dist/v2.0.0/`), then ignored `duckdb_sql_smoke` tests against downloaded v1.2.0 and v1.5.6 CLIs with the default build and and `duckdb_trusted_repository` against v2.0.0, both with the v1.5.6-API build | Real-SQL coverage on all three DuckDB versions and both extension builds, packaging with each CLI's `PRAGMA platform` tag; signed install through `CREATE EXTENSION REPOSITORY` |
 | `ci.yml` (`community-build`) | `make configure release` via the `extension-ci-tools` submodule, then `test/sql` with `duckdb_sqllogictest` on linux_amd64 | The community-extensions build path (`build: cargo`) keeps working |
-| `ci.yml` (`test-crates`, Linux) | `cargo test --locked --release -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` (core and DuckDB run in the build matrix) | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
+| `ci.yml` (`test-crates`, Linux) | `cargo test --locked --release -p raster-h3-cli -p raster-h3-python -p raster-h3-pg`, then PostgreSQL with `--features pg-extension` (core and DuckDB run in the build matrix) | Every adapter's unit/integration suites, including PostgreSQL's fmgr helpers |
 | `ci.yml` (`python-pytest`, Linux) | `cargo build --locked --release -p raster-h3-python --lib`, then `pytest crates/raster-h3-python/tests/pytest` with `RASTER_H3_PYTHON_LIB` set to the built library | The in-tree `raster_h3` package against real Polars and PyArrow on every code change, with the same three dependency sets as the manual `python-polars` engine below: declared minimums, first Polars with `register_io_source`, and latest |
 | `ci.yml` (`sedona-adapter`, Linux) | `cargo test --locked --no-fail-fast` in `crates/raster-h3-sedona`, Clippy on the Python bindings, then a built wheel tested with `pytest` against `sedonadb==0.5.0` | The standalone SedonaDB adapter workspace (without `sedona-e2e`) and its Python bindings |
 | `ci.yml` (`sedona-spark`, Linux) | `docker build -f Dockerfile.sedona`, then `pytest /opt/raster_h3/examples/tests` in the image with `SPARK_MASTER=local[2]`, and `pytest crates/raster-h3-python/tests/spark` with PySpark 4.1 installed beside the image's Spark 4.0 | Partitioned scans on real Spark with Apache Sedona, the Sedona SQL interop and the demo; also that the `sedona` image builds |
 | `ci.yml` (`metadata`, `package-check`) | Version-check script and its Python unit tests; `cargo package --locked -p raster-h3-core` | Version/publication policy, license consistency, and a clean-room packaged-core compile |
 | [`safety.yml`](../.github/workflows/safety.yml) | Bounded cargo-fuzz targets, scoped Miri tests over the columnar/categorical/predictor unsafe code and the DuckDB, Python and PostgreSQL FFI layers, and a ThreadSanitizer run over prefetch and aggregation tests | Malformed input, sanitizer smoke checks, FFI ownership and data races; longer fuzz runs weekly |
-| [`coverage.yml`](../.github/workflows/coverage.yml) | `cargo llvm-cov --locked --lcov --output-path lcov.info -p raster-h3-core -p raster-h3-cli -p raster-h3-datafusion -p raster-h3-python -p raster-h3-pg --lib --test it`, uploaded to Codecov | Line/region/function coverage on every push to main and PR; statuses informational |
+| [`coverage.yml`](../.github/workflows/coverage.yml) | `cargo llvm-cov --locked --lcov --output-path lcov.info -p raster-h3-core -p raster-h3-cli -p raster-h3-python -p raster-h3-pg --lib --test it`, uploaded to Codecov | Line/region/function coverage on every push to main and PR; statuses informational |
 | [`benchmarks.yml`](../.github/workflows/benchmarks.yml) | Criterion streaming benchmarks | Weekly/manual informational timings, not correctness or release gates |
 | `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example profile_hotspots` | Hotspot harness ownership-sampling correctness; profiling experiments are excluded |
 | `ci.yml`, per platform | `cargo test --locked --release -p raster-h3-core --example worker_scaling` | Worker-scaling benchmark: every workload produces identical output at 1 and 3 aggregation workers; timings are not run |
@@ -582,7 +582,7 @@ Use `--release` for anything that streams real data; debug builds are much slowe
 To run it: **Actions → Manual Tests → Run workflow**, or
 
 ```bash
-gh workflow run manual-tests.yml -f ref=my-branch -f engine=datafusion -f platform=all
+gh workflow run manual-tests.yml -f ref=my-branch -f engine=python -f platform=all
 ```
 
 The workflow file must exist on the default branch for GitHub to list it; `ref` can then

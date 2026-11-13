@@ -37,7 +37,7 @@ use datafusion::prelude::SessionContext;
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
-use raster_h3_datafusion::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
+use raster_h3_sedona::scan::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
 use sedona_extension::extension::SedonaCTableProvider;
 use sedona_extension::runtime::RuntimeHandle;
 use sedona_extension::table_provider::ExportedTableProvider;

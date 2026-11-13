@@ -6,9 +6,7 @@
 //! - [`raster_h3_cli`] (`cli`): Command-line streaming (`ipc`, `jsonl`, `parquet`, `pmtiles`).
 //! - [`raster_h3_duckdb`] (`duckdb`): DuckDB C-API loadable extension (`LOAD 'raster_h3'`).
 //!
-//! Behind optional features (off by default, all enabled by `full`):
-//! - `raster_h3_datafusion` (`datafusion`, feature `datafusion`): DataFusion `TableProvider`,
-//!   `ExecutionPlan`, and `ScalarUDFImpl`.
+//! Behind optional features (off by default, both enabled by `full`):
 //! - `raster_h3_python` (`python`, feature `python`): Python / Polars IO plugin and Arrow PyCapsule
 //!   (`__arrow_c_stream__`) bindings.
 //! - `raster_h3_pg` (`pg`, feature `pg`): PostgreSQL V1 extension (`Set-Returning Functions` and H3
@@ -19,8 +17,6 @@
 
 pub use raster_h3_cli as cli;
 pub use raster_h3_core as core;
-#[cfg(feature = "datafusion")]
-pub use raster_h3_datafusion as datafusion;
 pub use raster_h3_duckdb as duckdb;
 #[cfg(feature = "pg")]
 pub use raster_h3_pg as pg;

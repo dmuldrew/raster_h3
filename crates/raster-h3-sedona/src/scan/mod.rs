@@ -1,37 +1,41 @@
-//! # `raster-h3-datafusion`
+//! Engine-neutral raster scans and H3 scalar functions over `raster_h3_core`'s columnar types.
 //!
-//! Apache DataFusion integration for [`raster_h3_core`], providing:
-//! - [`ContinuousRasterTableProvider`] (`h3_raster_continuous_aggregate`)
-//! - [`CategoricalRasterTableProvider`] (`h3_raster_categorical_aggregate`)
-//! - [`ExecutionPlan`] implementations with column projection, filter (`min_count`, `min_mean`,
-//!   `max_mean`, `min_majority_fraction`, `bbox`, `resolution`), and row-limit pushdown
-//! - Vectorized [`ScalarUDFImpl`] implementations for all H3 scalar functions
-//! - [`RasterH3SessionCatalog`] for registering and invoking table functions and scalar UDFs
+//! [`crate::table::RasterH3Table`] and [`crate::udf::RasterH3ScalarUdf`] wrap these in
+//! DataFusion's real `TableProvider` and `ScalarUDFImpl`. The traits here are deliberately
+//! named differently from DataFusion's:
+//! - [`ContinuousRasterTableProvider`] and [`CategoricalRasterTableProvider`] implement
+//!   [`RasterScan`] (`h3_raster_continuous_aggregate`, `h3_raster_categorical_aggregate`):
+//!   schema, statistics, filter classification and [`RasterScan::scan`].
+//! - [`RasterScanExec`] plans with column projection, filter (`min_count`, `min_mean`,
+//!   `max_mean`, `min_majority_fraction`, `bbox`, `resolution`) and row-limit pushdown, run as
+//!   [`RecordBatch`] iterators or an Arrow C stream.
+//! - [`H3ScalarFn`] implementations for the H3 scalar functions, listed by
+//!   [`default_scalar_udfs`] and found by name or alias with [`find_scalar_udf`].
+//!
+//! This was the separate `raster-h3-datafusion` crate until it moved here, its only user.
 
-pub mod scalar_udf;
-pub mod table_provider;
+pub mod provider;
+pub mod scalar;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+pub use provider::{
+    CategoricalRasterExec, CategoricalRasterTableProvider, ContinuousRasterExec,
+    ContinuousRasterTableProvider, FilterPredicate, FilterPushdownStatus, PartitionedRasterExec,
+    RasterScan, RasterScanExec, TableStatistics,
+};
 pub use raster_h3_core::aggregator::multi_horizon::ScanPartition;
 pub use raster_h3_core::columnar::{
     merge_partial_batches, ArrowArray, ArrowArrayStream, ArrowDataType, ArrowSchema,
     CategoricalFormat, ColumnArray, ColumnField, ColumnSchema, RecordBatch, PARTIAL_STATE_COLUMN,
 };
-use raster_h3_core::error::{RasterH3Error, Result};
-pub use scalar_udf::{
-    H3CellToParentUdf, H3GetResolutionUdf, H3IsValidUdf, H3ToLatUdf, H3ToLngUdf, H3ToStringUdf,
-    H3ToWkbUdf, ScalarUDFImpl, StringToH3Udf,
-};
-pub use table_provider::{
-    CategoricalRasterExec, CategoricalRasterTableProvider, ContinuousRasterExec,
-    ContinuousRasterTableProvider, ExecutionPlan, FilterPredicate, FilterPushdownStatus,
-    PartitionedRasterExec, TableProvider, TableStatistics,
+pub use scalar::{
+    H3CellToParentUdf, H3GetResolutionUdf, H3IsValidUdf, H3ScalarFn, H3ToLatUdf, H3ToLngUdf,
+    H3ToStringUdf, H3ToWkbUdf, StringToH3Udf,
 };
 
 /// Return all standard `raster_h3` vectorized scalar UDFs.
-pub fn default_scalar_udfs() -> Vec<Arc<dyn ScalarUDFImpl>> {
+pub fn default_scalar_udfs() -> Vec<Arc<dyn H3ScalarFn>> {
     vec![
         Arc::new(H3ToStringUdf),
         Arc::new(StringToH3Udf),
@@ -44,88 +48,31 @@ pub fn default_scalar_udfs() -> Vec<Arc<dyn ScalarUDFImpl>> {
     ]
 }
 
-/// Session catalog registry managing registered `TableProvider`s and vectorized `ScalarUDFImpl`s.
-#[derive(Default)]
-pub struct RasterH3SessionCatalog {
-    tables: HashMap<String, Arc<dyn TableProvider>>,
-    scalar_udfs: HashMap<String, Arc<dyn ScalarUDFImpl>>,
-}
-
-impl RasterH3SessionCatalog {
-    /// Create a new catalog with all `raster_h3` scalar UDFs registered.
-    pub fn new() -> Self {
-        let mut cat = Self::default();
-        register_all(&mut cat);
-        cat
-    }
-
-    /// Register a vectorized scalar UDF (along with its aliases).
-    pub fn register_udf(&mut self, udf: Arc<dyn ScalarUDFImpl>) {
-        self.scalar_udfs
-            .insert(udf.name().to_ascii_lowercase(), Arc::clone(&udf));
-        for &alias in udf.aliases() {
-            self.scalar_udfs
-                .insert(alias.to_ascii_lowercase(), Arc::clone(&udf));
-        }
-    }
-
-    /// Register a named `TableProvider`.
-    pub fn register_table(&mut self, name: impl Into<String>, provider: Arc<dyn TableProvider>) {
-        self.tables
-            .insert(name.into().to_ascii_lowercase(), provider);
-    }
-
-    /// Look up a registered `TableProvider` by name.
-    pub fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        self.tables.get(&name.to_ascii_lowercase()).cloned()
-    }
-
-    /// Look up a registered `ScalarUDFImpl` by name or alias.
-    pub fn udf(&self, name: &str) -> Option<Arc<dyn ScalarUDFImpl>> {
-        self.scalar_udfs.get(&name.to_ascii_lowercase()).cloned()
-    }
-
-    /// Invoke a registered scalar UDF by name on columnar arguments.
-    pub fn invoke_scalar(&self, name: &str, args: &[ColumnArray]) -> Result<ColumnArray> {
-        let udf = self.udf(name).ok_or_else(|| {
-            RasterH3Error::InvalidParameter(format!("Unregistered scalar UDF: '{}'", name))
-        })?;
-        udf.invoke(args)
-    }
-
-    /// Create and scan a continuous raster table (`h3_raster_continuous_aggregate`).
-    pub fn h3_raster_continuous_aggregate(
-        &self,
-        source: &str,
-        resolutions: Vec<u8>,
-    ) -> Result<ContinuousRasterTableProvider> {
-        ContinuousRasterTableProvider::try_new(source, resolutions)
-    }
-
-    /// Create and scan a categorical raster table (`h3_raster_categorical_aggregate`).
-    pub fn h3_raster_categorical_aggregate(
-        &self,
-        source: &str,
-        resolutions: Vec<u8>,
-    ) -> Result<CategoricalRasterTableProvider> {
-        CategoricalRasterTableProvider::try_new(source, resolutions)
-    }
-}
-
-/// Register all `raster_h3` scalar UDFs into a [`RasterH3SessionCatalog`].
-pub fn register_all(catalog: &mut RasterH3SessionCatalog) {
-    for udf in default_scalar_udfs() {
-        catalog.register_udf(udf);
-    }
+/// The default scalar function named `name` or having it as an alias, ignoring ASCII case.
+pub fn find_scalar_udf(name: &str) -> Option<Arc<dyn H3ScalarFn>> {
+    default_scalar_udfs().into_iter().find(|udf| {
+        udf.name().eq_ignore_ascii_case(name)
+            || udf
+                .aliases()
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raster_h3_core::error::{RasterH3Error, Result};
     use std::fs::File;
     use tempfile::NamedTempFile;
     use tiff::encoder::colortype::Gray32Float;
     use tiff::encoder::TiffEncoder;
+
+    fn invoke_scalar(name: &str, args: &[ColumnArray]) -> Result<ColumnArray> {
+        find_scalar_udf(name)
+            .ok_or_else(|| RasterH3Error::InvalidParameter(format!("no scalar function '{name}'")))?
+            .invoke(args)
+    }
 
     fn write_test_tif(width: u32, height: u32, val: f32) -> NamedTempFile {
         let tmp = NamedTempFile::new().unwrap();
@@ -150,15 +97,14 @@ mod tests {
     }
 
     #[test]
-    fn test_datafusion_table_provider_projection_filter_limit_and_arrow_stream() {
+    fn test_scan_table_provider_projection_filter_limit_and_arrow_stream() {
         let tif = write_test_tif(24, 24, 15.0);
-        let ctx = RasterH3SessionCatalog::new();
 
-        let provider = ctx
-            .h3_raster_continuous_aggregate(&tif.path().to_string_lossy(), vec![8])
-            .unwrap()
-            .with_crs("EPSG:4326")
-            .with_batch_size(4);
+        let provider =
+            ContinuousRasterTableProvider::try_new(&tif.path().to_string_lossy(), vec![8])
+                .unwrap()
+                .with_crs("EPSG:4326")
+                .with_batch_size(4);
 
         let stats = provider.statistics();
         assert!(stats.num_rows > 0);
@@ -186,12 +132,12 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
         assert!(total_rows > 0 && total_rows <= 3);
 
-        // Test Categorical TableProvider in Long format
-        let cat_provider = ctx
-            .h3_raster_categorical_aggregate(&tif.path().to_string_lossy(), vec![8])
-            .unwrap()
-            .with_crs("EPSG:4326")
-            .with_format(CategoricalFormat::Long);
+        // Test Categorical RasterScan in Long format
+        let cat_provider =
+            CategoricalRasterTableProvider::try_new(&tif.path().to_string_lossy(), vec![8])
+                .unwrap()
+                .with_crs("EPSG:4326")
+                .with_format(CategoricalFormat::Long);
         let cat_plan = cat_provider.scan(Some(&[0, 2, 3]), &[], Some(5)).unwrap();
         let cat_batches: Vec<RecordBatch> = cat_plan
             .execute()
@@ -202,17 +148,15 @@ mod tests {
         assert_eq!(cat_batches[0].schema.fields[1].name, "category");
     }
 
-    fn count_rows(plan: Box<dyn ExecutionPlan>) -> usize {
+    fn count_rows(plan: Box<dyn RasterScanExec>) -> usize {
         plan.execute().unwrap().map(|b| b.unwrap().num_rows).sum()
     }
 
     #[test]
-    fn test_datafusion_pushdown_filters_only_narrow_the_table() {
+    fn test_scan_pushdown_filters_only_narrow_the_table() {
         let tif = write_test_tif(24, 24, 15.0);
         let path = tif.path().to_string_lossy().to_string();
-        let ctx = RasterH3SessionCatalog::new();
-        let provider = ctx
-            .h3_raster_continuous_aggregate(&path, vec![7, 8])
+        let provider = ContinuousRasterTableProvider::try_new(&path, vec![7, 8])
             .unwrap()
             .with_crs("EPSG:4326");
 
@@ -231,8 +175,7 @@ mod tests {
                 .unwrap();
             assert_eq!(count_rows(plan), 0, "resolution {r}");
         }
-        let cat = ctx
-            .h3_raster_categorical_aggregate(&path, vec![8])
+        let cat = CategoricalRasterTableProvider::try_new(&path, vec![8])
             .unwrap()
             .with_crs("EPSG:4326");
         let plan = cat
@@ -242,8 +185,7 @@ mod tests {
 
         // A pushed bbox intersects the table's own bbox instead of replacing it.
         let narrow = [-122.45, 37.79, -122.44, 37.80];
-        let bounded = ctx
-            .h3_raster_continuous_aggregate(&path, vec![8])
+        let bounded = ContinuousRasterTableProvider::try_new(&path, vec![8])
             .unwrap()
             .with_crs("EPSG:4326")
             .with_bbox(narrow);
@@ -265,63 +207,54 @@ mod tests {
     }
 
     #[test]
-    fn test_datafusion_vectorized_scalar_udfs() {
-        let ctx = RasterH3SessionCatalog::new();
+    fn test_scan_vectorized_scalar_udfs() {
         let cell = 0x8828308281fffffu64;
         let col_u64 = ColumnArray::UInt64 {
             values: vec![cell, 0],
             validity: Some(vec![true, false]),
         };
 
-        let hex_col = ctx
-            .invoke_scalar("h3_to_string", std::slice::from_ref(&col_u64))
-            .unwrap();
+        let hex_col = invoke_scalar("h3_to_string", std::slice::from_ref(&col_u64)).unwrap();
         let ColumnArray::Utf8 { values, validity } = &hex_col else {
             panic!("expected Utf8");
         };
         assert_eq!(values[0], "8828308281fffff");
         assert_eq!(validity.as_ref().unwrap(), &vec![true, false]);
 
-        let back_u64 = ctx
-            .invoke_scalar("string_to_h3", std::slice::from_ref(&hex_col))
-            .unwrap();
+        let back_u64 = invoke_scalar("string_to_h3", std::slice::from_ref(&hex_col)).unwrap();
         if let ColumnArray::UInt64 { values, .. } = back_u64 {
             assert_eq!(values[0], cell);
         } else {
             panic!("expected UInt64");
         }
 
-        let res_col = ctx
-            .invoke_scalar("h3_get_resolution", std::slice::from_ref(&col_u64))
-            .unwrap();
+        let res_col = invoke_scalar("h3_get_resolution", std::slice::from_ref(&col_u64)).unwrap();
         if let ColumnArray::Int64 { values, .. } = res_col {
             assert_eq!(values[0], 8);
         }
 
-        let valid_col = ctx.invoke_scalar("h3_is_valid", &[hex_col]).unwrap();
+        let valid_col = invoke_scalar("h3_is_valid", &[hex_col]).unwrap();
         if let ColumnArray::Boolean { values, .. } = valid_col {
             assert_eq!(values, vec![true, false]);
         }
 
-        let geom_col = ctx
-            .invoke_scalar("h3_cell_to_geometry", std::slice::from_ref(&col_u64))
-            .unwrap();
+        let geom_col =
+            invoke_scalar("h3_cell_to_geometry", std::slice::from_ref(&col_u64)).unwrap();
         if let ColumnArray::Binary { values, .. } = geom_col {
             assert!(values[0].len() >= 109);
         }
 
-        let parent_col = ctx
-            .invoke_scalar(
-                "h3_cell_to_parent",
-                &[
-                    col_u64,
-                    ColumnArray::Int64 {
-                        values: vec![5, 5],
-                        validity: None,
-                    },
-                ],
-            )
-            .unwrap();
+        let parent_col = invoke_scalar(
+            "h3_cell_to_parent",
+            &[
+                col_u64,
+                ColumnArray::Int64 {
+                    values: vec![5, 5],
+                    validity: None,
+                },
+            ],
+        )
+        .unwrap();
         if let ColumnArray::UInt64 { values, .. } = parent_col {
             assert_eq!(raster_h3_core::scalar_ops::h3_get_resolution(values[0]), 5);
         }

@@ -1,9 +1,9 @@
 //! Residual predicates must see completed compacted rows, with LIMIT applied last.
 
 use raster_h3_core::columnar::CategoricalFormat;
-use raster_h3_datafusion::{
+use raster_h3_sedona::scan::{
     CategoricalRasterTableProvider, ContinuousRasterTableProvider, FilterPredicate,
-    FilterPushdownStatus, TableProvider,
+    FilterPushdownStatus, RasterScan,
 };
 
 use crate::helpers::TestGeoTiffBuilder;
@@ -41,7 +41,7 @@ fn residual(table: &Table, filters: &[FilterPredicate]) -> Vec<Row> {
 }
 
 fn assert_residual_scan(
-    provider: &dyn TableProvider,
+    provider: &dyn RasterScan,
     projection: &[usize],
     filters: &[FilterPredicate],
     full: &Table,

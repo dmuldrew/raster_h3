@@ -3141,14 +3141,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raster-h3-datafusion"
-version = "0.7.0"
-dependencies = [
- "h3o",
- "raster-h3-core",
-]
-
-[[package]]
 name = "raster-h3-sedona"
 version = "0.7.0"
 dependencies = [
@@ -3159,7 +3151,6 @@ dependencies = [
  "futures",
  "h3o",
  "raster-h3-core",
- "raster-h3-datafusion",
  "rayon",
  "sedona",
  "sedona-extension",
@@ -3175,7 +3166,6 @@ version = "0.7.0"
 dependencies = [
  "datafusion",
  "pyo3",
- "raster-h3-datafusion",
  "raster-h3-sedona",
  "sedona-expr",
  "sedona-extension",

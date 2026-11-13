@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use crate::scan::{CategoricalRasterTableProvider, ContinuousRasterTableProvider, ScanPartition};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider};
@@ -21,9 +22,6 @@ use datafusion::common::{plan_err, ScalarValue};
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
 use datafusion::logical_expr::Expr;
-use raster_h3_datafusion::{
-    CategoricalRasterTableProvider, ContinuousRasterTableProvider, ScanPartition,
-};
 
 use crate::convert::to_df_error;
 use crate::table::RasterH3Table;

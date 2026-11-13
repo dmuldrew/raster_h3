@@ -5,9 +5,9 @@ use std::path::Path;
 
 use raster_h3_core::aggregator::multi_horizon::MultiResolutionConfig;
 use raster_h3_core::columnar::{CategoricalFormat, ColumnArray, RecordBatch};
-use raster_h3_datafusion::{
+use raster_h3_sedona::scan::{
     merge_partial_batches, CategoricalRasterTableProvider, ContinuousRasterTableProvider,
-    FilterPredicate, FilterPushdownStatus, TableProvider, PARTIAL_STATE_COLUMN,
+    FilterPredicate, FilterPushdownStatus, RasterScan, PARTIAL_STATE_COLUMN,
 };
 
 use crate::helpers::{write_geotiff, Crs, Layout};
@@ -84,13 +84,13 @@ fn without_state(batch: RecordBatch) -> RecordBatch {
 /// Scan every partition of `provider`, merge the partials, return all final rows.
 fn partitioned_rows<P>(
     provider: &P,
-    plan: Vec<raster_h3_datafusion::ScanPartition>,
-    with_partition: impl Fn(P, raster_h3_datafusion::ScanPartition) -> P,
+    plan: Vec<raster_h3_sedona::scan::ScanPartition>,
+    with_partition: impl Fn(P, raster_h3_sedona::scan::ScanPartition) -> P,
     categorical: bool,
     config: &MultiResolutionConfig,
 ) -> (Vec<String>, Vec<Row>, usize)
 where
-    P: TableProvider + Clone,
+    P: RasterScan + Clone,
 {
     let mut finals = Vec::new();
     let mut partials = Vec::new();

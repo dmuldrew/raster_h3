@@ -9,7 +9,7 @@ use datafusion::common::ScalarValue;
 use sedona::context::SedonaContext;
 
 use common::{gradient_tif, rows, source};
-use raster_h3_datafusion::ContinuousRasterTableProvider;
+use raster_h3_sedona::scan::ContinuousRasterTableProvider;
 use raster_h3_sedona::RasterH3Table;
 use std::sync::Arc;
 

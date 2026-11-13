@@ -21,7 +21,7 @@ use datafusion::logical_expr::{
     create_udf, ColumnarValue, Expr, ScalarUDF, TableProviderFilterPushDown, Volatility,
 };
 use datafusion::prelude::{col, lit, SessionContext};
-use raster_h3_datafusion::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
+use raster_h3_sedona::scan::{CategoricalRasterTableProvider, ContinuousRasterTableProvider};
 use raster_h3_sedona::{RasterH3Table, GEOARROW_WKB_EXTENSION, GEOARROW_WKB_METADATA};
 
 use common::write_tif_grid;

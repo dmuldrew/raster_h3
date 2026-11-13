@@ -1,12 +1,12 @@
 //! End-to-End Multi-Engine Integration & Parity Test Suite
 //!
-//! Exercises all 6 workspace crates (`raster-h3-core`, `raster-h3-cli`, `raster-h3-duckdb`,
-//! `raster-h3-datafusion`, `raster-h3-python`, and `raster-h3-pg`) on identical synthetic
+//! Exercises the engine crates (`raster-h3-core`, `raster-h3-cli`, `raster-h3-duckdb`,
+//! `raster-h3-python`, and `raster-h3-pg`) on identical synthetic
 //! continuous and categorical GeoTIFFs and verifies bit-for-bit / numerical parity across:
 //! 1. `raster-h3-core`: `ContinuousBatchReader`, `CategoricalBatchReader`, `ArrowArrayStream` C Data Interface.
 //! 2. `raster-h3-cli`: Real subprocess execution of `raster-h3` (`ipc`, `jsonl`, `parquet`, `pmtiles`).
-//! 3. `raster-h3-datafusion`: `RasterH3SessionCatalog`, `TableProvider` scan + pushdown, `ExecutionPlan`
-//!    Arrow C Stream, and vectorized `ScalarUDFImpl` execution.
+//! 3. (The DataFusion engine lives in the separate `raster-h3-sedona` workspace, whose
+//!    `scan` tests check its providers against the core batch readers.)
 //! 4. `raster-h3-python`: Real Python subprocess loading `libraster_h3_python`, testing
 //!    `RasterH3ArrowStream` (`to_dict()`, `__arrow_c_schema__()`, `__arrow_c_stream__()` C-ABI consumption),
 //!    `raster_to_parquet()`, `raster_to_pmtiles()`, and scalar H3 ops.
@@ -32,7 +32,6 @@ use raster_h3::core::columnar::ipc::read_ipc_stream;
 use raster_h3::core::columnar::{
     ArrowArrayStream, CategoricalBatchReader, CategoricalFormat, ColumnArray, ContinuousBatchReader,
 };
-use raster_h3_datafusion::{FilterPredicate, RasterH3SessionCatalog, TableProvider};
 use raster_h3_pg::{
     datum_to_float8, datum_to_int64, int64_to_datum, pg_h3_cell_to_parent, pg_h3_get_resolution,
     pg_h3_is_valid, pg_h3_to_lat, pg_h3_to_lng, pg_scalar_h3_to_string, pg_scalar_h3_to_wkb_u64,
@@ -455,49 +454,6 @@ fn run_continuous_parity(
     assert!(pm_status.success() && &std::fs::read(&cli_pm).unwrap()[..7] == b"PMTiles");
 
     // =========================================================================
-    // Engine 3: raster-h3-datafusion (Catalog + TableProvider + ScalarUDFImpl)
-    // =========================================================================
-    let catalog = RasterH3SessionCatalog::new();
-    let provider = catalog
-        .h3_raster_continuous_aggregate(tif_path.to_str().unwrap(), resolutions.to_vec())
-        .unwrap()
-        .with_crs(crs);
-
-    // Full scan via Arrow C Stream
-    let plan = provider.scan(None, &[], None).unwrap();
-    let mut df_stream = plan.execute_arrow_c_stream().unwrap();
-    // SAFETY: `execute_arrow_c_stream` returns a freshly built, unreleased stream owned here.
-    let (_df_schema, df_batches) = unsafe { df_stream.collect_batches().unwrap() };
-    let df_map = collect_continuous_from_batches(&df_batches);
-    assert_continuous_maps_equal("raster-h3-datafusion", &core_map, &df_map);
-
-    // Verify vectorized ScalarUDFImpls on DataFusion output batch
-    let first_batch = &df_batches[0];
-    let h3_col = first_batch.column_by_name("h3_index").unwrap().clone();
-    let hex_arr = catalog
-        .invoke_scalar("h3_to_string", std::slice::from_ref(&h3_col))
-        .unwrap();
-    let roundtrip_arr = catalog.invoke_scalar("string_to_h3", &[hex_arr]).unwrap();
-    assert_eq!(roundtrip_arr.len(), first_batch.num_rows);
-    let res_arr = catalog
-        .invoke_scalar("h3_get_resolution", std::slice::from_ref(&h3_col))
-        .unwrap();
-    assert_eq!(res_arr.len(), first_batch.num_rows);
-    let wkb_arr = catalog.invoke_scalar("h3_to_wkb", &[h3_col]).unwrap();
-    assert_eq!(wkb_arr.len(), first_batch.num_rows);
-
-    // Verify projection + limit pushdown on DataFusion TableProvider
-    let pushed_plan = provider
-        .scan(Some(&[0, 2, 4]), &[FilterPredicate::Resolution(8)], Some(2))
-        .unwrap();
-    let pushed_batches: Vec<_> = pushed_plan.execute().unwrap().collect();
-    let pushed_rows: usize = pushed_batches
-        .iter()
-        .map(|b| b.as_ref().unwrap().num_rows)
-        .sum();
-    assert!(pushed_rows <= 2 && pushed_rows > 0);
-
-    // =========================================================================
     // Engine 4: raster-h3-python (Real Python subprocess + PyCapsule C Stream)
     // =========================================================================
     let py_lib = ensure_cdylib_built("raster-h3-python", "raster_h3_python");
@@ -891,18 +847,6 @@ fn test_cross_engine_categorical_e2e_parity() {
     let (_s, cli_batches) = read_ipc_stream(&mut cursor).unwrap();
     let cli_map = collect_categorical_from_batches(&cli_batches);
     assert_categorical_maps_equal("raster-h3-cli (categorical ipc)", &core_map, &cli_map);
-
-    // 3. raster-h3-datafusion (`h3_raster_categorical_aggregate`)
-    let catalog = RasterH3SessionCatalog::new();
-    let provider = catalog
-        .h3_raster_categorical_aggregate(tif_path.to_str().unwrap(), vec![8])
-        .unwrap()
-        .with_crs("EPSG:4326")
-        .with_format(CategoricalFormat::Wide);
-    let plan = provider.scan(None, &[], None).unwrap();
-    let df_batches: Vec<_> = plan.execute().unwrap().map(|b| b.unwrap()).collect();
-    let df_map = collect_categorical_from_batches(&df_batches);
-    assert_categorical_maps_equal("raster-h3-datafusion (categorical)", &core_map, &df_map);
 
     // 4. raster-h3-python subprocess (`RasterH3ArrowStream(..., categorical=True)`)
     let py_lib = ensure_cdylib_built("raster-h3-python", "raster_h3_python");

@@ -4,7 +4,7 @@
 //! [SedonaDB](https://github.com/apache/sedona-db) so the same objects register into a
 //! plain DataFusion `SessionContext` or into `SedonaContext::ctx`:
 //! - [`RasterH3Table`]: a real `datafusion::catalog::TableProvider` wrapping the
-//!   `raster-h3-datafusion` providers, with projection, limit and `Expr` filter pushdown
+//!   [`scan`] providers, with projection, limit and `Expr` filter pushdown
 //! - Table functions `h3_raster_continuous_aggregate` / `h3_raster_categorical_aggregate`
 //! - The `raster_h3` H3 scalar functions as DataFusion `ScalarUDF`s, including
 //!   `h3_polygon_to_cells(geometry, resolution [, containment])`
@@ -32,6 +32,7 @@ mod filters;
 pub mod merge;
 pub mod pmtiles;
 mod polyfill;
+pub mod scan;
 mod spatial;
 pub mod table;
 pub mod udf;
