@@ -736,3 +736,57 @@ fn test_parquet_column_orders_readable_by_polars() {
         assert!(stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some());
     }
 }
+
+#[test]
+fn a5_unsigned_ids_round_trip_all_parquet_layouts() {
+    use raster_h3_core::grid::GridKind;
+    let tif = NamedTempFile::new().unwrap();
+    helpers::TestGeoTiffBuilder::new(8, 8)
+        .origin(140., -40.)
+        .pixel_size(0.00001)
+        .write_fn::<f32, _, _>(tif.path(), |_, _| 7.)
+        .unwrap();
+    let config = MultiResolutionConfig::single(10).with_grid(GridKind::A5);
+    let expected = GridKind::A5.cell_at(-40.00004, 140.00004, 10).unwrap();
+    assert!(expected > i64::MAX as u64);
+    for categorical in [false, true] {
+        for compact in [false, true] {
+            for geoparquet in [false, true] {
+                let output = NamedTempFile::new().unwrap();
+                let options = ParquetExportConfig {
+                    compact,
+                    geoparquet,
+                    ..Default::default()
+                };
+                let raster = GeoTiffStreamReader::open(tif.path().to_str().unwrap()).unwrap();
+                if categorical {
+                    H3ParquetWriter::write_categorical_streamer_to_parquet(
+                        MultiCategoricalHorizonStreamer::new(raster, &config).unwrap(),
+                        output.path(),
+                        options,
+                    )
+                    .unwrap();
+                } else {
+                    H3ParquetWriter::write_continuous_streamer_to_parquet(
+                        MultiScanHorizonStreamer::new(raster, &config).unwrap(),
+                        output.path(),
+                        options,
+                    )
+                    .unwrap();
+                }
+                let reader = SerializedFileReader::new(File::open(output.path()).unwrap()).unwrap();
+                let rows: Vec<_> = reader
+                    .get_row_iter(None)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_ulong(0).unwrap(),
+                    expected,
+                    "categorical={categorical}, compact={compact}, geo={geoparquet}"
+                );
+            }
+        }
+    }
+}

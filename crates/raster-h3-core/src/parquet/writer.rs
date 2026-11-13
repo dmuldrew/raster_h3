@@ -324,7 +324,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             (GridKind::A5, true, false) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED DOUBLE min_value;
                     REQUIRED DOUBLE max_value;
                     REQUIRED DOUBLE sum_value;
@@ -336,7 +336,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             (GridKind::A5, true, true) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED BYTE_ARRAY geometry;
                     REQUIRED DOUBLE min_value;
                     REQUIRED DOUBLE max_value;
@@ -349,7 +349,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             (GridKind::A5, false, false) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED BYTE_ARRAY a5_hex (UTF8);
                     REQUIRED DOUBLE min_value;
                     REQUIRED DOUBLE max_value;
@@ -364,7 +364,7 @@ impl ParquetRowGroupBuffer for ContinuousRowGroupBuffer {
             (GridKind::A5, false, true) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED BYTE_ARRAY a5_hex (UTF8);
                     REQUIRED BYTE_ARRAY geometry;
                     REQUIRED DOUBLE min_value;
@@ -628,7 +628,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             (GridKind::A5, true, false) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED INT64 majority;
                     REQUIRED DOUBLE majority_fraction;
                     REQUIRED DOUBLE pixel_count;
@@ -640,7 +640,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             (GridKind::A5, true, true) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED BYTE_ARRAY geometry;
                     REQUIRED INT64 majority;
                     REQUIRED DOUBLE majority_fraction;
@@ -653,7 +653,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             (GridKind::A5, false, false) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED BYTE_ARRAY a5_hex (UTF8);
                     REQUIRED INT64 majority;
                     REQUIRED DOUBLE majority_fraction;
@@ -668,7 +668,7 @@ impl ParquetRowGroupBuffer for CategoricalRowGroupBuffer {
             (GridKind::A5, false, true) => {
                 "
                 message schema {
-                    REQUIRED INT64 a5_index;
+                    REQUIRED INT64 a5_index (UINT_64);
                     REQUIRED BYTE_ARRAY a5_hex (UTF8);
                     REQUIRED BYTE_ARRAY geometry;
                     REQUIRED INT64 majority;

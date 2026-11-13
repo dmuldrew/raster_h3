@@ -1329,5 +1329,20 @@ mod tests {
         assert_eq!(schema.fields[3].name, "count");
         let total_decoded: usize = batches.iter().map(|b| b.num_rows).sum();
         assert_eq!(total_decoded, rows);
+        let (json_opts, _) = parse_stream_args(&args, StreamOutputFormat::Jsonl).unwrap();
+        let mut json = Vec::new();
+        assert_eq!(
+            stream_raster_to_writer(&json_opts, &mut json).unwrap(),
+            rows
+        );
+        let decoded: Vec<serde_json::Value> = String::from_utf8(json)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), rows);
+        assert!(decoded.iter().all(|row| row["mean"] == 42.0
+            && row["a5_index"].is_u64()
+            && row["a5_hex"].is_string()));
     }
 }

@@ -380,6 +380,9 @@ pub fn process_categorical_borrowed_into(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use super::*;
+
     /// The hardware-FMA copy of the kernel must produce exactly the class
     /// counts the portable copy does.
     #[cfg(target_arch = "x86_64")]

@@ -274,187 +274,197 @@ fn test_continuous_quantile_pushdown_and_batched_columns() {
 #[test]
 fn test_categorical_table_function_wide_and_long_formats() {
     install_mock_api();
-    let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
-        .origin(-122.45, 37.80)
-        .pixel_size(0.001)
-        .create_tempfile::<u8, _>(|c, r| ((c + r) % 3 + 1) as u8);
+    for grid in ["h3", "a5"] {
+        let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
+            .origin(-122.45, 37.80)
+            .pixel_size(0.001)
+            .create_tempfile::<u8, _>(|c, r| ((c + r) % 3 + 1) as u8);
 
-    // 0. Invalid remap syntax sets bind error cleanly
-    let mut bad_remap = HashMap::new();
-    bad_remap.insert(
-        "remap".to_string(),
-        MockVal::Str("invalid_without_colon".to_string()),
-    );
-    let mut bind_bad = MockBindContext::new(
-        vec![MockVal::Str(path.to_string_lossy().into_owned())],
-        bad_remap,
-    );
-    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
-    // treats as the bind info.
-    unsafe {
-        raster_h3_categorical_bind(&mut bind_bad as *mut MockBindContext as duckdb_bind_info);
-    }
-    assert!(bind_bad.error.is_some());
-
-    // 1. Wide Format with remap
-    let mut named_wide = HashMap::new();
-    named_wide.insert("resolution".to_string(), MockVal::Int(8));
-    named_wide.insert("format".to_string(), MockVal::Str("wide".to_string()));
-    named_wide.insert(
-        "remap".to_string(),
-        MockVal::Str("1: 10, 2: 20, 3: 30".to_string()),
-    );
-    named_wide.insert("geom".to_string(), MockVal::Bool(true));
-
-    let mut bind_wide = MockBindContext::new(
-        vec![MockVal::Str(path.to_string_lossy().into_owned())],
-        named_wide,
-    );
-    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
-    // treats as the bind info.
-    unsafe {
-        raster_h3_categorical_bind(&mut bind_wide as *mut MockBindContext as duckdb_bind_info);
-    }
-    assert!(bind_wide.error.is_none());
-    assert_eq!(bind_wide.result_columns.len(), 14);
-
-    let wide_cols: Vec<usize> = (0..14).collect();
-    let mut init_wide = MockInitContext::new(bind_wide.bind_data, wide_cols);
-    let mut local_wide = MockInitContext::new(bind_wide.bind_data, Vec::new());
-    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
-    // by the bind callback, which is still owned by its bind context.
-    unsafe {
-        raster_h3_categorical_init(&mut init_wide as *mut MockInitContext as duckdb_init_info);
-        raster_h3_categorical_init_local(
-            &mut local_wide as *mut MockInitContext as duckdb_init_info,
+        // 0. Invalid remap syntax sets bind error cleanly
+        let mut bad_remap = HashMap::new();
+        bad_remap.insert(
+            "remap".to_string(),
+            MockVal::Str("invalid_without_colon".to_string()),
         );
-    }
-    let mut func_wide = MockFuncContext {
-        bind_data: bind_wide.bind_data,
-        init_data: init_wide.init_data,
-        local_init_data: local_wide.init_data,
-        error: None,
-    };
-
-    let mut wide_cells = 0usize;
-    let mut wide_total_pixels = 0.0f64;
-    loop {
-        let mut chunk = MockDataChunk::new(14, 2048);
-        // SAFETY: the function context carries bind/init/local data installed above (still
-        // owned by their live contexts), and the chunk has one 2048-row mock vector per
-        // projected column.
+        let mut bind_bad = MockBindContext::new(
+            vec![MockVal::Str(path.to_string_lossy().into_owned())],
+            bad_remap,
+        );
+        // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+        // treats as the bind info.
         unsafe {
-            raster_h3_categorical_scan(
-                &mut func_wide as *mut MockFuncContext as duckdb_function_info,
-                &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
+            raster_h3_categorical_bind(&mut bind_bad as *mut MockBindContext as duckdb_bind_info);
+        }
+        assert!(bind_bad.error.is_some());
+
+        // 1. Wide Format with remap
+        let mut named_wide = HashMap::new();
+        named_wide.insert("grid".into(), MockVal::Str(grid.into()));
+        named_wide.insert("resolution".to_string(), MockVal::Int(8));
+        named_wide.insert("format".to_string(), MockVal::Str("wide".to_string()));
+        named_wide.insert(
+            "remap".to_string(),
+            MockVal::Str("1: 10, 2: 20, 3: 30".to_string()),
+        );
+        named_wide.insert("geom".to_string(), MockVal::Bool(true));
+
+        let mut bind_wide = MockBindContext::new(
+            vec![MockVal::Str(path.to_string_lossy().into_owned())],
+            named_wide,
+        );
+        // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+        // treats as the bind info.
+        unsafe {
+            raster_h3_categorical_bind(&mut bind_wide as *mut MockBindContext as duckdb_bind_info);
+        }
+        assert!(bind_wide.error.is_none());
+        assert_eq!(bind_wide.result_columns.len(), 14);
+
+        let wide_cols: Vec<usize> = (0..14).collect();
+        let mut init_wide = MockInitContext::new(bind_wide.bind_data, wide_cols);
+        let mut local_wide = MockInitContext::new(bind_wide.bind_data, Vec::new());
+        // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+        // by the bind callback, which is still owned by its bind context.
+        unsafe {
+            raster_h3_categorical_init(&mut init_wide as *mut MockInitContext as duckdb_init_info);
+            raster_h3_categorical_init_local(
+                &mut local_wide as *mut MockInitContext as duckdb_init_info,
             );
         }
-        if chunk.size == 0 {
-            break;
-        }
-        wide_cells += chunk.size;
-        // SAFETY: the callbacks above wrote values of these columns' declared types for
-        // rows `0..size` into 8-aligned buffers with room for at least that many rows.
-        unsafe {
-            let maj_classes = chunk.vectors[2].data.as_ptr() as *const i64;
-            let totals = chunk.vectors[6].data.as_ptr() as *const f64;
-            for (i, hist) in chunk.vectors[7].strings[..chunk.size].iter().enumerate() {
-                let mc = *maj_classes.add(i);
-                assert!(
-                    mc == 10 || mc == 20 || mc == 30,
-                    "Remapped majority class must be in {{10, 20, 30}}, got {mc}"
+        let mut func_wide = MockFuncContext {
+            bind_data: bind_wide.bind_data,
+            init_data: init_wide.init_data,
+            local_init_data: local_wide.init_data,
+            error: None,
+        };
+
+        let mut wide_cells = 0usize;
+        let mut wide_total_pixels = 0.0f64;
+        loop {
+            let mut chunk = MockDataChunk::new(14, 2048);
+            // SAFETY: the function context carries bind/init/local data installed above (still
+            // owned by their live contexts), and the chunk has one 2048-row mock vector per
+            // projected column.
+            unsafe {
+                raster_h3_categorical_scan(
+                    &mut func_wide as *mut MockFuncContext as duckdb_function_info,
+                    &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
                 );
-                wide_total_pixels += *totals.add(i);
-                let hist = std::str::from_utf8(hist).unwrap();
-                assert!(hist.starts_with('{') && hist.ends_with('}'));
+            }
+            if chunk.size == 0 {
+                break;
+            }
+            wide_cells += chunk.size;
+            // SAFETY: the callbacks above wrote values of these columns' declared types for
+            // rows `0..size` into 8-aligned buffers with room for at least that many rows.
+            unsafe {
+                let maj_classes = chunk.vectors[2].data.as_ptr() as *const i64;
+                let totals = chunk.vectors[6].data.as_ptr() as *const f64;
+                for (i, hist) in chunk.vectors[7].strings[..chunk.size].iter().enumerate() {
+                    let mc = *maj_classes.add(i);
+                    assert!(
+                        mc == 10 || mc == 20 || mc == 30,
+                        "Remapped majority class must be in {{10, 20, 30}}, got {mc}"
+                    );
+                    wide_total_pixels += *totals.add(i);
+                    let hist = std::str::from_utf8(hist).unwrap();
+                    assert!(hist.starts_with('{') && hist.ends_with('}'));
+                }
             }
         }
-    }
-    assert!(wide_cells > 0);
-    assert!((wide_total_pixels - 1024.0).abs() < 1e-6);
+        assert!(wide_cells > 0);
+        assert!((wide_total_pixels - 1024.0).abs() < 1e-6);
 
-    // 2. Long Format
-    let mut named_long = HashMap::new();
-    named_long.insert("resolution".to_string(), MockVal::Int(8));
-    named_long.insert("format".to_string(), MockVal::Str("long".to_string()));
-    named_long.insert(
-        "remap".to_string(),
-        MockVal::Str("1: 10, 2: 20, 3: 30".to_string()),
-    );
-    named_long.insert("geom".to_string(), MockVal::Bool(true));
-
-    let mut bind_long = MockBindContext::new(
-        vec![MockVal::Str(path.to_string_lossy().into_owned())],
-        named_long,
-    );
-    // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
-    // treats as the bind info.
-    unsafe {
-        raster_h3_categorical_bind(&mut bind_long as *mut MockBindContext as duckdb_bind_info);
-    }
-    assert!(bind_long.error.is_none());
-    assert_eq!(bind_long.result_columns.len(), 13);
-
-    let long_cols: Vec<usize> = (0..13).collect();
-    let mut init_long = MockInitContext::new(bind_long.bind_data, long_cols);
-    let mut local_long = MockInitContext::new(bind_long.bind_data, Vec::new());
-    // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
-    // by the bind callback, which is still owned by its bind context.
-    unsafe {
-        raster_h3_categorical_init(&mut init_long as *mut MockInitContext as duckdb_init_info);
-        raster_h3_categorical_init_local(
-            &mut local_long as *mut MockInitContext as duckdb_init_info,
+        // 2. Long Format
+        let mut named_long = HashMap::new();
+        named_long.insert("grid".into(), MockVal::Str(grid.into()));
+        named_long.insert("resolution".to_string(), MockVal::Int(8));
+        named_long.insert("format".to_string(), MockVal::Str("long".to_string()));
+        named_long.insert(
+            "remap".to_string(),
+            MockVal::Str("1: 10, 2: 20, 3: 30".to_string()),
         );
-    }
-    let mut func_long = MockFuncContext {
-        bind_data: bind_long.bind_data,
-        init_data: init_long.init_data,
-        local_init_data: local_long.init_data,
-        error: None,
-    };
+        named_long.insert("geom".to_string(), MockVal::Bool(true));
 
-    let mut long_rows = 0usize;
-    let mut long_total_pixels = 0.0f64;
-    loop {
-        let mut chunk = MockDataChunk::new(13, 2048);
-        // SAFETY: the function context carries bind/init/local data installed above (still
-        // owned by their live contexts), and the chunk has one 2048-row mock vector per
-        // projected column.
+        let mut bind_long = MockBindContext::new(
+            vec![MockVal::Str(path.to_string_lossy().into_owned())],
+            named_long,
+        );
+        // SAFETY: the context is a live `MockBindContext`, which the installed mock C API
+        // treats as the bind info.
         unsafe {
-            raster_h3_categorical_scan(
-                &mut func_long as *mut MockFuncContext as duckdb_function_info,
-                &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
+            raster_h3_categorical_bind(&mut bind_long as *mut MockBindContext as duckdb_bind_info);
+        }
+        assert!(bind_long.error.is_none());
+        assert_eq!(bind_long.result_columns.len(), 13);
+
+        let long_cols: Vec<usize> = (0..13).collect();
+        let mut init_long = MockInitContext::new(bind_long.bind_data, long_cols);
+        let mut local_long = MockInitContext::new(bind_long.bind_data, Vec::new());
+        // SAFETY: the contexts are live `MockInitContext`s that carry the bind data installed
+        // by the bind callback, which is still owned by its bind context.
+        unsafe {
+            raster_h3_categorical_init(&mut init_long as *mut MockInitContext as duckdb_init_info);
+            raster_h3_categorical_init_local(
+                &mut local_long as *mut MockInitContext as duckdb_init_info,
             );
         }
-        if chunk.size == 0 {
-            break;
-        }
-        long_rows += chunk.size;
-        // SAFETY: the callbacks above wrote values of these columns' declared types for
-        // rows `0..size` into 8-aligned buffers with room for at least that many rows.
-        unsafe {
-            let cats = chunk.vectors[2].data.as_ptr() as *const i64;
-            let counts = chunk.vectors[3].data.as_ptr() as *const f64;
-            let fracs = chunk.vectors[4].data.as_ptr() as *const f64;
-            for i in 0..chunk.size {
-                let c = *cats.add(i);
-                assert!(c == 10 || c == 20 || c == 30);
-                assert!(*fracs.add(i) > 0.0 && *fracs.add(i) <= 1.0);
-                long_total_pixels += *counts.add(i);
-                assert_eq!(chunk.vectors[11].strings[i].len(), 125);
-                assert_eq!(chunk.vectors[12].strings[i].len(), 125);
+        let mut func_long = MockFuncContext {
+            bind_data: bind_long.bind_data,
+            init_data: init_long.init_data,
+            local_init_data: local_long.init_data,
+            error: None,
+        };
+
+        let mut long_rows = 0usize;
+        let mut long_total_pixels = 0.0f64;
+        loop {
+            let mut chunk = MockDataChunk::new(13, 2048);
+            // SAFETY: the function context carries bind/init/local data installed above (still
+            // owned by their live contexts), and the chunk has one 2048-row mock vector per
+            // projected column.
+            unsafe {
+                raster_h3_categorical_scan(
+                    &mut func_long as *mut MockFuncContext as duckdb_function_info,
+                    &mut chunk as *mut MockDataChunk as duckdb_data_chunk,
+                );
+            }
+            if chunk.size == 0 {
+                break;
+            }
+            long_rows += chunk.size;
+            // SAFETY: the callbacks above wrote values of these columns' declared types for
+            // rows `0..size` into 8-aligned buffers with room for at least that many rows.
+            unsafe {
+                let cats = chunk.vectors[2].data.as_ptr() as *const i64;
+                let counts = chunk.vectors[3].data.as_ptr() as *const f64;
+                let fracs = chunk.vectors[4].data.as_ptr() as *const f64;
+                for i in 0..chunk.size {
+                    let c = *cats.add(i);
+                    assert!(c == 10 || c == 20 || c == 30);
+                    assert!(*fracs.add(i) > 0.0 && *fracs.add(i) <= 1.0);
+                    long_total_pixels += *counts.add(i);
+                    assert_eq!(
+                        chunk.vectors[11].strings[i].len(),
+                        if grid == "a5" { 109 } else { 125 }
+                    );
+                    assert_eq!(
+                        chunk.vectors[12].strings[i].len(),
+                        if grid == "a5" { 109 } else { 125 }
+                    );
+                }
             }
         }
+        assert!(
+            long_rows > wide_cells,
+            "Long format must expand multi-class cells into multiple rows"
+        );
+        assert!((long_total_pixels - 1024.0).abs() < 1e-6);
     }
-    assert!(
-        long_rows > wide_cells,
-        "Long format must expand multi-class cells into multiple rows"
-    );
-    assert!((long_total_pixels - 1024.0).abs() < 1e-6);
 }
 
 #[test]
-fn test_a5_continuous_and_categorical_table_scans() {
+fn test_a5_continuous_table_scan() {
     install_mock_api();
     let (_tmp, path) = TestGeoTiffBuilder::new(32, 32)
         .origin(-122.45, 37.80)
