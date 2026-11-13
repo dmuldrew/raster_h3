@@ -2,6 +2,7 @@
 //! conservative horizon eviction, and budgeted external aggregation.
 //! The aggregation budget does not limit TIFF decoder or whole-process memory.
 
+pub mod area_continuous;
 pub mod borrowed;
 pub mod categorical;
 pub mod categorical_streamer;
